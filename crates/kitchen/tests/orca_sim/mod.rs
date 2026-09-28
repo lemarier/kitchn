@@ -72,6 +72,10 @@ pub enum SimOutput {
         messages: Vec<SimMessage>,
         complete: bool,
     },
+    /// A released worker's archived transcript. As on 1.4.212, a read
+    /// starts at the oldest archived message, and its cursor moves forward
+    /// and never runs out: past the end, pages are empty.
+    Archived(Vec<SimMessage>),
     /// The terminal tail, when there is no proven transcript.
     Terminal(Vec<String>),
 }
@@ -132,11 +136,9 @@ impl SimWorker {
         })
     }
 
-    fn transcript(messages: &[SimMessage], complete: bool, limit: usize) -> Value {
-        let start = messages.len().saturating_sub(limit);
-        let window: Vec<Value> = messages
+    fn rows(messages: &[SimMessage]) -> Vec<Value> {
+        messages
             .iter()
-            .skip(start)
             .map(|message| {
                 json!({
                     "id": format!("m-{}", message.at),
@@ -146,7 +148,29 @@ impl SimWorker {
                     "source": "transcript",
                 })
             })
-            .collect();
+            .collect()
+    }
+
+    fn archived(messages: &[SimMessage], offset: usize, limit: usize) -> Value {
+        let page = messages.get(offset..).unwrap_or_default();
+        let page = page.get(..limit.min(page.len())).unwrap_or_default();
+        let window = Self::rows(page);
+        json!({
+            "source": "transcript",
+            "archived": true,
+            "contentComplete": offset == 0 && messages.len() <= limit,
+            "transcript": {
+                "limited": messages.len() > limit,
+                "returnedMessageCount": window.len(),
+                "messages": window,
+                "nextCursor": format!("a{}", offset + limit),
+            },
+        })
+    }
+
+    fn transcript(messages: &[SimMessage], complete: bool, limit: usize) -> Value {
+        let start = messages.len().saturating_sub(limit);
+        let window = Self::rows(messages.get(start..).unwrap_or_default());
         json!({
             "source": "transcript",
             "contentComplete": complete && start == 0,
@@ -268,6 +292,9 @@ pub struct SimState {
     pub stop_state: &'static str,
     /// Whether a stop also releases the worker's terminal, as on 1.4.212.
     pub stop_releases: bool,
+    /// When set, `worker-read` answers this many more calls, then refuses
+    /// with `source_changed`.
+    pub reads_left: Option<usize>,
     pub release_action: &'static str,
     /// When set, `automations edit` is accepted but changes nothing.
     pub ignore_edits: bool,
@@ -327,6 +354,7 @@ impl Default for SimOrca {
                 effects: 0,
                 stop_state: "stopped",
                 stop_releases: true,
+                reads_left: None,
                 release_action: "released",
                 ignore_edits: false,
                 bound: None,
@@ -768,6 +796,11 @@ impl SimState {
                     .get("limit")
                     .and_then(|limit| limit.parse().ok())
                     .unwrap_or(50);
+                match self.reads_left {
+                    Some(0) => return refuse("source_changed"),
+                    Some(left) => self.reads_left = Some(left - 1),
+                    None => {}
+                }
                 let Some(worker) = self.workers.get(&dispatch) else {
                     return refuse("dispatch_not_found");
                 };
@@ -775,6 +808,18 @@ impl SimState {
                     None => refuse("worker_read_unavailable"),
                     Some(SimOutput::Transcript { messages, complete }) => {
                         ok(SimWorker::transcript(messages, *complete, limit))
+                    }
+                    Some(SimOutput::Archived(messages)) => {
+                        let offset = match flags.get("cursor") {
+                            None => 0,
+                            Some(cursor) => {
+                                match cursor.strip_prefix('a').and_then(|n| n.parse().ok()) {
+                                    Some(offset) => offset,
+                                    None => return refuse("invalid_cursor"),
+                                }
+                            }
+                        };
+                        ok(SimWorker::archived(messages, offset, limit))
                     }
                     Some(SimOutput::Terminal(lines)) => ok(json!({
                         "source": "terminal",

@@ -1212,11 +1212,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         let Ok(Some(shown)) = self.show(dispatch) else {
             return Err(not_applied());
         };
-        let in_run = shown
-            .dispatch
-            .as_ref()
-            .and_then(|dispatch| dispatch.run_id.as_deref())
-            == Some(self.config.run.as_str());
+        let in_run = self.in_run(&shown);
         let person_owned = shown
             .terminal_resource
             .as_ref()
@@ -1316,12 +1312,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         let dispatch = self.dispatch_or_reject(resource)?;
         // Orca itself retains a person's terminal, so only the Run is checked.
         match self.show(dispatch) {
-            Ok(Some(shown))
-                if shown
-                    .dispatch
-                    .as_ref()
-                    .and_then(|dispatch| dispatch.run_id.as_deref())
-                    == Some(self.config.run.as_str()) => {}
+            Ok(Some(shown)) if self.in_run(&shown) => {}
             Ok(_) | Err(_) => return Err(not_applied()),
         }
         let args = wire::Args::command(&["orchestration", "worker-release"])
@@ -1336,6 +1327,15 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             Some("retained") => Err(not_applied()),
             _ => Err(response_lost()),
         }
+    }
+
+    /// Whether Orca records the Dispatch in this backend's Run.
+    fn in_run(&self, shown: &WorkerShow) -> bool {
+        shown
+            .dispatch
+            .as_ref()
+            .and_then(|dispatch| dispatch.run_id.as_deref())
+            == Some(self.config.run.as_str())
     }
 
     pub(crate) fn show(&self, dispatch: &str) -> Result<Option<WorkerShow>, OrcaError> {
@@ -1485,8 +1485,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// Look up a persisted request, operation by operation.
     ///
     /// Launches are found through their Task, stops and releases through the
-    /// Dispatch's recorded state. Messages and replies carry no key Orca
-    /// records, so they stay [`Lookup::Unknown`]. [`EffectExecutor::lookup`]
+    /// Dispatch's recorded state, for a Dispatch of this backend's Run only.
+    /// Messages and replies carry no key Orca records, so they stay
+    /// [`Lookup::Unknown`]. [`EffectExecutor::lookup`]
     /// delegates here for the kinds the backend declares lookup for.
     ///
     /// # Errors
@@ -1524,12 +1525,16 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                     return Ok(Lookup::Unknown);
                 };
                 let shown = self.show(dispatch).map_err(|error| read_failure(&error))?;
-                let applied = shown.is_some_and(|shown| match operation {
-                    Operation::CancelWorker { .. } => is_settled(&shown),
-                    _ => shown.terminal_resource.is_some_and(|terminal| {
-                        terminal.release_state.as_deref() == Some("released")
-                    }),
-                });
+                // A Dispatch of another Run was never this backend's to
+                // stop or release, whatever its state.
+                let applied = shown
+                    .filter(|shown| self.in_run(shown))
+                    .is_some_and(|shown| match operation {
+                        Operation::CancelWorker { .. } => is_settled(&shown),
+                        _ => shown.terminal_resource.is_some_and(|terminal| {
+                            terminal.release_state.as_deref() == Some("released")
+                        }),
+                    });
                 if applied {
                     self.dispatch_receipt(worker)
                         .map(Lookup::Applied)

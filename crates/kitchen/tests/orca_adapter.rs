@@ -22,9 +22,9 @@ use kitchen::{
         AttemptNumber, BackendUnavailable, BranchName, Capability, CapabilityRequirements, Effect,
         EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, Grant,
         HouseGrants, IdempotencyKey, Liveness, Lookup, NotAppliedReason, Operation, Permission,
-        Provenance, Repository, ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleEffect,
-        TaskAuthority, TaskSpec, Text, Timestamp, UncertainReason, WorkerBackend, WorkerOutcome,
-        WorkerState, Workspace,
+        Provenance, Receipt, Repository, ResourceKind, ResourceRef, RetryPolicy, Role,
+        ScheduleEffect, TaskAuthority, TaskSpec, Text, Timestamp, UncertainReason, WorkerBackend,
+        WorkerOutcome, WorkerState, Workspace,
         conformance::{self, Check, CheckResult, ConformanceFixture},
     },
     scheduling::{
@@ -590,6 +590,52 @@ fn workers_outside_this_run_are_never_changed() -> TestResult {
         WorkerState::Ready,
         "reading another Run's worker is harmless"
     );
+    Ok(())
+}
+
+#[test]
+fn lookups_of_stops_and_releases_need_this_run() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    // Stopped and released: what a lookup accepts as an applied cancel and
+    // release, but under another Run.
+    let mut elsewhere = SimWorker::new("stopped", "failed", "exited", false);
+    elsewhere.release_state = "released";
+    elsewhere.run = "run_someone_else";
+    sim.set_worker("ctx_elsewhere", elsewhere.clone());
+    let target = worker("ctx_elsewhere")?;
+    let cancel = request(
+        Operation::CancelWorker {
+            worker: target.clone(),
+        },
+        "cancel-elsewhere",
+    )?;
+    let release = request(
+        Operation::ReleaseResource {
+            resource: target.clone(),
+        },
+        "release-elsewhere",
+    )?;
+    assert_eq!(backend.resolve(&cancel)?, Lookup::Unknown);
+    assert_eq!(backend.resolve(&release)?, Lookup::Unknown);
+    assert_eq!(backend.lookup(&cancel)?, Lookup::Unknown);
+
+    // The same record in this Run is applied.
+    elsewhere.run = "run_sim";
+    sim.set_worker("ctx_elsewhere", elsewhere);
+    let applied = Receipt::new(target.handle.clone(), Vec::new(), vec![target.clone()])?;
+    assert_eq!(backend.resolve(&cancel)?, Lookup::Applied(applied.clone()));
+    assert_eq!(backend.resolve(&release)?, Lookup::Applied(applied));
+
+    // A Dispatch Orca no longer knows stays unknown, and a failed read is
+    // an error, not an answer.
+    sim.state().workers.clear();
+    assert_eq!(backend.resolve(&cancel)?, Lookup::Unknown);
+    sim.fault_on(
+        &["orchestration", "worker-show"],
+        Fault::TimeoutBeforeEffect,
+    );
+    assert_eq!(backend.resolve(&release), Err(BackendUnavailable::Timeout));
     Ok(())
 }
 
@@ -1176,13 +1222,18 @@ fn install_creates_paused_once_and_reuses_it() -> TestResult {
     assert_eq!(flag(create, "trigger"), Some("17,37,57 * * * *"));
     assert_eq!(flag(create, "timezone"), Some("America/Toronto"));
 
-    assert_eq!(
-        backend.execute(&request(install("pickup")?, "install-2")?)?,
-        receipt,
-        "reinstalling for the same consumer reuses it"
-    );
+    assert!(receipt.touched().is_empty());
+
+    // Reinstalling for the same consumer reuses it, and says so: the second
+    // task touched the schedule and did not create it.
+    let reused = backend.execute(&request(install("pickup")?, "install-2")?)?;
+    assert_eq!(reused.reference(), receipt.reference());
+    assert!(reused.created().is_empty(), "a reuse is not a creation");
+    assert_eq!(reused.touched(), std::slice::from_ref(&installed));
     assert_eq!(sim.calls_to(&["automations", "create"]).len(), 1);
-    assert_eq!(backend.resolve(&effect)?, Lookup::Applied(receipt));
+    // A lookup cannot tell which key created the schedule it finds, so it
+    // never claims the creation either.
+    assert_eq!(backend.resolve(&effect)?, Lookup::Applied(reused));
     let listed = backend.installed_schedules()?;
     assert_eq!(listed.len(), 1, "the live automation is not Kitchen's");
     assert_eq!(
@@ -1201,6 +1252,14 @@ fn lost_install_response_is_reconciled_never_recreated() -> TestResult {
     let installed = backend.install_schedule(&schedule_spec("pickup")?)?;
     assert_eq!(installed.handle.as_str(), "auto-1");
     assert_eq!(sim.calls_to(&["automations", "create"]).len(), 1);
+    // Through `execute`, that schedule is this install's creation: under the
+    // reservation the listing before the create showed none.
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    sim.fault_on(&["automations", "create"], Fault::TimeoutAfterEffect);
+    let receipt = backend.execute(&request(install("pickup")?, "install-late")?)?;
+    assert_eq!(receipt.created(), [schedule("auto-1")?]);
+    assert!(receipt.touched().is_empty());
 
     // The create timed out and no listing shows it: unknown, not retried.
     let sim = SimOrca::default();

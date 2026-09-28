@@ -14,8 +14,9 @@ use common::{TestResult, house, task_id};
 use kitchen::{
     BackendId, CredentialId,
     adapters::orca::{
-        AgentPrompt, DispatchActivity, OrcaBackend, OrcaConfig, OrcaError, ProviderErrorClass,
-        StartOutcome, StartWindow, TerminalOwner, TranscriptProgress, WorkerSignals,
+        AgentPrompt, DispatchActivity, MAX_ARCHIVE_PAGES, OrcaBackend, OrcaConfig, OrcaError,
+        ProviderErrorClass, SIGNAL_WINDOW_ROWS, StartOutcome, StartWindow, TerminalOwner,
+        TranscriptProgress, WorkerSignals,
     },
     contracts::{
         AttemptNumber, BranchName, Effect, EffectExecutor, EffectFailure, EffectRequest,
@@ -598,6 +599,107 @@ fn transcript_progress_is_a_lower_bound_when_the_window_clips() -> TestResult {
         })
     );
     assert_eq!(prompt_only.start, StartOutcome::NeverObserved);
+    Ok(())
+}
+
+/// A released worker whose archive holds `count` messages, one a second.
+fn released(count: u64) -> SimWorker {
+    SimWorker {
+        release_state: "released",
+        ownership: "released",
+        output: Some(SimOutput::Archived(
+            (1..=count)
+                .map(|n| message("assistant", "step", n * 1_000))
+                .collect(),
+        )),
+        ..SimWorker::new("succeeded", "succeeded", "exited", false)
+    }
+}
+
+/// The signals of `sim_worker` and the number of `worker-read` calls made.
+fn read_signals(sim_worker: SimWorker) -> TestResult<(WorkerSignals, usize)> {
+    let sim = SimOrca::default();
+    sim.set_worker(DISPATCH, sim_worker);
+    let backend = OrcaBackend::connect(config(&sim)?, &sim)?;
+    let signals = backend
+        .observe_signals(&worker(DISPATCH)?, &window(1_000))?
+        .ok_or("Orca has no record of the worker")?;
+    Ok((
+        signals,
+        sim.calls_to(&["orchestration", "worker-read"]).len(),
+    ))
+}
+
+#[test]
+fn a_released_worker_is_read_from_its_newest_archived_page() -> TestResult {
+    // 120 messages: the first page holds the oldest 50, so the cursor is
+    // followed to the empty page after the last.
+    let (signals, reads) = read_signals(released(120))?;
+    assert_eq!(
+        signals.transcript,
+        Some(TranscriptProgress {
+            messages: 50,
+            complete: false,
+            last_activity: Some(Timestamp::from_unix_millis(120_000)),
+            agent_spoke: true,
+        })
+    );
+    assert_eq!(reads, 4, "0-50, 50-100, 100-120, then an empty page");
+    // An archive of one page: its end is still confirmed.
+    let (signals, reads) = read_signals(released(30))?;
+    assert_eq!(
+        signals.transcript,
+        Some(TranscriptProgress {
+            messages: 30,
+            complete: true,
+            last_activity: Some(Timestamp::from_unix_millis(30_000)),
+            agent_spoke: true,
+        })
+    );
+    assert_eq!(reads, 2);
+    // A live worker's read is already its newest window: one call.
+    let (_, reads) = read_signals(SimWorker {
+        output: transcript(vec![message("assistant", "on it", 1_000)]),
+        ..live()
+    })?;
+    assert_eq!(reads, 1);
+    Ok(())
+}
+
+#[test]
+fn an_archive_that_does_not_end_in_bounds_has_no_transcript() -> TestResult {
+    // The last read of the bound confirms the end with an empty page, so
+    // the largest archive it reaches fills every page before it.
+    let fits = u64::try_from((MAX_ARCHIVE_PAGES - 1) * SIGNAL_WINDOW_ROWS)?;
+    let (signals, reads) = read_signals(released(fits))?;
+    assert_eq!(
+        signals
+            .transcript
+            .and_then(|progress| progress.last_activity),
+        Some(Timestamp::from_unix_millis(fits * 1_000))
+    );
+    assert_eq!(reads, MAX_ARCHIVE_PAGES);
+    // One message more and the newest page is never shown to be the last.
+    let (signals, reads) = read_signals(released(fits + 1))?;
+    assert_eq!(signals.transcript, None);
+    assert_eq!(reads, MAX_ARCHIVE_PAGES);
+    assert_eq!(signals.dispatch, DispatchActivity::Ended);
+    Ok(())
+}
+
+#[test]
+fn a_later_archive_page_that_fails_leaves_no_transcript() -> TestResult {
+    let sim = SimOrca::default();
+    sim.set_worker(DISPATCH, released(120));
+    let backend = OrcaBackend::connect(config(&sim)?, &sim)?;
+    // The oldest page is read; Orca refuses the next one.
+    sim.state().reads_left = Some(1);
+    let signals = backend
+        .observe_signals(&worker(DISPATCH)?, &window(1_000))?
+        .ok_or("Orca has no record of the worker")?;
+    assert_eq!(signals.transcript, None, "the oldest page is not progress");
+    assert_eq!(signals.terminal, TerminalOwner::Released);
+    assert_eq!(sim.calls_to(&["orchestration", "worker-read"]).len(), 2);
     Ok(())
 }
 

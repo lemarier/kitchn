@@ -465,6 +465,12 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// paused, [`OrcaError::ReservationBusy`] when another installer held the
     /// reservation for the whole wait, and call or parse failures.
     pub fn install_schedule(&self, spec: &ScheduleSpec) -> Result<ResourceRef, OrcaError> {
+        self.install(spec).map(|(schedule, _)| schedule)
+    }
+
+    /// [`OrcaBackend::install_schedule`], and whether this call created the
+    /// schedule or reused one already installed.
+    fn install(&self, spec: &ScheduleSpec) -> Result<(ResourceRef, Install), OrcaError> {
         let consumer = spec.consumer();
         let mut reservation = self.reserve(format!(
             "schedule-{:032x}",
@@ -476,7 +482,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }
         if let Some(existing) = self.existing_install(spec, &listed)? {
             reservation.settle();
-            return Ok(existing);
+            return Ok((existing, Install::Reused));
         }
         let args = self.create_args(spec)?;
         let created = match self.call(args, self.config().call_timeout) {
@@ -511,9 +517,11 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         let paused = installed.iter().any(|schedule| {
             schedule.resource == resource && schedule.state == ObservedScheduleState::Paused
         });
+        // Under the reservation the listing before the create showed none,
+        // so the one listed now is this call's.
         if paused {
             reservation.settle();
-            Ok(resource)
+            Ok((resource, Install::Created))
         } else {
             Err(OrcaError::StateMismatch)
         }
@@ -734,13 +742,23 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
     }
 }
 
-/// A receipt referenced by the automation id. An install created the
-/// schedule; every other change touches an existing one.
-fn schedule_receipt(schedule: &ResourceRef, created: bool) -> Result<Receipt, EffectFailure> {
-    let (created, touched) = if created {
-        (vec![schedule.clone()], Vec::new())
-    } else {
-        (Vec::new(), vec![schedule.clone()])
+/// Whether an install created its schedule or reused one already installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Install {
+    Created,
+    Reused,
+}
+
+/// A receipt referenced by the automation id. An install that created the
+/// schedule lists it as created; a reused schedule and every other change
+/// touch an existing one, which does not make the task its owner.
+fn schedule_receipt(
+    schedule: &ResourceRef,
+    install: Option<Install>,
+) -> Result<Receipt, EffectFailure> {
+    let (created, touched) = match install {
+        Some(Install::Created) => (vec![schedule.clone()], Vec::new()),
+        Some(Install::Reused) | None => (Vec::new(), vec![schedule.clone()]),
     };
     Receipt::new(schedule.handle.clone(), created, touched)
         .map_err(|_| EffectFailure::Uncertain(UncertainReason::ResponseLost))
@@ -755,25 +773,25 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     ) -> Result<Receipt, EffectFailure> {
         match effect {
             ScheduleEffect::InstallDisabled { schedule } => {
-                let installed = self
-                    .install_schedule(schedule)
+                let (installed, install) = self
+                    .install(schedule)
                     .map_err(|error| schedule_failure(&error))?;
-                schedule_receipt(&installed, true)
+                schedule_receipt(&installed, Some(install))
             }
             ScheduleEffect::SetState { schedule, state } => {
                 self.set_schedule_state(schedule, *state)
                     .map_err(|error| schedule_failure(&error))?;
-                schedule_receipt(schedule, false)
+                schedule_receipt(schedule, None)
             }
             ScheduleEffect::Remove { schedule } => {
                 self.remove_schedule(schedule)
                     .map_err(|error| schedule_failure(&error))?;
-                schedule_receipt(schedule, false)
+                schedule_receipt(schedule, None)
             }
             ScheduleEffect::Trial { schedule } => {
                 self.trial_schedule(schedule)
                     .map_err(|error| schedule_failure(&error))?;
-                schedule_receipt(schedule, false)
+                schedule_receipt(schedule, None)
             }
         }
     }
@@ -785,8 +803,8 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         effect: &ScheduleEffect,
     ) -> Result<Lookup, crate::contracts::BackendUnavailable> {
         let unavailable = |error: OrcaError| backend::read_failure(&error);
-        let applied = |schedule: &ResourceRef, created: bool| {
-            schedule_receipt(schedule, created)
+        let applied = |schedule: &ResourceRef, install: Option<Install>| {
+            schedule_receipt(schedule, install)
                 .map(Lookup::Applied)
                 .map_err(|_| crate::contracts::BackendUnavailable::Transport)
         };
@@ -794,9 +812,11 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             ScheduleEffect::InstallDisabled { schedule } => {
                 let listed = self.automations().map_err(unavailable)?;
                 // Applied only when an install would reuse the schedule: one
-                // that is active or different is not what was requested.
+                // that is active or different is not what was requested. The
+                // listing cannot show whether this key created it, so it is
+                // reported reused: creation is never claimed without proof.
                 match self.existing_install(schedule, &listed) {
-                    Ok(Some(existing)) => applied(&existing, true),
+                    Ok(Some(existing)) => applied(&existing, Some(Install::Reused)),
                     Ok(None)
                     | Err(
                         OrcaError::ScheduleActive
@@ -808,7 +828,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             }
             ScheduleEffect::SetState { schedule, state } => match self.owned(schedule) {
                 Ok(automation) if automation.enabled == matches!(state, ScheduleState::Active) => {
-                    applied(schedule, false)
+                    applied(schedule, None)
                 }
                 Ok(_) | Err(OrcaError::ScheduleNotFound | OrcaError::NotKitchenOwned) => {
                     Ok(Lookup::Unknown)
@@ -816,7 +836,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 Err(error) => Err(unavailable(error)),
             },
             ScheduleEffect::Remove { schedule } => match self.owned(schedule) {
-                Err(OrcaError::ScheduleNotFound) => applied(schedule, false),
+                Err(OrcaError::ScheduleNotFound) => applied(schedule, None),
                 Ok(_) | Err(OrcaError::NotKitchenOwned) => Ok(Lookup::Unknown),
                 Err(error) => Err(unavailable(error)),
             },

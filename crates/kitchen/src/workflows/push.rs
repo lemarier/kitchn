@@ -555,7 +555,8 @@ const GIT_POLL: Duration = Duration::from_millis(10);
 /// `insteadOf` and `pushInsteadOf` rewrites applied, must both be the
 /// granted repository under one of the accepted URL bases (GitHub's HTTPS
 /// and SSH forms by default). Every call disables hooks and pins the SSH
-/// command and the remote's pack programs. Credential helpers configured in
+/// command, the remote's pack programs, and a push's tags, submodules, and
+/// mirroring. Credential helpers configured in
 /// the checkout still run; a Kitchen-owned clone removes that limit.
 #[derive(Debug, Clone)]
 pub struct GitRemote {
@@ -643,20 +644,18 @@ impl GitRemote {
     }
 
     fn run(&self, args: &[&str]) -> Option<(Option<i32>, Vec<u8>)> {
-        let receive = format!("remote.{}.receivepack=git-receive-pack", self.remote);
-        let upload = format!("remote.{}.uploadpack=git-upload-pack", self.remote);
+        let pins = pinned_git_config(&self.remote);
         // The worker can edit the checkout's configuration: its hooks, SSH
-        // command, and pack programs must not run under Kitchen.
-        let mut full = vec![
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.sshCommand=ssh",
-            "-c",
-            &receive,
-            "-c",
-            &upload,
-        ];
+        // command, pack programs, and what a push carries along must not
+        // change under Kitchen.
+        let pairs: Vec<String> = pins
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        let mut full: Vec<&str> = Vec::with_capacity(pairs.len() * 2 + args.len());
+        for pair in &pairs {
+            full.extend(["-c", pair]);
+        }
         full.extend_from_slice(args);
         run_bounded(
             &self.git,
@@ -701,6 +700,44 @@ impl GitRemote {
             Observed::Known(self.names(&url, repository))
         })
     }
+}
+
+/// The Git configuration every Kitchen-run Git command pins over the
+/// checkout's own: no hooks, a plain `ssh`, the standard pack programs, and a
+/// push that carries only the ref it names (no tags, no submodules, no
+/// mirroring). Kitchen's direct Git calls pass these as `-c`; the stack tool's
+/// Git reads them from [`git_config_env`].
+pub(crate) fn pinned_git_config(remote: &str) -> Vec<(String, String)> {
+    [
+        ("core.hooksPath".to_owned(), "/dev/null".to_owned()),
+        ("core.sshCommand".to_owned(), "ssh".to_owned()),
+        (
+            format!("remote.{remote}.receivepack"),
+            "git-receive-pack".to_owned(),
+        ),
+        (
+            format!("remote.{remote}.uploadpack"),
+            "git-upload-pack".to_owned(),
+        ),
+        (format!("remote.{remote}.mirror"), "false".to_owned()),
+        ("push.recurseSubmodules".to_owned(), "no".to_owned()),
+        ("push.followTags".to_owned(), "false".to_owned()),
+        ("submodule.recurse".to_owned(), "false".to_owned()),
+    ]
+    .into()
+}
+
+/// [`pinned_git_config`] as `GIT_CONFIG_COUNT` environment entries, which
+/// Git ranks above every configuration file, for tools that run Git
+/// themselves.
+pub(crate) fn git_config_env(remote: &str) -> Vec<(String, String)> {
+    let pins = pinned_git_config(remote);
+    let mut env = vec![("GIT_CONFIG_COUNT".to_owned(), pins.len().to_string())];
+    for (index, (key, value)) in pins.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{index}"), key));
+        env.push((format!("GIT_CONFIG_VALUE_{index}"), value));
+    }
+    env
 }
 
 /// Run `program` in `dir` with `args` and `env`, stdin closed and stdout
@@ -803,7 +840,15 @@ impl RefUpdater for GitRemote {
             permit.replaces().map_or("", CommitId::as_str)
         );
         let refspec = format!("{commit}:{reference}");
-        match self.run(&["push", "--porcelain", &lease, &self.remote, &refspec]) {
+        match self.run(&[
+            "push",
+            "--porcelain",
+            "--no-follow-tags",
+            "--no-recurse-submodules",
+            &lease,
+            &self.remote,
+            &refspec,
+        ]) {
             Some((Some(0), _)) => Ok(()),
             // Git reports a refused ref, such as a failed lease, as a line
             // starting with `!` under `--porcelain`: nothing changed.

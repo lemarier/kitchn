@@ -1181,6 +1181,37 @@ mod git_remote {
     }
 
     #[test]
+    fn git_pushes_the_named_branch_and_nothing_the_checkouts_config_adds() -> TestResult {
+        let repos = fresh_repos()?;
+        let setup = pushing()?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        // The worker's Git configuration follows tags, recurses into
+        // submodules, and mirrors every ref, and an annotated tag points at
+        // the commit being pushed.
+        git(&repos.worker, &["tag", "-a", "-m", "release", "v1"])?;
+        for (key, value) in [
+            ("push.followTags", "true"),
+            ("push.recurseSubmodules", "on-demand"),
+            ("remote.origin.mirror", "true"),
+        ] {
+            git(&repos.worker, &["config", key, value])?;
+        }
+        let remote = remote_for(&repos)?;
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert_eq!(outcome, PushOutcome::Pushed { replaced: None });
+        let refs = git(&repos.remote, &["for-each-ref", "--format=%(refname)"])?;
+        assert_eq!(refs, format!("refs/heads/{BRANCH}"), "only the branch");
+        Ok(())
+    }
+
+    #[test]
     fn git_first_push_never_overwrites_a_branch_that_appears_meanwhile() -> TestResult {
         // The branch exists before the check.
         let repos = fresh_repos()?;

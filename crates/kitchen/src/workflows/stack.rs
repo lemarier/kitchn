@@ -32,8 +32,8 @@ use crate::{
         coordination::{CoordinationError, held_branches, task_branch},
         pickup::is_shell_safe,
         push::{
-            Decision, PullRequests, PushIntent, PushRefusal, RemoteBranches, bind, decide, observe,
-            record_landed, run_bounded,
+            Decision, GitRemote, PullRequests, PushIntent, PushRefusal, RefUpdater, RemoteBranches,
+            bind, decide, git_config_env, observe, record_landed, run_bounded,
         },
         repair::Observed,
     },
@@ -329,6 +329,21 @@ impl GhStack {
         args
     }
 
+    /// A [`GitRemote`] for the same checkout and remote name this tool
+    /// pushes with, so the boundary's URL checks read the remote the tool
+    /// uses.
+    ///
+    /// # Errors
+    /// Returns [`CoordinationError::InvalidGitRemote`] for a relative `git`
+    /// path or a zero deadline.
+    pub fn git_remote(
+        &self,
+        git: PathBuf,
+        deadline: Duration,
+    ) -> std::result::Result<GitRemote, CoordinationError> {
+        GitRemote::new(git, self.checkout.clone(), &self.remote, deadline)
+    }
+
     /// Probe whether `gh stack` is installed, for doctor. `None` means the
     /// probe did not finish, which is not evidence either way.
     #[must_use]
@@ -366,8 +381,20 @@ impl StackRunner for GhStack {
     fn run(&self, command: &StackCommand) -> StackResult {
         let args = self.args(command);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        // `gh stack` runs Git in the worker's checkout: pin what its
+        // configuration may change about a push or rebase.
+        let mut env: Vec<(String, String)> = NO_PROMPTS
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        env.push(("GIT_SSH_COMMAND".to_owned(), "ssh".to_owned()));
+        env.extend(git_config_env(&self.remote));
+        let env: Vec<(&str, &str)> = env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
         let Some((code, stdout)) =
-            run_bounded(&self.gh, &self.checkout, &args, &NO_PROMPTS, self.deadline)
+            run_bounded(&self.gh, &self.checkout, &args, &env, self.deadline)
         else {
             return StackResult::Uncertain;
         };
@@ -467,6 +494,9 @@ pub struct StackBoundary<'a> {
     pub pull_requests: &'a dyn PullRequests,
     /// Remote head reads, through the remote the tool pushes to.
     pub remote: &'a dyn RemoteBranches,
+    /// The push side of that same remote: only its
+    /// [`RefUpdater::pushes_to`] is used, to check the effective push URL.
+    pub updater: &'a dyn RefUpdater,
 }
 
 /// What a stack-tool command through the boundary did.
@@ -523,12 +553,19 @@ impl StackBoundary<'_> {
         if !command.touches_upstack() {
             return Ok(StackOutcome::Ran(self.runner.run(command)));
         }
-        match self.remote.reads_from(&binding.repository) {
-            Observed::Known(true) => {}
-            Observed::Known(false) => {
+        // The tool fetches from and pushes to the remote's own URLs, and a
+        // worker can set the push URL apart from the fetch URL.
+        match (
+            self.remote.reads_from(&binding.repository),
+            self.updater.pushes_to(&binding.repository),
+        ) {
+            (Observed::Known(true), Observed::Known(true)) => {}
+            (Observed::Known(false), _) | (_, Observed::Known(false)) => {
                 return Ok(refused(PushRefusal::RemoteMismatch));
             }
-            Observed::Unknown => return Ok(refused(PushRefusal::Unknown)),
+            (Observed::Unknown, _) | (_, Observed::Unknown) => {
+                return Ok(refused(PushRefusal::Unknown));
+            }
         }
         let observed = match observe(&binding, intent, self.pull_requests, self.remote, false) {
             Ok((observed, _)) => observed,

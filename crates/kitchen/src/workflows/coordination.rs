@@ -26,7 +26,9 @@
 //! ([`WorkerState::UserTakeover`]) is never dispatched into, and its branch
 //! stays theirs: once supervision sees a person holding a worker's terminal,
 //! no launch and no push through [`crate::workflows::push`] may use that
-//! branch again ([`held_branches`]).
+//! branch again ([`held_branches`]). Only a person present under an
+//! interactive claim ends the hold, by recording a release
+//! ([`release_held_branch`]); nothing releases it automatically.
 //!
 //! An adopting or taking-over coordinator continues the attempt its
 //! predecessor left interrupted ([`HouseStore::continue_attempt`]): the
@@ -43,7 +45,7 @@ use crate::{
         DecisionOwner, Disposition, Effect, EffectExecutor, Evidence, EvidenceKind,
         EvidenceRevision, EvidenceVerdict, ExternalRef, FailureClass, Fence, HouseGrants, LeaseTtl,
         NotAppliedReason, Operation, Permission, PostingBudget, ResourceKind, ResourceRef,
-        RogerAsk, RogerEffect, Settlement, Text, Timestamp, WorkerBackend, WorkerOutcome,
+        RogerAsk, RogerEffect, Settlement, Text, Timestamp, Trigger, WorkerBackend, WorkerOutcome,
         WorkerState, Workspace,
     },
     state::{
@@ -86,6 +88,10 @@ pub enum CoordinationError {
     /// The Git executable, checkout, remote name, or deadline is invalid.
     #[error("git remote is not configured with absolute paths, a plain name, and a deadline")]
     InvalidGitRemote,
+    /// Only a person present under an interactive claim releases a branch a
+    /// person holds.
+    #[error("releasing a held branch needs an interactive claim")]
+    ReleaseNeedsPerson,
 }
 
 impl CoordinationError {
@@ -99,6 +105,7 @@ impl CoordinationError {
             | Self::InvalidBriefArgument
             | Self::InvalidGitRemote => ErrorClass::InvalidInput,
             Self::BranchMismatch => ErrorClass::Conflict,
+            Self::ReleaseNeedsPerson => ErrorClass::Refused,
         }
     }
 }
@@ -239,6 +246,15 @@ fn held_key(worker: &ResourceRef) -> Result<ExternalRef> {
     ))?)
 }
 
+/// The durable key recording that a person or the owner released the hold on
+/// `worker`'s branch.
+fn released_key(worker: &ResourceRef) -> Result<ExternalRef> {
+    Ok(ExternalRef::new(&format!(
+        "person-released-{:016x}",
+        stable_hash(format!("{}\n{}", worker.backend, worker.handle).as_bytes())
+    ))?)
+}
+
 /// A durable fact Kitchen records about one of a task's branches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BranchFact {
@@ -289,6 +305,69 @@ impl BranchFact {
 /// Whether supervision recorded that a person holds `worker`'s terminal.
 fn person_held(record: &TaskRecord, worker: &ResourceRef) -> bool {
     held_key(worker).is_ok_and(|key| record.has_consumed(&key))
+        && !released_key(worker).is_ok_and(|key| record.has_consumed(&key))
+}
+
+/// What [`release_held_branch`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Release {
+    /// The hold was released: the task may launch and push on the branch.
+    Released,
+    /// No person holds the branch, or its hold was already released.
+    NotHeld,
+}
+
+/// Record that the person who took a worker's terminal over, or the house
+/// owner, hands `branch` back to the task. This is the only way a hold ends:
+/// nothing calls it on its own, and a person's terminal ending, a retry, or
+/// an adopting coordinator never releases it. The release is durable and
+/// covers the workers that held the branch when it was recorded; a worker
+/// taken over again afterwards keeps the terminal a person's, and the
+/// branch stays with the task until a new hold is recorded for another
+/// worker.
+///
+/// # Errors
+/// Returns [`CoordinationError::ReleaseNeedsPerson`] unless the task's live
+/// claim at `fence` belongs to an interactive claimant (a person present, not
+/// a schedule), the state errors of a claim that is not live at `fence`, and
+/// store failures.
+pub fn release_held_branch(
+    store: &HouseStore,
+    clock: &dyn Clock,
+    task: &TaskId,
+    fence: Fence,
+    branch: &BranchName,
+) -> Result<Release> {
+    let now = clock.now();
+    let record = store.task(task)?;
+    match record.state() {
+        TaskState::Claimed { lease } if lease.fence() == fence => {
+            if !lease.is_live(now) {
+                return Err(StateError::LeaseExpired {
+                    expired_at: lease.expires_at(),
+                }
+                .into());
+            }
+            if lease.trigger() != Trigger::Interactive {
+                return Err(CoordinationError::ReleaseNeedsPerson.into());
+            }
+        }
+        TaskState::Open | TaskState::Claimed { .. } | TaskState::Settled { .. } => {
+            return Err(StateError::StaleFence { presented: fence }.into());
+        }
+    }
+    let mut released = false;
+    for view in launched_workers(&record) {
+        if view.branch.as_ref() == Some(branch) && person_held(&record, &view.worker) {
+            store.consume_message(task, fence, &released_key(&view.worker)?, now)?;
+            released = true;
+        }
+    }
+    Ok(if released {
+        Release::Released
+    } else {
+        Release::NotHeld
+    })
 }
 
 /// The branches of the task's workers whose terminals a person took over.

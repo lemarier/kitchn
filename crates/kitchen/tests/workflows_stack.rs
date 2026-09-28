@@ -25,7 +25,10 @@ use kitchen::{
     workflows::{
         coordination::{LaunchOutcome, launch_worker},
         pickup::{ClaimOutcome, TaskTemplate, claim_issue, issue_task_id},
-        push::{PullRequests, PushIntent, PushRefusal, RemoteBranches},
+        push::{
+            PullRequests, PushIntent, PushPermit, PushRefusal, RefUpdater, RemoteBranches,
+            UpdateFailure,
+        },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
         stack::{
             BranchLayer, BranchOperation, Dependent, GhStack, MAX_STACK_LAYERS, MergedBase,
@@ -131,6 +134,7 @@ struct Remote {
     pull_request: Observed<Option<PullRequestView>>,
     head: Observed<Option<CommitId>>,
     bound: Observed<bool>,
+    pushes: Observed<bool>,
     reads: Cell<u32>,
 }
 
@@ -140,6 +144,7 @@ impl Remote {
             pull_request: Observed::Known(Some(pr_view(PullRequestState::Open)?)),
             head: Observed::Known(Some(commit('d')?)),
             bound: Observed::Known(true),
+            pushes: Observed::Known(true),
             reads: Cell::new(0),
         })
     }
@@ -164,6 +169,17 @@ impl RemoteBranches for Remote {
     fn head(&self, _: &BranchName) -> Observed<Option<CommitId>> {
         self.reads.set(self.reads.get() + 1);
         self.head.clone()
+    }
+}
+
+impl RefUpdater for Remote {
+    fn pushes_to(&self, _: &Repository) -> Observed<bool> {
+        self.pushes
+    }
+
+    /// The stack path never updates a ref itself; the tool does.
+    fn update(&self, _: &PushPermit, _: &BranchName, _: &CommitId) -> Result<(), UpdateFailure> {
+        Err(UpdateFailure::Rejected)
     }
 }
 
@@ -298,6 +314,7 @@ fn boundary<'a>(
         runner,
         pull_requests: remote,
         remote,
+        updater: remote,
     }
 }
 
@@ -548,6 +565,50 @@ fn the_stack_path_runs_the_push_boundarys_checks_first() -> TestResult {
             assert!(runner.ran().is_empty(), "{name} ran the tool");
         }
     }
+    Ok(())
+}
+
+#[test]
+fn the_stack_path_refuses_a_push_url_that_is_not_the_granted_repository() -> TestResult {
+    let setup = stacking()?;
+    for (pushes, refusal) in [
+        (Observed::Known(false), PushRefusal::RemoteMismatch),
+        (Observed::Unknown, PushRefusal::Unknown),
+    ] {
+        // Fetches read the granted repository; only the push URL differs.
+        let mut remote = Remote::open()?;
+        remote.pushes = pushes;
+        for command in [
+            StackCommand::Push,
+            StackCommand::Submit { ready: false },
+            StackCommand::RebaseUpstack,
+        ] {
+            let runner = Recording::answering(StackResult::Done)?;
+            let outcome = boundary(&setup, &runner, &remote).run(
+                &setup.task,
+                setup.fence,
+                &command,
+                &intent()?,
+            )?;
+            assert_eq!(
+                outcome,
+                StackOutcome::Refused(StackRefusal::Push(refusal.clone())),
+                "{pushes:?} {command:?}"
+            );
+            assert!(runner.ran().is_empty(), "{pushes:?} ran the tool");
+        }
+    }
+    // With both URLs on the granted repository the same command runs.
+    let runner = Recording::answering(StackResult::Done)?;
+    assert_eq!(
+        boundary(&setup, &runner, &Remote::open()?).run(
+            &setup.task,
+            setup.fence,
+            &StackCommand::Push,
+            &intent()?
+        )?,
+        StackOutcome::Ran(StackResult::Done)
+    );
     Ok(())
 }
 
@@ -890,6 +951,164 @@ mod gh_process {
         assert_eq!(
             GhStack::detect(&slow, &dir, Duration::from_millis(200)),
             None
+        );
+        Ok(())
+    }
+
+    const GIT: &str = "/usr/bin/git";
+
+    fn git(dir: &Path, args: &[&str]) -> TestResult<String> {
+        let output = std::process::Command::new(GIT)
+            .args([
+                "-c",
+                "user.name=Kitchen Test",
+                "-c",
+                "user.email=kitchen@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
+
+    fn text(path: &Path) -> TestResult<&str> {
+        Ok(path.to_str().ok_or("non-UTF-8 path")?)
+    }
+
+    /// The granted repository `origin89hq/firmware` as a bare repository
+    /// under the temporary directory (the URL base) and the worker's clone.
+    fn granted_clone(root: &Path) -> TestResult<(std::path::PathBuf, std::path::PathBuf)> {
+        let bare = root.join("origin89hq").join("firmware.git");
+        fs::create_dir_all(&bare)?;
+        git(&bare, &["init", "--bare"])?;
+        let worker = root.join("worker");
+        git(root, &["clone", text(&bare)?, text(&worker)?])?;
+        Ok((bare, worker))
+    }
+
+    #[test]
+    fn a_divergent_push_url_is_refused_before_gh_stack_runs() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (bare, worker) = granted_clone(&root)?;
+        let elsewhere = root.join("elsewhere").join("firmware.git");
+        fs::create_dir_all(&elsewhere)?;
+        git(&elsewhere, &["init", "--bare"])?;
+        let setup = stacking()?;
+        let gh = adapter(fake_gh(&root, "", 0)?, &worker)?;
+        let remote = gh
+            .git_remote(GIT.into(), Duration::from_secs(30))?
+            .with_url_bases(&[&format!("{}/", text(&root)?)])?;
+        // The fetch URL is the granted repository, so a fetch-only check
+        // passes; only the push URL, or its rewrite, leaves.
+        let other = text(&elsewhere)?.to_owned();
+        let granted = text(&bare)?.to_owned();
+        let redirects: [(&str, Vec<String>); 2] = [
+            (
+                "pushurl",
+                vec![
+                    "config".into(),
+                    "remote.origin.pushurl".into(),
+                    other.clone(),
+                ],
+            ),
+            (
+                "pushInsteadOf",
+                vec![
+                    "config".into(),
+                    format!("url.{other}.pushInsteadOf"),
+                    granted.clone(),
+                ],
+            ),
+        ];
+        for (name, args) in &redirects {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            git(&worker, &args)?;
+            assert_eq!(
+                remote.reads_from(&workflows_support::repo()?),
+                Observed::Known(true),
+                "{name}: the fetch URL is unchanged"
+            );
+            for command in [
+                StackCommand::Push,
+                StackCommand::Submit { ready: true },
+                StackCommand::RebaseUpstack,
+            ] {
+                let outcome = StackBoundary {
+                    store: &setup.world.fixture.store,
+                    grants: &setup.world.grants,
+                    destination: &setup.github,
+                    clock: &setup.world.clock,
+                    runner: &gh,
+                    pull_requests: &Remote::open()?,
+                    remote: &remote,
+                    updater: &remote,
+                }
+                .run(&setup.task, setup.fence, &command, &intent()?)?;
+                assert_eq!(
+                    outcome,
+                    StackOutcome::Refused(StackRefusal::Push(PushRefusal::RemoteMismatch)),
+                    "{name} {command:?}"
+                );
+            }
+            assert!(!root.join("log").exists(), "{name}: gh stack ran");
+            git(&worker, &["config", "--unset-all", "remote.origin.pushurl"]).ok();
+            git(
+                &worker,
+                &["config", "--remove-section", &format!("url.{other}")],
+            )
+            .ok();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh_stack_runs_git_with_the_pinned_configuration() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (_, worker) = granted_clone(&root)?;
+        // The worker's checkout asks for hooks, tags, and submodules.
+        for (key, value) in [
+            ("core.hooksPath", "/tmp/worker-hooks"),
+            ("core.sshCommand", "worker-ssh"),
+            ("push.followTags", "true"),
+            ("push.recurseSubmodules", "on-demand"),
+            ("remote.origin.mirror", "true"),
+        ] {
+            git(&worker, &["config", key, value])?;
+        }
+        // A stand-in `gh` whose own Git reads the configuration it would push
+        // with.
+        let gh_path = root.join("gh");
+        fs::write(
+            &gh_path,
+            format!(
+                "#!/bin/sh\nfor key in core.hooksPath core.sshCommand push.followTags \
+                 push.recurseSubmodules remote.origin.mirror; do\n  \
+                 echo \"$key=$({GIT} config --get $key)\" >> '{log}'\ndone\n",
+                log = root.join("config-log").display()
+            ),
+        )?;
+        fs::set_permissions(&gh_path, fs::Permissions::from_mode(0o755))?;
+        let gh = adapter(gh_path, &worker)?;
+        assert_eq!(gh.run(&StackCommand::Push), StackResult::Done);
+        assert_eq!(
+            fs::read_to_string(root.join("config-log"))?,
+            "core.hooksPath=/dev/null\ncore.sshCommand=ssh\npush.followTags=false\n\
+             push.recurseSubmodules=no\nremote.origin.mirror=false\n"
         );
         Ok(())
     }

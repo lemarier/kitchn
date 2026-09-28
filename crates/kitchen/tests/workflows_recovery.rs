@@ -18,9 +18,10 @@ use kitchen::{
     state::AttemptState,
     workflows::{
         coordination::{
-            Completion, EnvironmentNext, Escalation, FollowUpRoute, LaunchOutcome, Revalidation,
-            Supervision, SupervisionInput, held_branches, launch_worker, outstanding_follow_ups,
-            retry_validation, send_follow_up, supervise,
+            Completion, EnvironmentNext, Escalation, FollowUpRoute, LaunchOutcome, Release,
+            Revalidation, Supervision, SupervisionInput, held_branches, launch_worker,
+            outstanding_follow_ups, release_held_branch, retry_validation, send_follow_up,
+            supervise,
         },
         pickup::{ClaimOutcome, WorkerBrief, claim_issue, issue_task_id},
         recovery::{
@@ -810,6 +811,130 @@ fn a_persons_branch_stays_reserved_after_they_end_their_terminal() -> TestResult
         launch_worker(&world.ctx(), &task, fence, Workspace::Isolated, &brief(1)?)?,
         LaunchOutcome::BranchHeld { .. }
     ));
+    Ok(())
+}
+
+/// A task the scheduled coordinator claimed, whose worker a person took over,
+/// with the takeover recorded by supervision. Returns the coordinator's
+/// claimant so it can claim the task again.
+fn person_took_over(
+    world: &World,
+) -> TestResult<(TaskId, Fence, kitchen::contracts::Claimant, ResourceRef)> {
+    let (claimant, _) = under_consumer(world, "coordinator")?;
+    let ClaimOutcome::Claimed(lease) = claim_issue(
+        &world.fixture.store,
+        &template_with(3, workflows_support::provenance('a')?)?,
+        &issue(1)?,
+        &claimant,
+        ttl(300)?,
+        world.now(),
+    )?
+    else {
+        return Err("claim failed".into());
+    };
+    let task = issue_task_id(&issue(1)?)?;
+    let fence = lease.fence();
+    let worker = launched(world, &task, fence)?;
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::UserTakeover);
+    assert_eq!(
+        step(world, &task, fence, &SupervisionInput::default())?,
+        Supervision::PersonOwnsTerminal
+    );
+    Ok((task, fence, claimant, worker))
+}
+
+#[test]
+fn a_held_branch_is_released_only_by_a_person_who_records_it() -> TestResult {
+    let world = World::new()?;
+    let store = &world.fixture.store;
+    let (task, fence, coordinator, worker) = person_took_over(&world)?;
+    let held = branch("lemarier/issue-1")?;
+    let clock = &world.clock;
+
+    // A schedule is not a person: it cannot release, and nothing changes.
+    let refused = release_held_branch(store, clock, &task, fence, &held)
+        .err()
+        .ok_or("a scheduled claim released a person's branch")?;
+    assert!(matches!(
+        refused,
+        kitchen::Error::Coordination(
+            kitchen::workflows::coordination::CoordinationError::ReleaseNeedsPerson
+        )
+    ));
+    assert_eq!(held_branches(&store.task(&task)?), vec![held.clone()]);
+
+    // Nothing releases it on its own: the person ends their terminal, the
+    // attempt is retried, and the branch is still held.
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Cancelled));
+    assert_eq!(
+        step(&world, &task, fence, &SupervisionInput::default())?,
+        Supervision::Retry { remaining: 2 }
+    );
+    assert!(matches!(
+        launch_worker(&world.ctx(), &task, fence, Workspace::Isolated, &brief(1)?)?,
+        LaunchOutcome::BranchHeld { .. }
+    ));
+
+    // The person claims the task and records the release. A stale fence,
+    // the old coordinator's, is refused.
+    store.relinquish(&task, fence, world.now())?;
+    let person = common::interactive("david")?;
+    let lease = store.claim(&task, &person, ttl(300)?, world.now())?;
+    assert!(release_held_branch(store, clock, &task, fence, &held).is_err());
+    assert_eq!(
+        release_held_branch(store, clock, &task, lease.fence(), &held)?,
+        Release::Released
+    );
+    assert!(held_branches(&store.task(&task)?).is_empty());
+    // Repeating it, or naming a branch nobody held, changes nothing.
+    assert_eq!(
+        release_held_branch(store, clock, &task, lease.fence(), &held)?,
+        Release::NotHeld
+    );
+    assert_eq!(
+        release_held_branch(
+            store,
+            clock,
+            &task,
+            lease.fence(),
+            &branch("lemarier/other")?
+        )?,
+        Release::NotHeld
+    );
+
+    // Back with the coordinator, the task may use the branch again.
+    store.relinquish(&task, lease.fence(), world.now())?;
+    let again = store.claim(&task, &coordinator, ttl(300)?, world.now())?;
+    assert!(matches!(
+        launch_worker(
+            &world.ctx(),
+            &task,
+            again.fence(),
+            Workspace::Isolated,
+            &brief(1)?
+        )?,
+        LaunchOutcome::Accepted { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn releasing_a_branch_needs_a_live_claim() -> TestResult {
+    let world = World::new()?;
+    let store = &world.fixture.store;
+    let (task, fence, _, _) = person_took_over(&world)?;
+    let held = branch("lemarier/issue-1")?;
+    // A person's claim that expired records nothing.
+    store.relinquish(&task, fence, world.now())?;
+    let person = common::interactive("david")?;
+    let lease = store.claim(&task, &person, ttl(30)?, world.now())?;
+    world.clock.advance(31);
+    assert!(release_held_branch(store, &world.clock, &task, lease.fence(), &held).is_err());
+    assert_eq!(held_branches(&store.task(&task)?), vec![held]);
     Ok(())
 }
 

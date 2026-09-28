@@ -5,14 +5,15 @@ use kitchen::workflows::gate::{self, *};
 use kitchen::{
     BackendId, CredentialId, HouseId, TaskId, WorkflowId,
     contracts::{
-        BackendDescriptor, BranchName, Capability, CapabilitySet, Effect, Evidence, EvidenceKind,
-        EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, GitHubAction, GitHubEffect, Grant,
-        HouseGrants, IdempotencyKey, IssueNumber, NotAppliedReason, Permission, PostingBudget,
-        Receipt, Repository, TaskAuthority, Text, Timestamp,
+        BackendDescriptor, BranchName, Capability, CapabilitySet, Effect, EffectExecutor, Evidence,
+        EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, GitHubAction,
+        GitHubEffect, Grant, HouseGrants, IdempotencyKey, IssueNumber, NotAppliedReason, Operation,
+        Permission, PostingBudget, Receipt, Repository, ResourceKind, ResourceRef, Role,
+        TaskAuthority, Text, Timestamp, WorkerOutcome, WorkerState, Workspace, fake::FakeBackend,
     },
     state::{
-        EffectOutcome, EffectRecord, EffectState, HouseStore, MarkerFact, MarkerKey, MarkerSubject,
-        StateError, WorkItem,
+        EffectOutcome, EffectRecord, EffectStart, EffectState, HouseStore, MarkerFact, MarkerKey,
+        MarkerSubject, StateError, WorkItem,
     },
 };
 use std::{num::NonZeroU64, time::Duration};
@@ -1124,73 +1125,32 @@ fn invalid_forge_branch_cannot_target_fix_worker() -> TestResult {
     );
     Ok(())
 }
-struct WorkerFake {
-    supported: bool,
-    delivered: Vec<FixRequest>,
-    fail: bool,
-}
-impl GateWorkerBackend for WorkerFake {
-    type Error = std::io::Error;
-    fn supports(&self, _: &FixRequest) -> bool {
-        self.supported
-    }
-    fn deliver(&mut self, request: FixRequest) -> Result<ExternalRef, Self::Error> {
-        if self.fail {
-            return Err(std::io::Error::other("uncertain delivery"));
-        }
-        self.delivered.push(request);
-        ExternalRef::new("worker-receipt").map_err(|_| std::io::Error::other("invalid receipt"))
-    }
-}
 #[test]
-fn fake_worker_receives_one_narrow_fix_request() -> TestResult {
+fn fix_request_is_narrow_and_needs_an_active_submission() -> TestResult {
     let mut e = ready()?;
     e.contains_base = Some(false);
     let active = admitted(gate::evaluate(&e, grants(), GateHistory::default()))?;
-    let mut worker = WorkerFake {
-        supported: true,
-        delivered: Vec::new(),
-        fail: false,
-    };
-    assert_eq!(
-        gate::dispatch_fix(&active, &grants(), &mut worker)
-            .map_err(|_| "dispatch failed")?
-            .as_str(),
-        "worker-receipt"
-    );
-    assert_eq!(worker.delivered.len(), 1);
-    assert_eq!(worker.delivered[0].head_branch, "feature/gate");
-    assert_eq!(worker.delivered[0].gaps, vec![Gap::BaseBehind]);
-    assert!(worker.delivered[0].review_triggers.is_empty());
+    let request = gate::fix_request(&active, &grants())?;
+    assert_eq!(request.head_branch, "feature/gate");
+    assert_eq!(request.gaps, vec![Gap::BaseBehind]);
+    assert_eq!(request.key, key(0)?);
+    assert!(request.review_triggers.is_empty());
     let trial = RecordedDecision {
         mode: GateMode::ReportOnly,
         ..active.clone()
     };
-    assert!(matches!(
-        gate::dispatch_fix(&trial, &grants(), &mut worker),
-        Err(FixDispatchError::Refused(RequestRefusal::EffectsDisabled))
-    ));
-    assert_eq!(worker.delivered.len(), 1);
-    let mut unsupported = WorkerFake {
-        supported: false,
-        delivered: Vec::new(),
-        fail: false,
+    assert_eq!(
+        gate::fix_request(&trial, &grants()),
+        Err(RequestRefusal::EffectsDisabled)
+    );
+    let reconcile = RecordedDecision {
+        admission: Admission::Reconcile(key(0)?),
+        ..active
     };
-    assert!(matches!(
-        gate::dispatch_fix(&active, &grants(), &mut unsupported),
-        Err(FixDispatchError::Unsupported)
-    ));
-    assert!(unsupported.delivered.is_empty());
-    let mut uncertain = WorkerFake {
-        supported: true,
-        delivered: Vec::new(),
-        fail: true,
-    };
-    assert!(matches!(
-        gate::dispatch_fix(&active, &grants(), &mut uncertain),
-        Err(FixDispatchError::Backend(_))
-    ));
-    assert!(uncertain.delivered.is_empty());
+    assert_eq!(
+        gate::fix_request(&reconcile, &grants()),
+        Err(RequestRefusal::EffectsDisabled)
+    );
     Ok(())
 }
 #[test]
@@ -1571,6 +1531,7 @@ struct Durable {
     grants: HouseGrants,
     delegated: Vec<Grant>,
     backend: BackendDescriptor,
+    workers: FakeBackend,
     task: TaskId,
     fence: Fence,
 }
@@ -1578,7 +1539,7 @@ fn durable() -> TestResult<Durable> {
     let repository = Repository::new("lemarier/kitchen")?;
     let backend = BackendId::new("github")?;
     let credential = CredentialId::new("gate-credential")?;
-    let delegated: Vec<Grant> = [Permission::Merge, Permission::PostComment]
+    let mut delegated: Vec<Grant> = [Permission::Merge, Permission::PostComment]
         .into_iter()
         .map(|permission| {
             Grant::repository(
@@ -1589,9 +1550,13 @@ fn durable() -> TestResult<Durable> {
             )
         })
         .collect();
+    // Worker effects go to the fake worker backend under house-wide grants.
+    for permission in common::WORKER_PERMISSIONS {
+        delegated.push(common::grant(permission)?);
+    }
     let grants = HouseGrants::new(common::house()?, delegated.clone());
     let fixture = common::Fixture::new()?;
-    let (task, fence) = start_task(&fixture, &grants, &delegated, "gate-9")?;
+    let (task, fence) = start_task(&fixture, &grants, &delegated, "gate-9", [])?;
     Ok(Durable {
         fixture,
         grants,
@@ -1601,6 +1566,7 @@ fn durable() -> TestResult<Durable> {
             house: common::house()?,
             capabilities: CapabilitySet::supporting(Capability::ALL),
         },
+        workers: FakeBackend::fully_capable(common::backend_id()?, common::house()?),
         task,
         fence,
     })
@@ -1611,10 +1577,12 @@ fn start_task(
     grants: &HouseGrants,
     delegated: &[Grant],
     id: &str,
+    given: impl IntoIterator<Item = ResourceRef>,
 ) -> TestResult<(TaskId, Fence)> {
     let mut work = common::spec(id)?;
     work.repository = Some(Repository::new("lemarier/kitchen")?);
     work.authority = TaskAuthority::delegate(grants, delegated.to_vec())?;
+    work.resources = given.into_iter().collect();
     let store = &fixture.store;
     store.create_task(work, &common::creator()?, common::at(0))?;
     let task = TaskId::new(id)?;
@@ -1656,7 +1624,93 @@ fn record_subject(
 }
 impl Durable {
     fn add_task(&self, id: &str) -> TestResult<(TaskId, Fence)> {
-        start_task(&self.fixture, &self.grants, &self.delegated, id)
+        start_task(&self.fixture, &self.grants, &self.delegated, id, [])
+    }
+    /// A gate task given `worker`, as a coordinator hands a branch's writer
+    /// to the gate.
+    fn add_task_given(&self, id: &str, worker: &ResourceRef) -> TestResult<(TaskId, Fence)> {
+        start_task(
+            &self.fixture,
+            &self.grants,
+            &self.delegated,
+            id,
+            [worker.clone()],
+        )
+    }
+    /// Another task launches a worker on `branch` through the fake backend
+    /// and records the applied receipt; returns the worker.
+    fn launch_elsewhere(&self, id: &str, branch: &str) -> TestResult<ResourceRef> {
+        let store = &self.fixture.store;
+        store.create_task(common::spec(id)?, &common::creator()?, common::at(0))?;
+        let task = TaskId::new(id)?;
+        let fence = store
+            .claim(
+                &task,
+                &common::scheduled(id)?,
+                common::ttl(86_400)?,
+                common::at(0),
+            )?
+            .fence();
+        store.start_attempt(&task, fence, common::at(0))?;
+        let plan = common::plan(
+            &task,
+            fence,
+            "implement",
+            Operation::LaunchWorker {
+                role: Role::StationCook,
+                workspace: Workspace::Isolated,
+                brief: Text::new("Implement issue 9.")?,
+                branch: Some(BranchName::new(branch)?),
+            },
+        )?;
+        let EffectStart::Execute(started) =
+            store.begin_effect(plan, &self.grants, self.workers.descriptor(), common::at(1))?
+        else {
+            return Err("expected a new launch".into());
+        };
+        let receipt = self.workers.execute(started.request())?;
+        store.record_effect_outcome(
+            &task,
+            fence,
+            started.seq(),
+            EffectOutcome::Applied(receipt.clone()),
+            common::at(1),
+        )?;
+        receipt
+            .created()
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::Worker)
+            .cloned()
+            .ok_or_else(|| "no worker created".into())
+    }
+    /// Execute a persisted effect on the fake worker backend and record the
+    /// applied receipt under the gate task's fence.
+    fn execute(&self, key: &IdempotencyKey) -> TestResult<Receipt> {
+        self.execute_under(key, self.fence)
+    }
+    fn execute_under(&self, key: &IdempotencyKey, fence: Fence) -> TestResult<Receipt> {
+        let effect = self
+            .effects()?
+            .into_iter()
+            .find(|effect| effect.request().key() == key)
+            .ok_or("effect missing")?;
+        let receipt = self.workers.execute(effect.request())?;
+        self.settle_under(key, fence, EffectOutcome::Applied(receipt.clone()))?;
+        Ok(receipt)
+    }
+    /// The worker effect persisted under `key`.
+    fn operation(&self, key: &IdempotencyKey) -> TestResult<Operation> {
+        match self
+            .effects()?
+            .into_iter()
+            .find(|effect| effect.request().key() == key)
+            .ok_or("effect missing")?
+            .request()
+            .effect()
+        {
+            Effect::Worker(operation) => Ok(operation.clone()),
+            other => Err(format!("expected a worker effect, got {other:?}").into()),
+        }
     }
     fn subject(&self, task: &TaskId, fence: Fence, head: char) -> TestResult {
         record_subject(&self.fixture, task, fence, head)
@@ -1671,6 +1725,7 @@ impl Durable {
             backend: &self.backend,
             requester: ExternalRef::new("kitchen-gate")?,
             posting_budget: PostingBudget::new(10)?,
+            workers: Some(&self.workers),
         })
     }
     /// Every effect in the house, across tasks.
@@ -1684,6 +1739,15 @@ impl Durable {
             .collect())
     }
     fn settle(&self, key: &IdempotencyKey, outcome: EffectOutcome) -> TestResult {
+        self.settle_under(key, self.fence, outcome)
+    }
+    /// Record an outcome under the fence of the task that owns the effect.
+    fn settle_under(
+        &self,
+        key: &IdempotencyKey,
+        fence: Fence,
+        outcome: EffectOutcome,
+    ) -> TestResult {
         let effect = self
             .effects()?
             .into_iter()
@@ -1691,7 +1755,7 @@ impl Durable {
             .ok_or("effect missing")?;
         self.fixture.store.record_effect_outcome(
             effect.request().task(),
-            self.fence,
+            fence,
             effect.seq(),
             outcome,
             common::at(2),
@@ -1937,7 +2001,7 @@ fn durable_report_only_records_a_marker_without_an_effect() -> TestResult {
     Ok(())
 }
 #[test]
-fn durable_store_refuses_other_subjects_houses_and_fix_delivery_before_writing() -> TestResult {
+fn durable_store_refuses_other_subjects_houses_and_workerless_fixes_before_writing() -> TestResult {
     let d = durable()?;
     let e = durable_evidence()?;
     // The task's evidence moved to another head.
@@ -1971,13 +2035,16 @@ fn durable_store_refuses_other_subjects_houses_and_fix_delivery_before_writing()
     behind.contains_base = Some(false);
     assert!(matches!(
         gate::evaluate_and_record(
-            &mut d.gate(&d.fixture.store)?,
+            &mut HouseGateStore {
+                workers: None,
+                ..d.gate(&d.fixture.store)?
+            },
             &behind,
             grants(),
             GateMode::Active,
             secs(100)
         ),
-        Err(GateStoreError::NoHouseStoreEffect)
+        Err(GateStoreError::NoWorkerBackend)
     ));
     assert!(d.effects()?.is_empty());
     assert!(d.marker('a')?.is_none());
@@ -2133,5 +2200,263 @@ fn durable_history_counts_records_and_fails_closed() -> TestResult {
             StateError::MarkerSchemaMismatch { .. }
         )))
     ));
+    Ok(())
+}
+/// Ready evidence whose only gap is a head behind the base: a fixable,
+/// settled PR on `feature/gate`.
+fn behind_at(head: char) -> TestResult<GateEvidence> {
+    let mut e = durable_evidence()?;
+    let head = commit(head)?;
+    e.head = head.clone();
+    e.reviewers[0].reviewed_head = Some(head.clone());
+    e.semantic_head = Some(head.clone());
+    e.supporting_subject = Some((head, e.base.clone()));
+    e.contains_base = Some(false);
+    Ok(e)
+}
+fn brief_of(operation: &Operation) -> TestResult<&str> {
+    match operation {
+        Operation::LaunchWorker { brief, .. } => Ok(brief.as_str()),
+        Operation::MessageWorker { body, .. } => Ok(body.as_str()),
+        other => Err(format!("not a fix delivery: {other:?}").into()),
+    }
+}
+#[test]
+fn durable_fix_launches_on_the_exact_branch_then_messages_that_worker_within_two_rounds()
+-> TestResult {
+    let d = durable()?;
+    // Round one: no worker has ever run on the branch, so the gate launches
+    // one on exactly that branch.
+    let first = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &behind_at('a')?,
+        grants(),
+        GateMode::Active,
+        secs(100),
+    )?;
+    let Admission::Submit(launch) = first.admission.clone() else {
+        return Err(format!("expected a launch, got {:?}", first.admission).into());
+    };
+    let Operation::LaunchWorker {
+        role,
+        workspace,
+        brief,
+        branch,
+    } = d.operation(&launch)?
+    else {
+        return Err("expected a launch".into());
+    };
+    assert_eq!(role, Role::StationCook);
+    assert_eq!(workspace, Workspace::Isolated);
+    assert_eq!(branch, Some(BranchName::new("feature/gate")?));
+    assert!(brief.as_str().contains("BaseBehind"));
+    assert!(brief.as_str().contains("feature/gate"));
+    assert!(brief.as_str().contains(commit('a')?.as_str()));
+    let marker: GateVerdictRecord = d
+        .marker('a')?
+        .ok_or("marker missing")?
+        .fact()
+        .decode(&schema()?)?;
+    assert_eq!(marker.effect, Some(launch.clone()));
+    let receipt = d.execute(&launch)?;
+    let worker = receipt
+        .created()
+        .iter()
+        .find(|resource| resource.kind == ResourceKind::Worker)
+        .cloned()
+        .ok_or("no worker")?;
+    // The same head is not asked again while the request is fresh.
+    let wait = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &behind_at('a')?,
+        grants(),
+        GateMode::Active,
+        secs(200),
+    )?;
+    assert_eq!(wait.decision.verdict, Verdict::Skip);
+    assert_eq!(d.effects()?.len(), 1);
+    // Round two: the worker pushed a new head that is still behind. The
+    // live worker this task launched receives the request; nothing launches.
+    d.subject(&d.task, d.fence, 'c')?;
+    let second = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &behind_at('c')?,
+        grants(),
+        GateMode::Active,
+        secs(300),
+    )?;
+    let Admission::Submit(message) = second.admission.clone() else {
+        return Err(format!("expected a message, got {:?}", second.admission).into());
+    };
+    let Operation::MessageWorker { worker: to, body } = d.operation(&message)? else {
+        return Err("expected a message to the live worker".into());
+    };
+    assert_eq!(to, worker);
+    assert!(body.as_str().contains(commit('c')?.as_str()));
+    d.execute(&message)?;
+    // Round three is over budget: a person takes over, no worker effect.
+    d.subject(&d.task, d.fence, 'd')?;
+    let third = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &behind_at('d')?,
+        grants(),
+        GateMode::Active,
+        secs(400),
+    )?;
+    assert!(
+        matches!(&third.decision.verdict, Verdict::HandOver { gaps } if gaps.contains(&Gap::FixBudget))
+    );
+    let Admission::Submit(handover) = third.admission else {
+        return Err("expected a handover comment".into());
+    };
+    assert!(d.operation(&handover).is_err(), "the handover is a comment");
+    let workers = d
+        .effects()?
+        .iter()
+        .filter(|effect| matches!(effect.request().effect(), Effect::Worker(_)))
+        .count();
+    assert_eq!(workers, 2);
+    Ok(())
+}
+#[test]
+fn durable_fix_messages_a_given_branch_worker_with_resolved_review_triggers() -> TestResult {
+    let d = durable()?;
+    let worker = d.launch_elsewhere("cook-9", "feature/gate")?;
+    let (task, fence) = d.add_task_given("gate-9-given", &worker)?;
+    let mut e = behind_at('a')?;
+    e.contains_base = Some(true);
+    e.reviewers[0].reviewed_head = Some(commit('c')?);
+    let github = BackendId::new("github")?;
+    let house_grants = HouseGrants::new(e.house.clone(), [request_review_grant(&e.repository)?]);
+    let granted = GateGrants {
+        review_triggers: ReviewTriggers::resolve(
+            &house_grants,
+            &[reviewer_command()?],
+            &e.repository,
+            &e.head,
+            &github,
+        ),
+        ..grants()
+    };
+    let recorded = gate::evaluate_and_record(
+        &mut HouseGateStore {
+            task,
+            fence,
+            ..d.gate(&d.fixture.store)?
+        },
+        &e,
+        granted,
+        GateMode::Active,
+        secs(100),
+    )?;
+    assert!(
+        matches!(&recorded.decision.verdict, Verdict::FixRequest { gaps } if gaps == &vec![Gap::ReviewerStale])
+    );
+    let Admission::Submit(key) = recorded.admission else {
+        return Err("expected a message".into());
+    };
+    let operation = d.operation(&key)?;
+    let Operation::MessageWorker { worker: to, .. } = &operation else {
+        return Err(format!("expected a message, got {operation:?}").into());
+    };
+    assert_eq!(to, &worker);
+    let body = brief_of(&operation)?;
+    assert!(body.contains("@reviewer review"), "{body}");
+    assert!(body.contains("gate-reviewer"), "{body}");
+    // The fake backend accepts it for the live worker.
+    let receipt = d.execute_under(&key, fence)?;
+    assert_eq!(receipt.touched(), std::slice::from_ref(&worker));
+    assert!(receipt.created().is_empty());
+    Ok(())
+}
+#[test]
+fn durable_fix_refuses_unowned_or_unobservable_workers_before_writing() -> TestResult {
+    let d = durable()?;
+    let worker = d.launch_elsewhere("cook-9", "feature/gate")?;
+    let e = behind_at('a')?;
+    let run = |gate: &mut HouseGateStore<'_>| {
+        gate::evaluate_and_record(gate, &e, grants(), GateMode::Active, secs(100))
+    };
+    let before = d.effects()?.len();
+    // Live, but another task's worker: the gate task was not given it, so
+    // the house store refuses the message before persisting anything.
+    assert!(matches!(
+        run(&mut d.gate(&d.fixture.store)?),
+        Err(GateStoreError::Kitchen(kitchen::Error::State(
+            StateError::ResourceNotOwned
+        )))
+    ));
+    let (task, fence) = d.add_task_given("gate-9-given", &worker)?;
+    let given = |store| -> TestResult<HouseGateStore<'_>> {
+        Ok(HouseGateStore {
+            task: task.clone(),
+            fence,
+            ..d.gate(store)?
+        })
+    };
+    // A person took the worker over, or the backend cannot tell.
+    for state in [WorkerState::UserTakeover, WorkerState::Unknown] {
+        d.workers.set_worker_state(&worker, state);
+        assert!(
+            matches!(
+                run(&mut given(&d.fixture.store)?),
+                Err(GateStoreError::WorkerUnavailable(observed)) if observed == state
+            ),
+            "{state:?}"
+        );
+    }
+    assert_eq!(d.effects()?.len(), before);
+    assert!(d.marker('a')?.is_none());
+    // A settled worker is not live: the gate launches a new one on the branch.
+    d.workers
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    let relaunch = run(&mut given(&d.fixture.store)?)?;
+    let Admission::Submit(key) = relaunch.admission else {
+        return Err("expected a launch".into());
+    };
+    assert!(matches!(
+        d.operation(&key)?,
+        Operation::LaunchWorker { branch: Some(branch), .. } if branch.as_str() == "feature/gate"
+    ));
+    Ok(())
+}
+#[test]
+fn durable_fix_intent_survives_a_crash_and_a_worker_change() -> TestResult {
+    let d = durable()?;
+    let e = behind_at('a')?;
+    let decision = gate::evaluate(&e, grants(), GateHistory::default());
+    let mut record = record_at(&e, decision.verdict.clone(), GateMode::Active, 100);
+    record.recorded_at = secs(100);
+    let GateIntent::Submit(key) = d.gate(&d.fixture.store)?.begin_effect(&record, &decision)?
+    else {
+        return Err("expected a new intent".into());
+    };
+    assert!(matches!(d.operation(&key)?, Operation::LaunchWorker { .. }));
+    // The process stops before the marker. Meanwhile another task starts a
+    // worker on the branch and a person takes it over. The rerun must
+    // reconcile the recorded launch, not judge the new worker.
+    assert!(d.marker('a')?.is_none());
+    let other = d.launch_elsewhere("cook-9", "feature/gate")?;
+    d.workers
+        .set_worker_state(&other, WorkerState::UserTakeover);
+    let reopened = d.fixture.reopen()?;
+    let recovered = gate::evaluate_and_record(
+        &mut d.gate(&reopened)?,
+        &e,
+        grants(),
+        GateMode::Active,
+        secs(200),
+    )?;
+    assert_eq!(recovered.admission, Admission::Reconcile(key.clone()));
+    let workers = d
+        .effects()?
+        .iter()
+        .filter(|effect| effect.request().task() == &d.task)
+        .count();
+    assert_eq!(workers, 1);
+    assert_eq!(
+        gate::fix_request(&recovered, &grants()),
+        Err(RequestRefusal::EffectsDisabled)
+    );
     Ok(())
 }

@@ -11,15 +11,27 @@
 //! an intent, the adapter looks for the same logical effect (name, repository,
 //! and PR) in every task of the house, so a restart under another task or
 //! attempt finds the earlier intent instead of submitting again.
+//!
+//! Fix delivery: a fix verdict messages the branch's worker, found as the
+//! worker of the newest applied launch that created exactly the PR's head
+//! branch, when the worker backend observes it live. The house store admits
+//! that message only when the gate task owns the worker (it launched it, or
+//! the worker was given to it); otherwise nothing is written. With no live
+//! worker, the gate launches one on exactly that branch. A worker a person
+//! took over, or whose state is unknown, receives nothing.
 
-use std::num::{NonZeroU32, NonZeroU64};
+use std::{
+    fmt,
+    num::{NonZeroU32, NonZeroU64},
+};
 
 use crate::{
-    EffectName, HouseId, IdentifierError, TaskId, WorkflowId,
+    BackendId, EffectName, HouseId, IdentifierError, TaskId, WorkflowId,
     contracts::{
-        BackendDescriptor, Claimant, CommitId, ContractError, Effect, EvidenceSubject, ExternalRef,
-        Fence, GitHubAction, GitHubEffect, HouseGrants, IdempotencyKey, IssueNumber, PostingBudget,
-        Repository, Timestamp, ValueKind,
+        BackendDescriptor, BackendUnavailable, BranchName, Claimant, CommitId, ContractError,
+        Effect, EvidenceSubject, ExternalRef, Fence, GitHubAction, GitHubEffect, HouseGrants,
+        IdempotencyKey, IssueNumber, Operation, PostingBudget, Repository, ResourceKind,
+        ResourceRef, Role, Timestamp, ValueKind, WorkerBackend, WorkerState, Workspace,
     },
     state::{
         EffectPlan, EffectRecord, EffectStart, EffectState, HouseStore, MarkerFact, MarkerKey,
@@ -28,8 +40,9 @@ use crate::{
 };
 
 use super::{
-    GATE_VERDICT_SCHEMA, GATE_VERDICT_VERSION, GateDecision, GateEffectState, GateHistory,
-    GateIntent, GateMarkerStore, GateVerdictRecord, Verdict, handover_comment, merge_mutation,
+    GATE_VERDICT_SCHEMA, GATE_VERDICT_VERSION, Gap, GateDecision, GateEffectState, GateHistory,
+    GateIntent, GateMarkerStore, GateVerdictRecord, Verdict, fix_brief, fix_marker,
+    handover_comment, merge_mutation,
 };
 
 /// Workflow id under which gate verdict markers are recorded.
@@ -45,10 +58,22 @@ pub enum GateStoreError {
     /// The owning task's current evidence is not the verdict's head and base.
     #[error("the task's evidence is not at the verdict's head and base")]
     SubjectNotRecorded,
-    /// The verdict has no effect this store can persist. Fix delivery waits
-    /// for an owned worker-message path.
+    /// The verdict has no effect this store can persist.
     #[error("the verdict has no house-store effect")]
     NoHouseStoreEffect,
+    /// A fix verdict needs a worker backend and none was supplied.
+    #[error("no worker backend for fix delivery")]
+    NoWorkerBackend,
+    /// A fix verdict lacks a valid head branch.
+    #[error("a fix verdict lacks its head branch")]
+    MissingHeadBranch,
+    /// The branch's worker cannot receive a request now: a person took it
+    /// over, or the backend cannot tell its state.
+    #[error("the branch's worker cannot receive a request: {0:?}")]
+    WorkerUnavailable(WorkerState),
+    /// The worker backend could not be queried.
+    #[error(transparent)]
+    WorkerObservation(#[from] BackendUnavailable),
     /// A merge verdict lacks its validated base branch.
     #[error("a merge verdict lacks its base branch")]
     MissingBaseBranch,
@@ -79,7 +104,6 @@ impl From<IdentifierError> for GateStoreError {
 }
 
 /// [`GateMarkerStore`] backed by one house's [`HouseStore`].
-#[derive(Debug)]
 pub struct HouseGateStore<'a> {
     /// The house store; its house must be the evidence house.
     pub store: &'a HouseStore,
@@ -97,6 +121,25 @@ pub struct HouseGateStore<'a> {
     pub requester: ExternalRef,
     /// The house's per-task forge posting ceiling.
     pub posting_budget: PostingBudget,
+    /// The worker backend that delivers fix requests; `None` refuses them.
+    pub workers: Option<&'a dyn WorkerBackend>,
+}
+
+impl fmt::Debug for HouseGateStore<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HouseGateStore")
+            .field("store", &self.store)
+            .field("task", &self.task)
+            .field("fence", &self.fence)
+            .field("claimant", &self.claimant)
+            .field("backend", &self.backend.backend)
+            .field(
+                "workers",
+                &self.workers.map(|workers| &workers.descriptor().backend),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl HouseGateStore<'_> {
@@ -130,6 +173,7 @@ impl HouseGateStore<'_> {
 
     fn effect(
         &self,
+        tasks: &[TaskRecord],
         record: &GateVerdictRecord,
         decision: &GateDecision,
     ) -> Result<Effect, GateStoreError> {
@@ -152,9 +196,10 @@ impl HouseGateStore<'_> {
                 gaps,
                 &decision.verified_findings,
             )?,
-            Verdict::Skip | Verdict::FixRequest { .. } => {
-                return Err(GateStoreError::NoHouseStoreEffect);
+            Verdict::FixRequest { gaps } => {
+                return self.fix_effect(tasks, decision, gaps).map(Effect::Worker);
             }
+            Verdict::Skip => return Err(GateStoreError::NoHouseStoreEffect),
         };
         Ok(Effect::GitHub(GitHubEffect {
             requester: self.requester.clone(),
@@ -162,6 +207,87 @@ impl HouseGateStore<'_> {
             posting_budget: self.posting_budget,
         }))
     }
+
+    /// Deliver a fix to the branch's live worker, or launch one on exactly
+    /// the branch when none is live. The house store admits a message only
+    /// when the gate task owns the worker: it launched it, or the worker was
+    /// given to it.
+    fn fix_effect(
+        &self,
+        tasks: &[TaskRecord],
+        decision: &GateDecision,
+        gaps: &[Gap],
+    ) -> Result<Operation, GateStoreError> {
+        let workers = self.workers.ok_or(GateStoreError::NoWorkerBackend)?;
+        let branch = decision
+            .head_branch
+            .as_deref()
+            .and_then(|branch| BranchName::new(branch).ok())
+            .ok_or(GateStoreError::MissingHeadBranch)?;
+        let brief = fix_brief(decision, gaps, &branch)?;
+        let live = match branch_worker(tasks, &workers.descriptor().backend, &branch) {
+            None => None,
+            Some(worker) => match workers.observe_worker(&worker)? {
+                WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply => {
+                    Some(worker)
+                }
+                WorkerState::Settled(_) | WorkerState::Missing => None,
+                state @ (WorkerState::UserTakeover | WorkerState::Unknown) => {
+                    return Err(GateStoreError::WorkerUnavailable(state));
+                }
+            },
+        };
+        Ok(match live {
+            Some(worker) => Operation::MessageWorker {
+                worker,
+                body: brief,
+            },
+            None => Operation::LaunchWorker {
+                role: Role::StationCook,
+                workspace: Workspace::Isolated,
+                brief,
+                branch: Some(branch),
+            },
+        })
+    }
+}
+
+/// The worker of the newest applied launch, in any task of the house, that
+/// created exactly `branch` on `backend`.
+fn branch_worker(
+    tasks: &[TaskRecord],
+    backend: &BackendId,
+    branch: &BranchName,
+) -> Option<ResourceRef> {
+    tasks
+        .iter()
+        .flat_map(TaskRecord::effects)
+        .filter_map(|effect| {
+            let (
+                Effect::Worker(Operation::LaunchWorker { .. }),
+                EffectState::Applied { receipt, .. },
+            ) = (effect.request().effect(), effect.state())
+            else {
+                return None;
+            };
+            Some((effect.intended_at(), receipt.created()))
+        })
+        .filter(|(_, created)| {
+            created.iter().any(|resource| {
+                resource.kind == ResourceKind::Branch
+                    && &resource.backend == backend
+                    && resource.handle.as_str() == branch.as_str()
+            })
+        })
+        .max_by_key(|(at, _)| *at)
+        .and_then(|(_, created)| {
+            created
+                .iter()
+                .find(|resource| {
+                    resource.kind == ResourceKind::Worker && &resource.backend == backend
+                })
+                .cloned()
+        })
 }
 
 fn schema() -> Result<MarkerSchema, StateError> {
@@ -185,9 +311,8 @@ fn effect_name(record: &GateVerdictRecord) -> Result<EffectName, GateStoreError>
     let kind = match record.verdict {
         Verdict::Merge => "merge",
         Verdict::HandOver { .. } => "handover",
-        Verdict::Skip | Verdict::FixRequest { .. } => {
-            return Err(GateStoreError::NoHouseStoreEffect);
-        }
+        Verdict::FixRequest { .. } => "fix",
+        Verdict::Skip => return Err(GateStoreError::NoHouseStoreEffect),
     };
     let prefix = |commit: &CommitId| {
         let text = commit.as_str();
@@ -202,36 +327,53 @@ fn effect_name(record: &GateVerdictRecord) -> Result<EffectName, GateStoreError>
     ))?)
 }
 
-/// Whether a persisted effect is a forge effect on this PR.
-fn targets(effect: &EffectRecord, repository: &Repository, number: IssueNumber) -> bool {
-    let Effect::GitHub(github) = effect.request().effect() else {
-        return false;
-    };
-    &github.mutation.repository == repository
-        && match &github.mutation.action {
-            GitHubAction::MergePullRequest { number: pr, .. }
-            | GitHubAction::PostComment { issue: pr, .. } => *pr == number,
-            GitHubAction::CloseIssue { .. }
-            | GitHubAction::SetLabel { .. }
-            | GitHubAction::CreateIssue { .. }
-            | GitHubAction::LinkSubIssue { .. }
-            | GitHubAction::LinkDependency { .. }
-            | GitHubAction::CreateLabel { .. } => false,
+/// Whether a persisted effect is this record's forge effect on its PR, or
+/// its fix delivery, whose brief ends with the subject's marker.
+fn targets(effect: &EffectRecord, record: &GateVerdictRecord) -> bool {
+    match effect.request().effect() {
+        Effect::GitHub(github) => {
+            github.mutation.repository == record.repository
+                && match &github.mutation.action {
+                    GitHubAction::MergePullRequest { number: pr, .. }
+                    | GitHubAction::PostComment { issue: pr, .. } => *pr == record.number,
+                    GitHubAction::CloseIssue { .. }
+                    | GitHubAction::SetLabel { .. }
+                    | GitHubAction::CreateIssue { .. }
+                    | GitHubAction::LinkSubIssue { .. }
+                    | GitHubAction::LinkDependency { .. }
+                    | GitHubAction::CreateLabel { .. } => false,
+                }
         }
+        Effect::Worker(
+            Operation::LaunchWorker { brief: text, .. }
+            | Operation::MessageWorker { body: text, .. },
+        ) => text.as_str().ends_with(&fix_marker(
+            &record.repository,
+            record.number,
+            &record.head,
+            &record.base,
+        )),
+        Effect::Worker(
+            Operation::ReplyToWorker { .. }
+            | Operation::CancelWorker { .. }
+            | Operation::ReleaseResource { .. },
+        )
+        | Effect::Roger(_)
+        | Effect::Schedule(_) => false,
+    }
 }
 
-/// The latest same-named intent on this PR in any task, preferring one that
-/// may have applied over a refused one.
+/// The latest same-named intent for this record's subject in any task,
+/// preferring one that may have applied over a refused one.
 fn find_effect<'a>(
     tasks: &'a [TaskRecord],
     name: &EffectName,
-    repository: &Repository,
-    number: IssueNumber,
+    record: &GateVerdictRecord,
 ) -> Option<&'a EffectRecord> {
     tasks
         .iter()
         .flat_map(TaskRecord::effects)
-        .filter(|effect| effect.name() == name && targets(effect, repository, number))
+        .filter(|effect| effect.name() == name && targets(effect, record))
         .max_by_key(|effect| {
             (
                 !matches!(effect.state(), EffectState::NotApplied { .. }),
@@ -349,14 +491,16 @@ impl GateMarkerStore for HouseGateStore<'_> {
     ) -> Result<GateIntent, Self::Error> {
         self.check_house(&record.house)?;
         let name = effect_name(record)?;
-        let effect = self.effect(record, decision)?;
         let tasks = self.store.tasks()?;
-        if let Some(existing) = find_effect(&tasks, &name, &record.repository, record.number) {
+        // An earlier intent is found before the effect is rebuilt: the
+        // branch's worker may have changed since it was persisted.
+        if let Some(existing) = find_effect(&tasks, &name, record) {
             return Ok(GateIntent::Existing(
                 existing.request().key().clone(),
                 gate_state(existing.state()),
             ));
         }
+        let effect = self.effect(&tasks, record, decision)?;
         let owner = tasks
             .iter()
             .find(|task| task.spec().id == self.task)
@@ -368,6 +512,13 @@ impl GateMarkerStore for HouseGateStore<'_> {
         if owner.evidence().subject() != Some(&subject) {
             return Err(GateStoreError::SubjectNotRecorded);
         }
+        // Worker effects are authorized for and targeted at the worker
+        // backend; forge effects at the forge.
+        let backend = match (&effect, self.workers) {
+            (Effect::Worker(_), Some(workers)) => workers.descriptor(),
+            (Effect::Worker(_), None) => return Err(GateStoreError::NoWorkerBackend),
+            (Effect::GitHub(_) | Effect::Roger(_) | Effect::Schedule(_), _) => self.backend,
+        };
         let plan = EffectPlan {
             task: self.task.clone(),
             fence: self.fence,
@@ -379,7 +530,7 @@ impl GateMarkerStore for HouseGateStore<'_> {
         Ok(
             match self
                 .store
-                .begin_effect(plan, self.grants, self.backend, record.recorded_at)?
+                .begin_effect(plan, self.grants, backend, record.recorded_at)?
             {
                 EffectStart::Execute(started) => {
                     GateIntent::Submit(started.request().key().clone())

@@ -228,7 +228,10 @@ pub struct GateGrants {
     pub merge: bool,
     /// Permit a bounded request to a branch worker to edit, commit, and push.
     pub fix_request: bool,
-    /// Backend positively supports owned-branch delivery and readiness.
+    /// The worker backend positively supports owned-branch delivery and
+    /// readiness. Set it only when the marker store has a worker backend
+    /// declaring isolated launch and messaging; otherwise the store refuses
+    /// the fix verdict without writing.
     pub fix_delivery_capable: bool,
     /// Reviewer invocations Kitchen resolved from house configuration and the
     /// house's standing request-review grant. Empty means no invocation grant.
@@ -485,6 +488,9 @@ pub struct GateDecision {
     pub verified_findings: Vec<VerifiedFinding>,
     /// Disproved findings with reply evidence.
     pub disproved_findings: Vec<DisprovedFinding>,
+    /// Reviewer invocations a fix request carries: the resolved triggers for
+    /// this exact subject when a required review is stale, otherwise none.
+    pub review_triggers: Vec<ReviewTrigger>,
 }
 
 /// Evaluate a fully supplied observation. Missing evidence always fails closed.
@@ -628,6 +634,22 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
         }
         Verdict::HandOver { gaps }
     };
+    let review_triggers = match &verdict {
+        Verdict::FixRequest { gaps } if gaps.contains(&Gap::ReviewerStale) => grants
+            .review_triggers
+            .as_slice()
+            .iter()
+            .filter(|trigger| {
+                trigger.house == e.house
+                    && trigger.repository == e.repository
+                    && trigger.head == e.head
+            })
+            .cloned()
+            .collect(),
+        Verdict::Skip | Verdict::Merge | Verdict::FixRequest { .. } | Verdict::HandOver { .. } => {
+            Vec::new()
+        }
+    };
     GateDecision {
         house: e.house.clone(),
         repository: e.repository.clone(),
@@ -639,6 +661,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
         verdict,
         verified_findings: e.verified_findings.clone(),
         disproved_findings: e.disproved_findings.clone(),
+        review_triggers,
     }
 }
 
@@ -799,7 +822,9 @@ pub fn merge_request_from_forge<T: crate::integrations::github::GitHubReadTransp
         .map_err(|_| IntegrationError::StaleDecision)
 }
 
-/// Narrow work request sent through a capable worker backend, never a shell command.
+/// Narrow work request for the branch worker, never a shell command. The
+/// durable store delivers it as a worker message or a launch on the exact
+/// branch (see [`HouseGateStore`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixRequest {
     /// Authorized house.
@@ -865,48 +890,6 @@ pub fn fix_request(
         },
         key: key.clone(),
     })
-}
-
-/// Narrow capability boundary for a branch worker. An Orca implementation
-/// checks ownership and launch readiness; another backend can implement the
-/// same contract without exposing terminal commands to gate policy.
-pub trait GateWorkerBackend {
-    /// Execution failure. An uncertain delivery must be reconciled, not retried.
-    type Error;
-    /// Whether this exact request can be delivered to one owned branch writer.
-    fn supports(&self, request: &FixRequest) -> bool;
-    /// Send once and return positive delivery or readiness evidence.
-    ///
-    /// # Errors
-    /// Returns a backend failure or uncertain result without claiming success.
-    fn deliver(&mut self, request: FixRequest) -> Result<ExternalRef, Self::Error>;
-}
-/// Failure while dispatching a fix request.
-#[derive(Debug)]
-pub enum FixDispatchError<E> {
-    /// Decision or grant does not permit this request.
-    Refused(RequestRefusal),
-    /// Backend cannot provide owned-branch delivery/readiness.
-    Unsupported,
-    /// Backend did not provide positive delivery evidence.
-    Backend(E),
-}
-/// Deliver a newly recorded fix request through one capable backend. No retry
-/// happens here; the next tick reconciles its marker and worker state.
-///
-/// # Errors
-/// Refuses report-only and duplicate decisions, unsupported capability, or
-/// unconfirmed backend delivery.
-pub fn dispatch_fix<B: GateWorkerBackend>(
-    recorded: &RecordedDecision,
-    grants: &GateGrants,
-    backend: &mut B,
-) -> Result<ExternalRef, FixDispatchError<B::Error>> {
-    let request = fix_request(recorded, grants).map_err(FixDispatchError::Refused)?;
-    if !backend.supports(&request) {
-        return Err(FixDispatchError::Unsupported);
-    }
-    backend.deliver(request).map_err(FixDispatchError::Backend)
 }
 
 /// Bounded person handoff at an exact revision.
@@ -1019,6 +1002,78 @@ fn handover_comment(
     };
     mutation.validate()?;
     Ok(mutation)
+}
+
+/// The line that ends every fix brief, identifying its PR and exact subject
+/// so a restarted gate finds the same delivery.
+fn fix_marker(
+    repository: &Repository,
+    number: IssueNumber,
+    head: &CommitId,
+    base: &CommitId,
+) -> String {
+    let number = number.get();
+    format!("<!-- kitchen-gate fix repo={repository} pr={number} head={head} base={base} -->")
+}
+
+/// The bounded brief a branch worker receives for a fix verdict. Like the
+/// handover comment, it is derived only from the recorded decision, so a
+/// retry persists the same payload. It grants nothing: reviewer invocations
+/// are limited to the resolved triggers it lists.
+fn fix_brief(
+    decision: &GateDecision,
+    gaps: &[Gap],
+    branch: &BranchName,
+) -> Result<Text, crate::contracts::ContractError> {
+    use std::fmt::Write as _;
+    let GateDecision {
+        repository,
+        number,
+        head,
+        base,
+        ..
+    } = decision;
+    let pr = number.get();
+    let mut body = format!(
+        "Gate fix request for {repository}#{pr} on branch {branch}.\n\
+         Judged head {head} against base {base}.\nFailed conditions: {gaps:?}."
+    );
+    for finding in &decision.verified_findings {
+        let priority = match finding.priority {
+            FindingPriority::ActOn => "act on",
+            FindingPriority::Consider => "consider",
+        };
+        let _ = write!(
+            body,
+            "\nFinding ({priority}): {} — {}",
+            finding.source,
+            finding.reason.as_str()
+        );
+    }
+    for finding in &decision.disproved_findings {
+        let _ = write!(
+            body,
+            "\nDisproved finding: {} — reply with: {}",
+            finding.source,
+            finding.evidence.as_str()
+        );
+    }
+    for trigger in &decision.review_triggers {
+        let _ = write!(
+            body,
+            "\nAfter pushing, request a review from {} by posting exactly `{}` on {repository}#{pr} (grant: {} via {}).",
+            trigger.reviewer,
+            trigger.command.as_str(),
+            trigger.credential,
+            trigger.destination
+        );
+    }
+    let _ = write!(
+        body,
+        "\nPush fixes to {branch} only. Do not merge, close, relabel, or change repository settings.\n{}",
+        fix_marker(repository, *number, head, base)
+    );
+    Text::new(&body)
 }
 
 /// Trial mode records a verdict while forbidding every external effect.

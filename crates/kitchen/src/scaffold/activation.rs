@@ -77,11 +77,12 @@ impl Activation {
     /// its contents. Paths compare case-insensitively, as on common forge
     /// checkouts.
     ///
-    /// Forge configuration (`.github/workflows/`, `.githooks/`, and other CI
-    /// or dependency-update locations) matches only at the repository root,
-    /// where the forge reads it. Directories that editors, agent clients,
-    /// Husky, dev containers, and Cargo read from the folder they run in match
-    /// at any depth, as do the file names listed for each class.
+    /// Paths that a forge or CI service reads only from the repository root
+    /// (`.github/workflows/`, `.github/dependabot.yml`, `.circleci/`,
+    /// `.travis.yml`) and `.githooks/` match only there. Directories that
+    /// editors, agent clients, Husky, dev containers, and Cargo read from the
+    /// folder they run in match at any depth, as do file names such as
+    /// `Jenkinsfile`, `renovate.json`, `.mcp.json`, and `.env`.
     ///
     /// A workflow is scheduled when its top-level `on` names `schedule` as an
     /// event, in any YAML spelling. A workflow that is larger than

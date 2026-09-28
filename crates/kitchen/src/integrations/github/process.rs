@@ -1,0 +1,271 @@
+//! Bounded subprocess boundary with isolated credentials and redacted failures.
+
+use super::{CredentialRef, GitHubReadTransport, IntegrationError, ReadRequest};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+/// Explicit private credential-file binding. Never falls back to host CLI login.
+#[derive(Clone)]
+pub struct CredentialFile {
+    reference: CredentialRef,
+    path: PathBuf,
+}
+impl std::fmt::Debug for CredentialFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CredentialFile([private])")
+    }
+}
+impl CredentialFile {
+    /// Select a credential file from private house configuration.
+    ///
+    /// # Errors
+    /// Requires an absolute path; reading remains deferred until scope validation.
+    pub fn new(reference: CredentialRef, path: PathBuf) -> Result<Self, IntegrationError> {
+        if !path.is_absolute() {
+            return Err(IntegrationError::InvalidInput);
+        }
+        Ok(Self { reference, path })
+    }
+    /// Bound reference, without the credential or private path.
+    #[must_use]
+    pub const fn reference(&self) -> &CredentialRef {
+        &self.reference
+    }
+    pub(crate) fn load(&self, requested: &CredentialRef) -> Result<String, IntegrationError> {
+        if requested != &self.reference {
+            return Err(IntegrationError::ScopeMismatch);
+        }
+        let file = File::open(&self.path).map_err(|_| IntegrationError::Unavailable)?;
+        if !file
+            .metadata()
+            .map_err(|_| IntegrationError::Unavailable)?
+            .is_file()
+        {
+            return Err(IntegrationError::InvalidInput);
+        }
+        let mut bytes = Vec::new();
+        file.take(16 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| IntegrationError::Unavailable)?;
+        if bytes.len() > 16 * 1024 {
+            return Err(IntegrationError::LimitExceeded);
+        }
+        let token = String::from_utf8(bytes).map_err(|_| IntegrationError::InvalidInput)?;
+        let token = token.trim();
+        if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(IntegrationError::InvalidInput);
+        }
+        Ok(token.into())
+    }
+}
+
+/// Installed GitHub CLI, pinned by absolute executable path.
+#[derive(Debug, Clone)]
+pub struct GhCli {
+    executable: PathBuf,
+    credential: CredentialFile,
+}
+impl GhCli {
+    /// Select the binary and private credential binding without invoking them.
+    ///
+    /// # Errors
+    /// Refuses a relative executable path.
+    pub fn new(executable: PathBuf, credential: CredentialFile) -> Result<Self, IntegrationError> {
+        if !executable.is_absolute() {
+            return Err(IntegrationError::InvalidInput);
+        }
+        Ok(Self {
+            executable,
+            credential,
+        })
+    }
+    pub(crate) fn call(
+        &self,
+        reference: &CredentialRef,
+        args: &[String],
+        input: &[u8],
+        timeout: Duration,
+        max_bytes: usize,
+    ) -> Result<ProcessOutput, IntegrationError> {
+        let token = self.credential.load(reference)?;
+        run(
+            &self.executable,
+            args,
+            input,
+            &[
+                ("GH_TOKEN", &token),
+                ("GH_HOST", "github.com"),
+                ("GH_PROMPT_DISABLED", "1"),
+            ],
+            timeout,
+            max_bytes,
+        )
+    }
+}
+impl GitHubReadTransport for GhCli {
+    fn read(
+        &self,
+        credential: &CredentialRef,
+        request: &ReadRequest,
+        timeout: Duration,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, IntegrationError> {
+        let started = Instant::now();
+        // A valid token for another requester is still a scope violation.
+        let identity = self.call(
+            credential,
+            &[
+                "api".into(),
+                "--hostname".into(),
+                "github.com".into(),
+                "user".into(),
+            ],
+            &[],
+            timeout,
+            16 * 1024,
+        )?;
+        if identity.code != Some(0) {
+            return Err(IntegrationError::Unavailable);
+        }
+        let user: super::User =
+            serde_json::from_slice(&identity.stdout).map_err(|_| IntegrationError::Unknown)?;
+        if !user
+            .login
+            .eq_ignore_ascii_case(credential.requester().as_str())
+        {
+            return Err(IntegrationError::ScopeMismatch);
+        }
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or(IntegrationError::Timeout)?;
+        let mut args = vec![
+            "api".into(),
+            "--hostname".into(),
+            "github.com".into(),
+            "--method".into(),
+            if request.graphql.is_some() {
+                "POST".into()
+            } else {
+                "GET".into()
+            },
+            request.endpoint.clone(),
+        ];
+        let input = if let Some(body) = &request.graphql {
+            args.extend(["--input".into(), "-".into()]);
+            serde_json::to_vec(body).map_err(|_| IntegrationError::InvalidInput)?
+        } else {
+            Vec::new()
+        };
+        let output = self.call(credential, &args, &input, remaining, max_bytes)?;
+        if output.code != Some(0) {
+            return Err(IntegrationError::Unavailable);
+        }
+        Ok(output.stdout)
+    }
+}
+
+pub(crate) struct ProcessOutput {
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+}
+
+/// File-backed output avoids a pipe-reader thread remaining blocked after timeout.
+/// No ambient token, HOME, CLI config, proxy, shell, or pager is inherited.
+pub(crate) fn run(
+    executable: &Path,
+    args: &[String],
+    input: &[u8],
+    environment: &[(&str, &str)],
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<ProcessOutput, IntegrationError> {
+    if timeout.is_zero()
+        || timeout > Duration::from_secs(60)
+        || max_bytes == 0
+        || max_bytes > 8 * 1024 * 1024
+        || input.len() > 128 * 1024
+    {
+        return Err(IntegrationError::InvalidInput);
+    }
+    let private = tempfile::tempdir().map_err(|_| IntegrationError::Unavailable)?;
+    let mut stdin = tempfile::tempfile().map_err(|_| IntegrationError::Unavailable)?;
+    stdin
+        .write_all(input)
+        .and_then(|()| stdin.seek(SeekFrom::Start(0)).map(|_| ()))
+        .map_err(|_| IntegrationError::Unavailable)?;
+    let mut stdout = tempfile::tempfile().map_err(|_| IntegrationError::Unavailable)?;
+    let stderr = tempfile::tempfile().map_err(|_| IntegrationError::Unavailable)?;
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .env_clear()
+        .env("HOME", private.path())
+        .env("GH_CONFIG_DIR", private.path())
+        .env("NO_COLOR", "1")
+        .envs(environment.iter().copied())
+        .current_dir(private.path())
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(
+            stdout
+                .try_clone()
+                .map_err(|_| IntegrationError::Unavailable)?,
+        ))
+        .stderr(Stdio::from(
+            stderr
+                .try_clone()
+                .map_err(|_| IntegrationError::Unavailable)?,
+        ));
+    let started = Instant::now();
+    let mut child = command.spawn().map_err(|_| IntegrationError::Unavailable)?;
+    let outcome = loop {
+        let size = stdout
+            .metadata()
+            .and_then(|a| stderr.metadata().map(|b| a.len().saturating_add(b.len())));
+        match size {
+            Ok(size) if size > max_bytes as u64 => break Err(IntegrationError::LimitExceeded),
+            Err(_) => break Err(IntegrationError::Unavailable),
+            Ok(_) => {}
+        }
+        if started.elapsed() >= timeout {
+            break Err(IntegrationError::Timeout);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status.code()),
+            Ok(None) => thread::sleep(
+                Duration::from_millis(5).min(timeout.saturating_sub(started.elapsed())),
+            ),
+            Err(_) => break Err(IntegrationError::Unavailable),
+        }
+    };
+    if outcome.is_err() {
+        // Always attempt both termination and reap; failure cannot become success.
+        let killed = child.kill();
+        let reaped = child.wait();
+        if killed.is_err() && reaped.is_err() {
+            return Err(IntegrationError::Unavailable);
+        }
+    }
+    let code = outcome?;
+    stdout
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| IntegrationError::Unavailable)?;
+    let mut bytes = Vec::new();
+    stdout
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| IntegrationError::Unavailable)?;
+    if bytes.len() > max_bytes {
+        return Err(IntegrationError::LimitExceeded);
+    }
+    Ok(ProcessOutput {
+        code,
+        stdout: bytes,
+    })
+}

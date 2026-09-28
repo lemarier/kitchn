@@ -37,6 +37,9 @@ pub enum Error {
     /// A durable state operation failed.
     #[error(transparent)]
     State(#[from] StateError),
+    /// A house-scoped integration failed.
+    #[error(transparent)]
+    Integration(#[from] crate::integrations::github::IntegrationError),
     /// A template, rendering, or scaffold planning operation failed.
     #[error(transparent)]
     Scaffold(#[from] ScaffoldError),
@@ -51,6 +54,7 @@ impl Error {
             Self::Contract(error) => error.class(),
             Self::State(error) => error.class(),
             Self::House(error) => error.class(),
+            Self::Integration(error) => error.class(),
             Self::Scaffold(error) => error.class(),
         }
     }

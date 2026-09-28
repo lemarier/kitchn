@@ -1413,7 +1413,9 @@ fn duplicates_created_outside_the_reservation_are_still_an_explicit_error() -> T
     // Two installers that do not share a reservation directory stand in for
     // an older process, or a person creating the automation by hand.
     let sim = SimOrca::default();
-    sim.interleave(&["automations", "list"], 2, Duration::from_millis(400));
+    // Released as soon as both have listed; the long wait only covers a
+    // stalled machine, so both really read before either creates.
+    sim.interleave(&["automations", "list"], 2, Duration::from_secs(5));
     let elsewhere = tempfile::tempdir()?;
     let spec = schedule_spec("pickup")?;
     let first = connect(&sim)?;
@@ -1854,11 +1856,12 @@ fn a_launch_without_a_requested_branch_is_not_constrained() -> TestResult {
 #[test]
 fn a_held_reservation_reports_uncertain_and_resubmission_finds_the_launch() -> TestResult {
     let sim = SimOrca::default();
-    // The first launch holds its reservation while it waits after listing.
+    // The first launch holds its reservation while it waits after listing,
+    // far longer than the impatient caller is willing to wait.
     sim.interleave(
         &["orchestration", "task-list"],
         2,
-        Duration::from_millis(600),
+        Duration::from_millis(1500),
     );
     let launch = request(launch_op("Implement it.")?, "held")?;
     let holder = connect(&sim)?;

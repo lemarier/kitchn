@@ -12,7 +12,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ConsumerId, EffectName, Error, HolderId, HouseId, TaskId,
+    ConsumerId, CredentialId, EffectName, Error, HolderId, HouseId, TaskId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Capability,
         Claimant, Consent, ContractError, Disposition, Effect, EffectContext, EffectRequest,
@@ -621,6 +621,7 @@ impl TaskRecord {
         index: usize,
         plan: &EffectPlan,
         backend: &BackendDescriptor,
+        credential: &CredentialId,
         resubmission: Resubmission,
         now: Timestamp,
     ) -> Result<EffectStart> {
@@ -652,6 +653,11 @@ impl TaskRecord {
             Resubmission::Refuse => fail(StateError::UnsafeRetry(existing.seq)),
             Resubmission::SameKey if !reconciled => {
                 Ok(EffectStart::ReconcileFirst(existing.clone()))
+            }
+            // Resubmitting reuses the persisted request; it must still be
+            // exactly what current authority permits.
+            Resubmission::SameKey if existing.request.credential() != credential => {
+                Err(ContractError::CredentialChanged.into())
             }
             Resubmission::SameKey => {
                 let (name, attempt, seq) = (
@@ -1446,7 +1452,7 @@ impl StoreState {
                 && !matches!(effect.state, EffectState::NotApplied { .. })
         });
         if let Some(index) = same_name {
-            return task.repeat_effect(index, &plan, backend, resubmission, now);
+            return task.repeat_effect(index, &plan, backend, &credential, resubmission, now);
         }
         let unresolved = task.blocking_work();
         if unresolved > 0 && !stopping {

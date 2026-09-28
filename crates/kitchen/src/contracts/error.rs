@@ -61,6 +61,10 @@ pub enum ContractError {
     /// The consent is for a different house, task, operation, or revision.
     #[error("consent does not cover this effect")]
     ConsentMismatch,
+    /// Current authority selects a different credential than the one an
+    /// existing intent was persisted with; the intent is not resubmitted.
+    #[error("the authorized credential changed since the intent was persisted")]
+    CredentialChanged,
     /// The effect acts outside the task's scope, such as another repository.
     #[error("effect scope {effect} is outside the task scope {task}")]
     OutOfTaskScope {
@@ -104,6 +108,7 @@ impl ContractError {
             | Self::ConsentRequired { .. }
             | Self::ConsentMismatch
             | Self::OutOfTaskScope { .. }
+            | Self::CredentialChanged
             | Self::DecisionBindingMismatch
             | Self::EffectBudgetExhausted { .. }
             | Self::CrossHouse { .. } => ErrorClass::Refused,

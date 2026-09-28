@@ -317,3 +317,53 @@ fn triggers_share_claims_and_hand_over_through_relinquish_and_adopt() -> TestRes
     ));
     Ok(())
 }
+
+#[test]
+fn a_resubmission_fails_closed_when_the_permitted_credential_changed() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = interactive_task(&fixture, "task-1")?;
+    let backend = FakeBackend::fully_capable(backend_id()?, house()?);
+    let clock = ManualClock::starting_at(1);
+    let approval = consent("approval-1", &task, launch()?)?;
+    backend.fail_lookups(100);
+    backend.inject(kitchen::contracts::fake::ExecuteFault::TimeoutWithoutApplying);
+    let lost = run_effect(
+        &fixture.store,
+        &backend,
+        &house_policy()?,
+        with_consent(plan(&task, fence, "launch", launch()?)?, approval.clone()),
+        &clock,
+    )?;
+    assert_eq!(lost.request().credential(), &credential()?);
+
+    // House policy now permits the launch only with another credential.
+    let rotated = HouseGrants::with_limits(
+        house()?,
+        [kitchen::contracts::Grant::house(
+            Permission::LaunchWorker,
+            backend_id()?,
+            kitchen::CredentialId::new("rotated-token")?,
+        )],
+        [],
+    )?;
+    let retried = run_effect(
+        &fixture.store,
+        &backend,
+        &rotated,
+        with_consent(plan(&task, fence, "launch", launch()?)?, approval),
+        &clock,
+    );
+    assert!(
+        matches!(
+            retried,
+            Err(Error::Contract(ContractError::CredentialChanged))
+        ),
+        "{retried:?}"
+    );
+    assert_eq!(
+        backend.execute_calls(),
+        1,
+        "nothing ran with the old credential"
+    );
+    Ok(())
+}

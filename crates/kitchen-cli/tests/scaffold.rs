@@ -5,7 +5,7 @@ use kitchen::{
         HouseRegistry, InstructionAsset, InstructionBundle, RelativePath, role_cards_digest,
     },
     contracts::CommitId,
-    house::HouseConfig,
+    house::{HouseConfig, HouseError},
 };
 use std::{
     cell::Cell,
@@ -91,9 +91,23 @@ impl Fixture {
                 asset("templates/test/files/README.md", content)?,
             ],
         };
-        let current = self.registry.load(&house)?;
-        self.registry.update(&current, &bundle)?;
-        Ok(())
+        self.install(&bundle)
+    }
+    /// Select `bundle` as the house's guidance. Other tests spawn the CLI
+    /// concurrently, and a child forked while this process holds the registry
+    /// lock keeps it until exec, so `Busy` is retried within a bound.
+    fn install(&self, bundle: &InstructionBundle) -> Result {
+        for _ in 0..100 {
+            let current = self.registry.load(&bundle.house)?;
+            match self.registry.update(&current, bundle) {
+                Err(HouseError::Busy) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                result => {
+                    result?;
+                    return Ok(());
+                }
+            }
+        }
+        Err("registry stayed busy".into())
     }
     fn command(&self, verb: &str, target: &Path) -> Command {
         self.command_for(verb, target, "test")

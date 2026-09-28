@@ -2,7 +2,58 @@
 //! issue history and code evidence; this module never reads an Orca session.
 
 use super::{Precheck, WorkflowError, valid_label};
-use crate::contracts::{DecisionOwner, GitHubAction, IssueNumber, MAX_ASKS_PER_TASK};
+use crate::{
+    HouseId,
+    contracts::{DecisionOwner, GitHubAction, IssueNumber, MAX_ASKS_PER_TASK, Repository},
+    integrations::github::{
+        GitHubClient, GitHubReadTransport, Issue, IssueComment, IssueDetail, LinkedPullRequest,
+        Observation, TimelineEvent,
+    },
+};
+
+/// Complete forge inputs for an issue. Code and house requirements still need
+/// their own explicit evidence before a resolution can be chosen.
+#[derive(Debug, Clone)]
+pub struct IssueSources {
+    /// Current issue and labels.
+    pub issue: Issue,
+    /// Body, author, and timestamps.
+    pub detail: IssueDetail,
+    /// Entire comment history.
+    pub comments: Vec<IssueComment>,
+    /// Entire event history.
+    pub timeline: Vec<TimelineEvent>,
+    /// Explicit blocked-by relationships.
+    pub blockers: Vec<Issue>,
+    /// Pull requests linked from or closing this issue.
+    pub linked_prs: Vec<LinkedPullRequest>,
+}
+
+fn known<T>(observation: Observation<T>) -> Result<T, WorkflowError> {
+    match observation {
+        Observation::Known(value) => Ok(value),
+        Observation::Unavailable(_) => Err(WorkflowError::PrecheckFailed),
+        Observation::Unknown => Err(WorkflowError::IncompleteEvidence),
+    }
+}
+
+/// Collect a complete, bounded forge snapshot before policy or an agent runs.
+/// Every read is house scoped by #7's client; a partial read stops the pass.
+pub fn collect_issue<T: GitHubReadTransport>(
+    client: &GitHubClient<T>,
+    house: &HouseId,
+    repo: &Repository,
+    number: IssueNumber,
+) -> Result<IssueSources, WorkflowError> {
+    Ok(IssueSources {
+        issue: known(client.issue(house, repo, number))?,
+        detail: known(client.issue_detail(house, repo, number))?,
+        comments: known(client.comments(house, repo, number))?,
+        timeline: known(client.timeline(house, repo, number))?,
+        blockers: known(client.dependencies(house, repo, number))?,
+        linked_prs: known(client.linked_pull_requests(house, repo, number))?,
+    })
+}
 
 /// A human decision with its exact subject revision and owner.
 #[derive(Debug, Clone, PartialEq, Eq)]

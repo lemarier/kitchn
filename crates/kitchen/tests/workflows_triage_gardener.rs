@@ -1,9 +1,98 @@
 //! Offline triage and gardener behavior fixtures.
 
 use kitchen::{
+    CredentialId, HouseId,
+    contracts::{ExternalRef, Permission, PostingBudget, Repository},
+    integrations::github::{
+        CredentialRef, GitHubClient, GitHubReadTransport, HouseScope, IntegrationError, ReadLimits,
+        ReadRequest,
+    },
+};
+use kitchen::{
     contracts::{DecisionOwner, GitHubAction, IssueNumber},
     workflows::{Precheck, WorkflowError, gardener, triage},
 };
+use std::{cell::RefCell, collections::VecDeque, time::Duration};
+
+#[derive(Default)]
+struct FakeGitHub {
+    pages: RefCell<VecDeque<Result<Vec<u8>, IntegrationError>>>,
+}
+impl GitHubReadTransport for FakeGitHub {
+    fn read(
+        &self,
+        _: &CredentialRef,
+        _: &ReadRequest,
+        _: Duration,
+        _: usize,
+    ) -> Result<Vec<u8>, IntegrationError> {
+        self.pages
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(Err(IntegrationError::Unavailable))
+    }
+}
+fn github_scope() -> Result<HouseScope, Box<dyn std::error::Error>> {
+    let house = HouseId::new("sample")?;
+    let requester = ExternalRef::new("sample-bot")?;
+    Ok(HouseScope::new(
+        house.clone(),
+        [Repository::new("sample/project")?],
+        requester.clone(),
+        CredentialRef::new(house, CredentialId::new("read")?, requester),
+        PostingBudget::new(0)?,
+        [Permission::PostComment],
+    )?)
+}
+fn github_client(
+    pages: Vec<serde_json::Value>,
+) -> Result<GitHubClient<FakeGitHub>, Box<dyn std::error::Error>> {
+    let bytes = pages
+        .into_iter()
+        .map(|page| serde_json::to_vec(&page).map_err(|_| IntegrationError::Unknown))
+        .collect();
+    Ok(GitHubClient::new(
+        github_scope()?,
+        FakeGitHub {
+            pages: RefCell::new(bytes),
+        },
+        ReadLimits::default(),
+    ))
+}
+
+#[test]
+fn triage_collects_complete_forge_sources_and_rejects_partial_reads()
+-> Result<(), Box<dyn std::error::Error>> {
+    use serde_json::json;
+    let issue_json = json!({"repository_url":"https://api.github.com/repos/sample/project","id":10,"number":10,"title":"issue","state":"open","assignees":[],"labels":[]});
+    let detail = json!({"number":10,"state":"open","user":{"login":"owner"},"body":"request","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":null});
+    let pages = vec![
+        issue_json,
+        detail,
+        json!([]),
+        json!([]),
+        json!([]),
+        json!([]),
+        json!({"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}),
+    ];
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let client = github_client(pages.clone())?;
+    let collected = triage::collect_issue(&client, &house, &repo, issue(10))?;
+    assert_eq!(collected.detail.body.as_deref(), Some("request"));
+    assert!(collected.linked_prs.is_empty());
+    let client = github_client(pages[..3].to_vec())?;
+    assert!(matches!(
+        triage::collect_issue(&client, &house, &repo, issue(10)),
+        Err(WorkflowError::PrecheckFailed)
+    ));
+    let client = github_client(pages)?;
+    assert!(matches!(
+        triage::collect_issue(&client, &HouseId::new("foreign")?, &repo, issue(10)),
+        Err(WorkflowError::PrecheckFailed)
+    ));
+    Ok(())
+}
 
 #[expect(clippy::unwrap_used, reason = "fixed fixture issue numbers")]
 fn issue(n: u64) -> IssueNumber {

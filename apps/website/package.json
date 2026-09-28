@@ -1,0 +1,23 @@
+{
+  "name": "website",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "check": "biome check . && astro check && astro build",
+    "preview": "astro build && wrangler dev",
+    "deploy": "node scripts/launch-check.mjs && astro build && wrangler deploy"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.42.4",
+    "astro": "7.3.5",
+    "sharp": "0.35.5"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.10",
+    "simple-icons": "16.33.0",
+    "typescript": "6.0.3",
+    "wrangler": "4.142.0"
+  }
+}

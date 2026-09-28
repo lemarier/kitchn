@@ -1,0 +1,66 @@
+import {
+  type SimpleIcon,
+  siAmp,
+  siAtlassian,
+  siClaude,
+  siCline,
+  siCursor,
+  siGithubcopilot,
+  siGooglegemini,
+  siKimi,
+  siMinimax,
+  siMistralai,
+  siOpencode,
+  siQwen,
+  siTrae,
+} from "simple-icons";
+
+/** Orchestrators kitchn runs on. Add a backend here when its adapter ships. */
+export const backends = ["Orca"] as const;
+
+/** Names the landing page cycles through: every backend, then well-known agents. */
+export const brigadeFor = [...backends, "Claude Code", "Codex", "Gemini", "Cursor", "your agents"];
+
+// Agents Orca can launch, from https://www.onorca.dev/docs/agents/supported
+// (checked 2026-09-28). kitchn reaches them through its Orca backend. Update
+// this list from that page; the count on the site is its length.
+// Logos come from Simple Icons (CC0) only where the brand clearly matches.
+export const orcaAgents: { name: string; icon?: SimpleIcon }[] = [
+  { name: "Claude Code", icon: siClaude },
+  { name: "Claude Agent Teams", icon: siClaude },
+  { name: "Codex" },
+  { name: "Muse Code" },
+  { name: "Grok" },
+  { name: "GitHub Copilot CLI", icon: siGithubcopilot },
+  { name: "OpenCode", icon: siOpencode },
+  { name: "Pi" },
+  { name: "ZCode" },
+  { name: "OMP" },
+  { name: "Prime Agent" },
+  { name: "Gemini", icon: siGooglegemini },
+  { name: "Antigravity" },
+  { name: "Ante" },
+  { name: "Aider" },
+  { name: "Goose" },
+  { name: "Amp", icon: siAmp },
+  { name: "Kilocode" },
+  { name: "Kiro" },
+  { name: "Charm Crush" },
+  { name: "Auggie" },
+  { name: "Autohand" },
+  { name: "Cline", icon: siCline },
+  { name: "Codebuff" },
+  { name: "Command Code" },
+  { name: "Continue" },
+  { name: "Cursor CLI", icon: siCursor },
+  { name: "Devin" },
+  { name: "Droid (Factory)" },
+  { name: "Kimi", icon: siKimi },
+  { name: "Mistral Vibe", icon: siMistralai },
+  { name: "MiniMax", icon: siMinimax },
+  { name: "Qwen Code", icon: siQwen },
+  { name: "Rovo Dev", icon: siAtlassian },
+  { name: "Hermes" },
+  { name: "OpenClaw" },
+  { name: "Trae", icon: siTrae },
+];

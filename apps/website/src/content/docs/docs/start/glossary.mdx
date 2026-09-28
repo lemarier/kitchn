@@ -1,0 +1,18 @@
+---
+title: Glossary
+description: The words kitchn uses, in plain terms.
+---
+
+import { glossary } from "../../../../data/glossary";
+
+kitchn borrows its vocabulary from a restaurant kitchen. Here is what each word
+means in practice.
+
+<dl>
+  {glossary.map((t) => (
+    <>
+      <dt><strong>{t.term}</strong>{t.kitchen && <> ({t.kitchen})</>}</dt>
+      <dd>{t.meaning}</dd>
+    </>
+  ))}
+</dl>

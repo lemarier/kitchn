@@ -1613,7 +1613,16 @@ const DOCUMENTED_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "justfile",
-        "Kitchen keeps a temporary bootstrap-test recipe for its vendored .origin89 tests",
+        "Kitchen keeps a temporary bootstrap-test recipe for its vendored .origin89 tests and website recipes",
+    ),
+    (".gitignore", "Kitchen ignores the website's node_modules"),
+    (
+        ".github/workflows/check.yml",
+        "Kitchen adds a website check job",
+    ),
+    (
+        ".github/dependabot.yml",
+        "Kitchen updates the website's npm dependencies",
     ),
     (
         ".origin89/NOTICE.md",

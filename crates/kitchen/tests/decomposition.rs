@@ -3,7 +3,7 @@
 mod common;
 use common::{Fixture, ManualClock, TestResult, commit, house, interactive, scheduled, ttl};
 use kitchen::{
-    BackendId, CredentialId, Error, ErrorClass, HolderId,
+    BackendId, CredentialId, EffectName, Error, ErrorClass, HolderId,
     contracts::{
         Clock, EffectFailure, ExternalRef, Grant, HouseGrants, IssueNumber, NotAppliedReason,
         Permission, PostingBudget, Provenance, Repository, Settlement, Timestamp, UncertainReason,
@@ -832,6 +832,88 @@ fn a_revised_proposal_waits_for_the_unfinished_one() -> TestResult {
     );
     // Only the original's two submissions reached the forge.
     assert_eq!(forge.borrow().submissions, 2);
+    Ok(())
+}
+
+/// Runs `proposal` once with the forge's fault armed, then again after its
+/// retry budget has lapsed, so the task settles as exhausted.
+fn exhausted_after_a_refused_write(
+    house: &House,
+    forge: &RefCell<Forge>,
+    proposal: &Proposal,
+    approval: &Approval,
+) -> TestResult {
+    house.apply(forge, proposal, approval)?;
+    house.clock.advance(8 * 24 * 60 * 60);
+    let settled = house.apply(forge, proposal, approval)?;
+    assert_eq!(
+        settled.outcome,
+        ApplyOutcome::Settled(Settlement::Exhausted)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_task_that_exhausted_after_writing_keeps_the_repository_guard() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge {
+        fault: Some((2, Fault::Reject)),
+        ..Forge::seeded()
+    });
+    let proposal = project()?;
+    let original = preview(&proposal)?;
+    let approval = approval_of(&original)?;
+    exhausted_after_a_refused_write(&house, &forge, &proposal, &approval)?;
+    let submitted = forge.borrow().submissions;
+    let created = forge.borrow().created().len();
+    assert_eq!(created, 1);
+
+    let mut revised = proposal.clone();
+    if let Some(docs) = revised.issues.first_mut() {
+        docs.title = "Build the docs site".into();
+    }
+    let report = house.apply(&forge, &revised, &approval_of(&preview(&revised)?)?)?;
+    let ApplyOutcome::EarlierSettledWithWrites {
+        task,
+        settlement,
+        writes,
+    } = &report.outcome
+    else {
+        return Err(format!("expected a held guard, got {:?}", report.outcome).into());
+    };
+    assert_eq!(*task, task_id(&original.digest)?);
+    assert_eq!(*settlement, Settlement::Exhausted);
+    let names: Vec<&str> = writes.iter().map(EffectName::as_str).collect();
+    assert_eq!(names, ["issue-core"]);
+    assert_eq!(report.task, None);
+    // Nothing more reached the forge.
+    assert_eq!(forge.borrow().submissions, submitted);
+    assert_eq!(forge.borrow().created().len(), created);
+
+    // The original digest still reports its own settlement, unchanged.
+    let again = house.apply(&forge, &proposal, &approval)?;
+    assert_eq!(again.outcome, ApplyOutcome::Settled(Settlement::Exhausted));
+    Ok(())
+}
+
+#[test]
+fn a_task_that_exhausted_without_writing_releases_the_repository_guard() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge {
+        fault: Some((1, Fault::Reject)),
+        ..Forge::seeded()
+    });
+    let proposal = project()?;
+    let approval = approval_of(&preview(&proposal)?)?;
+    exhausted_after_a_refused_write(&house, &forge, &proposal, &approval)?;
+    assert!(forge.borrow().created().is_empty());
+
+    let mut revised = proposal;
+    if let Some(docs) = revised.issues.first_mut() {
+        docs.title = "Build the docs site".into();
+    }
+    let report = house.apply(&forge, &revised, &approval_of(&preview(&revised)?)?)?;
+    assert_eq!(report.outcome, ApplyOutcome::Completed);
     Ok(())
 }
 

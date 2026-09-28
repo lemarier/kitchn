@@ -493,7 +493,11 @@ impl Preview {
             // The body carries the outcome, owned paths, and acceptance
             // criteria; it is shown as posted so the digest covers what
             // the person read.
-            let _ = writeln!(out, "----- body of #{} as posted -----", index + 1);
+            let _ = writeln!(
+                out,
+                "----- body of #{} as posted (the GitHub backend appends a hidden idempotency marker) -----",
+                index + 1
+            );
             let _ = write!(out, "{}", issue.body);
             if !issue.body.ends_with('\n') {
                 out.push('\n');
@@ -931,6 +935,19 @@ pub enum ApplyOutcome {
         /// The unfinished task.
         task: TaskId,
     },
+    /// An earlier decomposition of this repository settled without
+    /// success after writing, or possibly writing, to the forge. It keeps the
+    /// repository until its owner reconciles the writes and decides how to
+    /// proceed; a different revision could post the same work again. Nothing
+    /// was written.
+    EarlierSettledWithWrites {
+        /// The settled task.
+        task: TaskId,
+        /// How it settled.
+        settlement: Settlement,
+        /// Its writes that were applied or whose outcome is unknown.
+        writes: Vec<EffectName>,
+    },
     /// Another run holds this decomposition's task.
     HeldElsewhere,
     /// A write's outcome is unknown; nothing after it was submitted. The next
@@ -1106,11 +1123,18 @@ pub fn apply<T: GitHubMutationTransport>(
     let fence = match reservation {
         Reservation::Reserved(lease) => lease.fence(),
         Reservation::Blocked(task) => {
-            return Ok(report(
-                preview,
-                None,
-                ApplyOutcome::EarlierUnfinished { task },
-            ));
+            let record = store.task(&task)?;
+            let outcome = match record.state() {
+                TaskState::Settled { settlement, .. } => ApplyOutcome::EarlierSettledWithWrites {
+                    task,
+                    settlement: *settlement,
+                    writes: forge_writes(&record),
+                },
+                TaskState::Open | TaskState::Claimed { .. } => {
+                    ApplyOutcome::EarlierUnfinished { task }
+                }
+            };
+            return Ok(report(preview, None, outcome));
         }
         Reservation::Existing => {
             let record = store.task(&id)?;
@@ -1352,10 +1376,13 @@ fn collect_applied(record: &TaskRecord, steps: &[Step], report: &mut ApplyReport
     Ok(())
 }
 
-/// The unfinished decomposition of `repository` other than `own`, if any: a
-/// task that has not settled and either holds a live claim or has a write
-/// that may have reached the forge. A task that only ever recorded refused
-/// or unsent writes, and is not being run, wrote nothing and frees the slot.
+/// The decomposition of `repository` other than `own` that still holds it,
+/// if any. One holds it while it has not settled and either holds a live
+/// claim or has a write that may have reached the forge, and after it settles
+/// without success if it has such a write: only an owner's reconciliation may
+/// release it, since a different revision could post the same work again. A
+/// task that only ever recorded refused or unsent writes and is not being run
+/// wrote nothing and frees the slot, as does one that settled successfully.
 fn earlier_unfinished(
     tasks: &[&TaskRecord],
     own: &TaskId,
@@ -1369,15 +1396,28 @@ fn earlier_unfinished(
                 && task.spec().id.as_str().starts_with(TASK_PREFIX)
                 && task.spec().repository.as_ref() == Some(repository)
                 && match task.state() {
-                    TaskState::Settled { .. } => false,
+                    TaskState::Settled { settlement, .. } => {
+                        *settlement != Settlement::Succeeded && !forge_writes(task).is_empty()
+                    }
                     TaskState::Claimed { lease } if lease.is_live(now) => true,
-                    TaskState::Open | TaskState::Claimed { .. } => task
-                        .effects()
-                        .iter()
-                        .any(|effect| !matches!(effect.state(), EffectState::NotApplied { .. })),
+                    TaskState::Open | TaskState::Claimed { .. } => !forge_writes(task).is_empty(),
                 }
         })
         .map(|task| task.spec().id.clone())
+}
+
+/// The logical names of `task`'s writes that were applied or may have reached
+/// the forge: everything not recorded as definitely not applied.
+fn forge_writes(task: &TaskRecord) -> Vec<EffectName> {
+    let mut names = Vec::new();
+    for effect in task.effects() {
+        if !matches!(effect.state(), EffectState::NotApplied { .. })
+            && !names.contains(effect.name())
+        {
+            names.push(effect.name().clone());
+        }
+    }
+    names
 }
 
 fn create_action(preview: &Preview, position: usize) -> Result<GitHubAction> {

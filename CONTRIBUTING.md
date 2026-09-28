@@ -42,3 +42,71 @@ out-of-scope defects in the owning repository when posting is authorized.
 Kitchen will adopt its own maintained operating rules after the integrated
 workflows are validated. Keep the engineering bootstrap until equivalent rules
 are available and the migration has been reviewed.
+
+## Module ownership
+
+The owning issue changes this map when an implementation moves. Paths below are
+reserved ownership boundaries, not a request to create empty modules. Keep shared
+exports in `crates/kitchen/src/lib.rs` coordinated with #4. The #3 bootstrap owns
+root manifests and the lockfile until it lands; afterward, any worker needing a
+dependency coordinates the root manifest and lockfile with the other active owners.
+
+| Owner | Library paths under `crates/kitchen/src/` | Other boundaries |
+| --- | --- | --- |
+| #4 core contracts and durable ownership | `id.rs`, `error.rs`, `contracts/`, `state/` | Shared exports; state-store integration tests |
+| #5 house configuration and adoption | `house/`, `adoption/` | CLI adoption commands and managed instruction installation |
+| #6 Orca adapter and scheduling | `adapters/orca/`, `scheduling/` | Backend execution only; generic capability contracts belong to #4 |
+| #7 GitHub and Roger | `integrations/github/`, `integrations/roger/` | House-scoped external access |
+| #8 pickup, coordination and repair | `workflows/pickup.rs`, `workflows/coordination.rs`, `workflows/repair.rs` | Workflow integration tests |
+| #9 exact-head gate | `workflows/gate.rs` | Gate evidence and approval tests |
+| #10 triage and gardener | `workflows/triage.rs`, `workflows/gardener.rs` | Hygiene tests |
+| #11 dishwasher | `workflows/cleanup.rs` | Ownership and preservation tests |
+| #12 trust and inspector | `trust/`, `workflows/inspector.rs` | Evidence and autonomy tests |
+
+Each owner keeps its integration tests in `crates/kitchen/tests/` with a matching
+area name. Coordinate shared `mod.rs`, exports, CLI command registration, and
+manifests before editing; ownership of a leaf does not authorize competing edits
+to those files. Keep domain decisions in the library. The CLI owns argument
+parsing, presentation, and exit codes: 0 for success, 2 for invalid input, and 1
+for execution or output failures. Library errors must remain structured and must
+not echo credentials or raw private input.
+
+## Bounded execution conventions
+
+Before adding I/O, define a finite deadline, input/output byte limits, and the
+owner of the operation. A retry policy must specify maximum attempts and elapsed
+time, retryable errors, and what proves a previous effect did not occur. An
+uncertain external result must be reconciled before retrying; cancellation does
+not prove rollback. Persist intent and idempotency identity before durable or
+external effects. Check cancellation before effects and between bounded waits,
+and define how interrupted work resumes after restart. Never hold a state lock
+across unrelated I/O. No background work or external I/O is implemented by the
+identifier validation commands.
+
+## Commands and review context
+
+From the repository root:
+
+```sh
+just --list
+cargo fetch --locked
+just fmt
+just check
+cargo test -p kitchen --locked --offline
+cargo test -p kitchen-cli --locked --offline
+just msrv-check
+cargo install --path crates/kitchen-cli --locked --offline
+```
+
+`just check` includes doctests through `just test`. The install command uses the
+committed lockfile; repeat it from the same revision to reinstall that version.
+`just security` is a separate networked audit and requires its documented tools.
+
+Local workers load the verified snapshot printed by `just skills-sync`, retain
+that immutable path, and read the working, Rust, testing, writing, review and
+commit skills there. An explicitly supplied verified snapshot takes precedence
+for an active dispatched task. Hosted reviewers read the committed `AGENTS.md`
+and this file at the reviewed revision: those are their reproducible local
+baseline. They must state that the full shared skills are unavailable if their
+snapshot was not supplied and verified; remote links and ignored caches are not
+proof of loading those skills. Hosted reviews do not refresh the cache.

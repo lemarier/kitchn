@@ -39,7 +39,7 @@ fn unknown_commands_fail_without_claiming_execution() -> Result<(), Box<dyn Erro
         .output()?;
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8(output.stderr)?.contains("unexpected argument"));
+    assert!(String::from_utf8(output.stderr)?.contains("unrecognized subcommand"));
     Ok(())
 }
 
@@ -51,5 +51,61 @@ fn unknown_flags_are_rejected() -> Result<(), Box<dyn Error>> {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8(output.stderr)?.contains("unexpected argument"));
+    Ok(())
+}
+
+#[test]
+fn identifiers_are_validated_by_the_library() -> Result<(), Box<dyn Error>> {
+    for command in ["validate-house", "validate-task"] {
+        for id in ["a".to_owned(), "A".repeat(64)] {
+            let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+                .args([command, &id])
+                .output()?;
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(String::from_utf8(output.stdout)?, format!("{id}\n"));
+            assert!(output.stderr.is_empty());
+        }
+        for (id, diagnostic) in [
+            (String::new(), "1 to 64 bytes"),
+            ("a".repeat(65), "1 to 64 bytes"),
+            ("private/secret".to_owned(), "ASCII"),
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+                .args([command, &id])
+                .output()?;
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8(output.stderr)?;
+            assert!(stderr.contains(diagnostic));
+            assert!(!stderr.contains("private/secret"));
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+            .arg(command)
+            .output()?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8(output.stderr)?.contains("required arguments"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_output_is_a_failure() -> Result<(), Box<dyn Error>> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    for args in [vec![], vec!["validate-house", "home"]] {
+        let (writer, reader) = UnixStream::pair()?;
+        drop(reader);
+        let fd: OwnedFd = writer.into();
+        let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+            .args(args)
+            .stdout(Stdio::from(fd))
+            .output()?;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8(output.stderr)?.contains("failed to write command output"));
+    }
     Ok(())
 }

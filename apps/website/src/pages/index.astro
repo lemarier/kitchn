@@ -505,10 +505,11 @@ const menu = [
       </section>
 
       <section class="explorer wrap" aria-labelledby="explorer-title">
-        <h2 id="explorer-title">Start next to it</h2>
+        <h2 id="explorer-title">Start from your session</h2>
         <p class="section-lede center">
-          Every brigade starts supervised. Hand it work from your agent session and watch how each
-          station cooks; set up your house from the terminal in a couple of minutes.
+          Open an Orca workspace, type <code>/kitchn</code> and point it at an issue. It reads the
+          sub-issues and their dependencies, then runs the whole tree through Orca's worktrees,
+          terminals and messaging while you watch and answer.
         </p>
         <div class="term" data-term>
           <svg class="doodle" viewBox="0 0 96 72" aria-hidden="true">
@@ -2000,6 +2001,10 @@ const menu = [
   .center {
     margin-inline: auto;
     text-align: center;
+  }
+  .section-lede code {
+    font: 400 0.9em var(--mono);
+    color: var(--ink);
   }
   .explorer h2 {
     margin-inline: auto;

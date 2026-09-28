@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <title>kitchn</title>
+  <circle cx="16" cy="7" r="2" fill="#e8552b"/>
+  <path d="M5 23a11 11 0 0 1 22 0Z" fill="#e8552b"/>
+  <rect x="3" y="24.5" width="26" height="3" rx="1.5" fill="#e8552b"/>
+</svg>

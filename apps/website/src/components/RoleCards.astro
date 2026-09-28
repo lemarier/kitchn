@@ -1,0 +1,37 @@
+---
+import { roles } from "../lib/roles";
+---
+
+{
+  roles.map((role) => (
+    <section class="role-card">
+      <h2 id={role.slug}>
+        {role.kitchenName} <small>{role.function}</small>
+      </h2>
+      <dl>
+        <dt>Responsibility</dt>
+        <dd>{role.responsibility}</dd>
+        <dt>Evidence</dt>
+        <dd>{role.evidence}</dd>
+        <dt>Boundary</dt>
+        <dd>{role.boundary}</dd>
+      </dl>
+    </section>
+  ))
+}
+
+<style>
+  .role-card small {
+    font-size: 0.55em;
+    color: var(--sl-color-gray-3);
+    font-weight: 500;
+    margin-left: 0.4rem;
+  }
+  dt {
+    font-weight: 700;
+    margin-top: 0.75rem;
+  }
+  dd {
+    margin: 0.2rem 0 0;
+  }
+</style>

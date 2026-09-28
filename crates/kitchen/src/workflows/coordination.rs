@@ -880,13 +880,13 @@ pub fn supervise(
     // A person's terminal is theirs, whichever source reports it.
     let person = state == WorkerState::UserTakeover
         || (live && signals.is_some_and(|signals| signals.terminal == TerminalHolder::Person));
-    // A validation run from before this worker launched is about another one.
     if person {
         // Durable, so the branch stays the person's after their terminal
         // ends or the attempt is replaced.
         ctx.store
             .consume_message(task, fence, &held_key(&view.worker)?, now)?;
     }
+    // A validation run from before this worker launched is about another one.
     let validation = input
         .validation
         .filter(|validation| validation.finished_at >= view.launched_at);

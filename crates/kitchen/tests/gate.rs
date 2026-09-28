@@ -582,7 +582,7 @@ fn unknown_rule_one_and_missing_checks_never_merge() -> TestResult {
     e.same_repository = Some(true);
     e.checks = Checks::Missing;
     assert!(
-        matches!(gate::evaluate(&e,grants()?,GateHistory::default()).verdict,Verdict::FixRequest{gaps} if gaps.contains(&Gap::Checks))
+        matches!(gate::evaluate(&e,grants()?,GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps == [Gap::ChecksUnavailable])
     );
     Ok(())
 }
@@ -891,8 +891,52 @@ fn required_check_absence_from_forge_refuses_merge() -> TestResult {
     )?;
     assert_eq!(observed.checks, Checks::Missing);
     assert!(
-        matches!(gate::evaluate(&observed,grants()?,GateHistory::default()).verdict,Verdict::FixRequest{gaps} if gaps.contains(&Gap::Checks))
+        matches!(gate::evaluate(&observed,grants()?,GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps == [Gap::ChecksUnavailable])
     );
+    Ok(())
+}
+#[test]
+fn unreadable_branch_protection_hands_over_without_a_worker() -> TestResult {
+    let e = ready()?;
+    let client = forge_client(e.head.as_str(), false)?;
+    // A 403/404 on branch protection is not a parseable required-checks body.
+    client.transport().responses.borrow_mut()[7] = serde_json::json!("forbidden");
+    let observed = gate::collect_forge_evidence(
+        &client,
+        &e.house,
+        &e.repository,
+        e.number,
+        &ForgeGatePolicy {
+            authors: vec!["allowed".into()],
+            expected_reviewers: vec!["reviewer".into()],
+        },
+        supplement(&e),
+        secs(1_790_607_600),
+    )?;
+    assert_eq!(observed.checks, Checks::Missing);
+    let decision = gate::evaluate(&observed, grants()?, GateHistory::default());
+    assert_eq!(
+        decision.verdict,
+        Verdict::HandOver {
+            gaps: vec![Gap::ChecksUnavailable]
+        }
+    );
+    Ok(())
+}
+#[test]
+fn unreadable_checks_stay_unfixable_behind_a_blocked_merge_state() -> TestResult {
+    let mut e = ready()?;
+    e.checks = Checks::Missing;
+    for state in [MergeStatusValue::Blocked, MergeStatusValue::Unstable] {
+        e.merge_state = Some(state);
+        assert_eq!(
+            gate::evaluate(&e, grants()?, GateHistory::default()).verdict,
+            Verdict::HandOver {
+                gaps: vec![Gap::ChecksUnavailable]
+            },
+            "{state:?}"
+        );
+    }
     Ok(())
 }
 #[test]

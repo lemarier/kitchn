@@ -480,8 +480,10 @@ pub enum Gap {
     BaseBehind,
     /// Supporting evidence belongs to another head or base.
     SupportingSubject,
-    /// Required checks are pending, failed, or missing.
+    /// Required checks are pending or failed.
     Checks,
+    /// Required check evidence is missing or unreadable, which no push can repair.
+    ChecksUnavailable,
     /// A required current-head review is missing.
     ReviewerPending,
     /// A required review covers only an older commit.
@@ -581,7 +583,10 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     }
     match e.checks {
         Checks::Passed => (),
-        Checks::Pending | Checks::Failed | Checks::Missing => gaps.push(Gap::Checks),
+        Checks::Pending | Checks::Failed => gaps.push(Gap::Checks),
+        // A required context that never reported, or protection or runs the
+        // credential cannot read, is not something a worker's push repairs.
+        Checks::Missing => gaps.push(Gap::ChecksUnavailable),
     }
     // Only a review of the current head counts, whatever its outcome; an
     // older quota failure is stale, not this head's result.
@@ -644,9 +649,9 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     let explained = match e.merge_state {
         Some(MergeStatusValue::Clean) => true,
         Some(MergeStatusValue::Behind) => e.contains_base == Some(false),
-        Some(MergeStatusValue::Blocked | MergeStatusValue::Unstable) => {
-            gaps.iter().any(|gap| EXPLAINS_BLOCKED.contains(gap))
-        }
+        Some(MergeStatusValue::Blocked | MergeStatusValue::Unstable) => gaps
+            .iter()
+            .any(|gap| EXPLAINS_BLOCKED.contains(gap) || *gap == Gap::ChecksUnavailable),
         Some(
             MergeStatusValue::Dirty
             | MergeStatusValue::Draft

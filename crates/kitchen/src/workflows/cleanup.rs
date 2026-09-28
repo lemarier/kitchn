@@ -1636,6 +1636,11 @@ fn evaluate(
     let mut busy: BTreeMap<&TaskId, (bool, bool)> = BTreeMap::new();
     for ((observation, _, owner), worker) in observed.iter().zip(&workers) {
         let Some(task) = owner else { continue };
+        // A branch or schedule is never reclaimed, so it being in use says
+        // nothing about whether the task's other resources are.
+        if !reclaimable(observation.resource.kind) {
+            continue;
+        }
         let flags = busy.entry(task).or_default();
         flags.0 |= observation.liveness != Liveness::Exited
             || worker.is_some_and(|state| !matches!(state, WorkerState::Settled(_)));
@@ -1761,11 +1766,8 @@ fn own_reasons(
     if !same_backend {
         reasons.insert(Exclusion::ForeignBackend);
     }
-    match observation.resource.kind {
-        ResourceKind::Worker | ResourceKind::Terminal | ResourceKind::Worktree => {}
-        ResourceKind::Branch | ResourceKind::Schedule => {
-            reasons.insert(Exclusion::NotReclaimable);
-        }
+    if !reclaimable(observation.resource.kind) {
+        reasons.insert(Exclusion::NotReclaimable);
     }
     match ownership {
         Ownership::Unknown => {
@@ -1863,6 +1865,15 @@ fn own_reasons(
                     .filter_map(|(applies, reason)| applies.then_some(reason)),
             );
         }
+    }
+}
+
+/// Whether the dishwasher may ever release a resource of `kind`. Branches and
+/// schedules are never removed.
+const fn reclaimable(kind: ResourceKind) -> bool {
+    match kind {
+        ResourceKind::Worker | ResourceKind::Terminal | ResourceKind::Worktree => true,
+        ResourceKind::Branch | ResourceKind::Schedule => false,
     }
 }
 

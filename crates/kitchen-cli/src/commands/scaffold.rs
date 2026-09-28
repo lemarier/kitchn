@@ -109,9 +109,15 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
         Err(error) => return installation_error(error),
     }
     let healthy = plan.files().conflicts().next().is_none();
+    let doctor_hint = match (shell_quote(registry.root()), shell_quote(&target)) {
+        (Some(registry), Some(target)) => format!(
+            "then run:\n  kitchen house doctor --registry {registry} --repository-path {target}"
+        ),
+        _ => "then run kitchen house doctor with the exact registry and repository paths; an executable hint cannot represent a non-UTF-8 path.".into(),
+    };
     Ok((
         format!(
-            "{}\nNext: inspect the generated files{}, then run:\n  kitchen house doctor --registry {} --repository-path {}\nKitchen runs no template scripts; follow the generated instructions to load house guidance.",
+            "{}\nNext: inspect the generated files{}, {doctor_hint}\nKitchen runs no template scripts; follow the generated instructions to load house guidance.",
             if healthy {
                 "Repository files applied."
             } else {
@@ -122,17 +128,28 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
             } else {
                 " and reconcile template revisions"
             },
-            shell_quote(registry.root()),
-            shell_quote(&target),
         ),
         healthy,
     ))
 }
 
 /// Quote a path as one POSIX shell word: wrap it in single quotes and write
-/// each embedded single quote as `'\''`. Non-UTF-8 bytes print lossily.
-fn shell_quote(path: &std::path::Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
+/// each embedded single quote as `'\''`. Refuse bytes that cannot be printed
+/// exactly in UTF-8 output.
+fn shell_quote(path: &std::path::Path) -> Option<String> {
+    Some(format!("'{}'", path.to_str()?.replace('\'', r"'\''")))
+}
+
+#[cfg(all(test, unix))]
+mod quote_tests {
+    use super::*;
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::Path};
+
+    #[test]
+    fn refuses_non_utf8_path_instead_of_changing_its_bytes() {
+        let path = OsString::from_vec(b"registry-\xff".to_vec());
+        assert_eq!(shell_quote(Path::new(&path)), None);
+    }
 }
 
 fn confirm() -> Result<bool, HouseError> {
@@ -233,7 +250,10 @@ mod tests {
             ("/$HOME `x` \"q\"", "'/$HOME `x` \"q\"'"),
             ("", "''"),
         ] {
-            assert_eq!(shell_quote(std::path::Path::new(path)), quoted);
+            assert_eq!(
+                shell_quote(std::path::Path::new(path)).as_deref(),
+                Some(quoted)
+            );
         }
     }
 

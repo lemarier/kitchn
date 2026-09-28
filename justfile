@@ -62,7 +62,7 @@ install:
     #!/usr/bin/env bash
     set -euo pipefail
     commit=$(git rev-parse HEAD)
-    if [ -n "$(git status --porcelain)" ]; then
+    if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
         echo "not recording the commit: the working tree has uncommitted changes" >&2
         commit=
     elif [ -z "$(git branch -r --contains "$commit")" ]; then

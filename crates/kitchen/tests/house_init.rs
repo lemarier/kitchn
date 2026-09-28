@@ -580,6 +580,15 @@ fn embedded_guidance_needs_this_builds_commit() -> TestResult {
         .ok_or("planned without a build commit")?;
     assert!(matches!(error, HouseInitError::BuildCommitUnknown));
     assert!(error.to_string().contains("--bundle"));
+    // Unanswered questions are reported before the unknown build commit.
+    let unanswered = InitAnswers {
+        house: None,
+        ..flags(&registry)
+    };
+    assert!(matches!(
+        plan_house_init(&unanswered, &unknown, &NoGitHubAccess, None),
+        Err(HouseInitError::MissingAnswers(missing)) if missing == [InitQuestion::House]
+    ));
     let mut script = Script::new(&["", "acme", "", "", "", "", "", "test", ""]);
     let prompted = plan_house_init(
         &InitAnswers::default(),

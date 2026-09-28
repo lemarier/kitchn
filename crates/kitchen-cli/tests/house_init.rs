@@ -280,11 +280,16 @@ fn house_scoped_github_access_offers_the_branch_required_checks() -> TestResult 
 
 #[test]
 fn the_built_in_guidance_is_refused_without_a_recorded_build_commit() -> TestResult {
+    // A build that recorded its commit (`just install`) can label the
+    // embedded guidance; this scenario only exists without one.
+    if option_env!("KITCHEN_COMMIT").is_some_and(|commit| CommitId::new(commit).is_ok()) {
+        return Ok(());
+    }
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let (checkout, home) = fixture(&root)?;
-    // This test binary is built without KITCHEN_COMMIT, so no commit can be
-    // claimed for the embedded guidance, whatever --kitchen says.
+    // No commit can be claimed for the embedded guidance, whatever --kitchen
+    // says.
     for extra in [&[][..], &["--kitchen", KITCHEN][..]] {
         let mut args = vec!["--house", "acme", "--required-checks", "none", "--yes"];
         args.extend(extra);

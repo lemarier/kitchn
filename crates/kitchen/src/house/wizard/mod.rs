@@ -372,7 +372,12 @@ pub fn plan_house_init(
         Some(Offer::plain(Role::Expediter.as_str().to_owned())),
         names,
     )?;
-    let kitchen = session.kitchen(answers, facts.kitchen.as_ref())?;
+    // Unanswered questions are reported first; an unknown build commit is
+    // only worth an error once every other answer is in hand.
+    let kitchen = match session.kitchen(answers, facts.kitchen.as_ref()) {
+        Err(HouseInitError::BuildCommitUnknown) if !session.missing.is_empty() => None,
+        other => other?,
+    };
     if !answers.yes && session.prompter.is_none() {
         session.missing.push(InitQuestion::Confirm);
     }

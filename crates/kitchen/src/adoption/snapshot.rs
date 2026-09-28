@@ -182,6 +182,16 @@ pub fn resolve_instructions(
     house: &HouseConfig,
     repository_revision: Option<CommitId>,
 ) -> Result<ResolvedInstructions, HouseError> {
+    verified_snapshot(root, house, repository_revision).map(|(resolved, _)| resolved)
+}
+
+/// Verify the house's configured snapshot and return its bundle as verified in
+/// the same pass, so callers never reread snapshot files after verification.
+pub(crate) fn verified_snapshot(
+    root: &Path,
+    house: &HouseConfig,
+    repository_revision: Option<CommitId>,
+) -> Result<(ResolvedInstructions, InstructionBundle), HouseError> {
     super::registry::ensure_external(root)?;
     let snapshot = snapshot_path(root, house);
     let manifest: SnapshotManifest = serde_json::from_slice(
@@ -228,7 +238,7 @@ pub fn resolve_instructions(
             return Err(HouseError::UnverifiedSnapshot);
         }
     }
-    Ok(ResolvedInstructions {
+    let resolved = ResolvedInstructions {
         house: house.house.clone(),
         provenance: Provenance {
             kitchen: house.kitchen.clone(),
@@ -238,9 +248,10 @@ pub fn resolve_instructions(
         entrypoint: snapshot
             .join("house")
             .join(manifest.bundle.entrypoint.as_path()),
-        role_cards_digest: manifest.bundle.role_cards_digest,
+        role_cards_digest: manifest.bundle.role_cards_digest.clone(),
         snapshot,
-    })
+    };
+    Ok((resolved, manifest.bundle))
 }
 
 /// SHA-256 of the ordered role paths and UTF-8 contents, encoded as lowercase hex.

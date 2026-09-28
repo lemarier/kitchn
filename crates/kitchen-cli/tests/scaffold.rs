@@ -1,6 +1,14 @@
 //! Real CLI, disposable local houses; no network or runtime activation.
-use kitchen::{adoption::HouseRegistry, house::HouseConfig};
+use kitchen::{
+    HouseId,
+    adoption::{
+        HouseRegistry, InstructionAsset, InstructionBundle, RelativePath, role_cards_digest,
+    },
+    contracts::CommitId,
+    house::HouseConfig,
+};
 use std::{
+    cell::Cell,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -10,26 +18,13 @@ type Result = std::result::Result<(), Box<dyn std::error::Error>>;
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
+    registry: HouseRegistry,
+    /// Fill character of the next guidance revision to publish.
+    next_guidance: Cell<u8>,
 }
-impl Fixture {
-    fn new() -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        let root = temp.path().canonicalize()?;
-        let registry = HouseRegistry::new(root.join("registry"))?;
-        let house: HouseConfig = serde_json::from_str(include_str!(
-            "../../kitchen/tests/fixtures/house/crabnebula.json"
-        ))?;
-        registry.initialize(&house)?;
-        fs::create_dir_all(root.join("template/files"))?;
-        let fixture = Self { _temp: temp, root };
-        fixture.revision(1)?;
-        Ok(fixture)
-    }
-    fn revision(&self, revision: u32) -> Result {
-        fs::write(
-            self.root.join("template/template.toml"),
-            format!(
-                r#"schema = 1
+fn manifest(revision: u32) -> String {
+    format!(
+        r#"schema = 1
 name = "test"
 house = "crabnebula"
 revision = {revision}
@@ -41,29 +36,83 @@ provenance = "html-comment"
 source = "README.md"
 provenance = "html-comment"
 "#
-            ),
-        )?;
-        for name in ["AGENTS.md", "README.md"] {
-            fs::write(
-                self.root.join("template/files").join(name),
-                format!("content revision {revision}\n"),
-            )?;
-        }
+    )
+}
+fn asset(
+    path: &str,
+    contents: &str,
+) -> std::result::Result<InstructionAsset, Box<dyn std::error::Error>> {
+    Ok(InstructionAsset {
+        path: RelativePath::new(path)?,
+        contents: contents.to_owned(),
+    })
+}
+impl Fixture {
+    fn new() -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let registry = HouseRegistry::new(root.join("registry"))?;
+        let house: HouseConfig = serde_json::from_str(include_str!(
+            "../../kitchen/tests/fixtures/house/crabnebula.json"
+        ))?;
+        registry.initialize(&house)?;
+        let fixture = Self {
+            _temp: temp,
+            root,
+            registry,
+            next_guidance: Cell::new(b'b'),
+        };
+        fixture.revision(1)?;
+        Ok(fixture)
+    }
+    /// Publish template revision `revision` under a new pinned guidance revision.
+    fn revision(&self, revision: u32) -> Result {
+        let content = format!("content revision {revision}\n");
+        self.publish(&manifest(revision), &content)
+    }
+    /// Import guidance containing the `test` template and select its revision.
+    fn publish(&self, manifest: &str, content: &str) -> Result {
+        let fill = self.next_guidance.get();
+        self.next_guidance.set(fill + 1);
+        let house = HouseId::new("crabnebula")?;
+        let bundle = InstructionBundle {
+            schema: 1,
+            house: house.clone(),
+            kitchen: CommitId::new(&"a".repeat(40))?,
+            role_cards_digest: role_cards_digest(),
+            guidance: CommitId::new(&char::from(fill).to_string().repeat(40))?,
+            entrypoint: RelativePath::new("SKILL.md")?,
+            notices: [RelativePath::new("NOTICE.md")?].into(),
+            assets: vec![
+                asset("SKILL.md", "Apply the house rules.")?,
+                asset("NOTICE.md", "Synthetic fixture notice.")?,
+                asset("templates/test/template.toml", manifest)?,
+                asset("templates/test/files/AGENTS.md", content)?,
+                asset("templates/test/files/README.md", content)?,
+            ],
+        };
+        let current = self.registry.load(&house)?;
+        self.registry.update(&current, &bundle)?;
         Ok(())
     }
     fn command(&self, verb: &str, target: &Path) -> Command {
+        self.command_for(verb, target, "test")
+    }
+    fn command_for(&self, verb: &str, target: &Path, template: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kitchen"));
         command
             .arg(verb)
             .arg(target)
             .arg("--registry")
             .arg(self.root.join("registry"))
-            .arg("--template")
-            .arg(self.root.join("template"));
+            .args(["--template", template]);
         command
     }
     fn selected(&self, verb: &str) -> Command {
-        let mut command = self.command(verb, &self.root.join("consumer"));
+        self.selected_for(verb, "test")
+    }
+    fn selected_for(&self, verb: &str, template: &str) -> Command {
+        let mut command = self.command_for(verb, &self.root.join("consumer"), template);
         command.args([
             "--house",
             "crabnebula",
@@ -153,18 +202,17 @@ fn missing_house_invalid_template_and_binding_override_write_nothing() -> Result
         .output()?;
     assert_eq!(output.status.code(), Some(1));
     assert!(!f.root.join("consumer").exists());
-    fs::write(f.root.join("template/template.toml"), "invalid")?;
+    f.publish("invalid", "content\n")?;
     assert_eq!(
         f.selected("init").arg("--yes").output()?.status.code(),
         Some(2)
     );
     assert!(!f.root.join("consumer").exists());
-    f.revision(1)?;
-    let manifest = fs::read_to_string(f.root.join("template/template.toml"))?.replace(
+    let manifest = manifest(1).replace(
         "source = \"README.md\"",
         "source = \"README.md\"\npath = \".kitchen.json\"",
     );
-    fs::write(f.root.join("template/template.toml"), manifest)?;
+    f.publish(&manifest, "content\n")?;
     assert_eq!(
         f.selected("init").arg("--yes").output()?.status.code(),
         Some(2)
@@ -286,5 +334,24 @@ fn redirected_and_invalid_target_roots_are_refused() -> Result {
     assert_eq!(fs::read_dir(f.root.join("destination"))?.count(), 0);
     assert_eq!(fs::read_to_string(f.root.join("file"))?, "local");
     assert!(!f.root.join("absent").exists());
+    Ok(())
+}
+
+#[test]
+fn template_names_resolve_only_from_the_pinned_guidance() -> Result {
+    let f = Fixture::new()?;
+    let output = f.selected_for("init", "absent").arg("--yes").output()?;
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.contains("no template named absent"), "{stderr}");
+    let output = f.selected_for("init", "../test").output()?;
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(!f.root.join("consumer").exists());
+    let output = f.selected("init").arg("--yes").output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        fs::read_to_string(f.root.join("consumer/README.md"))?
+            .contains(&format!("guidance-revision={}", "b".repeat(40)))
+    );
     Ok(())
 }

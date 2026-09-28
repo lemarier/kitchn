@@ -46,6 +46,14 @@ impl TryFrom<String> for TemplateName {
     }
 }
 
+impl FromStr for TemplateName {
+    type Err = crate::IdentifierError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
 impl fmt::Display for TemplateName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)

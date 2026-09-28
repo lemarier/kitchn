@@ -4,7 +4,7 @@ use std::{fmt, io, path::PathBuf};
 
 use crate::{ErrorClass, HouseId};
 
-use super::VariableName;
+use super::{TemplateName, VariableName};
 use crate::adoption::RelativePath;
 
 /// A size or count bound that a template or its output exceeded.
@@ -106,6 +106,12 @@ pub enum ScaffoldError {
         /// The template engine's description.
         message: String,
     },
+    /// The selected guidance revision contains no template with this name.
+    #[error("the pinned house guidance has no template named {name}")]
+    TemplateNotFound {
+        /// The requested template.
+        name: TemplateName,
+    },
     /// A required variable has no value and no default.
     #[error("missing value for template variable {name}")]
     MissingVariable {
@@ -175,6 +181,7 @@ impl ScaffoldError {
             | Self::Template { .. }
             | Self::Syntax { .. }
             | Self::Render { .. }
+            | Self::TemplateNotFound { .. }
             | Self::MissingVariable { .. }
             | Self::UnknownVariable { .. }
             | Self::InvalidVariableName
@@ -224,6 +231,9 @@ pub enum TemplateProblem {
     Empty,
     /// A marker would displace a shebang/front matter, or mark an executable.
     MarkerPlacement(RelativePath),
+    /// The manifest declares a different name than the guidance directory
+    /// the template was selected from.
+    NameMismatch,
 }
 
 impl fmt::Display for TemplateProblem {
@@ -262,6 +272,9 @@ impl fmt::Display for TemplateProblem {
                 "{} cannot carry a first-line provenance marker",
                 path.as_str()
             ),
+            Self::NameMismatch => {
+                formatter.write_str("manifest name differs from its guidance directory")
+            }
         }
     }
 }

@@ -5,7 +5,7 @@ use kitchen::{
     adoption::{FileStatus, HouseRegistry},
     contracts::Repository,
     house::HouseError,
-    scaffold::{Template, VariableName, plan_repository},
+    scaffold::{TemplateName, VariableName, plan_repository},
 };
 use std::{
     collections::BTreeMap,
@@ -21,9 +21,9 @@ pub struct ScaffoldArgs {
     /// External house registry created by kitchen house init.
     #[arg(long)]
     registry: PathBuf,
-    /// Reviewed template directory from the selected house's pinned guidance.
+    /// Template name in the selected house's pinned guidance snapshot.
     #[arg(long)]
-    template: PathBuf,
+    template: TemplateName,
     /// Required for an unbound repository; never inferred from available houses.
     #[arg(long)]
     house: Option<HouseId>,
@@ -47,7 +47,6 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
         return Err(HouseError::InvalidInput.into());
     }
     let registry = HouseRegistry::new(canonical_target(args.registry)?)?;
-    let template = Template::load(&args.template)?;
     let mut variables = BTreeMap::new();
     for value in args.variables {
         let (name, value) = value.split_once('=').ok_or(HouseError::InvalidInput)?;
@@ -61,7 +60,7 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
         &target,
         args.house,
         args.repository,
-        &template,
+        &args.template,
         &variables,
     )?;
     // Flush the entire preview before even asking for consent or writing files.

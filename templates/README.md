@@ -1,15 +1,19 @@
 # Initialize or adopt a repository
 
-Register a reviewed house configuration with `kitchen house init` first. The
-house allowlist must contain the repository. Obtain the template directory from
-the selected house's pinned guidance export; Kitchen checks its declared house
-and records the configured guidance revision, but does not authenticate the
-export's origin. Templates are trusted code inputs and must terminate.
+Register a reviewed house configuration with `kitchen house init` and import its
+pinned guidance with `kitchen house sync` first. The house allowlist must contain
+the repository. `--template` names a template in that guidance: Kitchen verifies
+the house's immutable snapshot for its configured guidance revision, loads
+`templates/<name>/` from the verified bundle, and records that revision in
+provenance markers. A missing or modified snapshot, or a name absent from the
+pinned guidance, is refused. Authenticating the bundle's origin remains the
+caller's step before `house sync`. Templates are trusted code inputs and must
+terminate.
 
 ```sh
 kitchen init my-project --registry /path/to/registry \
   --house example --repository example/my-project \
-  --template /path/to/guidance/templates/example --set project_name=my-project
+  --template example --set project_name=my-project
 ```
 
 The default is a preview of every addition, identical file, and conflict. Repeat
@@ -25,7 +29,9 @@ binding. Missing selection fails closed, even with only one registered house.
 Existing workflow selections and additional checks/reviewers are retained;
 new bindings select no workflows. Templates cannot replace the binding.
 
-Rerun `adopt` with a newer reviewed template to preview updates. Provenance
+After `kitchen house update` selects a newer guidance revision, rerun `adopt` to
+preview its template updates; earlier snapshots are retained for active tasks
+but are not used for new plans. Provenance
 markers distinguish pristine managed files whose upstream content or revision
 changed from files edited locally. Both are conflicts and remain untouched,
 even with `--yes`; reconcile them manually. Only missing files are installed.
@@ -67,8 +73,10 @@ not establish that guidance was installed. For pinned tasks use the immutable
 snapshot returned by `house sync`; the legacy refresh script follows upstream
 and must not silently change an active task's pin.
 
-Kitchen ships only `example/`. Copy it into your house guidance, set the house
-identity, declare all files, and bump the template revision when content changes.
+Kitchen ships only `example/`. Copy it into your house guidance as
+`templates/<name>/`, with `template.toml` and its `files/` tree as bundle assets,
+set the house identity and a manifest `name` matching the directory, declare all
+files, and bump the template revision when content changes.
 Keep product policy separate from Kitchen's development standards.
 
 ## Values in structured output

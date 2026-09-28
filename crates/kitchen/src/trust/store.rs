@@ -548,7 +548,7 @@ impl Ledger {
             .grants
             .iter_mut()
             .find(|audit| audit_identity(audit).0 == id)
-            .ok_or(TrustError::Incomplete)?;
+            .ok_or(TrustError::NotFound)?;
         match audit {
             GrantAudit::Revoked { .. } | GrantAudit::RevokedProposal { .. } => Ok(false),
             GrantAudit::Proposed(proposal) => {
@@ -576,7 +576,7 @@ impl Ledger {
         }
     }
 
-    /// The immutable issuance/revocation trail.
+    /// Current decisions with original proposal, approval, and revocation sources.
     ///
     /// # Errors
     /// Returns storage failures.

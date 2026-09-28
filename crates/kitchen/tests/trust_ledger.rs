@@ -628,7 +628,7 @@ fn unknown_revocation_and_privileged_grants_are_refused() -> TestResult {
             source("fixture:revoke")?,
             at(6)
         ),
-        Err(TrustError::Incomplete)
+        Err(TrustError::NotFound)
     ));
     for permission in [
         Permission::ReleaseResource,

@@ -19,6 +19,9 @@ pub enum TrustError {
     /// A required record or predecessor is absent.
     #[error("trust evidence is incomplete")]
     Incomplete,
+    /// The requested grant identity has never been proposed or issued.
+    #[error("trust grant not found")]
+    NotFound,
     /// Storage or inspection bound exhausted.
     #[error("trust budget exhausted")]
     Exhausted,
@@ -42,7 +45,9 @@ impl TrustError {
         match self {
             Self::Authority(error) => error.class(),
             Self::Invalid => ErrorClass::InvalidInput,
-            Self::Refused | Self::Exhausted | Self::UnsafePath => ErrorClass::Refused,
+            Self::Refused | Self::NotFound | Self::Exhausted | Self::UnsafePath => {
+                ErrorClass::Refused
+            }
             Self::Conflict | Self::Incomplete => ErrorClass::Conflict,
             Self::Corrupt | Self::Busy | Self::Io(_) => ErrorClass::Execution,
         }

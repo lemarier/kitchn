@@ -1451,6 +1451,12 @@ impl StoreState {
         }
         let attempt = match task.running_attempt_mut(plan.fence) {
             Some(attempt) => attempt.number,
+            // A stop effect after takeover or adoption runs under the latest
+            // attempt without starting ordinary work.
+            None if stopping => match task.attempts.last() {
+                Some(last) => last.number,
+                None => return fail(StateError::NoRunningAttempt),
+            },
             None => return fail(StateError::NoRunningAttempt),
         };
         if plan.decided_at != task.evidence.revision {

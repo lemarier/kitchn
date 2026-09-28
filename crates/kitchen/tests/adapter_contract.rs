@@ -1373,3 +1373,81 @@ fn a_delayed_absence_cannot_clear_a_newer_submission() -> TestResult {
     assert_eq!(effect.submissions(), 2);
     Ok(())
 }
+
+#[test]
+fn a_new_owner_can_stop_the_worker_after_cancellation() -> TestResult {
+    for adopt in [false, true] {
+        let fixture = Fixture::new()?;
+        let (task, fence) = started(&fixture, "task-1")?;
+        let backend = FakeBackend::fully_capable(backend_id()?, house()?);
+        let clock = ManualClock::starting_at(1);
+        let launched = run_effect(
+            &fixture.store,
+            &backend,
+            &grants()?,
+            plan(&task, fence, "launch", launch()?)?,
+            &clock,
+        )?;
+        let EffectState::Applied { receipt, .. } = launched.state() else {
+            return Err("launch not applied".into());
+        };
+        let worker = receipt
+            .resources()
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::Worker)
+            .cloned()
+            .ok_or("receipt names no worker")?;
+        fixture
+            .store
+            .request_cancel(&task, &holder("operator")?, at(2))?;
+        let owner = if adopt {
+            fixture.store.relinquish(&task, fence, at(3))?;
+            fixture
+                .store
+                .claim(&task, &scheduled("coordinator-b")?, ttl(60)?, at(4))?
+        } else {
+            fixture
+                .store
+                .take_over(&task, &scheduled("coordinator-b")?, ttl(60)?, at(61))?
+        };
+        assert!(matches!(
+            fixture.store.start_attempt(&task, owner.fence(), at(62)),
+            Err(Error::State(StateError::CancelRequested))
+        ));
+        let stopped = run_effect(
+            &fixture.store,
+            &backend,
+            &grants()?,
+            plan(
+                &task,
+                owner.fence(),
+                "cancel",
+                Operation::CancelWorker {
+                    worker: worker.clone(),
+                },
+            )?,
+            &ManualClock::starting_at(62),
+        )?;
+        assert!(matches!(stopped.state(), EffectState::Applied { .. }));
+        assert_eq!(
+            stopped.request().attempt(),
+            AttemptNumber::FIRST,
+            "no new attempt was started"
+        );
+        assert!(matches!(
+            run_effect(
+                &fixture.store,
+                &backend,
+                &grants()?,
+                plan(&task, owner.fence(), "relaunch", launch()?)?,
+                &ManualClock::starting_at(62)
+            ),
+            Err(Error::State(StateError::CancelRequested))
+        ));
+        fixture
+            .store
+            .settle_cancelled(&task, owner.fence(), at(63))?;
+        assert_eq!(fixture.store.task(&task)?.attempts().len(), 1);
+    }
+    Ok(())
+}

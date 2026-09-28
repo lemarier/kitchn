@@ -14,6 +14,7 @@ pub mod pickup;
 pub mod push;
 pub mod recovery;
 pub mod repair;
+pub mod stack;
 pub mod triage;
 
 use crate::{integrations::github::Observation, scheduling::PrecheckOutcome};

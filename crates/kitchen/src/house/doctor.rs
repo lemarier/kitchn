@@ -1,5 +1,5 @@
 use super::{
-    HouseError, LabelPreview, LabelStatus, RepositoryConfig, RepositoryLabel, Workflow,
+    HouseError, LabelPreview, LabelStatus, RepositoryConfig, RepositoryLabel, StackTool, Workflow,
     missing_capabilities, preview_labels, workflow_requirements,
 };
 use crate::{
@@ -40,6 +40,23 @@ pub struct DoctorEvidence {
     /// Models each installed agent reports offering; `None` means not observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_models: Option<Vec<OfferedModels>>,
+    /// The configured stack tool as detected on this host; `None` when it
+    /// was not probed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_tool: Option<StackToolStatus>,
+}
+
+/// Whether the house's stack tool is usable on this host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum StackToolStatus {
+    /// The tool answered with its version.
+    Installed {
+        /// The version it reported.
+        version: String,
+    },
+    /// The tool or the program that hosts it is not installed.
+    Missing,
 }
 /// A precise remaining setup action. No command here is executed automatically.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +85,8 @@ pub enum DoctorCode {
     AgentModel,
     /// A legacy `.kitchen.json` remains in the working tree.
     LegacyBinding,
+    /// The configured stack tool is missing or was not probed.
+    StackTool,
 }
 impl DoctorFinding {
     /// Report a leftover legacy binding file. Kitchen never deletes it.
@@ -235,6 +254,15 @@ pub fn doctor(
             findings.push(DoctorFinding { code: DoctorCode::AgentModel, message: format!("{message}: {names}."), next_step: "List the models each installed agent offers and rerun doctor with that observation. Correct the house agents policy for any model that is not offered; Kitchen refuses launches it cannot provide and never substitutes another model.".into() });
         }
     }
+    if let Some(tool) = house.stack_tool
+        && let Some(finding) = stack_tool_finding(
+            tool,
+            &repository.workflows,
+            evidence.and_then(|evidence| evidence.stack_tool.as_ref()),
+        )
+    {
+        findings.push(finding);
+    }
     let access = evidence.map_or(AccessStatus::Unobserved, |evidence| evidence.access);
     if access != AccessStatus::Available {
         findings.push(DoctorFinding { code: DoctorCode::Access, message: format!("House-scoped repository access: {access:?}."), next_step: format!("Configure {} access in the external credential provider, then probe {} through the house-scoped integration and rerun doctor; never put credential values in repository files.", house.house, repository.repository) });
@@ -247,5 +275,52 @@ pub fn doctor(
         missing_capabilities,
         access,
         findings,
+    })
+}
+
+/// Workflows that create dependent branches and stacked pull requests.
+const STACKING_WORKFLOWS: [Workflow; 1] = [Workflow::Pickup];
+
+/// The blocking finding for a configured stack tool that a stacking
+/// workflow needs and that is missing or was not probed.
+#[must_use]
+pub fn stack_tool_finding(
+    tool: StackTool,
+    workflows: &BTreeSet<Workflow>,
+    status: Option<&StackToolStatus>,
+) -> Option<DoctorFinding> {
+    let needed: Vec<&str> = STACKING_WORKFLOWS
+        .iter()
+        .filter(|workflow| workflows.contains(workflow))
+        .map(|workflow| workflow.as_str())
+        .collect();
+    if needed.is_empty() {
+        return None;
+    }
+    let (state, next_step) = match status {
+        Some(StackToolStatus::Installed { .. }) => return None,
+        Some(StackToolStatus::Missing) => (
+            "is not installed",
+            format!(
+                "Install {} on this host, then rerun doctor with its probe; dependent pull requests stay blocked until then.",
+                tool.command()
+            ),
+        ),
+        None => (
+            "was not probed",
+            format!(
+                "Probe {} on this host and rerun doctor with the result; dependent pull requests stay blocked until then.",
+                tool.command()
+            ),
+        ),
+    };
+    Some(DoctorFinding {
+        code: DoctorCode::StackTool,
+        message: format!(
+            "Stack tool {} {state} (needed by: {}).",
+            tool.command(),
+            needed.join(", ")
+        ),
+        next_step,
     })
 }

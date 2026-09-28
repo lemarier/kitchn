@@ -30,11 +30,13 @@ use crate::{
         BranchName, Clock, CommitId, Fence, GrantScope, HouseGrants, IssueNumber, Permission,
         Repository,
     },
+    house::StackTool,
     integrations::github::{GitHubClient, GitHubReadTransport},
     state::{HouseStore, StateError, TaskState},
     workflows::{
         coordination::CoordinationError,
         repair::{Observed, PullRequestState, PullRequestView, observe_pull_request},
+        stack::{BranchLayer, BranchOperation, StackRefusal, check_plain},
     },
 };
 
@@ -81,6 +83,9 @@ pub enum PushRefusal {
     PullRequestMissing,
     /// The observation is about another pull request.
     WrongPullRequest,
+    /// The branch is a dependent layer and the house configures a stack
+    /// tool: push it through [`crate::workflows::stack::StackBoundary`].
+    StackToolRequired(StackTool),
     /// State could not be read.
     Unknown,
 }
@@ -234,6 +239,10 @@ pub struct PushBoundary<'a> {
     /// The branch the task owns, from its durable record and never from the
     /// pushing worker: the only branch this boundary reads and updates.
     pub branch: &'a BranchName,
+    /// Where that branch sits, from the task's durable record.
+    pub layer: &'a BranchLayer,
+    /// The house's configured stack tool, if any.
+    pub stack_tool: Option<StackTool>,
     /// Time source.
     pub clock: &'a dyn Clock,
     /// Pull request reads.
@@ -249,7 +258,8 @@ impl PushBoundary<'_> {
     ///
     /// Nothing is read or sent until the task's live claim at `fence` and its
     /// delegated [`Permission::PushBranch`] for its repository are checked
-    /// against the house's current grants. The pull request and the remote
+    /// against the house's current grants. A dependent layer is refused when
+    /// the house configures a stack tool. The pull request and the remote
     /// head are then read, the push is checked against them, and the update
     /// is a compare-and-swap on the head that was read.
     ///
@@ -291,6 +301,15 @@ impl PushBoundary<'_> {
             self.destination,
         )?;
 
+        let operation = match intent.expected_remote {
+            None => BranchOperation::Create,
+            Some(_) => BranchOperation::Push,
+        };
+        if let Err(StackRefusal::StackToolRequired { tool, .. }) =
+            check_plain(self.stack_tool, self.layer, operation)
+        {
+            return Ok(PushOutcome::Refused(PushRefusal::StackToolRequired(tool)));
+        }
         let observed = PushObservation {
             pull_request: match intent.pull_request {
                 Some(number) => self.pull_requests.pull_request(number),
@@ -389,39 +408,56 @@ impl GitRemote {
         })
     }
 
-    /// Run `git` with `args` and return its exit code and bounded stdout.
-    /// `None` means the process did not complete: it could not start, ran
-    /// past the deadline, or produced too much output.
     fn run(&self, args: &[&str]) -> Option<(Option<i32>, Vec<u8>)> {
-        let mut output = tempfile::tempfile().ok()?;
-        let mut child = Command::new(&self.git)
-            .args(args)
-            .current_dir(&self.worktree)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("LC_ALL", "C")
-            // A caller inside a Git hook must not redirect Git to its own repository.
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(output.try_clone().ok()?))
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let started = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if started.elapsed() < self.deadline => thread::sleep(GIT_POLL),
-                Ok(None) | Err(_) => {
-                    // Best effort: the process may already have exited.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-            }
-        };
-        Some((status.code(), read_bounded(&mut output)?))
+        run_bounded(
+            &self.git,
+            &self.worktree,
+            args,
+            &[("GIT_TERMINAL_PROMPT", "0")],
+            self.deadline,
+        )
     }
+}
+
+/// Run `program` in `dir` with `args` and `env`, stdin closed and stdout
+/// captured to a file (never a terminal), and return its exit code and
+/// bounded stdout. `None` means the process did not complete: it could not
+/// start, ran past `deadline`, or produced too much output.
+pub(crate) fn run_bounded(
+    program: &std::path::Path,
+    dir: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    deadline: Duration,
+) -> Option<(Option<i32>, Vec<u8>)> {
+    let mut output = tempfile::tempfile().ok()?;
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .envs(env.iter().copied())
+        .env("LC_ALL", "C")
+        // A caller inside a Git hook must not redirect Git to its own repository.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output.try_clone().ok()?))
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < deadline => thread::sleep(GIT_POLL),
+            Ok(None) | Err(_) => {
+                // Best effort: the process may already have exited.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    Some((status.code(), read_bounded(&mut output)?))
 }
 
 /// Read `file` from the start, refusing more than [`MAX_GIT_OUTPUT`] bytes.

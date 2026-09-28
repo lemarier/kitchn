@@ -23,6 +23,7 @@ use kitchen::{
             RefUpdater, RemoteBranches, UpdateFailure,
         },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
+        stack::BranchLayer,
     },
 };
 use workflows_support::{World, branch, issue, template, under_consumer};
@@ -184,6 +185,8 @@ fn boundary<'a>(
         grants: &setup.world.grants,
         destination: &setup.github,
         branch: &setup.branch,
+        layer: &BranchLayer::Independent,
+        stack_tool: None,
         clock: &setup.world.clock,
         pull_requests: reads,
         remote: reads,
@@ -543,6 +546,63 @@ fn only_the_live_claim_holder_may_push() -> TestResult {
     ));
     assert_eq!(error.class(), ErrorClass::Conflict);
     assert_eq!(reads, 0);
+    Ok(())
+}
+
+#[test]
+fn a_stacked_layer_is_never_pushed_on_the_plain_path_when_a_stack_tool_is_configured() -> TestResult
+{
+    use kitchen::house::StackTool;
+    let setup = pushing()?;
+    let head = commit('d')?;
+    let parent = branch("lemarier/issue-4")?;
+    let dependent = BranchLayer::Dependent { parent };
+    let push = |layer: &BranchLayer,
+                tool: Option<StackTool>,
+                intent: &PushIntent|
+     -> TestResult<(PushOutcome, u32, usize)> {
+        let reads = Reads::new(open(5)?, Observed::Known(Some(head.clone())));
+        let updater = Recorder::answering(Ok(()));
+        let outcome = PushBoundary {
+            layer,
+            stack_tool: tool,
+            ..boundary(&setup, &reads, &updater)
+        }
+        .push(&setup.task, setup.fence, intent, &commit('e')?)?;
+        let updates = updater.calls.borrow().len();
+        Ok((outcome, reads.total(), updates))
+    };
+    // A dependent layer under a configured tool: refused before any read,
+    // for an update and for a first push alike.
+    let update = update_intent(Some(head.clone()))?;
+    let create = PushIntent {
+        pull_request: None,
+        expected_remote: None,
+    };
+    for intent in [&update, &create] {
+        assert_eq!(
+            push(&dependent, Some(StackTool::GhStack), intent)?,
+            (
+                PushOutcome::Refused(PushRefusal::StackToolRequired(StackTool::GhStack)),
+                0,
+                0
+            )
+        );
+    }
+    // An independent branch, or a house without a stack tool, pushes.
+    for (layer, tool) in [
+        (&BranchLayer::Independent, Some(StackTool::GhStack)),
+        (&dependent, None),
+    ] {
+        let (outcome, _, updates) = push(layer, tool, &update)?;
+        assert_eq!(
+            outcome,
+            PushOutcome::Pushed {
+                replaced: Some(head.clone())
+            }
+        );
+        assert_eq!(updates, 1);
+    }
     Ok(())
 }
 

@@ -353,6 +353,7 @@ fn doctor_unknown_is_not_success_and_scoped_evidence_can_complete_it() -> TestRe
         labels: Some(labels),
         access: AccessStatus::Available,
         agent_models: None,
+        stack_tool: None,
     };
     assert!(doctor(&registry, &repository, Some(&evidence))?.healthy());
     evidence.house = config("crabnebula")?.house;
@@ -590,6 +591,7 @@ fn label_metadata_drift_is_informational_in_preview_and_doctor() -> TestResult {
         labels: Some(labels.clone()),
         access: AccessStatus::Available,
         agent_models: None,
+        stack_tool: None,
     };
     let report = doctor(&registry, &repository, Some(&evidence))?;
     assert!(report.healthy());
@@ -661,5 +663,55 @@ fn repository_lookup_rejects_relative_input() -> TestResult {
         checkout_remotes(Path::new(".")),
         Err(HouseError::InvalidInput)
     ));
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_a_configured_stack_tool_that_is_missing() -> TestResult {
+    use kitchen::house::{StackTool, StackToolStatus};
+    let temp = tempfile::tempdir()?;
+    let registry = HouseRegistry::new(temp.path().canonicalize()?.join("registry"))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/house/origin89.json"))?;
+    value["stackTool"] = serde_json::json!("gh-stack");
+    let house: HouseConfig = serde_json::from_value(value)?;
+    assert_eq!(house.stack_tool, Some(StackTool::GhStack));
+    // Houses written before the field keep working without a stack tool.
+    assert_eq!(config("origin89")?.stack_tool, None);
+    let repository = repo(&house)?;
+    registry.initialize(&house)?;
+    registry.sync(&house.house, &bundle("origin89")?)?;
+    let labels: Vec<RepositoryLabel> = doctor(&registry, &repository, None)?
+        .labels
+        .into_iter()
+        .map(|item| RepositoryLabel {
+            name: item.requirement.name,
+            color: item.requirement.color,
+            description: item.requirement.description,
+        })
+        .collect();
+    let mut evidence = DoctorEvidence {
+        house: house.house.clone(),
+        repository: repository.repository.clone(),
+        capabilities: CapabilitySet::supporting(Capability::ALL),
+        labels: Some(labels),
+        access: AccessStatus::Available,
+        stack_tool: Some(StackToolStatus::Missing),
+    };
+    let report = doctor(&registry, &repository, Some(&evidence))?;
+    assert!(!report.healthy());
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .map(|finding| finding.code)
+            .collect::<Vec<_>>(),
+        vec![DoctorCode::StackTool]
+    );
+    assert!(report.human_readable().contains("gh stack"));
+    evidence.stack_tool = Some(StackToolStatus::Installed {
+        version: "0.1.0".into(),
+    });
+    assert!(doctor(&registry, &repository, Some(&evidence))?.healthy());
     Ok(())
 }

@@ -76,10 +76,12 @@ pub struct ThreadBounds {
     pub max_turns: u32,
     /// Participants, including invited ones, 2 to [`MAX_PARTICIPANTS`].
     pub max_participants: u32,
-    /// Tokens all turns may use together; at least 1. A turn whose usage the
-    /// backend cannot report ends the thread, since the bound can no longer
-    /// be enforced.
-    pub max_tokens: u64,
+    /// Tokens all turns may use together; at least 1 when set. A thread
+    /// without a token budget accepts turns whose usage the backend cannot
+    /// report. With one, such a turn ends the thread, since the budget can no
+    /// longer be enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
 }
 
 impl ThreadBounds {
@@ -88,7 +90,10 @@ impl ThreadBounds {
             && self.max_turns <= MAX_TURNS
             && self.max_participants >= 2
             && self.max_participants <= MAX_PARTICIPANTS
-            && self.max_tokens >= 1
+            && match self.max_tokens {
+                Some(tokens) => tokens >= 1,
+                None => true,
+            }
     }
 }
 
@@ -497,19 +502,16 @@ impl Thread {
         }
         self.turns = self.turns.saturating_add(1);
         let bounds = self.spec.bounds;
-        let cut_off = match turn.usage {
-            TurnUsage::Unknown => Some(CutOffReason::UsageUnknown),
-            TurnUsage::Tokens(used) => {
+        let budget = bounds.max_tokens;
+        let cut_off = match (turn.usage, budget) {
+            (TurnUsage::Unknown, Some(_)) => Some(CutOffReason::UsageUnknown),
+            (TurnUsage::Unknown, None) => None,
+            (TurnUsage::Tokens(used), _) => {
                 self.tokens = self.tokens.saturating_add(used);
-                if self.tokens >= bounds.max_tokens {
-                    Some(CutOffReason::UsageBound)
-                } else if self.turns >= bounds.max_turns {
-                    Some(CutOffReason::TurnBound)
-                } else {
-                    None
-                }
+                budget.and_then(|max| (self.tokens >= max).then_some(CutOffReason::UsageBound))
             }
-        };
+        }
+        .or_else(|| (self.turns >= bounds.max_turns).then_some(CutOffReason::TurnBound));
         if let Some(reason) = cut_off {
             self.status = ThreadStatus::Closed(Closure::CutOff(reason));
         }

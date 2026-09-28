@@ -38,6 +38,7 @@ use crate::{
         EffectRecord, EffectStart, Lease, MarkerAttempt, MarkerFact, MarkerKey, MarkerRecording,
         RecoveryItem, Reservation, RiskDecision, TaskRecord, WorkflowMarker, WriteAcknowledgement,
         effects::SettledLookup,
+        marker::PairPlan,
         model::StoreState,
         snapshot::{SnapshotStore, StoreLayout, StoreOptions},
     },
@@ -593,6 +594,26 @@ impl HouseStore {
         guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
     ) -> Result<MarkerAttempt<R>> {
         self.transact(|state| state.record_marker_unless(key, fact, recorded_by, now, guard))
+    }
+
+    /// Record `first` and, as the guard decides, `second` in one store
+    /// transaction. A refusal or error leaves neither written, so callers
+    /// never see one marker without the other they meant to write with it.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::record_marker`], for either marker, and
+    /// any the guard returns.
+    pub(crate) fn record_marker_pair_unless<R>(
+        &self,
+        first: (MarkerKey, MarkerFact),
+        second: (MarkerKey, MarkerFact),
+        recorded_by: &Claimant,
+        now: Timestamp,
+        guard: impl FnOnce(&[&WorkflowMarker]) -> Result<PairPlan<R>>,
+    ) -> Result<MarkerAttempt<R>> {
+        self.transact(|state| {
+            state.record_marker_pair_unless(first, second, recorded_by, now, guard)
+        })
     }
 
     /// Like [`Self::record_marker_unless`], but a key that is already

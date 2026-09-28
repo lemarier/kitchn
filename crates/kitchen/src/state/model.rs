@@ -25,7 +25,7 @@ use crate::{
         ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerAttempt, MarkerFact,
         MarkerKey, MarkerRecording, StateError, WorkflowMarker,
         effects::{Found, SettledLookup},
-        marker::{MarkerRefusal, Markers},
+        marker::{MarkerRefusal, Markers, PairPlan},
     },
 };
 
@@ -2253,6 +2253,47 @@ impl StoreState {
         guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
     ) -> Result<MarkerAttempt<R>> {
         self.record_marker_guarded(key, fact, recorded_by, now, Some(pending), guard)
+    }
+
+    /// Record `first` and, when the guard asks for it, `second` in one
+    /// transaction. The guard reads the workflow's markers before either is
+    /// written. It blocks both, skips `second`, or records both; an error
+    /// from either recording leaves neither written. Keys that are already
+    /// recorded resolve as in [`Self::record_marker`].
+    pub(crate) fn record_marker_pair_unless<R>(
+        &mut self,
+        first: (MarkerKey, MarkerFact),
+        second: (MarkerKey, MarkerFact),
+        recorded_by: &Claimant,
+        now: Timestamp,
+        guard: impl FnOnce(&[&WorkflowMarker]) -> Result<PairPlan<R>>,
+    ) -> Result<MarkerAttempt<R>> {
+        self.check_claimant(recorded_by, now)?;
+        let (first_key, first_fact) = first;
+        let (second_key, second_fact) = second;
+        let mut plan = PairPlan::Both;
+        if self.markers.get(&first_key).is_none() || self.markers.get(&second_key).is_none() {
+            let siblings: Vec<&WorkflowMarker> =
+                self.markers.for_workflow(&first_key.workflow).collect();
+            plan = guard(&siblings)?;
+        }
+        if let PairPlan::Block(blocked) = plan {
+            return Ok(MarkerAttempt::Blocked(blocked));
+        }
+        let recorded = self
+            .markers
+            .record(first_key, first_fact, recorded_by, now)
+            .or_else(marker_refusal)?;
+        if matches!(plan, PairPlan::Both) {
+            self.markers
+                .record(second_key, second_fact, recorded_by, now)
+                .or_else(marker_refusal)?;
+        }
+        match recorded {
+            MarkerRecording::Recorded(marker) => Ok(MarkerAttempt::Recorded(marker)),
+            MarkerRecording::AlreadyRecorded(marker) => Ok(MarkerAttempt::AlreadyRecorded(marker)),
+            MarkerRecording::Superseded(_) => fail(StateError::MarkerConflict),
+        }
     }
 
     fn record_marker_guarded<R>(

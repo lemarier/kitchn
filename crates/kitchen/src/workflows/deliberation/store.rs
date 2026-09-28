@@ -24,7 +24,7 @@ use crate::{
     integrations::roger::DecisionStatus,
     state::{
         EffectState, HouseStore, MAX_MARKER_PAYLOAD_BYTES, MarkerAttempt, MarkerFact, MarkerKey,
-        MarkerSchema, MarkerSubject, StateError, WorkItem, WorkflowMarker,
+        MarkerSchema, MarkerSubject, PairPlan, StateError, WorkItem, WorkflowMarker,
     },
 };
 
@@ -279,9 +279,12 @@ impl<'a> Deliberations<'a> {
         Ok((posting, ask))
     }
 
-    /// Record a person's answer to the thread's pending question. `status`
-    /// must come from [`crate::integrations::roger::validate_answer`] for
-    /// `ask` and `binding`. The thread resumes only when `binding` is exactly
+    /// Record a person's answer to the thread's pending question. Callers
+    /// must pass a `status` produced by
+    /// [`crate::integrations::roger::validate_answer`] for this `ask` and
+    /// `binding`; this method cannot tell a validated status from a forged
+    /// one, and checks only the recorded Ask, the binding, and the evidence.
+    /// The thread resumes only when `binding` is exactly
     /// the pending question's, `ask` is the Ask the task's named effect
     /// created, and the task's evidence has not moved since. An answer
     /// records instructions only; approvals are refused, because
@@ -401,21 +404,48 @@ impl<'a> Deliberations<'a> {
         let record = ContextRecord::summarize(&thread, draft)?;
         let key = self.key(task, &format!("record/{}", record.id))?;
         let fact = workflow_fact(&schema(RECORD_SCHEMA)?, &record)?;
-        let attempt =
-            self.store
-                .record_marker_unless(key, fact, self.recorded_by, now, |markers| {
-                    Ok(check_publication(&records(markers)?, &record))
-                });
+        let reference = record.reference();
+        let pin_key = self.key(task, &format!("pin/{}", reference.record))?;
+        let pin = workflow_fact(&schema(PIN_SCHEMA)?, &reference)?;
+        let item = task_item(task);
+        // The record and its pin are written in one transaction, so a pin
+        // refusal leaves no orphan record and consumes no identity.
+        let attempt = self.store.record_marker_pair_unless(
+            (key, fact),
+            (pin_key, pin),
+            self.recorded_by,
+            now,
+            |markers| {
+                let mut published = records(markers)?;
+                match published.iter().find(|one| one.id == record.id) {
+                    Some(same) if *same == record => {}
+                    Some(_) => {
+                        return Ok(PairPlan::Block(DeliberationError::RecordImmutable));
+                    }
+                    None => {
+                        if let Some(refusal) = check_publication(&published, &record) {
+                            return Ok(PairPlan::Block(refusal));
+                        }
+                        published.push(record.clone());
+                    }
+                }
+                Ok(
+                    match pin_block(&published, &pins(markers, &item)?, &reference)? {
+                        None => PairPlan::Both,
+                        Some(PinBlock::Covered) => PairPlan::FirstOnly,
+                        Some(PinBlock::Refused(refusal)) => PairPlan::Block(refusal),
+                    },
+                )
+            },
+        );
         match attempt {
-            Ok(MarkerAttempt::Recorded(_) | MarkerAttempt::AlreadyRecorded(_)) => {}
-            Ok(MarkerAttempt::Blocked(refusal)) => return Err(refusal.into()),
+            Ok(MarkerAttempt::Recorded(_) | MarkerAttempt::AlreadyRecorded(_)) => Ok(record),
+            Ok(MarkerAttempt::Blocked(refusal)) => Err(refusal.into()),
             Err(Error::State(StateError::MarkerConflict)) => {
-                return Err(DeliberationError::RecordImmutable.into());
+                Err(DeliberationError::RecordImmutable.into())
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         }
-        self.pin(task, &record.reference(), now)?;
-        Ok(record)
     }
 
     /// Read a published record by reference.
@@ -450,26 +480,7 @@ impl<'a> Deliberations<'a> {
         let attempt =
             self.store
                 .record_marker_unless(key, fact, self.recorded_by, now, |markers| {
-                    let published = records(markers)?;
-                    let Some(record) = published.iter().find(|one| one.id == reference.record)
-                    else {
-                        return Ok(Some(PinBlock::Refused(DeliberationError::UnknownRecord)));
-                    };
-                    let pinned = pins(markers, &item)?;
-                    let target = current(&published, record)?;
-                    for pin in &pinned {
-                        let Some(earlier) = published.iter().find(|one| one.id == pin.record)
-                        else {
-                            return Err(DeliberationError::Corrupt.into());
-                        };
-                        if current(&published, earlier)?.id == target.id {
-                            return Ok(Some(PinBlock::Covered));
-                        }
-                    }
-                    if pinned.len() >= MAX_PINS_PER_TASK {
-                        return Ok(Some(PinBlock::Refused(DeliberationError::PinBound)));
-                    }
-                    Ok(None)
+                    pin_block(&records(markers)?, &pins(markers, &item)?, reference)
                 })?;
         match attempt {
             MarkerAttempt::Blocked(PinBlock::Refused(refusal)) => Err(refusal.into()),
@@ -693,6 +704,31 @@ fn current<'r>(
         }
     }
     Err(DeliberationError::Corrupt.into())
+}
+
+/// Why `reference` may not be pinned next to the task's `pinned` records,
+/// if any. `published` must include the referenced record.
+fn pin_block(
+    published: &[ContextRecord],
+    pinned: &[RecordRef],
+    reference: &RecordRef,
+) -> Result<Option<PinBlock>> {
+    let Some(record) = published.iter().find(|one| one.id == reference.record) else {
+        return Ok(Some(PinBlock::Refused(DeliberationError::UnknownRecord)));
+    };
+    let target = current(published, record)?;
+    for pin in pinned {
+        let Some(earlier) = published.iter().find(|one| one.id == pin.record) else {
+            return Err(DeliberationError::Corrupt.into());
+        };
+        if current(published, earlier)?.id == target.id {
+            return Ok(Some(PinBlock::Covered));
+        }
+    }
+    if pinned.len() >= MAX_PINS_PER_TASK {
+        return Ok(Some(PinBlock::Refused(DeliberationError::PinBound)));
+    }
+    Ok(None)
 }
 
 /// Why `record` may not be published next to `published`, if any.

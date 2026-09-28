@@ -399,6 +399,17 @@ pub enum MarkerAttempt<R> {
     Blocked(R),
 }
 
+/// What a guard decides for a pair of markers recorded in one transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PairPlan<R> {
+    /// Record both markers.
+    Both,
+    /// Record only the first marker.
+    FirstOnly,
+    /// Record neither.
+    Block(R),
+}
+
 /// The persisted markers of one house.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]

@@ -11,7 +11,7 @@ use common::{
     task_id, ttl,
 };
 use kitchen::{
-    BackendId, EffectName, ErrorClass, TaskId,
+    BackendId, EffectName, ErrorClass, TaskId, WorkflowId,
     contracts::{
         AskRisk, AttemptStart, Capability, CapabilityRequirements, ContractError, DecisionBinding,
         DecisionOwner, Effect, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
@@ -20,7 +20,9 @@ use kitchen::{
         fake::FakeBackend,
     },
     integrations::roger::DecisionStatus,
-    state::{EffectState, HouseStore, StoreOptions, run_effect},
+    state::{
+        EffectState, HouseStore, MarkerKey, MarkerSubject, StoreOptions, WorkItem, run_effect,
+    },
     workflows::deliberation::{
         AnswerOutcome, Closure, ContextRecord, CutOffReason, DeliberationError, Deliberations,
         Entry, HumanQuestion, MessageSeq, NextTurn, Participant, Posting, RecordDecision,
@@ -172,7 +174,16 @@ const fn bounds(max_turns: u32, max_participants: u32, max_tokens: u64) -> Threa
     ThreadBounds {
         max_turns,
         max_participants,
-        max_tokens,
+        max_tokens: Some(max_tokens),
+    }
+}
+
+/// Bounds without a token budget, for a backend that reports no usage.
+const fn unmetered(max_turns: u32, max_participants: u32) -> ThreadBounds {
+    ThreadBounds {
+        max_turns,
+        max_participants,
+        max_tokens: None,
     }
 }
 
@@ -409,6 +420,7 @@ fn usage_bounds_cut_the_thread_off_and_unknown_usage_is_not_zero() -> TestResult
         &ThreadStatus::Closed(Closure::CutOff(CutOffReason::UsageBound))
     );
 
+    // With a budget, a turn of unknown usage fails closed.
     let kitchen = Kitchen::new()?;
     let thread = kitchen.open(bounds(10, 4, 500))?;
     let mut unmeasured = turn("reply-1", Role::SousChef, "Unmeasured.", &[], 0)?;
@@ -420,6 +432,50 @@ fn usage_bounds_cut_the_thread_off_and_unknown_usage_is_not_zero() -> TestResult
         posted.thread().status(),
         &ThreadStatus::Closed(Closure::CutOff(CutOffReason::UsageUnknown))
     );
+    Ok(())
+}
+
+#[test]
+fn a_thread_without_a_token_budget_runs_on_unreported_usage_until_its_turn_bound() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let thread = kitchen.open(unmetered(3, 4))?;
+    let deliberations = kitchen.deliberations()?;
+    let authors = [Role::SousChef, Role::StationCook, Role::SousChef];
+    for (index, author) in authors.into_iter().enumerate() {
+        let mut unmeasured = turn(&format!("reply-{index}"), author, "Unmeasured.", &[], 0)?;
+        unmeasured.usage = TurnUsage::Unknown;
+        let posted = deliberations.post(&kitchen.task, &thread, unmeasured, at(5))?;
+        let expected = if index + 1 < authors.len() {
+            ThreadStatus::Open
+        } else {
+            ThreadStatus::Closed(Closure::CutOff(CutOffReason::TurnBound))
+        };
+        assert_eq!(posted.thread().status(), &expected);
+        assert_eq!(posted.thread().tokens(), 0);
+    }
+
+    // Reported usage is still counted, though nothing bounds it.
+    let kitchen = Kitchen::new()?;
+    let thread = kitchen.open(unmetered(5, 4))?;
+    let posted = kitchen.deliberations()?.post(
+        &kitchen.task,
+        &thread,
+        turn("reply-1", Role::SousChef, "Counted.", &[], 1_000_000)?,
+        at(5),
+    )?;
+    assert_eq!(posted.thread().tokens(), 1_000_000);
+    assert_eq!(posted.thread().status(), &ThreadStatus::Open);
+    Ok(())
+}
+
+#[test]
+fn a_zero_token_budget_is_an_invalid_spec() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let spec = kitchen.spec(bounds(10, 4, 0))?;
+    let opened = kitchen
+        .deliberations()?
+        .open(spec, kitchen.backend_descriptor(), at(4));
+    assert_eq!(refusal(opened)?, DeliberationError::InvalidSpec);
     Ok(())
 }
 
@@ -1062,6 +1118,27 @@ fn a_task_pins_a_bounded_number_of_records() -> TestResult {
             deliberations.pin(&later_id, &record.reference(), at(7))?;
         } else {
             assert_eq!(refusal(record)?, DeliberationError::PinBound);
+            // The refused publication left nothing behind: no record to
+            // read, no record or pin marker, and the task still holds four.
+            let reference = RecordRef {
+                house: house()?,
+                record: RecordId::new("record-4")?,
+            };
+            assert_eq!(
+                refusal(deliberations.record(&reference))?,
+                DeliberationError::UnknownRecord
+            );
+            for subject in ["record/record-4", "pin/record-4"] {
+                let key = MarkerKey {
+                    workflow: WorkflowId::new("deliberation")?,
+                    item: WorkItem::Task {
+                        task: kitchen.task.clone(),
+                    },
+                    subject: MarkerSubject::Observation(ExternalRef::new(subject)?),
+                };
+                assert_eq!(kitchen.fixture.store.marker(&key)?, None, "{subject}");
+            }
+            assert_eq!(deliberations.task_context(&kitchen.task)?.records.len(), 4);
         }
     }
     assert_eq!(deliberations.task_context(&later_id)?.records.len(), 4);

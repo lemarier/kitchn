@@ -536,6 +536,19 @@ fn an_environment_fault_is_inspected_and_the_validation_retried_once() -> TestRe
         world.now(),
         ValidationFailure::Environment(EnvironmentFault::NoSpace),
     );
+    // A run from before this worker launched is about an earlier worker.
+    assert_eq!(
+        step(
+            &world,
+            &task,
+            fence,
+            &failed(
+                at(999),
+                ValidationFailure::Environment(EnvironmentFault::NoSpace)
+            )
+        )?,
+        Supervision::Running(WorkerState::Ready)
+    );
     // A test failure is the worker's to fix; supervision does not act.
     assert_eq!(
         step(
@@ -607,19 +620,16 @@ fn a_worker_that_ended_on_an_environment_fault_retries_as_a_new_attempt() -> Tes
     world
         .backend
         .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Failed));
+    let failed = |finished_at| SupervisionInput {
+        validation: Some(ValidationReport {
+            failure: ValidationFailure::Environment(EnvironmentFault::NoSpace),
+            finished_at,
+        }),
+        ..SupervisionInput::default()
+    };
+    world.clock.advance(1);
     assert_eq!(
-        step(
-            &world,
-            &task,
-            fence,
-            &SupervisionInput {
-                validation: Some(ValidationReport {
-                    failure: ValidationFailure::Environment(EnvironmentFault::NoSpace),
-                    finished_at: world.now(),
-                }),
-                ..SupervisionInput::default()
-            }
-        )?,
+        step(&world, &task, fence, &failed(world.now()))?,
         Supervision::EnvironmentFailure {
             fault: EnvironmentFault::NoSpace,
             workspace: worker,

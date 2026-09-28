@@ -761,6 +761,10 @@ pub fn supervise(
     // A person's terminal is theirs, whichever source reports it.
     let person = state == WorkerState::UserTakeover
         || (live && signals.is_some_and(|signals| signals.terminal == TerminalHolder::Person));
+    // A validation run from before this worker launched is about another one.
+    let validation = input
+        .validation
+        .filter(|validation| validation.finished_at >= view.launched_at);
     let stalled = signals
         .and_then(RecoverySignals::idle_since)
         .is_some_and(|since| now.saturating_since(since) > policy.idle_deadline);
@@ -781,7 +785,7 @@ pub fn supervise(
     }
     if live
         && !person
-        && let Some(validation) = input.validation
+        && let Some(validation) = validation
         && let ValidationFailure::Environment(fault) = validation.failure
     {
         return environment(ctx, task, &view, state, &validation, fault);
@@ -848,7 +852,7 @@ pub fn supervise(
         }
         WorkerState::Settled(WorkerOutcome::Failed) => {
             let failed = AttemptOutcome::Failed(FailureClass::Retryable);
-            match input.validation.map(|validation| validation.failure) {
+            match validation.map(|validation| validation.failure) {
                 Some(ValidationFailure::Environment(fault)) => {
                     Ok(match end_attempt(ctx, task, fence, failed)? {
                         None => Supervision::Settled(Settlement::Exhausted),

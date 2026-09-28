@@ -1,12 +1,16 @@
 //! Offline triage and gardener behavior fixtures.
 
 use kitchen::{
-    CredentialId, HouseId,
-    contracts::{ExternalRef, Permission, PostingBudget, Repository},
+    CredentialId, HouseId, TaskId,
+    contracts::{
+        CommitId, DecisionBinding, EvidenceRevision, ExternalRef, Permission, PostingBudget,
+        Repository, Text,
+    },
     integrations::github::{
         CredentialRef, GitHubClient, GitHubReadTransport, HouseScope, IntegrationError, ReadLimits,
         ReadRequest,
     },
+    integrations::roger::{DecisionStatus, RogerClient, RogerReadTransport},
 };
 use kitchen::{
     contracts::{DecisionOwner, GitHubAction, IssueNumber},
@@ -30,6 +34,18 @@ impl GitHubReadTransport for FakeGitHub {
             .borrow_mut()
             .pop_front()
             .unwrap_or(Err(IntegrationError::Unavailable))
+    }
+}
+struct FakeRoger(Vec<u8>);
+impl RogerReadTransport for FakeRoger {
+    fn get(
+        &self,
+        _: &CredentialRef,
+        _: &ExternalRef,
+        _: Duration,
+        _: usize,
+    ) -> Result<Vec<u8>, IntegrationError> {
+        Ok(self.0.clone())
     }
 }
 fn github_scope() -> Result<HouseScope, Box<dyn std::error::Error>> {
@@ -67,13 +83,15 @@ fn triage_collects_complete_forge_sources_and_rejects_partial_reads()
     let issue_json = json!({"repository_url":"https://api.github.com/repos/sample/project","id":10,"number":10,"title":"issue","state":"open","assignees":[],"labels":[]});
     let detail = json!({"number":10,"state":"open","user":{"login":"owner"},"body":"request","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":null});
     let pages = vec![
-        issue_json,
-        detail,
+        issue_json.clone(),
+        detail.clone(),
         json!([]),
         json!([]),
         json!([]),
         json!([]),
         json!({"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}),
+        detail.clone(),
+        issue_json,
     ];
     let house = HouseId::new("sample")?;
     let repo = Repository::new("sample/project")?;
@@ -81,6 +99,21 @@ fn triage_collects_complete_forge_sources_and_rejects_partial_reads()
     let collected = triage::collect_issue(&client, &house, &repo, issue(10))?;
     assert_eq!(collected.detail.body.as_deref(), Some("request"));
     assert!(collected.linked_prs.is_empty());
+    let mut stale = pages.clone();
+    stale[7]["updated_at"] = json!("2026-01-03T00:00:00Z");
+    let client = github_client(stale)?;
+    assert!(matches!(
+        triage::collect_issue(&client, &house, &repo, issue(10)),
+        Err(WorkflowError::IncompleteEvidence)
+    ));
+    let mut stale_labels = pages.clone();
+    stale_labels[8]["labels"] =
+        json!([{"name":"agent-working","color":"000000","description":null}]);
+    let client = github_client(stale_labels)?;
+    assert!(matches!(
+        triage::collect_issue(&client, &house, &repo, issue(10)),
+        Err(WorkflowError::IncompleteEvidence)
+    ));
     let client = github_client(pages[..3].to_vec())?;
     assert!(matches!(
         triage::collect_issue(&client, &house, &repo, issue(10)),
@@ -94,12 +127,53 @@ fn triage_collects_complete_forge_sources_and_rejects_partial_reads()
     Ok(())
 }
 
+#[test]
+fn spec_answer_is_routed_and_bound_before_it_can_resume() -> Result<(), Box<dyn std::error::Error>>
+{
+    use serde_json::json;
+    let mut binding = DecisionBinding {
+        house: HouseId::new("sample")?,
+        task: TaskId::new("t01ARZ3NDEKTSV4RRFFQ69G5FAV")?,
+        owner: DecisionOwner::Spec,
+        repository: Repository::new("sample/project")?,
+        action: Permission::AskHuman,
+        target: ExternalRef::new("issue:sample/project#10")?,
+        revision: EvidenceRevision::INITIAL,
+        subject: CommitId::new(&"a".repeat(40))?,
+        limits: Text::new("question only")?,
+    };
+    let ask_id = ExternalRef::new("01ARZ3NDEKTSV4RRFFQ69G5FAV")?;
+    let answer = json!({"id":ask_id,"requester":"sample-bot","repo":"sample/project","decisionKey":binding.decision_key()?,"kind":"question","action":null,"resume":{"task":binding.task,"rev":"a".repeat(40)},"state":"answered","supersededBy":null,"answer":{"decision":"other","optionId":"_custom","action":null,"input":"Use limit 3","passkey":false}});
+    let client = RogerClient::new(
+        github_scope()?,
+        FakeRoger(serde_json::to_vec(&answer)?),
+        ReadLimits::default(),
+    );
+    assert!(
+        matches!(triage::poll_spec_answer(&client, &binding, &ask_id), Ok(DecisionStatus::Instructions(Some(text))) if text.as_str() == "Use limit 3")
+    );
+    binding.house = HouseId::new("foreign")?;
+    assert_eq!(
+        triage::poll_spec_answer(&client, &binding, &ask_id),
+        Err(WorkflowError::DecisionMismatch)
+    );
+    binding.house = HouseId::new("sample")?;
+    binding.owner = DecisionOwner::Merge;
+    assert_eq!(
+        triage::poll_spec_answer(&client, &binding, &ask_id),
+        Err(WorkflowError::DecisionMismatch)
+    );
+    Ok(())
+}
+
 #[expect(clippy::unwrap_used, reason = "fixed fixture issue numbers")]
 fn issue(n: u64) -> IssueNumber {
     IssueNumber::new(n).unwrap()
 }
+#[expect(clippy::unwrap_used, reason = "fixed fixture repository")]
 fn triage_input() -> triage::Evidence {
     triage::Evidence {
+        repository: Repository::new("sample/project").unwrap(),
         issue: issue(10),
         revision: "r1".into(),
         coverage: triage::Coverage {
@@ -208,6 +282,28 @@ fn triage_caps_asks_and_rejects_partial_evidence() {
         triage::precheck(&input),
         Err(WorkflowError::IncompleteEvidence)
     );
+}
+
+#[test]
+fn unresolved_issue_requests_one_bounded_gardener_worker() {
+    use kitchen::contracts::{Capability, Operation, Role, Workspace};
+    let mut input = triage_input();
+    input.factual_resolution = None;
+    let plan = triage::plan(&input);
+    assert!(matches!(
+        plan,
+        Ok(changes) if matches!(&changes[..], [triage::Change::Judgment(Operation::LaunchWorker {
+            role: Role::Gardener,
+            workspace: Workspace::Isolated,
+            brief,
+        })] if brief.as_str().contains("sample/project issue #10"))
+    ));
+    let request = triage::judgment_request(&input);
+    assert!(
+        matches!(request, Ok(Some(op)) if op.required_capability() == Capability::WorkerLaunchIsolated)
+    );
+    input.claimed_by_other = true;
+    assert_eq!(triage::judgment_request(&input), Ok(None));
 }
 
 struct FakeMarkers {

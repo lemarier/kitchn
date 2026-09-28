@@ -4,12 +4,37 @@
 use super::{Precheck, WorkflowError, valid_label};
 use crate::{
     HouseId,
-    contracts::{DecisionOwner, GitHubAction, IssueNumber, MAX_ASKS_PER_TASK, Repository},
-    integrations::github::{
-        GitHubClient, GitHubReadTransport, Issue, IssueComment, IssueDetail, LinkedPullRequest,
-        Observation, TimelineEvent,
+    contracts::{
+        DecisionBinding, DecisionOwner, ExternalRef, GitHubAction, IssueNumber, MAX_ASKS_PER_TASK,
+        Operation, Repository, Role, Text, Workspace,
     },
+    integrations::github::{
+        GitHubClient, GitHubReadTransport, IntegrationError, Issue, IssueComment, IssueDetail,
+        LinkedPullRequest, Observation, TimelineEvent,
+    },
+    integrations::roger::{DecisionStatus, RogerClient, RogerReadTransport},
 };
+
+/// Poll only a specification answer with its persisted, exact binding.
+/// Other decision families have their own consumers; unknown keys are errors.
+pub fn poll_spec_answer<T: RogerReadTransport>(
+    client: &RogerClient<T>,
+    binding: &DecisionBinding,
+    ask: &ExternalRef,
+) -> Result<DecisionStatus, WorkflowError> {
+    let key = binding
+        .decision_key()
+        .map_err(|_| WorkflowError::DecisionMismatch)?;
+    if binding.owner != DecisionOwner::Spec || route_answer(&key)? != DecisionOwner::Spec {
+        return Err(WorkflowError::DecisionMismatch);
+    }
+    client.poll(binding, ask).map_err(|error| match error {
+        IntegrationError::ScopeMismatch | IntegrationError::StaleDecision => {
+            WorkflowError::DecisionMismatch
+        }
+        _ => WorkflowError::PrecheckFailed,
+    })
+}
 
 /// Complete forge inputs for an issue. Code and house requirements still need
 /// their own explicit evidence before a resolution can be chosen.
@@ -45,13 +70,24 @@ pub fn collect_issue<T: GitHubReadTransport>(
     repo: &Repository,
     number: IssueNumber,
 ) -> Result<IssueSources, WorkflowError> {
+    let issue = known(client.issue(house, repo, number))?;
+    let detail = known(client.issue_detail(house, repo, number))?;
+    let comments = known(client.comments(house, repo, number))?;
+    let timeline = known(client.timeline(house, repo, number))?;
+    let blockers = known(client.dependencies(house, repo, number))?;
+    let linked_prs = known(client.linked_pull_requests(house, repo, number))?;
+    if known(client.issue_detail(house, repo, number))? != detail
+        || known(client.issue(house, repo, number))? != issue
+    {
+        return Err(WorkflowError::IncompleteEvidence);
+    }
     Ok(IssueSources {
-        issue: known(client.issue(house, repo, number))?,
-        detail: known(client.issue_detail(house, repo, number))?,
-        comments: known(client.comments(house, repo, number))?,
-        timeline: known(client.timeline(house, repo, number))?,
-        blockers: known(client.dependencies(house, repo, number))?,
-        linked_prs: known(client.linked_pull_requests(house, repo, number))?,
+        issue,
+        detail,
+        comments,
+        timeline,
+        blockers,
+        linked_prs,
     })
 }
 
@@ -121,6 +157,8 @@ impl Coverage {
 /// One issue's evidence and prior pass state.
 #[derive(Debug, Clone)]
 pub struct Evidence {
+    /// Source repository selected by the house.
+    pub repository: Repository,
     /// Issue.
     pub issue: IssueNumber,
     /// Current issue evidence revision.
@@ -183,6 +221,8 @@ pub fn plan_with_markers(
 /// after its trigger-specific authority and a fresh provider read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
+    /// Bounded isolated worker request for evidence judgment.
+    Judgment(Operation),
     /// Proposed typed forge mutation.
     Mutation(GitHubAction),
     /// Proposed human question slot.
@@ -190,6 +230,30 @@ pub enum Change {
         /// Slot within the task's bounded question budget.
         ordinal: u32,
     },
+}
+
+/// Request bounded judgment when evidence alone cannot resolve the issue or
+/// identify a concrete product question. The store must claim the issue and
+/// persist this effect before any backend launch.
+pub fn judgment_request(evidence: &Evidence) -> Result<Option<Operation>, WorkflowError> {
+    if precheck(evidence)? == Precheck::Idle
+        || evidence.factual_resolution.is_some()
+        || evidence.pending_product_questions > 0
+        || !evidence.existing_decisions.is_empty()
+    {
+        return Ok(None);
+    }
+    let brief = format!(
+        "Inspect {} issue #{} at evidence revision {}; return factual resolution or exact product questions, without posting",
+        evidence.repository,
+        evidence.issue.get(),
+        evidence.revision
+    );
+    Ok(Some(Operation::LaunchWorker {
+        role: Role::Gardener,
+        workspace: Workspace::Isolated,
+        brief: Text::new(&brief).map_err(|_| WorkflowError::IncompleteEvidence)?,
+    }))
 }
 
 /// No changes means an idle pass. There is never a repeated informational comment.
@@ -242,6 +306,9 @@ pub fn plan(evidence: &Evidence) -> Result<Vec<Change>, WorkflowError> {
         .iter()
         .any(|decision| decision.state != DecisionState::Answered);
     let mut changes = Vec::new();
+    if let Some(operation) = judgment_request(evidence)? {
+        changes.push(Change::Judgment(operation));
+    }
     if let Some(body) = &evidence.factual_resolution {
         if body.trim().is_empty() {
             return Err(WorkflowError::IncompleteEvidence);

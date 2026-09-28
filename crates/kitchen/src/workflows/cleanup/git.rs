@@ -1,15 +1,16 @@
 //! A bounded, read-only Git reader for worktree preservation evidence.
 //!
 //! Every call runs `git` with a deadline and an output limit, without a
-//! terminal prompt, optional locks, or the file-system monitor, and with the
-//! caller's `GIT_DIR`-style overrides removed so the path alone selects the
-//! repository. Nothing here writes to the repository.
+//! terminal prompt, optional locks, replace refs, or the file-system monitor,
+//! and with the caller's `GIT_DIR`-style, configuration, and pathspec
+//! overrides removed so the path alone selects the repository. Nothing here
+//! writes to the repository.
 
 use std::{
     ffi::OsStr,
-    io::Read,
+    io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{ChildStdout, Command, ExitStatus, Stdio},
     sync::mpsc::{self, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
@@ -19,8 +20,9 @@ use serde::Serialize;
 
 use crate::contracts::CommitId;
 
-/// Environment variables that would redirect Git away from the given path.
-const REDIRECTING_ENV: [&str; 8] = [
+/// Environment variables that would redirect Git away from the given path or
+/// change what its answers mean.
+const REDIRECTING_ENV: [&str; 15] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -29,10 +31,21 @@ const REDIRECTING_ENV: [&str; 8] = [
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_NAMESPACE",
     "GIT_CEILING_DIRECTORIES",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
 ];
 
 /// Longest poll interval while waiting for `git` to exit.
 const MAX_POLL: Duration = Duration::from_millis(20);
+/// Most ignored paths one inspection lists; more is treated as unreadable.
+pub const MAX_IGNORED_PATHS: usize = 256;
+/// Longest single `git ls-files` record accepted while scanning the index.
+const MAX_RECORD_BYTES: u64 = 8192;
 
 /// Bounds for one worktree inspection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +109,12 @@ pub struct WorktreeState {
     pub tracked_changes: u32,
     /// Untracked, non-ignored paths.
     pub untracked_files: u32,
+    /// Paths Git ignores, from every ignore source, as `git ls-files` lists
+    /// them: a wholly ignored directory appears once with a trailing `/`.
+    pub ignored: Vec<String>,
+    /// Tracked files marked assume-unchanged or skip-worktree, whose edits
+    /// `git status` does not report.
+    pub hidden_tracked: u32,
     /// Whether `HEAD` has commits that no remote-tracking ref contains.
     pub unpushed_commits: bool,
 }
@@ -159,6 +178,8 @@ pub fn inspect_worktree(path: &Path, limits: &GitLimits) -> Result<WorktreeState
         limits,
     )?;
     let (tracked_changes, untracked_files) = count_status(&status)?;
+    let ignored = list_ignored(path, limits)?;
+    let hidden_tracked = count_hidden_tracked(path, limits)?;
 
     let unpushed = run(
         path,
@@ -171,6 +192,8 @@ pub fn inspect_worktree(path: &Path, limits: &GitLimits) -> Result<WorktreeState
         locked,
         tracked_changes,
         untracked_files,
+        ignored,
+        hidden_tracked,
         unpushed_commits: !unpushed.trim().is_empty(),
     })
 }
@@ -198,6 +221,72 @@ fn count_status(output: &str) -> Result<(u32, u32), GitReadError> {
     Ok((tracked, untracked))
 }
 
+/// The paths Git ignores in the checkout at `path`, from `.gitignore` files,
+/// `.git/info/exclude`, and the user's global excludes alike. A wholly ignored
+/// directory is listed once, so build output does not flood the list.
+fn list_ignored(path: &Path, limits: &GitLimits) -> Result<Vec<String>, GitReadError> {
+    let listing = run(
+        path,
+        [
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ],
+        limits,
+    )?;
+    let mut ignored: Vec<String> = listing
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    ignored.sort();
+    ignored.dedup();
+    if ignored.len() > MAX_IGNORED_PATHS {
+        return Err(GitReadError::OutputTooLarge);
+    }
+    Ok(ignored)
+}
+
+/// How many tracked files carry the assume-unchanged or skip-worktree flag.
+/// `git status` does not report edits to them. The index listing can be far
+/// larger than the output limit, so it is filtered while it streams and only
+/// the deadline bounds the scan.
+fn count_hidden_tracked(path: &Path, limits: &GitLimits) -> Result<u32, GitReadError> {
+    let (status, hidden) = run_with(path, ["ls-files", "-v", "-z"], limits, count_hidden)?;
+    if !status.success() {
+        return Err(GitReadError::Failed);
+    }
+    Ok(hidden)
+}
+
+/// Count `git ls-files -v -z` records whose tag is not `H` (an ordinary
+/// cached file): `S` is skip-worktree, lowercase is assume-unchanged, and any
+/// unknown tag is treated as hidden rather than as clean.
+fn count_hidden(stdout: ChildStdout) -> io::Result<u32> {
+    let mut reader = BufReader::new(stdout);
+    let mut record = Vec::new();
+    let mut hidden: u32 = 0;
+    loop {
+        record.clear();
+        let read = (&mut reader)
+            .take(MAX_RECORD_BYTES)
+            .read_until(0, &mut record)?;
+        if read == 0 {
+            return Ok(hidden);
+        }
+        // A record is `<tag> <path>` ending in NUL; anything else is malformed.
+        if record.last() != Some(&0) || record.get(1) != Some(&b' ') {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        if record.first() != Some(&b'H') {
+            hidden = hidden.saturating_add(1);
+        }
+    }
+}
+
 /// Whether `name`, a top-level entry of the checkout at `dir`, is ignored
 /// by Git and contains no tracked files.
 ///
@@ -209,14 +298,22 @@ pub(super) fn ignored_untracked(
     name: &str,
     limits: &GitLimits,
 ) -> Result<bool, GitReadError> {
-    let entry = format!("{name}/");
-    let (ignored, _) = run_raw(dir, ["check-ignore", "--quiet", "--", &entry], limits)?;
+    // `check-ignore` reads a leading `:` as pathspec magic, so a directory
+    // named `:(top)target` would be checked as `target`. `./` prevents that.
+    let relative = format!("./{name}/");
+    let (ignored, _) = run_raw(dir, ["check-ignore", "--quiet", "--", &relative], limits)?;
     match ignored.code() {
         Some(0) => {}
         Some(1) => return Ok(false),
         _ => return Err(GitReadError::Failed),
     }
-    let tracked = run(dir, ["ls-files", "-z", "--", &entry], limits)?;
+    // Literal, so the name is neither magic nor a glob.
+    let entry = format!("{name}/");
+    let tracked = run(
+        dir,
+        ["--literal-pathspecs", "ls-files", "-z", "--", &entry],
+        limits,
+    )?;
     Ok(tracked.is_empty())
 }
 
@@ -240,9 +337,32 @@ fn run_raw<const N: usize>(
     args: [&str; N],
     limits: &GitLimits,
 ) -> Result<(ExitStatus, String), GitReadError> {
+    let max = limits.max_output_bytes;
+    let (status, output) = run_with(dir, args, limits, move |stdout| {
+        let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+        let mut buffer = Vec::new();
+        stdout.take(limit).read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })?;
+    if output.len() > max {
+        return Err(GitReadError::OutputTooLarge);
+    }
+    let output = String::from_utf8(output).map_err(|_| GitReadError::Malformed)?;
+    Ok((status, output))
+}
+
+/// Run one read-only `git` call in `dir` under its deadline, handing its
+/// standard output to `read` on a separate thread.
+fn run_with<const N: usize, T: Send + 'static>(
+    dir: &Path,
+    args: [&str; N],
+    limits: &GitLimits,
+    read: impl FnOnce(ChildStdout) -> io::Result<T> + Send + 'static,
+) -> Result<(ExitStatus, T), GitReadError> {
     let mut command = Command::new(&limits.program);
     command
         .arg("--no-optional-locks")
+        .arg("--no-replace-objects")
         .args([
             "-c",
             "core.fsmonitor=false",
@@ -266,16 +386,11 @@ fn run_raw<const N: usize>(
         let _ = child.wait();
         return Err(GitReadError::Spawn);
     };
-    let limit = u64::try_from(limits.max_output_bytes)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
     // The reader reports through a channel so that waiting for it is bounded
     // too: a grandchild process can keep the pipe open after `git` exits.
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let read = stdout.take(limit).read_to_end(&mut buffer).map(|_| buffer);
-        let _ = sender.send(read);
+        let _ = sender.send(read(stdout));
     });
     let started = Instant::now();
     let mut poll = Duration::from_millis(1);
@@ -304,10 +419,6 @@ fn run_raw<const N: usize>(
         // The detached reader ends when the last writer closes the pipe.
         Err(RecvTimeoutError::Timeout) => return Err(GitReadError::Timeout),
     };
-    if output.len() > limits.max_output_bytes {
-        return Err(GitReadError::OutputTooLarge);
-    }
-    let output = String::from_utf8(output).map_err(|_| GitReadError::Malformed)?;
     Ok((status, output))
 }
 

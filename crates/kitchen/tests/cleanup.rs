@@ -133,6 +133,24 @@ fn build_dir(dir: &Path, bytes: usize) -> TestResult<PathBuf> {
     Ok(target)
 }
 
+/// Ignore `patterns` in every worktree of the repository through
+/// `.git/info/exclude`, which `git status` honors without reporting.
+fn exclude(repo: &Repo, patterns: &str) -> TestResult {
+    let file = repo.main().join(".git").join("info").join("exclude");
+    let mut current = fs::read_to_string(&file).unwrap_or_default();
+    current.push_str(patterns);
+    fs::write(file, current)?;
+    Ok(())
+}
+
+/// The ignored paths the worktree entry of `preview` lists as keeping it.
+fn ignored_files(preview: &Preview, resource: &ResourceRef) -> TestResult<Vec<String>> {
+    let json = serde_json::to_value(preview.entry(resource).ok_or("resource not previewed")?)?;
+    Ok(serde_json::from_value(
+        json["worktree"]["ignoredFiles"].clone(),
+    )?)
+}
+
 /// Commit locally without pushing.
 fn commit_locally(path: &Path, name: &str) -> TestResult {
     fs::write(path.join(name), "unpushed\n")?;
@@ -575,6 +593,173 @@ fn dirty_worktrees_are_retained() -> TestResult {
     );
     // The workers themselves are settled and independent of the checkout.
     assert_eq!(reasons(&preview, &tracked.worker)?, []);
+    Ok(())
+}
+
+#[test]
+fn ignored_local_files_keep_the_worktree_and_are_listed() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    exclude(&harness.repo, ".env\n.claude/\n")?;
+    fs::write(path.join(".env"), "TOKEN=secret\n")?;
+    fs::create_dir_all(path.join(".claude"))?;
+    fs::write(path.join(".claude").join("notes.md"), "plan\n")?;
+    // `git status` reports neither, so the worktree looks clean.
+    let state = inspect_worktree(&path, &GitLimits::default())?;
+    assert_eq!((state.tracked_changes, state.untracked_files), (0, 0));
+
+    let preview = harness.inspect()?;
+    assert_eq!(
+        reasons(&preview, &owned.worktree)?,
+        [Exclusion::IgnoredFiles]
+    );
+    assert_eq!(
+        ignored_files(&preview, &owned.worktree)?,
+        [".claude/", ".env"]
+    );
+    // The settled worker does not depend on the checkout.
+    assert_eq!(reasons(&preview, &owned.worker)?, []);
+    Ok(())
+}
+
+#[test]
+fn proven_build_output_does_not_keep_the_worktree_but_other_ignored_files_do() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    // A tagged, Git-ignored, untracked directory is regenerable.
+    build_dir(&path, 1024)?;
+    let preview = harness.inspect()?;
+    assert_eq!(reasons(&preview, &owned.worktree)?, []);
+    assert_eq!(ignored_files(&preview, &owned.worktree)?, [] as [&str; 0]);
+
+    // An ignored file beside it is not, and only that file is listed.
+    exclude(&harness.repo, ".env\n")?;
+    fs::write(path.join(".env"), "TOKEN=secret\n")?;
+    let preview = harness.inspect()?;
+    assert_eq!(
+        reasons(&preview, &owned.worktree)?,
+        [Exclusion::IgnoredFiles]
+    );
+    assert_eq!(ignored_files(&preview, &owned.worktree)?, [".env"]);
+    // The build output can still be reclaimed: it is not the work.
+    let entry = preview.entry(&owned.worktree).ok_or("worktree")?;
+    assert!(entry.build_output_eligible());
+    Ok(())
+}
+
+#[test]
+fn ignored_directories_without_a_cache_tag_are_not_build_output() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    exclude(&harness.repo, "node_modules/\n")?;
+    fs::create_dir_all(path.join("node_modules").join("pkg"))?;
+    fs::write(path.join("node_modules").join("pkg").join("index.js"), "x")?;
+    // `target/` is ignored by the repository but carries no cache tag.
+    fs::create_dir_all(path.join("target"))?;
+    fs::write(path.join("target").join("notes"), "kept by hand\n")?;
+    let preview = harness.inspect()?;
+    assert_eq!(
+        reasons(&preview, &owned.worktree)?,
+        [Exclusion::IgnoredFiles]
+    );
+    assert_eq!(
+        ignored_files(&preview, &owned.worktree)?,
+        ["node_modules/", "target/"]
+    );
+    Ok(())
+}
+
+#[test]
+fn files_ignored_by_a_global_excludes_file_keep_the_worktree() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    let global = harness.repo.dir.path().join("global-ignore");
+    fs::write(&global, "secret.txt\n")?;
+    git(
+        &harness.repo.main(),
+        &["config", "core.excludesFile", path_str(&global)?],
+    )?;
+    fs::write(path.join("secret.txt"), "keep me\n")?;
+    let state = inspect_worktree(&path, &GitLimits::default())?;
+    assert_eq!((state.tracked_changes, state.untracked_files), (0, 0));
+    let preview = harness.inspect()?;
+    assert_eq!(
+        reasons(&preview, &owned.worktree)?,
+        [Exclusion::IgnoredFiles]
+    );
+    assert_eq!(ignored_files(&preview, &owned.worktree)?, ["secret.txt"]);
+    Ok(())
+}
+
+#[test]
+fn an_ignored_nested_repository_with_unpushed_commits_keeps_the_worktree() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    exclude(&harness.repo, "scratch-repo/\n")?;
+    let nested = path.join("scratch-repo");
+    fs::create_dir_all(&nested)?;
+    git(&nested, &["init", "--quiet"])?;
+    commit_locally(&nested, "only-here.txt")?;
+    let preview = harness.inspect()?;
+    assert_eq!(
+        reasons(&preview, &owned.worktree)?,
+        [Exclusion::IgnoredFiles]
+    );
+    assert_eq!(ignored_files(&preview, &owned.worktree)?, ["scratch-repo/"]);
+    Ok(())
+}
+
+#[test]
+fn edits_hidden_by_index_flags_keep_the_worktree() -> TestResult {
+    let mut harness = Harness::new()?;
+    let assumed = harness.owner("task-1", true)?;
+    let skipped = harness.owner("task-2", true)?;
+    let plain = harness.owner("task-3", true)?;
+    for (owned, flag) in [
+        (&assumed, "--assume-unchanged"),
+        (&skipped, "--skip-worktree"),
+    ] {
+        let path = harness.path(&owned.worktree)?.to_path_buf();
+        git(&path, &["update-index", flag, "README.md"])?;
+        fs::write(path.join("README.md"), "edited where status cannot see\n")?;
+        let state = inspect_worktree(&path, &GitLimits::default())?;
+        assert_eq!(state.tracked_changes, 0, "status reports the edit: {flag}");
+        assert_eq!(state.hidden_tracked, 1);
+    }
+    let preview = harness.inspect()?;
+    for owned in [&assumed, &skipped] {
+        assert_eq!(
+            reasons(&preview, &owned.worktree)?,
+            [Exclusion::HiddenTrackedFiles]
+        );
+    }
+    assert_eq!(reasons(&preview, &plain.worktree)?, []);
+    Ok(())
+}
+
+#[test]
+fn too_many_ignored_paths_make_the_worktree_unreadable() -> TestResult {
+    let repo = Repo::new()?;
+    let path = repo.pushed_worktree("many")?;
+    // Ignored files inside a tracked directory are listed one by one.
+    fs::create_dir_all(path.join("logs"))?;
+    fs::write(path.join("logs").join("keep.txt"), "tracked\n")?;
+    git(&path, &["add", "logs"])?;
+    git(&path, &["commit", "--quiet", "-m", "logs"])?;
+    git(&path, &["push", "--quiet", "origin", "many"])?;
+    exclude(&repo, "*.log\n")?;
+    for index in 0..300 {
+        fs::write(path.join("logs").join(format!("run-{index}.log")), "x")?;
+    }
+    assert_eq!(
+        inspect_worktree(&path, &GitLimits::default()),
+        Err(GitReadError::OutputTooLarge)
+    );
     Ok(())
 }
 
@@ -1362,6 +1547,35 @@ fn only_ignored_untracked_tagged_directories_are_build_output() -> TestResult {
         assert!(harness.reclaim()?.results.is_empty());
         assert!(elsewhere.join("CACHEDIR.TAG").is_file());
     }
+    Ok(())
+}
+
+#[test]
+fn a_directory_named_like_pathspec_magic_is_checked_literally() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    // As a pathspec, `:(top)target/` names the ignored top-level `target/`,
+    // not this directory, which is neither ignored nor free of tracked files.
+    let odd = path.join(":(top)target");
+    fs::create_dir_all(&odd)?;
+    fs::write(odd.join("CACHEDIR.TAG"), CACHEDIR_SIGNATURE)?;
+    fs::write(odd.join("kept.txt"), "tracked\n")?;
+    git(
+        &path,
+        &["--literal-pathspecs", "add", "--", ":(top)target/kept.txt"],
+    )?;
+    git(
+        &path,
+        &["commit", "--quiet", "-m", "tracked file in odd dir"],
+    )?;
+    git(&path, &["push", "--quiet", "origin", "task-1"])?;
+    let preview = harness.inspect()?;
+    let entry = preview.entry(&owned.worktree).ok_or("worktree")?;
+    assert!(
+        entry.build_output.is_none(),
+        "a directory holding tracked files is not build output"
+    );
     Ok(())
 }
 

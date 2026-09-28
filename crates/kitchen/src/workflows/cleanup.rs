@@ -13,8 +13,12 @@
 //!   settled; a person's takeover of any of them retains everything the task
 //!   owns;
 //! - a worktree is a linked, unlocked worktree with no tracked or untracked
-//!   changes whose `HEAD` is contained in a remote-tracking ref or equals the
-//!   head of the pull request that merged it (for squash merges).
+//!   changes, no tracked file whose edits Git is told to hide
+//!   (assume-unchanged, skip-worktree), and no ignored file except proven
+//!   build output, because deleting a worktree deletes its local
+//!   configuration, notes, and ignored nested repositories too; its `HEAD` is
+//!   contained in a remote-tracking ref or equals the head of the pull
+//!   request that merged it (for squash merges).
 //!
 //! Anything else is retained with every reason that applies. Unknown and
 //! legacy resources are retained. Branches and schedules are never removed.
@@ -199,6 +203,10 @@ pub enum Exclusion {
     TrackedChanges,
     /// Untracked files exist.
     UntrackedFiles,
+    /// Git-ignored files exist that are not proven build output.
+    IgnoredFiles,
+    /// Tracked files are marked assume-unchanged or skip-worktree.
+    HiddenTrackedFiles,
     /// `HEAD` has commits that are neither pushed nor the merged head.
     UnpreservedCommits,
 }
@@ -227,6 +235,8 @@ impl Exclusion {
             Self::WorktreeLocked => "worktree-locked",
             Self::TrackedChanges => "tracked-changes",
             Self::UntrackedFiles => "untracked-files",
+            Self::IgnoredFiles => "ignored-files",
+            Self::HiddenTrackedFiles => "hidden-tracked-files",
             Self::UnpreservedCommits => "unpreserved-commits",
         }
     }
@@ -325,6 +335,9 @@ pub enum WorktreeEvidence {
         /// The merged pull-request head, when the forge reported one.
         #[serde(skip_serializing_if = "Option::is_none")]
         merged_head: Option<CommitId>,
+        /// Ignored paths that are not proven build output; each keeps the
+        /// worktree.
+        ignored_files: Vec<String>,
     },
 }
 
@@ -1407,8 +1420,12 @@ fn evaluate(
         if !*chosen {
             continue;
         }
-        let worktree = (observation.resource.kind == ResourceKind::Worktree)
+        let inspected = (observation.resource.kind == ResourceKind::Worktree)
             .then(|| worktree_evidence(inspector, &observation.resource));
+        let (worktree, build_dirs) = match inspected {
+            Some((evidence, build_dirs)) => (Some(evidence), build_dirs),
+            None => (None, Vec::new()),
+        };
         let mut reasons = BTreeSet::new();
         own_reasons(
             &mut reasons,
@@ -1447,7 +1464,7 @@ fn evaluate(
         };
         let build_output = match &worktree {
             Some(WorktreeEvidence::Read { .. }) => {
-                build_output(inspector, observation, ownership, &decision)?
+                build_output(inspector, observation, ownership, &decision, build_dirs)?
             }
             Some(WorktreeEvidence::Unlocated | WorktreeEvidence::Unreadable { .. }) | None => None,
         };
@@ -1574,12 +1591,18 @@ fn own_reasons(
         Some(WorktreeEvidence::Unreadable { .. }) => {
             reasons.insert(Exclusion::WorktreeUnreadable);
         }
-        Some(WorktreeEvidence::Read { state, merged_head }) => {
+        Some(WorktreeEvidence::Read {
+            state,
+            merged_head,
+            ignored_files,
+        }) => {
             let checks = [
                 (!state.linked, Exclusion::MainCheckout),
                 (state.locked, Exclusion::WorktreeLocked),
                 (state.tracked_changes > 0, Exclusion::TrackedChanges),
                 (state.untracked_files > 0, Exclusion::UntrackedFiles),
+                (!ignored_files.is_empty(), Exclusion::IgnoredFiles),
+                (state.hidden_tracked > 0, Exclusion::HiddenTrackedFiles),
                 (
                     state.unpushed_commits && merged_head.as_ref() != Some(&state.head),
                     Exclusion::UnpreservedCommits,
@@ -1643,17 +1666,41 @@ fn ownership(tasks: &[TaskRecord], resource: &ResourceRef) -> Ownership {
     })
 }
 
-fn worktree_evidence(inspector: &Inspector<'_>, resource: &ResourceRef) -> WorktreeEvidence {
+/// What Git reports about a worktree, and the top-level directories of it that
+/// are proven build output.
+fn worktree_evidence(
+    inspector: &Inspector<'_>,
+    resource: &ResourceRef,
+) -> (WorktreeEvidence, Vec<String>) {
     let Some(path) = inspector.worktrees.locate(resource) else {
-        return WorktreeEvidence::Unlocated;
+        return (WorktreeEvidence::Unlocated, Vec::new());
     };
     match inspect_worktree(&path, inspector.git) {
-        Ok(state) => WorktreeEvidence::Read {
-            state,
-            merged_head: inspector.merged_heads.get(resource).cloned(),
-        },
-        Err(error) => WorktreeEvidence::Unreadable { error },
+        Ok(state) => {
+            // A checkout Git cannot list precisely proves no build output, so
+            // every ignored path then counts as work.
+            let build_dirs = build::find(&path, inspector.git).unwrap_or_default();
+            let ignored_files = state
+                .ignored
+                .iter()
+                .filter(|ignored| !inside_any(ignored, &build_dirs))
+                .cloned()
+                .collect();
+            let evidence = WorktreeEvidence::Read {
+                state,
+                merged_head: inspector.merged_heads.get(resource).cloned(),
+                ignored_files,
+            };
+            (evidence, build_dirs)
+        }
+        Err(error) => (WorktreeEvidence::Unreadable { error }, Vec::new()),
     }
+}
+
+/// Whether the Git-listed `path` is a build directory or lies inside one.
+fn inside_any(path: &str, build_dirs: &[String]) -> bool {
+    let top = path.split('/').next().unwrap_or(path);
+    build_dirs.iter().any(|dir| dir == top)
 }
 
 /// The evidence a decision rests on. Time-dependent values are excluded so
@@ -1707,6 +1754,8 @@ const fn blocks_build_output(reason: Exclusion) -> bool {
         Exclusion::OwnerActive
         | Exclusion::TrackedChanges
         | Exclusion::UntrackedFiles
+        | Exclusion::IgnoredFiles
+        | Exclusion::HiddenTrackedFiles
         | Exclusion::UnpreservedCommits => false,
     }
 }
@@ -1717,17 +1766,14 @@ fn build_output(
     observation: &ResourceObservation,
     ownership: &Ownership,
     worktree_decision: &Decision,
+    names: Vec<String>,
 ) -> Result<Option<BuildOutput>> {
-    let Some(path) = inspector.worktrees.locate(&observation.resource) else {
-        return Ok(None);
-    };
-    // A checkout Git cannot list precisely has no build output to offer.
-    let Ok(names) = build::find(&path, inspector.git) else {
-        return Ok(None);
-    };
     if names.is_empty() {
         return Ok(None);
     }
+    let Some(path) = inspector.worktrees.locate(&observation.resource) else {
+        return Ok(None);
+    };
     let reasons: Vec<Exclusion> = match worktree_decision {
         Decision::Release => Vec::new(),
         Decision::Retain { reasons } => reasons

@@ -590,3 +590,43 @@ fn a_template_declaring_another_house_is_refused() -> Result {
     assert!(!f.root.join("consumer").exists());
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn printed_doctor_command_survives_quotes_and_spaces_in_paths() -> Result {
+    let f = Fixture::new()?;
+    let target = f.root.join("it's a \"consumer\" $HOME");
+    let output = f
+        .command_for("init", &target, "test")
+        .args([
+            "--house",
+            "crabnebula",
+            "--repository",
+            "crabnebula/tauri-fixture",
+            "--yes",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    let command = text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("kitchen house doctor "))
+        .ok_or_else(|| format!("no doctor command in {text}"))?;
+    let echoed = Command::new("sh")
+        .arg("-c")
+        .arg(format!("printf '%s\\n' {command}"))
+        .env_remove("HOME")
+        .output()?;
+    assert!(echoed.status.success(), "{echoed:?}");
+    let registry = f.root.join("registry");
+    assert_eq!(
+        String::from_utf8(echoed.stdout)?,
+        format!(
+            "--registry\n{}\n--repository-path\n{}\n",
+            registry.display(),
+            target.display()
+        )
+    );
+    Ok(())
+}

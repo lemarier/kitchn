@@ -1,0 +1,17 @@
+{
+  "origin": {
+    "house": "origin89",
+    "source": "github",
+    "event": "a1b2c3d4-0000-11f0-8000-000000000001"
+  },
+  "kind": "pull-request-pushed",
+  "item": { "type": "pull-request", "repository": "lemarier/kitchen", "number": 60 },
+  "subject": {
+    "type": "git",
+    "revision": {
+      "head": "1111111111111111111111111111111111111111",
+      "base": "2222222222222222222222222222222222222222"
+    }
+  },
+  "occurredAt": 1759064400000
+}

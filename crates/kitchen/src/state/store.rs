@@ -35,8 +35,8 @@ use crate::{
     },
     state::{
         CancelStatus, ConsumerRecord, Consumption, Creation, EffectOutcome, EffectPlan,
-        EffectRecord, EffectStart, Lease, MarkerFact, MarkerKey, MarkerRecording, RecoveryItem,
-        RiskDecision, TaskRecord, WorkflowMarker,
+        EffectRecord, EffectStart, Lease, MarkerAttempt, MarkerFact, MarkerKey, MarkerRecording,
+        RecoveryItem, RiskDecision, TaskRecord, WorkflowMarker,
         model::StoreState,
         snapshot::{SnapshotStore, StoreLayout, StoreOptions},
     },
@@ -455,6 +455,47 @@ impl HouseStore {
         now: Timestamp,
     ) -> Result<MarkerRecording> {
         self.transact(|state| state.record_marker(key, fact, recorded_by, now))
+    }
+
+    /// Record a workflow marker unless `guard` objects to the workflow's
+    /// markers. The guard reads them and the marker is written in one store
+    /// transaction, so a concurrent recording cannot slip between the check
+    /// and the write. A key that is already recorded is never blocked; it
+    /// resolves as in [`Self::record_marker`]. The guard returns the reason
+    /// to block, and nothing is written then.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::record_marker`] and any the guard returns.
+    pub fn record_marker_unless<R>(
+        &self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+        guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
+    ) -> Result<MarkerAttempt<R>> {
+        self.transact(|state| state.record_marker_unless(key, fact, recorded_by, now, guard))
+    }
+
+    /// Like [`Self::record_marker_unless`], but a key that is already
+    /// recorded is guarded too while the task `pending` does not exist. This
+    /// lets a redelivery that finishes an interrupted admission be checked
+    /// against markers recorded since, in the same transaction.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::record_marker_unless`].
+    pub fn record_marker_unless_created<R>(
+        &self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+        pending: &TaskId,
+        guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
+    ) -> Result<MarkerAttempt<R>> {
+        self.transact(|state| {
+            state.record_marker_unless_created(key, fact, recorded_by, now, pending, guard)
+        })
     }
 
     /// Replace the fact recorded under `key`, but only if it is still

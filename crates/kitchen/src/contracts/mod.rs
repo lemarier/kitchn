@@ -91,7 +91,7 @@ pub use task::{
     AttemptNumber, AttemptOutcome, AttemptStart, CapabilityRequirements, Disposition, EffectSeq,
     FailureClass, Fence, Provenance, RetryPolicy, Settlement, TaskSpec,
 };
-pub use trigger::{Authorization, Claimant, Consent, ConsumerFence, Trigger};
+pub use trigger::{Authorization, Claimant, Consent, ConsumerFence, EventOrigin, Trigger};
 pub use value::{
     BranchName, Clock, CommitId, ExternalRef, LeaseTtl, MAX_BRANCH_NAME_BYTES,
     MAX_EXTERNAL_REF_BYTES, MAX_TEXT_BYTES, Repository, SystemClock, Text, Timestamp, ValueKind,

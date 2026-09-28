@@ -375,6 +375,19 @@ pub enum MarkerRecording {
     Superseded(WorkflowMarker),
 }
 
+/// The result of [`crate::state::HouseStore::record_marker_unless`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MarkerAttempt<R> {
+    /// No guard objected and the marker is new.
+    Recorded(WorkflowMarker),
+    /// The same fact was already recorded under this key; nothing changed.
+    AlreadyRecorded(WorkflowMarker),
+    /// The guard objected against the workflow's markers as they were in
+    /// the same transaction; nothing was written.
+    Blocked(R),
+}
+
 /// The persisted markers of one house.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]

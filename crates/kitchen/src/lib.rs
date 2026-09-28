@@ -21,6 +21,7 @@ pub mod adapters;
 pub mod adoption;
 pub mod contracts;
 mod error;
+pub mod events;
 pub mod house;
 mod id;
 pub mod integrations;

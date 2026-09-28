@@ -1,0 +1,14 @@
+{
+  "origin": {
+    "house": "origin89",
+    "source": "github",
+    "event": "72d3162e-cc78-11e3-81ab-4c9367dc0958"
+  },
+  "kind": "issue-labeled",
+  "item": { "type": "issue", "repository": "lemarier/kitchen", "number": 41 },
+  "subject": {
+    "type": "issue",
+    "revision": { "updatedAt": 1759060800000, "lastComment": "IC_kwDOA1" }
+  },
+  "occurredAt": 1759060800000
+}

@@ -147,6 +147,16 @@ pub enum OrcaError {
         /// The branch the caller wanted.
         requested: String,
     },
+    /// An Orca worktree of the repository already has the requested branch
+    /// checked out, or the worktree listing could not prove that none does.
+    /// Orca would create another branch instead, so the launch was refused
+    /// before anything was created. To work on that branch, launch in its
+    /// worktree ([`Workspace::Existing`](crate::contracts::Workspace::Existing)).
+    #[error("the requested branch {requested} may already exist in an Orca worktree")]
+    BranchTaken {
+        /// The branch the caller wanted.
+        requested: String,
+    },
     /// A schedule value was rejected.
     #[error(transparent)]
     Schedule(#[from] ScheduleError),
@@ -179,6 +189,7 @@ impl OrcaError {
             | Self::ScheduleDiffers { .. }
             | Self::ReservationBusy
             | Self::BranchMismatch { .. }
+            | Self::BranchTaken { .. }
             | Self::WrongBranchRunning { .. }
             | Self::InstallUncertain
             | Self::StateMismatch

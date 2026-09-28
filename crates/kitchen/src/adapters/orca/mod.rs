@@ -56,6 +56,16 @@
 //!   and holds the launch as uncertain; [`OrcaBackend::verify_launch_branch`]
 //!   reports both branches. Receipts always name the branch Orca created, and
 //!   [`verify_branch`] checks any receipt.
+//! - Branch collisions. When the requested branch already exists, Orca
+//!   creates it with a numeric suffix (`<branch>-2`) instead. Before the
+//!   first start the adapter lists the repository's Orca worktrees and
+//!   refuses a branch one of them has checked out
+//!   ([`OrcaBackend::check_branch_free`]). A branch that exists only in Git
+//!   is not listed, so the collision can still happen: the worker is
+//!   stopped and its terminal released as for any wrong branch, and
+//!   [`OrcaBackend::launch_collision`] reports the stray worker, worktree,
+//!   and branch with the evidence that the launch owns them. The adapter
+//!   never removes a worktree or branch; that is left to the dishwasher.
 //! - Recovery signals. [`OrcaBackend::observe_signals`] reads what a
 //!   coordinator needs to recover without a person, as typed observations
 //!   with an explicit "cannot tell": whether the agent's first turn was seen
@@ -109,8 +119,9 @@ mod signals;
 mod wire;
 
 pub use backend::{
-    DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, MAX_RUN_TASKS,
-    OrcaBackend, OrcaConfig, WORKER_SELECTION, launch_marker, verify_branch,
+    BranchCollision, DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT,
+    MAX_REPO_WORKTREES, MAX_RUN_TASKS, OrcaBackend, OrcaConfig, WORKER_SELECTION, launch_marker,
+    verify_branch,
 };
 pub use error::OrcaError;
 pub use inspect::{

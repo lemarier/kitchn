@@ -265,6 +265,8 @@ pub struct SimState {
     /// Mutations that changed simulated state.
     pub effects: usize,
     pub stop_state: &'static str,
+    /// Whether a stop also releases the worker's terminal, as on 1.4.212.
+    pub stop_releases: bool,
     pub release_action: &'static str,
     /// When set, `automations edit` is accepted but changes nothing.
     pub ignore_edits: bool,
@@ -276,6 +278,14 @@ pub struct SimState {
     pub branch_prefix: &'static str,
     /// The branch an existing worktree is on, when Orca reports one.
     pub existing_branch: Option<&'static str>,
+    /// Worktrees Orca lists that no simulated worker created: id and branch.
+    pub worktrees: Vec<(String, String)>,
+    /// Branches that exist in Git without an Orca worktree.
+    pub git_branches: Vec<String>,
+    /// Whether `worktree list` reports its listing truncated.
+    pub listing_truncated: bool,
+    /// Hosts `worktree list` reports it did not cover.
+    pub omitted_hosts: Vec<&'static str>,
     /// When set, the worker settles in this state just before Orca handles
     /// the next `worker-stop`, as when it exits while the stop is sent.
     pub settle_before_stop: Option<&'static str>,
@@ -313,12 +323,17 @@ impl Default for SimOrca {
                 deadlines: Vec::new(),
                 effects: 0,
                 stop_state: "stopped",
+                stop_releases: true,
                 release_action: "released",
                 ignore_edits: false,
                 bound: None,
                 start_state: "ready",
                 branch_prefix: "lemarier/",
                 existing_branch: None,
+                worktrees: Vec::new(),
+                git_branches: Vec::new(),
+                listing_truncated: false,
+                omitted_hosts: Vec::new(),
                 settle_before_stop: None,
                 gate: None,
                 next: 0,
@@ -463,6 +478,26 @@ impl SimState {
         ok(result)
     }
 
+    /// Whether `branch` exists, in an Orca worktree or only in Git.
+    fn branch_exists(&self, branch: &str) -> bool {
+        let full = format!("refs/heads/{branch}");
+        self.workers
+            .values()
+            .any(|worker| worker.branch.as_deref() == Some(full.as_str()))
+            || self.worktrees.iter().any(|(_, listed)| listed == &full)
+            || self.git_branches.iter().any(|existing| existing == branch)
+    }
+
+    /// The full ref Orca creates for `branch`: as asked, or with the first
+    /// free numeric suffix from 2 when it exists (a collision).
+    fn free_branch(&self, branch: &str) -> String {
+        let free = std::iter::once(branch.to_owned())
+            .chain((2..).map(|n| format!("{branch}-{n}")))
+            .find(|candidate| !self.branch_exists(candidate))
+            .unwrap_or_default();
+        format!("refs/heads/{free}")
+    }
+
     fn flag(flags: &BTreeMap<String, String>, name: &str) -> String {
         flags.get(name).cloned().unwrap_or_default()
     }
@@ -534,7 +569,7 @@ impl SimState {
                 // Orca prefixes the requested worktree name and reports the
                 // full ref; an existing worktree keeps the branch it has.
                 worker.branch = match flags.get("name") {
-                    Some(name) => Some(format!("refs/heads/{}{name}", self.branch_prefix)),
+                    Some(name) => Some(self.free_branch(&format!("{}{name}", self.branch_prefix))),
                     None => self
                         .existing_branch
                         .map(|branch| format!("refs/heads/{branch}")),
@@ -573,6 +608,7 @@ impl SimState {
             ["orchestration", "worker-stop"] => {
                 let dispatch = Self::flag(flags, "dispatch");
                 let stop_state = self.stop_state;
+                let stop_releases = self.stop_releases;
                 let settle = self.settle_before_stop.take();
                 let Some(worker) = self.workers.get_mut(&dispatch) else {
                     return refuse("dispatch_not_found");
@@ -603,7 +639,9 @@ impl SimState {
                     worker.worker_state = "stopped";
                     worker.outcome = "failed";
                     worker.liveness = "exited";
-                    worker.release_state = "released";
+                    if stop_releases {
+                        worker.release_state = "released";
+                    }
                     self.effects += 1;
                 }
                 self.mutation(json!({"dispatchId": dispatch, "state": stop_state}))
@@ -679,6 +717,29 @@ impl SimState {
                     })),
                     None => refuse("worktree_not_found"),
                 }
+            }
+            ["worktree", "list"] => {
+                let rows: Vec<Value> = self
+                    .workers
+                    .values()
+                    .filter_map(|worker| {
+                        worker
+                            .worktree
+                            .as_ref()
+                            .map(|id| json!({"id": id, "branch": worker.branch}))
+                    })
+                    .chain(
+                        self.worktrees
+                            .iter()
+                            .map(|(id, branch)| json!({"id": id, "branch": branch})),
+                    )
+                    .collect();
+                ok(json!({
+                    "worktrees": rows,
+                    "hostScope": {"hostIds": ["local"], "omittedHostIds": self.omitted_hosts},
+                    "totalCount": rows.len(),
+                    "truncated": self.listing_truncated,
+                }))
             }
             ["orchestration", "worker-read"] => {
                 let dispatch = Self::flag(flags, "dispatch");

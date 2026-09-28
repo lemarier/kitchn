@@ -28,7 +28,9 @@
 //! one key create one Task, not two. A launch with a requested branch
 //! ([`Operation::LaunchWorker`]'s `branch`) passes the worktree name that
 //! yields it under [`OrcaConfig::branch_prefix`], verifies the branch Orca
-//! created, and stops the worker it just started when they differ.
+//! created, and stops the worker it just started when they differ. Before
+//! the first start it refuses a branch an Orca worktree already has checked
+//! out, and it reports a collision Orca still made as a [`BranchCollision`].
 
 use std::{path::PathBuf, time::Duration};
 
@@ -90,6 +92,10 @@ const SETTLED_WORKER_STATES: [&str; 4] = ["stopped", "failed", "succeeded", "aba
 /// Stop attempts for a worker a launch started on the wrong branch, before
 /// the launch is left held with the worker reported as running.
 const WRONG_BRANCH_STOP_ATTEMPTS: usize = 3;
+
+/// Most worktrees of the repository the branch check reads; a longer listing
+/// cannot show a branch is free, and the launch is refused.
+pub const MAX_REPO_WORKTREES: usize = 1000;
 
 /// What `worker-start` can launch: both agent families, any opaque model id
 /// through `--model`, and `--effort` only together with `--model`.
@@ -202,6 +208,23 @@ struct WorktreeShow {
 struct WorktreeRow {
     #[serde(default)]
     branch: Option<String>,
+}
+
+/// `worktree list`. Completeness is required, not defaulted: a listing that
+/// does not say it is whole cannot show a branch is free.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeList {
+    worktrees: Vec<WorktreeRow>,
+    truncated: bool,
+    host_scope: HostScope,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HostScope {
+    /// Hosts the listing does not cover; they may hold worktrees.
+    omitted_host_ids: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -400,6 +423,36 @@ pub fn verify_branch(receipt: &Receipt, requested: &str) -> Result<(), OrcaError
     }
 }
 
+/// What Orca shows about a launch whose requested branch already existed,
+/// so Orca created [`BranchCollision::branch`] instead.
+///
+/// It is positive ownership evidence for the stray resources: exactly one
+/// Orca Task in the Run carries [`BranchCollision::owner`], this house's
+/// launch marker for the key; the worker is that Task's Dispatch; and Orca's
+/// effect record for the Dispatch names the worktrees it created. The
+/// adapter stops the worker and closes its terminal, but never removes the
+/// worktree or branch: that is the dishwasher's decision, after its own
+/// preservation checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCollision {
+    /// The branch the launch asked for.
+    pub requested: BranchName,
+    /// The branch Orca created instead: the requested one with a numeric
+    /// suffix.
+    pub branch: ResourceRef,
+    /// The worker the launch started.
+    pub worker: ResourceRef,
+    /// The worktrees Orca records the worker's Dispatch as creating.
+    pub worktrees: Vec<ResourceRef>,
+    /// The launch marker on the owning Orca Task ([`launch_marker`]).
+    pub owner: ExternalRef,
+    /// Whether Orca's record shows the worker settled. Until it does, the
+    /// worker could still push to [`BranchCollision::branch`].
+    pub settled: bool,
+    /// Whether Orca's record shows the worker's terminal released.
+    pub terminal_released: bool,
+}
+
 /// Map Orca's worker projection to a [`WorkerState`].
 ///
 /// Settlement comes only from Orca's accepted worker report (`succeeded`,
@@ -485,6 +538,7 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::ReservationInsideRepository
         | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
+        | OrcaError::BranchTaken { .. }
         | OrcaError::ScheduleActive
         | OrcaError::ScheduleDiffers { .. }
         | OrcaError::ScheduleLimit(_) => not_applied(),
@@ -556,6 +610,7 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::ScheduleLimit(_)
         | OrcaError::ReservationBusy
         | OrcaError::BranchUnobtainable { .. }
+        | OrcaError::BranchTaken { .. }
         | OrcaError::InstallUncertain
         | OrcaError::StateMismatch
         | OrcaError::Schedule(_)
@@ -930,20 +985,22 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 gap.capability(),
             )));
         }
-        let name = match (workspace, branch) {
-            (Workspace::Isolated, Some(branch)) => Some(
-                branch::worktree_name(self.config.branch_prefix.as_ref(), branch)
-                    .map_err(|error| call_failure(&error))?,
-            ),
-            (Workspace::Isolated | Workspace::Existing(_), _) => None,
+        // The branch a new worktree is to be created on.
+        let new_branch = match workspace {
+            Workspace::Isolated => branch,
+            Workspace::Existing(_) => None,
         };
+        let name = new_branch
+            .map(|branch| branch::worktree_name(self.config.branch_prefix.as_ref(), branch))
+            .transpose()
+            .map_err(|error| call_failure(&error))?;
         let mut reservation = self
             .reserve(format!(
                 "launch-{:032x}",
                 key_digest(&self.config.house, key.as_str())
             ))
             .map_err(|error| call_failure(&error))?;
-        let receipt = self.launch_reserved(key, workspace, brief, name, agent)?;
+        let receipt = self.launch_reserved(key, workspace, brief, name, new_branch, agent)?;
         reservation.settle();
         let Some(branch) = branch else {
             return Ok(receipt);
@@ -962,14 +1019,27 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .created()
             .iter()
             .find(|resource| resource.kind == ResourceKind::Worker)
+            && (0..WRONG_BRANCH_STOP_ATTEMPTS).any(|_| self.cancel(worker).is_ok())
         {
-            for _ in 0..WRONG_BRANCH_STOP_ATTEMPTS {
-                if self.cancel(worker).is_ok() {
-                    break;
-                }
-            }
+            self.release_stopped(worker);
         }
         Err(response_lost())
+    }
+
+    /// Close the terminal of a worker stopped for running on the wrong
+    /// branch. Orca archives its output and keeps its worktree and branch.
+    /// The outcome is not needed here: a failed release is tried again by the
+    /// next submission, and [`OrcaBackend::launch_collision`] reads back
+    /// whether the terminal was released.
+    fn release_stopped(&self, worker: &ResourceRef) {
+        let released = self
+            .dispatch_of(worker)
+            .and_then(|dispatch| self.show(dispatch).ok().flatten())
+            .and_then(|shown| shown.terminal_resource)
+            .is_some_and(|terminal| terminal.release_state.as_deref() == Some("released"));
+        if !released {
+            let _ = self.release(worker);
+        }
     }
 
     fn launch_reserved(
@@ -978,6 +1048,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         workspace: &Workspace,
         brief: &Text,
         name: Option<String>,
+        new_branch: Option<&BranchName>,
         agent: Option<&AgentSelection>,
     ) -> Result<Receipt, EffectFailure> {
         let task = match self
@@ -986,10 +1057,62 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         {
             TaskLaunch::Dispatched(receipt) => return Ok(receipt),
             TaskLaunch::Unclear => return Err(response_lost()),
-            TaskLaunch::Undispatched(task) => task,
-            TaskLaunch::None => self.create_task(key, brief)?,
+            TaskLaunch::Undispatched(task) => Some(task),
+            TaskLaunch::None => None,
+        };
+        // Only a first start is checked: once dispatched, the launch's own
+        // worktree holds the branch. Only reads happened so far, so any
+        // failure of the check is a refusal.
+        if let Some(branch) = new_branch {
+            self.check_branch_free(branch).map_err(|_| not_applied())?;
+        }
+        let task = match task {
+            Some(task) => task,
+            None => self.create_task(key, brief)?,
         };
         self.start(key, &task, workspace, name.as_deref(), agent)
+    }
+
+    /// Check that no Orca worktree of the repository has `branch` checked
+    /// out. A launch requesting such a branch would get `<branch>-2` from
+    /// Orca, so it runs this check before creating anything and refuses on
+    /// any error; call it to learn why. To work on an existing branch, launch
+    /// in its worktree ([`Workspace::Existing`]).
+    ///
+    /// A branch that exists in Git without an Orca worktree is not visible
+    /// here; the check after the launch still catches that collision, and
+    /// [`OrcaBackend::launch_collision`] reports it.
+    ///
+    /// # Errors
+    /// [`OrcaError::BranchTaken`] when a worktree has the branch, or the
+    /// listing is truncated, holds [`MAX_REPO_WORKTREES`] or more rows, or
+    /// leaves out a host. Other errors when Orca cannot be read.
+    pub fn check_branch_free(&self, branch: &BranchName) -> Result<(), OrcaError> {
+        let args = wire::Args::command(&["worktree", "list"])
+            .value("repo", self.config.repo.as_str())
+            .value("limit", &MAX_REPO_WORKTREES.to_string())
+            .json();
+        let list: WorktreeList =
+            wire::typed(self.call(args, self.config.call_timeout)?, "worktree list")?;
+        let taken = || OrcaError::BranchTaken {
+            requested: branch.as_str().to_owned(),
+        };
+        if list.truncated
+            || list.worktrees.len() >= MAX_REPO_WORKTREES
+            || !list.host_scope.omitted_host_ids.is_empty()
+        {
+            return Err(taken());
+        }
+        if list.worktrees.iter().any(|worktree| {
+            worktree
+                .branch
+                .as_deref()
+                .map(|name| name.strip_prefix("refs/heads/").unwrap_or(name))
+                == Some(branch.as_str())
+        }) {
+            return Err(taken());
+        }
+        Ok(())
     }
 
     /// Reserve `stem` under this instance's runtime directory.
@@ -1231,6 +1354,60 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 })
             }
         }
+    }
+
+    /// The collision a launch with a requested branch ran into, if it did.
+    ///
+    /// Returns `Some` when the key's launch was dispatched and Orca created
+    /// the requested branch with a numeric suffix because the branch already
+    /// existed, with the evidence that this launch owns the stray worker,
+    /// worktree, and branch. Returns `None` for no dispatched launch, the
+    /// requested branch itself, or another mismatch
+    /// ([`OrcaBackend::verify_launch_branch`] reports those).
+    ///
+    /// # Errors
+    /// [`OrcaError`] when Orca cannot be read.
+    pub fn launch_collision(
+        &self,
+        key: &IdempotencyKey,
+        requested: &BranchName,
+    ) -> Result<Option<BranchCollision>, OrcaError> {
+        let TaskLaunch::Dispatched(receipt) = self.task_launch(key)? else {
+            return Ok(None);
+        };
+        let created = receipt.created();
+        let (Some(stray), Some(worker)) = (
+            created
+                .iter()
+                .find(|resource| resource.kind == ResourceKind::Branch),
+            created
+                .iter()
+                .find(|resource| resource.kind == ResourceKind::Worker),
+        ) else {
+            return Ok(None);
+        };
+        if !branch::is_collision(requested.as_str(), stray.handle.as_str()) {
+            return Ok(None);
+        }
+        let shown = match self.dispatch_of(worker) {
+            Some(dispatch) => self.show(dispatch)?,
+            None => None,
+        };
+        Ok(Some(BranchCollision {
+            requested: requested.clone(),
+            branch: stray.clone(),
+            worker: worker.clone(),
+            worktrees: created
+                .iter()
+                .filter(|resource| resource.kind == ResourceKind::Worktree)
+                .cloned()
+                .collect(),
+            owner: ExternalRef::new(&self.task_title(key))?,
+            settled: shown.as_ref().is_some_and(is_settled),
+            terminal_released: shown
+                .and_then(|shown| shown.terminal_resource)
+                .is_some_and(|terminal| terminal.release_state.as_deref() == Some("released")),
+        }))
     }
 
     /// Look up a persisted request, operation by operation.

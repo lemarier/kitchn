@@ -49,9 +49,38 @@ pub(crate) fn worktree_name(
     }
 }
 
+/// Whether `actual` is the branch Orca creates in place of `requested` when
+/// `requested` already exists: `requested`, a `-`, and a number from 2.
+pub(crate) fn is_collision(requested: &str, actual: &str) -> bool {
+    actual
+        .strip_prefix(requested)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .filter(|suffix| !suffix.starts_with('0') && suffix.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|suffix| suffix.parse::<u32>().ok())
+        .is_some_and(|n| n >= 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_collision_is_the_requested_branch_with_a_numeric_suffix() {
+        assert!(is_collision("lemarier/x", "lemarier/x-2"));
+        assert!(is_collision("lemarier/x", "lemarier/x-17"));
+        for actual in [
+            "lemarier/x",    // the requested branch itself
+            "lemarier/x-1",  // Orca starts at 2
+            "lemarier/x-02", // not a number Orca writes
+            "lemarier/x-",
+            "lemarier/x-2a",
+            "lemarier/x2",
+            "other/x-2", // another prefix: a plain mismatch
+            "lemarier/y-2",
+        ] {
+            assert!(!is_collision("lemarier/x", actual), "{actual}");
+        }
+    }
 
     fn branch(value: &str) -> Result<BranchName, Box<dyn std::error::Error>> {
         Ok(BranchName::new(value)?)

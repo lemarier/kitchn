@@ -883,7 +883,8 @@ const menu = [
       </section>
 
       <section class="final wrap" aria-labelledby="final-title">
-        <h2 id="final-title">Open your kitchen</h2>
+        <p class="final-kicker">Always dreamed of running a kitchen?</p>
+        <h2 id="final-title">Now you're the chef-owner.</h2>
         <p class="section-lede">Install the CLI, register your house and adopt a repository. About two minutes.</p>
         <div class="installer" data-installer data-second>
           <div class="installer-tabs" role="tablist" aria-label="Install method">
@@ -2075,6 +2076,12 @@ const menu = [
   .final {
     text-align: center;
     padding-bottom: clamp(5rem, 11vw, 8rem);
+  }
+  .final-kicker {
+    margin: 0 0 0.75rem;
+    font: 900 clamp(1.4rem, 2.6vw, 2rem)/1 var(--display);
+    text-transform: uppercase;
+    color: var(--red);
   }
   .final h2,
   .final .section-lede {

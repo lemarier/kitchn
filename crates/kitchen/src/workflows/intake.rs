@@ -995,9 +995,9 @@ impl<'a> IntakeLedger<'a> {
     }
 
     /// Read which reports are counted, for planning in `task`. A
-    /// reservation counts when an effect with its name was applied, or
-    /// waived by a risk decision (so an unknown outcome is never posted
-    /// twice). It is ignored when its task settled without applying it, and
+    /// reservation counts only when an effect with its name was applied. A
+    /// waived effect does not count: a risk decision is not evidence that
+    /// the forge accepted the mutation. It is ignored when its task settled without applying it, and
     /// when it belongs to `task` itself, which resolves its own effects by
     /// planning the same mutation again.
     ///
@@ -1109,15 +1109,18 @@ fn reservation_schema() -> Result<MarkerSchema, crate::Error> {
     Ok(MarkerSchema::new(RESERVATION_SCHEMA, NonZeroU32::MIN)?)
 }
 
-/// Whether `task` applied an effect named `name`. A waived effect has an
-/// unknown outcome and counts, so its reports are never posted again.
+/// Whether `task` applied an effect named `name`. A waived effect is a risk
+/// decision, not forge evidence: its outcome is still unknown, so it does not
+/// count and its reports are proposed again until reconciliation finds the
+/// mutation applied.
 fn applied(task: &TaskRecord, name: &EffectName) -> bool {
     task.effects()
         .iter()
         .filter(|effect| effect.name() == name)
         .any(|effect| match effect.state() {
-            EffectState::Applied { .. } | EffectState::Waived { .. } => true,
+            EffectState::Applied { .. } => true,
             EffectState::Intended
+            | EffectState::Waived { .. }
             | EffectState::Uncertain { .. }
             | EffectState::NotApplied { .. }
             | EffectState::Unresolvable { .. } => false,

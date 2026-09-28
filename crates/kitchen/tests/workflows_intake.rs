@@ -1419,3 +1419,74 @@ fn a_full_proposal_fits_one_reservation_and_the_rest_wait() -> TestResult {
     assert_eq!((reports.len(), *total), (5, MAX_PER_PROPOSAL + 5));
     Ok(())
 }
+
+#[test]
+fn a_waived_effect_does_not_count_its_reports() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let forge = Forge::new()?;
+    let sources = sources()?;
+    let (task, fence) = kitchen.start("intake-1")?;
+    let ledger = kitchen.ledger(kitchen.store())?;
+    let batch = login(&sources, &["m1"])?;
+    let counted = ledger.counted(&task)?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &batch,
+        &open_issue(12)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let proposal = proposals.first().ok_or("no proposal")?;
+    forge.lose_next_response.set(true);
+    let uncertain = kitchen.submit(&forge, &counted, proposal, &task, fence)?;
+    assert!(matches!(uncertain.state(), EffectState::Uncertain { .. }));
+
+    // A person hands the effect over and waives the risk: the forge never
+    // confirmed the comment, so the outcome is still unknown.
+    kitchen.store().record_effect_outcome(
+        &task,
+        fence,
+        uncertain.seq(),
+        kitchen::state::EffectOutcome::Unresolvable,
+        common::at(2),
+    )?;
+    let waived = kitchen.store().accept_risk(
+        &task,
+        fence,
+        uncertain.seq(),
+        kitchen::state::RiskDecision {
+            effect: uncertain.request().key().clone(),
+            decided_by: common::holder("operator")?,
+            revision: EvidenceRevision::INITIAL,
+            action: kitchen::state::RiskAction::SettleUnsuccessfully,
+        },
+        common::at(3),
+    )?;
+    assert!(matches!(waived.state(), EffectState::Waived { .. }));
+    kitchen.store().finish_attempt(
+        &task,
+        fence,
+        kitchen::contracts::AttemptNumber::FIRST,
+        kitchen::contracts::AttemptOutcome::Failed(kitchen::contracts::FailureClass::Retryable),
+        common::at(4),
+    )?;
+
+    // Replaying the same report in a new task proposes it again.
+    let (next, _) = kitchen.start("intake-2")?;
+    let counted = ledger.counted(&next)?;
+    assert_eq!(counted.total(&ProblemKey::new("login-timeout")?), 0);
+    let replay = plan(
+        &house()?,
+        &repo()?,
+        &batch,
+        &open_issue(12)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let [Proposal::AddReports { reports, .. }] = replay.as_slice() else {
+        return Err(format!("unexpected proposals: {replay:?}").into());
+    };
+    assert_eq!(reports.len(), 1);
+    Ok(())
+}

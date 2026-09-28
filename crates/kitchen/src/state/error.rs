@@ -23,6 +23,8 @@ pub enum Limit {
     OwnershipHistory,
     /// Remembered consumed message ids per task.
     ConsumedMessages,
+    /// Risk decisions per effect.
+    Decisions,
 }
 
 impl fmt::Display for Limit {
@@ -34,6 +36,7 @@ impl fmt::Display for Limit {
             Self::Evidence => "evidence items per revision",
             Self::OwnershipHistory => "ownership history per task",
             Self::ConsumedMessages => "consumed messages per task",
+            Self::Decisions => "risk decisions per effect",
         })
     }
 }

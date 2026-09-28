@@ -1630,3 +1630,96 @@ fn a_persisted_effect_key_must_match_its_derivation() -> TestResult {
     assert_eq!(fs::read(&path)?, corrupt, "rejected state is not rewritten");
     Ok(())
 }
+
+#[test]
+fn a_waiver_expires_when_the_evidence_moves() -> TestResult {
+    for move_base in [false, true] {
+        let fixture = Fixture::new()?;
+        let fence = claimed_attempt(&fixture, "task-1", at(0))?;
+        let task = task_id("task-1")?;
+        let store = &fixture.store;
+        let subject = |base: char| -> TestResult<Evidence> {
+            Ok(Evidence {
+                subject: EvidenceSubject {
+                    head: commit('a')?,
+                    base: Some(commit(base)?),
+                },
+                ..evidence('a', "ci-1")?
+            })
+        };
+        let approved_at = store.record_evidence(&task, fence, subject('b')?, at(1))?;
+        let mut launch_plan = plan(&task, fence, "launch", launch()?)?;
+        launch_plan.decided_at = approved_at;
+        let EffectStart::Execute(intent) =
+            store.begin_effect(launch_plan, &grants()?, &common::refusing()?, at(1))?
+        else {
+            return Err("expected a new effect".into());
+        };
+        store.record_effect_outcome(
+            &task,
+            fence,
+            intent.seq(),
+            EffectOutcome::Unresolvable,
+            at(2),
+        )?;
+        let decision = |revision| -> TestResult<RiskDecision> {
+            Ok(RiskDecision {
+                effect: intent.request().key().clone(),
+                decided_by: holder("operator")?,
+                revision,
+                action: RiskAction::ContinueWork,
+            })
+        };
+        store.accept_risk(&task, fence, intent.seq(), decision(approved_at)?, at(3))?;
+
+        // The head or the base moves after the decision.
+        let moved = if move_base {
+            store.record_evidence(&task, fence, subject('c')?, at(4))?
+        } else {
+            store.record_evidence(&task, fence, evidence('d', "ci-2")?, at(4))?
+        };
+        let reopened = fixture.reopen()?;
+        let mut relaunch = plan(&task, fence, "relaunch", launch()?)?;
+        relaunch.decided_at = moved;
+        assert!(matches!(
+            reopened.begin_effect(relaunch.clone(), &grants()?, &common::refusing()?, at(5)),
+            Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+        ));
+        assert!(matches!(
+            reopened.finish_attempt(
+                &task,
+                fence,
+                AttemptNumber::FIRST,
+                AttemptOutcome::Succeeded,
+                at(5)
+            ),
+            Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+        ));
+        assert!(
+            reopened
+                .recovery_queue(at(5))?
+                .contains(&RecoveryItem::HandedOver {
+                    task: task.clone(),
+                    seq: intent.seq(),
+                })
+        );
+
+        // A new decision at the current revision applies; the old one stays in audit.
+        reopened.accept_risk(&task, fence, intent.seq(), decision(moved)?, at(6))?;
+        assert!(matches!(
+            reopened.begin_effect(relaunch, &grants()?, &common::refusing()?, at(7))?,
+            EffectStart::Execute(_)
+        ));
+        let record = reopened.task(&task)?;
+        let effect = record.effects().first().ok_or("effect")?;
+        assert_eq!(
+            effect
+                .decisions()
+                .iter()
+                .map(|decision| decision.revision)
+                .collect::<Vec<_>>(),
+            [approved_at, moved]
+        );
+    }
+    Ok(())
+}

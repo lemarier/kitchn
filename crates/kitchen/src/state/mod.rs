@@ -42,7 +42,8 @@ pub use error::{Corruption, Limit, StateError, StorageOperation};
 pub use model::{
     AttemptRecord, AttemptState, CancelRequest, CancelStatus, Consumption, Creation, EffectOutcome,
     EffectPlan, EffectRecord, EffectStart, EffectState, EvidenceLog, Lease, MAX_CONSUMED_MESSAGES,
-    MAX_CONSUMERS, MAX_EFFECTS_PER_TASK, MAX_EVIDENCE_PER_REVISION, MAX_OWNERSHIP_HISTORY,
-    MAX_TASKS, OwnershipEvent, RecoveryItem, RiskAction, RiskDecision, TaskRecord, TaskState,
+    MAX_CONSUMERS, MAX_DECISIONS_PER_EFFECT, MAX_EFFECTS_PER_TASK, MAX_EVIDENCE_PER_REVISION,
+    MAX_OWNERSHIP_HISTORY, MAX_TASKS, OwnershipEvent, RecoveryItem, RiskAction, RiskDecision,
+    TaskRecord, TaskState,
 };
 pub use store::{HouseStore, StoreOptions};

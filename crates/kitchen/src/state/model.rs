@@ -35,6 +35,8 @@ pub const MAX_CONSUMERS: usize = 256;
 pub const MAX_EFFECTS_PER_TASK: usize = 256;
 /// Evidence items kept for the current evidence revision.
 pub const MAX_EVIDENCE_PER_REVISION: usize = 128;
+/// Risk decisions kept per effect, expired ones included.
+pub const MAX_DECISIONS_PER_EFFECT: usize = 16;
 /// Ownership history entries per task.
 pub const MAX_OWNERSHIP_HISTORY: usize = 256;
 /// Consumed message ids remembered per task.
@@ -237,35 +239,63 @@ impl EffectState {
         }
     }
 
-    /// Whether the outcome still needs evidence and no decision covers it.
-    const fn needs_outcome(&self) -> bool {
+    /// The decision covering this effect at evidence revision `current`.
+    /// A decision made at another revision has expired: the effect is handed
+    /// over again until a new decision or positive evidence.
+    const fn current_decision(&self, current: EvidenceRevision) -> Option<&RiskDecision> {
         match self {
-            Self::Intended | Self::Uncertain { .. } | Self::Unresolvable { .. } => true,
-            Self::Applied { .. } | Self::NotApplied { .. } | Self::Waived { .. } => false,
+            Self::Waived { decision, .. } if decision.revision.get() == current.get() => {
+                Some(decision)
+            }
+            Self::Waived { .. }
+            | Self::Intended
+            | Self::Uncertain { .. }
+            | Self::Applied { .. }
+            | Self::NotApplied { .. }
+            | Self::Unresolvable { .. } => None,
+        }
+    }
+
+    /// Whether this is handed over without a current decision.
+    const fn is_handed_over(&self, current: EvidenceRevision) -> bool {
+        match self {
+            Self::Unresolvable { .. } => true,
+            Self::Waived { .. } => self.current_decision(current).is_none(),
+            Self::Intended
+            | Self::Uncertain { .. }
+            | Self::Applied { .. }
+            | Self::NotApplied { .. } => false,
+        }
+    }
+
+    /// Whether the outcome still needs evidence and no current decision covers it.
+    const fn needs_outcome(&self, current: EvidenceRevision) -> bool {
+        match self {
+            Self::Intended | Self::Uncertain { .. } => true,
+            Self::Unresolvable { .. } | Self::Waived { .. } => self.is_handed_over(current),
+            Self::Applied { .. } | Self::NotApplied { .. } => false,
         }
     }
 
     /// Whether this effect prevents new attempts and new effects.
-    const fn blocks_work(&self) -> bool {
-        match self {
-            Self::Waived { decision, .. } => match decision.action {
+    const fn blocks_work(&self, current: EvidenceRevision) -> bool {
+        match self.current_decision(current) {
+            Some(decision) => match decision.action {
                 RiskAction::ContinueWork => false,
                 RiskAction::SettleUnsuccessfully => true,
             },
-            Self::Intended | Self::Uncertain { .. } | Self::Unresolvable { .. } => true,
-            Self::Applied { .. } | Self::NotApplied { .. } => false,
+            None => self.needs_outcome(current),
         }
     }
 
     /// Whether this effect prevents settling the task, successfully or not.
-    const fn blocks_settlement(&self, success: bool) -> bool {
-        match self {
-            Self::Waived { decision, .. } => match decision.action {
+    const fn blocks_settlement(&self, success: bool, current: EvidenceRevision) -> bool {
+        match self.current_decision(current) {
+            Some(decision) => match decision.action {
                 RiskAction::ContinueWork => false,
                 RiskAction::SettleUnsuccessfully => success,
             },
-            Self::Intended | Self::Uncertain { .. } | Self::Unresolvable { .. } => true,
-            Self::Applied { .. } | Self::NotApplied { .. } => false,
+            None => self.needs_outcome(current),
         }
     }
 }
@@ -322,6 +352,7 @@ pub struct EffectRecord {
     request: EffectRequest,
     authorization: Authorization,
     submissions: u32,
+    decisions: Vec<RiskDecision>,
     state: EffectState,
 }
 
@@ -360,6 +391,13 @@ impl EffectRecord {
     #[must_use]
     pub const fn authorization(&self) -> &Authorization {
         &self.authorization
+    }
+
+    /// Every risk decision accepted for this effect, oldest first,
+    /// including expired ones.
+    #[must_use]
+    pub fn decisions(&self) -> &[RiskDecision] {
+        &self.decisions
     }
 
     /// How many times the request was handed to the backend under its key.
@@ -561,28 +599,34 @@ impl TaskRecord {
     pub fn unresolved_effects(&self) -> impl Iterator<Item = &EffectRecord> {
         self.effects
             .iter()
-            .filter(|effect| effect.state.needs_outcome())
+            .filter(|effect| effect.state.needs_outcome(self.evidence.revision))
     }
 
     fn blocking_work(&self) -> usize {
         self.effects
             .iter()
-            .filter(|effect| effect.state.blocks_work())
+            .filter(|effect| effect.state.blocks_work(self.evidence.revision))
             .count()
     }
 
     fn blocking_settlement(&self, success: bool) -> usize {
         self.effects
             .iter()
-            .filter(|effect| effect.state.blocks_settlement(success))
+            .filter(|effect| {
+                effect
+                    .state
+                    .blocks_settlement(success, self.evidence.revision)
+            })
             .count()
     }
 
     /// Whether a decision limits the task to an unsuccessful settlement.
     fn must_settle_unsuccessfully(&self) -> bool {
         self.effects.iter().any(|effect| {
-            matches!(&effect.state, EffectState::Waived { decision, .. }
-                if decision.action == RiskAction::SettleUnsuccessfully)
+            effect
+                .state
+                .current_decision(self.evidence.revision)
+                .is_some_and(|decision| decision.action == RiskAction::SettleUnsuccessfully)
         })
     }
 
@@ -1489,6 +1533,7 @@ impl StoreState {
             ),
             authorization,
             submissions: 1,
+            decisions: Vec::new(),
             state: EffectState::Intended,
         };
         task.effects.push(record.clone());
@@ -1606,13 +1651,23 @@ impl StoreState {
             });
         }
         match &effect.state {
-            EffectState::Unresolvable { .. } => {
-                effect.state = EffectState::Waived { decision, at: now };
-            }
             EffectState::Waived {
                 decision: recorded, ..
             } if *recorded == decision => {}
-            EffectState::Waived { .. }
+            // Handed over, or waived at an older revision (expired).
+            EffectState::Unresolvable { .. } | EffectState::Waived { .. }
+                if effect.state.is_handed_over(revision) =>
+            {
+                if effect.decisions.len() >= MAX_DECISIONS_PER_EFFECT {
+                    return fail(StateError::CapacityExceeded {
+                        limit: Limit::Decisions,
+                    });
+                }
+                effect.decisions.push(decision.clone());
+                effect.state = EffectState::Waived { decision, at: now };
+            }
+            EffectState::Unresolvable { .. }
+            | EffectState::Waived { .. }
             | EffectState::Intended
             | EffectState::Uncertain { .. }
             | EffectState::Applied { .. }
@@ -1843,9 +1898,7 @@ impl StoreState {
             let open = task.settlement().is_none();
             task.effects
                 .iter()
-                .filter(move |effect| {
-                    open && matches!(effect.state, EffectState::Unresolvable { .. })
-                })
+                .filter(move |effect| open && effect.state.is_handed_over(task.evidence.revision))
                 .map(|effect| RecoveryItem::HandedOver {
                     task: task.spec.id.clone(),
                     seq: effect.seq,
@@ -1958,7 +2011,10 @@ impl StoreState {
             if u32::try_from(index).ok() != Some(effect.seq.get()) {
                 return Err(Corruption::EffectSequence);
             }
-            if effect.submissions == 0 || effect.submissions > RetryPolicy::MAX_ATTEMPTS {
+            if effect.submissions == 0
+                || effect.submissions > RetryPolicy::MAX_ATTEMPTS
+                || effect.decisions.len() > MAX_DECISIONS_PER_EFFECT
+            {
                 return Err(Corruption::LimitExceeded);
             }
             let request = &effect.request;

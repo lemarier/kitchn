@@ -10,11 +10,16 @@ tests. They are not Kitchen defaults and are never installed by Kitchen.
   conventions. It proves that one house's rules and names do not leak into
   another house's repository. It is not CrabNebula's real policy.
 
-The Origin89 fixture omits the upstream `.origin89/` bootstrap assets. Before
-using its `skills-sync` recipe, supply the script and all three notices/licenses
-listed in [the template guide](../../../../../templates/README.md#house-guidance-and-bootstrap-assets)
-from a reviewed export. Offline `just check` does not validate guidance loading.
-
+The Origin89 fixture ships the unchanged upstream `.origin89/sync-engineering.py`
+with its MIT and Apache-2.0 licenses and a consumer notice, so its `skills-sync`
+and `skills-offline` recipes work in a generated repository. The script needs
+Python 3 and network access for its first refresh; `skills-offline` needs a
+previously verified cache and otherwise exits with an error, which
+`generated_origin89_bootstrap_reports_a_missing_cache_offline` checks. Offline
+`just check` does not run either recipe or establish that guidance was
+installed. Refresh the three upstream files from `origin89hq/engineering`
+(`templates/agents/sync-engineering.py`, `LICENSE-MIT`, `LICENSE-APACHE`) when
+Kitchen's own `.origin89/` copies change; the drift test compares them.
 
 The Origin89 fixture's generated `Cargo.toml`, `Cargo.lock`, crate manifest,
 `src/lib.rs`, and `justfile` intentionally differ from Kitchen's production

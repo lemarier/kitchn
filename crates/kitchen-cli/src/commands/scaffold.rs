@@ -110,7 +110,7 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
     let healthy = plan.conflicts().next().is_none();
     Ok((
         format!(
-            "{}\nNext: inspect the generated files{}; run kitchen house doctor --registry '{}' --repository-path '{}'.\nHouse guidance bootstrap assets must be supplied by the house template; see templates/README.md in Kitchen.",
+            "{}\nNext: inspect the generated files{}; run kitchen house doctor --registry '{}' --repository-path '{}'.\nKitchen runs no template scripts; follow the generated instructions to load house guidance.",
             if healthy {
                 "Repository files applied."
             } else {

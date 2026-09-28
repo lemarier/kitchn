@@ -191,7 +191,7 @@ fn new_repository_plan_adds_every_file_and_previews_it() -> TestResult {
             .any(|planned| planned.file.path.as_str() == "crates/kitchen/src/lib.rs")
     );
     let preview = plan.to_string();
-    assert!(preview.starts_with("Template origin89/rust-workspace revision 1, guidance aaaa"));
+    assert!(preview.starts_with("Template origin89/rust-workspace revision 2, guidance aaaa"));
     assert!(preview.contains("(new repository)"));
     assert!(preview.contains("  add        .github/workflows/check.yml\n"));
     assert!(preview.contains(&format!(
@@ -349,7 +349,7 @@ fn markers_record_house_template_and_both_revisions() -> TestResult {
     let agents = contents(&rendered, "AGENTS.md").ok_or("AGENTS.md rendered")?;
     let first_line = agents.lines().next().unwrap_or_default();
     assert!(first_line.starts_with(&format!(
-        "<!-- kitchen-managed: house=origin89 template=rust-workspace template-revision=1 guidance-revision={} content-sha256=",
+        "<!-- kitchen-managed: house=origin89 template=rust-workspace template-revision=2 guidance-revision={} content-sha256=",
         "c".repeat(40)
     )));
     let ManagedState::Pristine(marker) = inspect_managed(agents) else {
@@ -1013,7 +1013,330 @@ const DOCUMENTED_DIFFERENCES: &[(&str, &str)] = &[
         "justfile",
         "Kitchen keeps a temporary bootstrap-test recipe for its vendored .origin89 tests",
     ),
+    (
+        ".origin89/NOTICE.md",
+        "Kitchen's notice also covers its vendored bootstrap tests",
+    ),
 ];
+
+#[test]
+fn origin89_fixture_ships_its_bootstrap_and_notices() -> TestResult {
+    let rendered = render_origin89('a')?;
+    let justfile = contents(&rendered, "justfile").ok_or("justfile is rendered")?;
+    let scripts: Vec<&str> = justfile
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("python3 "))
+        .map(|command| command.split_whitespace().next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        scripts,
+        [
+            ".origin89/sync-engineering.py",
+            ".origin89/sync-engineering.py"
+        ]
+    );
+    for path in scripts {
+        assert!(contents(&rendered, path).is_some(), "{path} is not shipped");
+    }
+    let notice = contents(&rendered, ".origin89/NOTICE.md").ok_or("notice is shipped")?;
+    assert!(notice.contains("Origin89 contributors"));
+    for license in ["LICENSE-MIT", "LICENSE-APACHE"] {
+        assert!(
+            notice.contains(&format!("]({license})")),
+            "{license} is linked"
+        );
+    }
+    // Upstream bytes are preserved; Kitchen's vendored copies match upstream.
+    for path in [
+        ".origin89/sync-engineering.py",
+        ".origin89/LICENSE-MIT",
+        ".origin89/LICENSE-APACHE",
+    ] {
+        assert_eq!(
+            contents(&rendered, path),
+            Some(fs::read_to_string(repository_root().join(path))?.as_str()),
+            "{path}"
+        );
+    }
+    Ok(())
+}
+
+/// Run `python3` with `args` in `dir` and collect its output, killing it after
+/// 30 seconds. `None`, with a message on stderr, when `python3` is not installed.
+fn run_python(what: &str, args: &[&str], dir: &Path) -> TestResult<Option<std::process::Output>> {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let mut child = match Command::new("python3")
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            writeln!(std::io::stderr(), "SKIP {what}: python3 unavailable")?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            return Err(format!("{what} exceeded 30 seconds").into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(Some(child.wait_with_output()?))
+}
+
+#[test]
+fn generated_origin89_bootstrap_reports_a_missing_cache_offline() -> TestResult {
+    let temp = TempDir::new()?;
+    let consumer = real(&temp)?.join("consumer");
+    FilePlan::new(render_origin89('a')?, &consumer)?.apply()?;
+    let Some(output) = run_python(
+        "generated Origin89 offline bootstrap",
+        &[".origin89/sync-engineering.py", "--offline"],
+        &consumer,
+    )?
+    else {
+        return Ok(());
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr.contains("No cached engineering skills available"),
+        "{stderr}"
+    );
+    assert!(!consumer.join(".agents").exists());
+    assert!(!consumer.join(".claude/skills").exists());
+    Ok(())
+}
+
+const UPSTREAM_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+const UPSTREAM_SKILLS: [&str; 4] = [
+    "origin89-commits",
+    "origin89-rust",
+    "origin89-working",
+    "origin89-writing",
+];
+const UPSTREAM_HEAD_URL: &str = "https://api.github.com/repos/origin89hq/engineering/commits/main";
+
+/// Runs the rendered bootstrap's own `refresh` with its `fetch` seam pointed at
+/// an in-memory upstream, so no request leaves the process. `mode` selects what
+/// upstream serves: a valid archive, an archive with an escaping path, one
+/// missing a required skill, or a network outage. Prints one JSON report.
+const CONTROLLED_UPSTREAM: &str = r##"
+import importlib.util, io, json, sys, tarfile, urllib.error
+from pathlib import Path
+
+consumer, mode, revision = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location(
+    "sync_engineering", consumer / ".origin89" / "sync-engineering.py")
+sync = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sync)
+requests = []
+
+def skill(name):
+    return (f"---\nname: {name}\ndescription: Controlled upstream skill {name}\n---\n"
+            f"Body of {name}.\n").encode()
+
+def archive():
+    names = ["origin89-rust", "origin89-working", "origin89-writing"]
+    if mode != "incomplete":
+        names.append("origin89-commits")
+    entries = {f"skills/{name}/SKILL.md": skill(name) for name in names}
+    entries["README.md"] = b"not a skill\n"
+    if mode == "unsafe":
+        entries["skills/../escape"] = b"outside\n"
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as bundle:
+        for path, data in entries.items():
+            info = tarfile.TarInfo(f"engineering-{revision}/{path}")
+            info.size = len(data)
+            bundle.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+def fetch(url):
+    requests.append(url)
+    if mode == "unreachable":
+        raise urllib.error.URLError("controlled outage")
+    if url == sync.HEAD_URL:
+        return json.dumps({"sha": revision}).encode()
+    if url == f"https://codeload.github.com/{sync.SOURCE}/tar.gz/{revision}":
+        return archive()
+    raise AssertionError(f"unexpected request: {url}")
+
+try:
+    report = {"ok": True, "result": sync.refresh(consumer, fetch=fetch)}
+except ValueError as error:
+    report = {"ok": False, "error": str(error)}
+print(json.dumps(report | {"requests": requests}))
+"##;
+
+/// The controlled-upstream report, or `None` when `python3` is unavailable.
+fn refresh_from_controlled_upstream(
+    consumer: &Path,
+    mode: &str,
+) -> TestResult<Option<serde_json::Value>> {
+    let consumer_arg = consumer.to_str().ok_or("consumer path is not UTF-8")?;
+    let Some(output) = run_python(
+        "generated Origin89 first-use bootstrap",
+        &[
+            "-c",
+            CONTROLLED_UPSTREAM,
+            consumer_arg,
+            mode,
+            UPSTREAM_REVISION,
+        ],
+        consumer,
+    )?
+    else {
+        return Ok(None);
+    };
+    assert!(output.status.success(), "{output:?}");
+    Ok(Some(serde_json::from_slice(&output.stdout)?))
+}
+
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+#[test]
+fn generated_origin89_bootstrap_first_use_installs_guidance_from_a_controlled_upstream()
+-> TestResult {
+    use serde_json::{Value, json};
+    let temp = TempDir::new()?;
+    let consumer = real(&temp)?.join("consumer");
+    FilePlan::new(render_origin89('a')?, &consumer)?.apply()?;
+    let cache = consumer.join(".origin89/engineering");
+    assert!(!cache.exists(), "a new consumer starts with an empty cache");
+
+    let Some(report) = refresh_from_controlled_upstream(&consumer, "good")? else {
+        return Ok(());
+    };
+    let archive_url =
+        format!("https://codeload.github.com/origin89hq/engineering/tar.gz/{UPSTREAM_REVISION}");
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(
+        report["requests"],
+        json!([UPSTREAM_HEAD_URL, archive_url]),
+        "the archive is fetched by the revision the head lookup returned"
+    );
+    assert_eq!(report["result"]["revision"], UPSTREAM_REVISION);
+    assert_eq!(report["result"]["skills"], json!(UPSTREAM_SKILLS));
+    assert_eq!(report["result"]["cached"], Value::Null);
+
+    // The cache holds a verified snapshot of the skill folders only.
+    let snapshot = cache.join("versions").join(UPSTREAM_REVISION);
+    let state: Value = serde_json::from_str(&fs::read_to_string(snapshot.join("state.json"))?)?;
+    assert_eq!(state["revision"], UPSTREAM_REVISION);
+    assert_eq!(state["skills"], json!(UPSTREAM_SKILLS));
+    assert_eq!(
+        state["files"].as_object().map(serde_json::Map::len),
+        Some(UPSTREAM_SKILLS.len())
+    );
+    assert!(!snapshot.join("README.md").exists());
+    assert_eq!(
+        fs::read_link(cache.join("current"))?,
+        PathBuf::from(format!("versions/{UPSTREAM_REVISION}"))
+    );
+    assert!(fs::symlink_metadata(cache.join("sync.lock")).is_err());
+
+    // Every skill is discoverable by both assistants and resolves to the cache.
+    for assistant in [".agents", ".claude"] {
+        for name in UPSTREAM_SKILLS {
+            let link = consumer.join(assistant).join("skills").join(name);
+            assert!(is_link(&link), "{}", link.display());
+            let text = fs::read_to_string(link.join("SKILL.md"))?;
+            assert!(text.contains(&format!("Body of {name}.")), "{name}");
+        }
+    }
+
+    // An unchanged upstream revision reuses the verified snapshot.
+    let again = refresh_from_controlled_upstream(&consumer, "good")?.ok_or("python3 vanished")?;
+    assert_eq!(again["ok"], true, "{again}");
+    assert_eq!(again["requests"], json!([UPSTREAM_HEAD_URL]));
+    assert_eq!(again["result"]["cached"], Value::Null);
+
+    // With no network at all, the shipped command line reuses that cache.
+    let output = run_python(
+        "generated Origin89 offline bootstrap",
+        &[".origin89/sync-engineering.py", "--offline"],
+        &consumer,
+    )?
+    .ok_or("python3 vanished")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        stdout.contains(&format!("\"revision\": \"{UPSTREAM_REVISION}\"")),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .contains("Using cached skills; this run did not confirm the latest upstream content."),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rejected_first_use_refresh_activates_nothing_and_a_later_one_recovers() -> TestResult {
+    let temp = TempDir::new()?;
+    let consumer = real(&temp)?.join("consumer");
+    FilePlan::new(render_origin89('a')?, &consumer)?.apply()?;
+    let cache = consumer.join(".origin89/engineering");
+    for (mode, error) in [
+        ("unsafe", "Unsafe path in skill archive"),
+        (
+            "incomplete",
+            "Archive is missing the shared working, writing, or commit skill",
+        ),
+        (
+            "unreachable",
+            "No cached engineering skills available (refresh unavailable:",
+        ),
+    ] {
+        let Some(report) = refresh_from_controlled_upstream(&consumer, mode)? else {
+            return Ok(());
+        };
+        assert_eq!(report["ok"], false, "{mode}: {report}");
+        assert!(
+            report["error"]
+                .as_str()
+                .is_some_and(|message| message.contains(error)),
+            "{mode}: {report}"
+        );
+        assert!(!cache.join("versions").exists(), "{mode}");
+        assert!(
+            fs::symlink_metadata(cache.join("current")).is_err(),
+            "{mode}"
+        );
+        assert!(
+            fs::symlink_metadata(cache.join("sync.lock")).is_err(),
+            "{mode}"
+        );
+        assert!(!consumer.join(".agents").exists(), "{mode}");
+        assert!(!consumer.join(".claude/skills").exists(), "{mode}");
+    }
+
+    let report = refresh_from_controlled_upstream(&consumer, "good")?.ok_or("python3 vanished")?;
+    assert_eq!(report["ok"], true, "{report}");
+    for assistant in [".agents", ".claude"] {
+        for name in UPSTREAM_SKILLS {
+            let link = consumer.join(assistant).join("skills").join(name);
+            assert!(is_link(&link), "{}", link.display());
+        }
+    }
+    Ok(())
+}
 
 #[test]
 fn kitchen_layout_matches_the_origin89_template() -> TestResult {

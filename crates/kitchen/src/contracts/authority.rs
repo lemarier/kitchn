@@ -42,6 +42,8 @@ closed_names! {
         EditLabels = "edit-labels",
         /// Open an issue.
         CreateIssue = "create-issue",
+        /// Close an issue. Granted only explicitly; no other permission implies it.
+        CloseIssue = "close-issue",
         /// Change issue relationships such as blocked-by links and sub-issues.
         EditIssueRelationships = "edit-issue-relationships",
         /// Push commits to a branch.

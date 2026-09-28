@@ -55,6 +55,7 @@ impl HouseConfig {
                 | Permission::PostComment
                 | Permission::EditLabels
                 | Permission::CreateIssue
+                | Permission::CloseIssue
                 | Permission::EditIssueRelationships
                 | Permission::PushBranch
                 | Permission::OpenPullRequest

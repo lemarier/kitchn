@@ -498,3 +498,33 @@ fn errors_expose_a_handling_class() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn closing_an_issue_needs_its_own_explicit_grant() -> TestResult {
+    let close: Permission = "close-issue".parse()?;
+    assert_eq!(close.as_str(), "close-issue");
+    let orca = backend_id()?;
+    // Every other issue permission is granted, closing is not.
+    let token = credential()?;
+    let others: Vec<_> = Permission::ALL
+        .into_iter()
+        .filter(|permission| permission.as_str() != "close-issue")
+        .map(|permission| Grant::house(permission, orca.clone(), token.clone()))
+        .collect();
+    let house_grants = HouseGrants::new(house()?, others.clone());
+    let authority = TaskAuthority::delegate(&house_grants, others)?;
+    assert_eq!(
+        authority.authorize(&house_grants, close, &GrantScope::House, &orca),
+        Err(ContractError::PermissionDenied { permission: close })
+    );
+    let explicit = HouseGrants::new(house()?, [Grant::house(close, orca.clone(), credential()?)]);
+    let granted = TaskAuthority::delegate(
+        &explicit,
+        [Grant::house(close, orca.clone(), credential()?)],
+    )?;
+    assert_eq!(
+        granted.authorize(&explicit, close, &GrantScope::House, &orca)?,
+        credential()?
+    );
+    Ok(())
+}

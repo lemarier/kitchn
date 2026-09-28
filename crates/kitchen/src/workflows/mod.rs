@@ -2,6 +2,7 @@
 
 pub mod cleanup;
 pub mod gardener;
+pub mod gate;
 pub mod inspector;
 pub mod triage;
 

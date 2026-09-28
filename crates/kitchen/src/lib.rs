@@ -27,6 +27,7 @@ pub mod integrations;
 pub mod scaffold;
 pub mod scheduling;
 pub mod state;
+pub mod trust;
 pub mod workflows;
 
 pub use error::{Error, ErrorClass, Result};

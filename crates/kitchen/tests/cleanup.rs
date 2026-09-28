@@ -183,6 +183,9 @@ struct Inventory {
     /// While set, every launch's receipt names these resources as created,
     /// instead of the ones the fake made: a reused or foreign identifier.
     created_override: RefCell<Option<Vec<ResourceRef>>>,
+    /// Resources the inventory leaves out although the backend still knows
+    /// them, such as a worker whose listing was truncated.
+    hidden: RefCell<Vec<ResourceRef>>,
 }
 
 impl Inventory {
@@ -195,6 +198,7 @@ impl Inventory {
             change: RefCell::new(None),
             outage: Cell::new(false),
             created_override: RefCell::new(None),
+            hidden: RefCell::new(Vec::new()),
         }
     }
 
@@ -273,6 +277,8 @@ impl WorkerBackend for Inventory {
         }
         let mut all = self.fake.inventory()?;
         all.extend(self.extra.borrow().iter().cloned());
+        let hidden = self.hidden.borrow();
+        all.retain(|observation| !hidden.contains(&observation.resource));
         Ok(all)
     }
 }
@@ -1776,31 +1782,9 @@ fn branches_and_schedules_are_never_reclaimed_even_when_a_task_created_them() ->
         let entry = preview.entry(resource).ok_or("resource")?;
         assert!(matches!(entry.ownership, Ownership::Task(_)));
     }
-    // The task's settled worker is released; the branch and schedule are not.
-    let before = harness.backend.fake.effects_performed();
-    harness.approve_all()?;
-    harness.clock.advance(60);
-    let report = harness.apply()?;
-    let released: Vec<&ResourceRef> = report
-        .results
-        .iter()
-        .filter(|result| result.outcome == ReleaseOutcome::Released)
-        .map(|result| &result.resource)
-        .collect();
-    assert_eq!(
-        released
-            .iter()
-            .map(|resource| resource.kind)
-            .collect::<Vec<_>>(),
-        [ResourceKind::Worker]
-    );
-    assert_eq!(harness.backend.fake.effects_performed(), before + 1);
-    assert!(
-        report
-            .results
-            .iter()
-            .all(|result| result.resource != branch && result.resource != schedule)
-    );
+    // Nothing is released: the backend lists the task's worker without an
+    // owner record, and the branch and schedule are not reclaimable at all.
+    assert_eq!(effects_from_applying(&harness)?, 0);
     Ok(())
 }
 
@@ -1876,6 +1860,78 @@ fn releases_beyond_the_bound_are_deferred_and_finish_on_a_later_run() -> TestRes
             .all(|r| r.outcome == ReleaseOutcome::Released)
     );
     assert_eq!(harness.backend.fake.effects_performed(), before + 4);
+    Ok(())
+}
+
+#[test]
+fn a_resource_the_backend_gives_no_owner_record_for_is_retained() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    for observation in harness.backend.extra.borrow_mut().iter_mut() {
+        if observation.resource == owned.worktree {
+            observation.owner = None;
+        }
+    }
+    let preview = harness.inspect()?;
+    // Kitchen's record says task-1 created it; the backend confirms nothing.
+    assert!(matches!(
+        preview.entry(&owned.worktree).ok_or("worktree")?.ownership,
+        Ownership::Task(_)
+    ));
+    assert_eq!(
+        reasons(&preview, &owned.worktree)?,
+        [Exclusion::BackendOwnerUnrecorded]
+    );
+    // Build output is not removed on that evidence either.
+    build_dir(harness.path(&owned.worktree)?, 1024)?;
+    let preview = harness.inspect()?;
+    let build = preview
+        .entry(&owned.worktree)
+        .and_then(|entry| entry.build_output.as_ref())
+        .ok_or("build output")?;
+    assert_eq!(
+        build.decision,
+        Decision::Retain {
+            reasons: vec![Exclusion::BackendOwnerUnrecorded]
+        }
+    );
+    // The worker, whose owner the backend does record, is unaffected.
+    assert_eq!(reasons(&preview, &owned.worker)?, []);
+    Ok(())
+}
+
+#[test]
+fn workers_the_inventory_omits_are_still_observed_before_their_task_is_reclaimed() -> TestResult {
+    let mut harness = Harness::new()?;
+    let taken = harness.owner("task-1", true)?;
+    let running = harness.owner("task-2", true)?;
+    let gone = harness.owner("task-3", true)?;
+    let settled = harness.owner("task-4", true)?;
+    let fake = &harness.backend.fake;
+    fake.set_worker_state(&taken.worker, WorkerState::UserTakeover);
+    fake.set_worker_state(&running.worker, WorkerState::Ready);
+    fake.set_worker_state(&gone.worker, WorkerState::Missing);
+    for owned in [&taken, &running, &gone, &settled] {
+        harness
+            .backend
+            .hidden
+            .borrow_mut()
+            .push(owned.worker.clone());
+    }
+    let preview = harness.inspect()?;
+    assert!(preview.entry(&taken.worker).is_none(), "worker is unlisted");
+    // A person's takeover retains the worktree though nothing lists the worker.
+    assert_eq!(
+        reasons(&preview, &taken.worktree)?,
+        [Exclusion::UserTakeover, Exclusion::SiblingInUse]
+    );
+    assert_eq!(
+        reasons(&preview, &running.worktree)?,
+        [Exclusion::SiblingInUse]
+    );
+    // A worker the backend no longer knows, or one that settled, is not in use.
+    assert_eq!(reasons(&preview, &gone.worktree)?, []);
+    assert_eq!(reasons(&preview, &settled.worktree)?, []);
     Ok(())
 }
 
@@ -2096,6 +2152,40 @@ fn build_output_of_settled_workers_is_reclaimed_without_touching_work() -> TestR
 
     harness.clock.advance(60);
     assert!(harness.reclaim()?.results.is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_removal_names_its_error_and_a_later_run_finishes_it() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let target = build_dir(harness.path(&owned.worktree)?, 1024)?;
+    let locked = target.join("debug");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500))?;
+    // The superuser ignores directory permissions, so there is no failure to show.
+    if fs::write(locked.join("probe"), b"x").is_ok() {
+        return Ok(());
+    }
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    let report = harness.reclaim()?;
+    let result = report.results.first().ok_or("no result")?;
+    assert_eq!(result.outcome, BuildOutcome::Failed);
+    assert_eq!(result.error.as_deref(), Some("permission denied"));
+    assert_eq!(result.freed, None);
+    assert_eq!(report.freed().bytes, 0, "nothing is reported as freed");
+    // The directory still looks like build output, so the same approval
+    // covers the next attempt once the obstacle is gone.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700))?;
+    harness.clock.advance(60);
+    let again = harness.reclaim()?;
+    assert_eq!(
+        again.results.iter().map(|r| r.outcome).collect::<Vec<_>>(),
+        [BuildOutcome::Removed]
+    );
+    assert!(!target.exists());
     Ok(())
 }
 

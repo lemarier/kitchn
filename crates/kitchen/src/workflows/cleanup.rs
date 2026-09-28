@@ -186,6 +186,9 @@ pub enum Exclusion {
     AmbiguousOwner,
     /// The backend's owner record names a different effect.
     BackendOwnerMismatch,
+    /// The backend records no owner, so nothing but Kitchen's own record ties
+    /// the resource to the task.
+    BackendOwnerUnrecorded,
     /// The owning task is not settled.
     OwnerActive,
     /// The owning task has an effect whose outcome is unknown or waived.
@@ -232,6 +235,7 @@ impl Exclusion {
             Self::UnknownOwner => "unknown-owner",
             Self::AmbiguousOwner => "ambiguous-owner",
             Self::BackendOwnerMismatch => "backend-owner-mismatch",
+            Self::BackendOwnerUnrecorded => "backend-owner-unrecorded",
             Self::OwnerActive => "owner-active",
             Self::UnresolvedEffects => "unresolved-effects",
             Self::SharedWithTask => "shared-with-task",
@@ -401,9 +405,9 @@ pub const EXTERNAL_CACHE_SUGGESTIONS: [Suggestion; 3] = [
         caution: "needs cargo-cache; affects every project on this host",
     },
     Suggestion {
-        reclaims: "a shared compiler cache",
+        reclaims: "nothing itself: shows how large a shared compiler cache is",
         command: "sccache --show-stats",
-        caution: "clear its cache directory only while nothing is compiling",
+        caution: "sccache has no clear command; delete its cache directory yourself, and only while nothing is compiling",
     },
     Suggestion {
         reclaims: "build output in checkouts Kitchen does not own",
@@ -1437,6 +1441,22 @@ fn evaluate(
             || worker.is_some_and(|state| !matches!(state, WorkerState::Settled(_)));
         flags.1 |= *worker == Some(WorkerState::UserTakeover);
     }
+    // A worker the owning task created is observed even when the inventory
+    // omits it: a person's takeover or a live agent must still keep the task.
+    for task_id in &relevant_owners {
+        let Some(record) = tasks.iter().find(|task| &task.spec().id == *task_id) else {
+            continue;
+        };
+        for worker in created_workers(record).filter(|worker| !seen.contains(worker)) {
+            let state = inspector
+                .backend
+                .observe_worker(worker)
+                .map_err(CleanupError::Backend)?;
+            let flags = busy.entry(task_id).or_default();
+            flags.0 |= !matches!(state, WorkerState::Settled(_) | WorkerState::Missing);
+            flags.1 |= state == WorkerState::UserTakeover;
+        }
+    }
     let mut entries = Vec::new();
     for (((observation, ownership, owner), worker), chosen) in
         observed.iter().zip(&workers).zip(&selected)
@@ -1555,12 +1575,15 @@ fn own_reasons(
             reasons.insert(Exclusion::AmbiguousOwner);
         }
         Ownership::Task(owner) => {
-            if observation
-                .owner
-                .as_ref()
-                .is_some_and(|recorded| recorded.as_str() != owner.key.as_str())
-            {
-                reasons.insert(Exclusion::BackendOwnerMismatch);
+            match &observation.owner {
+                Some(recorded) if recorded.as_str() != owner.key.as_str() => {
+                    reasons.insert(Exclusion::BackendOwnerMismatch);
+                }
+                Some(_) => {}
+                // Kitchen's own record is not enough to delete on.
+                None => {
+                    reasons.insert(Exclusion::BackendOwnerUnrecorded);
+                }
             }
             if !matches!(owner.state, OwnerState::Settled { .. }) {
                 reasons.insert(Exclusion::OwnerActive);
@@ -1639,6 +1662,22 @@ fn own_reasons(
             );
         }
     }
+}
+
+/// The workers that applied effects of `task` created.
+fn created_workers(task: &TaskRecord) -> impl Iterator<Item = &ResourceRef> {
+    task.effects()
+        .iter()
+        .filter_map(|effect| match effect.state() {
+            EffectState::Applied { receipt, .. } => Some(receipt.created()),
+            EffectState::Intended
+            | EffectState::Uncertain { .. }
+            | EffectState::NotApplied { .. }
+            | EffectState::Unresolvable { .. }
+            | EffectState::Waived { .. } => None,
+        })
+        .flatten()
+        .filter(|resource| resource.kind == ResourceKind::Worker)
 }
 
 /// Ownership of `resource` according to the store's applied effects.
@@ -1764,6 +1803,7 @@ const fn blocks_build_output(reason: Exclusion) -> bool {
         | Exclusion::UnknownOwner
         | Exclusion::AmbiguousOwner
         | Exclusion::BackendOwnerMismatch
+        | Exclusion::BackendOwnerUnrecorded
         | Exclusion::UnresolvedEffects
         | Exclusion::SharedWithTask
         | Exclusion::InUse

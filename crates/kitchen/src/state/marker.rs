@@ -30,6 +30,7 @@ pub const MAX_MARKER_HISTORY: usize = 16;
 /// The work item a marker is about.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum WorkItem {
     /// An issue.
     Issue {
@@ -68,6 +69,7 @@ pub struct IssueRevision {
 /// The exact revision a marker's fact is about.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "revision", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MarkerSubject {
     /// A Git head and optional base, such as a pull request under review.
     Git(EvidenceSubject),

@@ -988,7 +988,7 @@ fn registry_with(
         serde_json::from_str(include_str!("fixtures/house/origin89.json"))?;
     house.schedules = schedules;
     let repository = RepositoryConfig {
-        schema: 1,
+        schema: 2,
         house: house.house.clone(),
         repository: house.repositories.first().ok_or("empty fixture")?.clone(),
         workflows: BTreeSet::from([Workflow::Pickup]),
@@ -1015,6 +1015,7 @@ fn registry_with(
         labels: Some(labels),
         access: AccessStatus::Available,
         agent_models: None,
+        stack_tool: None,
         schedules: None,
     };
     Ok((temp, registry, repository, evidence))

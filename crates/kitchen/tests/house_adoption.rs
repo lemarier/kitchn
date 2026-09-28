@@ -700,6 +700,7 @@ fn doctor_reports_a_configured_stack_tool_that_is_missing() -> TestResult {
         access: AccessStatus::Available,
         agent_models: None,
         stack_tool: Some(StackToolStatus::Missing),
+        schedules: None,
     };
     let report = doctor(&registry, &repository, Some(&evidence))?;
     assert!(!report.healthy());

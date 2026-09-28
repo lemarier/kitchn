@@ -1062,3 +1062,108 @@ fn cancelling_an_uncertain_launch_keeps_its_uncertainty() -> TestResult {
     );
     Ok(())
 }
+
+/// Exits the process inside `execute`, after intent is durable and before
+/// anything reaches a provider.
+struct ExitingBackend(FakeBackend);
+
+impl ExecutionBackend for ExitingBackend {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.0.descriptor()
+    }
+    fn execute(&self, _request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        std::process::exit(44)
+    }
+    fn lookup(&self, key: &IdempotencyKey) -> Result<Lookup, BackendUnavailable> {
+        self.0.lookup(key)
+    }
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.0.observe_worker(worker)
+    }
+}
+
+const CRASH_DIR: &str = "KITCHEN_CRASH_STORE";
+const CRASH_FENCE: &str = "KITCHEN_CRASH_FENCE";
+
+/// The child half of `abrupt_exit_after_intent_leaves_a_reconcilable_effect`.
+/// It does nothing unless that test starts it.
+#[test]
+fn crash_child_exits_inside_execute() -> TestResult {
+    let (Some(dir), Some(fence)) = (std::env::var_os(CRASH_DIR), std::env::var_os(CRASH_FENCE))
+    else {
+        return Ok(());
+    };
+    let store =
+        kitchen::state::HouseStore::open(dir, house()?, kitchen::state::StoreOptions::default())?;
+    let fence: u64 = fence.to_str().ok_or("fence")?.parse()?;
+    let lease_fence = match store.task(&task_id("task-1")?)?.state() {
+        kitchen::state::TaskState::Claimed { lease } if lease.fence().get() == fence => {
+            lease.fence()
+        }
+        kitchen::state::TaskState::Claimed { .. }
+        | kitchen::state::TaskState::Open
+        | kitchen::state::TaskState::Settled { .. } => {
+            return Err("the parent's claim is missing".into());
+        }
+    };
+    let backend = ExitingBackend(FakeBackend::fully_capable(backend_id()?, house()?));
+    run_effect(
+        &store,
+        &backend,
+        &grants()?,
+        plan(&task_id("task-1")?, lease_fence, "launch", launch()?)?,
+        &ManualClock::starting_at(1),
+    )?;
+    Err("the child returned from execute".into())
+}
+
+#[test]
+fn abrupt_exit_after_intent_leaves_a_reconcilable_effect() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = started(&fixture, "task-1")?;
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .args(["--exact", "crash_child_exits_inside_execute", "--nocapture"])
+        .env(CRASH_DIR, fixture.dir.path().join("house"))
+        .env(CRASH_FENCE, fence.get().to_string())
+        .status()?;
+    assert_eq!(
+        status.code(),
+        Some(44),
+        "the child must exit inside execute"
+    );
+
+    // A new process finds the durable intent and an owner that is gone.
+    let store = fixture.reopen()?;
+    let record = store.task(&task)?;
+    assert!(matches!(
+        record.effects(),
+        [effect] if effect.state() == &EffectState::Intended && effect.submissions() == 1
+    ));
+    assert!(store.recovery_queue(at(61))?.contains(
+        &kitchen::state::RecoveryItem::UncertainTaskOwner {
+            task: task.clone(),
+            holder: holder("coordinator-a")?,
+            expired_at: at(60),
+        }
+    ));
+    let lease = store.take_over(&task, &scheduled("coordinator-b")?, ttl(60)?, at(61))?;
+    assert!(matches!(
+        store.start_attempt(&task, lease.fence(), at(61)),
+        Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+    ));
+    // Without lookup nothing can establish the outcome, so nothing reruns.
+    let backend = fake([Capability::WorkerLaunchIsolated])?;
+    let report = reconcile(
+        &store,
+        &backend,
+        &task,
+        lease.fence(),
+        &ManualClock::starting_at(62),
+    )?;
+    assert!(matches!(
+        report.unresolved.as_slice(),
+        [effect] if matches!(effect.state(), EffectState::Uncertain { reason: UncertainReason::LookupUnsupported, .. })
+    ));
+    assert_eq!(backend.execute_calls(), 0);
+    Ok(())
+}

@@ -23,14 +23,15 @@ use kitchen::{
         EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, Grant,
         HouseGrants, IdempotencyKey, Liveness, Lookup, NotAppliedReason, Operation, Permission,
         Provenance, Repository, ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleEffect,
-        TaskAuthority, TaskSpec, Text, UncertainReason, WorkerBackend, WorkerOutcome, WorkerState,
-        Workspace,
+        TaskAuthority, TaskSpec, Text, Timestamp, UncertainReason, WorkerBackend, WorkerOutcome,
+        WorkerState, Workspace,
         conformance::{self, Check, CheckResult, ConformanceFixture},
     },
     scheduling::{
-        AgentFamily, CronExpr, GraceMinutes, ObservedScheduleState, Precheck, PrecheckTimeout,
-        Readiness, ReadinessSignal, Recurrence, RunOutcome, RunVerdict, ScheduleField,
-        ScheduleSpec, ScheduleState, ScheduleWorkspace, TimeOfDay, Timezone, WorkflowName,
+        AgentFamily, CronExpr, GraceMinutes, MAX_SCHEDULE_RUNS, ObservedScheduleState, Precheck,
+        PrecheckTimeout, Readiness, ReadinessSignal, Recurrence, RunOutcome, RunVerdict,
+        ScheduleField, ScheduleSpec, ScheduleState, ScheduleWorkspace, TimeOfDay, Timezone,
+        WorkflowName,
     },
     state::{EffectPlan, EffectState, reconcile, run_effect},
 };
@@ -1348,13 +1349,14 @@ fn schedule_changes_are_owned_and_read_back() -> TestResult {
     assert_eq!(
         judged,
         [
+            // No due time: counted as the newest run.
+            (RunOutcome::Unknown, RunVerdict::Unknown),
             (RunOutcome::LaunchFailed, RunVerdict::LaunchFailed),
             (RunOutcome::PrecheckIdle, RunVerdict::Idle),
             (RunOutcome::PrecheckFailed, RunVerdict::PrecheckFailed),
             (RunOutcome::PrecheckFailed, RunVerdict::PrecheckFailed),
             // Not yet due for a verdict: the deadline has not passed.
             (RunOutcome::LaunchReported, RunVerdict::Pending),
-            (RunOutcome::Unknown, RunVerdict::Unknown)
         ]
     );
 
@@ -1857,6 +1859,73 @@ fn a_swallowed_scheduled_launch_is_reported_as_failed() -> TestResult {
     // A run without a due time cannot be joined or aged out.
     sim.state().runs = vec![json!({"status": "completed"})];
     assert_eq!(inspect(at(999_999), &signals)?, [RunVerdict::Pending]);
+    Ok(())
+}
+
+#[test]
+fn runs_without_a_due_time_survive_the_cut_to_the_newest_runs() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let installed = backend.install_schedule(&schedule_spec("pickup")?)?;
+    let readiness = Readiness::new(&[], at(0), Duration::from_secs(300));
+    let dated = |seconds: u64| json!({"status": "completed", "scheduledFor": seconds * 1000});
+    // A trial, or a run still dispatching, has no due time yet.
+    let undated = || json!({"status": "running"});
+    let observe = |runs: Vec<serde_json::Value>| -> TestResult<Vec<Option<Timestamp>>> {
+        sim.state().runs = runs;
+        Ok(backend
+            .inspect_schedule(&installed, &readiness)?
+            .recent_runs
+            .iter()
+            .map(|judged| judged.run.scheduled_for)
+            .collect())
+    };
+    let newest_first = |seconds: std::ops::RangeInclusive<u64>| -> Vec<Option<Timestamp>> {
+        seconds.rev().map(|seconds| Some(at(seconds))).collect()
+    };
+    let with_undated = |count: usize, dated: Vec<Option<Timestamp>>| -> Vec<Option<Timestamp>> {
+        std::iter::repeat_n(None, count).chain(dated).collect()
+    };
+    assert_eq!(MAX_SCHEDULE_RUNS, 20);
+
+    // Listed last, the undated run is the one a plain truncation would drop.
+    let mut listing: Vec<_> = (1..=25).map(dated).collect();
+    listing.push(undated());
+    assert_eq!(
+        observe(listing)?,
+        with_undated(1, newest_first(7..=25)),
+        "the undated run counts as the newest; the oldest dated runs are cut"
+    );
+
+    // Several undated runs take their places before any dated run does.
+    let mut listing: Vec<_> = (1..=22).map(dated).collect();
+    listing.extend([undated(), undated(), undated()]);
+    assert_eq!(
+        observe(listing)?,
+        with_undated(3, newest_first(6..=22)),
+        "three undated runs leave room for the 17 newest dated runs"
+    );
+
+    // Exactly the cap: nothing is dropped, and an undated run is not moved out.
+    let mut listing: Vec<_> = (1..=19).map(dated).collect();
+    listing.insert(0, undated());
+    assert_eq!(
+        observe(listing)?,
+        with_undated(1, newest_first(1..=19)),
+        "a listing at the cap keeps every run"
+    );
+
+    // More undated runs than the cap still yield only the cap.
+    assert_eq!(
+        observe((0..=MAX_SCHEDULE_RUNS).map(|_| undated()).collect())?,
+        with_undated(MAX_SCHEDULE_RUNS, Vec::new())
+    );
+
+    // Without undated runs the newest dated runs are kept, as before.
+    assert_eq!(
+        observe((1..=21).map(dated).collect())?,
+        newest_first(2..=21)
+    );
     Ok(())
 }
 

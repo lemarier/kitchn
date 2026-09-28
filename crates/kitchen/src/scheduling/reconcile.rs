@@ -215,7 +215,9 @@ pub struct JudgedRun {
 pub struct ScheduleObservation {
     /// Its state.
     pub state: ObservedScheduleState,
-    /// Up to [`MAX_SCHEDULE_RUNS`] runs with their verdicts, newest first.
+    /// Up to [`MAX_SCHEDULE_RUNS`] runs with their verdicts, newest first. A
+    /// run with no due time, such as a trial or one still dispatching, counts
+    /// as the newest and comes first.
     pub recent_runs: Vec<JudgedRun>,
 }
 

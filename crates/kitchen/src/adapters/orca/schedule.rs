@@ -510,8 +510,11 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             self.call(args, self.config().call_timeout)?,
             "automation runs",
         )?;
+        // Newest first. A run with no due time is a trial or still
+        // dispatching, so it ranks newest and survives the cut below; the
+        // sort is stable, so undated runs keep Orca's listing order.
         runs.runs
-            .sort_by_key(|run| std::cmp::Reverse(run.scheduled_for));
+            .sort_by_key(|run| std::cmp::Reverse((run.scheduled_for.is_none(), run.scheduled_for)));
         let recent: Vec<ScheduleRun> = runs
             .runs
             .iter()

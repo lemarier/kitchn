@@ -12,10 +12,10 @@ use kitchen::{
     BackendId, Error, HouseId, TaskId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, BackendUnavailable,
-        Capability, CapabilitySet, ContractError, Disposition, EffectExecutor, EffectFailure,
-        EffectRequest, ExternalRef, Fence, Grant, HouseGrants, Lookup, NotAppliedReason, Operation,
-        Permission, Receipt, ResourceKind, ResourceRef, Settlement, TaskAuthority, Text,
-        UncertainReason, WorkerBackend, WorkerState,
+        BranchName, Capability, CapabilitySet, ContractError, Disposition, Effect, EffectExecutor,
+        EffectFailure, EffectRequest, ExternalRef, Fence, Grant, HouseGrants, Lookup,
+        NotAppliedReason, Operation, Permission, Receipt, ResourceKind, ResourceRef, Settlement,
+        TaskAuthority, Text, UncertainReason, WorkerBackend, WorkerState,
         conformance::{self, Check, CheckResult, ConformanceFixture},
         fake::{ExecuteFault, FakeBackend},
     },
@@ -1586,8 +1586,8 @@ fn a_user_takeover_is_not_evidence_of_cancellation() -> TestResult {
     Ok(())
 }
 
-/// Creates the worker on a branch other than the one requested.
-struct WrongBranch(FakeBackend);
+/// Creates the worker on the named branch, whatever branch was requested.
+struct WrongBranch(FakeBackend, &'static str);
 
 impl EffectExecutor for WrongBranch {
     fn descriptor(&self) -> &BackendDescriptor {
@@ -1600,7 +1600,7 @@ impl EffectExecutor for WrongBranch {
             .iter()
             .map(|resource| {
                 if resource.kind == ResourceKind::Branch {
-                    ExternalRef::new("some-other-branch").map(|handle| ResourceRef {
+                    ExternalRef::new(self.1).map(|handle| ResourceRef {
                         handle,
                         ..resource.clone()
                     })
@@ -1631,13 +1631,126 @@ impl WorkerBackend for WrongBranch {
 #[test]
 fn a_backend_reporting_another_branch_fails_the_contract() -> TestResult {
     // Without lookup or idempotency, only the receipt itself is checked.
-    let backend = WrongBranch(fake([
-        Capability::WorkerLaunchIsolated,
-        Capability::WorkerStatusAndOutcome,
-    ])?);
+    let backend = WrongBranch(
+        fake([
+            Capability::WorkerLaunchIsolated,
+            Capability::WorkerStatusAndOutcome,
+        ])?,
+        "some-other-branch",
+    );
     let failure = conformance::run_worker(&backend, &conformance_fixture()?)
         .err()
         .ok_or("a launch on another branch passed")?;
+    assert_eq!(failure.check, Check::LaunchReceipt);
+    assert_eq!(
+        failure.problem,
+        "receipt does not name exactly the requested branch"
+    );
+    Ok(())
+}
+
+/// Records the branch each launch request names.
+struct RecordsBranches {
+    inner: FakeBackend,
+    launches: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+impl RecordsBranches {
+    fn new(inner: FakeBackend) -> Self {
+        Self {
+            inner,
+            launches: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn launched_branches(&self) -> Vec<Option<String>> {
+        self.launches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl EffectExecutor for RecordsBranches {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.inner.descriptor()
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        if let Effect::Worker(Operation::LaunchWorker { branch, .. }) = request.effect() {
+            self.launches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(branch.as_ref().map(|branch| branch.as_str().to_owned()));
+        }
+        self.inner.execute(request)
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.inner.lookup(request)
+    }
+}
+
+impl WorkerBackend for RecordsBranches {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.inner.observe_worker(worker)
+    }
+}
+
+fn launch_and_observe() -> TestResult<FakeBackend> {
+    fake([
+        Capability::WorkerLaunchIsolated,
+        Capability::WorkerStatusAndOutcome,
+    ])
+}
+
+#[test]
+fn the_probe_launch_requests_the_branch_the_caller_supplies() -> TestResult {
+    let backend = RecordsBranches::new(launch_and_observe()?);
+    let supplied = BranchName::new("lemarier/kitchen-smoke-1")?;
+    let report = conformance::run_worker_on_branch(&backend, &conformance_fixture()?, &supplied)?;
+    assert_eq!(
+        report.result(Check::LaunchReceipt),
+        Some(CheckResult::Passed)
+    );
+    let launches = backend.launched_branches();
+    assert!(!launches.is_empty(), "the suite launched nothing");
+    assert!(
+        launches
+            .iter()
+            .all(|branch| branch.as_deref() == Some("lemarier/kitchen-smoke-1")),
+        "{launches:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn without_a_supplied_branch_the_probe_requests_kitchen_and_the_run_tag() -> TestResult {
+    let backend = RecordsBranches::new(launch_and_observe()?);
+    let report = conformance::run_worker(&backend, &conformance_fixture()?)?;
+    assert_eq!(
+        report.result(Check::LaunchReceipt),
+        Some(CheckResult::Passed)
+    );
+    let launches = backend.launched_branches();
+    assert!(!launches.is_empty(), "the suite launched nothing");
+    assert!(
+        launches
+            .iter()
+            .all(|branch| branch.as_deref() == Some("kitchen/run-1")),
+        "{launches:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_backend_that_ignores_the_supplied_branch_fails_the_contract() -> TestResult {
+    // A host that always yields `kitchen/run-1`: right for the default
+    // fixture, wrong for a caller that needs another branch.
+    let backend = WrongBranch(launch_and_observe()?, "kitchen/run-1");
+    conformance::run_worker(&backend, &conformance_fixture()?)?;
+    let supplied = BranchName::new("lemarier/kitchen-smoke-1")?;
+    let failure = conformance::run_worker_on_branch(&backend, &conformance_fixture()?, &supplied)
+        .err()
+        .ok_or("a launch on the default branch passed for a supplied one")?;
     assert_eq!(failure.check, Check::LaunchReceipt);
     assert_eq!(
         failure.problem,

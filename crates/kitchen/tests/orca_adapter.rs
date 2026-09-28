@@ -114,14 +114,7 @@ fn flag<'a>(call: &'a [String], name: &str) -> Option<&'a str> {
         .find_map(|arg| arg.strip_prefix(&format!("--{name}=")))
 }
 
-#[test]
-fn simulated_orca_passes_the_shared_worker_contract() -> TestResult {
-    let sim = SimOrca::default();
-    // The suite launches on `kitchen/<run tag>`: a host whose branch prefix
-    // is `kitchen`.
-    sim.state().branch_prefix = "kitchen/";
-    let backend = OrcaBackend::connect(conformance_config(&sim)?, &sim)?;
-    let report = conformance::run_worker(&backend, &conformance_fixture()?)?;
+fn assert_shared_suite_passed(report: &conformance::ConformanceReport) {
     for check in [
         Check::DescriptorHouse,
         Check::CrossHouseRefused,
@@ -139,6 +132,17 @@ fn simulated_orca_passes_the_shared_worker_contract() -> TestResult {
     ] {
         assert_eq!(report.result(check), Some(CheckResult::Passed), "{check}");
     }
+}
+
+#[test]
+fn simulated_orca_passes_the_shared_worker_contract() -> TestResult {
+    let sim = SimOrca::default();
+    // The default suite launches on `kitchen/<run tag>`: a host whose branch
+    // prefix is `kitchen`.
+    sim.state().branch_prefix = "kitchen/";
+    let backend = OrcaBackend::connect(conformance_config(&sim)?, &sim)?;
+    let report = conformance::run_worker(&backend, &conformance_fixture()?)?;
+    assert_shared_suite_passed(&report);
     assert!(
         sim.state()
             .calls
@@ -174,6 +178,86 @@ fn conformance_config(sim: &SimOrca) -> TestResult<OrcaConfig> {
         branch_prefix: Some(BranchName::new("kitchen")?),
         ..config(sim)?
     })
+}
+
+#[test]
+fn simulated_orca_passes_the_shared_contract_on_a_branch_under_its_own_prefix() -> TestResult {
+    // The host's prefix is `lemarier` (the sim's default, and the config's):
+    // the backend under test supplies a branch it can obtain there.
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let branch = BranchName::new("lemarier/kitchen-sim-run-1")?;
+    let report = conformance::run_worker_on_branch(&backend, &conformance_fixture()?, &branch)?;
+    assert_shared_suite_passed(&report);
+    // The exact branch was requested by name, under the host's prefix, and
+    // the receipt names exactly it.
+    let starts = sim.calls_to(&["orchestration", "worker-start"]);
+    assert_eq!(
+        starts.first().and_then(|call| flag(call, "name")),
+        Some("kitchen-sim-run-1")
+    );
+    let probe = backend.lookup_launch(&key("sim-run-1-probe")?)?;
+    let Lookup::Applied(receipt) = probe else {
+        return Err("the probe launch was not found by its key".into());
+    };
+    verify_branch(&receipt, branch.as_str())?;
+    Ok(())
+}
+
+#[test]
+fn a_supplied_branch_under_another_prefix_is_refused_before_anything_exists() -> TestResult {
+    for (host, supplied) in [
+        ("lemarier/", "kitchen/kitchen-sim-run-1"),
+        ("lemarier/", "lemarierx/kitchen-sim-run-1"),
+        ("lemarier/", "kitchen-sim-run-1"),
+        ("kitchen/", "lemarier/kitchen-sim-run-1"),
+    ] {
+        let sim = SimOrca::default();
+        sim.state().branch_prefix = host;
+        let backend = OrcaBackend::connect(
+            OrcaConfig {
+                branch_prefix: Some(BranchName::new(host.trim_end_matches('/'))?),
+                ..config(&sim)?
+            },
+            &sim,
+        )?;
+        let failure = conformance::run_worker_on_branch(
+            &backend,
+            &conformance_fixture()?,
+            &BranchName::new(supplied)?,
+        )
+        .err()
+        .ok_or("a launch on a branch the host cannot create passed")?;
+        assert_eq!(failure.check, Check::ProbeReceipt, "{host} {supplied}");
+        assert_eq!(failure.problem, "probe was refused", "{host} {supplied}");
+        assert!(
+            sim.calls_to(&["orchestration", "task-create"]).is_empty(),
+            "{host} {supplied}"
+        );
+        assert!(
+            sim.calls_to(&["orchestration", "worker-start"]).is_empty(),
+            "{host} {supplied}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_host_whose_actual_prefix_differs_from_the_configured_one_fails_and_stops() -> TestResult {
+    // The configuration says `lemarier`, the host says `kitchen`: the name is
+    // accepted, Orca creates `kitchen/<name>`, and the launch is held after
+    // the worker is stopped rather than passing on the wrong branch.
+    let sim = SimOrca::default();
+    sim.state().branch_prefix = "kitchen/";
+    let backend = connect(&sim)?;
+    let branch = BranchName::new("lemarier/kitchen-sim-run-1")?;
+    let failure = conformance::run_worker_on_branch(&backend, &conformance_fixture()?, &branch)
+        .err()
+        .ok_or("a launch on another branch than requested passed")?;
+    assert_eq!(failure.check, Check::ProbeReceipt);
+    assert_eq!(failure.problem, "probe outcome was uncertain");
+    assert_eq!(sim.calls_to(&["orchestration", "worker-stop"]).len(), 1);
+    Ok(())
 }
 
 #[test]

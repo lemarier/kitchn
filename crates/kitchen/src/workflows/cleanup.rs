@@ -76,6 +76,10 @@
 //! through the durable effect path ([`crate::state::run_effect`]) and the
 //! explicit release grant, and is revalidated immediately before the effect.
 //! An interrupted release is reconciled by the next run before anything else.
+//! Each [`apply`] first retires the dishwasher's spent records ([`retire`]):
+//! approvals of resources the backend no longer lists, and release tasks
+//! settled for longer than a retention no shorter than the approval age. The
+//! house's marker and task tables are bounded and shared with other workflows.
 //!
 //! Build output is the one thing reclaimed without a grant: a `CACHEDIR.TAG`
 //! directory that Git ignores and tracks nothing in, at the top of a
@@ -175,6 +179,10 @@ pub enum CleanupError {
     /// An evidence digest is not `sha256:` followed by 64 lowercase hex digits.
     #[error("an evidence digest must be 'sha256:' followed by 64 lowercase hex digits")]
     InvalidDigest,
+    /// Settled release tasks would be retired before their approval expires,
+    /// so a later run could create the same task again.
+    #[error("release task retention must be at least the maximum approval age")]
+    RetentionTooShort,
 }
 
 impl CleanupError {
@@ -182,9 +190,10 @@ impl CleanupError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
-            Self::GrantMismatch | Self::InvalidRemote | Self::InvalidDigest => {
-                ErrorClass::InvalidInput
-            }
+            Self::GrantMismatch
+            | Self::InvalidRemote
+            | Self::InvalidDigest
+            | Self::RetentionTooShort => ErrorClass::InvalidInput,
             Self::ApprovalNeedsPerson => ErrorClass::Refused,
             Self::Backend(_) | Self::DuplicateResource | Self::Encoding => ErrorClass::Execution,
         }
@@ -753,6 +762,9 @@ pub struct ApplyOptions {
     pub max_approval_age: Duration,
     /// Most releases attempted in one call; the rest are deferred.
     pub max_releases: usize,
+    /// How long a settled release task is kept before [`retire`] removes it.
+    /// At least `max_approval_age`.
+    pub retention: Duration,
 }
 
 /// A person's consent to one release, with the digest of the preview they gave
@@ -898,6 +910,8 @@ pub struct ReleaseResult {
 pub struct ApplyReport {
     /// The inspection this call acted on.
     pub preview: Preview,
+    /// Records retired before this call acted.
+    pub retired: RetireReport,
     /// Interrupted releases from earlier runs, reconciled first.
     pub recovered: Vec<ReleaseResult>,
     /// Results for the eligible resources.
@@ -911,11 +925,15 @@ pub struct ApplyReport {
 /// the digest of the evidence this call inspected; otherwise the release is
 /// refused before anything is written. Writes no marker.
 ///
+/// Retires the dishwasher's own spent records first ([`retire`]), so the
+/// house's shared tables do not fill with them.
+///
 /// # Errors
-/// As [`inspect`]; [`CleanupError::GrantMismatch`] for a grant that is not
-/// release on this backend; [`ContractError::AuthorityExpansion`] when a
-/// scheduled claimant's house does not hold the release grant as a standing
-/// grant; and store errors, which leave interrupted work for the next run.
+/// As [`inspect`] and [`retire`]; [`CleanupError::GrantMismatch`] for a
+/// grant that is not release on this backend;
+/// [`ContractError::AuthorityExpansion`] when a scheduled claimant's house
+/// does not hold the release grant as a standing grant; and store errors,
+/// which leave interrupted work for the next run.
 pub fn apply(
     inspector: &Inspector<'_>,
     grants: &HouseGrants,
@@ -949,6 +967,12 @@ pub fn apply(
         Trigger::Scheduled | Trigger::Event(_) => InspectionTrigger::Schedule,
         Trigger::Interactive => InspectionTrigger::Manual,
     };
+    let retired = retire(
+        inspector,
+        options.retention,
+        options.max_approval_age,
+        clock,
+    )?;
     let preview = inspect(inspector, trigger, clock.now())?;
     let eligible: Vec<&PreviewEntry> = preview
         .entries
@@ -1057,8 +1081,104 @@ pub fn apply(
     }
     Ok(ApplyReport {
         preview,
+        retired,
         recovered,
         results,
+    })
+}
+
+/// What [`retire`] removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetireReport {
+    /// Approval markers whose resource has left the inventory.
+    pub markers: Vec<ResourceRef>,
+    /// Release tasks settled for longer than the retention.
+    pub tasks: Vec<TaskId>,
+}
+
+/// Remove the dishwasher's spent records from the house store, whose marker
+/// and task tables are bounded and shared with other workflows:
+///
+/// - an approval marker whose resource this backend no longer lists: the
+///   approval can never authorize anything again, since a resource that
+///   reappears under the same handle has other evidence and another digest;
+/// - a release task settled for longer than `retention`, with every effect
+///   resolved. Its identity comes from the evidence digest and the time of
+///   the approval (scheduled) or of the run (interactive), so once
+///   `retention` is at least `max_approval_age` the approval behind it has
+///   expired and no later run creates that task again.
+///
+/// Markers of other workflows, of other backends, and of resources still
+/// listed are kept, as is every unsettled task.
+///
+/// # Errors
+/// [`CleanupError::RetentionTooShort`] when `retention` is shorter than
+/// `max_approval_age`; [`CleanupError::Backend`] when the inventory cannot be
+/// read, in which case nothing is retired; and store errors.
+pub fn retire(
+    inspector: &Inspector<'_>,
+    retention: Duration,
+    max_approval_age: Duration,
+    clock: &dyn Clock,
+) -> Result<RetireReport> {
+    if retention < max_approval_age {
+        return Err(CleanupError::RetentionTooShort.into());
+    }
+    let store = inspector.store;
+    let backend = &inspector.backend.descriptor().backend;
+    let listed: BTreeSet<ResourceRef> = inspector
+        .backend
+        .inventory()
+        .map_err(CleanupError::Backend)?
+        .into_iter()
+        .map(|observation| observation.resource)
+        .collect();
+    let spent: Vec<(MarkerKey, MarkerFact)> = store
+        .markers(&WorkflowId::new(WORKFLOW)?)?
+        .into_iter()
+        .filter(|marker| {
+            matches!(&marker.key().item, WorkItem::Resource { resource }
+                if &resource.backend == backend && !listed.contains(resource))
+        })
+        .map(|marker| (marker.key().clone(), marker.fact().clone()))
+        .collect();
+    let markers = if spent.is_empty() {
+        Vec::new()
+    } else {
+        store.retire_markers(&spent)?
+    };
+    let now = clock.now();
+    let expired: Vec<TaskId> = store
+        .tasks()?
+        .into_iter()
+        .filter(|task| {
+            is_release_task(task)
+                && matches!(task.state(), TaskState::Settled { at, .. }
+                    if now.saturating_since(*at) > retention)
+                && task.effects().iter().all(|effect| {
+                    matches!(
+                        effect.state(),
+                        EffectState::Applied { .. } | EffectState::NotApplied { .. }
+                    )
+                })
+        })
+        .map(|task| task.spec().id.clone())
+        .collect();
+    let tasks = if expired.is_empty() {
+        Vec::new()
+    } else {
+        store.retire_tasks(&expired)?
+    };
+    Ok(RetireReport {
+        markers: markers
+            .into_iter()
+            .filter_map(|key| match key.item {
+                WorkItem::Resource { resource } => Some(resource),
+                WorkItem::Issue { .. } | WorkItem::PullRequest { .. } => None,
+            })
+            .collect(),
+        tasks,
     })
 }
 

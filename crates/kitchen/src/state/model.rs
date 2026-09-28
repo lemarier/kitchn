@@ -32,8 +32,8 @@ use crate::{
 /// The persisted schema version.
 pub(crate) const SCHEMA_VERSION: u64 = 1;
 /// Tasks per house store, settled ones included. Settled tasks are kept so
-/// their identities and idempotency keys are never reused; retention is not
-/// implemented yet.
+/// their identities and idempotency keys are never reused, until the workflow
+/// that owns one retires it (see [`crate::state::HouseStore::retire_tasks`]).
 pub const MAX_TASKS: usize = 4096;
 /// Consumer leases per house store.
 pub const MAX_CONSUMERS: usize = 256;
@@ -2297,6 +2297,46 @@ impl StoreState {
         self.markers
             .supersede(key, expected, fact, recorded_by, now)
             .or_else(marker_refusal)
+    }
+
+    pub(crate) fn retire_markers(
+        &mut self,
+        markers: &[(MarkerKey, MarkerFact)],
+    ) -> Result<Vec<MarkerKey>> {
+        let mut retired = Vec::new();
+        for (key, expected) in markers {
+            match self.markers.retire(key, expected) {
+                Ok(()) => retired.push(key.clone()),
+                // Gone, or changed since the caller read it: kept as it is.
+                Err(MarkerRefusal::Missing | MarkerRefusal::Conflict) => {}
+                Err(refusal @ (MarkerRefusal::Full | MarkerRefusal::NotSupersedable)) => {
+                    return marker_refusal(refusal);
+                }
+            }
+        }
+        Ok(retired)
+    }
+
+    pub(crate) fn retire_tasks(&mut self, ids: &[TaskId]) -> Result<Vec<TaskId>> {
+        for id in ids {
+            let Some(task) = self.tasks.get(id) else {
+                continue;
+            };
+            let resolved = task.effects.iter().all(|effect| {
+                matches!(
+                    effect.state,
+                    EffectState::Applied { .. } | EffectState::NotApplied { .. }
+                )
+            });
+            if task.settlement().is_none() || !resolved {
+                return fail(StateError::TaskNotRetirable(id.clone()));
+            }
+        }
+        Ok(ids
+            .iter()
+            .filter(|id| self.tasks.remove(*id).is_some())
+            .cloned()
+            .collect())
     }
 
     pub(crate) fn marker(&self, key: &MarkerKey) -> Option<&WorkflowMarker> {

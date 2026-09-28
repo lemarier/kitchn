@@ -640,6 +640,36 @@ impl HouseStore {
         self.transact(|state| state.supersede_marker(key, expected, fact, recorded_by, now))
     }
 
+    /// Remove each marker recorded under its key whose fact is still the
+    /// expected one (compare-and-remove), in one transaction, and return the
+    /// keys removed. A marker that is gone or whose fact changed since it was
+    /// read, such as by a concurrent renewal, is kept. Only the workflow that
+    /// owns a marker should retire it, once the fact can no longer matter.
+    ///
+    /// # Errors
+    /// Returns [`StateError::MarkerNotSupersedable`] for an asked question,
+    /// which is never removed; nothing is removed then.
+    pub fn retire_markers(&self, markers: &[(MarkerKey, MarkerFact)]) -> Result<Vec<MarkerKey>> {
+        self.transact(|state| state.retire_markers(markers))
+    }
+
+    /// Remove settled tasks whose every effect applied or definitely did
+    /// not, in one transaction, freeing their places under
+    /// [`crate::state::MAX_TASKS`], and return the ones removed; an absent
+    /// task is already gone.
+    ///
+    /// Retiring forgets a task, so its identity can be created again, and a
+    /// recreated task derives the same idempotency keys for its effects. Only
+    /// the workflow that owns a task may retire it, and only when it can show
+    /// it will never create that identity again.
+    ///
+    /// # Errors
+    /// Returns [`StateError::TaskNotRetirable`] for an unsettled task or one
+    /// with an unresolved or waived effect; nothing is removed then.
+    pub fn retire_tasks(&self, ids: &[TaskId]) -> Result<Vec<TaskId>> {
+        self.transact(|state| state.retire_tasks(ids))
+    }
+
     /// Read the marker recorded under `key`.
     ///
     /// # Errors

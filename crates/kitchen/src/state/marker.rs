@@ -507,6 +507,29 @@ impl Markers {
         Ok(MarkerRecording::Superseded(marker.clone()))
     }
 
+    /// Remove the marker under `key` if its fact is still `expected`. An
+    /// append-only fact is never removed.
+    pub(super) fn retire(
+        &mut self,
+        key: &MarkerKey,
+        expected: &MarkerFact,
+    ) -> Result<(), MarkerRefusal> {
+        let Some(index) = self.0.iter().position(|marker| &marker.key == key) else {
+            return Err(MarkerRefusal::Missing);
+        };
+        let Some(marker) = self.0.get(index) else {
+            return Err(MarkerRefusal::Missing);
+        };
+        if &marker.fact != expected {
+            return Err(MarkerRefusal::Conflict);
+        }
+        if !marker.fact.supersedable() {
+            return Err(MarkerRefusal::NotSupersedable);
+        }
+        self.0.remove(index);
+        Ok(())
+    }
+
     /// Markers are bounded and keys are unique.
     pub(super) fn validate(&self) -> Result<(), Corruption> {
         if self.0.len() > MAX_MARKERS

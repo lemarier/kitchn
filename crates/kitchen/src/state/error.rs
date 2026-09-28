@@ -250,6 +250,10 @@ pub enum StateError {
         /// The recorded schema; `None` for a core fact kind.
         found: Option<MarkerSchema>,
     },
+    /// Only a settled task whose every effect applied or definitely did not
+    /// can be retired.
+    #[error("task {0} is not settled with every effect resolved")]
+    TaskNotRetirable(TaskId),
     /// No workflow marker is recorded under this key.
     #[error("no workflow marker is recorded for this key")]
     MarkerNotFound,
@@ -361,6 +365,7 @@ impl StateError {
             | Self::TaskConflict(_)
             | Self::TaskSettled { .. }
             | Self::TaskNotSettled(_)
+            | Self::TaskNotRetirable(_)
             | Self::ClaimHeld { .. }
             | Self::LeaseExpired { .. }
             | Self::StaleFence { .. }

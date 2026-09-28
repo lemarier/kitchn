@@ -104,7 +104,9 @@ const MAX_REMOTE_NAME_BYTES: usize = 64;
 
 /// The name of a Git remote whose remote-tracking refs prove a commit is
 /// pushed: the house's forge remote, not a local mirror or a person's backup.
-/// Validated on construction, so it is safe as part of a ref pattern.
+/// Validated on construction, so it is safe as part of a ref pattern. Names
+/// with a slash are not accepted here, but a differently configured remote
+/// whose name starts with this one followed by `/` would still match its refs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteName(String);
 
@@ -222,6 +224,11 @@ pub struct WorktreeState {
     /// Tracked files marked assume-unchanged or skip-worktree, whose edits
     /// `git status` does not report.
     pub hidden_tracked: u32,
+    /// Whether `HEAD` is detached rather than on a branch. Commits made on a
+    /// detached `HEAD` and then left are remembered only by this worktree's
+    /// reflog.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub detached_head: bool,
     /// The operation Git left unfinished in this worktree, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<GitOperation>,
@@ -278,6 +285,14 @@ pub fn inspect_worktree(
         limits,
     )?;
     let head = CommitId::new(head.trim_end()).map_err(|_| GitReadError::Malformed)?;
+    // Exit 0 names the branch `HEAD` is on, 1 means it is detached; anything
+    // else is a failure, never "attached".
+    let (symbolic, _) = run_raw(path, ["symbolic-ref", "--quiet", "HEAD"], limits)?;
+    let detached_head = match symbolic.code() {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return Err(GitReadError::Failed),
+    };
 
     let status = run(
         path,
@@ -294,9 +309,11 @@ pub fn inspect_worktree(
     let ignored = list_ignored(path, limits)?;
     let hidden_tracked = count_hidden_tracked(path, limits)?;
 
-    // `--remotes=<name>` matches `refs/remotes/<name>/*` and no other remote
-    // whose name merely starts with it. With no remotes the `--not` list is
-    // empty, so `HEAD` itself is listed: nothing counts as pushed.
+    // `--remotes=<name>` matches `refs/remotes/<name>/*`, so a remote such as
+    // `origin-backup` does not match `origin`. Git allows a remote's name to
+    // hold a slash, and then a remote `origin/backup` would match too. With no
+    // remotes the `--not` list is empty, so `HEAD` itself is listed: nothing
+    // counts as pushed.
     let mut unpushed_args = vec![
         "rev-list".to_owned(),
         "--max-count=1".to_owned(),
@@ -313,6 +330,7 @@ pub fn inspect_worktree(
         untracked_files,
         ignored,
         hidden_tracked,
+        detached_head,
         operation,
         unpushed_commits: !unpushed.trim().is_empty(),
     })

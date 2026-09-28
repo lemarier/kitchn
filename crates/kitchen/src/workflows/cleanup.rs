@@ -13,24 +13,29 @@
 //! - the backend reports it exited, and every worker of the owning task is
 //!   settled; a person's takeover of any of them retains everything the task
 //!   owns;
-//! - a worktree is a linked, unlocked worktree with no rebase, merge,
-//!   cherry-pick, revert, `am`, or bisect unfinished (its progress lives only
-//!   in the worktree), no tracked or untracked changes, no tracked file whose
-//!   edits Git is told to hide (assume-unchanged, skip-worktree), and no
-//!   ignored file except proven build output, because deleting a worktree
-//!   deletes its local configuration, notes, and ignored nested repositories
-//!   too; its `HEAD` is contained in a remote-tracking ref of a configured
-//!   forge remote (a local mirror or a person's backup remote does not count)
-//!   or equals the head of the pull request that merged it (for squash
-//!   merges).
+//! - a worktree is a linked, unlocked worktree with a branch checked out and
+//!   no rebase, merge, cherry-pick, revert, `am`, or bisect unfinished (its
+//!   progress lives only in the worktree), no tracked or untracked changes, no
+//!   tracked file whose edits Git is told to hide (assume-unchanged,
+//!   skip-worktree), and no ignored file except proven build output, because
+//!   deleting a worktree deletes its local configuration, notes, and ignored
+//!   nested repositories too; its `HEAD` is contained in a remote-tracking ref
+//!   of a configured forge remote (a local mirror or a person's backup remote
+//!   does not count) or equals the head of the pull request that merged it
+//!   (for squash merges).
 //!
 //! The pushed check reads remote-tracking refs as the last fetch left them;
 //! Kitchen never fetches, so a branch deleted on the forge since then still
-//! looks pushed. The check covers `HEAD` only, and that is enough outside an
-//! unfinished operation: an attached `HEAD` is its branch's tip, and a branch
-//! outlives its worktree, because the dishwasher never removes one. During an
-//! unfinished operation `HEAD` can sit on a pushed base while the branch tip
-//! holds unpushed commits, which is why the operation retains the worktree.
+//! looks pushed. It examines `HEAD` alone, which is enough only while `HEAD` is
+//! on a branch and nothing is unfinished: an attached `HEAD` is its branch's
+//! tip, and the branch outlives the worktree, provided the backend's release
+//! of a worktree removes the checkout and never the branch. That is a
+//! requirement on backends; the dishwasher itself never removes a branch. A
+//! detached `HEAD` has no branch behind it, and commits made on it and then
+//! left are remembered only by the worktree's own reflog, which goes with the
+//! worktree, so a detached worktree is retained. During an unfinished
+//! operation `HEAD` is detached or sits on a pushed base while the branch tip
+//! holds unpushed commits, so the operation retains the worktree too.
 //!
 //! Anything else is retained with every reason that applies. Unknown and
 //! legacy resources are retained. Branches and schedules are never removed.
@@ -240,6 +245,8 @@ pub enum Exclusion {
     MainCheckout,
     /// The worktree is locked.
     WorktreeLocked,
+    /// `HEAD` is detached, so no branch vouches for its commits.
+    DetachedHead,
     /// A rebase, merge, cherry-pick, revert, `am`, or bisect is unfinished.
     OperationInProgress,
     /// Tracked files have changes.
@@ -277,6 +284,7 @@ impl Exclusion {
             Self::WorktreeUnreadable => "worktree-unreadable",
             Self::MainCheckout => "main-checkout",
             Self::WorktreeLocked => "worktree-locked",
+            Self::DetachedHead => "detached-head",
             Self::OperationInProgress => "operation-in-progress",
             Self::TrackedChanges => "tracked-changes",
             Self::UntrackedFiles => "untracked-files",
@@ -1693,6 +1701,7 @@ fn own_reasons(
             let checks = [
                 (!state.linked, Exclusion::MainCheckout),
                 (state.locked, Exclusion::WorktreeLocked),
+                (state.detached_head, Exclusion::DetachedHead),
                 (state.operation.is_some(), Exclusion::OperationInProgress),
                 (state.tracked_changes > 0, Exclusion::TrackedChanges),
                 (state.untracked_files > 0, Exclusion::UntrackedFiles),
@@ -1864,6 +1873,7 @@ const fn blocks_build_output(reason: Exclusion) -> bool {
         | Exclusion::MainCheckout
         | Exclusion::WorktreeLocked => true,
         Exclusion::OwnerActive
+        | Exclusion::DetachedHead
         | Exclusion::OperationInProgress
         | Exclusion::TrackedChanges
         | Exclusion::UntrackedFiles

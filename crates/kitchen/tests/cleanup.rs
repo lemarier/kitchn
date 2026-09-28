@@ -1139,9 +1139,10 @@ fn a_rebase_stopped_on_a_clean_tree_keeps_a_worktree_that_head_alone_calls_pushe
     )?;
     assert_eq!(tip.trim(), "1");
     assert_eq!(state.operation, Some(GitOperation::Rebase));
+    // A rebase detaches HEAD; both facts keep the worktree.
     assert_eq!(
         reasons(&harness.inspect()?, &owned.worktree)?,
-        [Exclusion::OperationInProgress]
+        [Exclusion::DetachedHead, Exclusion::OperationInProgress]
     );
 
     // Approving what the preview offers (the worker only) leaves it alone.
@@ -1681,6 +1682,80 @@ fn ignored_or_hidden_files_that_appear_after_the_approval_stop_the_release() -> 
     );
     // Only the two workers were released.
     assert_eq!(harness.backend.fake.effects_performed(), before + 2);
+    Ok(())
+}
+
+#[test]
+fn a_detached_head_keeps_the_worktree_even_when_it_looks_pushed() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    // Work committed on a detached HEAD, then HEAD moved to a pushed commit.
+    // No branch holds the commit and no operation is unfinished, so only the
+    // worktree's own HEAD reflog remembers it, and that goes with the worktree.
+    git(&path, &["checkout", "--quiet", "--detach"])?;
+    commit_locally(&path, "detached-work.txt")?;
+    let lost = head(&path)?;
+    git(&path, &["checkout", "--quiet", "--detach", "origin/main"])?;
+
+    let state = inspect_worktree(&path, &GitLimits::default(), &origin()?)?;
+    // What the earlier checks saw: clean, pushed HEAD, no operation.
+    assert_eq!(
+        (
+            state.tracked_changes,
+            state.untracked_files,
+            state.unpushed_commits
+        ),
+        (0, 0, false)
+    );
+    assert_eq!(state.operation, None);
+    assert!(
+        git(&path, &["branch", "--contains", lost.as_str()])?
+            .trim()
+            .is_empty(),
+        "no branch holds the commit"
+    );
+    assert!(state.detached_head);
+    assert_eq!(
+        reasons(&harness.inspect()?, &owned.worktree)?,
+        [Exclusion::DetachedHead]
+    );
+    // Back on a branch, the worktree is judged on its commits again.
+    git(&path, &["checkout", "--quiet", "task-1"])?;
+    assert!(!inspect_worktree(&path, &GitLimits::default(), &origin()?)?.detached_head);
+    assert_eq!(reasons(&harness.inspect()?, &owned.worktree)?, []);
+    Ok(())
+}
+
+#[test]
+fn an_operation_started_after_the_approval_stops_the_release() -> TestResult {
+    let mut harness = Harness::new()?;
+    let started = harness.owner("task-1", true)?;
+    let untouched = harness.owner("task-2", true)?;
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    // A person picks the worktree up again and starts a bisect.
+    git(harness.path(&started.worktree)?, &["bisect", "start"])?;
+    let before = harness.backend.fake.effects_performed();
+    let report = harness.apply()?;
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|result| result.resource != started.worktree),
+        "a changed worktree is not even planned"
+    );
+    assert_eq!(
+        reasons(&report.preview, &started.worktree)?,
+        [Exclusion::OperationInProgress]
+    );
+    assert_eq!(
+        outcome(&report, &untouched.worktree)?,
+        ReleaseOutcome::Released
+    );
+    // Both workers and the untouched worktree; not the bisecting one.
+    assert_eq!(harness.backend.fake.effects_performed(), before + 3);
+    assert!(harness.path(&started.worktree)?.is_dir());
     Ok(())
 }
 

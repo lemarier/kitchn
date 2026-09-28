@@ -425,7 +425,7 @@ pub struct ResourceObservation {
 ///   definitely did not happen.
 /// - With [`Capability::EffectIdempotentRequests`], resubmitting a key returns
 ///   the original receipt without repeating the effect.
-/// - With [`Capability::EffectLookup`], `lookup` reports an applied key's
+/// - With [`Capability::EffectLookup`], `lookup` reports an applied request's
 ///   receipt and returns [`Lookup::Absent`] only with proof that the key was
 ///   not applied and cannot be applied later, including by an earlier
 ///   invocation that is still in flight; otherwise [`Lookup::Unknown`].
@@ -441,11 +441,14 @@ pub trait EffectExecutor {
     /// from "outcome unknown".
     fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure>;
 
-    /// Look up an effect by key without performing it.
+    /// Look up what happened to a persisted request without performing it.
+    /// The executor receives the whole request, so it can inspect the
+    /// original target (such as a repository, operation, and marker, or a
+    /// decision binding) when it has no global key index.
     ///
     /// # Errors
     /// Returns [`BackendUnavailable`] when the executor cannot be queried.
-    fn lookup(&self, key: &IdempotencyKey) -> Result<Lookup, BackendUnavailable>;
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable>;
 }
 
 /// An executor that runs and observes workers.

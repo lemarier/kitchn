@@ -79,7 +79,7 @@ fn look_up(executor: &dyn EffectExecutor, effect: &EffectRecord) -> EffectOutcom
     {
         return EffectOutcome::Uncertain(UncertainReason::LookupUnsupported);
     }
-    match executor.lookup(effect.request().key()) {
+    match executor.lookup(effect.request()) {
         Ok(Lookup::Applied(receipt)) => EffectOutcome::Applied(receipt),
         Ok(Lookup::Absent) => EffectOutcome::NotApplied(NotAppliedReason::ConfirmedAbsent),
         Ok(Lookup::Unknown) | Err(_) => {

@@ -35,7 +35,7 @@ pub enum Check {
     ForeignBackendRefused,
     /// Effects without full capability support are refused without effect.
     UnsupportedRefused,
-    /// A never-used key is not reported as applied.
+    /// A never-submitted request is not reported as applied.
     UnknownKeyNotApplied,
     /// The probe effect returns a receipt.
     ProbeReceipt,
@@ -333,12 +333,12 @@ impl<'a> Runner<'a> {
     fn assert_not_applied(
         &self,
         check: Check,
-        key: &IdempotencyKey,
+        request: &EffectRequest,
     ) -> Result<(), ConformanceFailure> {
         if !self.supports(Capability::EffectLookup) {
             return Ok(());
         }
-        match self.executor.lookup(key) {
+        match self.executor.lookup(request) {
             Ok(Lookup::Applied(_)) => fail(check, "refused request was applied"),
             Ok(Lookup::Absent | Lookup::Unknown) => Ok(()),
             Err(_) => fail(check, "lookup failed after a refused request"),
@@ -355,7 +355,7 @@ impl<'a> Runner<'a> {
         self.cross_house(probe)?;
         self.foreign_backend(probe)?;
         self.unsupported()?;
-        self.unknown_key()?;
+        self.unknown_key(probe)?;
         let Some((request, receipt)) = self.probe_receipt(probe)? else {
             for check in [Check::LookupMatchesReceipt, Check::IdempotentResubmission] {
                 self.record(
@@ -386,7 +386,7 @@ impl<'a> Runner<'a> {
             Err(_) => return fail(check, "refusal did not name the house mismatch"),
             Ok(_) => return fail(check, "request for another house was applied"),
         }
-        self.assert_not_applied(check, request.key())?;
+        self.assert_not_applied(check, &request)?;
         self.record(check, CheckResult::Passed);
         Ok(())
     }
@@ -410,7 +410,7 @@ impl<'a> Runner<'a> {
             Err(_) => return fail(check, "refusal did not name the backend mismatch"),
             Ok(_) => return fail(check, "request for another backend was applied"),
         }
-        self.assert_not_applied(check, request.key())?;
+        self.assert_not_applied(check, &request)?;
         self.record(check, CheckResult::Passed);
         Ok(())
     }
@@ -429,17 +429,17 @@ impl<'a> Runner<'a> {
                 Err(_) => return fail(check, "refusal did not name the missing capability"),
                 Ok(_) => return fail(check, "effect without declared support was applied"),
             }
-            self.assert_not_applied(check, request.key())?;
+            self.assert_not_applied(check, &request)?;
         }
         self.record(check, CheckResult::Passed);
         Ok(())
     }
 
-    fn unknown_key(&mut self) -> Result<(), ConformanceFailure> {
+    fn unknown_key(&mut self, probe: &Effect) -> Result<(), ConformanceFailure> {
         let check = Check::UnknownKeyNotApplied;
-        let key = self.key("never-used")?;
+        let request = self.own_request("never-used", probe.clone())?;
         if !self.supports(Capability::EffectLookup) {
-            return match self.executor.lookup(&key) {
+            return match self.executor.lookup(&request) {
                 Err(BackendUnavailable::Unsupported(Capability::EffectLookup)) => {
                     self.record(
                         check,
@@ -452,7 +452,7 @@ impl<'a> Runner<'a> {
                 Ok(_) | Err(_) => fail(check, "undeclared lookup did not report unsupported"),
             };
         }
-        match self.executor.lookup(&key) {
+        match self.executor.lookup(&request) {
             Ok(Lookup::Absent | Lookup::Unknown) => {
                 self.record(check, CheckResult::Passed);
                 Ok(())
@@ -497,7 +497,7 @@ impl<'a> Runner<'a> {
             );
             return Ok(());
         }
-        match self.executor.lookup(request.key()) {
+        match self.executor.lookup(request) {
             Ok(Lookup::Applied(found)) if &found == receipt => {
                 self.record(check, CheckResult::Passed);
                 Ok(())

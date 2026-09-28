@@ -242,7 +242,7 @@ impl EffectExecutor for FakeBackend {
         }
     }
 
-    fn lookup(&self, key: &IdempotencyKey) -> Result<Lookup, BackendUnavailable> {
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
         if !self
             .descriptor
             .capabilities
@@ -257,7 +257,7 @@ impl EffectExecutor for FakeBackend {
         }
         Ok(state
             .applied
-            .get(key)
+            .get(request.key())
             .map_or(Lookup::Absent, |receipt| Lookup::Applied(receipt.clone())))
     }
 }

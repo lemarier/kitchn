@@ -13,9 +13,9 @@ use kitchen::{
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, BackendUnavailable,
         Capability, CapabilitySet, ContractError, Disposition, EffectExecutor, EffectFailure,
-        EffectRequest, ExternalRef, Fence, Grant, HouseGrants, IdempotencyKey, Lookup,
-        NotAppliedReason, Operation, Permission, Receipt, ResourceKind, ResourceRef, Settlement,
-        TaskAuthority, Text, UncertainReason, WorkerBackend, WorkerState,
+        EffectRequest, ExternalRef, Fence, Grant, HouseGrants, Lookup, NotAppliedReason, Operation,
+        Permission, Receipt, ResourceKind, ResourceRef, Settlement, TaskAuthority, Text,
+        UncertainReason, WorkerBackend, WorkerState,
         conformance::{self, Check, CheckResult, ConformanceFixture},
         fake::{ExecuteFault, FakeBackend},
     },
@@ -124,8 +124,8 @@ impl EffectExecutor for OverreachingBackend {
     fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
         self.inner.execute(request)
     }
-    fn lookup(&self, key: &IdempotencyKey) -> Result<Lookup, BackendUnavailable> {
-        self.inner.lookup(key)
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.inner.lookup(request)
     }
 }
 
@@ -154,8 +154,8 @@ impl EffectExecutor for HouseBlindBackend {
         );
         self.0.execute(&rewritten)
     }
-    fn lookup(&self, key: &IdempotencyKey) -> Result<Lookup, BackendUnavailable> {
-        self.0.lookup(key)
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.0.lookup(request)
     }
 }
 
@@ -175,7 +175,7 @@ impl EffectExecutor for OptimisticLookupBackend {
     fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
         self.0.execute(request)
     }
-    fn lookup(&self, _key: &IdempotencyKey) -> Result<Lookup, BackendUnavailable> {
+    fn lookup(&self, _request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
         let receipt = Receipt::new(
             ExternalRef::new("made-up").map_err(|_| BackendUnavailable::Transport)?,
             Vec::new(),
@@ -1086,8 +1086,8 @@ impl EffectExecutor for ExitingBackend {
     fn execute(&self, _request: &EffectRequest) -> Result<Receipt, EffectFailure> {
         std::process::exit(44)
     }
-    fn lookup(&self, key: &IdempotencyKey) -> Result<Lookup, BackendUnavailable> {
-        self.0.lookup(key)
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.0.lookup(request)
     }
 }
 

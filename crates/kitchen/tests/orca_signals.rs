@@ -688,6 +688,50 @@ fn an_archive_that_does_not_end_in_bounds_has_no_transcript() -> TestResult {
 }
 
 #[test]
+fn an_archive_page_without_a_cursor_must_prove_the_archive_complete() -> TestResult {
+    // A limited first page with no cursor: more of the archive may exist.
+    let sim = SimOrca::default();
+    sim.set_worker(DISPATCH, released(120));
+    sim.state().archive_cursor_ends_at = Some(0);
+    let backend = OrcaBackend::connect(config(&sim)?, &sim)?;
+    let signals = backend
+        .observe_signals(&worker(DISPATCH)?, &window(1_000))?
+        .ok_or("Orca has no record of the worker")?;
+    assert_eq!(signals.transcript, None, "the oldest page is not progress");
+    assert_eq!(sim.calls_to(&["orchestration", "worker-read"]).len(), 1);
+    // A later page with no cursor does not show it is the last.
+    let sim = SimOrca::default();
+    sim.set_worker(DISPATCH, released(120));
+    sim.state().archive_cursor_ends_at = Some(50);
+    let backend = OrcaBackend::connect(config(&sim)?, &sim)?;
+    let signals = backend
+        .observe_signals(&worker(DISPATCH)?, &window(1_000))?
+        .ok_or("Orca has no record of the worker")?;
+    assert_eq!(signals.transcript, None, "the newest page is not shown");
+    assert_eq!(signals.dispatch, DispatchActivity::Ended);
+    assert_eq!(sim.calls_to(&["orchestration", "worker-read"]).len(), 2);
+    // A whole archive in one page proves itself without a cursor.
+    let sim = SimOrca::default();
+    sim.set_worker(DISPATCH, released(30));
+    sim.state().archive_cursor_ends_at = Some(0);
+    let backend = OrcaBackend::connect(config(&sim)?, &sim)?;
+    let signals = backend
+        .observe_signals(&worker(DISPATCH)?, &window(1_000))?
+        .ok_or("Orca has no record of the worker")?;
+    assert_eq!(
+        signals.transcript,
+        Some(TranscriptProgress {
+            messages: 30,
+            complete: true,
+            last_activity: Some(Timestamp::from_unix_millis(30_000)),
+            agent_spoke: true,
+        })
+    );
+    assert_eq!(sim.calls_to(&["orchestration", "worker-read"]).len(), 1);
+    Ok(())
+}
+
+#[test]
 fn a_later_archive_page_that_fails_leaves_no_transcript() -> TestResult {
     let sim = SimOrca::default();
     sim.set_worker(DISPATCH, released(120));

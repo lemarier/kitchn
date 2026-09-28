@@ -734,7 +734,8 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// message forward (observed on 1.4.212), so its cursor is followed to
     /// an empty page, at most [`MAX_ARCHIVE_PAGES`] pages, keeping the newest
     /// [`SIGNAL_WINDOW_ROWS`] messages. An archive that does not end within
-    /// the bound, or a later page Orca refuses, yields no output.
+    /// the bound, a later page Orca refuses, or a page without a cursor that
+    /// does not prove the archive complete, yields no output.
     fn read_output(&self, dispatch: &str) -> Result<Option<WorkerRead>, OrcaError> {
         let Some(mut read) = self.read_page(dispatch, None)? else {
             return Ok(None);
@@ -746,8 +747,12 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             let Some(transcript) = read.transcript.as_mut() else {
                 return Ok(Some(read));
             };
+            // Every page Orca observably returns carries a cursor until it
+            // is empty. Without one, the page is the end only when it says
+            // it holds the whole archive; otherwise the end is unknown.
             let Some(cursor) = transcript.next_cursor.take() else {
-                return Ok(Some(read));
+                let whole = read.content_complete == Some(true) && transcript.limited != Some(true);
+                return Ok(whole.then_some(read));
             };
             let Some(page) = self
                 .read_page(dispatch, Some(&cursor))?
@@ -761,7 +766,12 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             transcript.messages.extend(page.messages);
             let older = transcript.messages.len().saturating_sub(SIGNAL_WINDOW_ROWS);
             transcript.messages.drain(..older);
-            transcript.next_cursor = page.next_cursor;
+            // A later page cannot claim the whole archive, so one without a
+            // cursor leaves the newest messages unproven.
+            let Some(next) = page.next_cursor else {
+                return Ok(None);
+            };
+            transcript.next_cursor = Some(next);
             // The window is a part of the archive now.
             transcript.limited = Some(true);
         }

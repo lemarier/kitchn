@@ -151,20 +151,28 @@ impl SimWorker {
             .collect()
     }
 
-    fn archived(messages: &[SimMessage], offset: usize, limit: usize) -> Value {
+    fn archived(
+        messages: &[SimMessage],
+        offset: usize,
+        limit: usize,
+        cursor_ends_at: Option<usize>,
+    ) -> Value {
         let page = messages.get(offset..).unwrap_or_default();
         let page = page.get(..limit.min(page.len())).unwrap_or_default();
         let window = Self::rows(page);
+        let mut transcript = json!({
+            "limited": messages.len() > limit,
+            "returnedMessageCount": window.len(),
+            "messages": window,
+        });
+        if cursor_ends_at.is_none_or(|end| offset < end) {
+            transcript["nextCursor"] = json!(format!("a{}", offset + limit));
+        }
         json!({
             "source": "transcript",
             "archived": true,
             "contentComplete": offset == 0 && messages.len() <= limit,
-            "transcript": {
-                "limited": messages.len() > limit,
-                "returnedMessageCount": window.len(),
-                "messages": window,
-                "nextCursor": format!("a{}", offset + limit),
-            },
+            "transcript": transcript,
         })
     }
 
@@ -295,6 +303,8 @@ pub struct SimState {
     /// When set, `worker-read` answers this many more calls, then refuses
     /// with `source_changed`.
     pub reads_left: Option<usize>,
+    /// Archived pages from this message offset on carry no `nextCursor`.
+    pub archive_cursor_ends_at: Option<usize>,
     pub release_action: &'static str,
     /// When set, `automations edit` is accepted but changes nothing.
     pub ignore_edits: bool,
@@ -355,6 +365,7 @@ impl Default for SimOrca {
                 stop_state: "stopped",
                 stop_releases: true,
                 reads_left: None,
+                archive_cursor_ends_at: None,
                 release_action: "released",
                 ignore_edits: false,
                 bound: None,
@@ -819,7 +830,12 @@ impl SimState {
                                 }
                             }
                         };
-                        ok(SimWorker::archived(messages, offset, limit))
+                        ok(SimWorker::archived(
+                            messages,
+                            offset,
+                            limit,
+                            self.archive_cursor_ends_at,
+                        ))
                     }
                     Some(SimOutput::Terminal(lines)) => ok(json!({
                         "source": "terminal",

@@ -82,12 +82,16 @@ fn triage_resolves_then_rerun_is_idle() {
 fn triage_keeps_unanswered_and_expired_decisions() {
     let mut input = triage_input();
     input.existing_decisions.push(triage::Decision {
+        issue: issue(10),
         owner: DecisionOwner::Spec,
         revision: "r1".into(),
         state: triage::DecisionState::Expired,
     });
     assert_eq!(triage::plan(&input).unwrap().len(), 1); // comment only
     input.existing_decisions[0].revision = "old".into();
+    assert_eq!(triage::plan(&input), Err(WorkflowError::DecisionMismatch));
+    input.existing_decisions[0].revision = "r1".into();
+    input.existing_decisions[0].issue = issue(11);
     assert_eq!(triage::plan(&input), Err(WorkflowError::DecisionMismatch));
     input.existing_decisions.clear();
     input.claimed_by_other = true;
@@ -104,6 +108,7 @@ fn triage_caps_asks_and_rejects_partial_evidence() {
     input.pending_product_questions = 4;
     assert_eq!(triage::plan(&input).unwrap().len(), 3);
     input.existing_decisions.push(triage::Decision {
+        issue: issue(10),
         owner: DecisionOwner::Spec,
         revision: "r1".into(),
         state: triage::DecisionState::Open,
@@ -118,7 +123,7 @@ fn triage_caps_asks_and_rejects_partial_evidence() {
 
 struct FakeMarkers {
     posted: Result<bool, WorkflowError>,
-    decisions: Vec<triage::Decision>,
+    decisions: Result<Vec<triage::Decision>, WorkflowError>,
 }
 
 impl triage::MarkerView for FakeMarkers {
@@ -135,7 +140,7 @@ impl triage::MarkerView for FakeMarkers {
         _issue: IssueNumber,
         _revision: &str,
     ) -> Result<Vec<triage::Decision>, WorkflowError> {
-        Ok(self.decisions.clone())
+        self.decisions.clone()
     }
 }
 
@@ -145,19 +150,29 @@ fn marker_read_controls_repetition_and_propagates_failure() {
     input.resolution_already_posted = false;
     let markers = FakeMarkers {
         posted: Ok(true),
-        decisions: vec![],
+        decisions: Ok(vec![]),
     };
     assert!(
         matches!(triage::plan_with_markers(&input, &markers), Ok(changes) if changes.len() == 1)
     );
     let failed = FakeMarkers {
         posted: Err(WorkflowError::PrecheckFailed),
-        decisions: vec![],
+        decisions: Ok(vec![]),
     };
     assert_eq!(
         triage::plan_with_markers(&input, &failed),
         Err(WorkflowError::PrecheckFailed)
     );
+    let failed_decisions = FakeMarkers {
+        posted: Ok(true),
+        decisions: Err(WorkflowError::PrecheckFailed),
+    };
+    assert_eq!(
+        triage::plan_with_markers(&input, &failed_decisions),
+        Err(WorkflowError::PrecheckFailed)
+    );
+    input.human_only = true;
+    assert_eq!(triage::plan_with_markers(&input, &failed), Ok(vec![]));
 }
 fn hygiene_issue() -> gardener::Issue {
     gardener::Issue {

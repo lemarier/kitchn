@@ -1,12 +1,14 @@
 //! Evidence based needs-spec decisions. Callers collect complete, bounded
 //! issue history and code evidence; this module never reads an Orca session.
 
-use super::{Precheck, WorkflowError};
+use super::{Precheck, WorkflowError, valid_label};
 use crate::contracts::{DecisionOwner, GitHubAction, IssueNumber, MAX_ASKS_PER_TASK};
 
 /// A human decision with its exact subject revision and owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
+    /// Issue the question was bound to.
+    pub issue: IssueNumber,
     /// The declared decision family.
     pub owner: DecisionOwner,
     /// The subject revision the human saw.
@@ -116,6 +118,9 @@ pub fn plan_with_markers(
     evidence: &Evidence,
     markers: &impl MarkerView,
 ) -> Result<Vec<Change>, WorkflowError> {
+    if !evidence.needs_spec || evidence.human_only || evidence.claimed_by_other {
+        return Ok(Vec::new());
+    }
     let mut current = evidence.clone();
     current.resolution_already_posted =
         markers.resolution_posted(current.issue, &current.revision)?;
@@ -140,8 +145,8 @@ pub enum Change {
 pub fn precheck(evidence: &Evidence) -> Result<Precheck, WorkflowError> {
     if !evidence.coverage.is_complete()
         || evidence.revision.is_empty()
-        || evidence.ready_label.is_empty()
-        || evidence.needs_spec_label.is_empty()
+        || !valid_label(&evidence.ready_label)
+        || !valid_label(&evidence.needs_spec_label)
         || evidence.ready_label == evidence.needs_spec_label
     {
         return Err(WorkflowError::IncompleteEvidence);
@@ -172,9 +177,14 @@ pub fn plan(evidence: &Evidence) -> Result<Vec<Change>, WorkflowError> {
         return Ok(Vec::new());
     }
     if evidence.existing_decisions.iter().any(|decision| {
-        decision.owner != DecisionOwner::Spec || decision.revision != evidence.revision
+        decision.owner != DecisionOwner::Spec
+            || decision.issue != evidence.issue
+            || decision.revision != evidence.revision
     }) {
         return Err(WorkflowError::DecisionMismatch);
+    }
+    if evidence.existing_decisions.len() > MAX_ASKS_PER_TASK as usize {
+        return Err(WorkflowError::IncompleteEvidence);
     }
     let unresolved = evidence
         .existing_decisions

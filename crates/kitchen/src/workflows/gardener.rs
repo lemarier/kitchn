@@ -1,7 +1,7 @@
 //! Independent daily issue hygiene policy. The schedule owner supplies an
 //! inventory; this workflow only previews changes under separate house grants.
 
-use super::{Precheck, WorkflowError};
+use super::{Precheck, WorkflowError, valid_label};
 use crate::contracts::{Capability, GitHubAction, IssueNumber};
 
 /// Portable declaration until #6's schedule payload accepts a workflow owner
@@ -120,7 +120,10 @@ pub enum ReviewReason {
 /// Preview only actionable findings. A closed issue's agent label is removed
 /// only when it has no live claim. Human-only and claimed work is untouched.
 pub fn plan(issues: &[Issue], labels: &AgentLabels) -> Result<Vec<Finding>, WorkflowError> {
-    if labels.ready.is_empty() || labels.working.is_empty() || labels.ready == labels.working {
+    if !valid_label(&labels.ready)
+        || !valid_label(&labels.working)
+        || labels.ready == labels.working
+    {
         return Err(WorkflowError::IncompleteEvidence);
     }
     let mut findings = Vec::new();

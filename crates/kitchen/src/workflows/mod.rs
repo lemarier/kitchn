@@ -5,6 +5,10 @@ pub mod gardener;
 pub mod inspector;
 pub mod triage;
 
+fn valid_label(label: &str) -> bool {
+    !label.is_empty() && label.len() <= 50 && !label.chars().any(char::is_control)
+}
+
 /// Workflow input or evidence failure. Private issue content is never included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WorkflowError {

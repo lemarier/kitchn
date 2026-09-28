@@ -2451,7 +2451,7 @@ fn a_task_with_unresolved_or_waived_effects_keeps_its_resources() -> TestResult 
     let EffectStart::Execute(_) = harness.store().begin_effect(
         plan(&pending.task, pending.fence, "relaunch", launch()?)?,
         &grants()?,
-        harness.backend.descriptor(),
+        &harness.backend,
         harness.clock.now(),
     )?
     else {
@@ -2464,7 +2464,7 @@ fn a_task_with_unresolved_or_waived_effects_keeps_its_resources() -> TestResult 
     let EffectStart::Execute(intent) = harness.store().begin_effect(
         plan(&waived.task, waived.fence, "relaunch", launch()?)?,
         &grants()?,
-        harness.backend.descriptor(),
+        &harness.backend,
         harness.clock.now(),
     )?
     else {

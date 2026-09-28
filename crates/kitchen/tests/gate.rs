@@ -6,11 +6,11 @@ use kitchen::workflows::gate::{self, *};
 use kitchen::{
     BackendId, CredentialId, HouseId, TaskId, WorkflowId,
     contracts::{
-        BackendDescriptor, BranchName, Capability, CapabilitySet, Effect, EffectExecutor, Evidence,
-        EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, GitHubAction,
-        GitHubEffect, Grant, HouseGrants, IdempotencyKey, IssueNumber, NotAppliedReason, Operation,
-        Permission, PostingBudget, Receipt, Repository, ResourceKind, ResourceRef, Role,
-        TaskAuthority, Text, Timestamp, WorkerOutcome, WorkerState, Workspace, fake::FakeBackend,
+        BranchName, Capability, CapabilitySet, Effect, EffectExecutor, Evidence, EvidenceKind,
+        EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, GitHubAction, GitHubEffect, Grant,
+        HouseGrants, IdempotencyKey, IssueNumber, NotAppliedReason, Operation, Permission,
+        PostingBudget, Receipt, Repository, ResourceKind, ResourceRef, Role, TaskAuthority, Text,
+        Timestamp, WorkerOutcome, WorkerState, Workspace, fake::FakeBackend,
     },
     state::{
         EffectOutcome, EffectRecord, EffectStart, EffectState, HouseStore, MarkerFact, MarkerKey,
@@ -1692,7 +1692,7 @@ struct Durable {
     grants: HouseGrants,
     merge: MergeGrant,
     delegated: Vec<Grant>,
-    backend: BackendDescriptor,
+    backend: FakeBackend,
     workers: FakeBackend,
     task: TaskId,
     fence: Fence,
@@ -1736,12 +1736,11 @@ fn durable_selecting(delegate_push: bool, agent: Option<ResolvedSelection>) -> T
         grants,
         merge: merge_grant(&common::house()?, &ready_subject()?)?,
         delegated,
-        backend: BackendDescriptor {
+        backend: FakeBackend::new(
             backend,
-            house: common::house()?,
-            capabilities: CapabilitySet::supporting(Capability::ALL),
-            worker_selection: None,
-        },
+            common::house()?,
+            CapabilitySet::supporting(Capability::ALL),
+        ),
         workers: FakeBackend::fully_capable(common::backend_id()?, common::house()?),
         task,
         fence,
@@ -1853,7 +1852,7 @@ impl Durable {
             },
         )?;
         let EffectStart::Execute(started) =
-            store.begin_effect(plan, &self.grants, self.workers.descriptor(), common::at(1))?
+            store.begin_effect(plan, &self.grants, &self.workers, common::at(1))?
         else {
             return Err("expected a new launch".into());
         };
@@ -2773,7 +2772,7 @@ fn durable_fix_needs_the_tasks_push_grant_before_writing() -> TestResult {
         fix_request: FixGrant::resolve(
             &d.grants,
             &e.repository,
-            &d.backend.backend,
+            &d.backend.descriptor().backend,
             d.workers.descriptor(),
         ),
         ..dgrants()?

@@ -19,6 +19,8 @@ use kitchen::{
         conformance::{self, Check, CheckResult, ConformanceFixture},
         fake::{ExecuteFault, FakeBackend},
     },
+    scheduling::AgentFamily,
+    selection::{EffortSupport, SelectionSupport},
     state::{EffectState, StateError, reconcile, run_effect},
 };
 
@@ -238,6 +240,31 @@ fn contract_detects_an_adapter_that_launches_an_undeclared_selection() -> TestRe
         .err()
         .ok_or("a selection-blind adapter passed")?;
     assert_eq!(failure.check, Check::SelectionRefused);
+    Ok(())
+}
+
+#[test]
+fn a_backend_honoring_every_selection_has_nothing_undeclared_to_refuse() -> TestResult {
+    let backend = FakeBackend::fully_capable(backend_id()?, house()?).with_worker_selection(
+        SelectionSupport {
+            families: &[AgentFamily::Claude, AgentFamily::Codex],
+            model: true,
+            effort: EffortSupport::Always,
+        },
+    );
+    let report = conformance::run_worker(&backend, &conformance_fixture()?)?;
+    assert_eq!(
+        report.result(Check::SelectionRefused),
+        Some(CheckResult::NothingUndeclared)
+    );
+    assert_eq!(
+        report.result(Check::LaunchReceipt),
+        Some(CheckResult::Passed)
+    );
+    assert!(
+        backend.launched_agents().iter().all(Option::is_none),
+        "no selection launch was attempted"
+    );
     Ok(())
 }
 

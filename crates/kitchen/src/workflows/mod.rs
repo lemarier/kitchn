@@ -5,8 +5,20 @@ pub mod gardener;
 pub mod inspector;
 pub mod triage;
 
+use crate::integrations::github::Observation;
+
 fn valid_label(label: &str) -> bool {
     !label.is_empty() && label.len() <= 50 && !label.chars().any(char::is_control)
+}
+
+/// A read that did not complete stops the pass: unavailable is a failure,
+/// incomplete or malformed evidence is never treated as empty.
+fn known<T>(observation: Observation<T>) -> Result<T, WorkflowError> {
+    match observation {
+        Observation::Known(value) => Ok(value),
+        Observation::Unavailable(_) => Err(WorkflowError::PrecheckFailed),
+        Observation::Unknown => Err(WorkflowError::IncompleteEvidence),
+    }
 }
 
 /// Workflow input or evidence failure. Private issue content is never included.

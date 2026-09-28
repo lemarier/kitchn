@@ -1,18 +1,24 @@
 //! Evidence based needs-spec decisions. Callers collect complete, bounded
 //! issue history and code evidence; this module never reads an Orca session.
 
-use super::{ClaimState, Precheck, WorkflowError, valid_label};
+use std::num::NonZeroU64;
+
+use super::{ClaimState, Precheck, WorkflowError, known, valid_label};
 use crate::{
-    HouseId,
+    HouseId, WorkflowId,
     contracts::{
-        DecisionBinding, DecisionOwner, ExternalRef, GitHubAction, IssueNumber, MAX_ASKS_PER_TASK,
-        Operation, Repository, Role, Text, Workspace,
+        Claimant, DecisionBinding, DecisionOwner, ExternalRef, GitHubAction, IssueNumber,
+        MAX_ASKS_PER_TASK, Operation, Repository, Role, Text, Timestamp, Workspace,
     },
     integrations::github::{
         GitHubClient, GitHubReadTransport, IntegrationError, Issue, IssueComment, IssueDetail,
-        LinkedPullRequest, Observation, TimelineEvent,
+        LinkedPullRequest, TimelineEvent,
     },
     integrations::roger::{DecisionStatus, RogerClient, RogerReadTransport},
+    state::{
+        HouseStore, IssueRevision, MarkerFact, MarkerKey, MarkerRecording, MarkerSubject,
+        StateError, WorkItem,
+    },
 };
 
 /// Poll only a specification answer with its persisted, exact binding.
@@ -66,13 +72,14 @@ impl IssueSources {
             })
             .transpose()
     }
-}
 
-fn known<T>(observation: Observation<T>) -> Result<T, WorkflowError> {
-    match observation {
-        Observation::Known(value) => Ok(value),
-        Observation::Unavailable(_) => Err(WorkflowError::PrecheckFailed),
-        Observation::Unknown => Err(WorkflowError::IncompleteEvidence),
+    /// The provider revision a human answer or a marker is bound to: the
+    /// issue's last update and the newest comment observed.
+    pub fn revision(&self) -> Result<IssueRevision, WorkflowError> {
+        Ok(IssueRevision {
+            updated_at: self.detail.updated_at,
+            last_comment: self.last_comment()?,
+        })
     }
 }
 
@@ -113,7 +120,7 @@ pub struct Decision {
     /// The declared decision family.
     pub owner: DecisionOwner,
     /// The subject revision the human saw.
-    pub revision: String,
+    pub revision: IssueRevision,
     /// Whether an answer remains open.
     pub state: DecisionState,
 }
@@ -176,7 +183,7 @@ pub struct Evidence {
     /// Issue.
     pub issue: IssueNumber,
     /// Current issue evidence revision.
-    pub revision: String,
+    pub revision: IssueRevision,
     /// Evidence-source coverage; incomplete reads are errors.
     pub coverage: Coverage,
     /// Changed since last pass.
@@ -197,6 +204,9 @@ pub struct Evidence {
     pub pending_product_questions: u32,
     /// Existing decisions.
     pub existing_decisions: Vec<Decision>,
+    /// Revisions at which a question about this issue was already asked.
+    /// [`plan_with_markers`] replaces it from the durable marker store.
+    pub asked_at: Vec<IssueRevision>,
     /// Ready label present.
     pub ready_label_present: bool,
     /// House-configured ready label.
@@ -205,15 +215,98 @@ pub struct Evidence {
     pub needs_spec_label: String,
 }
 
-/// Reads durable no-repeat state for a single issue revision. The eventual
-/// house marker store supplies this view; a missing or failed read is an error.
+/// Reads durable no-repeat question state for one issue. A missing or failed
+/// read is an error, never an empty history.
 pub trait MarkerView {
-    /// Whether the exact resolution for this revision was posted.
-    fn resolution_posted(&self, issue: IssueNumber, revision: &str) -> Result<bool, WorkflowError>;
+    /// Every revision at which a question about `issue` was asked.
+    fn asked(
+        &self,
+        repository: &Repository,
+        issue: IssueNumber,
+    ) -> Result<Vec<IssueRevision>, WorkflowError>;
+}
 
-    /// Decisions already asked for this issue and revision.
-    fn decisions(&self, issue: IssueNumber, revision: &str)
-    -> Result<Vec<Decision>, WorkflowError>;
+/// Question markers in the house store, keyed by workflow, issue, and
+/// [`MarkerSubject::Issue`]. An edited or newly commented issue is a new key.
+#[derive(Debug, Clone)]
+pub struct IssueMarkers<'a> {
+    store: &'a HouseStore,
+    workflow: WorkflowId,
+}
+
+impl<'a> IssueMarkers<'a> {
+    /// Read `workflow`'s markers from `store`.
+    #[must_use]
+    pub const fn new(store: &'a HouseStore, workflow: WorkflowId) -> Self {
+        Self { store, workflow }
+    }
+}
+
+fn work_item(repository: &Repository, issue: IssueNumber) -> Result<WorkItem, WorkflowError> {
+    Ok(WorkItem::Issue {
+        repository: repository.clone(),
+        number: NonZeroU64::new(issue.get()).ok_or(WorkflowError::IncompleteEvidence)?,
+    })
+}
+
+impl MarkerView for IssueMarkers<'_> {
+    fn asked(
+        &self,
+        repository: &Repository,
+        issue: IssueNumber,
+    ) -> Result<Vec<IssueRevision>, WorkflowError> {
+        let item = work_item(repository, issue)?;
+        let markers = self
+            .store
+            .markers(&self.workflow)
+            .map_err(|_| WorkflowError::PrecheckFailed)?;
+        markers
+            .iter()
+            .filter(|marker| marker.key().item == item)
+            .filter(|marker| matches!(marker.fact(), MarkerFact::QuestionAsked { .. }))
+            .map(|marker| match &marker.key().subject {
+                MarkerSubject::Issue(revision) => Ok(revision.clone()),
+                MarkerSubject::Git(_) | MarkerSubject::Observation(_) => {
+                    Err(WorkflowError::IncompleteEvidence)
+                }
+            })
+            .collect()
+    }
+}
+
+/// Record that `question` was asked about `issue` at `revision`. Recording
+/// the same question again changes nothing; a different question at the same
+/// revision is refused, because a revision gets at most one ask.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each value is part of the durable marker key or its provenance"
+)]
+pub fn record_question(
+    store: &HouseStore,
+    workflow: &WorkflowId,
+    repository: &Repository,
+    issue: IssueNumber,
+    revision: &IssueRevision,
+    question: ExternalRef,
+    recorded_by: &Claimant,
+    now: Timestamp,
+) -> Result<MarkerRecording, WorkflowError> {
+    let key = MarkerKey {
+        workflow: workflow.clone(),
+        item: work_item(repository, issue)?,
+        subject: MarkerSubject::Issue(revision.clone()),
+    };
+    store
+        .record_marker(
+            key,
+            MarkerFact::QuestionAsked { question },
+            recorded_by,
+            now,
+        )
+        .map_err(|error| match error {
+            crate::Error::State(StateError::MarkerConflict) => WorkflowError::DecisionMismatch,
+            _ => WorkflowError::PrecheckFailed,
+        })
 }
 
 /// Refresh durable no-repeat evidence before planning a pass.
@@ -228,9 +321,7 @@ pub fn plan_with_markers(
         return Err(WorkflowError::IncompleteEvidence);
     }
     let mut current = evidence.clone();
-    current.resolution_already_posted =
-        markers.resolution_posted(current.issue, &current.revision)?;
-    current.existing_decisions = markers.decisions(current.issue, &current.revision)?;
+    current.asked_at = markers.asked(&current.repository, current.issue)?;
     plan(&current)
 }
 
@@ -261,22 +352,27 @@ pub fn judgment_request(evidence: &Evidence) -> Result<Option<Operation>, Workfl
         return Ok(None);
     }
     let brief = format!(
-        "Inspect {} issue #{} at evidence revision {}; return factual resolution or exact product questions, without posting",
+        "Inspect {} issue #{} as updated at {} with newest comment {}; return factual resolution or exact product questions, without posting",
         evidence.repository,
         evidence.issue.get(),
-        evidence.revision
+        evidence.revision.updated_at,
+        evidence
+            .revision
+            .last_comment
+            .as_ref()
+            .map_or("none", ExternalRef::as_str)
     );
     Ok(Some(Operation::LaunchWorker {
         role: Role::Gardener,
         workspace: Workspace::Isolated,
         brief: Text::new(&brief).map_err(|_| WorkflowError::IncompleteEvidence)?,
+        branch: None,
     }))
 }
 
 /// No changes means an idle pass. There is never a repeated informational comment.
 pub fn precheck(evidence: &Evidence) -> Result<Precheck, WorkflowError> {
     if !evidence.coverage.is_complete()
-        || evidence.revision.is_empty()
         || !valid_label(&evidence.ready_label)
         || !valid_label(&evidence.needs_spec_label)
         || evidence.ready_label == evidence.needs_spec_label
@@ -341,11 +437,16 @@ pub fn plan(evidence: &Evidence) -> Result<Vec<Change>, WorkflowError> {
             }));
         }
     }
-    let remaining = MAX_ASKS_PER_TASK.saturating_sub(evidence.existing_decisions.len() as u32);
-    if evidence.factual_resolution.is_none() {
-        for ordinal in 0..evidence.pending_product_questions.min(remaining) {
-            changes.push(Change::Ask { ordinal });
-        }
+    // One ask per issue revision batches its questions, so a marker keyed by
+    // the revision prevents repeating it. Prior asks count toward the budget.
+    let asked = u32::try_from(evidence.asked_at.len()).unwrap_or(u32::MAX);
+    if evidence.factual_resolution.is_none()
+        && evidence.pending_product_questions > 0
+        && evidence.existing_decisions.is_empty()
+        && !evidence.asked_at.contains(&evidence.revision)
+        && asked < MAX_ASKS_PER_TASK
+    {
+        changes.push(Change::Ask { ordinal: asked });
     }
     if evidence.factual_resolution.is_some()
         && !unresolved

@@ -8,8 +8,8 @@ the first execution backend; workflow contracts must also support other
 orchestrators.
 
 This checkout contains the Rust workspace and development bootstrap. The CLI
-currently supports help and version output. The complete automation release is
-tracked in [issue #1](https://github.com/lemarier/kitchen/issues/1); this bootstrap
+supports help, version output, and offline identifier validation. The complete
+automation release is tracked in [issue #1](https://github.com/lemarier/kitchen/issues/1); this bootstrap
 does not implement or enable those workflows.
 
 ## Development
@@ -36,6 +36,20 @@ To install the bootstrap executable locally:
 ```sh
 cargo install --path crates/kitchen-cli --locked --offline
 ```
+
+The `validate-house` and `validate-task` bootstrap diagnostic commands validate
+identifiers without accessing a house, credentials, or a backend:
+
+```sh
+kitchen validate-house home
+kitchen validate-task task-42
+```
+
+Identifiers are case-sensitive, 1–64 ASCII bytes, start with a letter or digit,
+and otherwise contain only letters, digits, hyphens or underscores. Validation
+preserves spelling and grants no authority. Invalid input exits with code 2;
+output failures exit with code 1. The library exposes distinct `HouseId` and
+`TaskId` types and structured `kitchen::Error` values.
 
 Read [contributing](CONTRIBUTING.md) and [agent instructions](AGENTS.md) before
 working. Library code lives in `crates/kitchen`; the executable lives in

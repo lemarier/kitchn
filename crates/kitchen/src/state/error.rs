@@ -312,6 +312,10 @@ pub enum StateError {
     /// The store directory or a managed file is a symlink or not a regular file.
     #[error("store path is redirected or not a regular file")]
     RedirectedPath,
+    /// A store that requires private storage found a directory or managed
+    /// file readable or writable by other users.
+    #[error("store path is readable or writable by other users")]
+    PublicPath,
     /// The state file uses an unknown schema version.
     #[error("unsupported state schema version {found}")]
     UnsupportedSchema {
@@ -360,7 +364,8 @@ impl StateError {
             Self::UnsafeRetry(_)
             | Self::CapacityExceeded { .. }
             | Self::StorageInsideRepository
-            | Self::RedirectedPath => ErrorClass::Refused,
+            | Self::RedirectedPath
+            | Self::PublicPath => ErrorClass::Refused,
             Self::LockTimeout { .. }
             | Self::Io { .. }
             | Self::StateTooLarge { .. }

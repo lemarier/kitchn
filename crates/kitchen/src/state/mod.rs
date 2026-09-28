@@ -42,6 +42,7 @@ mod effects;
 mod error;
 mod marker;
 mod model;
+pub(crate) mod snapshot;
 mod store;
 
 pub use consumer::{ConsumerEvent, ConsumerRecord, ConsumerState, MAX_CONSUMER_HISTORY};
@@ -59,4 +60,5 @@ pub use model::{
     MAX_OWNERSHIP_HISTORY, MAX_TASKS, OwnershipEvent, RecoveryItem, RiskAction, RiskDecision,
     TaskRecord, TaskState,
 };
-pub use store::{HouseStore, StoreOptions};
+pub use snapshot::StoreOptions;
+pub use store::HouseStore;

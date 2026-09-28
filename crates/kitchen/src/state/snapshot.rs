@@ -1,0 +1,833 @@
+//! Shared snapshot persistence for house-scoped stores.
+//!
+//! A store is one directory holding an initialization marker, one snapshot
+//! file, a temporary file for atomic replacement, and a lock file. Each
+//! operation takes the lock, reloads the snapshot within a size bound, and
+//! replaces it atomically only when the content changed. The marker binds the
+//! snapshot to one house and one store identity (nonce), so a snapshot copied
+//! from another store fails closed.
+//!
+//! [`crate::state::HouseStore`] and the trust ledger use this engine with
+//! their own [`StoreLayout`] and payload type.
+
+use std::{
+    fs::{self, File, OpenOptions, TryLockError},
+    hash::{BuildHasher, RandomState},
+    io::{Read, Write},
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+use crate::{
+    HouseId,
+    contracts::ContractError,
+    state::{Corruption, StateError, StorageOperation},
+};
+
+const MAX_LOCK_BACKOFF: Duration = Duration::from_millis(50);
+static PRIORITY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Bounds for store I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreOptions {
+    /// Longest wait for the store lock before [`StateError::LockTimeout`].
+    pub lock_timeout: Duration,
+    /// Largest state file the store reads or writes.
+    pub max_state_bytes: u64,
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        Self {
+            lock_timeout: Duration::from_secs(5),
+            max_state_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+/// The payload one store persists.
+pub(crate) trait Snapshot: Serialize + DeserializeOwned {
+    /// The persisted schema version, checked in the marker and the snapshot.
+    const SCHEMA: u64;
+    /// The payload's error type; engine failures convert into it.
+    type Error: From<StateError> + From<ContractError>;
+    /// The empty payload written at initialization.
+    fn empty(house: HouseId, nonce: u64) -> Self;
+    /// The store identity recorded in the payload.
+    fn nonce(&self) -> u64;
+    /// Check payload invariants after decoding.
+    fn validate(&self, house: &HouseId) -> Result<(), Self::Error>;
+}
+
+/// File names and policy for one store within its own directory.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoreLayout {
+    pub marker: &'static str,
+    pub snapshot: &'static str,
+    pub temporary: &'static str,
+    pub lock: &'static str,
+    /// Write the snapshot as indented JSON.
+    pub pretty: bool,
+    /// Refuse a store directory or managed file readable by other users.
+    /// Enforced on Unix; other platforms have no mode bits to check.
+    pub require_private: bool,
+    /// A file whose held lock makes ordinary lockers yield to a priority
+    /// writer. `None` disables priority writes.
+    pub priority_intent: Option<&'static str>,
+    /// Bytes of [`StoreOptions::max_state_bytes`] only priority writes may use.
+    pub priority_reserve_bytes: u64,
+}
+
+/// Handles are cheap and hold no open files; separate handles and processes
+/// coordinate through the lock file.
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotStore<S> {
+    dir: PathBuf,
+    house: HouseId,
+    nonce: u64,
+    options: StoreOptions,
+    layout: StoreLayout,
+    payload: PhantomData<fn() -> S>,
+}
+
+/// The initialization marker. It never changes after initialization.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoreMarker {
+    schema: u64,
+    house: HouseId,
+    nonce: u64,
+}
+
+/// The fields checked before the full payload is decoded.
+#[derive(Deserialize)]
+struct SchemaProbe {
+    schema: u64,
+    house: HouseId,
+}
+
+impl<S: Snapshot> SnapshotStore<S> {
+    /// Create a new store in `dir`, creating the directory and missing parents.
+    pub(crate) fn initialize(
+        dir: impl AsRef<Path>,
+        house: HouseId,
+        options: StoreOptions,
+        layout: StoreLayout,
+    ) -> Result<Self, S::Error> {
+        let dir = dir.as_ref();
+        refuse_symlink(dir)?;
+        create_private_dir(dir)
+            .map_err(|error| StateError::io(StorageOperation::Prepare, error))?;
+        let mut store = Self::at(dir, house, 0, options, layout)?;
+        let _lock = store.lock(true, false)?;
+        if exists(&store.dir.join(layout.marker))? || exists(&store.dir.join(layout.snapshot))? {
+            return Err(StateError::AlreadyInitialized.into());
+        }
+        store.nonce = fresh_nonce();
+        let marker = StoreMarker {
+            schema: S::SCHEMA,
+            house: store.house.clone(),
+            nonce: store.nonce,
+        };
+        let marker = serde_json::to_vec_pretty(&marker)
+            .map_err(|error| StateError::io(StorageOperation::Write, error.into()))?;
+        // The marker goes first: if a crash follows, the store is
+        // established without a snapshot and fails closed on open.
+        store.write_file(layout.marker, &marker)?;
+        let empty = store.serialize(&S::empty(store.house.clone(), store.nonce))?;
+        store.write_bytes(&empty, false)?;
+        Ok(store)
+    }
+
+    /// Open the established store in `dir`. It never writes a replacement
+    /// snapshot.
+    pub(crate) fn open(
+        dir: impl AsRef<Path>,
+        house: HouseId,
+        options: StoreOptions,
+        layout: StoreLayout,
+    ) -> Result<Self, S::Error> {
+        let dir = dir.as_ref();
+        refuse_symlink(dir)?;
+        let mut store = Self::at(dir, house, 0, options, layout)?;
+        let _lock = store.lock(false, false)?;
+        let marker = store.read_marker()?;
+        store.nonce = marker.nonce;
+        store.load()?.ok_or(StateError::StateMissing)?;
+        Ok(store)
+    }
+
+    fn at(
+        dir: &Path,
+        house: HouseId,
+        nonce: u64,
+        options: StoreOptions,
+        layout: StoreLayout,
+    ) -> Result<Self, StateError> {
+        let dir = fs::canonicalize(dir).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StateError::NotInitialized
+            } else {
+                StateError::io(StorageOperation::Prepare, error)
+            }
+        })?;
+        if dir
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").symlink_metadata().is_ok())
+        {
+            return Err(StateError::StorageInsideRepository);
+        }
+        Ok(Self {
+            dir,
+            house,
+            nonce,
+            options,
+            layout,
+            payload: PhantomData,
+        })
+    }
+
+    /// The house this store serves.
+    pub(crate) const fn house(&self) -> &HouseId {
+        &self.house
+    }
+
+    /// Apply `apply` to the snapshot under the exclusive lock, and replace
+    /// the snapshot if the content changed. An error from `apply` writes
+    /// nothing.
+    pub(crate) fn transact<T>(
+        &self,
+        apply: impl FnOnce(&mut S) -> Result<T, S::Error>,
+    ) -> Result<T, S::Error> {
+        self.transact_inner(false, apply)
+    }
+
+    /// Like [`Self::transact`], but ordinary lockers yield to this writer and
+    /// it may use [`StoreLayout::priority_reserve_bytes`].
+    pub(crate) fn transact_priority<T>(
+        &self,
+        apply: impl FnOnce(&mut S) -> Result<T, S::Error>,
+    ) -> Result<T, S::Error> {
+        self.transact_inner(true, apply)
+    }
+
+    fn transact_inner<T>(
+        &self,
+        priority: bool,
+        apply: impl FnOnce(&mut S) -> Result<T, S::Error>,
+    ) -> Result<T, S::Error> {
+        let _intent = match (priority, self.layout.priority_intent) {
+            (true, Some(name)) => Some(PriorityIntent::acquire(
+                &self.dir,
+                name,
+                self.options.lock_timeout,
+            )?),
+            (true, None) | (false, _) => None,
+        };
+        let _lock = self.lock(true, priority)?;
+        let (mut state, before) = self.load()?.ok_or(StateError::StateMissing)?;
+        let value = apply(&mut state)?;
+        let after = self.serialize(&state)?;
+        if after != before {
+            self.write_bytes(&after, priority)?;
+        }
+        Ok(value)
+    }
+
+    /// Read the snapshot under the shared lock.
+    pub(crate) fn read<T>(&self, view: impl FnOnce(&S) -> T) -> Result<T, S::Error> {
+        let _lock = self.lock(false, false)?;
+        let (state, _) = self.load()?.ok_or(StateError::StateMissing)?;
+        Ok(view(&state))
+    }
+
+    fn read_marker(&self) -> Result<StoreMarker, S::Error> {
+        let path = self.dir.join(self.layout.marker);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(if exists(&self.dir.join(self.layout.snapshot))? {
+                    StateError::CorruptState(Corruption::Marker).into()
+                } else {
+                    StateError::NotInitialized.into()
+                });
+            }
+            Err(error) => return Err(StateError::io(StorageOperation::Read, error).into()),
+        };
+        let marker: StoreMarker = serde_json::from_slice(&bytes)
+            .map_err(|_| StateError::CorruptState(Corruption::Marker))?;
+        if marker.schema != S::SCHEMA {
+            return Err(StateError::UnsupportedSchema {
+                found: marker.schema,
+            }
+            .into());
+        }
+        if marker.house != self.house {
+            return Err(ContractError::CrossHouse {
+                expected: self.house.clone(),
+                found: marker.house,
+            }
+            .into());
+        }
+        Ok(marker)
+    }
+
+    fn lock(&self, exclusive: bool, priority: bool) -> Result<File, StateError> {
+        if self.layout.require_private {
+            require_private(&self.dir)?;
+        }
+        for name in [
+            self.layout.marker,
+            self.layout.lock,
+            self.layout.snapshot,
+            self.layout.temporary,
+        ] {
+            let path = self.dir.join(name);
+            refuse_redirected(&path)?;
+            if self.layout.require_private && exists(&path)? {
+                require_private(&path)?;
+            }
+        }
+        let file = open_lock_file(&self.dir.join(self.layout.lock))
+            .map_err(|error| StateError::io(StorageOperation::Lock, error))?;
+        let started = Instant::now();
+        let mut backoff = Duration::from_millis(2);
+        loop {
+            if !priority && self.priority_pending()? {
+                self.wait_for_lock(started, &mut backoff)?;
+                continue;
+            }
+            let attempt = if exclusive {
+                file.try_lock()
+            } else {
+                file.try_lock_shared()
+            };
+            match attempt {
+                // A priority writer may have announced itself while this
+                // locker waited; yield to it before touching the snapshot.
+                Ok(()) if !priority && self.priority_pending()? => {
+                    file.unlock()
+                        .map_err(|error| StateError::io(StorageOperation::Lock, error))?;
+                }
+                Ok(()) => return Ok(file),
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Error(error)) => {
+                    return Err(StateError::io(StorageOperation::Lock, error));
+                }
+            }
+            self.wait_for_lock(started, &mut backoff)?;
+        }
+    }
+
+    fn wait_for_lock(&self, started: Instant, backoff: &mut Duration) -> Result<(), StateError> {
+        let waited = started.elapsed();
+        let Some(remaining) = self
+            .options
+            .lock_timeout
+            .checked_sub(waited)
+            .filter(|left| !left.is_zero())
+        else {
+            return Err(StateError::LockTimeout {
+                waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+            });
+        };
+        thread::sleep((*backoff).min(remaining));
+        *backoff = backoff.saturating_mul(2).min(MAX_LOCK_BACKOFF);
+        Ok(())
+    }
+
+    /// Whether a priority writer currently holds its intent. A stale intent
+    /// left by a crashed writer is unlocked and removed.
+    fn priority_pending(&self) -> Result<bool, StateError> {
+        let Some(name) = self.layout.priority_intent else {
+            return Ok(false);
+        };
+        let lock = |error| StateError::io(StorageOperation::Lock, error);
+        let path = self.dir.join(name);
+        refuse_redirected(&path)?;
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(lock(error)),
+        };
+        match file.try_lock() {
+            Err(TryLockError::WouldBlock) => Ok(true),
+            Err(TryLockError::Error(error)) => Err(lock(error)),
+            Ok(()) => match fs::remove_file(path) {
+                Ok(()) => Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(lock(error)),
+            },
+        }
+    }
+
+    fn load(&self) -> Result<Option<(S, Vec<u8>)>, S::Error> {
+        let file = match File::open(self.dir.join(self.layout.snapshot)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(StateError::io(StorageOperation::Read, error).into()),
+        };
+        let limit = self.options.max_state_bytes;
+        let mut bytes = Vec::new();
+        file.take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| StateError::io(StorageOperation::Read, error))?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+            return Err(StateError::StateTooLarge { limit_bytes: limit }.into());
+        }
+        let state = self.parse(&bytes)?;
+        Ok(Some((state, bytes)))
+    }
+
+    fn parse(&self, bytes: &[u8]) -> Result<S, S::Error> {
+        let probe: SchemaProbe = serde_json::from_slice(bytes).map_err(syntax)?;
+        if probe.schema != S::SCHEMA {
+            return Err(StateError::UnsupportedSchema {
+                found: probe.schema,
+            }
+            .into());
+        }
+        if probe.house != self.house {
+            return Err(ContractError::CrossHouse {
+                expected: self.house.clone(),
+                found: probe.house,
+            }
+            .into());
+        }
+        let state: S = serde_json::from_slice(bytes).map_err(syntax)?;
+        state.validate(&self.house)?;
+        if state.nonce() != self.nonce {
+            return Err(StateError::CorruptState(Corruption::StoreIdentity).into());
+        }
+        Ok(state)
+    }
+
+    fn serialize(&self, state: &S) -> Result<Vec<u8>, StateError> {
+        if self.layout.pretty {
+            serde_json::to_vec_pretty(state)
+        } else {
+            serde_json::to_vec(state)
+        }
+        .map_err(|error| StateError::io(StorageOperation::Write, error.into()))
+    }
+
+    fn write_bytes(&self, bytes: &[u8], priority: bool) -> Result<(), StateError> {
+        let limit = if priority {
+            self.options.max_state_bytes
+        } else {
+            self.options
+                .max_state_bytes
+                .saturating_sub(self.layout.priority_reserve_bytes)
+        };
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+            return Err(StateError::StateTooLarge { limit_bytes: limit });
+        }
+        self.write_file(self.layout.snapshot, bytes)
+    }
+
+    /// Atomically replace `name` with `bytes` through the temporary file.
+    fn write_file(&self, name: &str, bytes: &[u8]) -> Result<(), StateError> {
+        let io = |error| StateError::io(StorageOperation::Write, error);
+        let temp = self.dir.join(self.layout.temporary);
+        let mut file = create_private_file(&temp).map_err(io)?;
+        file.write_all(bytes).map_err(io)?;
+        file.sync_all().map_err(io)?;
+        drop(file);
+        fs::rename(&temp, self.dir.join(name)).map_err(io)?;
+        sync_dir(&self.dir).map_err(io)?;
+        Ok(())
+    }
+}
+
+/// A held intent file announcing a priority writer. Ordinary lockers see the
+/// locked file and wait; it is removed on drop.
+struct PriorityIntent {
+    intent: PathBuf,
+    temporary: PathBuf,
+    _lock: File,
+}
+
+impl PriorityIntent {
+    /// Publish the intent by hard-linking a locked private file into place,
+    /// waiting for another priority writer within `timeout`.
+    fn acquire(dir: &Path, name: &str, timeout: Duration) -> Result<Self, StateError> {
+        let lock = |error| StateError::io(StorageOperation::Lock, error);
+        let temporary = dir.join(format!(
+            "{name}.{}-{}.tmp",
+            std::process::id(),
+            PRIORITY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = create_private_new_file(&temporary).map_err(lock)?;
+        let mut cleanup = RemoveOnDrop(Some(temporary.clone()));
+        file.lock().map_err(lock)?;
+        let intent = dir.join(name);
+        let started = Instant::now();
+        loop {
+            match fs::hard_link(&temporary, &intent) {
+                Ok(()) => {
+                    cleanup.0 = None;
+                    return Ok(Self {
+                        intent,
+                        temporary,
+                        _lock: file,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    refuse_redirected(&intent)?;
+                    let held = match File::open(&intent) {
+                        Ok(other) => match other.try_lock() {
+                            Ok(()) => false,
+                            Err(TryLockError::WouldBlock) => true,
+                            Err(TryLockError::Error(error)) => return Err(lock(error)),
+                        },
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(error) => return Err(lock(error)),
+                    };
+                    let waited = started.elapsed();
+                    if waited >= timeout {
+                        return Err(StateError::LockTimeout {
+                            waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                        });
+                    }
+                    if held {
+                        thread::sleep(Duration::from_millis(5));
+                    } else {
+                        // Stale intent from a crashed writer.
+                        match fs::remove_file(&intent) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(lock(error)),
+                        }
+                    }
+                }
+                Err(error) => return Err(lock(error)),
+            }
+        }
+    }
+}
+
+impl Drop for PriorityIntent {
+    fn drop(&mut self) {
+        // Best effort: a leftover unlocked intent is removed by the next locker.
+        let _ = fs::remove_file(&self.intent);
+        let _ = fs::remove_file(&self.temporary);
+    }
+}
+
+struct RemoveOnDrop(Option<PathBuf>);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn syntax(error: serde_json::Error) -> StateError {
+    StateError::CorruptState(Corruption::Syntax {
+        line: error.line(),
+        column: error.column(),
+    })
+}
+
+#[cfg(unix)]
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Create the store directory (and missing parents) readable only by the owner.
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)
+}
+
+/// Create or truncate a state file readable only by the owner.
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    File::create(path)
+}
+
+/// Create a new file readable only by the owner; fails if it exists.
+#[cfg(unix)]
+fn create_private_new_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_new_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    // Directory handles cannot be synced on this platform; rename is still atomic.
+    Ok(())
+}
+
+fn exists(path: &Path) -> Result<bool, StateError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StateError::io(StorageOperation::Prepare, error)),
+    }
+}
+
+/// Refuse a store directory that is itself a symlink.
+fn refuse_symlink(dir: &Path) -> Result<(), StateError> {
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(StateError::RedirectedPath),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::io(StorageOperation::Prepare, error)),
+    }
+}
+
+/// Refuse a managed file that exists but is not a regular file, such as a
+/// symlink redirecting writes elsewhere.
+fn refuse_redirected(path: &Path) -> Result<(), StateError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(StateError::RedirectedPath),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::io(StorageOperation::Prepare, error)),
+    }
+}
+
+/// Refuse a path that other users can read or write.
+#[cfg(unix)]
+fn require_private(path: &Path) -> Result<(), StateError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| StateError::io(StorageOperation::Prepare, error))?;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(StateError::PublicPath);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_private(_path: &Path) -> Result<(), StateError> {
+    Ok(())
+}
+
+fn fresh_nonce() -> u64 {
+    // RandomState is seeded from OS randomness per process; mixing in the
+    // time distinguishes stores created in the same process.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    RandomState::new().hash_one((std::process::id(), now))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Toy {
+        schema: u64,
+        house: HouseId,
+        nonce: u64,
+        items: Vec<u32>,
+    }
+
+    impl Snapshot for Toy {
+        const SCHEMA: u64 = 7;
+        type Error = crate::Error;
+
+        fn empty(house: HouseId, nonce: u64) -> Self {
+            Self {
+                schema: Self::SCHEMA,
+                house,
+                nonce,
+                items: Vec::new(),
+            }
+        }
+
+        fn nonce(&self) -> u64 {
+            self.nonce
+        }
+
+        fn validate(&self, _house: &HouseId) -> Result<(), crate::Error> {
+            Ok(())
+        }
+    }
+
+    const RESERVE: u64 = 16;
+    const LAYOUT: StoreLayout = StoreLayout {
+        marker: "store.json",
+        snapshot: "toy.json",
+        temporary: "toy.tmp",
+        lock: "toy.lock",
+        pretty: false,
+        require_private: true,
+        priority_intent: Some("toy.priority"),
+        priority_reserve_bytes: RESERVE,
+    };
+
+    fn house() -> std::result::Result<HouseId, crate::IdentifierError> {
+        HouseId::new("example")
+    }
+
+    /// A store whose ordinary writes may reach exactly the encoded size of
+    /// `fits` and no more.
+    fn bounded(
+        dir: &Path,
+        fits: &[u32],
+    ) -> std::result::Result<SnapshotStore<Toy>, Box<dyn std::error::Error>> {
+        let store =
+            SnapshotStore::<Toy>::initialize(dir, house()?, StoreOptions::default(), LAYOUT)?;
+        let nonce = store.nonce;
+        let at_limit = serde_json::to_vec(&Toy {
+            items: fits.to_vec(),
+            ..Toy::empty(house()?, nonce)
+        })?;
+        let options = StoreOptions {
+            max_state_bytes: u64::try_from(at_limit.len())? + RESERVE,
+            ..StoreOptions::default()
+        };
+        Ok(SnapshotStore::open(dir, house()?, options, LAYOUT)?)
+    }
+
+    #[test]
+    fn ordinary_writes_stop_at_the_reserve_and_priority_writes_use_it() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[1, 2, 3])?;
+        store.transact(|toy| {
+            toy.items.extend([1, 2, 3]);
+            Ok(())
+        })?;
+        let refused = store.transact(|toy| {
+            toy.items.push(4);
+            Ok(())
+        });
+        assert!(matches!(
+            refused,
+            Err(crate::Error::State(StateError::StateTooLarge { .. }))
+        ));
+        assert_eq!(store.read(|toy| toy.items.clone())?, [1, 2, 3]);
+        store.transact_priority(|toy| {
+            toy.items.push(4);
+            Ok(())
+        })?;
+        assert_eq!(store.read(|toy| toy.items.clone())?, [1, 2, 3, 4]);
+        assert!(!path.join("toy.priority").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_transaction_writes_nothing() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[1])?;
+        let before = fs::read(path.join("toy.json"))?;
+        let failed: Result<(), crate::Error> = store.transact(|toy| {
+            toy.items.push(9);
+            Err(StateError::StateMissing.into())
+        });
+        assert!(failed.is_err());
+        assert_eq!(fs::read(path.join("toy.json"))?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_priority_intent_does_not_block_ordinary_writers() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[1, 2])?;
+        // An unlocked intent left by a crashed priority writer.
+        create_private_new_file(&path.join("toy.priority"))?;
+        store.transact(|toy| {
+            toy.items.push(1);
+            Ok(())
+        })?;
+        assert!(!path.join("toy.priority").exists());
+        assert_eq!(store.read(|toy| toy.items.clone())?, [1]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_held_priority_intent_makes_ordinary_lockers_time_out() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = SnapshotStore::<Toy>::open(
+            {
+                bounded(&path, &[])?;
+                &path
+            },
+            house()?,
+            StoreOptions {
+                lock_timeout: Duration::from_millis(30),
+                ..StoreOptions::default()
+            },
+            LAYOUT,
+        )?;
+        let _held = PriorityIntent::acquire(&store.dir, "toy.priority", Duration::from_secs(1))?;
+        assert!(matches!(
+            store.read(|toy| toy.items.len()),
+            Err(crate::Error::State(StateError::LockTimeout { .. }))
+        ));
+        Ok(())
+    }
+}

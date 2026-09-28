@@ -36,7 +36,7 @@ use crate::{
     state::{
         CancelStatus, ConsumerRecord, Consumption, Creation, EffectOutcome, EffectPlan,
         EffectRecord, EffectStart, Lease, MarkerAttempt, MarkerFact, MarkerKey, MarkerRecording,
-        RecoveryItem, RiskDecision, TaskRecord, WorkflowMarker,
+        RecoveryItem, Reservation, RiskDecision, TaskRecord, WorkflowMarker,
         model::StoreState,
         snapshot::{SnapshotStore, StoreLayout, StoreOptions},
     },
@@ -120,6 +120,30 @@ impl HouseStore {
         now: Timestamp,
     ) -> Result<Creation> {
         self.transact(|state| state.create_task(spec, created_by, now))
+    }
+
+    /// Create a task and claim it for `claimant` unless `guard` objects to
+    /// the tasks already stored. The guard reads them, and the task is
+    /// created and claimed, in one store transaction, so a concurrent
+    /// reservation cannot slip between the check and the write and the new
+    /// task never exists unclaimed. A task that already exists, if
+    /// identical, is reported as [`Reservation::Existing`] and is not
+    /// guarded or claimed; the caller resumes it with [`Self::claim`] or
+    /// [`Self::take_over`]. The guard returns the reason to block, and
+    /// nothing is written then.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::create_task`] and [`Self::claim`], and
+    /// any the guard returns.
+    pub fn reserve_task<R>(
+        &self,
+        spec: TaskSpec,
+        claimant: &Claimant,
+        ttl: LeaseTtl,
+        now: Timestamp,
+        guard: impl FnOnce(&[&TaskRecord]) -> Result<Option<R>>,
+    ) -> Result<Reservation<R>> {
+        self.transact(|state| state.reserve_task(spec, claimant, ttl, now, guard))
     }
 
     /// Read one task.

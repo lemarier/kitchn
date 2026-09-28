@@ -5,8 +5,8 @@ use common::{Fixture, ManualClock, TestResult, commit, house, interactive, sched
 use kitchen::{
     BackendId, CredentialId, Error, ErrorClass, HolderId,
     contracts::{
-        EffectFailure, ExternalRef, Grant, HouseGrants, IssueNumber, NotAppliedReason, Permission,
-        PostingBudget, Provenance, Repository, Settlement, UncertainReason,
+        Clock, EffectFailure, ExternalRef, Grant, HouseGrants, IssueNumber, NotAppliedReason,
+        Permission, PostingBudget, Provenance, Repository, Settlement, Timestamp, UncertainReason,
     },
     integrations::github::{
         CredentialRef, GitHubExecutor, GitHubMutationTransport, GitHubReadTransport, HouseScope,
@@ -258,6 +258,17 @@ impl House {
         proposal: &Proposal,
         approval: &Approval,
     ) -> TestResult<kitchen::workflows::decomposition::ApplyReport> {
+        self.apply_with(&self.clock, forge, proposal, approval)
+    }
+
+    /// Like [`Self::apply`], reading time from `clock`.
+    fn apply_with(
+        &self,
+        clock: &dyn Clock,
+        forge: &RefCell<Forge>,
+        proposal: &Proposal,
+        approval: &Approval,
+    ) -> TestResult<kitchen::workflows::decomposition::ApplyReport> {
         let executor = GitHubExecutor::new(
             BackendId::new("github")?,
             self.scope.clone(),
@@ -268,7 +279,7 @@ impl House {
             store: &self.fixture.store,
             executor: &executor,
             grants: &self.grants,
-            clock: &self.clock,
+            clock,
         };
         self.clock.advance(1);
         Ok(apply(
@@ -278,6 +289,26 @@ impl House {
             &interactive("session")?,
             &options()?,
         )?)
+    }
+}
+
+/// A clock that runs one action the first time it is read, to interleave
+/// another caller at a chosen point inside `apply`.
+struct InterleavingClock<'a> {
+    inner: &'a ManualClock,
+    action: RefCell<Option<Box<dyn FnOnce() -> TestResult + 'a>>>,
+    failure: RefCell<Option<String>>,
+}
+
+impl Clock for InterleavingClock<'_> {
+    fn now(&self) -> Timestamp {
+        let action = self.action.borrow_mut().take();
+        if let Some(action) = action
+            && let Err(error) = action()
+        {
+            *self.failure.borrow_mut() = Some(error.to_string());
+        }
+        self.inner.now()
     }
 }
 
@@ -824,5 +855,122 @@ fn a_revision_may_replace_a_proposal_that_wrote_nothing() -> TestResult {
     let seen = forge.borrow();
     assert_eq!(seen.created().len(), 3);
     assert_eq!(seen.created_titled("Build the docs site").len(), 1);
+    Ok(())
+}
+
+#[test]
+fn the_rendered_preview_is_the_exact_text_that_is_posted() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge::seeded());
+    let proposal = project()?;
+    let shown = preview(&proposal)?;
+    let text = shown.render();
+    house.apply(&forge, &proposal, &approval_of(&shown)?)?;
+    let seen = forge.borrow();
+    let created = seen.created();
+    assert_eq!(created.len(), 3);
+    for issue in created {
+        let title = issue["title"].as_str().ok_or("title")?;
+        // The executor appends its own idempotency marker after the body.
+        let body = issue["body"]
+            .as_str()
+            .and_then(|body| body.split("<!-- kitchen:").next())
+            .ok_or("body")?
+            .trim_end();
+        assert!(text.contains(title), "title not shown: {title}");
+        assert!(text.contains(body), "body not shown: {body}");
+    }
+    Ok(())
+}
+
+#[test]
+fn editing_only_the_outcome_changes_the_body_the_preview_and_the_digest() -> TestResult {
+    let proposal = project()?;
+    let shown = preview(&proposal)?;
+    let mut edited = proposal;
+    if let Some(docs) = edited.issues.first_mut() {
+        docs.outcome = "The docs part ships a different outcome.".into();
+    }
+    let changed = preview(&edited)?;
+    assert_ne!(changed.digest, shown.digest);
+    assert_ne!(changed.render(), shown.render());
+    assert!(
+        changed
+            .render()
+            .contains("The docs part ships a different outcome.")
+    );
+    assert!(!shown.render().contains("a different outcome"));
+    Ok(())
+}
+
+#[test]
+fn a_second_preview_that_interleaves_with_apply_is_refused() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge {
+        // The interleaved run creates one issue, then its second write is
+        // refused, leaving its task unfinished with an applied write.
+        fault: Some((2, Fault::Reject)),
+        ..Forge::seeded()
+    });
+    let first = project()?;
+    let mut second = first.clone();
+    if let Some(docs) = second.issues.first_mut() {
+        docs.title = "Build the docs site".into();
+    }
+    let first_approval = approval_of(&preview(&first)?)?;
+    let second_preview = preview(&second)?;
+    let clock = InterleavingClock {
+        inner: &house.clock,
+        action: RefCell::new(Some(Box::new(|| {
+            // Runs after `second` passed its checks and before it creates
+            // its task.
+            house.apply(&forge, &first, &first_approval)?;
+            Ok(())
+        }))),
+        failure: RefCell::new(None),
+    };
+    let report = house.apply_with(&clock, &forge, &second, &approval_of(&second_preview)?)?;
+    assert_eq!(clock.failure.borrow().as_deref(), None);
+    assert_eq!(
+        report.outcome,
+        ApplyOutcome::EarlierUnfinished {
+            task: task_id(&preview(&first)?.digest)?
+        }
+    );
+    assert_eq!(report.task, None);
+    // Only the first preview's submissions reached the forge.
+    assert_eq!(forge.borrow().submissions, 2);
+    assert!(
+        forge
+            .borrow()
+            .created_titled("Build the docs site")
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_refused_revision_and_the_same_preview_retry_do_not_duplicate() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge {
+        fault: Some((2, Fault::Reject)),
+        ..Forge::seeded()
+    });
+    let proposal = project()?;
+    let approval = approval_of(&preview(&proposal)?)?;
+    house.apply(&forge, &proposal, &approval)?;
+    let mut revised = proposal.clone();
+    if let Some(docs) = revised.issues.first_mut() {
+        docs.title = "Build the docs site".into();
+    }
+    let refused = house.apply(&forge, &revised, &approval_of(&preview(&revised)?)?)?;
+    assert!(matches!(
+        refused.outcome,
+        ApplyOutcome::EarlierUnfinished { .. }
+    ));
+    // Retrying the original digest resumes its task and completes the set.
+    let resumed = house.apply(&forge, &proposal, &approval)?;
+    assert_eq!(resumed.outcome, ApplyOutcome::Completed);
+    assert_eq!(forge.borrow().created().len(), 3);
     Ok(())
 }

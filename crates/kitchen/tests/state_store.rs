@@ -26,8 +26,8 @@ use kitchen::{
     state::{
         AttemptState, CancelStatus, ConsumerEvent, ConsumerState, Consumption, Corruption,
         Creation, EffectOutcome, EffectStart, EffectState, HouseStore, MAX_EVIDENCE_PER_REVISION,
-        OwnershipEvent, RecoveryItem, RiskAction, RiskDecision, StateError, StoreOptions,
-        TaskState,
+        OwnershipEvent, RecoveryItem, Reservation, RiskAction, RiskDecision, StateError,
+        StoreOptions, TaskState,
     },
 };
 
@@ -1886,6 +1886,34 @@ fn a_taking_over_owner_continues_the_interrupted_attempt_without_spending_budget
 }
 
 #[test]
+fn reserving_a_task_creates_and_claims_it_in_one_step() -> TestResult {
+    let fixture = Fixture::new()?;
+    let id = task_id("slot-a")?;
+    let reserved =
+        fixture
+            .store
+            .reserve_task(spec("slot-a")?, &creator()?, ttl(60)?, at(10), |_| {
+                Ok(None::<()>)
+            })?;
+    let Reservation::Reserved(lease) = reserved else {
+        return Err("expected a reservation".into());
+    };
+    assert!(matches!(
+        fixture.store.task(&id)?.state(),
+        TaskState::Claimed { lease: held } if held.fence() == lease.fence()
+    ));
+    // Repeating the identical request resumes nothing and claims nothing.
+    let again =
+        fixture
+            .store
+            .reserve_task(spec("slot-a")?, &creator()?, ttl(60)?, at(11), |_| {
+                Ok(Some(()))
+            })?;
+    assert_eq!(again, Reservation::Existing);
+    Ok(())
+}
+
+#[test]
 fn continuing_needs_a_live_claim_and_an_attempt() -> TestResult {
     let fixture = Fixture::new()?;
     let task = task_id("task-2")?;
@@ -1900,5 +1928,64 @@ fn continuing_needs_a_live_claim_and_an_attempt() -> TestResult {
         store.continue_attempt(&task, lease.fence(), at(61)),
         Err(Error::State(StateError::LeaseExpired { .. }))
     ));
+    Ok(())
+}
+
+#[test]
+fn a_blocked_reservation_writes_nothing_and_a_conflicting_spec_is_refused() -> TestResult {
+    let fixture = Fixture::new()?;
+    let blocked =
+        fixture
+            .store
+            .reserve_task(spec("slot-b")?, &creator()?, ttl(60)?, at(10), |tasks| {
+                Ok(Some(tasks.len()))
+            })?;
+    assert_eq!(blocked, Reservation::Blocked(0));
+    assert!(fixture.store.task(&task_id("slot-b")?).is_err());
+
+    fixture
+        .store
+        .create_task(spec("slot-b")?, &creator()?, at(10))?;
+    let different = spec_with("slot-b", RetryPolicy::new(1, Duration::from_secs(60))?, &[])?;
+    let error = fixture
+        .store
+        .reserve_task(different, &creator()?, ttl(60)?, at(11), |_| Ok(None::<()>))
+        .err()
+        .ok_or("a different spec under the same id must be refused")?;
+    assert!(matches!(error, Error::State(StateError::TaskConflict(_))));
+    Ok(())
+}
+
+#[test]
+fn concurrent_reservations_admit_exactly_one() -> TestResult {
+    let fixture = Fixture::new()?;
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = ["slot-c1", "slot-c2"]
+        .into_iter()
+        .map(|name| {
+            let store = fixture.store.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || -> Result<bool, String> {
+                let task = spec(name).map_err(|e| e.to_string())?;
+                let claimant = creator().map_err(|e| e.to_string())?;
+                let lease = ttl(60).map_err(|e| e.to_string())?;
+                barrier.wait();
+                let outcome = store
+                    .reserve_task(task, &claimant, lease, at(10), |tasks| {
+                        Ok(tasks.first().map(|_| ()))
+                    })
+                    .map_err(|e| e.to_string())?;
+                Ok(matches!(outcome, Reservation::Reserved(_)))
+            })
+        })
+        .collect();
+    let mut admitted = 0;
+    for handle in handles {
+        if handle.join().map_err(|_| "reservation thread panicked")?? {
+            admitted += 1;
+        }
+    }
+    assert_eq!(admitted, 1);
+    assert_eq!(fixture.store.tasks()?.len(), 1);
     Ok(())
 }

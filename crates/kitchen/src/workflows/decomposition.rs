@@ -27,8 +27,12 @@
 //! without duplicate issues or edges. A write whose outcome stays unknown
 //! stops the run: nothing after it is submitted until it is reconciled.
 //! A second decomposition of the same repository is refused while an earlier
-//! one is unfinished and has a write that may have reached the forge, so a
-//! revised proposal cannot recreate issues that the earlier task created.
+//! one is unfinished and either is being run or has a write that may have
+//! reached the forge, so a revised proposal cannot recreate issues that the
+//! earlier task created. The check, the creation of the task, and its claim
+//! are one store transaction ([`HouseStore::reserve_task`]), so two approved
+//! previews cannot both pass. The slot frees when the earlier task settles,
+//! or when its claim lapses with no write that could have reached the forge.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -46,12 +50,12 @@ use crate::{
         AttemptNumber, AttemptOutcome, AttemptStart, CapabilityRequirements, Claimant, Clock,
         Consent, Effect, ExternalRef, FailureClass, GitHubAction, GitHubMutation, HouseGrants,
         IssueNumber, LeaseTtl, NotAppliedReason, Provenance, Repository, RetryPolicy, Role,
-        Settlement, TaskAuthority, TaskSpec, Text, Trigger,
+        Settlement, TaskAuthority, TaskSpec, Text, Timestamp, Trigger,
     },
     integrations::github::{GitHubExecutor, GitHubMutationTransport},
     state::{
-        EffectPlan, EffectRecord, EffectState, HouseStore, StateError, TaskRecord, TaskState,
-        reconcile, run_effect,
+        EffectPlan, EffectRecord, EffectState, HouseStore, Reservation, StateError, TaskRecord,
+        TaskState, reconcile, run_effect,
     },
 };
 
@@ -482,16 +486,19 @@ impl Preview {
             if let Some(phase) = &issue.phase {
                 let _ = writeln!(out, "   Phase: {phase}");
             }
-            let paths: Vec<&str> = issue.owned_paths.iter().map(OwnedPath::as_str).collect();
-            let _ = writeln!(out, "   Owns: {}", paths.join(", "));
             if !issue.blocked_by.is_empty() {
                 let blockers: Vec<String> = issue.blocked_by.iter().map(render_blocker).collect();
                 let _ = writeln!(out, "   Blocked by: {}", blockers.join(", "));
             }
-            let _ = writeln!(out, "   Acceptance criteria:");
-            for criterion in &issue.acceptance {
-                let _ = writeln!(out, "   - {criterion}");
+            // The body carries the outcome, owned paths, and acceptance
+            // criteria; it is shown as posted so the digest covers what
+            // the person read.
+            let _ = writeln!(out, "----- body of #{} as posted -----", index + 1);
+            let _ = write!(out, "{}", issue.body);
+            if !issue.body.ends_with('\n') {
+                out.push('\n');
             }
+            let _ = writeln!(out, "----- end of body -----");
         }
         if !self.overlaps.is_empty() {
             let _ = writeln!(out, "\nOwnership overlaps:");
@@ -1072,65 +1079,59 @@ pub fn apply<T: GitHubMutationTransport>(
     }
     let id = task_id(&preview.digest)?;
     let store = writer.store;
-    for task in store.tasks()? {
-        if task.spec().id != id
-            && task.spec().id.as_str().starts_with(TASK_PREFIX)
-            && task.spec().repository.as_ref() == Some(&preview.repository)
-            && !matches!(task.state(), TaskState::Settled { .. })
-            && task
-                .effects()
-                .iter()
-                .any(|effect| !matches!(effect.state(), EffectState::NotApplied { .. }))
-        {
+    let spec = TaskSpec {
+        id: id.clone(),
+        role: Role::SousChef,
+        repository: Some(preview.repository.clone()),
+        authority: TaskAuthority::delegate(writer.grants, [])?,
+        retry: RetryPolicy::new(ATTEMPTS, BUDGET)?,
+        provenance: options.provenance.clone(),
+        resources: BTreeSet::new(),
+        requires: CapabilityRequirements::new(),
+        agent: None,
+    };
+    // The repository's decomposition slot is the task itself: the check
+    // for an earlier unfinished task and the creation and claim of this one
+    // happen in one store transaction, so two different approved previews
+    // cannot both pass the check.
+    let now = writer.clock.now();
+    let reservation = store.reserve_task(spec, claimant, options.lease, now, |tasks| {
+        Ok(earlier_unfinished(tasks, &id, &preview.repository, now))
+    })?;
+    let fence = match reservation {
+        Reservation::Reserved(lease) => lease.fence(),
+        Reservation::Blocked(task) => {
             return Ok(report(
                 preview,
                 None,
-                ApplyOutcome::EarlierUnfinished {
-                    task: task.spec().id.clone(),
-                },
+                ApplyOutcome::EarlierUnfinished { task },
             ));
         }
-    }
-    let record = match store.task(&id) {
-        Ok(record) => record,
-        Err(Error::State(StateError::TaskNotFound(_))) => {
-            let spec = TaskSpec {
-                id: id.clone(),
-                role: Role::SousChef,
-                repository: Some(preview.repository.clone()),
-                authority: TaskAuthority::delegate(writer.grants, [])?,
-                retry: RetryPolicy::new(ATTEMPTS, BUDGET)?,
-                provenance: options.provenance.clone(),
-                resources: BTreeSet::new(),
-                requires: CapabilityRequirements::new(),
-                agent: None,
+        Reservation::Existing => {
+            let record = store.task(&id)?;
+            let now = writer.clock.now();
+            let lease = match record.state() {
+                TaskState::Settled { settlement, .. } => {
+                    let mut done = report(preview, Some(id), ApplyOutcome::Settled(*settlement));
+                    collect_applied(&record, &steps, &mut done)?;
+                    return Ok(done);
+                }
+                TaskState::Open => store.claim(&id, claimant, options.lease, now),
+                TaskState::Claimed { lease } if lease.is_live(now) => {
+                    return Ok(report(preview, Some(id), ApplyOutcome::HeldElsewhere));
+                }
+                TaskState::Claimed { .. } => store.take_over(&id, claimant, options.lease, now),
             };
-            store.create_task(spec, claimant, writer.clock.now())?;
-            store.task(&id)?
+            match lease {
+                Ok(lease) => lease.fence(),
+                Err(Error::State(
+                    StateError::ClaimHeld { .. }
+                    | StateError::LeaseExpired { .. }
+                    | StateError::LeaseLive { .. },
+                )) => return Ok(report(preview, Some(id), ApplyOutcome::HeldElsewhere)),
+                Err(error) => return Err(error),
+            }
         }
-        Err(error) => return Err(error),
-    };
-    let now = writer.clock.now();
-    let lease = match record.state() {
-        TaskState::Settled { settlement, .. } => {
-            let mut done = report(preview, Some(id), ApplyOutcome::Settled(*settlement));
-            collect_applied(&record, &steps, &mut done)?;
-            return Ok(done);
-        }
-        TaskState::Open => store.claim(&id, claimant, options.lease, now),
-        TaskState::Claimed { lease } if lease.is_live(now) => {
-            return Ok(report(preview, Some(id), ApplyOutcome::HeldElsewhere));
-        }
-        TaskState::Claimed { .. } => store.take_over(&id, claimant, options.lease, now),
-    };
-    let fence = match lease {
-        Ok(lease) => lease.fence(),
-        Err(Error::State(
-            StateError::ClaimHeld { .. }
-            | StateError::LeaseExpired { .. }
-            | StateError::LeaseLive { .. },
-        )) => return Ok(report(preview, Some(id), ApplyOutcome::HeldElsewhere)),
-        Err(error) => return Err(error),
     };
     let reconciled = reconcile(store, writer.executor, &id, fence, writer.clock)?;
     if let Some(stuck) = reconciled
@@ -1344,6 +1345,34 @@ fn collect_applied(record: &TaskRecord, steps: &[Step], report: &mut ApplyReport
         });
     }
     Ok(())
+}
+
+/// The unfinished decomposition of `repository` other than `own`, if any: a
+/// task that has not settled and either holds a live claim or has a write
+/// that may have reached the forge. A task that only ever recorded refused
+/// or unsent writes, and is not being run, wrote nothing and frees the slot.
+fn earlier_unfinished(
+    tasks: &[&TaskRecord],
+    own: &TaskId,
+    repository: &Repository,
+    now: Timestamp,
+) -> Option<TaskId> {
+    tasks
+        .iter()
+        .find(|task| {
+            task.spec().id != *own
+                && task.spec().id.as_str().starts_with(TASK_PREFIX)
+                && task.spec().repository.as_ref() == Some(repository)
+                && match task.state() {
+                    TaskState::Settled { .. } => false,
+                    TaskState::Claimed { lease } if lease.is_live(now) => true,
+                    TaskState::Open | TaskState::Claimed { .. } => task
+                        .effects()
+                        .iter()
+                        .any(|effect| !matches!(effect.state(), EffectState::NotApplied { .. })),
+                }
+        })
+        .map(|task| task.spec().id.clone())
 }
 
 fn create_action(preview: &Preview, position: usize) -> Result<GitHubAction> {

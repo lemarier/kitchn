@@ -883,6 +883,21 @@ pub enum Creation {
     AlreadyExists,
 }
 
+/// Result of [`crate::state::HouseStore::reserve_task`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Reservation<R> {
+    /// The task did not exist. It was created and claimed in one
+    /// transaction, so it already holds its slot.
+    Reserved(Lease),
+    /// An identical task already existed; nothing changed and nothing was
+    /// claimed.
+    Existing,
+    /// The guard objected to the tasks as they were in the same transaction;
+    /// nothing was written.
+    Blocked(R),
+}
+
 /// Result of a cancellation request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelStatus {
@@ -1187,6 +1202,30 @@ impl StoreState {
         };
         self.tasks.insert(spec.id, record);
         Ok(Creation::Created)
+    }
+
+    pub(crate) fn reserve_task<R>(
+        &mut self,
+        spec: TaskSpec,
+        claimant: &Claimant,
+        ttl: LeaseTtl,
+        now: Timestamp,
+        guard: impl FnOnce(&[&TaskRecord]) -> Result<Option<R>>,
+    ) -> Result<Reservation<R>> {
+        let id = spec.id.clone();
+        if self.tasks.contains_key(&id) {
+            // Validates that the existing task is identical; the guard
+            // protects a new slot only.
+            self.create_task(spec, claimant, now)?;
+            return Ok(Reservation::Existing);
+        }
+        let tasks: Vec<&TaskRecord> = self.tasks().collect();
+        if let Some(blocked) = guard(&tasks)? {
+            return Ok(Reservation::Blocked(blocked));
+        }
+        self.create_task(spec, claimant, now)?;
+        self.claim(&id, claimant, ttl, now)
+            .map(Reservation::Reserved)
     }
 
     pub(crate) fn claim(

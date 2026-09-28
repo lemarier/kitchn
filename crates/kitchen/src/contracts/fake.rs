@@ -312,8 +312,9 @@ impl WorkerBackend for FakeBackend {
                     WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply => {
                         Liveness::Live
                     }
-                    WorkerState::Settled(_) | WorkerState::Missing => Liveness::Exited,
-                    WorkerState::Unknown => Liveness::Unverifiable,
+                    WorkerState::Settled(_) => Liveness::Exited,
+                    // A lost record is not evidence that the process ended.
+                    WorkerState::Missing | WorkerState::Unknown => Liveness::Unverifiable,
                 },
             })
             .collect())

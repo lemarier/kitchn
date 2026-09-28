@@ -489,6 +489,19 @@ fn inventory_reports_owner_and_liveness_within_its_bound() -> TestResult {
         Some(Liveness::Exited)
     );
 
+    // A lost record or an unknown state is not evidence of exit.
+    for state in [
+        kitchen::contracts::WorkerState::Missing,
+        kitchen::contracts::WorkerState::Unknown,
+    ] {
+        workers.set_worker_state(&observation.resource, state);
+        assert_eq!(
+            workers.inventory()?.first().map(|found| found.liveness),
+            Some(Liveness::Unverifiable),
+            "{state:?}"
+        );
+    }
+
     // Without the capability, the default reports it unsupported.
     let blind = executor(ExecutorKind::Worker, Capability::WorkerLaunchIsolated)?;
     assert_eq!(
@@ -661,5 +674,149 @@ fn targeted_operations_need_a_resource_the_task_owns() -> TestResult {
         &ManualClock::starting_at(4),
     )?;
     assert!(matches!(stopped.state(), EffectState::Applied { .. }));
+    Ok(())
+}
+
+#[test]
+fn a_same_key_ask_retry_is_checked_against_the_current_revision() -> TestResult {
+    for move_base in [false, true] {
+        let fixture = Fixture::new()?;
+        let (task, fence) = task_for(&fixture, "task-1", None)?;
+        let roger = executor(ExecutorKind::Roger, Capability::AskHuman)?;
+        let grants = grants_everywhere()?;
+        let subject = |head: char, base: char| -> TestResult<kitchen::contracts::Evidence> {
+            Ok(kitchen::contracts::Evidence {
+                kind: kitchen::contracts::EvidenceKind::Check,
+                verdict: kitchen::contracts::EvidenceVerdict::Pass,
+                subject: kitchen::contracts::EvidenceSubject {
+                    head: common::commit(head)?,
+                    base: Some(common::commit(base)?),
+                },
+                source: ExternalRef::new("ci-1")?,
+                observed_at: at(1),
+            })
+        };
+        let asked_at = fixture
+            .store
+            .record_evidence(&task, fence, subject('a', 'b')?, at(1))?;
+        let mut first = plan(&task, fence, "ask", ask(&task, asked_at)?)?;
+        first.decided_at = asked_at;
+        roger.inject(ExecuteFault::TimeoutWithoutApplying);
+        let lost = run_effect(
+            &fixture.store,
+            &roger,
+            &grants,
+            first,
+            &ManualClock::starting_at(2),
+        )?;
+        assert!(matches!(lost.state(), EffectState::Uncertain { .. }));
+
+        let moved = if move_base {
+            fixture
+                .store
+                .record_evidence(&task, fence, subject('a', 'c')?, at(3))?
+        } else {
+            fixture
+                .store
+                .record_evidence(&task, fence, subject('d', 'b')?, at(3))?
+        };
+        roger.fail_lookups(100);
+        let mut retry = plan(&task, fence, "ask", ask(&task, asked_at)?)?;
+        retry.decided_at = moved;
+        let result = run_effect(
+            &fixture.store,
+            &roger,
+            &grants,
+            retry,
+            &ManualClock::starting_at(4),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(Error::Contract(ContractError::DecisionBindingMismatch))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            roger.execute_calls(),
+            1,
+            "the stale question was not sent again"
+        );
+        let record = fixture.store.task(&task)?;
+        assert_eq!(
+            record.effects().first().map(|effect| effect.submissions()),
+            Some(1)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_same_key_ask_retry_does_not_count_against_its_own_budget() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = task_for(&fixture, "task-1", None)?;
+    let roger = executor(ExecutorKind::Roger, Capability::AskHuman)?;
+    let grants = grants_everywhere()?;
+    let clock = ManualClock::starting_at(1);
+    for index in 1..MAX_ASKS_PER_TASK {
+        run_effect(
+            &fixture.store,
+            &roger,
+            &grants,
+            plan(
+                &task,
+                fence,
+                &format!("ask-{index}"),
+                ask(&task, EvidenceRevision::INITIAL)?,
+            )?,
+            &clock,
+        )?;
+    }
+    // The last ask the budget allows is lost; its retry is the same effect.
+    roger.inject(ExecuteFault::TimeoutWithoutApplying);
+    let last = run_effect(
+        &fixture.store,
+        &roger,
+        &grants,
+        plan(
+            &task,
+            fence,
+            "ask-last",
+            ask(&task, EvidenceRevision::INITIAL)?,
+        )?,
+        &clock,
+    )?;
+    assert!(matches!(last.state(), EffectState::Uncertain { .. }));
+    roger.fail_lookups(1);
+    let retried = run_effect(
+        &fixture.store,
+        &roger,
+        &grants,
+        plan(
+            &task,
+            fence,
+            "ask-last",
+            ask(&task, EvidenceRevision::INITIAL)?,
+        )?,
+        &clock,
+    )?;
+    assert_eq!(retried.seq(), last.seq());
+    assert!(matches!(retried.state(), EffectState::Applied { .. }));
+    assert_eq!(retried.submissions(), 2);
+    assert!(matches!(
+        run_effect(
+            &fixture.store,
+            &roger,
+            &grants,
+            plan(
+                &task,
+                fence,
+                "ask-extra",
+                ask(&task, EvidenceRevision::INITIAL)?
+            )?,
+            &clock
+        ),
+        Err(Error::Contract(ContractError::EffectBudgetExhausted { .. }))
+    ));
     Ok(())
 }

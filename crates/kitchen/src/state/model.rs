@@ -675,9 +675,10 @@ impl TaskRecord {
         plan: &EffectPlan,
         backend: &BackendDescriptor,
         credential: &CredentialId,
-        resubmission: Resubmission,
+        current: std::result::Result<(), ContractError>,
         now: Timestamp,
     ) -> Result<EffectStart> {
+        let resubmission = Resubmission::for_backend(backend);
         let Some(existing) = self.effects.get(index) else {
             return fail(StateError::CorruptState(Corruption::EffectSequence));
         };
@@ -713,6 +714,10 @@ impl TaskRecord {
                 Err(ContractError::CredentialChanged.into())
             }
             Resubmission::SameKey => {
+                // The persisted effect must still be valid now, such as a
+                // decision request's binding to the current evidence
+                // revision; the key and payload are kept as persisted.
+                current?;
                 let (name, attempt, seq) = (
                     existing.name.clone(),
                     existing.request.attempt(),
@@ -895,6 +900,19 @@ enum Resubmission {
     Refuse,
     /// The backend deduplicates by key; resubmit with the same key.
     SameKey,
+}
+
+impl Resubmission {
+    fn for_backend(backend: &BackendDescriptor) -> Self {
+        if backend
+            .capabilities
+            .supports(Capability::EffectIdempotentRequests)
+        {
+            Self::SameKey
+        } else {
+            Self::Refuse
+        }
+    }
 }
 
 /// What a caller must do after [`crate::state::HouseStore::begin_effect`].
@@ -1232,6 +1250,14 @@ impl StoreState {
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
+        // Renewing extends authority: a claim made under a workflow consumer
+        // renews only while that consumer lease is current and live.
+        if let Some(TaskState::Claimed { lease }) = self.tasks.get(id).map(|task| &task.state)
+            && lease.fence == fence
+            && let Some(consumer) = &lease.consumer
+        {
+            self.check_consumer(consumer, now)?;
+        }
         let task = self.task_mut(id)?;
         task.owned_lease(fence, now, true)?;
         match &mut task.state {
@@ -1458,14 +1484,6 @@ impl StoreState {
                 .into());
             }
         }
-        let resubmission = if backend
-            .capabilities
-            .supports(Capability::EffectIdempotentRequests)
-        {
-            Resubmission::SameKey
-        } else {
-            Resubmission::Refuse
-        };
         let house = self.house.clone();
         let nonce = self.nonce;
         // Work claimed under a workflow consumer stops when that consumer is
@@ -1558,14 +1576,26 @@ impl StoreState {
                 )
             }
         };
+        let submitted = task.submitted_effects();
+        let context = EffectContext {
+            house: &house,
+            task: &plan.task,
+            task_scope: &task_scope,
+            revision: task.evidence.revision,
+            submitted: &submitted,
+        };
+        // Checks every submission must pass, including a same-key retry of
+        // an existing intent; capacity is reserved only for new intents.
+        let current = plan.effect.check(&context);
         let same_name = task.effects.iter().rposition(|effect| {
             effect.name == plan.name
                 && effect.request.attempt() == attempt
                 && !matches!(effect.state, EffectState::NotApplied { .. })
         });
         if let Some(index) = same_name {
-            return task.repeat_effect(index, &plan, backend, &credential, resubmission, now);
+            return task.repeat_effect(index, &plan, backend, &credential, current, now);
         }
+        current?;
         let unresolved = task.blocking_work();
         if unresolved > 0 && !stopping {
             return fail(StateError::UnresolvedEffects { count: unresolved });
@@ -1577,13 +1607,7 @@ impl StoreState {
         }
         let seq = EffectSeq::new(u32::try_from(task.effects.len()).unwrap_or(u32::MAX));
         task.check_submission_budget(&plan.name, attempt, seq, now)?;
-        plan.effect.admit(&EffectContext {
-            house: &house,
-            task: &plan.task,
-            task_scope: &task_scope,
-            revision: task.evidence.revision,
-            submitted: &task.submitted_effects(),
-        })?;
+        plan.effect.admit(&context)?;
         let key = effect_key(&house, &plan.task, nonce, seq)?;
         let record = EffectRecord {
             seq,

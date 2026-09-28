@@ -46,6 +46,16 @@ impl GitHubEffect {
         }
     }
 
+    /// Per-submission check; see [`crate::contracts::Effect::check`].
+    ///
+    /// # Errors
+    /// None yet.
+    pub const fn check(&self, _context: &EffectContext<'_>) -> Result<(), ContractError> {
+        match self {
+            Self::CreateLabel { .. } => Ok(()),
+        }
+    }
+
     /// Admission hook; see [`crate::contracts::Effect::admit`].
     ///
     /// # Errors

@@ -4,10 +4,11 @@
 //! [`crate::contracts::EffectRequest`] carrying an [`Effect`], then an
 //! [`crate::contracts::EffectExecutor`] performs it. Each payload maps
 //! exhaustively to the [`Permission`] and [`Capability`] it needs and to the
-//! scope its authority is checked against. Before a new effect's intent is
-//! persisted, its admission hook ([`Effect::admit`]) sees an
-//! [`EffectContext`] computed in the same store transaction, so per-task
-//! budgets hold even under concurrent callers.
+//! scope its authority is checked against. Every submission runs the
+//! payload's check ([`Effect::check`]), and a new intent also runs its
+//! admission hook ([`Effect::admit`]); both see an [`EffectContext`] computed
+//! in the same store transaction, so per-task budgets hold even under
+//! concurrent callers.
 //!
 //! The payload modules are owned by the workflows that use them: `github`
 //! and `roger` by #7, `schedule` by #6. They start with the minimal payloads
@@ -119,13 +120,30 @@ impl Effect {
         }
     }
 
-    /// The admission hook, run inside the transaction that persists a new
-    /// effect's intent (not for a repeat of an existing logical effect).
+    /// The per-submission check, run inside the store transaction before
+    /// every submission: a new intent and a same-key retry of an existing
+    /// one. Read-only reconciliation does not run it.
     ///
     /// # Errors
     /// Returns the payload's refusal, such as
-    /// [`ContractError::EffectBudgetExhausted`] or
     /// [`ContractError::DecisionBindingMismatch`].
+    pub fn check(&self, context: &EffectContext<'_>) -> Result<(), ContractError> {
+        match self {
+            Self::Worker(_) => Ok(()),
+            Self::GitHub(effect) => effect.check(context),
+            Self::Roger(effect) => effect.check(context),
+            Self::Schedule(effect) => effect.check(context),
+        }
+    }
+
+    /// The admission hook, run inside the transaction that persists a new
+    /// effect's intent, after [`Self::check`]. It reserves capacity, such as a
+    /// per-task budget; a same-key retry of an existing intent does not run
+    /// it, so the retry does not count against itself.
+    ///
+    /// # Errors
+    /// Returns the payload's refusal, such as
+    /// [`ContractError::EffectBudgetExhausted`].
     pub fn admit(&self, context: &EffectContext<'_>) -> Result<(), ContractError> {
         match self {
             Self::Worker(_) => Ok(()),

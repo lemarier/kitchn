@@ -1783,3 +1783,55 @@ fn a_superseded_consumer_cannot_create_claim_or_act() -> TestResult {
     ));
     Ok(())
 }
+
+#[test]
+fn a_superseded_consumer_cannot_renew_its_task_lease() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let pickup = ConsumerId::new("pickup-origin89")?;
+    let first = store.acquire_consumer(&pickup, &scheduled("tick-1")?, ttl(60)?, at(0))?;
+    let tick1 = scheduled("tick-1")?.under(pickup.clone(), first.fence());
+    store.create_task(spec("task-1")?, &tick1, at(1))?;
+    let task = task_id("task-1")?;
+    let lease = store.claim(&task, &tick1, ttl(600)?, at(1))?;
+    // While the consumer is current, renewal works.
+    assert_eq!(
+        store
+            .renew(&task, lease.fence(), ttl(600)?, at(30))?
+            .expires_at(),
+        at(630)
+    );
+
+    // The consumer lease expired: renewal is refused and changes nothing.
+    assert!(matches!(
+        store.renew(&task, lease.fence(), ttl(600)?, at(91)),
+        Err(Error::State(StateError::LeaseExpired { .. }))
+    ));
+    // Another tick takes over the consumer scope.
+    let second = store.take_over_consumer(&pickup, &scheduled("tick-2")?, ttl(1200)?, at(92))?;
+    assert!(matches!(
+        store.renew(&task, lease.fence(), ttl(600)?, at(93)),
+        Err(Error::State(StateError::StaleFence { presented })) if presented == first.fence()
+    ));
+    let TaskState::Claimed { lease: kept } = store.task(&task)?.state().clone() else {
+        return Err("task claim lost".into());
+    };
+    assert_eq!(kept.expires_at(), at(630), "expiry unchanged");
+
+    // Facts can still be recorded under the task fence.
+    store.record_evidence(&task, lease.fence(), evidence('a', "ci-1")?, at(94))?;
+
+    // After the original task lease expires, the replacement recovers it.
+    let tick2 = scheduled("tick-2")?.under(pickup, second.fence());
+    assert!(matches!(
+        store.take_over(&task, &tick2, ttl(600)?, at(629)),
+        Err(Error::State(StateError::LeaseLive { .. }))
+    ));
+    let recovered = store.take_over(&task, &tick2, ttl(600)?, at(631))?;
+    assert_eq!(
+        recovered.consumer().map(|consumer| consumer.fence),
+        Some(second.fence())
+    );
+    store.renew(&task, recovered.fence(), ttl(600)?, at(640))?;
+    Ok(())
+}

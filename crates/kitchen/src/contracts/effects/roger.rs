@@ -60,13 +60,12 @@ impl RogerEffect {
         }
     }
 
-    /// Admission hook: the binding must name this house, task, and current
-    /// evidence revision, and the task may ask at most [`MAX_ASKS_PER_TASK`].
+    /// Per-submission check: the binding must name this house, task, and
+    /// current evidence revision, for a first submission and every retry.
     ///
     /// # Errors
-    /// Returns [`ContractError::DecisionBindingMismatch`] or
-    /// [`ContractError::EffectBudgetExhausted`].
-    pub fn admit(&self, context: &EffectContext<'_>) -> Result<(), ContractError> {
+    /// Returns [`ContractError::DecisionBindingMismatch`].
+    pub fn check(&self, context: &EffectContext<'_>) -> Result<(), ContractError> {
         match self {
             Self::Ask { binding, .. } => {
                 if &binding.house != context.house
@@ -75,6 +74,19 @@ impl RogerEffect {
                 {
                     return Err(ContractError::DecisionBindingMismatch);
                 }
+                Ok(())
+            }
+        }
+    }
+
+    /// Admission hook for a new ask: the task may ask at most
+    /// [`MAX_ASKS_PER_TASK`].
+    ///
+    /// # Errors
+    /// Returns [`ContractError::EffectBudgetExhausted`].
+    pub fn admit(&self, context: &EffectContext<'_>) -> Result<(), ContractError> {
+        match self {
+            Self::Ask { .. } => {
                 if context.submitted.for_executor(ExecutorKind::Roger) >= MAX_ASKS_PER_TASK {
                     return Err(ContractError::EffectBudgetExhausted {
                         executor: ExecutorKind::Roger,

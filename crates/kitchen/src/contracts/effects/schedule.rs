@@ -47,6 +47,16 @@ impl ScheduleEffect {
         }
     }
 
+    /// Per-submission check; see [`crate::contracts::Effect::check`].
+    ///
+    /// # Errors
+    /// None yet.
+    pub const fn check(&self, _context: &EffectContext<'_>) -> Result<(), ContractError> {
+        match self {
+            Self::InstallDisabled { .. } => Ok(()),
+        }
+    }
+
     /// Admission hook; see [`crate::contracts::Effect::admit`].
     ///
     /// # Errors

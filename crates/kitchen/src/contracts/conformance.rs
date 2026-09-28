@@ -66,6 +66,9 @@ pub enum Check {
     MessageRecovery,
     /// A cancelled worker is reported settled; a missing record is not evidence.
     CancelObserved,
+    /// Releasing the cancelled worker names no branch in its receipt, and a
+    /// branch the inventory listed before is still listed after.
+    ReleaseKeepsBranch,
 }
 
 impl fmt::Display for Check {
@@ -86,6 +89,7 @@ impl fmt::Display for Check {
             Self::InventoryListsLaunch => "inventory lists launch",
             Self::MessageRecovery => "message recovery as declared",
             Self::CancelObserved => "cancel observed",
+            Self::ReleaseKeepsBranch => "release keeps the branch",
         })
     }
 }
@@ -233,6 +237,7 @@ fn worker_checks(
             Check::InventoryListsLaunch,
             Check::MessageRecovery,
             Check::CancelObserved,
+            Check::ReleaseKeepsBranch,
         ] {
             runner.record(
                 check,
@@ -281,6 +286,13 @@ fn worker_checks(
     runner.inventory(backend, &worker)?;
     runner.message_recovery(backend, &worker)?;
     runner.cancel(backend, &worker)?;
+    let branch = ResourceRef {
+        kind: ResourceKind::Branch,
+        backend: own.clone(),
+        handle: ExternalRef::new(requested.as_str())
+            .or_else(|_| fail(Check::Fixture, "branch is not a valid reference"))?,
+    };
+    runner.release_keeps_branch(backend, &worker, &branch)?;
     Ok(runner.report)
 }
 
@@ -866,6 +878,73 @@ impl<'a> Runner<'a> {
             }
             Ok(WorkerState::Unknown) => fail(check, "cancelled worker state is unknown"),
             Err(_) => fail(check, "declared status was unavailable"),
+        }
+    }
+
+    /// Release the cancelled worker. A release removes what it releases and
+    /// never the branch that was checked out: the dishwasher's pushed check
+    /// relies on that branch outliving a released worktree. A release the
+    /// backend retains deletes nothing and passes.
+    fn release_keeps_branch(
+        &mut self,
+        backend: &dyn WorkerBackend,
+        worker: &ResourceRef,
+        branch: &ResourceRef,
+    ) -> Result<(), ConformanceFailure> {
+        let check = Check::ReleaseKeepsBranch;
+        for requires in [Capability::ResourceRelease, Capability::WorkerCancel] {
+            if !self.supports(requires) {
+                self.record(check, CheckResult::NotApplicable { requires });
+                return Ok(());
+            }
+        }
+        let listed_before = self.lists(backend, branch)?;
+        let request = self.own_request(
+            "release",
+            Effect::Worker(Operation::ReleaseResource {
+                resource: worker.clone(),
+            }),
+        )?;
+        match backend.execute(&request) {
+            Ok(receipt) => {
+                if receipt
+                    .created()
+                    .iter()
+                    .chain(receipt.touched())
+                    .any(|resource| resource.kind == ResourceKind::Branch)
+                {
+                    return fail(check, "release receipt names a branch");
+                }
+            }
+            Err(EffectFailure::NotApplied(_)) => {}
+            Err(EffectFailure::Uncertain(_)) => {
+                return fail(check, "release of a cancelled worker has no clear outcome");
+            }
+        }
+        if listed_before && !self.lists(backend, branch)? {
+            return fail(check, "branch left the inventory after the release");
+        }
+        self.record(check, CheckResult::Passed);
+        Ok(())
+    }
+
+    /// Whether a declared inventory lists `resource`; `false` without one.
+    fn lists(
+        &self,
+        backend: &dyn WorkerBackend,
+        resource: &ResourceRef,
+    ) -> Result<bool, ConformanceFailure> {
+        if !self.supports(Capability::ResourceInventory) {
+            return Ok(false);
+        }
+        match backend.inventory() {
+            Ok(observations) => Ok(observations
+                .iter()
+                .any(|observation| &observation.resource == resource)),
+            Err(_) => fail(
+                Check::ReleaseKeepsBranch,
+                "declared inventory was unavailable",
+            ),
         }
     }
 }

@@ -367,6 +367,8 @@ pub struct EffectRecord {
     intended_at: Timestamp,
     request: EffectRequest,
     authorization: Authorization,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    basis: Option<ExternalRef>,
     submissions: u32,
     decisions: Vec<RiskDecision>,
     state: EffectState,
@@ -407,6 +409,12 @@ impl EffectRecord {
     #[must_use]
     pub const fn authorization(&self) -> &Authorization {
         &self.authorization
+    }
+
+    /// The evidence the decision rested on, as its plan named it.
+    #[must_use]
+    pub const fn basis(&self) -> Option<&ExternalRef> {
+        self.basis.as_ref()
     }
 
     /// Every risk decision accepted for this effect, oldest first,
@@ -722,7 +730,7 @@ impl TaskRecord {
         let Some(existing) = self.effects.get(index) else {
             return fail(StateError::CorruptState(Corruption::EffectSequence));
         };
-        if existing.request.effect() != &plan.effect {
+        if existing.request.effect() != &plan.effect || existing.basis != plan.basis {
             return fail(StateError::EffectNameConflict(existing.seq));
         }
         if existing.request.backend() != &backend.backend {
@@ -1003,6 +1011,10 @@ pub struct EffectPlan {
     /// The person's consent for exactly this effect. Required under an
     /// interactive claim and refused under a scheduled one.
     pub consent: Option<Consent>,
+    /// A reference to the evidence the decision rested on, such as the
+    /// digest of a preview a person approved. Recorded with the effect for
+    /// audit only; the store neither interprets nor authorizes by it.
+    pub basis: Option<ExternalRef>,
 }
 
 /// Work needing an explicit recovery decision.
@@ -1760,6 +1772,7 @@ impl StoreState {
                 plan.effect,
             ),
             authorization,
+            basis: plan.basis,
             submissions: 1,
             decisions: Vec::new(),
             state: EffectState::Intended,

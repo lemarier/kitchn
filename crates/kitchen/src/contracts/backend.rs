@@ -80,7 +80,9 @@ pub enum Operation {
         /// Target worker.
         worker: ResourceRef,
     },
-    /// Release a resource the task owns.
+    /// Release a resource the task owns. The executor removes only that
+    /// resource: releasing a worktree removes the checkout and never deletes
+    /// the branch checked out in it, whose commits may exist nowhere else.
     ReleaseResource {
         /// Target resource.
         resource: ResourceRef,

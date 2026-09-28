@@ -574,6 +574,7 @@ impl GateMarkerStore for HouseGateStore<'_> {
             decided_at: owner.evidence().revision(),
             effect,
             consent: None,
+            basis: None,
         };
         Ok(
             match self

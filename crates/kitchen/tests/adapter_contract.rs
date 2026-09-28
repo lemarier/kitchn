@@ -84,13 +84,14 @@ fn fake_backend_passes_the_shared_contract() -> TestResult {
         Check::InventoryListsLaunch,
         Check::MessageRecovery,
         Check::CancelObserved,
+        Check::ReleaseKeepsBranch,
     ] {
         assert_eq!(report.result(check), Some(CheckResult::Passed), "{check}");
     }
     assert_eq!(
         backend.effects_performed(),
-        3,
-        "one launch, one message, and one cancel"
+        4,
+        "one launch, one message, one cancel, and one release"
     );
     Ok(())
 }
@@ -115,7 +116,153 @@ fn minimal_backend_passes_with_checks_marked_not_applicable() -> TestResult {
             requires: Capability::LookupLaunchWorker
         })
     );
+    assert_eq!(
+        report.result(Check::ReleaseKeepsBranch),
+        Some(CheckResult::NotApplicable {
+            requires: Capability::WorkerLaunchIsolated
+        })
+    );
     assert_eq!(backend.effects_performed(), 0);
+    Ok(())
+}
+
+/// How [`BranchListingBackend`] treats a launched branch on release.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnRelease {
+    /// Keeps it, as the contract requires.
+    Keep,
+    /// Deletes it and says so in the release receipt.
+    DeleteInReceipt,
+    /// Deletes it silently: the inventory stops listing it.
+    DeleteQuietly,
+}
+
+/// The fake, with the branches its launches created listed in the inventory.
+struct BranchListingBackend {
+    inner: FakeBackend,
+    on_release: OnRelease,
+    branches: std::sync::Mutex<Vec<ResourceRef>>,
+}
+
+impl BranchListingBackend {
+    fn new(on_release: OnRelease) -> TestResult<Self> {
+        Ok(Self {
+            inner: FakeBackend::fully_capable(backend_id()?, house()?),
+            on_release,
+            branches: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn branches(&self) -> std::sync::MutexGuard<'_, Vec<ResourceRef>> {
+        self.branches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl EffectExecutor for BranchListingBackend {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.inner.descriptor()
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        let receipt = self.inner.execute(request)?;
+        match request.effect() {
+            Effect::Worker(Operation::LaunchWorker { .. }) => {
+                let mut branches = self.branches();
+                for created in receipt.created() {
+                    if created.kind == ResourceKind::Branch && !branches.contains(created) {
+                        branches.push(created.clone());
+                    }
+                }
+                Ok(receipt)
+            }
+            Effect::Worker(Operation::ReleaseResource { .. }) => {
+                let deleted: Vec<ResourceRef> = match self.on_release {
+                    OnRelease::Keep => return Ok(receipt),
+                    OnRelease::DeleteInReceipt | OnRelease::DeleteQuietly => {
+                        self.branches().drain(..).collect()
+                    }
+                };
+                if self.on_release == OnRelease::DeleteQuietly {
+                    return Ok(receipt);
+                }
+                let touched = receipt.touched().iter().cloned().chain(deleted).collect();
+                Receipt::new(
+                    receipt.reference().clone(),
+                    receipt.created().to_vec(),
+                    touched,
+                )
+                .map_err(|_| EffectFailure::NotApplied(NotAppliedReason::Rejected))
+            }
+            _ => Ok(receipt),
+        }
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.inner.lookup(request)
+    }
+}
+
+impl WorkerBackend for BranchListingBackend {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.inner.observe_worker(worker)
+    }
+    fn inventory(
+        &self,
+    ) -> Result<Vec<kitchen::contracts::ResourceObservation>, BackendUnavailable> {
+        let mut all = self.inner.inventory()?;
+        all.extend(
+            self.branches()
+                .iter()
+                .map(|branch| kitchen::contracts::ResourceObservation {
+                    resource: branch.clone(),
+                    owner: None,
+                    liveness: kitchen::contracts::Liveness::Exited,
+                }),
+        );
+        Ok(all)
+    }
+}
+
+#[test]
+fn contract_requires_a_release_to_keep_the_branch() -> TestResult {
+    let fixture = conformance_fixture()?;
+    // A backend that lists the branch and keeps it passes, and the branch is
+    // still listed after the release.
+    let keeping = BranchListingBackend::new(OnRelease::Keep)?;
+    let report = conformance::run_worker(&keeping, &fixture)?;
+    assert_eq!(
+        report.result(Check::ReleaseKeepsBranch),
+        Some(CheckResult::Passed)
+    );
+    assert_eq!(keeping.branches().len(), 1);
+    // Deleting it is a failure whether the receipt admits it or not.
+    for on_release in [OnRelease::DeleteInReceipt, OnRelease::DeleteQuietly] {
+        let deleting = BranchListingBackend::new(on_release)?;
+        let failure = conformance::run_worker(&deleting, &fixture)
+            .err()
+            .ok_or("a backend that deletes the branch passed")?;
+        assert_eq!(failure.check, Check::ReleaseKeepsBranch);
+        assert!(deleting.branches().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn a_backend_without_release_skips_the_branch_check() -> TestResult {
+    let mut capabilities: Vec<Capability> = Capability::ALL.to_vec();
+    capabilities.retain(|capability| *capability != Capability::ResourceRelease);
+    let backend = fake(capabilities)?;
+    let report = conformance::run_worker(&backend, &conformance_fixture()?)?;
+    assert_eq!(
+        report.result(Check::ReleaseKeepsBranch),
+        Some(CheckResult::NotApplicable {
+            requires: Capability::ResourceRelease
+        })
+    );
+    assert_eq!(
+        report.result(Check::CancelObserved),
+        Some(CheckResult::Passed)
+    );
     Ok(())
 }
 

@@ -40,7 +40,10 @@ closed_names! {
         WorkerCancel = "worker.cancel",
         /// Inventory resources with ownership details.
         ResourceInventory = "resource.inventory",
-        /// Idempotent, safety-retaining resource release.
+        /// Idempotent, safety-retaining resource release. A release removes
+        /// only what it releases: releasing a worktree removes the checkout
+        /// and never deletes the branch checked out in it
+        /// ([`crate::contracts::conformance::Check::ReleaseKeepsBranch`]).
         ResourceRelease = "resource.release",
         /// Close a console owned by a settled run.
         ResourceCloseConsole = "resource.close_console",

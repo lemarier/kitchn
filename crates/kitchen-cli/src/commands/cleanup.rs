@@ -27,8 +27,8 @@ use kitchen::{
     state::{HouseStore, StoreOptions},
     workflows::cleanup::{
         ApprovalOutcome, ApprovalResult, Decision, DiskUsage, GitLimits, InspectionTrigger,
-        Inspector, OwnerState, Ownership, Preview, RemoteName, Step, WorktreeEvidence, approve,
-        inspect,
+        Inspector, ObservationDigest, OwnerState, Ownership, Preview, RemoteName, Step,
+        WorktreeEvidence, approve, inspect,
     },
 };
 use serde::Deserialize;
@@ -83,7 +83,7 @@ enum CleanupCommand {
         /// An evidence digest from the preview, such as `sha256:…`. Repeat for
         /// each step.
         #[arg(long = "digest", required = true)]
-        digests: Vec<ExternalRef>,
+        digests: Vec<ObservationDigest>,
     },
 }
 

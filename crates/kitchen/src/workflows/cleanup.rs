@@ -92,10 +92,10 @@
 //! The pushed check examines `HEAD` only, so it is sound only if a backend's
 //! release of a worktree removes the checkout and never deletes the branch
 //! that was checked out in it: an attached `HEAD` is protected because its
-//! branch survives the release. An adapter must not delete that branch, and
-//! must document that it does not. The `ResourceRelease` capability calls a
-//! release only "safety-retaining" and does not name the branch, so this is
-//! not yet part of the contract. The dishwasher itself never removes a branch.
+//! branch survives the release. That is part of the
+//! [`Capability::ResourceRelease`] contract, and the shared conformance suite
+//! checks it ([`crate::contracts::conformance::Check::ReleaseKeepsBranch`]).
+//! The dishwasher itself never removes a branch.
 
 mod build;
 mod git;
@@ -172,6 +172,9 @@ pub enum CleanupError {
     /// plain letters, digits, `-`, `_`, or `.`.
     #[error("a remote name must be 1 to 64 letters, digits, '-', '_' or '.'")]
     InvalidRemote,
+    /// An evidence digest is not `sha256:` followed by 64 lowercase hex digits.
+    #[error("an evidence digest must be 'sha256:' followed by 64 lowercase hex digits")]
+    InvalidDigest,
 }
 
 impl CleanupError {
@@ -179,7 +182,9 @@ impl CleanupError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
-            Self::GrantMismatch | Self::InvalidRemote => ErrorClass::InvalidInput,
+            Self::GrantMismatch | Self::InvalidRemote | Self::InvalidDigest => {
+                ErrorClass::InvalidInput
+            }
             Self::ApprovalNeedsPerson => ErrorClass::Refused,
             Self::Backend(_) | Self::DuplicateResource | Self::Encoding => ErrorClass::Execution,
         }
@@ -197,6 +202,76 @@ pub enum InspectionTrigger {
     DiskPressure,
     /// A person asked for it.
     Manual,
+}
+
+/// The digest of the evidence one previewed step rests on: `sha256:`
+/// followed by 64 lowercase hex digits. A person approves or consents to a
+/// step by naming it, and a release records it, so it is kept apart from
+/// other references.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ObservationDigest(String);
+
+impl ObservationDigest {
+    const PREFIX: &'static str = "sha256:";
+
+    /// Validate a digest as a preview shows it.
+    ///
+    /// # Errors
+    /// [`CleanupError::InvalidDigest`] unless `text` is `sha256:` followed by
+    /// 64 lowercase hex digits.
+    pub fn new(text: &str) -> std::result::Result<Self, CleanupError> {
+        let valid = text.strip_prefix(Self::PREFIX).is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        });
+        if valid {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(CleanupError::InvalidDigest)
+        }
+    }
+
+    /// The digest as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The digest as a reference, where a shared record takes one.
+    fn to_ref(&self) -> Result<ExternalRef> {
+        Ok(ExternalRef::new(&self.0)?)
+    }
+}
+
+impl fmt::Display for ObservationDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for ObservationDigest {
+    type Err = CleanupError;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        Self::new(text)
+    }
+}
+
+impl TryFrom<String> for ObservationDigest {
+    type Error = CleanupError;
+
+    fn try_from(text: String) -> std::result::Result<Self, Self::Error> {
+        Self::new(&text)
+    }
+}
+
+impl From<ObservationDigest> for String {
+    fn from(digest: ObservationDigest) -> Self {
+        digest.0
+    }
 }
 
 /// Maps a worktree resource to its local checkout. Adapters that know where
@@ -429,7 +504,7 @@ pub enum WorktreeEvidence {
 #[serde(rename_all = "camelCase")]
 pub struct BuildOutput {
     /// Digest of the evidence the decision rests on; sizes are excluded.
-    pub observation: ExternalRef,
+    pub observation: ObservationDigest,
     /// The directories, sorted by name.
     pub directories: Vec<BuildDirectory>,
     /// [`Decision::Release`] when they may be removed.
@@ -492,7 +567,7 @@ pub struct PreviewEntry {
     pub resource: ResourceRef,
     /// Digest of the evidence the decision rests on. A different digest
     /// means different evidence.
-    pub observation: ExternalRef,
+    pub observation: ObservationDigest,
     /// The backend's liveness report.
     #[serde(serialize_with = "serialize_liveness")]
     pub liveness: Liveness,
@@ -650,7 +725,7 @@ pub fn inspect(
 }
 
 /// The eligible steps of `entry` and the evidence digest of each.
-fn previewed_steps(entry: &PreviewEntry) -> impl Iterator<Item = (Step, &ExternalRef)> {
+fn previewed_steps(entry: &PreviewEntry) -> impl Iterator<Item = (Step, &ObservationDigest)> {
     let release = entry
         .eligible()
         .then_some((Step::Release, &entry.observation));
@@ -691,7 +766,7 @@ pub struct ApplyOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseConsent {
     consent: Consent,
-    digest: Option<ExternalRef>,
+    digest: Option<ObservationDigest>,
 }
 
 impl ReleaseConsent {
@@ -706,7 +781,7 @@ impl ReleaseConsent {
 
     /// The consent, given for the preview whose evidence digest is `digest`.
     #[must_use]
-    pub fn for_digest(mut self, digest: ExternalRef) -> Self {
+    pub fn for_digest(mut self, digest: ObservationDigest) -> Self {
         self.digest = Some(digest);
         self
     }
@@ -1311,6 +1386,8 @@ impl Run<'_> {
             decided_at: store.task(&id)?.evidence().revision(),
             effect,
             consent,
+            // The preview this release was approved or consented for.
+            basis: Some(entry.observation.to_ref()?),
         };
         let record = run_effect(store, self.executor(), self.grants, plan, self.clock)?;
         match record.state() {
@@ -1385,7 +1462,11 @@ fn is_release_task(task: &TaskRecord) -> bool {
 /// the identity, so a consent minted for one release task names one piece of
 /// evidence. So is the trigger: a scheduled and an interactive run hold
 /// different authority, and neither may inherit a task the other created.
-fn release_task_id(observation: &ExternalRef, at: Timestamp, trigger: &Trigger) -> Result<TaskId> {
+fn release_task_id(
+    observation: &ObservationDigest,
+    at: Timestamp,
+    trigger: &Trigger,
+) -> Result<TaskId> {
     let mut digest = Sha256::new();
     digest.update(b"kitchen-dishwasher-release-v2\0");
     digest.update(observation.as_str().as_bytes());
@@ -1414,7 +1495,7 @@ fn approval(
     store: &HouseStore,
     resource: &ResourceRef,
     step: Step,
-    observation: &ExternalRef,
+    observation: &ObservationDigest,
     max_age: Duration,
     now: Timestamp,
 ) -> Result<Approval> {
@@ -1460,7 +1541,7 @@ pub enum ApprovalOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalResult {
     /// The evidence digest the person named.
-    pub observation: ExternalRef,
+    pub observation: ObservationDigest,
     /// What happened.
     pub outcome: ApprovalOutcome,
 }
@@ -1480,7 +1561,7 @@ pub struct ApprovalResult {
 pub fn approve(
     inspector: &Inspector<'_>,
     approver: &Claimant,
-    digests: &[ExternalRef],
+    digests: &[ObservationDigest],
     clock: &dyn Clock,
 ) -> Result<Vec<ApprovalResult>> {
     if approver.trigger != Trigger::Interactive {
@@ -1520,13 +1601,13 @@ fn schema() -> Result<MarkerSchema> {
     Ok(MarkerSchema::new(APPROVAL_SCHEMA, NonZeroU32::MIN)?)
 }
 
-fn marker_key(resource: &ResourceRef, observation: &ExternalRef) -> Result<MarkerKey> {
+fn marker_key(resource: &ResourceRef, observation: &ObservationDigest) -> Result<MarkerKey> {
     Ok(MarkerKey {
         workflow: WorkflowId::new(WORKFLOW)?,
         item: WorkItem::Resource {
             resource: resource.clone(),
         },
-        subject: MarkerSubject::Observation(observation.clone()),
+        subject: MarkerSubject::Observation(observation.to_ref()?),
     })
 }
 
@@ -1537,7 +1618,7 @@ fn record_approval(
     entry: &PreviewEntry,
     owner: &TaskId,
     step: Step,
-    observation: &ExternalRef,
+    observation: &ObservationDigest,
     approver: &Claimant,
     now: Timestamp,
 ) -> Result<()> {
@@ -2089,13 +2170,14 @@ fn build_output(
     }))
 }
 
-fn digest(input: &impl Serialize) -> Result<ExternalRef> {
+fn digest(input: &impl Serialize) -> Result<ObservationDigest> {
     let bytes = serde_json::to_vec(input).map_err(|_| CleanupError::Encoding)?;
     let mut digest = Sha256::new();
     digest.update(b"kitchen-dishwasher-observation-v1\0");
     digest.update(&bytes);
-    Ok(ExternalRef::new(&format!(
-        "sha256:{}",
+    Ok(ObservationDigest::new(&format!(
+        "{}{}",
+        ObservationDigest::PREFIX,
         hex(digest.finalize().as_slice())
     ))?)
 }
@@ -2170,13 +2252,58 @@ fn serialize_age<S: Serializer>(
 mod tests {
     use super::*;
 
-    fn digest_of(text: &str) -> Result<ExternalRef> {
-        Ok(ExternalRef::new(text)?)
+    fn digest_of(fill: char) -> Result<ObservationDigest> {
+        Ok(ObservationDigest::new(&format!(
+            "sha256:{}",
+            fill.to_string().repeat(64)
+        ))?)
+    }
+
+    #[test]
+    fn a_digest_is_sha256_and_64_lowercase_hex_digits() -> Result<()> {
+        let valid = format!("sha256:{}", "0123456789abcdef".repeat(4));
+        let digest = ObservationDigest::new(&valid)?;
+        assert_eq!(digest.as_str(), valid);
+        assert_eq!(valid.parse::<ObservationDigest>()?, digest);
+        // It serializes as the plain string and reads back only when valid.
+        let json = serde_json::to_string(&digest).map_err(|_| CleanupError::Encoding)?;
+        assert_eq!(json, format!("\"{valid}\""));
+        let read: ObservationDigest =
+            serde_json::from_str(&json).map_err(|_| CleanupError::Encoding)?;
+        assert_eq!(read, digest);
+        Ok(())
+    }
+
+    #[test]
+    fn a_digest_rejects_other_references() {
+        let hex = "a".repeat(64);
+        for invalid in [
+            String::new(),
+            hex.clone(),
+            format!("sha1:{hex}"),
+            format!("SHA256:{hex}"),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "a".repeat(65)),
+            format!("sha256:{}g", "a".repeat(63)),
+            "consent-task-1".to_owned(),
+        ] {
+            assert_eq!(
+                ObservationDigest::new(&invalid),
+                Err(CleanupError::InvalidDigest),
+                "{invalid}"
+            );
+            assert!(serde_json::from_value::<ObservationDigest>(invalid.into()).is_err());
+        }
+        assert_eq!(
+            CleanupError::InvalidDigest.class(),
+            ErrorClass::InvalidInput
+        );
     }
 
     #[test]
     fn a_release_task_names_its_digest_time_and_trigger() -> Result<()> {
-        let first = digest_of("sha256:aaaa")?;
+        let first = digest_of('a')?;
         let at = Timestamp::from_unix_millis(1_000);
         let id = release_task_id(&first, at, &Trigger::Interactive)?;
         assert!(id.as_str().starts_with(TASK_PREFIX));
@@ -2186,7 +2313,7 @@ mod tests {
         // A consent minted for one release task cannot serve another piece of
         // evidence, a later run or approval, or the other kind of run.
         for other in [
-            release_task_id(&digest_of("sha256:bbbb")?, at, &Trigger::Interactive)?,
+            release_task_id(&digest_of('b')?, at, &Trigger::Interactive)?,
             release_task_id(
                 &first,
                 Timestamp::from_unix_millis(1_001),

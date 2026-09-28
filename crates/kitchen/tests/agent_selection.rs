@@ -610,6 +610,7 @@ fn plan(task: &TaskId, fence: Fence, name: &str, effect: Operation) -> TestResul
         decided_at: EvidenceRevision::INITIAL,
         effect: Effect::from(effect),
         consent: None,
+        basis: None,
     })
 }
 

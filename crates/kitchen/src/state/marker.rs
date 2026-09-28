@@ -51,6 +51,12 @@ pub enum WorkItem {
         /// The resource.
         resource: ResourceRef,
     },
+    /// A repository as a whole, for facts that precede any one issue or
+    /// pull request, such as report intake before its draft issue exists.
+    Repository {
+        /// The repository.
+        repository: Repository,
+    },
 }
 
 /// The provider's revision of an issue: when it was last updated and the

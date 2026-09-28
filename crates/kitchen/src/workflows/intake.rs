@@ -14,19 +14,36 @@
 //! reach public issue text only when the source's [`PrivacyClass`] allows it.
 //! Concrete connectors belong to house configuration; this module defines
 //! only the [`ReportConnector`] boundary.
+//!
+//! Which reports are already counted is durable house state. Before a
+//! proposal's mutation is submitted, [`IntakeLedger::reserve`] records a
+//! reservation marker holding the task, the effect name, the problem, and
+//! digests of the reports; it never holds report ids or text. A reservation
+//! counts once its effect is applied, so the effect-outcome transaction is
+//! the confirmation and a crash between the two cannot lose a count. Each
+//! effect name is a digest of the exact mutation and report set, so a
+//! replanned batch never reuses a name for a different mutation.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{self, Write as _},
+    num::NonZeroU32,
 };
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
 use crate::{
-    BackendId, CredentialId, EffectName, HouseId,
+    BackendId, CredentialId, EffectName, HouseId, TaskId, WorkflowId,
     contracts::{
-        ContractError, ExternalRef, GitHubAction, GitHubMutation, GrantScope, HouseGrants,
-        IssueNumber, Permission, Repository, TaskAuthority, Text, Timestamp,
+        Claimant, ContractError, ExternalRef, GitHubAction, GitHubMutation, GrantScope,
+        HouseGrants, IssueNumber, Permission, Repository, TaskAuthority, Text, Timestamp,
     },
     integrations::github::IssueState,
+    state::{
+        EffectState, HouseStore, MarkerAttempt, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject,
+        TaskRecord, TaskState, WorkItem,
+    },
 };
 
 /// Most sources one house may declare.
@@ -41,9 +58,16 @@ pub const MAX_BATCH: usize = 500;
 pub const MAX_LISTED: usize = 50;
 /// Longest public quote of report text, in bytes.
 pub const MAX_QUOTE_BYTES: usize = 500;
-/// Longest source or problem key, in bytes. Short enough that a problem key
-/// fits in an [`EffectName`] with its prefix.
+/// Longest source or problem key, in bytes.
 pub const MAX_KEY_BYTES: usize = 48;
+/// Most new reports one posting proposal carries, so that its reservation
+/// fits in one house-store marker. Further new reports for the problem stay
+/// uncounted and are proposed by a later plan that includes them.
+pub const MAX_PER_PROPOSAL: usize = 100;
+
+const RESERVATION_SCHEMA: &str = "intake.reservation";
+/// Digest bytes kept in report digests and effect names (128 bits).
+const DIGEST_BYTES: usize = 16;
 
 const MARKER_PREFIX: &str = "<!-- kitchen-intake:";
 const MARKER_SUFFIX: &str = " -->";
@@ -83,6 +107,13 @@ pub enum IntakeError {
     /// The source could not be read; this is never an empty batch.
     #[error("intake source unavailable")]
     SourceUnavailable,
+    /// Another task's intake effect for this repository is not yet
+    /// resolved, so its reports may or may not be counted.
+    #[error("another intake effect is unresolved")]
+    Unreconciled,
+    /// Intake state changed since it was read; read it and plan again.
+    #[error("intake state changed since it was read")]
+    StaleCount,
 }
 
 impl IntakeError {
@@ -100,6 +131,7 @@ impl IntakeError {
             | Self::Authority
             | Self::SourceUnauthorized => crate::ErrorClass::Refused,
             Self::SourceUnavailable => crate::ErrorClass::Execution,
+            Self::Unreconciled | Self::StaleCount => crate::ErrorClass::Conflict,
         }
     }
 }
@@ -115,7 +147,8 @@ fn valid_key(value: &str) -> bool {
 macro_rules! intake_key {
     ($name:ident, $error:expr, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
         pub struct $name(String);
 
         impl $name {
@@ -142,6 +175,20 @@ macro_rules! intake_key {
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str(&self.0)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = IntakeError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(&value)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(key: $name) -> Self {
+                key.0
             }
         }
     };
@@ -479,14 +526,75 @@ impl Report {
     }
 }
 
-/// A report's identity: its source and source-native id. It is kept in
-/// house-scoped state and never written to public issue text.
+/// A report's identity: its source and source-native id. It is never
+/// written to public issue text; house state keeps only its
+/// [`ReportDigest`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReportKey {
     /// Declared source.
     pub source: SourceId,
     /// Source-native id.
     pub id: ExternalRef,
+}
+
+impl ReportKey {
+    /// The digest recorded in house state for this report.
+    #[must_use]
+    pub fn digest(&self) -> ReportDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"kitchen-intake-report/1\0");
+        hasher.update(self.source.as_str());
+        hasher.update([0]);
+        hasher.update(self.id.as_str());
+        ReportDigest(hex(&hasher.finalize()))
+    }
+}
+
+/// The first 128 bits of SHA-256 over a report's source and id, as 32
+/// lowercase hex digits. Durable intake state records these instead of
+/// report ids, which may identify a reporter.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ReportDigest(String);
+
+impl ReportDigest {
+    /// The digest in hex.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ReportDigest {
+    type Error = IntakeError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let valid = value.len() == DIGEST_BYTES * 2
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(IntakeError::IncompleteEvidence)
+        }
+    }
+}
+
+impl From<ReportDigest> for String {
+    fn from(digest: ReportDigest) -> Self {
+        digest.0
+    }
+}
+
+/// Lowercase hex of the first [`DIGEST_BYTES`] bytes of `digest`.
+fn hex(digest: &[u8]) -> String {
+    let mut text = String::with_capacity(DIGEST_BYTES * 2);
+    for byte in digest.iter().take(DIGEST_BYTES) {
+        // Writing to a String cannot fail.
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 /// A report and the problem it was classified under. Classification is a
@@ -499,16 +607,60 @@ pub struct Classified {
     pub problem: ProblemKey,
 }
 
-/// An issue already tracking a problem, with the reports it has counted.
-/// `counted` comes from the house's private intake state, not from issue text.
+/// An issue already tracking a problem, found from forge evidence such as
+/// [`problem_marker`]. Which reports it counts comes from [`Counted`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownIssue {
     /// Issue number.
     pub number: IssueNumber,
     /// Its lifecycle; unknown is never treated as open or closed.
     pub state: IssueState,
-    /// Reports already counted on it.
-    pub counted: BTreeSet<ReportKey>,
+}
+
+/// The reports one repository's intake has counted, read from the house
+/// store by [`IntakeLedger::counted`]. It also remembers which reservations
+/// it saw, so [`IntakeLedger::reserve`] can refuse a plan made from state
+/// that has since changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Counted {
+    house: HouseId,
+    repository: Repository,
+    problems: BTreeMap<ProblemKey, BTreeSet<ReportDigest>>,
+    reports: BTreeSet<ReportDigest>,
+    observed: BTreeSet<MarkerKey>,
+}
+
+impl Counted {
+    /// Nothing counted. Use it only to plan without a store; reserving
+    /// against it is refused once the store holds any reservation for
+    /// `repository`.
+    #[must_use]
+    pub const fn none(house: HouseId, repository: Repository) -> Self {
+        Self {
+            house,
+            repository,
+            problems: BTreeMap::new(),
+            reports: BTreeSet::new(),
+            observed: BTreeSet::new(),
+        }
+    }
+
+    /// Whether `report` is counted under any problem.
+    #[must_use]
+    pub fn contains(&self, report: &ReportKey) -> bool {
+        self.reports.contains(&report.digest())
+    }
+
+    /// How many reports are counted for `problem`.
+    #[must_use]
+    pub fn total(&self, problem: &ProblemKey) -> usize {
+        self.problems.get(problem).map_or(0, BTreeSet::len)
+    }
+
+    fn add(&mut self, problem: ProblemKey, reports: Vec<ReportDigest>) {
+        self.reports.extend(reports.iter().cloned());
+        self.problems.entry(problem).or_default().extend(reports);
+    }
 }
 
 /// Which posting permissions the task holds for one repository. Intake
@@ -616,40 +768,77 @@ impl Proposal {
         }
     }
 
-    /// A stable name for submitting [`Self::mutation`] as a task effect, so a
-    /// rerun after an uncertain submission reuses the same effect instead of
-    /// posting twice. A draft is named after its problem; a count comment
-    /// after its issue and the new total, which a rerun computes the same way
-    /// until the new reports are recorded as counted.
+    /// The name for submitting [`Self::mutation`] as a task effect: a digest
+    /// of the exact mutation and report set. A rerun that plans the same
+    /// mutation for the same reports reuses the effect, so an uncertain
+    /// submission is reconciled instead of posted twice; any other batch
+    /// gets another name.
     #[must_use]
     pub fn effect_name(&self) -> Option<EffectName> {
-        let name = match self {
-            Self::DraftIssue { problem, .. } => format!("intake-draft-{problem}"),
-            Self::AddReports { issue, total, .. } => {
-                format!("intake-{}-{total}", issue.get())
-            }
+        let (kind, reports, mutation) = match self {
+            Self::DraftIssue {
+                reports, mutation, ..
+            } => ("draft", reports, mutation),
+            Self::AddReports {
+                reports, mutation, ..
+            } => ("comment", reports, mutation),
             Self::ClosedMatch { .. } | Self::MissingGrant { .. } => return None,
         };
-        EffectName::new(&name).ok()
+        let mut hasher = Sha256::new();
+        hasher.update(b"kitchen-intake-effect/1\0");
+        hasher.update(serde_json::to_vec(mutation).ok()?);
+        let digests: BTreeSet<ReportDigest> = reports.iter().map(ReportKey::digest).collect();
+        for digest in &digests {
+            hasher.update([0]);
+            hasher.update(digest.as_str());
+        }
+        EffectName::new(&format!("intake-{kind}-{}", hex(&hasher.finalize()))).ok()
+    }
+
+    fn reservation(&self, task: &TaskId) -> Option<Reservation> {
+        let (problem, reports) = match self {
+            Self::DraftIssue {
+                problem, reports, ..
+            }
+            | Self::AddReports {
+                problem, reports, ..
+            } => (problem, reports),
+            Self::ClosedMatch { .. } | Self::MissingGrant { .. } => return None,
+        };
+        let digests: BTreeSet<ReportDigest> = reports.iter().map(ReportKey::digest).collect();
+        Some(Reservation {
+            task: task.clone(),
+            effect: self.effect_name()?,
+            problem: problem.clone(),
+            reports: digests.into_iter().collect(),
+        })
     }
 }
 
 /// Group `reports` by problem and propose one result per problem with new
-/// reports. Reports already counted on a known issue, and redelivered copies
-/// of one report, count once. Problems with nothing new produce nothing.
+/// reports. Reports in `counted`, and redelivered copies of one report,
+/// count once. Problems with nothing new produce nothing. A posting proposal
+/// carries at most [`MAX_PER_PROPOSAL`] reports; the rest wait for a later
+/// plan.
 ///
 /// # Errors
-/// Refuses reports from another house, authority for another repository,
-/// more than 500 reports, one report classified under two problems, a known
-/// issue in an unknown state, and output that exceeds forge bounds.
+/// Refuses reports or counted state from another house, authority or
+/// counted state for another repository, more than 500 reports, one report
+/// classified under two problems, a known issue in an unknown state, a
+/// problem with counted reports but no known issue, and output that exceeds
+/// forge bounds.
 pub fn plan(
     house: &HouseId,
     repository: &Repository,
     reports: &[Classified],
     known: &BTreeMap<ProblemKey, KnownIssue>,
+    counted: &Counted,
     authority: &PostingAuthority,
 ) -> Result<Vec<Proposal>, IntakeError> {
-    if &authority.repository != repository {
+    if &counted.house != house {
+        return Err(IntakeError::CrossHouse);
+    }
+    if &authority.repository != repository || &counted.repository != repository {
         return Err(IntakeError::Authority);
     }
     if reports.len() > MAX_BATCH {
@@ -679,12 +868,21 @@ pub fn plan(
 
     let mut proposals = Vec::new();
     for (problem, mut grouped) in problems {
-        let issue = known.get(problem);
-        if let Some(issue) = issue {
-            grouped.retain(|key, _| !issue.counted.contains(key));
-        }
+        grouped.retain(|key, _| !counted.contains(key));
         if grouped.is_empty() {
             continue;
+        }
+        let issue = known.get(problem);
+        let posts = match issue.map(|issue| issue.state) {
+            // Counted reports mean intake already created or commented on an
+            // issue for this problem; the forge evidence is missing it.
+            None if counted.total(problem) > 0 => return Err(IntakeError::IncompleteEvidence),
+            None => authority.create_issue,
+            Some(IssueState::Open) => authority.post_comment,
+            Some(IssueState::Closed | IssueState::Unknown) => false,
+        };
+        if posts && let Some(first_deferred) = grouped.keys().nth(MAX_PER_PROPOSAL).cloned() {
+            grouped.split_off(&first_deferred);
         }
         let keys: Vec<ReportKey> = grouped.keys().cloned().collect();
         let listed: Vec<&Report> = grouped.into_values().collect();
@@ -697,7 +895,7 @@ pub fn plan(
                     reports: keys,
                 },
                 IssueState::Open if authority.post_comment => {
-                    let total = issue.counted.len().saturating_add(keys.len());
+                    let total = counted.total(problem).saturating_add(keys.len());
                     let body = render_comment(problem, total, &listed)?;
                     Proposal::AddReports {
                         problem: problem.clone(),
@@ -749,6 +947,181 @@ fn checked(repository: &Repository, action: GitHubAction) -> Result<GitHubMutati
         .validate()
         .map_err(|_| IntakeError::InvalidReport)?;
     Ok(mutation)
+}
+
+/// What a reservation marker records: digests only, never report ids or
+/// text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Reservation {
+    task: TaskId,
+    effect: EffectName,
+    problem: ProblemKey,
+    reports: Vec<ReportDigest>,
+}
+
+/// Durable, house-scoped intake accounting for one repository, kept as
+/// workflow markers in the [`HouseStore`].
+///
+/// Use it in this order within the task that submits the effect:
+/// [`Self::counted`], [`plan`], [`Self::reserve`] for each posting proposal,
+/// then [`crate::state::run_effect`] under the returned name. Use one
+/// workflow id for a repository's intake: ledgers under different ids do not
+/// see each other's reservations. Marker capacity
+/// ([`crate::state::MAX_MARKERS`], shared by the house) bounds how many
+/// intake effects one store records.
+#[derive(Debug, Clone)]
+pub struct IntakeLedger<'a> {
+    store: &'a HouseStore,
+    workflow: WorkflowId,
+    repository: Repository,
+}
+
+impl<'a> IntakeLedger<'a> {
+    /// Intake accounting for `repository` under `workflow` in `store`.
+    #[must_use]
+    pub const fn new(store: &'a HouseStore, workflow: WorkflowId, repository: Repository) -> Self {
+        Self {
+            store,
+            workflow,
+            repository,
+        }
+    }
+
+    fn item(&self) -> WorkItem {
+        WorkItem::Repository {
+            repository: self.repository.clone(),
+        }
+    }
+
+    /// Read which reports are counted, for planning in `task`. A
+    /// reservation counts when an effect with its name was applied, or
+    /// waived by a risk decision (so an unknown outcome is never posted
+    /// twice). It is ignored when its task settled without applying it, and
+    /// when it belongs to `task` itself, which resolves its own effects by
+    /// planning the same mutation again.
+    ///
+    /// # Errors
+    /// Returns [`IntakeError::Unreconciled`] while another unsettled task
+    /// holds an unapplied reservation, [`IntakeError::IncompleteEvidence`]
+    /// for a malformed reservation or one whose task is missing, and store
+    /// errors.
+    pub fn counted(&self, task: &TaskId) -> Result<Counted, crate::Error> {
+        let schema = reservation_schema()?;
+        let item = self.item();
+        let mut counted = Counted::none(self.store.house().clone(), self.repository.clone());
+        let markers: Vec<_> = self
+            .store
+            .markers(&self.workflow)?
+            .into_iter()
+            .filter(|marker| marker.key().item == item)
+            .collect();
+        if markers.is_empty() {
+            return Ok(counted);
+        }
+        // Read after the markers, so every reserving task is present and its
+        // effects are at least as new as the reservation.
+        let tasks: BTreeMap<TaskId, TaskRecord> = self
+            .store
+            .tasks()?
+            .into_iter()
+            .map(|record| (record.spec().id.clone(), record))
+            .collect();
+        for marker in markers {
+            counted.observed.insert(marker.key().clone());
+            let reservation: Reservation = marker
+                .fact()
+                .decode(&schema)
+                .map_err(|_| IntakeError::IncompleteEvidence)?;
+            let record = tasks
+                .get(&reservation.task)
+                .ok_or(IntakeError::IncompleteEvidence)?;
+            if applied(record, &reservation.effect) {
+                counted.add(reservation.problem, reservation.reports);
+            } else if !matches!(record.state(), TaskState::Settled { .. })
+                && &reservation.task != task
+            {
+                return Err(IntakeError::Unreconciled.into());
+            }
+        }
+        Ok(counted)
+    }
+
+    /// Record the reservation for `proposal` in `task` before its mutation is
+    /// submitted, and return the effect name to submit it under. Reserving
+    /// the same proposal again is a no-op. The write is refused if any
+    /// reservation for this repository was recorded after `counted` was
+    /// read, so two planners cannot both claim the same reports.
+    ///
+    /// # Errors
+    /// Returns [`IntakeError::StaleCount`] when intake state changed since
+    /// `counted`, [`IntakeError::CrossHouse`] or [`IntakeError::Authority`]
+    /// for another house's or repository's state or mutation,
+    /// [`IntakeError::InvalidReport`] for a proposal without a mutation or
+    /// over [`MAX_PER_PROPOSAL`], and store errors such as a full marker
+    /// store.
+    pub fn reserve(
+        &self,
+        counted: &Counted,
+        proposal: &Proposal,
+        task: &TaskId,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<EffectName, crate::Error> {
+        if &counted.house != self.store.house() {
+            return Err(IntakeError::CrossHouse.into());
+        }
+        let mutation = proposal.mutation().ok_or(IntakeError::InvalidReport)?;
+        if counted.repository != self.repository || mutation.repository != self.repository {
+            return Err(IntakeError::Authority.into());
+        }
+        let reservation = proposal
+            .reservation(task)
+            .ok_or(IntakeError::InvalidReport)?;
+        if reservation.reports.len() > MAX_PER_PROPOSAL {
+            return Err(IntakeError::InvalidReport.into());
+        }
+        let name = reservation.effect.clone();
+        let subject = ExternalRef::new(&format!("{task}/{name}"))?;
+        let key = MarkerKey {
+            workflow: self.workflow.clone(),
+            item: self.item(),
+            subject: MarkerSubject::Observation(subject),
+        };
+        let fact = MarkerFact::workflow(reservation_schema()?, &reservation)?;
+        let item = self.item();
+        let attempt = self
+            .store
+            .record_marker_unless(key, fact, recorded_by, now, |markers| {
+                let changed = markers.iter().any(|marker| {
+                    marker.key().item == item && !counted.observed.contains(marker.key())
+                });
+                Ok(changed.then_some(()))
+            })?;
+        match attempt {
+            MarkerAttempt::Recorded(_) | MarkerAttempt::AlreadyRecorded(_) => Ok(name),
+            MarkerAttempt::Blocked(()) => Err(IntakeError::StaleCount.into()),
+        }
+    }
+}
+
+fn reservation_schema() -> Result<MarkerSchema, crate::Error> {
+    Ok(MarkerSchema::new(RESERVATION_SCHEMA, NonZeroU32::MIN)?)
+}
+
+/// Whether `task` applied an effect named `name`. A waived effect has an
+/// unknown outcome and counts, so its reports are never posted again.
+fn applied(task: &TaskRecord, name: &EffectName) -> bool {
+    task.effects()
+        .iter()
+        .filter(|effect| effect.name() == name)
+        .any(|effect| match effect.state() {
+            EffectState::Applied { .. } | EffectState::Waived { .. } => true,
+            EffectState::Intended
+            | EffectState::Uncertain { .. }
+            | EffectState::NotApplied { .. }
+            | EffectState::Unresolvable { .. } => false,
+        })
 }
 
 /// The hidden marker intake writes into the issues and comments it creates.

@@ -1,22 +1,34 @@
 //! Report intake policy with a fake connector. All tests are simulated: no
 //! external service, credential, or forge is contacted.
 
+mod common;
+
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
 };
 
+use common::Fixture;
+
 use kitchen::{
-    BackendId, CredentialId, ErrorClass, HouseId,
+    BackendId, CredentialId, ErrorClass, HouseId, TaskId, WorkflowId,
     contracts::{
-        ExternalRef, GitHubAction, Grant, HouseGrants, IssueNumber, Permission, Repository,
-        TaskAuthority, Text, Timestamp,
+        BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, Effect, EffectExecutor,
+        EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, Fence, GitHubAction,
+        GitHubEffect, GitHubMutation, Grant, HouseGrants, IssueNumber, Lookup, NotAppliedReason,
+        Permission, PostingBudget, Receipt, Repository, TaskAuthority, Text, Timestamp,
+        UncertainReason,
     },
     integrations::github::IssueState,
+    state::{
+        EffectPlan, EffectRecord, EffectState, HouseStore, StateError, StoreOptions, reconcile,
+        run_effect,
+    },
     workflows::intake::{
-        Classified, ConnectorFailure, FetchRequest, IntakeError, IntakeSource, IntakeSources,
-        KnownIssue, MAX_LISTED, PostingAuthority, PrivacyClass, ProblemKey, Proposal, RawReport,
-        ReadScope, Report, ReportConnector, ReportLink, SourceId, marker, plan, problem_marker,
+        Classified, ConnectorFailure, Counted, FetchRequest, IntakeError, IntakeLedger,
+        IntakeSource, IntakeSources, KnownIssue, MAX_LISTED, MAX_PER_PROPOSAL, PostingAuthority,
+        PrivacyClass, ProblemKey, Proposal, RawReport, ReadScope, Report, ReportConnector,
+        ReportLink, SourceId, marker, plan, problem_marker,
     },
 };
 
@@ -127,6 +139,10 @@ fn classified(report: Report, problem: &str) -> Result<Classified, Box<dyn std::
 
 fn issue(number: u64) -> Result<IssueNumber, Box<dyn std::error::Error>> {
     Ok(IssueNumber::new(number)?)
+}
+
+fn uncounted() -> Result<Counted, Box<dyn std::error::Error>> {
+    Ok(Counted::none(house()?, repo()?))
 }
 
 fn full_authority() -> Result<PostingAuthority, Box<dyn std::error::Error>> {
@@ -333,6 +349,7 @@ fn duplicate_reports_become_one_draft_proposal() -> TestResult {
         &repo()?,
         &reports,
         &BTreeMap::new(),
+        &uncounted()?,
         &full_authority()?,
     )?;
     assert_eq!(proposals.len(), 2);
@@ -363,10 +380,9 @@ fn duplicate_reports_become_one_draft_proposal() -> TestResult {
         problem_marker(body.as_str()),
         Some(ProblemKey::new("login-timeout")?)
     );
-    assert_eq!(
-        login.effect_name().map(|n| n.as_str().to_owned()),
-        Some("intake-draft-login-timeout".to_owned())
-    );
+    let name = login.effect_name().ok_or("no effect name")?;
+    assert!(name.as_str().starts_with("intake-draft-"));
+    assert_eq!(name.as_str().len(), "intake-draft-".len() + 32);
 
     // The longest problem key still yields a valid effect name.
     let longest = "a".repeat(48);
@@ -376,6 +392,7 @@ fn duplicate_reports_become_one_draft_proposal() -> TestResult {
         &repo()?,
         &[classified(report, &longest)?],
         &BTreeMap::new(),
+        &uncounted()?,
         &full_authority()?,
     )?;
     assert!(proposals.first().and_then(Proposal::effect_name).is_some());
@@ -386,21 +403,28 @@ fn duplicate_reports_become_one_draft_proposal() -> TestResult {
 fn reports_matching_an_open_issue_add_a_count_instead_of_a_duplicate() -> TestResult {
     let sources = sources()?;
     let forum = SourceId::new("forum")?;
-    let counted = sources.accept(&forum, raw("m1", "bugs", "ann", "login times out")?)?;
+    let first = sources.accept(&forum, raw("m1", "bugs", "ann", "login times out")?)?;
     let new = sources.accept(&forum, raw("m2", "bugs", "bob", "login hangs")?)?;
     let known = BTreeMap::from([(
         ProblemKey::new("login-timeout")?,
         KnownIssue {
             number: issue(12)?,
             state: IssueState::Open,
-            counted: BTreeSet::from([counted.key()]),
         },
     )]);
     let reports = [
-        classified(counted.clone(), "login-timeout")?,
+        classified(first.clone(), "login-timeout")?,
+        classified(new.clone(), "login-timeout")?,
         classified(new.clone(), "login-timeout")?,
     ];
-    let proposals = plan(&house()?, &repo()?, &reports, &known, &full_authority()?)?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &reports,
+        &known,
+        &uncounted()?,
+        &full_authority()?,
+    )?;
     let [
         Proposal::AddReports {
             issue: target,
@@ -413,31 +437,55 @@ fn reports_matching_an_open_issue_add_a_count_instead_of_a_duplicate() -> TestRe
         return Err(format!("unexpected proposals: {proposals:?}").into());
     };
     assert_eq!(*target, issue(12)?);
-    assert_eq!(added, &vec![new.key()]);
+    assert_eq!(added, &vec![first.key(), new.key()]);
     let GitHubAction::PostComment { issue: on, body } = &mutation.action else {
         return Err("not a comment".into());
     };
     assert_eq!(*on, issue(12)?);
     assert!(
         body.as_str()
-            .contains("1 new external report for this problem; 2 counted in total.")
+            .contains("2 new external reports for this problem; 2 counted in total.")
     );
+    assert!(body.as_str().contains("<https://example.test/m1>"));
     assert!(body.as_str().contains("<https://example.test/m2>"));
-    assert!(!body.as_str().contains("<https://example.test/m1>"));
     let name = proposals.first().and_then(Proposal::effect_name);
-    assert_eq!(name.as_ref().map(|n| n.as_str()), Some("intake-12-2"));
+    assert!(
+        name.as_ref()
+            .is_some_and(|n| n.as_str().starts_with("intake-comment-"))
+    );
 
-    // A rerun before the comment is recorded names the same effect, so an
-    // uncertain submission is reconciled instead of posted twice.
-    let retry = plan(&house()?, &repo()?, &reports, &known, &full_authority()?)?;
+    // A rerun with the same reports names the same effect, so an uncertain
+    // submission is reconciled instead of posted twice.
+    let retry = plan(
+        &house()?,
+        &repo()?,
+        &reports,
+        &known,
+        &uncounted()?,
+        &full_authority()?,
+    )?;
     assert_eq!(retry.first().and_then(Proposal::effect_name), name);
 
-    // A rerun after the comment is recorded proposes nothing.
-    let mut recorded = known;
-    if let Some(entry) = recorded.get_mut(&ProblemKey::new("login-timeout")?) {
-        entry.counted.insert(new.key());
-    }
-    assert!(plan(&house()?, &repo()?, &reports, &recorded, &full_authority()?)?.is_empty());
+    // Another batch with the same count is another mutation and another
+    // name; before the fix both were `intake-12-2`.
+    let other = sources.accept(&forum, raw("m3", "bugs", "cy", "login stalls")?)?;
+    let changed = [
+        classified(first, "login-timeout")?,
+        classified(other, "login-timeout")?,
+    ];
+    let changed = plan(
+        &house()?,
+        &repo()?,
+        &changed,
+        &known,
+        &uncounted()?,
+        &full_authority()?,
+    )?;
+    assert_ne!(
+        changed.first().and_then(Proposal::mutation),
+        proposals.first().and_then(Proposal::mutation)
+    );
+    assert_ne!(changed.first().and_then(Proposal::effect_name), name);
     Ok(())
 }
 
@@ -451,7 +499,6 @@ fn a_report_matching_a_closed_issue_is_held_for_review() -> TestResult {
         KnownIssue {
             number: issue(7)?,
             state: IssueState::Closed,
-            counted: BTreeSet::new(),
         },
     )]);
     let proposals = plan(
@@ -459,6 +506,7 @@ fn a_report_matching_a_closed_issue_is_held_for_review() -> TestResult {
         &repo()?,
         &[classified(report, "login-timeout")?],
         &known,
+        &uncounted()?,
         &full_authority()?,
     )?;
     assert_eq!(
@@ -483,7 +531,6 @@ fn unknown_issue_state_is_incomplete_evidence() -> TestResult {
         KnownIssue {
             number: issue(7)?,
             state: IssueState::Unknown,
-            counted: BTreeSet::new(),
         },
     )]);
     let error = plan(
@@ -491,6 +538,7 @@ fn unknown_issue_state_is_incomplete_evidence() -> TestResult {
         &repo()?,
         &[classified(report, "login-timeout")?],
         &known,
+        &uncounted()?,
         &full_authority()?,
     )
     .err();
@@ -528,6 +576,7 @@ fn private_content_is_redacted_by_privacy_class() -> TestResult {
         &repo()?,
         &reports,
         &BTreeMap::new(),
+        &uncounted()?,
         &full_authority()?,
     )?;
     let text = proposals.first().and_then(body).ok_or("no body")?;
@@ -572,6 +621,7 @@ fn listing_is_bounded_and_the_rest_counted() -> TestResult {
         &repo()?,
         &reports,
         &BTreeMap::new(),
+        &uncounted()?,
         &full_authority()?,
     )?;
     let text = proposals.first().and_then(body).ok_or("no body")?;
@@ -590,6 +640,7 @@ fn listing_is_bounded_and_the_rest_counted() -> TestResult {
             &repo()?,
             &over,
             &BTreeMap::new(),
+            &uncounted()?,
             &full_authority()?
         )
         .err(),
@@ -609,7 +660,6 @@ fn missing_posting_grant_posts_nothing() -> TestResult {
         KnownIssue {
             number: issue(12)?,
             state: IssueState::Open,
-            counted: BTreeSet::new(),
         },
     )]);
     let reports = [
@@ -618,7 +668,14 @@ fn missing_posting_grant_posts_nothing() -> TestResult {
     ];
 
     let unrelated = authority_with(&[Permission::EditLabels])?;
-    let proposals = plan(&house()?, &repo()?, &reports, &known, &unrelated)?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &reports,
+        &known,
+        &uncounted()?,
+        &unrelated,
+    )?;
     assert_eq!(proposals.len(), 2);
     assert!(proposals.iter().all(|p| p.mutation().is_none()));
     let missing: BTreeSet<Permission> = proposals
@@ -636,14 +693,21 @@ fn missing_posting_grant_posts_nothing() -> TestResult {
     // Report-only intake behaves the same.
     let none = PostingAuthority::none(repo()?);
     assert!(
-        plan(&house()?, &repo()?, &reports, &known, &none)?
+        plan(&house()?, &repo()?, &reports, &known, &uncounted()?, &none)?
             .iter()
             .all(|p| matches!(p, Proposal::MissingGrant { .. }))
     );
 
     // Comment-only authority comments but still cannot create issues.
     let comment_only = authority_with(&[Permission::PostComment])?;
-    let proposals = plan(&house()?, &repo()?, &reports, &known, &comment_only)?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &reports,
+        &known,
+        &uncounted()?,
+        &comment_only,
+    )?;
     assert!(
         proposals
             .iter()
@@ -683,7 +747,15 @@ fn revoked_or_foreign_authority_is_refused() -> TestResult {
 
     let other_repo = PostingAuthority::none(Repository::new("lemarier/other")?);
     assert_eq!(
-        plan(&house()?, &repo()?, &[], &BTreeMap::new(), &other_repo).err(),
+        plan(
+            &house()?,
+            &repo()?,
+            &[],
+            &BTreeMap::new(),
+            &uncounted()?,
+            &other_repo
+        )
+        .err(),
         Some(IntakeError::Authority)
     );
     Ok(())
@@ -704,6 +776,7 @@ fn cross_house_and_conflicting_reports_are_refused() -> TestResult {
             &repo()?,
             &[classified(foreign, "login-timeout")?],
             &BTreeMap::new(),
+            &uncounted()?,
             &full_authority()?,
         )
         .err(),
@@ -721,6 +794,7 @@ fn cross_house_and_conflicting_reports_are_refused() -> TestResult {
             &repo()?,
             &conflicting,
             &BTreeMap::new(),
+            &uncounted()?,
             &full_authority()?
         )
         .err(),
@@ -739,5 +813,609 @@ fn problem_markers_round_trip_and_ignore_malformed_input() -> TestResult {
     assert_eq!(problem_marker("no marker here"), None);
     assert_eq!(problem_marker("<!-- kitchen-intake:Bad Key -->"), None);
     assert_eq!(problem_marker("<!-- kitchen-intake:unterminated"), None);
+    Ok(())
+}
+
+// Durable counting through the house store and effect lifecycle. The forge
+// is an in-memory fake; nothing is posted anywhere.
+
+/// A fake forge that records applied mutations and can lose one response.
+struct Forge {
+    descriptor: BackendDescriptor,
+    posted: RefCell<Vec<GitHubMutation>>,
+    lose_next_response: Cell<bool>,
+}
+
+impl Forge {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            descriptor: BackendDescriptor {
+                backend: backend()?,
+                house: house()?,
+                worker_selection: None,
+                capabilities: CapabilitySet::supporting(Capability::ALL),
+            },
+            posted: RefCell::new(Vec::new()),
+            lose_next_response: Cell::new(false),
+        })
+    }
+
+    fn posts(&self) -> usize {
+        self.posted.borrow().len()
+    }
+}
+
+fn mutation_of(request: &EffectRequest) -> Option<&GitHubMutation> {
+    match request.effect() {
+        Effect::GitHub(effect) => Some(&effect.mutation),
+        _ => None,
+    }
+}
+
+fn receipt() -> Option<Receipt> {
+    let reference = ExternalRef::new("forge-receipt").ok()?;
+    Receipt::new(reference, Vec::new(), Vec::new()).ok()
+}
+
+impl EffectExecutor for Forge {
+    fn descriptor(&self) -> &BackendDescriptor {
+        &self.descriptor
+    }
+
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        let mutation =
+            mutation_of(request).ok_or(EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
+        self.posted.borrow_mut().push(mutation.clone());
+        if self.lose_next_response.replace(false) {
+            return Err(EffectFailure::Uncertain(UncertainReason::ResponseLost));
+        }
+        receipt().ok_or(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    }
+
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        let posted =
+            mutation_of(request).is_some_and(|mutation| self.posted.borrow().contains(mutation));
+        Ok(match (posted, receipt()) {
+            (true, Some(receipt)) => Lookup::Applied(receipt),
+            (true, None) => Lookup::Unknown,
+            (false, _) => Lookup::Absent,
+        })
+    }
+}
+
+/// A house store with one claimed intake task holding forge grants.
+struct Kitchen {
+    fixture: Fixture,
+    grants: HouseGrants,
+}
+
+impl Kitchen {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store =
+            HouseStore::initialize(dir.path().join("house"), house()?, StoreOptions::default())?;
+        let grants = HouseGrants::new(house()?, forge_grants()?);
+        Ok(Self {
+            fixture: Fixture { dir, store },
+            grants,
+        })
+    }
+
+    fn store(&self) -> &HouseStore {
+        &self.fixture.store
+    }
+
+    /// Another handle on the same directory, as after a process restart.
+    fn reopen(&self) -> Result<HouseStore, Box<dyn std::error::Error>> {
+        Ok(HouseStore::open(
+            self.fixture.dir.path().join("house"),
+            house()?,
+            StoreOptions::default(),
+        )?)
+    }
+
+    fn start(&self, id: &str) -> Result<(TaskId, Fence), Box<dyn std::error::Error>> {
+        let mut spec = common::spec(id)?;
+        spec.repository = Some(repo()?);
+        spec.authority = TaskAuthority::delegate(&self.grants, forge_grants()?)?;
+        self.store()
+            .create_task(spec, &common::creator()?, common::at(0))?;
+        let task = TaskId::new(id)?;
+        let fence = self
+            .store()
+            .claim(
+                &task,
+                &common::scheduled(id)?,
+                common::ttl(600)?,
+                common::at(0),
+            )?
+            .fence();
+        self.store().start_attempt(&task, fence, common::at(0))?;
+        Ok((task, fence))
+    }
+
+    fn ledger<'a>(
+        &self,
+        store: &'a HouseStore,
+    ) -> Result<IntakeLedger<'a>, Box<dyn std::error::Error>> {
+        Ok(IntakeLedger::new(
+            store,
+            WorkflowId::new("intake")?,
+            repo()?,
+        ))
+    }
+
+    /// Reserve `proposal` and submit it through the effect store.
+    fn submit(
+        &self,
+        forge: &Forge,
+        counted: &Counted,
+        proposal: &Proposal,
+        task: &TaskId,
+        fence: Fence,
+    ) -> Result<EffectRecord, Box<dyn std::error::Error>> {
+        let name = self.ledger(self.store())?.reserve(
+            counted,
+            proposal,
+            task,
+            &common::scheduled("intake")?,
+            common::at(1),
+        )?;
+        let mutation = proposal.mutation().ok_or("no mutation")?.clone();
+        let effect = GitHubEffect {
+            requester: ExternalRef::new("kitchen-bot")?,
+            mutation,
+            posting_budget: PostingBudget::new(10)?,
+        };
+        Ok(run_effect(
+            self.store(),
+            forge,
+            &self.grants,
+            EffectPlan {
+                task: task.clone(),
+                fence,
+                name,
+                decided_at: EvidenceRevision::INITIAL,
+                effect: Effect::GitHub(effect),
+                consent: None,
+            },
+            &common::ManualClock::starting_at(1),
+        )?)
+    }
+}
+
+fn forge_grants() -> Result<Vec<Grant>, Box<dyn std::error::Error>> {
+    [Permission::CreateIssue, Permission::PostComment]
+        .into_iter()
+        .map(|permission| -> Result<Grant, Box<dyn std::error::Error>> {
+            Ok(Grant::repository(
+                permission,
+                repo()?,
+                backend()?,
+                CredentialId::new("forge")?,
+            ))
+        })
+        .collect()
+}
+
+fn open_issue(number: u64) -> Result<BTreeMap<ProblemKey, KnownIssue>, Box<dyn std::error::Error>> {
+    Ok(BTreeMap::from([(
+        ProblemKey::new("login-timeout")?,
+        KnownIssue {
+            number: issue(number)?,
+            state: IssueState::Open,
+        },
+    )]))
+}
+
+fn login(
+    sources: &IntakeSources,
+    ids: &[&str],
+) -> Result<Vec<Classified>, Box<dyn std::error::Error>> {
+    ids.iter()
+        .map(|id| -> Result<Classified, Box<dyn std::error::Error>> {
+            let report = sources.accept(
+                &SourceId::new("support")?,
+                raw(id, "inbox", PRIVATE_REPORTER, PRIVATE_TEXT)?,
+            )?;
+            classified(report, "login-timeout")
+        })
+        .collect()
+}
+
+fn applied(record: &EffectRecord) -> bool {
+    matches!(record.state(), EffectState::Applied { .. })
+}
+
+#[test]
+fn counted_reports_survive_a_restart_and_are_not_counted_twice() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let forge = Forge::new()?;
+    let sources = sources()?;
+    let (task, fence) = kitchen.start("intake-1")?;
+    let ledger = kitchen.ledger(kitchen.store())?;
+
+    // A new problem becomes a draft, counted once its effect is applied.
+    let batch = login(&sources, &["msg-4471-a", "msg-4471-b"])?;
+    let counted = ledger.counted(&task)?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &batch,
+        &BTreeMap::new(),
+        &counted,
+        &full_authority()?,
+    )?;
+    let [draft @ Proposal::DraftIssue { .. }] = proposals.as_slice() else {
+        return Err(format!("unexpected proposals: {proposals:?}").into());
+    };
+    assert!(applied(
+        &kitchen.submit(&forge, &counted, draft, &task, fence)?
+    ));
+
+    // The draft exists but the forge index has not seen it yet: planning
+    // refuses rather than drafting the problem twice.
+    let counted = ledger.counted(&task)?;
+    let more = login(&sources, &["msg-4471-a", "msg-4471-b", "msg-4471-c"])?;
+    assert_eq!(
+        plan(
+            &house()?,
+            &repo()?,
+            &more,
+            &BTreeMap::new(),
+            &counted,
+            &full_authority()?
+        )
+        .err(),
+        Some(IntakeError::IncompleteEvidence)
+    );
+
+    // Once the issue is known, a changed batch after the applied draft adds
+    // only the new report, under a new effect name in the same attempt.
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &more,
+        &open_issue(3)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let [comment @ Proposal::AddReports { reports, total, .. }] = proposals.as_slice() else {
+        return Err(format!("unexpected proposals: {proposals:?}").into());
+    };
+    assert_eq!(reports.len(), 1);
+    assert_eq!(*total, 3);
+    assert_ne!(comment.effect_name(), draft.effect_name());
+    assert!(applied(
+        &kitchen.submit(&forge, &counted, comment, &task, fence)?
+    ));
+    assert_eq!(forge.posts(), 2);
+
+    // After a restart, another task replaying the same reports proposes
+    // nothing, and the next report is counted on top of three.
+    let restarted = kitchen.reopen()?;
+    kitchen.store().finish_attempt(
+        &task,
+        fence,
+        kitchen::contracts::AttemptNumber::FIRST,
+        kitchen::contracts::AttemptOutcome::Succeeded,
+        common::at(2),
+    )?;
+    let (next, _) = kitchen.start("intake-2")?;
+    let counted = kitchen.ledger(&restarted)?.counted(&next)?;
+    assert!(
+        plan(
+            &house()?,
+            &repo()?,
+            &more,
+            &open_issue(3)?,
+            &counted,
+            &full_authority()?
+        )?
+        .is_empty()
+    );
+    let latest = login(&sources, &["msg-4471-a", "msg-4471-d"])?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &latest,
+        &open_issue(3)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let [Proposal::AddReports { reports, total, .. }] = proposals.as_slice() else {
+        return Err(format!("unexpected proposals: {proposals:?}").into());
+    };
+    assert_eq!((reports.len(), *total), (1, 4));
+
+    // House state holds digests, never report ids, reporters, or text.
+    let state = std::fs::read_to_string(kitchen.fixture.state_path())?;
+    for private in ["msg-4471", PRIVATE_REPORTER, PRIVATE_TEXT] {
+        assert!(!state.contains(private), "state leaks {private}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_changed_batch_before_submission_reserves_its_own_effect() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let forge = Forge::new()?;
+    let sources = sources()?;
+    let (task, fence) = kitchen.start("intake-1")?;
+    let ledger = kitchen.ledger(kitchen.store())?;
+    let counted = ledger.counted(&task)?;
+    let first = plan(
+        &house()?,
+        &repo()?,
+        &login(&sources, &["m1"])?,
+        &open_issue(12)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let first = first.first().ok_or("no proposal")?;
+    let reserved = ledger.reserve(
+        &counted,
+        first,
+        &task,
+        &common::scheduled("intake")?,
+        common::at(1),
+    )?;
+    // Reserving the same proposal again is a no-op.
+    assert_eq!(
+        ledger.reserve(
+            &counted,
+            first,
+            &task,
+            &common::scheduled("intake")?,
+            common::at(1)
+        )?,
+        reserved
+    );
+
+    // Another task cannot plan while the reservation is unapplied.
+    assert!(matches!(
+        ledger.counted(&TaskId::new("intake-2")?),
+        Err(kitchen::Error::Intake(IntakeError::Unreconciled))
+    ));
+
+    // The same task replans with a new report before submitting: the batch
+    // is a different mutation with a different name, and it applies.
+    let counted = ledger.counted(&task)?;
+    let changed = plan(
+        &house()?,
+        &repo()?,
+        &login(&sources, &["m1", "m2"])?,
+        &open_issue(12)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let changed = changed.first().ok_or("no proposal")?;
+    assert_ne!(changed.effect_name().as_ref(), Some(&reserved));
+    assert!(applied(
+        &kitchen.submit(&forge, &counted, changed, &task, fence)?
+    ));
+    assert_eq!(forge.posts(), 1);
+    let counted = ledger.counted(&task)?;
+    assert_eq!(counted.total(&ProblemKey::new("login-timeout")?), 2);
+    Ok(())
+}
+
+#[test]
+fn a_changed_batch_after_an_uncertain_submission_waits_for_reconciliation() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let forge = Forge::new()?;
+    let sources = sources()?;
+    let (task, fence) = kitchen.start("intake-1")?;
+    let ledger = kitchen.ledger(kitchen.store())?;
+    let counted = ledger.counted(&task)?;
+    let first = plan(
+        &house()?,
+        &repo()?,
+        &login(&sources, &["m1"])?,
+        &open_issue(12)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let first = first.first().ok_or("no proposal")?;
+    forge.lose_next_response.set(true);
+    let uncertain = kitchen.submit(&forge, &counted, first, &task, fence)?;
+    assert!(matches!(uncertain.state(), EffectState::Uncertain { .. }));
+
+    // The uncertain report is not counted yet, so the replanned batch holds
+    // both reports. It is another effect, and the store refuses to start it
+    // while the first is unresolved: no name conflict and no second post.
+    let counted = ledger.counted(&task)?;
+    let changed = plan(
+        &house()?,
+        &repo()?,
+        &login(&sources, &["m1", "m2"])?,
+        &open_issue(12)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let changed = changed.first().ok_or("no proposal")?;
+    let refused = kitchen
+        .submit(&forge, &counted, changed, &task, fence)
+        .err();
+    assert!(
+        refused.as_ref().is_some_and(|error| matches!(
+            error.downcast_ref::<kitchen::Error>(),
+            Some(kitchen::Error::State(StateError::UnresolvedEffects { .. }))
+        )),
+        "unexpected: {refused:?}"
+    );
+    assert_eq!(forge.posts(), 1);
+    assert!(matches!(
+        ledger.counted(&TaskId::new("intake-2")?),
+        Err(kitchen::Error::Intake(IntakeError::Unreconciled))
+    ));
+
+    // Reconciling finds the first comment applied; the next plan counts it
+    // and proposes only the new report.
+    let report = reconcile(
+        kitchen.store(),
+        &forge,
+        &task,
+        fence,
+        &common::ManualClock::starting_at(2),
+    )?;
+    assert_eq!(report.resolved.len(), 1);
+    let counted = ledger.counted(&task)?;
+    let rest = plan(
+        &house()?,
+        &repo()?,
+        &login(&sources, &["m1", "m2"])?,
+        &open_issue(12)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let [rest @ Proposal::AddReports { reports, total, .. }] = rest.as_slice() else {
+        return Err(format!("unexpected proposals: {rest:?}").into());
+    };
+    assert_eq!((reports.len(), *total), (1, 2));
+    assert!(applied(
+        &kitchen.submit(&forge, &counted, rest, &task, fence)?
+    ));
+    assert_eq!(forge.posts(), 2);
+    Ok(())
+}
+
+#[test]
+fn reservations_refuse_stale_foreign_or_mutationless_input() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let forge = Forge::new()?;
+    let sources = sources()?;
+    let (task, fence) = kitchen.start("intake-1")?;
+    let ledger = kitchen.ledger(kitchen.store())?;
+    let recorder = common::scheduled("intake")?;
+    let batch = login(&sources, &["m1"])?;
+    let counted = ledger.counted(&task)?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &batch,
+        &open_issue(12)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let proposal = proposals.first().ok_or("no proposal")?;
+    assert!(applied(
+        &kitchen.submit(&forge, &counted, proposal, &task, fence)?
+    ));
+
+    // State read before that reservation, or fabricated as empty, is stale.
+    let another = plan(
+        &house()?,
+        &repo()?,
+        &login(&sources, &["m2"])?,
+        &open_issue(12)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let another = another.first().ok_or("no proposal")?;
+    for stale in [&counted, &uncounted()?] {
+        assert!(matches!(
+            ledger.reserve(stale, another, &task, &recorder, common::at(1)),
+            Err(kitchen::Error::Intake(IntakeError::StaleCount))
+        ));
+    }
+
+    // Another repository's ledger, or another house's state, is refused.
+    let current = ledger.counted(&task)?;
+    let elsewhere = IntakeLedger::new(
+        kitchen.store(),
+        WorkflowId::new("intake")?,
+        Repository::new("lemarier/other")?,
+    );
+    assert!(matches!(
+        elsewhere.reserve(&current, another, &task, &recorder, common::at(1)),
+        Err(kitchen::Error::Intake(IntakeError::Authority))
+    ));
+    let foreign = Counted::none(HouseId::new("elsewhere")?, repo()?);
+    assert!(matches!(
+        ledger.reserve(&foreign, another, &task, &recorder, common::at(1)),
+        Err(kitchen::Error::Intake(IntakeError::CrossHouse))
+    ));
+    assert_eq!(
+        plan(
+            &house()?,
+            &repo()?,
+            &batch,
+            &open_issue(12)?,
+            &foreign,
+            &full_authority()?
+        )
+        .err(),
+        Some(IntakeError::CrossHouse)
+    );
+
+    // A proposal without a mutation has nothing to reserve.
+    let held = Proposal::ClosedMatch {
+        problem: ProblemKey::new("login-timeout")?,
+        issue: issue(7)?,
+        reports: Vec::new(),
+    };
+    assert!(matches!(
+        ledger.reserve(&current, &held, &task, &recorder, common::at(1)),
+        Err(kitchen::Error::Intake(IntakeError::InvalidReport))
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_full_proposal_fits_one_reservation_and_the_rest_wait() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let forge = Forge::new()?;
+    let sources = sources()?;
+    // The longest task id and problem key give the largest reservation.
+    let (task, fence) = kitchen.start(&"t".repeat(64))?;
+    let ledger = kitchen.ledger(kitchen.store())?;
+    let problem = "p".repeat(48);
+    let batch = (0..MAX_PER_PROPOSAL + 5)
+        .map(|n| -> Result<Classified, Box<dyn std::error::Error>> {
+            let report = sources.accept(
+                &SourceId::new("support")?,
+                raw(&format!("m{n:03}"), "inbox", "ann", "x")?,
+            )?;
+            classified(report, &problem)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let counted = ledger.counted(&task)?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &batch,
+        &BTreeMap::new(),
+        &counted,
+        &full_authority()?,
+    )?;
+    let [draft @ Proposal::DraftIssue { reports, .. }] = proposals.as_slice() else {
+        return Err(format!("unexpected proposals: {proposals:?}").into());
+    };
+    assert_eq!(reports.len(), MAX_PER_PROPOSAL);
+    assert!(applied(
+        &kitchen.submit(&forge, &counted, draft, &task, fence)?
+    ));
+
+    let counted = ledger.counted(&task)?;
+    let known = BTreeMap::from([(
+        ProblemKey::new(&problem)?,
+        KnownIssue {
+            number: issue(3)?,
+            state: IssueState::Open,
+        },
+    )]);
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &batch,
+        &known,
+        &counted,
+        &full_authority()?,
+    )?;
+    let [Proposal::AddReports { reports, total, .. }] = proposals.as_slice() else {
+        return Err(format!("unexpected proposals: {proposals:?}").into());
+    };
+    assert_eq!((reports.len(), *total), (5, MAX_PER_PROPOSAL + 5));
     Ok(())
 }

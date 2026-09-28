@@ -7,7 +7,8 @@
 // are still being built (see issue #1). Replace each with captured output when
 // its feature lands; deploys list any that remain.
 
-export type Tone = "cmd" | "out" | "dim" | "ok" | "warn";
+/** `you` is the person's reply inside an agent session. */
+export type Tone = "cmd" | "you" | "out" | "dim" | "ok" | "warn";
 export interface TermLine {
   tone: Tone;
   text: string;
@@ -28,6 +29,7 @@ const out = (text: string): TermLine => ({ tone: "out", text });
 const dim = (text: string): TermLine => ({ tone: "dim", text });
 const ok = (text: string): TermLine => ({ tone: "ok", text });
 const warn = (text: string): TermLine => ({ tone: "warn", text });
+const you = (text: string): TermLine => ({ tone: "you", text });
 
 export const commands: TermCommand[] = [
   {
@@ -44,7 +46,8 @@ export const commands: TermCommand[] = [
       out("  #16 Pickup workflow     blocked by #15"),
       out("  #17 Merge gate          blocked by #15"),
       out("  #19 Docs                ready"),
-      warn("Start cooks on #15 and #19 now, then #16 and #17 when #15 merges? [y/N] y"),
+      warn("Start cooks on #15 and #19 now, then #16 and #17 when #15 merges?"),
+      you("yes, go"),
       ok("Orca: 2 worktrees, Codex cooking, Claude Code at the pass."),
       out("11:40 #15 merged. Started #16 and #17."),
       warn("11:52 Cook on #17 asks: keep the legacy flag? Waiting for your answer."),

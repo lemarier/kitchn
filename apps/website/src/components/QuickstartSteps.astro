@@ -1,0 +1,413 @@
+---
+import { type Block, steps } from "../data/quickstart";
+
+const repository = "https://github.com/lemarier/kitchen";
+
+/** Splits `code` spans out of a sentence so they render as <code>. */
+const spans = (text: string) => text.split("`").map((part, i) => ({ code: i % 2 === 1, part }));
+
+const commandsOf = (block: Block) =>
+  block.kind === "term"
+    ? block.lines
+        .filter((l) => l.tone === "cmd")
+        .map((l) => l.text)
+        .join("\n")
+    : "";
+---
+
+<div class="qs not-content">
+  <ol class="qs-rail" aria-label="Steps">
+    {
+      steps.map((s, i) => (
+        <li>
+          <a href={`#${s.id}`}>
+            <span class="qs-rail-n">{i + 1}</span>
+            <span class="qs-rail-t">{s.title}</span>
+          </a>
+        </li>
+      ))
+    }
+  </ol>
+
+  {
+    steps.map((s, i) => (
+      <section class="qs-step" id={s.id} aria-labelledby={`${s.id}-title`}>
+        <header class="qs-head">
+          <span class="qs-n" aria-hidden="true">
+            {String(i + 1).padStart(2, "0")}
+          </span>
+          <h2 id={`${s.id}-title`}>
+            <span class="sr-only">Step {i + 1}: </span>
+            {s.title}
+          </h2>
+        </header>
+        <p class="qs-lede">{spans(s.lede).map((p) => (p.code ? <code>{p.part}</code> : p.part))}</p>
+
+        {s.blocks.map((b) => (
+          <figure class={`qs-block qs-${b.kind}`}>
+            <figcaption class="qs-bar">
+              <span>{b.label}</span>
+              {"planned" in b && b.planned && <span class="qs-tag">Intended output</span>}
+              {b.kind === "term" && (
+                <button type="button" class="qs-copy" data-copy={commandsOf(b)}>
+                  Copy
+                </button>
+              )}
+            </figcaption>
+            {b.kind === "term" && (
+              <div class="qs-out">
+                {b.lines.map((l) => (
+                  <span class={`tl ${l.tone}`} data-chat={l.tone === "cmd" && l.text.startsWith("/") ? "" : undefined}>{l.text}</span>
+                ))}
+              </div>
+            )}
+            {b.kind === "file" && <pre>{b.body}</pre>}
+            {b.kind === "form" && (
+              <>
+                {"src" in b.screenshot ? (
+                  <img src={b.screenshot.src} alt={b.screenshot.alt} loading="lazy" />
+                ) : (
+                  <dl>
+                    {b.fields.map((f) => (
+                      <div>
+                        <dt>{f.name}</dt>
+                        <dd>{f.value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                )}
+              </>
+            )}
+          </figure>
+        ))}
+
+        <div class="qs-ticket">
+          <p class="qs-ticket-h">It worked when</p>
+          <ul>
+            {s.worked.map((w) => (
+              <li>{spans(w).map((p) => (p.code ? <code>{p.part}</code> : p.part))}</li>
+            ))}
+          </ul>
+        </div>
+
+        {s.tracking && (
+          <p class="qs-track">
+            Not released yet:{" "}
+            {s.tracking.map((t, j) => (
+              <>
+                {j > 0 && ", "}
+                <a href={`${repository}/issues/${t.issue}`}>#{t.issue}</a>: {spans(t.what).map((p) => (p.code ? <code>{p.part}</code> : p.part))}
+              </>
+            ))}
+            .
+          </p>
+        )}
+      </section>
+    ))
+  }
+</div>
+
+<script>
+  for (const button of document.querySelectorAll<HTMLButtonElement>(".qs-copy")) {
+    button.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(button.dataset.copy ?? "");
+        button.textContent = "Copied";
+      } catch {
+        button.textContent = "Copy failed";
+      }
+      setTimeout(() => {
+        button.textContent = "Copy";
+      }, 1500);
+    });
+  }
+</script>
+
+<style>
+  .qs {
+    --paper: #f8f5ea;
+    --print: #1a1f22;
+    --print-red: #cf1d12;
+    --term: #0c1012;
+    --steel-edge: #3a464d;
+    --lamp: #ffb23e;
+    --display: var(--kn-font-display);
+    --mono: var(--sl-font-mono);
+    margin-top: 1.5rem;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  /* Step rail: the five steps as a row of numbered tickets. */
+  .qs-rail {
+    list-style: none;
+    margin: 0 0 3rem;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 0.5rem;
+  }
+  .qs-rail a {
+    display: grid;
+    gap: 0.35rem;
+    height: 100%;
+    padding: 0.7rem 0.7rem 0.85rem;
+    color: var(--sl-color-white);
+    text-decoration: none;
+    border-top: 3px solid var(--sl-color-gray-5);
+    background: var(--sl-color-gray-6);
+  }
+  .qs-rail a:hover,
+  .qs-rail a:focus-visible {
+    border-top-color: var(--sl-color-accent);
+  }
+  .qs-rail-n {
+    font: 900 1.6rem/1 var(--display);
+    color: var(--sl-color-accent);
+  }
+  .qs-rail-t {
+    font-size: 0.8125rem;
+    line-height: 1.3;
+  }
+
+  .qs-step {
+    scroll-margin-top: calc(var(--sl-nav-height, 4rem) + 1rem);
+    padding-bottom: 3rem;
+    margin-bottom: 3rem;
+    border-bottom: 1px solid var(--sl-color-gray-5);
+  }
+  .qs-step:last-child {
+    border-bottom: 0;
+  }
+  .qs-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.9rem;
+  }
+  .qs-n {
+    font: 900 clamp(3rem, 9vw, 4.5rem) / 0.85 var(--display);
+    color: var(--sl-color-accent);
+  }
+  .qs-head h2 {
+    margin: 0;
+    font: 900 clamp(1.7rem, 5vw, 2.3rem) / 1 var(--display);
+    text-transform: uppercase;
+    color: var(--sl-color-white);
+  }
+  .qs-lede code {
+    font: 400 0.9em var(--mono);
+    padding: 0.05rem 0.3rem;
+    color: var(--sl-color-white);
+    background: var(--sl-color-gray-6);
+    border-radius: 3px;
+  }
+  .qs-lede {
+    margin: 0.9rem 0 1.5rem;
+    max-width: 38rem;
+    color: var(--sl-color-gray-2);
+    font-size: 1.05rem;
+    line-height: 1.55;
+  }
+
+  /* Terminal and file blocks: the landing page's terminal. */
+  .qs-block {
+    margin: 0 0 1rem;
+    background: var(--term);
+    border: 1px solid var(--steel-edge);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .qs-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.6rem 1rem;
+    font: 400 0.75rem/1.2 var(--mono);
+    color: #9eabb3;
+    border-bottom: 1px solid #1f282d;
+  }
+  .qs-tag {
+    padding: 0.15rem 0.45rem;
+    color: var(--lamp);
+    border: 1px solid currentColor;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.6875rem;
+  }
+  .qs-copy {
+    margin-left: auto;
+    padding: 0;
+    font: inherit;
+    color: #9eabb3;
+    background: none;
+    border: 0;
+    cursor: pointer;
+  }
+  .qs-copy:hover,
+  .qs-copy:focus-visible {
+    color: #fff;
+  }
+  .qs-block pre {
+    margin: 0;
+    padding: 0.9rem 1rem 1.1rem;
+    font: 400 0.8125rem/1.65 var(--mono);
+    color: #c9d1d6;
+    background: none;
+    border: 0;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .tl {
+    display: block;
+  }
+  .tl.cmd {
+    color: #fff;
+  }
+  .tl.dim {
+    color: #74828b;
+  }
+  .tl.ok {
+    color: #8fd694;
+  }
+  .tl.warn {
+    color: var(--lamp);
+  }
+  /* Lines are block spans, so template whitespace between them is ignored. */
+  .qs-out {
+    padding: 0.9rem 1rem 1.1rem;
+    font: 400 0.8125rem/1.65 var(--mono);
+    color: #c9d1d6;
+  }
+  .tl {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .tl.cmd::before {
+    content: "$ " / "";
+    color: #74828b;
+  }
+  /* Inside an agent session: slash commands and replies, as on the landing page. */
+  .tl.cmd[data-chat]::before,
+  .tl.you::before {
+    content: "› " / "";
+    color: #74828b;
+  }
+  .tl.you {
+    color: #fff;
+  }
+
+  /* Orca dialog fields, as text rather than an imitation of its UI. */
+  .qs-form dl {
+    margin: 0;
+    padding: 0.4rem 1rem 0.8rem;
+    font: 400 0.875rem/1.4 var(--mono);
+  }
+  .qs-form dl div {
+    display: flex;
+    gap: 1rem;
+    padding: 0.45rem 0;
+    border-bottom: 1px dashed #2a343a;
+  }
+  .qs-form dl div:last-child {
+    border-bottom: 0;
+  }
+  .qs-form dt {
+    min-width: 7rem;
+    color: #9eabb3;
+  }
+  .qs-form dd {
+    margin: 0;
+    color: #fff;
+  }
+  .qs-form img {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+
+  /* "It worked when": a printed ticket with a torn bottom edge. */
+  .qs-ticket {
+    margin-top: 1.5rem;
+    padding: 1.1rem 1.25rem 1.6rem;
+    color: var(--print);
+    background: var(--paper);
+    mask: conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) 50% / 12px 100%;
+    box-shadow: 0 18px 28px -16px rgb(0 0 0 / 45%);
+  }
+  .qs-ticket-h {
+    margin: 0 0 0.6rem;
+    font: 900 1.15rem/1 var(--display);
+    text-transform: uppercase;
+    color: var(--print-red);
+  }
+  .qs-ticket ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 0.5rem;
+  }
+  .qs-ticket li {
+    position: relative;
+    padding-left: 1.6rem;
+    line-height: 1.45;
+    font-size: 0.9375rem;
+  }
+  .qs-ticket li::before {
+    content: "✓";
+    position: absolute;
+    left: 0;
+    font-weight: 700;
+    color: var(--print-red);
+  }
+  .qs-ticket code {
+    font: 400 0.85em var(--mono);
+    padding: 0.05rem 0.3rem;
+    background: rgb(26 31 34 / 8%);
+    border-radius: 3px;
+    overflow-wrap: anywhere;
+  }
+
+  .qs-track {
+    margin: 1rem 0 0;
+    font-size: 0.875rem;
+    color: var(--sl-color-gray-3);
+  }
+  .qs-track code {
+    font: 400 0.9em var(--mono);
+  }
+  .qs-track a {
+    color: var(--sl-color-accent);
+  }
+
+  @media (max-width: 50rem) {
+    .qs-rail {
+      grid-template-columns: 1fr;
+      gap: 0.25rem;
+    }
+    .qs-rail a {
+      grid-template-columns: 2rem 1fr;
+      align-items: center;
+      padding: 0.5rem 0.75rem;
+      border-top: 0;
+    }
+    .qs-rail a:hover,
+    .qs-rail a:focus-visible {
+      background: var(--sl-color-gray-5);
+    }
+    .qs-rail-n {
+      font-size: 1.3rem;
+    }
+    .qs-form dt {
+      min-width: 6rem;
+    }
+  }
+</style>

@@ -554,7 +554,7 @@ const menu = [
               commands.map((c, i) => (
                 <pre class="term-out" data-term-out={c.id} data-summary={c.summary} data-docs={c.docs} hidden={i !== 0} aria-hidden={i !== 0 ? "true" : undefined}>
                   {c.lines.map((l) => (
-                    <span class:list={["tl", l.tone]}>{l.tone === "cmd" && <span class="prompt">{l.text.startsWith("/") ? "› " : "$ "}</span>}{l.text}</span>
+                    <span class:list={["tl", l.tone]}>{(l.tone === "cmd" || l.tone === "you") && <span class="prompt">{l.tone === "you" || l.text.startsWith("/") ? "› " : "$ "}</span>}{l.text}</span>
                   ))}
                 </pre>
               ))
@@ -2283,7 +2283,8 @@ const menu = [
   .live .tl.shown {
     visibility: visible;
   }
-  .tl.cmd {
+  .tl.cmd,
+  .tl.you {
     color: #fff;
   }
   .tl.out {

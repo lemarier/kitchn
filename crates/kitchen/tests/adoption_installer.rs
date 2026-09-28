@@ -38,7 +38,13 @@ fn create_rerun_and_conflict_preserve_local_files() -> Result<(), Box<dyn std::e
             mode: FileMode::Regular,
         },
     ];
-    assert!(install_new_files(&root, &files)?.has_conflicts());
+    match install_new_files(&root, &files) {
+        Err(HouseError::Conflicts(report)) => {
+            assert_eq!(report.files[0].status, FileStatus::Conflict);
+            assert_eq!(report.files[1].status, FileStatus::Created);
+        }
+        result => return Err(format!("expected blocked batch, got {result:?}").into()),
+    }
     assert!(!root.join("other").exists());
     assert_eq!(fs::read(root.join(path.as_path()))?, b"local edit");
     Ok(())
@@ -118,7 +124,7 @@ fn bounded_content_and_modes() -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             fs::metadata(root.join("run"))?.permissions().mode() & 0o777,
-            0o700
+            0o755
         );
     }
     Ok(())
@@ -164,6 +170,131 @@ fn redirected_paths_and_managed_links_are_preserved() -> Result<(), Box<dyn std:
         fs::symlink_metadata(root.join("managed"))?
             .file_type()
             .is_symlink()
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn repository_regular_files_and_private_house_state_have_distinct_modes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let path = RelativePath::new("nested/readme.md")?;
+    install_new_files(
+        &root.join("consumer"),
+        &[NewFile {
+            path: &path,
+            contents: b"public",
+            mode: FileMode::Regular,
+        }],
+    )?;
+    assert_eq!(
+        fs::metadata(root.join("consumer/nested/readme.md"))?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    assert_eq!(
+        fs::metadata(root.join("consumer/nested"))?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    let house: kitchen::house::HouseConfig =
+        serde_json::from_str(include_str!("fixtures/house/origin89.json"))?;
+    let registry = kitchen::adoption::HouseRegistry::new(root.join("registry"))?;
+    registry.initialize(&house)?;
+    assert_eq!(
+        fs::metadata(registry.root().join("houses/origin89.json"))?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(registry.root().join("houses"))?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn repository_modes_respect_umask_in_subprocess() -> Result<(), Box<dyn std::error::Error>> {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+    if std::env::var_os("KITCHEN_TEST_RESTRICTIVE_UMASK").is_none() {
+        let output = Command::new("sh")
+            .args(["-c", "umask 077; exec \"$@\"", "kitchen-umask-test"])
+            .arg(std::env::current_exe()?)
+            .args(["--exact", "repository_modes_respect_umask_in_subprocess"])
+            .env("KITCHEN_TEST_RESTRICTIVE_UMASK", "1")
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        return Ok(());
+    }
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let regular = RelativePath::new("nested/readme")?;
+    let executable = RelativePath::new("nested/run")?;
+    install_new_files(
+        &root,
+        &[
+            NewFile {
+                path: &regular,
+                contents: b"data",
+                mode: FileMode::Regular,
+            },
+            NewFile {
+                path: &executable,
+                contents: b"#!/bin/sh\n",
+                mode: FileMode::Executable,
+            },
+        ],
+    )?;
+    for (path, expected) in [
+        ("nested/readme", 0o600),
+        ("nested/run", 0o700),
+        ("nested", 0o700),
+    ] {
+        assert_eq!(
+            fs::metadata(root.join(path))?.permissions().mode() & 0o777,
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn oversized_existing_file_is_a_conflict_without_blocking_preview()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let path = RelativePath::new("large")?;
+    fs::File::create(root.join("large"))?
+        .set_len((kitchen::adoption::MAX_INSTALL_BYTES + 1) as u64)?;
+    let files = [NewFile {
+        path: &path,
+        contents: b"small",
+        mode: FileMode::Regular,
+    }];
+    assert_eq!(
+        SafeInstaller::preview(&root, &files)?.files[0].status,
+        FileStatus::Conflict
+    );
+    assert!(matches!(
+        install_new_files(&root, &files),
+        Err(HouseError::Conflicts(_))
+    ));
+    assert_eq!(
+        fs::metadata(root.join("large"))?.len(),
+        (kitchen::adoption::MAX_INSTALL_BYTES + 1) as u64
     );
     Ok(())
 }

@@ -50,19 +50,26 @@ impl HouseConfig {
         validate_names(&self.required_checks)?;
         for grant in self.grants.iter().chain(&self.policy_limits) {
             use crate::contracts::{GrantScope, Permission};
-            let repository_effect = matches!(
-                grant.permission,
+            let repository_effect = match grant.permission {
                 Permission::LaunchWorker
-                    | Permission::PostComment
-                    | Permission::EditLabels
-                    | Permission::CreateIssue
-                    | Permission::EditIssueRelationships
-                    | Permission::PushBranch
-                    | Permission::OpenPullRequest
-                    | Permission::RequestReview
-                    | Permission::Merge
-                    | Permission::Publish
-            );
+                | Permission::PostComment
+                | Permission::EditLabels
+                | Permission::CreateIssue
+                | Permission::EditIssueRelationships
+                | Permission::PushBranch
+                | Permission::OpenPullRequest
+                | Permission::RequestReview
+                | Permission::Merge
+                | Permission::Publish => true,
+                Permission::MessageWorker
+                | Permission::CancelWorker
+                | Permission::ReleaseResource
+                | Permission::AskHuman
+                | Permission::ManageSchedule
+                | Permission::ActivateSchedule
+                | Permission::TrialSchedule
+                | Permission::OperateEquipment => false,
+            };
             if repository_effect {
                 let GrantScope::Repository(repository) = &grant.scope else {
                     return Err(HouseError::PolicyRelaxation);

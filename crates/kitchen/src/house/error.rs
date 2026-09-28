@@ -21,6 +21,9 @@ pub enum HouseError {
     /// Existing content differs; it is preserved.
     #[error("installation conflicts with existing content; inspect the preview")]
     Conflict,
+    /// A create-only batch was blocked; no files were written.
+    #[error("installation conflicts with existing content; inspect the report")]
+    Conflicts(crate::adoption::InstallReport),
     /// A pinned installation is absent or no longer matches its manifest.
     #[error("pinned instructions are missing or modified; restore the verified bundle and sync")]
     UnverifiedSnapshot,
@@ -52,7 +55,7 @@ impl HouseError {
             | Self::InsideRepository
             | Self::RedirectedPath
             | Self::PinMismatch => ErrorClass::Refused,
-            Self::Conflict | Self::Busy => ErrorClass::Conflict,
+            Self::Conflict | Self::Conflicts(_) | Self::Busy => ErrorClass::Conflict,
             Self::UnverifiedSnapshot | Self::PartialInstallation { .. } | Self::Io(_) => {
                 ErrorClass::Execution
             }

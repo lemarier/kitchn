@@ -6,7 +6,7 @@ use super::{
 use crate::{
     HouseId,
     contracts::CommitId,
-    house::{HouseConfig, HouseError, RepositoryConfig, resolve_house},
+    house::{HouseConfig, HouseError, RepositoryConfig},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -46,18 +46,14 @@ impl HouseRegistry {
         house.validate()?;
         let path = RelativePath::new(&format!("houses/{}.json", house.house))?;
         let contents = encode(house)?;
-        if install_new_files(
+        super::installer::install_private_files(
             &self.root,
             &[NewFile {
                 path: &path,
                 contents: &contents,
                 mode: FileMode::Regular,
             }],
-        )?
-        .has_conflicts()
-        {
-            return Err(HouseError::Conflict);
-        }
+        )?;
         Ok(())
     }
     /// Read and validate one exact house. No fallback to another house.
@@ -71,29 +67,43 @@ impl HouseRegistry {
         Ok(config)
     }
     /// Enumerate bounded house configurations for explicit guided selection.
-    pub fn houses(&self) -> Result<Vec<HouseConfig>, HouseError> {
+    pub fn houses(&self) -> Result<HouseListing, HouseError> {
         ensure_external(&self.root)?;
         let directory = self.root.join("houses");
         check_path(&directory)?;
         let entries = match fs::read_dir(directory) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(HouseListing::default());
+            }
             Err(error) => return Err(error.into()),
         };
-        let mut houses = Vec::new();
-        for entry in entries {
+        let mut listing = HouseListing::default();
+        for (index, entry) in entries.enumerate() {
             let entry = entry?;
-            if houses.len() >= 256 {
+            if index >= 256 {
                 return Err(HouseError::InvalidInput);
             }
             let name = entry.file_name();
-            let name = name.to_str().ok_or(HouseError::InvalidInput)?;
-            let id = name.strip_suffix(".json").ok_or(HouseError::InvalidInput)?;
-            let id = HouseId::new(id).map_err(|_| HouseError::InvalidInput)?;
-            houses.push(self.load(&id)?);
+            let Some(id) = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .and_then(|id| HouseId::new(id).ok())
+            else {
+                continue;
+            };
+            match self.load(&id) {
+                Ok(house) => listing.available.push(house),
+                Err(error) => listing.unavailable.push((id, error)),
+            }
         }
-        houses.sort_by(|left, right| left.house.cmp(&right.house));
-        Ok(houses)
+        listing
+            .available
+            .sort_by(|left, right| left.house.cmp(&right.house));
+        listing
+            .unavailable
+            .sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(listing)
     }
     /// Install exactly the configured pins, without changing the configuration.
     pub fn sync(
@@ -124,7 +134,12 @@ impl HouseRegistry {
         next.kitchen = bundle.kitchen.clone();
         next.guidance = bundle.guidance.clone();
         let resolved = install_snapshot(&self.root, &next, bundle)?;
-        atomic_config(&self.config_path(&next.house), &current, &next)?;
+        atomic_config(
+            &self.config_path(&next.house),
+            &current,
+            &next,
+            super::installer::Visibility::Private,
+        )?;
         Ok(resolved)
     }
     /// Resolve and verify pins for a new task in an adopted repository.
@@ -134,9 +149,9 @@ impl HouseRegistry {
         revision: CommitId,
     ) -> Result<ResolvedInstructions, HouseError> {
         let config = read_repository(repository_root)?;
-        let houses = self.houses()?;
-        let house = resolve_house(&config, &houses)?;
-        resolve_instructions(&self.root, house, Some(revision))
+        let house = self.load(&config.house)?;
+        config.validate(&house)?;
+        resolve_instructions(&self.root, &house, Some(revision))
     }
     /// Change only an already-adopted repository's public settings after an
     /// explicit selection. The expected binding is rechecked under the registry
@@ -158,7 +173,12 @@ impl HouseRegistry {
             return Err(HouseError::Conflict);
         }
         if expected != next {
-            atomic_config(&root.join(REPOSITORY_CONFIG), expected, next)?;
+            atomic_config(
+                &root.join(REPOSITORY_CONFIG),
+                expected,
+                next,
+                super::installer::Visibility::Repository,
+            )?;
         }
         Ok(())
     }
@@ -224,6 +244,9 @@ pub fn read_repository(root: &Path) -> Result<RepositoryConfig, HouseError> {
 /// Git root; never inherit a parent repository's house through a nested checkout.
 /// Multiple bindings between the start and root are ambiguous and refused.
 pub fn repository_from_path(start: &Path) -> Result<(PathBuf, RepositoryConfig), HouseError> {
+    if !start.is_absolute() {
+        return Err(HouseError::InvalidInput);
+    }
     check_path(start)?;
     let mut found = None;
     for root in start.ancestors() {
@@ -276,6 +299,7 @@ fn atomic_config<T: Serialize + DeserializeOwned + PartialEq>(
     path: &Path,
     expected: &T,
     next: &T,
+    visibility: super::installer::Visibility,
 ) -> Result<(), HouseError> {
     let bytes = encode(next)?;
     check_path(path)?;
@@ -287,7 +311,7 @@ fn atomic_config<T: Serialize + DeserializeOwned + PartialEq>(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(visibility.file_mode(FileMode::Regular));
     }
     let mut file = options.open(&temporary).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -314,4 +338,30 @@ fn atomic_config<T: Serialize + DeserializeOwned + PartialEq>(
     fs::rename(&temporary, path)?;
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+/// Guided selection results; a damaged house never prevents selecting another.
+#[derive(Debug, Default)]
+pub struct HouseListing {
+    /// Valid configurations, sorted by house ID.
+    pub available: Vec<HouseConfig>,
+    /// Houses requiring individual repair, with their load failures.
+    pub unavailable: Vec<(HouseId, HouseError)>,
+}
+
+/// Find the nearest Git repository/worktree root without following redirects.
+/// An absolute path is required; absence of a Git marker refuses implicit setup.
+pub fn git_repository_root(start: &Path) -> Result<PathBuf, HouseError> {
+    if !start.is_absolute() {
+        return Err(HouseError::InvalidInput);
+    }
+    check_path(start)?;
+    for root in start.ancestors() {
+        let marker = root.join(".git");
+        check_path(&marker)?;
+        if path_present(&marker)? {
+            return Ok(root.to_path_buf());
+        }
+    }
+    Err(HouseError::HouseSelection)
 }

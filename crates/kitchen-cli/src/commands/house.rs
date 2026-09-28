@@ -2,10 +2,14 @@ use clap::{Args, Subcommand};
 use kitchen::{
     HouseId,
     adoption::{
-        HouseRegistry, InstructionBundle, adopt_repository, decode, encode, read_repository,
+        FileMode, HouseRegistry, InstructionBundle, NewFile, RelativePath, SafeInstaller,
+        adopt_repository, decode, encode, git_repository_root, read_repository,
+        repository_from_path,
     },
     contracts::Repository,
-    house::{DoctorEvidence, HouseConfig, HouseError, RepositoryConfig, Workflow, doctor},
+    house::{
+        DoctorEvidence, DoctorReport, HouseConfig, HouseError, RepositoryConfig, Workflow, doctor,
+    },
 };
 use std::{
     collections::BTreeSet,
@@ -31,8 +35,8 @@ enum HouseCommand {
     Setup {
         #[arg(long)]
         registry: PathBuf,
-        #[arg(long, default_value = ".")]
-        repository_path: PathBuf,
+        #[arg(long)]
+        repository_path: Option<PathBuf>,
         #[arg(long)]
         repository: Repository,
         #[arg(long)]
@@ -124,7 +128,7 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
         } => {
             let registry = HouseRegistry::new(canonical_root(registry)?)?;
             let root = canonical_root(repository_path)?;
-            let config = read_repository(&root)?;
+            let (_, config) = repository_from_path(&root)?;
             diagnose(&registry, &config, evidence, json)
         }
         HouseCommand::Setup {
@@ -138,19 +142,27 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             json,
         } => {
             let registry = HouseRegistry::new(canonical_root(registry)?)?;
-            let root = canonical_root(repository_path)?;
-            let houses = registry.houses()?;
-            if houses.is_empty() {
-                return Err(HouseError::HouseSelection.into());
-            }
+            let root = match repository_path {
+                Some(path) => canonical_root(path)?,
+                None => git_repository_root(&std::env::current_dir().map_err(HouseError::from)?)?,
+            };
             let house = match house {
                 Some(house) => house,
                 None => {
-                    let eligible: Vec<_> = houses
+                    let listing = registry.houses()?;
+                    for (house, error) in &listing.unavailable {
+                        writeln!(io::stderr().lock(), "House {house} unavailable: {error}")
+                            .map_err(HouseError::from)?;
+                    }
+                    let eligible: Vec<_> = listing
+                        .available
                         .iter()
                         .filter(|house| house.repositories.contains(&repository))
                         .map(|house| house.house.as_str())
                         .collect();
+                    if eligible.is_empty() {
+                        return Err(HouseError::HouseSelection.into());
+                    }
                     let answer = prompt(&format!("House ({}): ", eligible.join(", ")))?;
                     HouseId::new(&answer)?
                 }
@@ -178,31 +190,72 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
                     .as_ref()
                     .map_or_else(BTreeSet::new, |config| config.additional_checks.clone()),
             };
-            let house = kitchen::house::resolve_house(&config, &houses)?;
+            let house = registry.load(&config.house)?;
+            config.validate(&house)?;
             let evidence: Option<DoctorEvidence> = evidence.as_deref().map(decode).transpose()?;
             // Scope-check observations and preview label changes before any write.
             let report = doctor(&registry, &config, evidence.as_ref())?;
-            if !preview {
+            let binding = if let Some(existing) = &existing {
+                if existing.house != config.house || existing.repository != config.repository {
+                    BindingStatus::Refused
+                } else if existing == &config {
+                    BindingStatus::Unchanged
+                } else {
+                    BindingStatus::Updated
+                }
+            } else {
+                let path = RelativePath::new(".kitchen.json")?;
+                let contents = encode(&config)?;
+                let plan = SafeInstaller::preview(
+                    &root,
+                    &[NewFile {
+                        path: &path,
+                        contents: &contents,
+                        mode: FileMode::Regular,
+                    }],
+                )?;
+                if plan.has_conflicts() {
+                    BindingStatus::Conflict
+                } else {
+                    BindingStatus::Created
+                }
+            };
+            let accepted = matches!(
+                binding,
+                BindingStatus::Created | BindingStatus::Unchanged | BindingStatus::Updated
+            );
+            if !preview && accepted {
                 if let Some(existing) = &existing {
                     registry.configure_repository(&root, existing, &config)?;
                 } else {
-                    let installed = adopt_repository(&root, &config, house)?;
-                    if installed.has_conflicts() {
-                        return Err(HouseError::Conflict.into());
-                    }
+                    adopt_repository(&root, &config, &house)?;
                 }
             }
             let result = if json {
-                json_text(&report)?
+                json_text(&SetupReport {
+                    preview,
+                    binding,
+                    written: !preview
+                        && matches!(binding, BindingStatus::Created | BindingStatus::Updated),
+                    doctor: &report,
+                })?
             } else {
+                let action = match (binding, preview) {
+                    (BindingStatus::Refused, _) => "Refused rebinding",
+                    (BindingStatus::Conflict, _) => "Conflicting binding",
+                    (BindingStatus::Unchanged, _) => "Unchanged binding",
+                    (BindingStatus::Created, true) => "Would adopt",
+                    (BindingStatus::Updated, true) => "Would update",
+                    (BindingStatus::Created, false) => "Adopted",
+                    (BindingStatus::Updated, false) => "Updated",
+                };
                 format!(
-                    "{} .kitchen.json for {}.\n{}",
-                    if preview { "Would adopt" } else { "Adopted" },
+                    "{action} .kitchen.json for {}.\n{}",
                     config.repository,
                     report.human_readable()
                 )
             };
-            Ok((result, report.healthy()))
+            Ok((result, accepted))
         }
     }
 }
@@ -262,4 +315,22 @@ fn canonical_root(path: PathBuf) -> Result<PathBuf, HouseError> {
 }
 fn json_text(value: &impl serde::Serialize) -> Result<String, HouseError> {
     String::from_utf8(encode(value)?).map_err(|_| HouseError::InvalidInput)
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum BindingStatus {
+    Created,
+    Unchanged,
+    Updated,
+    Conflict,
+    Refused,
+}
+#[derive(serde::Serialize)]
+struct SetupReport<'a> {
+    preview: bool,
+    binding: BindingStatus,
+    written: bool,
+    #[serde(flatten)]
+    doctor: &'a DoctorReport,
 }

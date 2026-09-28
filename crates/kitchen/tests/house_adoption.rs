@@ -14,17 +14,19 @@ use kitchen::{
 use std::{collections::BTreeSet, fs};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
-fn config(name: &str) -> Result<HouseConfig, serde_json::Error> {
-    serde_json::from_str(match name {
+fn config(name: &str) -> Result<HouseConfig, Box<dyn std::error::Error>> {
+    let config: HouseConfig = serde_json::from_str(match name {
         "origin89" => include_str!("fixtures/house/origin89.json"),
         _ => include_str!("fixtures/house/crabnebula.json"),
-    })
+    })?;
+    Ok(config)
 }
-fn bundle(name: &str) -> Result<InstructionBundle, serde_json::Error> {
-    serde_json::from_str(match name {
+fn bundle(name: &str) -> Result<InstructionBundle, Box<dyn std::error::Error>> {
+    let bundle: InstructionBundle = serde_json::from_str(match name {
         "origin89" => include_str!("fixtures/house/origin89-bundle.json"),
         _ => include_str!("fixtures/house/crabnebula-bundle.json"),
-    })
+    })?;
+    Ok(bundle)
 }
 fn repo(house: &HouseConfig) -> Result<RepositoryConfig, Box<dyn std::error::Error>> {
     Ok(RepositoryConfig {
@@ -252,13 +254,20 @@ fn labels_preview_missing_conflicting_present_and_disabled() -> TestResult {
             .all(|item| item.status == LabelStatus::Present)
     );
     let mut conflict = observed.clone();
-    conflict[0].color = "ffffff".into();
+    conflict[0].name = conflict[0].name.to_uppercase();
     assert!(
         preview_labels(&declarations, Some(&conflict))?
             .iter()
             .any(|item| item.status == LabelStatus::Conflict)
     );
-    assert_eq!(conflict[0].color, "ffffff");
+    assert_eq!(conflict[0].name, observed[0].name.to_uppercase());
+    let mut duplicates = observed.clone();
+    duplicates.push(observed[0].clone());
+    assert!(
+        preview_labels(&declarations, Some(&duplicates))?
+            .iter()
+            .any(|item| item.status == LabelStatus::Conflict)
+    );
     assert!(preview_labels(&[], Some(&conflict))?.is_empty());
     assert!(
         preview_labels(&declarations, None)?
@@ -368,6 +377,24 @@ fn explicit_workflow_change_preserves_strengthening_and_detects_stale_setup() ->
     next.workflows.clear();
     registry.configure_repository(&consumer, &original, &next)?;
     assert_eq!(kitchen::adoption::read_repository(&consumer)?, next);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(consumer.join(".kitchen.json"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(registry.root().join("houses/origin89.json"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
     assert!(next.checks(&house)?.contains("local-check"));
     assert!(doctor(&registry, &next, None)?.labels.is_empty());
     assert!(matches!(
@@ -467,5 +494,155 @@ fn posting_grants_cannot_bypass_repository_and_destination_allowlists() -> TestR
         ));
         house.posting_destinations = saved;
     }
+    Ok(())
+}
+
+#[test]
+fn pending_and_stray_files_do_not_block_other_houses() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let registry = HouseRegistry::new(root.join("registry"))?;
+    let house = config("crabnebula")?;
+    registry.initialize(&house)?;
+    registry.sync(&house.house, &bundle("crabnebula")?)?;
+    let consumer = root.join("consumer");
+    adopt_repository(&consumer, &repo(&house)?, &house)?;
+    for stray in ["origin89.pending", ".DS_Store", "broken.json"] {
+        fs::write(registry.root().join("houses").join(stray), b"interrupted")?;
+        assert_eq!(
+            registry
+                .resolve(&consumer, CommitId::new(&"c".repeat(40))?)?
+                .house,
+            house.house
+        );
+        assert_eq!(registry.houses()?.available, vec![house.clone()]);
+    }
+    assert!(registry.load(&kitchen::HouseId::new("broken")?).is_err());
+    let listing = registry.houses()?;
+    assert_eq!(listing.unavailable.len(), 1);
+    assert_eq!(listing.unavailable[0].0.as_str(), "broken");
+    assert!(matches!(listing.unavailable[0].1, HouseError::InvalidInput));
+    Ok(())
+}
+
+#[test]
+fn mismatched_role_digest_is_refused_before_snapshot_or_pin_write() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let registry = HouseRegistry::new(temp.path().canonicalize()?.join("registry"))?;
+    let house = config("origin89")?;
+    registry.initialize(&house)?;
+    let mut wrong = bundle("origin89")?;
+    wrong.kitchen = CommitId::new(&"f".repeat(40))?;
+    wrong.role_cards_digest = kitchen::adoption::RoleCardsDigest::new(&"0".repeat(64))?;
+    assert!(matches!(
+        registry.update(&house, &wrong),
+        Err(HouseError::PinMismatch)
+    ));
+    assert_eq!(registry.load(&house.house)?, house);
+    assert!(!registry.root().join("snapshots").exists());
+    Ok(())
+}
+
+#[test]
+fn label_metadata_drift_is_informational_in_preview_and_doctor() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let registry = HouseRegistry::new(temp.path().canonicalize()?.join("registry"))?;
+    let house = config("origin89")?;
+    registry.initialize(&house)?;
+    registry.sync(&house.house, &bundle("origin89")?)?;
+    let repository = repo(&house)?;
+    let declarations: Vec<_> = repository
+        .workflows
+        .iter()
+        .copied()
+        .map(workflow_requirements)
+        .collect();
+    let labels: Vec<_> = preview_labels(&declarations, Some(&[]))?
+        .into_iter()
+        .map(|item| RepositoryLabel {
+            name: item.requirement.name,
+            color: "ffffff".into(),
+            description: "local meaning".into(),
+        })
+        .collect();
+    let previews = preview_labels(&declarations, Some(&labels))?;
+    assert!(previews.iter().all(|p| p.status == LabelStatus::Drift));
+    let evidence = DoctorEvidence {
+        house: house.house,
+        repository: repository.repository.clone(),
+        capabilities: CapabilitySet::supporting(Capability::ALL),
+        labels: Some(labels.clone()),
+        access: AccessStatus::Available,
+    };
+    let report = doctor(&registry, &repository, Some(&evidence))?;
+    assert!(report.healthy());
+    assert!(report.human_readable().contains("drift"));
+    assert_eq!(evidence.labels, Some(labels));
+    Ok(())
+}
+
+#[test]
+fn role_digest_rejects_invalid_input_and_changed_manifest_role_bytes() -> TestResult {
+    use kitchen::adoption::{RoleCardsDigest, role_cards_digest};
+    for invalid in ["", "1234", &"x".repeat(64), &"0".repeat(65)] {
+        assert!(matches!(
+            RoleCardsDigest::new(invalid),
+            Err(HouseError::InvalidInput)
+        ));
+    }
+    assert_eq!(
+        RoleCardsDigest::new(&role_cards_digest().as_str().to_uppercase())?,
+        role_cards_digest()
+    );
+    let bundle = bundle("origin89")?;
+    assert_eq!(bundle.role_cards_digest, role_cards_digest()); // Independently generated fixture digest.
+    let mut raw = serde_json::to_value(&bundle)?;
+    raw.as_object_mut()
+        .ok_or("not an object")?
+        .remove("roleCardsDigest");
+    assert!(serde_json::from_value::<InstructionBundle>(raw).is_err());
+    let temp = tempfile::tempdir()?;
+    let registry = HouseRegistry::new(temp.path().canonicalize()?.join("registry"))?;
+    let house = config("origin89")?;
+    registry.initialize(&house)?;
+    let resolved = registry.sync(&house.house, &bundle)?;
+    assert_eq!(resolved.role_cards_digest, bundle.role_cards_digest);
+    let mut wrong_reference = resolved.clone();
+    wrong_reference.role_cards_digest = RoleCardsDigest::new(&"0".repeat(64))?;
+    assert!(matches!(
+        wrong_reference.verify(&registry),
+        Err(HouseError::UnverifiedSnapshot)
+    ));
+    let mut wrong = bundle.clone();
+    wrong.role_cards_digest = RoleCardsDigest::new(&"0".repeat(64))?;
+    assert!(matches!(
+        registry.sync(&house.house, &wrong),
+        Err(HouseError::PinMismatch)
+    ));
+    let path = resolved.snapshot.join("manifest.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let role_path = manifest["roles"][0]["path"]
+        .as_str()
+        .ok_or("missing path")?
+        .to_owned();
+    manifest["roles"][0]["contents"] = serde_json::json!("altered but self-consistent bytes");
+    fs::write(
+        resolved.snapshot.join(role_path),
+        "altered but self-consistent bytes",
+    )?;
+    fs::write(path, serde_json::to_vec(&manifest)?)?;
+    assert!(matches!(
+        resolved.verify(&registry),
+        Err(HouseError::UnverifiedSnapshot)
+    ));
+    Ok(())
+}
+
+#[test]
+fn repository_lookup_rejects_relative_input() -> TestResult {
+    assert!(matches!(
+        repository_from_path(std::path::Path::new(".")),
+        Err(HouseError::InvalidInput)
+    ));
     Ok(())
 }

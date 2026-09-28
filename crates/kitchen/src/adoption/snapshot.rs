@@ -1,10 +1,11 @@
-use super::{FileMode, NewFile, RelativePath, install_new_files, read_bounded};
+use super::{FileMode, NewFile, RelativePath, read_bounded};
 use crate::{
     HouseId,
     contracts::{CommitId, Provenance, Role},
     house::{HouseConfig, HouseError, role_card},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -30,6 +31,8 @@ pub struct InstructionBundle {
     pub house: HouseId,
     /// Kitchen revision supplying the role cards.
     pub kitchen: CommitId,
+    /// Digest of the role cards exported from the caller-authenticated Kitchen pin.
+    pub role_cards_digest: RoleCardsDigest,
     /// Guidance revision supplying the house assets.
     pub guidance: CommitId,
     /// Entry point within `assets`.
@@ -88,6 +91,8 @@ pub struct ResolvedInstructions {
     pub house: HouseId,
     /// Core task provenance contract.
     pub provenance: Provenance,
+    /// Content identity retained independently of later binaries and manifests.
+    pub role_cards_digest: RoleCardsDigest,
     /// Immutable snapshot directory; updates never delete old snapshots.
     pub snapshot: PathBuf,
     /// Exact entry point inside the snapshot.
@@ -129,6 +134,9 @@ pub(crate) fn install_snapshot(
 ) -> Result<ResolvedInstructions, HouseError> {
     super::registry::ensure_external(root)?;
     bundle.validate(house)?;
+    if bundle.role_cards_digest != role_cards_digest() {
+        return Err(HouseError::PinMismatch);
+    }
     let manifest = SnapshotManifest {
         bundle: bundle.clone(),
         roles: Role::ALL
@@ -162,13 +170,11 @@ pub(crate) fn install_snapshot(
         })
         .collect();
     let snapshot = snapshot_path(root, house);
-    if install_new_files(&snapshot, &files)?.has_conflicts() {
-        return Err(HouseError::Conflict);
-    }
+    super::installer::install_private_files(&snapshot, &files)?;
     resolve_instructions(root, house, None)
 }
 
-/// Verify exact manifest bytes and all files before handing instructions to a
+/// Verify files against the locally trusted manifest before handing instructions to a
 /// fresh agent. Repository instructions are pinned by the task's Git revision;
 /// they remain in the repository and are not silently copied from another house.
 pub fn resolve_instructions(
@@ -197,6 +203,15 @@ pub fn resolve_instructions(
             return Err(HouseError::UnverifiedSnapshot);
         }
     }
+    if digest_cards(
+        manifest
+            .roles
+            .iter()
+            .map(|asset| (asset.path.as_str().to_owned(), asset.contents.as_str())),
+    ) != manifest.bundle.role_cards_digest
+    {
+        return Err(HouseError::UnverifiedSnapshot);
+    }
     for asset in &manifest.roles {
         if read_bounded(&snapshot.join(asset.path.as_path()))
             .map_err(|_| HouseError::UnverifiedSnapshot)?
@@ -223,6 +238,66 @@ pub fn resolve_instructions(
         entrypoint: snapshot
             .join("house")
             .join(manifest.bundle.entrypoint.as_path()),
+        role_cards_digest: manifest.bundle.role_cards_digest,
         snapshot,
     })
+}
+
+/// SHA-256 of the ordered role paths and UTF-8 contents, encoded as lowercase hex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RoleCardsDigest(String);
+impl RoleCardsDigest {
+    /// Parse an exact SHA-256 hex digest without accepting arbitrary labels.
+    pub fn new(value: &str) -> Result<Self, HouseError> {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(HouseError::InvalidInput);
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+    /// Canonical lowercase hexadecimal encoding.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl TryFrom<String> for RoleCardsDigest {
+    type Error = HouseError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(&value)
+    }
+}
+impl From<RoleCardsDigest> for String {
+    fn from(value: RoleCardsDigest) -> Self {
+        value.0
+    }
+}
+
+/// Digest an export in lexicographic role-path order: domain `kitchen-role-cards-v1\0`, then
+/// each `roles/<name>.md` path and content, each prefixed with its u64 big-endian
+/// byte length. Exporters must compute this from the claimed source revision.
+pub fn role_cards_digest() -> RoleCardsDigest {
+    digest_cards(
+        Role::ALL
+            .into_iter()
+            .map(|role| (format!("roles/{}.md", role.as_str()), role_card(role))),
+    )
+}
+fn digest_cards<'a>(cards: impl IntoIterator<Item = (String, &'a str)>) -> RoleCardsDigest {
+    let mut cards: Vec<_> = cards.into_iter().collect();
+    cards.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = Sha256::new();
+    digest.update(b"kitchen-role-cards-v1\0");
+    for (path, contents) in cards {
+        for value in [path.as_bytes(), contents.as_bytes()] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+    }
+    RoleCardsDigest(
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }

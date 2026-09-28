@@ -61,9 +61,9 @@ impl From<RelativePath> for String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FileMode {
-    /// Data or instructions, owner-readable/writable on Unix.
+    /// Repository data or instructions, mode 0644 subject to umask on Unix.
     Regular,
-    /// Executable, owner-readable/writable/executable on Unix.
+    /// Repository executable, mode 0755 subject to umask on Unix.
     Executable,
 }
 /// One borrowed file to install. Rendering belongs to the caller.
@@ -128,7 +128,7 @@ impl SafeInstaller {
             check_path(&target)?;
             let status = match fs::symlink_metadata(&target) {
                 Ok(metadata) => {
-                    if !metadata.is_file() {
+                    if !metadata.is_file() || metadata.len() > MAX_INSTALL_BYTES as u64 {
                         FileStatus::Conflict
                     } else if read_bounded(&target)? == file.contents
                         && mode_matches(&metadata, file.mode)
@@ -148,32 +148,53 @@ impl SafeInstaller {
         }
         Ok(report)
     }
-    /// Apply the create-only plan, rechecking immediately before writes.
-    pub fn apply(root: &Path, files: &[NewFile<'_>]) -> Result<InstallReport, AdoptionError> {
-        install_new_files(root, files)
-    }
 }
 
 /// Install without overwriting or deleting any pre-existing path. A conflicting
-/// batch returns its preview with no effects. On I/O failure, roll back only
+/// batch returns [`HouseError::Conflicts`] with its preview and no effects. On I/O failure, roll back only
 /// unchanged files created by this call and empty directories created by it;
 /// [`HouseError::PartialInstallation`] lists any paths that could not be removed.
-/// A process crash can leave create-only files; an identical rerun resumes safely.
+/// A process crash can leave files; a rerun accepts complete identical files,
+/// but partial files conflict and require explicit inspection.
 pub fn install_new_files(
     root: &Path,
     files: &[NewFile<'_>],
 ) -> Result<InstallReport, AdoptionError> {
-    install_with_checkpoint(root, files, |_| Ok(()))
+    install_with_checkpoint(root, files, Visibility::Repository, |_| Ok(()))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Visibility {
+    Repository,
+    Private,
+}
+impl Visibility {
+    pub(crate) const fn file_mode(self, mode: FileMode) -> u32 {
+        match (self, mode) {
+            (Self::Repository, FileMode::Regular) => 0o644,
+            (Self::Repository, FileMode::Executable) => 0o755,
+            (Self::Private, FileMode::Regular) => 0o600,
+            (Self::Private, FileMode::Executable) => 0o700,
+        }
+    }
+}
+pub(crate) fn install_private_files(
+    root: &Path,
+    files: &[NewFile<'_>],
+) -> Result<InstallReport, AdoptionError> {
+    super::registry::ensure_external(root)?;
+    install_with_checkpoint(root, files, Visibility::Private, |_| Ok(()))
 }
 
 fn install_with_checkpoint(
     root: &Path,
     files: &[NewFile<'_>],
+    visibility: Visibility,
     mut checkpoint: impl FnMut(usize) -> Result<(), AdoptionError>,
 ) -> Result<InstallReport, AdoptionError> {
     let report = SafeInstaller::preview(root, files)?;
     if report.has_conflicts() {
-        return Ok(report);
+        return Err(HouseError::Conflicts(report));
     }
     let mut created: Vec<(PathBuf, &[u8], File, usize)> = Vec::new();
     let mut dirs = Vec::new();
@@ -191,7 +212,7 @@ fn install_with_checkpoint(
                 continue;
             }
             if let Some(parent) = target.parent() {
-                create_dirs(parent, &mut dirs)?;
+                create_dirs(parent, &mut dirs, visibility)?;
             }
             check_path(&target)?;
             let mut options = OpenOptions::new();
@@ -199,10 +220,7 @@ fn install_with_checkpoint(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                options.mode(match file.mode {
-                    FileMode::Regular => 0o600,
-                    FileMode::Executable => 0o700,
-                });
+                options.mode(visibility.file_mode(file.mode));
             }
             let output = options.open(&target)?;
             created.push((target.clone(), file.contents, output, 0));
@@ -322,6 +340,7 @@ pub(crate) struct CreatedDirectory {
 pub(crate) fn create_dirs(
     path: &Path,
     created: &mut Vec<CreatedDirectory>,
+    visibility: Visibility,
 ) -> Result<(), AdoptionError> {
     check_path(path)?;
     if path.is_dir() {
@@ -330,14 +349,14 @@ pub(crate) fn create_dirs(
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        create_dirs(parent, created)?;
+        create_dirs(parent, created, visibility)?;
     }
     check_path(path)?;
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+        builder.mode(visibility.file_mode(FileMode::Executable));
     }
     builder.create(path)?;
     created.push(CreatedDirectory {
@@ -422,7 +441,7 @@ mod tests {
                 mode: FileMode::Regular,
             },
         ];
-        let result = install_with_checkpoint(&root, &files, |index| {
+        let result = install_with_checkpoint(&root, &files, Visibility::Repository, |index| {
             if index == 1 {
                 Err(HouseError::Io(std::io::ErrorKind::StorageFull))
             } else {
@@ -457,7 +476,7 @@ mod tests {
                 mode: FileMode::Regular,
             },
         ];
-        let result = install_with_checkpoint(&root, &files, |index| {
+        let result = install_with_checkpoint(&root, &files, Visibility::Repository, |index| {
             if index == 1 {
                 fs::write(root.join("first"), b"other owner")?;
                 Err(HouseError::Conflict)

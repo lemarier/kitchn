@@ -183,7 +183,9 @@ pub enum LabelStatus {
     Missing,
     /// Exact name, color and description already match.
     Present,
-    /// Existing case/name/color/description differs or declarations disagree.
+    /// Exact name exists with different color or description; informational only.
+    Drift,
+    /// Existing case differs, duplicate names exist, or declarations disagree.
     Conflict,
 }
 /// A deduplicated label requirement with all consumers and its preview verdict.
@@ -246,6 +248,7 @@ pub fn preview_labels(
                     {
                         LabelStatus::Present
                     }
+                    [existing] if existing.name == label.name => LabelStatus::Drift,
                     _ => LabelStatus::Conflict,
                 }
             });

@@ -98,6 +98,16 @@ impl DoctorReport {
                 "setup incomplete"
             }
         );
+        for label in self
+            .labels
+            .iter()
+            .filter(|label| label.status == LabelStatus::Drift)
+        {
+            text.push_str(&format!(
+                "\nLabel {}: metadata drift; existing color and description retained.\n",
+                label.requirement.name
+            ));
+        }
         for finding in &self.findings {
             text.push_str(&format!(
                 "\n{}\nNext: {}\n",
@@ -149,7 +159,7 @@ pub fn doctor(
     )?;
     for label in &labels {
         let action = match label.status {
-            LabelStatus::Present => continue,
+            LabelStatus::Present | LabelStatus::Drift => continue,
             LabelStatus::Unobserved => {
                 "Use the house-scoped GitHub integration to read this repository's labels, then rerun doctor with that observation."
             }

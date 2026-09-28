@@ -13,16 +13,17 @@
 //! runs backwards is refused. At most [`MAX_OPEN_INSPECTIONS`] inspections
 //! are open at once. A recorded result is a routing intent, never authority.
 //!
-//! The claim is read from the core store inside the ledger transaction, after
-//! the ledger lock is taken. A takeover that commits before that read is
-//! refused; one that commits after it waits behind the ledger write, as if the
-//! write had finished first. The core lock is taken only for that read and is
-//! never held while waiting for the ledger lock.
+//! Each operation takes the core store's shared lock, then the ledger lock,
+//! and checks the claim and commits the ledger write before releasing either.
+//! A takeover needs the core exclusive lock, so it commits either before the
+//! claim check, which then refuses, or after the ledger write. Only this
+//! module holds both locks, always in that order; no ledger operation takes
+//! the core lock while holding the ledger lock.
 use crate::{
     HolderId, HouseId, TaskId,
     contracts::{Clock, EvidenceSubject, ExternalRef, Fence, Role, Settlement, Text, Timestamp},
-    state::{HouseStore, TaskState},
-    trust::{Finding, Ledger, Measurement, TrustError},
+    state::{HouseStore, StoreState, TaskState},
+    trust::{Document, Finding, Ledger, Measurement, TrustError, store_error},
 };
 use serde::{Deserialize, Serialize};
 
@@ -246,33 +247,20 @@ impl Inspection {
 }
 
 impl Ledger {
-    /// Refuse unless `plan.inspector` holds a live claim on the inspector
-    /// task with `fence` at `now`. Call it inside the ledger transaction that
-    /// the claim authorizes, so no takeover can commit between the two.
-    fn check_inspector(
+    /// Run `apply` in one ledger transaction while holding the core store's
+    /// shared lock, so the claim `apply` checks with [`check_inspector`] stays
+    /// current until the ledger write commits.
+    fn fenced<T>(
         &self,
         store: &HouseStore,
-        plan: &InspectionPlan,
-        fence: Fence,
-        now: Timestamp,
-    ) -> Result<(), TrustError> {
+        apply: impl FnOnce(&StoreState, &mut Document) -> Result<T, TrustError>,
+    ) -> Result<T, TrustError> {
         if store.house() != self.house() {
             return Err(TrustError::Refused);
         }
-        let task = store.task(&plan.task).map_err(crate::trust::store_error)?;
-        match task.state() {
-            TaskState::Claimed { lease }
-                if task.spec().role == Role::Inspector
-                    && lease.fence() == fence
-                    && lease.holder() == &plan.inspector
-                    && lease.is_live(now) =>
-            {
-                Ok(())
-            }
-            TaskState::Open | TaskState::Claimed { .. } | TaskState::Settled { .. } => {
-                Err(TrustError::Refused)
-            }
-        }
+        store
+            .read_holding(|core| self.transact(|doc| apply(core, doc)))
+            .map_err(store_error)?
     }
 
     /// Start an inspection only for positively delivered work and an exact PR
@@ -291,9 +279,9 @@ impl Ledger {
         fence: Fence,
         clock: &dyn Clock,
     ) -> Result<Inspection, TrustError> {
-        self.transact(|doc| {
+        self.fenced(store, |core, doc| {
             let now = clock.now();
-            self.check_inspector(store, &plan, fence, now)?;
+            check_inspector(core, &plan, fence, now)?;
             if let Some(old) = doc.inspections.iter_mut().find(|i| i.id() == &plan.id) {
                 if old.plan != plan {
                     return Err(TrustError::Conflict);
@@ -356,14 +344,14 @@ impl Ledger {
         tokens: u64,
         clock: &dyn Clock,
     ) -> Result<SampleReservation, TrustError> {
-        self.transact(|doc| {
+        self.fenced(store, |core, doc| {
             let now = clock.now();
             let index = doc
                 .inspections
                 .iter()
                 .position(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
-            self.check_inspector(store, &doc.inspections[index].plan, fence, now)?;
+            check_inspector(core, &doc.inspections[index].plan, fence, now)?;
             doc.inspections[index].advance_fence(fence)?;
             let inspection = &doc.inspections[index];
             if let Some(old) = inspection.samples.iter().find(|s| s.number == number) {
@@ -435,13 +423,13 @@ impl Ledger {
         result: SampleResult,
         clock: &dyn Clock,
     ) -> Result<bool, TrustError> {
-        self.transact(|doc| {
+        self.fenced(store, |core, doc| {
             let inspection = doc
                 .inspections
                 .iter_mut()
                 .find(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
-            self.check_inspector(store, &inspection.plan, fence, clock.now())?;
+            check_inspector(core, &inspection.plan, fence, clock.now())?;
             inspection.advance_fence(fence)?;
             let sample = inspection
                 .samples
@@ -472,13 +460,13 @@ impl Ledger {
         fence: Fence,
         clock: &dyn Clock,
     ) -> Result<(), TrustError> {
-        self.transact(|doc| {
+        self.fenced(store, |core, doc| {
             let inspection = doc
                 .inspections
                 .iter_mut()
                 .find(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
-            self.check_inspector(store, &inspection.plan, fence, clock.now())?;
+            check_inspector(core, &inspection.plan, fence, clock.now())?;
             inspection.advance_fence(fence)?;
             inspection.cancelled = true;
             Ok(())
@@ -497,5 +485,29 @@ impl Ledger {
                 .cloned()
                 .ok_or(TrustError::Incomplete)
         })
+    }
+}
+
+/// Refuse unless `plan.inspector` holds a live claim on the inspector task
+/// with `fence` at `now` in `core`, as held by [`Ledger::fenced`].
+fn check_inspector(
+    core: &StoreState,
+    plan: &InspectionPlan,
+    fence: Fence,
+    now: Timestamp,
+) -> Result<(), TrustError> {
+    let task = core.task(&plan.task).map_err(store_error)?;
+    match task.state() {
+        TaskState::Claimed { lease }
+            if task.spec().role == Role::Inspector
+                && lease.fence() == fence
+                && lease.holder() == &plan.inspector
+                && lease.is_live(now) =>
+        {
+            Ok(())
+        }
+        TaskState::Open | TaskState::Claimed { .. } | TaskState::Settled { .. } => {
+            Err(TrustError::Refused)
+        }
     }
 }

@@ -2671,81 +2671,165 @@ fn a_taken_over_inspection_refuses_the_previous_fence() -> TestResult {
     Ok(())
 }
 
+/// A clock that runs `pause` the first time it is read. Inspector
+/// operations read the clock after taking the core and ledger locks, so
+/// `pause` runs after the claim is read and before the ledger write.
+struct PausingClock<'a> {
+    time: ManualClock,
+    pause: std::cell::RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+}
+
+impl<'a> PausingClock<'a> {
+    fn new(seconds: u64, pause: impl FnOnce() + 'a) -> Self {
+        Self {
+            time: clock(seconds),
+            pause: std::cell::RefCell::new(Some(Box::new(pause))),
+        }
+    }
+}
+
+impl kitchen::contracts::Clock for PausingClock<'_> {
+    fn now(&self) -> kitchen::contracts::Timestamp {
+        if let Some(pause) = self.pause.borrow_mut().take() {
+            pause();
+        }
+        self.time.now()
+    }
+}
+
 #[test]
-fn a_takeover_before_the_ledger_commit_refuses_the_stale_write() -> TestResult {
-    use std::{fs::OpenOptions, sync::mpsc, thread, time::Duration};
+fn a_takeover_cannot_commit_between_the_claim_check_and_the_ledger_write() -> TestResult {
+    use std::{cell::RefCell, thread, time::Duration};
     let f = Fixture::new()?;
     let l = inspectable(&f)?;
     let inspector = task_id("inspector")?;
     let reviewer = scheduled("independent-reviewer")?;
     let first = f.store.claim(&inspector, &reviewer, ttl(10)?, at(0))?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(f.dir.path().join("trust/ledger.lock"))?;
-    // Run `stale` while the test holds the ledger lock, and commit a
-    // takeover in core before the stale call can reach the ledger.
-    let interleave = |stale: Box<dyn FnOnce() -> Result<(), TrustError> + Send>,
-                      at_seconds: u64|
-     -> TestResult<(Result<(), TrustError>, Fence)> {
-        lock.lock()?;
-        let (ready, started) = mpsc::channel();
-        let call = thread::spawn(move || {
-            // A send fails only if the test already ended.
-            let _ = ready.send(());
-            stale()
-        });
-        started.recv_timeout(Duration::from_secs(1))?;
-        // Give a check made before the ledger lock time to pass first.
-        thread::sleep(Duration::from_millis(50));
-        let next = f
-            .store
-            .take_over(&inspector, &reviewer, ttl(10)?, at(at_seconds))?;
-        lock.unlock()?;
-        Ok((
-            call.join().map_err(|_| "stale call panicked")?,
-            next.fence(),
-        ))
-    };
-    // The stale owner's clock still reads inside its lease.
-    let (store, ledger, stale_plan) = (f.store.clone(), l.clone(), plan()?);
-    let (started, second) = interleave(
-        Box::new(move || {
-            ledger
-                .start_inspection(&store, stale_plan, first.fence(), &clock(9))
-                .map(drop)
-        }),
-        12,
+    l.start_inspection(&f.store, plan()?, first.fence(), &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, first.fence(), 1, 1, &clock(6))?;
+    let quick = HouseStore::open(
+        f.dir.path().join("house"),
+        house()?,
+        StoreOptions {
+            lock_timeout: Duration::from_millis(30),
+            ..StoreOptions::default()
+        },
     )?;
-    assert!(matches!(started, Err(TrustError::Refused)), "{started:?}");
-    assert!(matches!(
-        l.inspection(&plan()?.id),
-        Err(TrustError::Incomplete)
-    ));
-    // The new owner starts and reserves; a takeover then lands before the
-    // previous owner's result, which would otherwise route a finding.
-    l.start_inspection(&f.store, plan()?, second, &clock(13))?;
-    l.reserve_sample(&f.store, &plan()?.id, second, 1, 1, &clock(14))?;
-    let (store, ledger, id) = (f.store.clone(), l.clone(), plan()?.id);
-    let forged = SampleResult::Confirmed {
-        finding: confirmed("fixture:stale-finding")?,
+    let waiting = f.reopen()?;
+    let long = ttl(600)?;
+    let blocked = RefCell::new(None);
+    let background = RefCell::new(None);
+    let finding = SampleResult::Confirmed {
+        finding: confirmed("fixture:finding")?,
         route: FollowUpRoute::Issue,
     };
-    let (finished, _) = interleave(
-        Box::new(move || {
-            ledger
-                .finish_sample(&store, &id, second, 1, forged, &clock(21))
-                .map(drop)
-        }),
-        23,
-    )?;
-    assert!(matches!(finished, Err(TrustError::Refused)), "{finished:?}");
-    let inspection = l.inspection(&plan()?.id)?;
-    assert_eq!(
-        inspection.samples().first().and_then(|s| s.result.as_ref()),
-        None
+    // The first owner's lease has expired in core by 12, but its operation
+    // read the claim at 9 and has not written yet.
+    let paused = PausingClock::new(9, || {
+        let (inspector, reviewer) = (inspector.clone(), reviewer.clone());
+        let waiting = waiting.clone();
+        blocked.replace(Some(quick.take_over(&inspector, &reviewer, long, at(12))));
+        background.replace(Some(thread::spawn(move || {
+            waiting.take_over(&inspector, &reviewer, long, at(12))
+        })));
+    });
+    let written = l.finish_sample(
+        &f.store,
+        &plan()?.id,
+        first.fence(),
+        1,
+        finding.clone(),
+        &paused,
     );
-    assert_eq!(inspection.follow_ups().count(), 0);
+    drop(paused);
+    // No takeover committed while the claim was held.
+    let blocked = blocked.into_inner().ok_or("pause did not run")?;
+    assert!(
+        matches!(
+            blocked,
+            Err(kitchen::Error::State(StateError::LockTimeout { .. }))
+        ),
+        "{blocked:?}"
+    );
+    // The write committed under the claim it checked; the waiting takeover
+    // then completed after it instead of deadlocking.
+    assert!(written?);
+    let second = background
+        .into_inner()
+        .ok_or("pause did not run")?
+        .join()
+        .map_err(|_| "takeover panicked")??;
+    assert!(second.fence() > first.fence());
+    assert_eq!(
+        l.inspection(&plan()?.id)?
+            .samples()
+            .first()
+            .and_then(|s| s.result.as_ref()),
+        Some(&finding)
+    );
+    // Once the takeover commits, the previous owner is refused even while its
+    // own clock still reads inside its lease, and nothing is written.
+    let before = fs::read(ledger_path(&f))?;
+    assert!(matches!(
+        l.reserve_sample(&f.store, &plan()?.id, first.fence(), 2, 1, &clock(9)),
+        Err(TrustError::Refused)
+    ));
+    assert!(matches!(
+        l.cancel_inspection(&f.store, &plan()?.id, first.fence(), &clock(9)),
+        Err(TrustError::Refused)
+    ));
+    assert_eq!(fs::read(ledger_path(&f))?, before);
+    Ok(())
+}
+
+#[test]
+fn concurrent_takeovers_and_inspector_writes_finish_without_deadlock() -> TestResult {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+    let f = Fixture::new()?;
+    let l = inspectable(&f)?;
+    let inspector = task_id("inspector")?;
+    let reviewer = scheduled("independent-reviewer")?;
+    let first = f.store.claim(&inspector, &reviewer, ttl(10)?, at(0))?;
+    l.start_inspection(&f.store, plan()?, first.fence(), &clock(5))?;
+    let short = ttl(10)?;
+    let mut fence = first.fence();
+    for round in 1..=16u64 {
+        // The previous lease runs from 20 * (round - 1) for 10 seconds: the
+        // writer's clock reads inside it, and the takeover comes after it.
+        let base = 20 * round;
+        let barrier = Arc::new(Barrier::new(2));
+        let (store, gate, (id, holder)) = (
+            f.reopen()?,
+            barrier.clone(),
+            (inspector.clone(), reviewer.clone()),
+        );
+        let takeover = thread::spawn(move || {
+            gate.wait();
+            store.take_over(&id, &holder, short, at(base))
+        });
+        let (store, ledger, gate, stale_plan) = (f.reopen()?, l.clone(), barrier, plan()?);
+        let write = thread::spawn(move || {
+            gate.wait();
+            ledger.start_inspection(&store, stale_plan, fence, &clock(base - 15))
+        });
+        let taken = takeover.join().map_err(|_| "takeover panicked")??;
+        // A lock wait that ran out would surface as a storage error here.
+        match write.join().map_err(|_| "write panicked")? {
+            Ok(_) | Err(TrustError::Refused) => {}
+            Err(error) => return Err(format!("round {round}: {error:?}").into()),
+        }
+        assert!(taken.fence() > fence);
+        fence = taken.fence();
+    }
+    // The first owner cannot act; the newest can.
+    assert!(matches!(
+        l.cancel_inspection(&f.store, &plan()?.id, first.fence(), &clock(5)),
+        Err(TrustError::Refused)
+    ));
+    l.cancel_inspection(&f.store, &plan()?.id, fence, &clock(20 * 16 + 1))?;
     Ok(())
 }
 

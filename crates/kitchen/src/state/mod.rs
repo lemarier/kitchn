@@ -53,6 +53,7 @@ pub use marker::{
     MarkerFact, MarkerKey, MarkerPayload, MarkerRecording, MarkerSchema, MarkerSubject,
     SupersededFact, WorkItem, WorkflowMarker,
 };
+pub(crate) use model::StoreState;
 pub use model::{
     AttemptRecord, AttemptState, CancelRequest, CancelStatus, Consumption, Creation, EffectOutcome,
     EffectPlan, EffectRecord, EffectStart, EffectState, EvidenceLog, Lease, MAX_CONSUMED_MESSAGES,

@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "house": "crabnebula",
+  "kitchen": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "guidance": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "entrypoint": "SKILL.md",
+  "notices": [
+    "NOTICE.md"
+  ],
+  "assets": [
+    {
+      "path": "SKILL.md",
+      "contents": "Apply Tauri and specta conventions. Review IPC types and desktop release checks."
+    },
+    {
+      "path": "NOTICE.md",
+      "contents": "Synthetic fixture notice; retained verbatim."
+    }
+  ]
+}

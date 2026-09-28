@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "house": "origin89",
+  "kitchen": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "guidance": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "repositories": [
+    "origin89hq/firmware"
+  ],
+  "postingDestinations": [
+    "origin89hq/firmware"
+  ],
+  "requiredReviewers": [
+    "safety-reviewer"
+  ],
+  "requiredChecks": [
+    "check",
+    "bench"
+  ],
+  "grants": []
+}

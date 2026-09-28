@@ -17,6 +17,11 @@ doc = false
 [dependencies]
 clap.workspace = true
 kitchen.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true

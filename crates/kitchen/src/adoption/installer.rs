@@ -163,16 +163,31 @@ pub fn install_new_files(
     root: &Path,
     files: &[NewFile<'_>],
 ) -> Result<InstallReport, AdoptionError> {
+    install_with_checkpoint(root, files, |_| Ok(()))
+}
+
+fn install_with_checkpoint(
+    root: &Path,
+    files: &[NewFile<'_>],
+    mut checkpoint: impl FnMut(usize) -> Result<(), AdoptionError>,
+) -> Result<InstallReport, AdoptionError> {
     let report = SafeInstaller::preview(root, files)?;
     if report.has_conflicts() {
         return Ok(report);
     }
-    let mut created: Vec<(PathBuf, &[u8], File)> = Vec::new();
+    let mut created: Vec<(PathBuf, &[u8], File, usize)> = Vec::new();
     let mut dirs = Vec::new();
     let result = (|| {
-        for (file, decision) in files.iter().zip(&report.files) {
+        for (index, (file, decision)) in files.iter().zip(&report.files).enumerate() {
+            checkpoint(index)?;
             let target = root.join(file.path.as_path());
             if decision.status == FileStatus::AlreadyIdentical {
+                check_path(&target)?;
+                if read_bounded(&target)? != file.contents
+                    || !mode_matches(&fs::symlink_metadata(&target)?, file.mode)
+                {
+                    return Err(HouseError::Conflict);
+                }
                 continue;
             }
             if let Some(parent) = target.parent() {
@@ -189,13 +204,29 @@ pub fn install_new_files(
                     FileMode::Executable => 0o700,
                 });
             }
-            let mut output = options.open(&target)?;
-            created.push((target.clone(), file.contents, output.try_clone()?));
-            output.write_all(file.contents)?;
-            output.sync_all()?;
+            let output = options.open(&target)?;
+            created.push((target.clone(), file.contents, output, 0));
+            if let Some((_, _, output, written)) = created.last_mut() {
+                while *written < file.contents.len() {
+                    let count = output.write(&file.contents[*written..])?;
+                    if count == 0 {
+                        return Err(HouseError::Io(std::io::ErrorKind::WriteZero));
+                    }
+                    *written += count;
+                }
+                output.sync_all()?;
+            }
         }
         // Sync directory entries before reporting a durable installation.
-        for dir in dirs.iter().rev() {
+        let mut parents: BTreeSet<PathBuf> = created
+            .iter()
+            .filter_map(|(path, _, _, _)| path.parent().map(Path::to_path_buf))
+            .collect();
+        parents.extend(
+            dirs.iter()
+                .filter_map(|dir: &CreatedDirectory| dir.path.parent().map(Path::to_path_buf)),
+        );
+        for dir in parents {
             File::open(dir)?.sync_all()?;
         }
         if root.is_dir() {
@@ -205,16 +236,24 @@ pub fn install_new_files(
     })();
     if let Err(error) = result {
         let mut remaining = Vec::new();
-        for (path, _, handle) in created.iter().rev() {
+        for (path, expected, handle, written) in created.iter().rev() {
             // The open handle proves identity even when a write was partial.
-            let removable = check_path(path).is_ok() && same_file(path, handle);
+            let removable = check_path(path).is_ok()
+                && same_file(path, handle)
+                && read_bounded(path).is_ok_and(|bytes| bytes == expected[..*written]);
             if !removable || fs::remove_file(path).is_err() {
                 remaining.push(path.clone());
             }
         }
         for dir in dirs.iter().rev() {
-            if check_path(dir).is_err() || fs::remove_dir(dir).is_err() {
-                remaining.push(dir.clone());
+            if check_path(&dir.path).is_err()
+                || !dir
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| same_metadata(&dir.path, metadata))
+                || fs::remove_dir(&dir.path).is_err()
+            {
+                remaining.push(dir.path.clone());
             }
         }
         if !remaining.is_empty() {
@@ -275,7 +314,15 @@ pub(crate) fn check_path(path: &Path) -> Result<(), AdoptionError> {
     Ok(())
 }
 
-pub(crate) fn create_dirs(path: &Path, created: &mut Vec<PathBuf>) -> Result<(), AdoptionError> {
+pub(crate) struct CreatedDirectory {
+    path: PathBuf,
+    metadata: Option<fs::Metadata>,
+}
+
+pub(crate) fn create_dirs(
+    path: &Path,
+    created: &mut Vec<CreatedDirectory>,
+) -> Result<(), AdoptionError> {
     check_path(path)?;
     if path.is_dir() {
         return Ok(());
@@ -293,7 +340,14 @@ pub(crate) fn create_dirs(path: &Path, created: &mut Vec<PathBuf>) -> Result<(),
         builder.mode(0o700);
     }
     builder.create(path)?;
-    created.push(path.to_path_buf());
+    created.push(CreatedDirectory {
+        path: path.to_path_buf(),
+        metadata: None,
+    });
+    let metadata = fs::symlink_metadata(path)?;
+    if let Some(dir) = created.last_mut() {
+        dir.metadata = Some(metadata);
+    }
     Ok(())
 }
 
@@ -327,19 +381,97 @@ fn mode_matches(metadata: &fs::Metadata, mode: FileMode) -> bool {
     }
 }
 fn same_file(path: &Path, handle: &File) -> bool {
+    handle
+        .metadata()
+        .is_ok_and(|metadata| same_metadata(path, &metadata))
+}
+fn same_metadata(path: &Path, created: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        match (fs::symlink_metadata(path), handle.metadata()) {
-            (Ok(current), Ok(created)) => {
-                current.dev() == created.dev() && current.ino() == created.ino()
-            }
-            _ => false,
-        }
+        fs::symlink_metadata(path)
+            .is_ok_and(|current| current.dev() == created.dev() && current.ino() == created.ino())
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, handle);
+        let _ = (path, created);
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn partial_failure_rolls_back_only_this_calls_files() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        fs::write(root.join("local"), b"retain")?;
+        let first = RelativePath::new("nested/first")?;
+        let second = RelativePath::new("second")?;
+        let files = [
+            NewFile {
+                path: &first,
+                contents: b"created",
+                mode: FileMode::Regular,
+            },
+            NewFile {
+                path: &second,
+                contents: b"later",
+                mode: FileMode::Regular,
+            },
+        ];
+        let result = install_with_checkpoint(&root, &files, |index| {
+            if index == 1 {
+                Err(HouseError::Io(std::io::ErrorKind::StorageFull))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(
+            result,
+            Err(HouseError::Io(std::io::ErrorKind::StorageFull))
+        ));
+        assert!(!root.join("nested").exists());
+        assert_eq!(fs::read(root.join("local"))?, b"retain");
+        assert!(!install_new_files(&root, &files)?.has_conflicts());
+        Ok(())
+    }
+    #[test]
+    fn changed_file_is_retained_and_reported_during_rollback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let first = RelativePath::new("first")?;
+        let second = RelativePath::new("second")?;
+        let files = [
+            NewFile {
+                path: &first,
+                contents: b"created",
+                mode: FileMode::Regular,
+            },
+            NewFile {
+                path: &second,
+                contents: b"later",
+                mode: FileMode::Regular,
+            },
+        ];
+        let result = install_with_checkpoint(&root, &files, |index| {
+            if index == 1 {
+                fs::write(root.join("first"), b"other owner")?;
+                Err(HouseError::Conflict)
+            } else {
+                Ok(())
+            }
+        });
+        match result {
+            Err(HouseError::PartialInstallation { remaining }) => {
+                assert_eq!(remaining, vec![root.join("first")])
+            }
+            other => return Err(format!("unexpected result: {other:?}").into()),
+        }
+        assert_eq!(fs::read(root.join("first"))?, b"other owner");
+        Ok(())
     }
 }

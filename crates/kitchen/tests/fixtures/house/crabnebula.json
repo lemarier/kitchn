@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "house": "crabnebula",
+  "kitchen": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "guidance": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "repositories": [
+    "crabnebula/tauri-fixture"
+  ],
+  "postingDestinations": [
+    "crabnebula/tauri-fixture"
+  ],
+  "requiredReviewers": [
+    "desktop-reviewer"
+  ],
+  "requiredChecks": [
+    "tauri-check",
+    "specta-types"
+  ],
+  "grants": []
+}

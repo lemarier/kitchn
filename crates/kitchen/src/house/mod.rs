@@ -9,3 +9,5 @@ pub use config::*;
 pub use error::HouseError;
 pub use requirements::*;
 pub use roles::*;
+mod doctor;
+pub use doctor::*;

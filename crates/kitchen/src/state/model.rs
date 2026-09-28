@@ -1034,9 +1034,6 @@ impl StoreState {
                 .into());
             }
         }
-        backend
-            .capabilities
-            .require([plan.operation.required_capability()])?;
         let resubmission = if backend
             .capabilities
             .supports(Capability::EffectIdempotentRequests)
@@ -1048,6 +1045,13 @@ impl StoreState {
         let house = self.house.clone();
         let nonce = self.nonce;
         let task = self.task_mut(&plan.task)?;
+        backend.capabilities.require(
+            task.spec
+                .requires
+                .iter()
+                .copied()
+                .chain([plan.operation.required_capability()]),
+        )?;
         task.owned_lease(plan.fence, now, true)?;
         if task.cancel.is_some() {
             return fail(StateError::CancelRequested);

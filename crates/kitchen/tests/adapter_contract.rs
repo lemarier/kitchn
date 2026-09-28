@@ -689,3 +689,67 @@ fn recovery_stays_on_the_backend_namespace_that_received_the_effect() -> TestRes
     assert_eq!(first.effects_performed(), 1);
     Ok(())
 }
+
+#[test]
+fn workflow_capability_requirements_are_checked_at_execution() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task = task_id("task-1")?;
+    let mut workflow = spec("task-1")?;
+    workflow.requires = [
+        Capability::WorkerLaunchReadiness,
+        Capability::ScheduleRunTimeout,
+    ]
+    .into();
+    fixture.store.create_task(workflow, at(0))?;
+    let fence = fixture
+        .store
+        .claim(&task, &holder("coordinator-a")?, ttl(60)?, at(0))?
+        .fence();
+    fixture.store.start_attempt(&task, fence, at(0))?;
+    let clock = ManualClock::starting_at(1);
+
+    // Launch alone is supported; the workflow's readiness requirement is
+    // missing and its run timeout is only partial.
+    let backend = FakeBackend::new(
+        backend_id()?,
+        house()?,
+        CapabilitySet::supporting([Capability::WorkerLaunchIsolated]).with(
+            Capability::ScheduleRunTimeout,
+            kitchen::contracts::Support::Partial,
+        ),
+    );
+    let refused = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(&task, fence, "launch", launch()?)?,
+        &clock,
+    );
+    assert!(matches!(
+        refused,
+        Err(Error::Contract(ContractError::UnsupportedCapabilities { ref missing, ref partial }))
+            if missing == &[Capability::WorkerLaunchReadiness]
+                && partial == &[Capability::ScheduleRunTimeout]
+    ));
+    assert!(fixture.store.task(&task)?.effects().is_empty());
+    assert_eq!(backend.effects_performed(), 0);
+
+    let capable = FakeBackend::fully_capable(backend_id()?, house()?);
+    let launched = run_effect(
+        &fixture.store,
+        &capable,
+        &grants()?,
+        plan(&task, fence, "launch", launch()?)?,
+        &clock,
+    )?;
+    assert!(matches!(launched.state(), EffectState::Applied { .. }));
+    let stored = fixture.store.task(&task)?;
+    assert_eq!(
+        stored.spec().requires.iter().copied().collect::<Vec<_>>(),
+        [
+            Capability::ScheduleRunTimeout,
+            Capability::WorkerLaunchReadiness
+        ]
+    );
+    Ok(())
+}

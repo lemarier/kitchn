@@ -1,12 +1,14 @@
 //! Task definitions, attempts, retry bounds, and settlement.
 
-use std::{fmt, num::NonZeroU32, time::Duration};
+use std::{collections::BTreeSet, fmt, num::NonZeroU32, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     TaskId,
-    contracts::{CommitId, ContractError, GrantScope, Repository, Role, TaskAuthority, ValueKind},
+    contracts::{
+        Capability, CommitId, ContractError, GrantScope, Repository, Role, TaskAuthority, ValueKind,
+    },
 };
 
 /// A monotonically increasing ownership token. Every claim or takeover gets a
@@ -167,6 +169,11 @@ pub struct TaskSpec {
     pub retry: RetryPolicy,
     /// Pinned instruction revisions.
     pub provenance: Provenance,
+    /// Backend capabilities the task's workflow requires, such as launch
+    /// readiness or a run timeout. Every effect is refused on a backend that
+    /// does not fully support all of them, in addition to the capability the
+    /// effect's own operation needs.
+    pub requires: BTreeSet<Capability>,
 }
 
 impl TaskSpec {

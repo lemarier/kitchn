@@ -387,7 +387,7 @@ fn redelivered_event_produces_one_task() -> TestResult {
 }
 
 #[test]
-fn out_of_order_delivery_admits_each_revision_once_and_skips_stale_ones() -> TestResult {
+fn out_of_order_delivery_admits_each_revision_once() -> TestResult {
     let fixture = Fixture::new()?;
     let (config, source) = (house_config()?, delivering()?);
     let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
@@ -395,23 +395,25 @@ fn out_of_order_delivery_admits_each_revision_once_and_skips_stale_ones() -> Tes
     let older = pushed("delivery-1", 'c', 10)?;
     let newer = pushed("delivery-2", 'd', 20)?;
 
-    // The newer head arrives first, then the older one, then a redelivery of
-    // the newer one.
+    // The newer head arrives first, then the older one, then redeliveries.
+    // The source's times do not order admissions: the older head is a
+    // revision the store has not received, so it is work of its own.
     let admitted = admit(&intake, &newer, &receiver(&newer, fence)?, 21)?;
     let newer_task = task_of(&admitted)?;
     assert_eq!(admitted, Admission::Admitted(newer_task.clone()));
-    assert_eq!(
-        admit(&intake, &older, &receiver(&older, fence)?, 22)?,
-        Admission::Stale(newer_task.clone())
-    );
+    let older_task = task_of(&admit(&intake, &older, &receiver(&older, fence)?, 22)?)?;
+    assert_ne!(older_task, newer_task);
     assert_eq!(
         admit(&intake, &newer, &receiver(&newer, fence)?, 23)?,
         Admission::Duplicate(newer_task.clone())
     );
-    assert_eq!(fixture.store.tasks()?.len(), 1);
+    assert_eq!(
+        admit(&intake, &older, &receiver(&older, fence)?, 24)?,
+        Admission::Duplicate(older_task)
+    );
+    assert_eq!(fixture.store.tasks()?.len(), 2);
 
-    // An older event delivered before the newer one is not stale: both
-    // revisions are real work, admitted once each, in either delivery order.
+    // Issue revisions behave the same: each is real work, admitted once.
     let first = labeled("delivery-3", 7, 30)?;
     let second = labeled("delivery-4", 7, 40)?;
     let first_task = task_of(&admit(&intake, &first, &receiver(&first, fence)?, 41)?)?;
@@ -421,16 +423,62 @@ fn out_of_order_delivery_admits_each_revision_once_and_skips_stale_ones() -> Tes
         admit(&intake, &first, &receiver(&first, fence)?, 43)?,
         Admission::Duplicate(first_task)
     );
+    assert_eq!(fixture.store.tasks()?.len(), 4);
+    Ok(())
+}
+
+/// A skewed, future, or hostile event time cannot make later real events
+/// stale or merge distinct revisions: only the store's receipt order counts.
+#[test]
+fn provider_event_times_never_order_admissions() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (config, source) = (house_config()?, delivering()?);
+    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let fence = receiver_fence(&fixture.store, 0)?;
+    let future = ForgeEvent::new(
+        origin(house()?, "delivery-future")?,
+        ForgeEventKind::PullRequestPushed,
+        pull_request(60)?,
+        head('c')?,
+        Timestamp::from_unix_millis(u64::MAX),
+    )?;
+    let future_task = task_of(&admit(&intake, &future, &receiver(&future, fence)?, 10)?)?;
+
+    // Real pushes after it, one claiming the epoch, are each new work.
+    let mut tasks = vec![future_task.clone()];
+    for (event, fill, seconds) in [("delivery-2", 'd', 11), ("delivery-3", 'e', 0)] {
+        let pushed = pushed(event, fill, seconds)?;
+        let admitted = admit(&intake, &pushed, &receiver(&pushed, fence)?, 12)?;
+        assert_eq!(admitted, Admission::Admitted(task_of(&admitted)?));
+        tasks.push(task_of(&admitted)?);
+    }
+    assert_eq!(fixture.store.tasks()?.len(), 3);
+    tasks.sort();
+    tasks.dedup();
+    assert_eq!(tasks.len(), 3);
+
+    // A redelivery of the same revision with a different claimed time is the
+    // same work, not a new or stale one.
+    let rewound = ForgeEvent::new(
+        origin(house()?, "delivery-future")?,
+        ForgeEventKind::PullRequestPushed,
+        pull_request(60)?,
+        head('c')?,
+        at(1),
+    )?;
+    assert_eq!(
+        admit(&intake, &rewound, &receiver(&rewound, fence)?, 13)?,
+        Admission::Duplicate(future_task)
+    );
     assert_eq!(fixture.store.tasks()?.len(), 3);
     Ok(())
 }
 
-/// An older event never records after a newer one, even when both deliveries
-/// race under the same live consumer fence: the stale scan and the marker
-/// write are one store transaction. Each round is an independent race, so a
-/// scan separated from the write would fail some round.
+/// Racing deliveries of two revisions under the same live consumer fence
+/// each admit their own work once; the store's transaction orders the two
+/// markers. Each round is an independent race.
 #[test]
-fn racing_deliveries_never_record_an_older_event_after_a_newer_one() -> TestResult {
+fn racing_deliveries_admit_each_revision_once() -> TestResult {
     let (config, source) = (house_config()?, delivering()?);
     let older = pushed("delivery-1", 'c', 10)?;
     let newer = pushed("delivery-2", 'd', 20)?;
@@ -456,32 +504,25 @@ fn racing_deliveries_never_record_an_older_event_after_a_newer_one() -> TestResu
             from_older.map_err(|_| "older delivery panicked")??,
             from_newer.map_err(|_| "newer delivery panicked")??,
         );
-        assert!(
-            matches!(from_newer, Admission::Admitted(_)),
-            "round {round}: {from_newer:?}"
-        );
-        let recorded: Vec<MarkerSubject> = fixture
+        for admitted in [&from_older, &from_newer] {
+            assert!(
+                matches!(admitted, Admission::Admitted(_)),
+                "round {round}: {admitted:?}"
+            );
+        }
+        let mut recorded: Vec<MarkerSubject> = fixture
             .store
             .markers(&route()?.workflow)?
             .iter()
             .map(|marker| marker.key().subject.clone())
             .collect();
-        match from_older {
-            // The older event lost the race: it left no marker or task.
-            Admission::Stale(_) => {
-                assert_eq!(recorded, std::slice::from_ref(&newer_head), "round {round}");
-                assert_eq!(fixture.store.tasks()?.len(), 1, "round {round}");
-            }
-            // The older event won: it was recorded first.
-            Admission::Admitted(_) => {
-                assert_eq!(
-                    recorded,
-                    [older_head.clone(), newer_head.clone()],
-                    "round {round}"
-                );
-            }
-            other => return Err(format!("round {round}: unexpected {other:?}").into()),
-        }
+        recorded.sort_by_key(|subject| subject == &newer_head);
+        assert_eq!(
+            recorded,
+            [older_head.clone(), newer_head.clone()],
+            "round {round}"
+        );
+        assert_eq!(fixture.store.tasks()?.len(), 2, "round {round}");
     }
     Ok(())
 }
@@ -828,13 +869,12 @@ fn event_and_fallback_schedule_share_work_and_one_consumer() -> TestResult {
     assert_ne!(missed_task, polled_task);
     assert_eq!(fixture.store.tasks()?.len(), 3);
 
-    // Events still order each other: one older than an admitted event is stale.
+    // Neither do event times: an event that claims to predate an admitted
+    // one is new work for a revision the store has not received.
     let old = pushed("delivery-0", 'a', 1)?;
-    assert_eq!(
-        admit(&intake, &old, &receiver(&old, fence)?, 22)?,
-        Admission::Stale(missed_task)
-    );
-    assert_eq!(fixture.store.tasks()?.len(), 3);
+    let old_task = task_of(&admit(&intake, &old, &receiver(&old, fence)?, 22)?)?;
+    assert_ne!(old_task, missed_task);
+    assert_eq!(fixture.store.tasks()?.len(), 4);
     Ok(())
 }
 

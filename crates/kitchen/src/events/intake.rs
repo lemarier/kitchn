@@ -67,9 +67,9 @@ pub enum Admission {
     /// another event about the same revision, or the fallback poll. Its task
     /// exists; claim it through the store as usual.
     Duplicate(TaskId),
-    /// An event about a newer revision of the same item was already
-    /// admitted, so this out-of-order event starts nothing. Names the newer
-    /// work's task.
+    /// This revision's admission was interrupted, and the store received
+    /// another revision of the same item since, so finishing it starts
+    /// nothing. Names the newer work's task.
     Stale(TaskId),
     /// The route does not start work for this event kind. Nothing was read or
     /// written.
@@ -91,8 +91,9 @@ enum Via {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AdmissionRecord {
     task: TaskId,
-    /// Source time of the event, or the poll's observation time. Only event
-    /// times order admissions.
+    /// Source time of the event, or the poll's observation time. Recorded
+    /// for audit only: a provider or sender supplies an event's time, so it
+    /// never orders or deduplicates admissions.
     at: Timestamp,
     via: Via,
 }
@@ -314,18 +315,18 @@ impl<'a> EventIntake<'a> {
             subject: subject.clone(),
             task: record.task.clone(),
         };
-        // The stale scan and the write are one store transaction, so an older
-        // event cannot record after a newer one under the same live fence.
+        // The stale scan and the write are one store transaction, so the
+        // store's receipt order is the order the scan sees.
         let fact = MarkerFact::workflow(self.schema.clone(), &record)?;
         // A redelivery that finishes an interrupted admission is checked too:
-        // a newer event may have been admitted since the key was recorded.
+        // another revision may have been received since the key was recorded.
         let recorded_now = match self.store.record_marker_unless_created(
             key.clone(),
             fact,
             claimant,
             now,
             &order.task,
-            |markers| self.newer_event(markers, &key, &record),
+            |markers| self.newer_receipt(markers, &key),
         ) {
             Ok(MarkerAttempt::Recorded(_)) => true,
             Ok(MarkerAttempt::AlreadyRecorded(_)) => false,
@@ -350,39 +351,33 @@ impl<'a> EventIntake<'a> {
         }
     }
 
-    /// For an event, the task of the newest event admitted for the same item
-    /// at another revision that occurred after it. Only events order each
-    /// other: their times come from the same source, while a poll's
-    /// observation time says nothing about when its revision was made, so a
-    /// poll never makes an event stale and is never stale itself.
-    fn newer_event(
+    /// The task of the newest admission the store received for the same item
+    /// at another revision after it first received `key`. Ordering uses only
+    /// the store's receipt order (markers are kept oldest first), never a
+    /// provider or sender time, so a skewed or hostile event time cannot make
+    /// real work stale. A revision the store has not received before is
+    /// therefore never stale; only finishing an interrupted admission can be.
+    fn newer_receipt(
         &self,
         markers: &[&WorkflowMarker],
         key: &MarkerKey,
-        record: &AdmissionRecord,
     ) -> Result<Option<TaskId>> {
-        if record.via == Via::Poll {
+        let Some(position) = markers.iter().position(|marker| marker.key() == key) else {
             return Ok(None);
-        }
-        let mut newest: Option<AdmissionRecord> = None;
-        for marker in markers {
+        };
+        let mut newest = None;
+        for marker in markers.iter().skip(position.saturating_add(1)) {
             let other = marker.key();
             let admission = matches!(
                 marker.fact(),
                 MarkerFact::Workflow { schema, .. } if schema == &self.schema
             );
-            if !admission || other.item != key.item || other.subject == key.subject {
-                continue;
-            }
-            let seen: AdmissionRecord = marker.fact().decode(&self.schema)?;
-            let newer = seen.at > record.at
-                && matches!(seen.via, Via::Event { .. })
-                && newest.as_ref().is_none_or(|best| seen.at > best.at);
-            if newer {
-                newest = Some(seen);
+            if admission && other.item == key.item && other.subject != key.subject {
+                let seen: AdmissionRecord = marker.fact().decode(&self.schema)?;
+                newest = Some(seen.task);
             }
         }
-        Ok(newest.map(|seen| seen.task))
+        Ok(newest)
     }
 
     /// The task id for work on `item` at `subject` in this workflow. Stable

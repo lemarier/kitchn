@@ -128,7 +128,8 @@ impl ForgeEvent {
         &self.subject
     }
 
-    /// When the source says the event happened.
+    /// When the source says the event happened. Informational only: the
+    /// provider or sender supplies it, so admission never orders by it.
     #[must_use]
     pub const fn occurred_at(&self) -> Timestamp {
         self.occurred_at

@@ -1,6 +1,6 @@
 //! PR repair: which settled, owned branches may get a repair writer, in
-//! which order, within which budgets, and the push check every writer runs
-//! immediately before pushing.
+//! which order, and within which budgets. Pushes go through
+//! [`crate::workflows::push`].
 //!
 //! Repair never touches a branch with a live writer, a person's terminal,
 //! dirty or unpushed work, or a merged or closed pull request. Stacks repair
@@ -60,7 +60,7 @@ pub enum Mergeability {
     Unknown,
 }
 
-/// The facts repair and the push check need about one pull request.
+/// The facts repair and the push boundary need about one pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestView {
     /// Number.
@@ -393,107 +393,5 @@ pub fn repair_spec(
         provenance,
         resources: BTreeSet::from([worktree]),
         requires: crate::contracts::CapabilityRequirements::new(),
-    }
-}
-
-/// What a writer is about to push.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PushIntent {
-    /// The exact branch.
-    pub branch: BranchName,
-    /// The pull request the branch belongs to, once opened.
-    pub pull_request: Option<IssueNumber>,
-    /// The remote head the writer last saw; `None` before the first push.
-    pub expected_remote: Option<CommitId>,
-}
-
-/// State read immediately before the push.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PushObservation {
-    /// The pull request, when the intent names one.
-    pub pull_request: Observed<Option<PullRequestView>>,
-    /// The remote branch head; `None` when the branch does not exist.
-    pub remote_head: Observed<Option<CommitId>>,
-}
-
-/// Why a push must not happen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PushRefusal {
-    /// The pull request merged; pushing would recreate a deleted branch.
-    Merged,
-    /// The pull request closed.
-    Closed,
-    /// The branch was deleted.
-    BranchDeleted,
-    /// Someone else moved the branch.
-    RemoteMoved {
-        /// The head found.
-        found: CommitId,
-    },
-    /// The branch already exists though the writer expected to create it.
-    BranchExists,
-    /// The pull request's head branch is not this branch.
-    WrongBranch,
-    /// The named pull request does not exist.
-    PullRequestMissing,
-    /// The observation is about another pull request.
-    WrongPullRequest,
-    /// State could not be read.
-    Unknown,
-}
-
-/// Permission to push, valid only for the state it was checked against.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[must_use]
-pub struct PushPermit {
-    /// The remote head the push may replace, if any.
-    pub replaces: Option<CommitId>,
-}
-
-/// Check PR and branch state immediately before a push. Every push needs a
-/// fresh check; a stale permit proves nothing.
-///
-/// # Errors
-/// Returns the [`PushRefusal`] that forbids pushing.
-pub fn check_push(
-    intent: &PushIntent,
-    observed: &PushObservation,
-) -> std::result::Result<PushPermit, PushRefusal> {
-    if let Some(number) = intent.pull_request {
-        let Observed::Known(pull_request) = &observed.pull_request else {
-            return Err(PushRefusal::Unknown);
-        };
-        let Some(pull_request) = pull_request else {
-            return Err(PushRefusal::PullRequestMissing);
-        };
-        if pull_request.number != number {
-            return Err(PushRefusal::WrongPullRequest);
-        }
-        match pull_request.state {
-            PullRequestState::Open => {}
-            PullRequestState::Merged => return Err(PushRefusal::Merged),
-            PullRequestState::Closed => return Err(PushRefusal::Closed),
-        }
-        if intent
-            .branch
-            .verify_observed(&pull_request.head_branch)
-            .is_err()
-        {
-            return Err(PushRefusal::WrongBranch);
-        }
-    }
-    let Observed::Known(remote) = &observed.remote_head else {
-        return Err(PushRefusal::Unknown);
-    };
-    match (&intent.expected_remote, remote) {
-        (None, None) => Ok(PushPermit { replaces: None }),
-        (None, Some(_)) => Err(PushRefusal::BranchExists),
-        (Some(_), None) => Err(PushRefusal::BranchDeleted),
-        (Some(expected), Some(found)) if expected == found => Ok(PushPermit {
-            replaces: Some(found.clone()),
-        }),
-        (Some(_), Some(found)) => Err(PushRefusal::RemoteMoved {
-            found: found.clone(),
-        }),
     }
 }

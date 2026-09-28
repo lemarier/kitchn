@@ -63,6 +63,9 @@ pub enum CoordinationError {
     /// the report path, is not a plain single-line value.
     #[error("brief argument is not a plain single-line value")]
     InvalidBriefArgument,
+    /// The Git executable, checkout, remote name, or deadline is invalid.
+    #[error("git remote is not configured with absolute paths, a plain name, and a deadline")]
+    InvalidGitRemote,
 }
 
 impl CoordinationError {
@@ -73,7 +76,8 @@ impl CoordinationError {
             Self::InvalidBranchName
             | Self::BriefMismatch
             | Self::MissingRepository
-            | Self::InvalidBriefArgument => ErrorClass::InvalidInput,
+            | Self::InvalidBriefArgument
+            | Self::InvalidGitRemote => ErrorClass::InvalidInput,
             Self::BranchMismatch => ErrorClass::Conflict,
         }
     }

@@ -1,31 +1,27 @@
-//! Repair eligibility, stack order, slots, budgets, and the push check.
-//! Sanitized fixtures, the fake backend, and a fake GitHub transport only.
+//! Repair eligibility, stack order, slots, budgets, and the GitHub read
+//! mapping. Sanitized fixtures and the fake backend only; pushes are tested
+//! in `workflows_push`.
 
 mod common;
 mod workflows_support;
 
-use std::{cell::RefCell, collections::VecDeque, time::Duration};
+use std::time::Duration;
 
 use common::{TestResult, commit, scheduled, ttl};
 use kitchen::{
-    CredentialId, HouseId, TaskId,
+    TaskId,
     contracts::{
-        CommitId, ExternalRef, IssueNumber, Permission, PostingBudget, ResourceKind, ResourceRef,
-        RetryPolicy, Settlement, Workspace,
+        ExternalRef, IssueNumber, ResourceKind, ResourceRef, RetryPolicy, Settlement, Workspace,
     },
-    integrations::github::{
-        CredentialRef, GitHubClient, GitHubReadTransport, HouseScope, IntegrationError,
-        PullRequest, ReadLimits, ReadRequest,
-    },
+    integrations::github::PullRequest,
     state::StateError,
     workflows::{
         coordination::{LaunchOutcome, launch_worker},
         pickup::FollowUpBudget,
         repair::{
             HandOver, MAX_CONCURRENT_REPAIRS, Mergeability, Observed, Ownership, PullRequestState,
-            PullRequestView, PushIntent, PushObservation, PushRefusal, RepairCandidate,
-            RepairDecision, RepairKind, RepairPolicy, Skip, StackLayer, WorktreeView, Writer,
-            assess, check_push, observe_pull_request, plan, repair_spec, repair_task_id,
+            PullRequestView, RepairCandidate, RepairDecision, RepairKind, RepairPolicy, Skip,
+            StackLayer, WorktreeView, Writer, assess, plan, repair_spec, repair_task_id,
         },
     },
 };
@@ -340,130 +336,6 @@ fn a_lower_layer_waiting_for_a_person_blocks_the_layers_above() -> TestResult {
     Ok(())
 }
 
-fn open_pr(pr: u64, head: CommitId) -> TestResult<Observed<Option<PullRequestView>>> {
-    Ok(Observed::Known(Some(PullRequestView {
-        head,
-        ..view(pr, PullRequestState::Open, Mergeability::Clean)?
-    })))
-}
-
-#[test]
-fn every_push_is_checked_against_fresh_pr_and_branch_state() -> TestResult {
-    let pushed = commit('d')?;
-    let intent = PushIntent {
-        branch: branch("lemarier/issue-5")?,
-        pull_request: Some(number(5)?),
-        expected_remote: Some(pushed.clone()),
-    };
-    let open = PushObservation {
-        pull_request: open_pr(5, pushed.clone())?,
-        remote_head: Observed::Known(Some(pushed.clone())),
-    };
-    assert_eq!(
-        check_push(&intent, &open),
-        Ok(kitchen::workflows::repair::PushPermit {
-            replaces: Some(pushed.clone())
-        })
-    );
-    let with_state = |state| -> TestResult<PushObservation> {
-        Ok(PushObservation {
-            pull_request: Observed::Known(Some(view(5, state, Mergeability::Clean)?)),
-            remote_head: Observed::Known(None),
-        })
-    };
-    // The live incident: the PR merged and its branch was deleted.
-    assert_eq!(
-        check_push(&intent, &with_state(PullRequestState::Merged)?),
-        Err(PushRefusal::Merged)
-    );
-    assert_eq!(
-        check_push(&intent, &with_state(PullRequestState::Closed)?),
-        Err(PushRefusal::Closed)
-    );
-    let deleted = PushObservation {
-        remote_head: Observed::Known(None),
-        ..open.clone()
-    };
-    assert_eq!(
-        check_push(&intent, &deleted),
-        Err(PushRefusal::BranchDeleted)
-    );
-    let moved = PushObservation {
-        remote_head: Observed::Known(Some(commit('f')?)),
-        ..open.clone()
-    };
-    assert_eq!(
-        check_push(&intent, &moved),
-        Err(PushRefusal::RemoteMoved {
-            found: commit('f')?
-        })
-    );
-    let unknown_pr = PushObservation {
-        pull_request: Observed::Unknown,
-        ..open.clone()
-    };
-    assert_eq!(check_push(&intent, &unknown_pr), Err(PushRefusal::Unknown));
-    let unknown_remote = PushObservation {
-        remote_head: Observed::Unknown,
-        ..open.clone()
-    };
-    assert_eq!(
-        check_push(&intent, &unknown_remote),
-        Err(PushRefusal::Unknown)
-    );
-    let missing = PushObservation {
-        pull_request: Observed::Known(None),
-        ..open.clone()
-    };
-    assert_eq!(
-        check_push(&intent, &missing),
-        Err(PushRefusal::PullRequestMissing)
-    );
-    let other = PushObservation {
-        pull_request: open_pr(6, pushed.clone())?,
-        ..open.clone()
-    };
-    assert_eq!(
-        check_push(&intent, &other),
-        Err(PushRefusal::WrongPullRequest)
-    );
-    let renamed = PushObservation {
-        pull_request: Observed::Known(Some(PullRequestView {
-            head_branch: "orca/lemarier/issue-5".to_owned(),
-            ..view(5, PullRequestState::Open, Mergeability::Clean)?
-        })),
-        ..open
-    };
-    assert_eq!(check_push(&intent, &renamed), Err(PushRefusal::WrongBranch));
-    Ok(())
-}
-
-#[test]
-fn a_first_push_must_not_find_an_existing_branch() -> TestResult {
-    let intent = PushIntent {
-        branch: branch("lemarier/issue-6")?,
-        pull_request: None,
-        expected_remote: None,
-    };
-    let absent = PushObservation {
-        pull_request: Observed::Unknown,
-        remote_head: Observed::Known(None),
-    };
-    assert_eq!(
-        check_push(&intent, &absent),
-        Ok(kitchen::workflows::repair::PushPermit { replaces: None })
-    );
-    let present = PushObservation {
-        remote_head: Observed::Known(Some(commit('d')?)),
-        ..absent
-    };
-    assert_eq!(
-        check_push(&intent, &present),
-        Err(PushRefusal::BranchExists)
-    );
-    Ok(())
-}
-
 fn github_pr(
     merged: bool,
     state: &str,
@@ -523,72 +395,6 @@ fn github_pull_requests_map_to_the_repair_view_without_optimism() -> TestResult 
         assert_eq!(view.head_branch, "lemarier/issue-5");
         assert_eq!(view.head, commit('d')?);
     }
-    Ok(())
-}
-
-struct Transport(RefCell<VecDeque<Result<Vec<u8>, IntegrationError>>>);
-
-impl GitHubReadTransport for Transport {
-    fn read(
-        &self,
-        _: &CredentialRef,
-        _: &ReadRequest,
-        _: Duration,
-        _: usize,
-    ) -> Result<Vec<u8>, IntegrationError> {
-        self.0
-            .borrow_mut()
-            .pop_front()
-            .unwrap_or(Err(IntegrationError::Unavailable))
-    }
-}
-
-#[test]
-fn a_failed_pull_request_read_is_unknown_and_refuses_the_push() -> TestResult {
-    let house = HouseId::new("origin89")?;
-    let requester = ExternalRef::new("origin89-bot")?;
-    let scope = HouseScope::new(
-        house.clone(),
-        [repo()?],
-        requester.clone(),
-        CredentialRef::new(house.clone(), CredentialId::new("github-read")?, requester),
-        PostingBudget::new(0)?,
-        [Permission::PostComment],
-    )?;
-    let responses = VecDeque::from([
-        Ok(serde_json::to_vec(&github_pr(
-            true, "closed", None, "unknown",
-        ))?),
-        Err(IntegrationError::Timeout),
-    ]);
-    let client = GitHubClient::new(
-        scope,
-        Transport(RefCell::new(responses)),
-        ReadLimits::new(Duration::from_secs(5), 1, 64 * 1024)?,
-    );
-    let intent = PushIntent {
-        branch: branch("lemarier/issue-5")?,
-        pull_request: Some(number(5)?),
-        expected_remote: Some(commit('d')?),
-    };
-    let merged = observe_pull_request(&client, &house, &repo()?, number(5)?);
-    let head = commit('d')?;
-    let observation = |pull_request| PushObservation {
-        pull_request,
-        remote_head: Observed::Known(Some(head.clone())),
-    };
-    assert_eq!(
-        check_push(
-            &intent,
-            &observation(match merged {
-                Observed::Known(view) => Observed::Known(Some(view)),
-                Observed::Unknown => Observed::Unknown,
-            })
-        ),
-        Err(PushRefusal::Merged)
-    );
-    let failed = observe_pull_request(&client, &house, &repo()?, number(5)?);
-    assert_eq!(failed, Observed::Unknown);
     Ok(())
 }
 

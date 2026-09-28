@@ -214,6 +214,7 @@ impl Template {
                     if entry.mode == FileMode::Executable
                         || body.starts_with("#!")
                         || body.starts_with("---")
+                        || body.starts_with("+++")
                     {
                         return Err(template_problem(TemplateProblem::MarkerPlacement(
                             entry.source.clone(),

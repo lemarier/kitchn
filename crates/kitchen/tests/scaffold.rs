@@ -963,6 +963,7 @@ fn markers_refuse_first_line_sensitive_content() -> TestResult {
     for (body, mode) in [
         ("#!/bin/sh\necho hello\n", "regular"),
         ("---\nname: skill\n---\n", "regular"),
+        ("+++\nname = \"skill\"\n+++\n", "regular"),
         ("echo hello\n", "executable"),
     ] {
         let manifest = Manifest::parse(&minimal_with(&format!(

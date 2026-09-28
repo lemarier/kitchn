@@ -94,6 +94,6 @@ house template if it needs richer text; do not put unrestricted text directly
 into structured syntax or commands. For example, the Origin89 fixture rejects
 `summary='A "quoted" tool'` rather than producing invalid TOML.
 
-Provenance cannot be enabled for executables or content beginning with `#!` or
-`---`. Those formats need their first line; leave them unmarked. The check runs
+Provenance cannot be enabled for executables or content beginning with `#!`,
+`---`, or `+++`. Those formats need their first line; leave them unmarked. The check runs
 after rendering, so variables cannot introduce a displaced shebang or front matter.

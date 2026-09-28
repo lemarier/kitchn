@@ -324,6 +324,11 @@ pub enum NotAppliedReason {
     ForeignBackend,
     /// The provider refused the request before acting.
     Rejected,
+    /// A rate-limit refusal with a provider retry delay.
+    RateLimited {
+        /// Delay advertised by the provider, when it is a numeric Retry-After value.
+        retry_after: Option<std::time::Duration>,
+    },
     /// A lookup established that the provider never applied the key.
     ConfirmedAbsent,
 }

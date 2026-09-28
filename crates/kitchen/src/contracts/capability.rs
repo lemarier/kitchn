@@ -87,6 +87,34 @@ closed_names! {
         LookupCreateLabel = "effect.lookup.create_label",
         /// Resubmitting a `create_label` effect's key never repeats it.
         IdempotentCreateLabel = "effect.idempotent.create_label",
+        /// Look up a `post_comment` effect's outcome by its persisted request.
+        LookupPostComment = "effect.lookup.post_comment",
+        /// Resubmitting a `post_comment` effect's key never repeats it.
+        IdempotentPostComment = "effect.idempotent.post_comment",
+        /// Look up a `set_label` effect's outcome by its persisted request.
+        LookupSetLabel = "effect.lookup.set_label",
+        /// Resubmitting a `set_label` effect's key never repeats it.
+        IdempotentSetLabel = "effect.idempotent.set_label",
+        /// Look up a `create_issue` effect's outcome by its persisted request.
+        LookupCreateIssue = "effect.lookup.create_issue",
+        /// Resubmitting a `create_issue` effect's key never repeats it.
+        IdempotentCreateIssue = "effect.idempotent.create_issue",
+        /// Look up a `link_sub_issue` effect's outcome by its persisted request.
+        LookupLinkSubIssue = "effect.lookup.link_sub_issue",
+        /// Resubmitting a `link_sub_issue` effect's key never repeats it.
+        IdempotentLinkSubIssue = "effect.idempotent.link_sub_issue",
+        /// Look up a `link_dependency` effect's outcome by its persisted request.
+        LookupLinkDependency = "effect.lookup.link_dependency",
+        /// Resubmitting a `link_dependency` effect's key never repeats it.
+        IdempotentLinkDependency = "effect.idempotent.link_dependency",
+        /// Look up a `merge_pull_request` effect's outcome by its persisted request.
+        LookupMergePullRequest = "effect.lookup.merge_pull_request",
+        /// Resubmitting a `merge_pull_request` effect's key never repeats it.
+        IdempotentMergePullRequest = "effect.idempotent.merge_pull_request",
+        /// Look up a `close_issue` effect's outcome by its persisted request.
+        LookupCloseIssue = "effect.lookup.close_issue",
+        /// Resubmitting a `close_issue` effect's key never repeats it.
+        IdempotentCloseIssue = "effect.idempotent.close_issue",
         /// Look up a `ask` effect's outcome by its persisted request.
         LookupAsk = "effect.lookup.ask",
         /// Resubmitting a `ask` effect's key never repeats it.

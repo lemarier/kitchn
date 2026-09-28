@@ -498,6 +498,38 @@ fn inventory_reports_owner_and_liveness_within_its_bound() -> TestResult {
         Some(Liveness::Exited)
     );
 
+    // A person holding the worker keeps it live, and nothing is dispatched into it.
+    workers.set_worker_state(
+        &observation.resource,
+        kitchen::contracts::WorkerState::UserTakeover,
+    );
+    assert_eq!(
+        workers.inventory()?.first().map(|found| found.liveness),
+        Some(Liveness::Live)
+    );
+    let held = run_effect(
+        &fixture.store,
+        &workers,
+        &grants,
+        plan(
+            &task,
+            fence,
+            "message-held",
+            Operation::MessageWorker {
+                worker: observation.resource.clone(),
+                body: Text::new("still there?")?,
+            },
+        )?,
+        &clock,
+    )?;
+    assert!(matches!(
+        held.state(),
+        EffectState::NotApplied {
+            reason: NotAppliedReason::Rejected,
+            ..
+        }
+    ));
+
     // A lost record or an unknown state is not evidence of exit.
     for state in [
         kitchen::contracts::WorkerState::Missing,

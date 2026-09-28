@@ -554,7 +554,12 @@ impl<'a> Runner<'a> {
             return Ok(());
         }
         match backend.observe_worker(worker) {
-            Ok(WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply) => {
+            Ok(
+                WorkerState::Starting
+                | WorkerState::Ready
+                | WorkerState::AwaitingReply
+                | WorkerState::UserTakeover,
+            ) => {
                 self.record(check, CheckResult::Passed);
                 Ok(())
             }
@@ -689,6 +694,9 @@ impl<'a> Runner<'a> {
             }
             // No record is not proof that the worker stopped.
             Ok(WorkerState::Missing) => fail(check, "cancelled worker is missing, not settled"),
+            Ok(WorkerState::UserTakeover) => {
+                fail(check, "cancelled worker is held by a person, not settled")
+            }
             Ok(WorkerState::Unknown) => fail(check, "cancelled worker state is unknown"),
             Err(_) => fail(check, "declared status was unavailable"),
         }

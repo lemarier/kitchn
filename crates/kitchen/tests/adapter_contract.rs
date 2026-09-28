@@ -1537,3 +1537,45 @@ fn an_overclaimed_message_declaration_fails_the_contract() -> TestResult {
     }
     Ok(())
 }
+
+/// Hands the worker to a person instead of stopping it.
+struct TakeoverOnCancel(FakeBackend);
+
+impl EffectExecutor for TakeoverOnCancel {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.0.descriptor()
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        match request.effect() {
+            kitchen::contracts::Effect::Worker(Operation::CancelWorker { worker }) => {
+                self.0.set_worker_state(worker, WorkerState::UserTakeover);
+                Err(EffectFailure::Uncertain(UncertainReason::Timeout))
+            }
+            _ => self.0.execute(request),
+        }
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.0.lookup(request)
+    }
+}
+
+impl WorkerBackend for TakeoverOnCancel {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.0.observe_worker(worker)
+    }
+    fn inventory(
+        &self,
+    ) -> Result<Vec<kitchen::contracts::ResourceObservation>, BackendUnavailable> {
+        self.0.inventory()
+    }
+}
+
+#[test]
+fn a_user_takeover_is_not_evidence_of_cancellation() -> TestResult {
+    let backend = TakeoverOnCancel(FakeBackend::fully_capable(backend_id()?, house()?));
+    let failure = conformance::run_worker(&backend, &conformance_fixture()?)
+        .err()
+        .ok_or("a taken-over worker passed as cancelled")?;
+    assert_eq!(failure.check, Check::CancelObserved);
+    Ok(())
+}

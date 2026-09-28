@@ -304,9 +304,10 @@ impl WorkerBackend for FakeBackend {
                 resource: self.resource(ResourceKind::Worker, handle.clone()),
                 owner: state.owners.get(handle).cloned(),
                 liveness: match worker {
-                    WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply => {
-                        Liveness::Live
-                    }
+                    WorkerState::Starting
+                    | WorkerState::Ready
+                    | WorkerState::AwaitingReply
+                    | WorkerState::UserTakeover => Liveness::Live,
                     WorkerState::Settled(_) => Liveness::Exited,
                     // A lost record is not evidence that the process ended.
                     WorkerState::Missing | WorkerState::Unknown => Liveness::Unverifiable,

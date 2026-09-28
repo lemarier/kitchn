@@ -392,6 +392,10 @@ pub enum WorkerState {
     Ready,
     /// Waiting for a reply to a question.
     AwaitingReply,
+    /// A person took over the worker's session and retains it. Do not
+    /// dispatch into it; this is neither a failure nor a settlement, and it
+    /// is never evidence that the worker stopped.
+    UserTakeover,
     /// The worker settled with an outcome.
     Settled(WorkerOutcome),
     /// The backend has no record of the worker.

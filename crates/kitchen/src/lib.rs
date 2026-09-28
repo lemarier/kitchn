@@ -27,4 +27,5 @@ pub mod state;
 pub use error::{Error, ErrorClass, Result};
 pub use id::{
     BackendId, ConsumerId, CredentialId, EffectName, HolderId, HouseId, IdentifierError, TaskId,
+    WorkflowId,
 };

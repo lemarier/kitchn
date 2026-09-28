@@ -12,7 +12,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ConsumerId, CredentialId, EffectName, Error, HolderId, HouseId, TaskId,
+    ConsumerId, CredentialId, EffectName, Error, HolderId, HouseId, TaskId, WorkflowId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Claimant,
         Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext, EffectRequest,
@@ -20,7 +20,11 @@ use crate::{
         HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef,
         RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Timestamp, Trigger, UncertainReason,
     },
-    state::{ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, StateError},
+    state::{
+        ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerFact, MarkerKey,
+        MarkerRecording, StateError, WorkflowMarker,
+        marker::{MarkerRefusal, Markers},
+    },
 };
 
 /// The persisted schema version.
@@ -1008,6 +1012,8 @@ pub(crate) struct StoreState {
     tasks: BTreeMap<TaskId, TaskRecord>,
     #[serde(deserialize_with = "unique_map")]
     consumers: BTreeMap<ConsumerId, ConsumerRecord>,
+    #[serde(default)]
+    markers: Markers,
 }
 
 /// Deserialize a map, rejecting a repeated key instead of letting a later
@@ -1061,6 +1067,7 @@ impl StoreState {
             next_fence: 1,
             tasks: BTreeMap::new(),
             consumers: BTreeMap::new(),
+            markers: Markers::new(),
         }
     }
 
@@ -1984,6 +1991,35 @@ impl StoreState {
         Ok(lease)
     }
 
+    pub(crate) fn record_marker(
+        &mut self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<MarkerRecording> {
+        self.check_claimant(recorded_by, now)?;
+        self.markers
+            .record(key, fact, recorded_by, now)
+            .or_else(|refusal| match refusal {
+                MarkerRefusal::Conflict => fail(StateError::MarkerConflict),
+                MarkerRefusal::Full => fail(StateError::CapacityExceeded {
+                    limit: Limit::Markers,
+                }),
+            })
+    }
+
+    pub(crate) fn marker(&self, key: &MarkerKey) -> Option<&WorkflowMarker> {
+        self.markers.get(key)
+    }
+
+    pub(crate) fn markers<'a>(
+        &'a self,
+        workflow: &'a WorkflowId,
+    ) -> impl Iterator<Item = &'a WorkflowMarker> {
+        self.markers.for_workflow(workflow)
+    }
+
     pub(crate) fn recovery_queue(&self, now: Timestamp) -> Vec<RecoveryItem> {
         let handed_over = self.tasks.values().flat_map(|task| {
             let open = task.settlement().is_none();
@@ -2043,6 +2079,7 @@ impl StoreState {
         if self.tasks.len() > MAX_TASKS || self.consumers.len() > MAX_CONSUMERS {
             return Err(Corruption::LimitExceeded);
         }
+        self.markers.validate()?;
         for record in self.consumers.values() {
             record.validate(self.next_fence)?;
         }

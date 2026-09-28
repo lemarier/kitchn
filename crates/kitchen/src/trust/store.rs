@@ -2,7 +2,7 @@
 //! Private records never belong in Git.
 use crate::{
     HouseId,
-    contracts::{Grant, GrantScope, HouseGrants, Permission, Role, TaskSpec},
+    contracts::{ExternalRef, Grant, GrantScope, HouseGrants, Permission, Role, TaskSpec},
     state::{
         HouseStore, StateError, StoreOptions, TaskState,
         snapshot::{Snapshot, SnapshotStore, StoreLayout},
@@ -14,7 +14,12 @@ use crate::{
     workflows::inspector::Inspection,
 };
 use serde::{Deserialize, Serialize};
-use std::{path::Path, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroU32,
+    path::Path,
+    time::Duration,
+};
 
 /// Permissions eligible for earned standing authority. Git publication,
 /// release, merge, schedules, equipment, and cleanup require separate policy.
@@ -67,6 +72,8 @@ pub(crate) struct Document {
 }
 
 impl Document {
+    /// Checks every entry once against hash indexes, so a full ledger
+    /// validates in time linear in its entries and evidence references.
     fn validate(&self, house: &HouseId) -> Result<(), TrustError> {
         if &self.house != house {
             return Err(TrustError::Refused);
@@ -80,83 +87,81 @@ impl Document {
         {
             return Err(TrustError::Corrupt);
         }
-        for (index, observation) in self.observations.iter().enumerate() {
+        let mut revisions = HashMap::with_capacity(self.observations.len());
+        let mut stream_tasks = HashMap::with_capacity(self.observations.len());
+        let mut task_streams = HashMap::with_capacity(self.observations.len());
+        for observation in &self.observations {
             observation.validate()?;
             if &observation.house != house {
                 return Err(TrustError::Refused);
             }
-            if self.observations[..index].iter().any(|old| {
-                (old.id == observation.id
-                    && (old.revision == observation.revision || old.task != observation.task))
-                    || (old.task == observation.task && old.id != observation.id)
-            }) {
+            // One stream per task and one task per stream; each revision once.
+            if *stream_tasks
+                .entry(&observation.id)
+                .or_insert(&observation.task)
+                != &observation.task
+                || *task_streams
+                    .entry(&observation.task)
+                    .or_insert(&observation.id)
+                    != &observation.id
+                || revisions
+                    .insert((&observation.id, observation.revision), observation)
+                    .is_some()
+            {
                 return Err(TrustError::Conflict);
             }
         }
-        for (index, binding) in self.bindings.iter().enumerate() {
+        let mut bindings = HashMap::with_capacity(self.bindings.len());
+        for binding in &self.bindings {
             if binding.spec.authority.house() != house
                 || binding.spec.repository.as_ref() != Some(&binding.scope.project)
                 || !role_matches_station(binding.spec.role, &binding.scope)
-                || self.bindings[..index]
-                    .iter()
-                    .any(|old| old.spec.id == binding.spec.id)
+                || bindings.insert(&binding.spec.id, binding).is_some()
             {
                 return Err(TrustError::Corrupt);
             }
         }
-        for (index, audit) in self.grants.iter().enumerate() {
+        let evidence_holds =
+            |scope: &StationScope, (source, revision): &(ExternalRef, NonZeroU32)| {
+                revisions.get(&(source, *revision)).is_some_and(|evidence| {
+                    evidence.trust_eligible()
+                        && &evidence.attribution.scope == scope
+                        && bindings
+                            .get(&evidence.task)
+                            .is_some_and(|binding| binding_covers(binding, evidence))
+                })
+            };
+        let mut grant_ids = HashSet::with_capacity(self.grants.len());
+        for audit in &self.grants {
             let (id, audit_house) = audit_identity(audit);
             if audit_house != house {
                 return Err(TrustError::Refused);
             }
-            if let GrantAudit::Proposed(proposal) | GrantAudit::RevokedProposal { proposal, .. } =
-                audit
-            {
-                validate_claim(&proposal.claim, &proposal.scope, &proposal.evidence)?;
-                for (source, revision) in &proposal.evidence {
-                    let evidence = self
-                        .observations
-                        .iter()
-                        .find(|o| &o.id == source && &o.revision == revision)
-                        .ok_or(TrustError::Corrupt)?;
-                    if !evidence.trust_eligible()
-                        || evidence.attribution.scope != proposal.scope
-                        || !evidence_matches_binding(self, evidence)
-                    {
-                        return Err(TrustError::Corrupt);
-                    }
+            let (scope, evidence) = match audit {
+                GrantAudit::Proposed(proposal) | GrantAudit::RevokedProposal { proposal, .. } => {
+                    validate_claim(&proposal.claim, &proposal.scope, &proposal.evidence)?;
+                    (&proposal.scope, &proposal.evidence)
                 }
-            }
-            if let GrantAudit::Issued(grant) | GrantAudit::Revoked { grant, .. } = audit {
-                validate_grant(grant)?;
-                for (source, revision) in &grant.evidence {
-                    let evidence = self
-                        .observations
-                        .iter()
-                        .find(|o| &o.id == source && &o.revision == revision)
-                        .ok_or(TrustError::Corrupt)?;
-                    if !evidence.trust_eligible()
-                        || evidence.attribution.scope != grant.scope
-                        || !evidence_matches_binding(self, evidence)
-                    {
-                        return Err(TrustError::Corrupt);
-                    }
+                GrantAudit::Issued(grant) | GrantAudit::Revoked { grant, .. } => {
+                    validate_grant(grant)?;
+                    (&grant.scope, &grant.evidence)
                 }
+            };
+            if !evidence.iter().all(|item| evidence_holds(scope, item)) {
+                return Err(TrustError::Corrupt);
             }
-            if self.grants[..index]
-                .iter()
-                .any(|old| audit_identity(old).0 == id)
-            {
+            if !grant_ids.insert(id) {
                 return Err(TrustError::Conflict);
             }
         }
-        for (index, inspection) in self.inspections.iter().enumerate() {
+        let mut inspection_ids = HashSet::with_capacity(self.inspections.len());
+        for inspection in &self.inspections {
             inspection.validate(house)?;
-            inspection.validate_observation(&self.observations)?;
-            if self.inspections[..index]
-                .iter()
-                .any(|old| old.id() == inspection.id())
-            {
+            let observation = revisions
+                .get(&(&inspection.plan().observation, inspection.revision()))
+                .ok_or(TrustError::Corrupt)?;
+            inspection.validate_observation(observation)?;
+            if !inspection_ids.insert(inspection.id()) {
                 return Err(TrustError::Conflict);
             }
         }
@@ -722,10 +727,13 @@ fn validate_evidence(
     Ok(())
 }
 fn evidence_matches_binding(doc: &Document, observed: &Observation) -> bool {
-    doc.bindings.iter().any(|binding| {
-        binding.spec.id == observed.task
-            && binding.scope == observed.attribution.scope
-            && binding.spec.provenance == observed.instructions
-            && matches!(&observed.attribution.model, Measurement::Observed { value, .. } if value == &binding.model)
-    })
+    doc.bindings
+        .iter()
+        .any(|binding| binding.spec.id == observed.task && binding_covers(binding, observed))
+}
+/// Whether `observed` ran with the station, pins, and model its task was bound to.
+fn binding_covers(binding: &TaskBinding, observed: &Observation) -> bool {
+    binding.scope == observed.attribution.scope
+        && binding.spec.provenance == observed.instructions
+        && matches!(&observed.attribution.model, Measurement::Observed { value, .. } if value == &binding.model)
 }

@@ -1290,3 +1290,86 @@ fn the_elapsed_budget_runs_from_the_first_key() -> TestResult {
     assert_eq!(backend.execute_calls(), 2);
     Ok(())
 }
+
+/// Blocks its first lookup until the test releases it.
+struct GatedLookup {
+    inner: FakeBackend,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl EffectExecutor for GatedLookup {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.inner.descriptor()
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        self.inner.execute(request)
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        let answer = self.inner.lookup(request);
+        let _ = self.entered.send(());
+        let _ = self
+            .release
+            .lock()
+            .map_err(|_| BackendUnavailable::Transport)?
+            .recv();
+        answer
+    }
+}
+
+#[test]
+fn a_delayed_absence_cannot_clear_a_newer_submission() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = started(&fixture, "task-1")?;
+    let backend = FakeBackend::fully_capable(backend_id()?, house()?);
+    backend.inject(ExecuteFault::TimeoutWithoutApplying);
+    run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(&task, fence, "launch", launch()?)?,
+        &ManualClock::starting_at(1),
+    )?;
+
+    // Reconciler A looks up submission 1 and truthfully sees it absent, but
+    // records the answer only after submission 2 was sent.
+    let (entered, wait_entered) = std::sync::mpsc::sync_channel(1);
+    let (release, wait_release) = std::sync::mpsc::sync_channel(1);
+    let gated = GatedLookup {
+        inner: FakeBackend::fully_capable(backend_id()?, house()?),
+        entered,
+        release: std::sync::Mutex::new(wait_release),
+    };
+    let store = fixture.reopen()?;
+    let reconciled = std::thread::scope(|scope| -> TestResult<_> {
+        let reconciler = scope.spawn(|| {
+            reconcile(&store, &gated, &task, fence, &ManualClock::starting_at(2))
+                .map_err(|error| error.to_string())
+        });
+        wait_entered.recv()?;
+        backend.fail_lookups(1);
+        backend.inject(ExecuteFault::TimeoutWithoutApplying);
+        let resubmitted = run_effect(
+            &fixture.store,
+            &backend,
+            &grants()?,
+            plan(&task, fence, "launch", launch()?)?,
+            &ManualClock::starting_at(3),
+        )?;
+        assert_eq!(resubmitted.submissions(), 2);
+        release.send(())?;
+        Ok(reconciler.join().map_err(|_| "reconciler panicked")??)
+    })?;
+    assert!(reconciled.resolved.is_empty(), "{reconciled:?}");
+    let record = fixture.store.task(&task)?;
+    let [effect] = record.effects() else {
+        return Err("expected one effect".into());
+    };
+    assert!(
+        !matches!(effect.state(), EffectState::NotApplied { .. }),
+        "stale absence cleared submission 2: {:?}",
+        effect.state()
+    );
+    assert_eq!(effect.submissions(), 2);
+    Ok(())
+}

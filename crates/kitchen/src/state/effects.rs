@@ -45,7 +45,15 @@ pub fn run_effect(
         EffectStart::Execute(record) => record,
         EffectStart::ReconcileFirst(pending) => {
             let outcome = look_up(executor, &pending);
-            store.record_effect_outcome(&task, fence, pending.seq(), outcome, clock.now())?;
+            // Applied only to the submission generation the lookup observed.
+            store.record_submission_outcome(
+                &task,
+                fence,
+                pending.seq(),
+                pending.submissions(),
+                outcome,
+                clock.now(),
+            )?;
             match store.begin_effect(plan, grants, descriptor, clock.now())? {
                 EffectStart::Execute(record) => record,
                 // Another handle changed the effect meanwhile; report it as is.
@@ -154,8 +162,16 @@ pub fn reconcile(
             continue;
         }
         let outcome = look_up(executor, &effect);
-        let updated =
-            store.record_effect_outcome(task, fence, effect.seq(), outcome, clock.now())?;
+        // A negative or uncertain answer applies only if no newer submission
+        // was sent since this lookup's snapshot.
+        let updated = store.record_submission_outcome(
+            task,
+            fence,
+            effect.seq(),
+            effect.submissions(),
+            outcome,
+            clock.now(),
+        )?;
         if updated.state().is_resolved() {
             report.resolved.push(updated);
         } else {

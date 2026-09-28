@@ -1354,13 +1354,8 @@ fn a_late_response_from_an_older_submission_cannot_clear_a_newer_one() -> TestRe
         EffectOutcome::NotApplied(NotAppliedReason::Rejected),
         at(4),
     )?;
-    assert!(matches!(
-        late.state(),
-        EffectState::Uncertain {
-            reason: UncertainReason::LookupInconclusive,
-            ..
-        }
-    ));
+    // Submission 2 is in flight; the old refusal does not settle it.
+    assert_eq!(late.state(), &EffectState::Intended);
     let current = store.record_submission_outcome(
         &task,
         fence,

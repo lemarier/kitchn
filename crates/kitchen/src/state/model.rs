@@ -715,6 +715,9 @@ impl TaskRecord {
                     return fail(StateError::CorruptState(Corruption::EffectSequence));
                 };
                 existing.submissions = existing.submissions.saturating_add(1);
+                // The lookup that allowed this resubmission is consumed: a
+                // concurrent caller must reconcile again before another.
+                existing.state = EffectState::Intended;
                 Ok(EffectStart::Execute(existing.clone()))
             }
         }

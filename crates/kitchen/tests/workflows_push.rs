@@ -1789,6 +1789,108 @@ mod git_remote {
         Ok(())
     }
 
+    /// A `git` that writes `key = value` into the worker's configuration
+    /// just before it runs a push: the change lands after every check the
+    /// update makes, the window issue #92 describes.
+    fn git_rewriting_before_push(repos: &Repos, key: &str, value: &str) -> TestResult<PathBuf> {
+        let path = repos.dir.path().join("git-racing");
+        let config = repos.worker.join(".git").join("config");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 for arg in \"$@\"; do\n  \
+                 if [ \"$arg\" = push ]; then {GIT} config --file '{config}' '{key}' '{value}'; fi\n\
+                 done\n\
+                 exec {GIT} \"$@\"\n",
+                config = text(&config)?,
+            ),
+        )?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    /// A rewrite written after the update's last check does not reach the
+    /// push: it pushes the verified URL under configuration the checkout
+    /// cannot change.
+    #[test]
+    fn git_pushes_the_verified_url_despite_a_rewrite_written_as_the_push_starts() -> TestResult {
+        for variable in ["insteadOf", "pushInsteadOf"] {
+            let repos = fresh_repos()?;
+            let setup = pushing()?;
+            let elsewhere = elsewhere(&repos, "elsewhere")?;
+            let mine = commit_in(&repos.worker, "mine")?;
+            let granted = text(&repos.remote)?.to_owned();
+            let key = format!("url.{}.{variable}", text(&elsewhere)?);
+            let remote = GitRemote::new(
+                git_rewriting_before_push(&repos, &key, &granted)?,
+                repos.worker.clone(),
+                "origin",
+                workflows_support::isolated_config(repos.dir.path(), &[])?,
+                Duration::from_secs(30),
+            )?
+            .with_url_bases(&[&url_base(&repos)?])?;
+            let outcome = push_with(
+                &setup,
+                Observed::Unknown,
+                &remote,
+                &remote,
+                &first_intent()?,
+                &mine,
+            )?;
+            // The rewrite did land in the checkout, after the checks.
+            assert_eq!(git(&repos.worker, &["config", "--get", &key])?, granted);
+            assert_eq!(
+                outcome,
+                PushOutcome::Pushed { replaced: None },
+                "{variable}"
+            );
+            assert_eq!(
+                remote_head(&repos, BRANCH)?.as_deref(),
+                Some(mine.as_str()),
+                "{variable}"
+            );
+            assert!(
+                git(&elsewhere, &["for-each-ref"])?.is_empty(),
+                "{variable}: the push followed the late rewrite"
+            );
+        }
+        Ok(())
+    }
+
+    /// Without its own push repository Kitchen sends nothing, and says the
+    /// outcome is unknown rather than stale or pushed.
+    #[test]
+    fn git_sends_nothing_when_its_push_repository_cannot_be_made() -> TestResult {
+        let repos = fresh_repos()?;
+        let setup = pushing()?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        let kitchen = tempfile::tempdir()?;
+        let remote = GitRemote::new(
+            PathBuf::from(GIT),
+            repos.worker.clone(),
+            "origin",
+            workflows_support::isolated_config(kitchen.path(), &[])?,
+            Duration::from_secs(30),
+        )?
+        .with_url_bases(&[&url_base(&repos)?])?;
+        // Kitchen's configuration directory is gone.
+        let gone = kitchen.path().to_path_buf();
+        drop(kitchen);
+        assert!(!gone.exists());
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert_eq!(outcome, PushOutcome::Uncertain);
+        assert_eq!(remote_head(&repos, BRANCH)?, None);
+        Ok(())
+    }
+
     /// A clean checkout pushes to a local bare remote with Kitchen's own
     /// configuration carrying a credential helper, and the push's Git reads
     /// no system configuration and no user configuration but Kitchen's file.

@@ -685,14 +685,15 @@ const GIT_POLL: Duration = Duration::from_millis(10);
 /// of the remote (`git remote get-url --all`) must also be the granted
 /// repository under one of the accepted URL bases (GitHub's HTTPS and SSH
 /// forms by default). Credential helpers configured in the checkout still
-/// run; a Kitchen-owned clone removes that limit.
+/// run for reads; a Kitchen-owned clone removes that limit.
 ///
 /// An update does not push by remote name: it pushes to the verified URL,
-/// which no configuration Git reads may rewrite. The checks and the push
-/// are separate Git processes, so a worker still writing to its checkout's
-/// configuration while Kitchen pushes can add a rewrite after the last
-/// check; the two reads narrow that to the instants between the final check
-/// and Git's own read.
+/// and it pushes from a Kitchen-owned, empty bare repository beside
+/// Kitchen's configuration that borrows the checkout's objects, so the push
+/// never reads the checkout's configuration. A rewrite or remote URL a
+/// worker writes to its checkout after the last check cannot redirect it,
+/// and the checkout's credential helpers do not run for it: give Kitchen's
+/// own [`PushSetting::CredentialHelper`] instead.
 #[derive(Debug, Clone)]
 pub struct GitRemote {
     git: PathBuf,
@@ -788,12 +789,45 @@ impl GitRemote {
     }
 
     pub(crate) fn run(&self, args: &[&str]) -> Option<(Option<i32>, Vec<u8>)> {
+        self.run_in(&self.worktree, args)
+    }
+
+    fn run_in(&self, dir: &std::path::Path, args: &[&str]) -> Option<(Option<i32>, Vec<u8>)> {
         let env = git_environment(&self.config, &self.remote);
         let env: Vec<(&str, &str)> = env
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
-        run_bounded(&self.git, &self.worktree, args, &env, self.deadline)
+        run_bounded(&self.git, dir, args, &env, self.deadline)
+    }
+
+    /// An empty bare repository in Kitchen's configuration directory whose
+    /// object store borrows the checkout's, so a push from it reads only
+    /// configuration Kitchen wrote. Removed when dropped. `None` when it
+    /// could not be made.
+    fn push_snapshot(&self) -> Option<tempfile::TempDir> {
+        let (Some(0), stdout) = self.run(&["rev-parse", "--git-common-dir"])? else {
+            return None;
+        };
+        let common = String::from_utf8(stdout).ok()?;
+        // Git prints the common directory relative to the checkout when it
+        // is inside it.
+        let objects = self.worktree.join(common.trim_end()).join("objects");
+        let objects = objects.canonicalize().ok()?;
+        let objects = objects.to_str().filter(|path| !path.contains('\n'))?;
+        let snapshot = tempfile::Builder::new()
+            .prefix("kitchen-push-")
+            .tempdir_in(self.config.path.parent()?)
+            .ok()?;
+        let dir = snapshot.path();
+        let (Some(0), _) = self.run_in(dir, &["init", "--bare", "--quiet", "--template=", "."])?
+        else {
+            return None;
+        };
+        let info = dir.join("objects").join("info");
+        std::fs::create_dir_all(&info).ok()?;
+        std::fs::write(info.join("alternates"), format!("{objects}\n")).ok()?;
+        Some(snapshot)
     }
 
     /// Whether `url` names `repository` under an accepted base.
@@ -1250,6 +1284,10 @@ impl GitRemote {
         let Some(destination) = urls.first() else {
             return Err(UpdateFailure::Uncertain);
         };
+        // From here on the checkout's configuration is not read.
+        let Some(snapshot) = self.push_snapshot() else {
+            return Err(UpdateFailure::Uncertain);
+        };
         let mut args: Vec<String> = [
             "push",
             "--porcelain",
@@ -1278,7 +1316,7 @@ impl GitRemote {
                 .map(|update| format!("{}:refs/heads/{}", update.commit, update.branch)),
         );
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        match self.run(&args) {
+        match self.run_in(snapshot.path(), &args) {
             Some((Some(0), _)) => Ok(()),
             // Git reports a refused ref, such as a failed lease, as a line
             // starting with `!` under `--porcelain`: nothing changed, since

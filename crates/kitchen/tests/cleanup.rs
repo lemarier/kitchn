@@ -38,8 +38,8 @@ use kitchen::{
         CACHEDIR_SIGNATURE, CleanupError, ConsentSource, Decision, EXTERNAL_CACHE_SUGGESTIONS,
         Exclusion, GitLimits, GitOperation, GitReadError, InspectionTrigger, Inspector, NoConsent,
         ObservationDigest, Ownership, Precheck, Preview, ReleaseConsent, ReleaseOutcome,
-        RemoteName, RetireReport, Step, TASK_PREFIX, apply, approve, inspect, inspect_worktree,
-        reclaim_build_output, retire,
+        RemoteName, RetireReport, Step, TASK_PREFIX, apply, approve, check_disk_pressure, inspect,
+        inspect_worktree, reclaim_build_output, retire,
     },
 };
 
@@ -3710,5 +3710,147 @@ fn a_full_task_table_of_settled_releases_is_freed_after_the_retention() -> TestR
     let report = harness.apply()?;
     assert!(report.retired.tasks.len() >= kitchen::state::MAX_TASKS - 4);
     assert_eq!(outcome(&report, &next.worker)?, ReleaseOutcome::Released);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Disk pressure
+
+/// A probe that reports a fixed measurement and counts its calls.
+struct FixedProbe {
+    result: Result<kitchen::workflows::cleanup::FreeSpace, kitchen::workflows::cleanup::ProbeError>,
+    calls: Cell<usize>,
+}
+
+impl FixedProbe {
+    fn available(bytes: u64) -> Self {
+        Self {
+            result: Ok(kitchen::workflows::cleanup::FreeSpace {
+                available: bytes,
+                total: 1_000_000,
+            }),
+            calls: Cell::new(0),
+        }
+    }
+}
+
+impl kitchen::workflows::cleanup::FreeSpaceProbe for FixedProbe {
+    fn free_space(
+        &self,
+        _: &Path,
+    ) -> Result<kitchen::workflows::cleanup::FreeSpace, kitchen::workflows::cleanup::ProbeError>
+    {
+        self.calls.set(self.calls.get() + 1);
+        self.result
+    }
+}
+
+fn pressure_policy() -> TestResult<kitchen::workflows::cleanup::DiskPressurePolicy> {
+    Ok(kitchen::workflows::cleanup::DiskPressurePolicy {
+        min_free_bytes: std::num::NonZeroU64::new(10_000).ok_or("zero")?,
+    })
+}
+
+#[test]
+fn low_free_space_starts_a_preview_only_inspection() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let probe = FixedProbe::available(9_999);
+    let before = harness.backend.fake.effects_performed();
+    let check = check_disk_pressure(
+        &harness.inspector(),
+        &probe,
+        harness.repo.main().as_path(),
+        &pressure_policy()?,
+        harness.clock.now(),
+    )?;
+    let kitchen::workflows::cleanup::PressureCheck::Low { free, preview } = check else {
+        return Err("pressure not detected".into());
+    };
+    assert_eq!(free.available, 9_999);
+    assert_eq!(preview.trigger, InspectionTrigger::DiskPressure);
+    assert_eq!(preview.suggestions, EXTERNAL_CACHE_SUGGESTIONS);
+    // Pressure changes no decision and acts on nothing.
+    assert_eq!(
+        preview.entry(&owned.worker).ok_or("worker")?.decision,
+        Decision::Release
+    );
+    assert_eq!(harness.backend.fake.effects_performed(), before);
+    assert!(harness.markers()?.is_empty());
+    assert!(harness.release_tasks()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn free_space_at_the_threshold_inspects_nothing() -> TestResult {
+    let mut harness = Harness::new()?;
+    harness.owner("task-1", true)?;
+    let calls = harness.backend.calls.get();
+    for available in [10_000, 1_000_000] {
+        let probe = FixedProbe::available(available);
+        let check = check_disk_pressure(
+            &harness.inspector(),
+            &probe,
+            harness.repo.main().as_path(),
+            &pressure_policy()?,
+            harness.clock.now(),
+        )?;
+        assert!(matches!(
+            check,
+            kitchen::workflows::cleanup::PressureCheck::Clear { free } if free.available == available
+        ));
+        assert_eq!(probe.calls.get(), 1);
+    }
+    assert_eq!(harness.backend.calls.get(), calls, "no inventory read");
+    Ok(())
+}
+
+#[test]
+fn a_failed_measurement_is_an_error_not_a_verdict() -> TestResult {
+    let harness = Harness::new()?;
+    let calls = harness.backend.calls.get();
+    for failure in [
+        kitchen::workflows::cleanup::ProbeError::Timeout,
+        kitchen::workflows::cleanup::ProbeError::Unsupported,
+        kitchen::workflows::cleanup::ProbeError::Io(std::io::ErrorKind::NotFound),
+    ] {
+        let probe = FixedProbe {
+            result: Err(failure),
+            calls: Cell::new(0),
+        };
+        let error = check_disk_pressure(
+            &harness.inspector(),
+            &probe,
+            harness.repo.main().as_path(),
+            &pressure_policy()?,
+            harness.clock.now(),
+        )
+        .err()
+        .ok_or("a failed probe gave a verdict")?;
+        assert!(matches!(
+            error,
+            Error::Cleanup(CleanupError::DiskProbe(found)) if found == failure
+        ));
+        assert_eq!(error.class(), ErrorClass::Execution);
+    }
+    assert_eq!(harness.backend.calls.get(), calls, "no inventory read");
+    Ok(())
+}
+
+#[test]
+fn an_unreadable_inventory_under_pressure_is_not_reported_clear() -> TestResult {
+    let harness = Harness::new()?;
+    harness.backend.outage.set(true);
+    let result = check_disk_pressure(
+        &harness.inspector(),
+        &FixedProbe::available(0),
+        harness.repo.main().as_path(),
+        &pressure_policy()?,
+        harness.clock.now(),
+    );
+    assert!(matches!(
+        result,
+        Err(Error::Cleanup(CleanupError::Backend(_)))
+    ));
     Ok(())
 }

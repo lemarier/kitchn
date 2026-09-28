@@ -27,5 +27,8 @@ test-hooks = []
 [dev-dependencies]
 kitchen = { path = ".", features = ["test-hooks"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [lints]
 workspace = true

@@ -3,15 +3,18 @@
 //! Release contract: the tag is `v<semver>` and the release carries one asset per
 //! target named `kitchen-<target-triple>.tar.gz`. The archive contains the
 //! executable at any depth, and GitHub must report a SHA-256 digest for the asset.
+//! `GITHUB_TOKEN`, when set, authenticates the GitHub API requests so a private
+//! repository works; it is not sent on the redirect to the download host.
 
 use std::{
     ffi::OsStr,
     fmt,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::{Command, ExitStatus, Stdio},
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use semver::Version;
@@ -27,6 +30,8 @@ const ARCHIVE_LIMIT: u64 = 128 * 1024 * 1024;
 const UNPACKED_LIMIT: u64 = 512 * 1024 * 1024;
 const API_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+const SELF_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+const SELF_CHECK_OUTPUT_LIMIT: u64 = 1024;
 
 /// Result of a completed update check.
 #[derive(Debug, PartialEq, Eq)]
@@ -58,7 +63,7 @@ impl fmt::Display for Outcome {
 pub enum UpdateError {
     #[error("running version is not a semantic version: {0}")]
     CurrentVersion(#[from] semver::Error),
-    #[error("no published release found")]
+    #[error("no published release found; a private repository needs GITHUB_TOKEN")]
     NoRelease,
     #[error("request to {url} failed: {source}")]
     Http {
@@ -83,17 +88,51 @@ pub enum UpdateError {
     BinaryDuplicate { name: String },
     #[error("release archive contains an empty {name}")]
     BinaryEmpty { name: String },
+    #[error("downloaded {BINARY_NAME} failed its self-check: {0}")]
+    SelfCheck(SelfCheckError),
     #[error("could not replace {path}: {source}")]
     Install { path: PathBuf, source: io::Error },
+}
+
+/// Why the downloaded executable was not trusted to replace the running one.
+#[derive(Debug, thiserror::Error)]
+pub enum SelfCheckError {
+    #[error("could not run it: {0}")]
+    Run(#[source] io::Error),
+    #[error("it did not exit within {0:?}")]
+    TimedOut(Duration),
+    #[error("it exited with {0}")]
+    Status(ExitStatus),
+    #[error("it reported {actual:?} instead of {expected:?}")]
+    Version { expected: String, actual: String },
+}
+
+/// GitHub API token; kept out of `Debug` output.
+struct GithubToken(String);
+
+impl GithubToken {
+    fn from_env() -> Option<Self> {
+        std::env::var("GITHUB_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+            .map(Self)
+    }
 }
 
 /// Replaces the running executable when the latest GitHub release is newer.
 pub fn run() -> Result<Outcome, UpdateError> {
     let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
-    match prepare(&agent(true), LATEST_RELEASE_URL, &current, TARGET)? {
+    let token = GithubToken::from_env();
+    match prepare(
+        &agent(true),
+        LATEST_RELEASE_URL,
+        &current,
+        TARGET,
+        token.as_ref(),
+    )? {
         Prepared::Skip(outcome) => Ok(outcome),
         Prepared::Install { version, binary } => {
-            install(&binary)?;
+            install(&binary, &version)?;
             Ok(Outcome::Updated {
                 from: current,
                 to: version,
@@ -126,8 +165,16 @@ fn prepare(
     latest_url: &str,
     current: &Version,
     target: &str,
+    token: Option<&GithubToken>,
 ) -> Result<Prepared, UpdateError> {
-    let body = match fetch(agent, latest_url, API_TIMEOUT, RELEASE_LIMIT) {
+    let release_request = Request {
+        url: latest_url,
+        accept: "application/vnd.github+json",
+        token,
+        timeout: API_TIMEOUT,
+        limit: RELEASE_LIMIT,
+    };
+    let body = match release_request.fetch(agent) {
         Err(UpdateError::Http { source, .. })
             if matches!(*source, ureq::Error::StatusCode(404)) =>
         {
@@ -148,12 +195,15 @@ fn prepare(
         }));
     }
     let (asset, digest) = release.asset_for(target)?;
-    let archive = fetch(
-        agent,
-        &asset.browser_download_url,
-        DOWNLOAD_TIMEOUT,
-        ARCHIVE_LIMIT,
-    )?;
+    // The API asset URL, unlike browser_download_url, also serves private repositories.
+    let archive = Request {
+        url: &asset.url,
+        accept: "application/octet-stream",
+        token,
+        timeout: DOWNLOAD_TIMEOUT,
+        limit: ARCHIVE_LIMIT,
+    }
+    .fetch(agent)?;
     digest.verify(&archive, &asset.name)?;
     let binary = extract_binary(
         &archive,
@@ -165,29 +215,37 @@ fn prepare(
     })
 }
 
-fn fetch(
-    agent: &ureq::Agent,
-    url: &str,
+struct Request<'a> {
+    url: &'a str,
+    accept: &'a str,
+    token: Option<&'a GithubToken>,
     timeout: Duration,
     limit: u64,
-) -> Result<Vec<u8>, UpdateError> {
-    let http = |source| UpdateError::Http {
-        url: url.to_owned(),
-        source: Box::new(source),
-    };
-    agent
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .config()
-        .timeout_global(Some(timeout))
-        .build()
-        .call()
-        .map_err(http)?
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
-        .map_err(http)
+}
+
+impl Request<'_> {
+    fn fetch(&self, agent: &ureq::Agent) -> Result<Vec<u8>, UpdateError> {
+        let http = |source| UpdateError::Http {
+            url: self.url.to_owned(),
+            source: Box::new(source),
+        };
+        let mut request = agent.get(self.url).header("Accept", self.accept);
+        if let Some(GithubToken(token)) = self.token {
+            // ureq's default redirect policy drops this header on redirects.
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        request
+            .config()
+            .timeout_global(Some(self.timeout))
+            .build()
+            .call()
+            .map_err(http)?
+            .body_mut()
+            .with_config()
+            .limit(self.limit)
+            .read_to_vec()
+            .map_err(http)
+    }
 }
 
 #[derive(Deserialize)]
@@ -199,7 +257,7 @@ struct ReleaseJson {
 #[derive(Debug, Deserialize)]
 struct Asset {
     name: String,
-    browser_download_url: String,
+    url: String,
     digest: Option<String>,
 }
 
@@ -306,7 +364,7 @@ fn extract_binary(archive: &[u8], name: &str) -> Result<Vec<u8>, UpdateError> {
     }
 }
 
-fn install(binary: &[u8]) -> Result<(), UpdateError> {
+fn install(binary: &[u8], version: &Version) -> Result<(), UpdateError> {
     let exe = std::env::current_exe().map_err(|source| UpdateError::Install {
         path: PathBuf::from(BINARY_NAME),
         source,
@@ -333,7 +391,52 @@ fn install(binary: &[u8]) -> Result<(), UpdateError> {
             .set_permissions(std::fs::Permissions::from_mode(0o755))
             .map_err(failed)?;
     }
-    self_replace::self_replace(staged.path()).map_err(failed)
+    // Close the write handle first: Linux refuses to execute a file open for writing.
+    let staged = staged.into_temp_path();
+    self_check(&staged, version, SELF_CHECK_TIMEOUT).map_err(UpdateError::SelfCheck)?;
+    self_replace::self_replace(&staged).map_err(failed)
+}
+
+/// Runs `<path> --version` and requires the exact version line clap prints.
+fn self_check(path: &Path, version: &Version, timeout: Duration) -> Result<(), SelfCheckError> {
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(SelfCheckError::Run)?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                // Best effort: the error below is reported whether or not the kill succeeds.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SelfCheckError::TimedOut(timeout));
+            }
+            Err(error) => return Err(SelfCheckError::Run(error)),
+        }
+    };
+    if !status.success() {
+        return Err(SelfCheckError::Status(status));
+    }
+    let mut output = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take(SELF_CHECK_OUTPUT_LIMIT)
+            .read_to_end(&mut output)
+            .map_err(SelfCheckError::Run)?;
+    }
+    let expected = format!("{BINARY_NAME} {version}");
+    let actual = String::from_utf8_lossy(&output).trim_end().to_owned();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(SelfCheckError::Version { expected, actual })
+    }
 }
 
 #[cfg(test)]
@@ -379,7 +482,7 @@ mod tests {
             "tag_name": tag,
             "assets": [{
                 "name": asset_name(),
-                "browser_download_url": format!("{base}/download"),
+                "url": format!("{base}/download"),
                 "digest": digest,
             }],
         })
@@ -387,10 +490,13 @@ mod tests {
         .into_bytes()
     }
 
-    /// Serves canned responses over plain HTTP and records requested paths.
+    /// A request seen by [`Server`]: its path and lowercased header lines.
+    type Seen = (String, Vec<String>);
+
+    /// Serves canned responses over plain HTTP and records each request.
     struct Server {
         base: String,
-        requests: Arc<Mutex<Vec<String>>>,
+        requests: Arc<Mutex<Vec<Seen>>>,
     }
 
     impl Server {
@@ -411,15 +517,19 @@ mod tests {
                         continue;
                     }
                     let path = line.split(' ').nth(1).unwrap_or_default().to_owned();
+                    let mut headers = Vec::new();
                     let mut header = String::new();
                     while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+                        headers.push(header.trim_end().to_ascii_lowercase());
                         header.clear();
                     }
                     let (status, body) = routes
                         .get(path.as_str())
                         .cloned()
                         .unwrap_or((404, Vec::new()));
-                    seen.lock().unwrap_or_else(|e| e.into_inner()).push(path);
+                    seen.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((path, headers));
                     let mut stream = &stream;
                     let _ = write!(
                         stream,
@@ -436,11 +546,15 @@ mod tests {
             format!("{}/latest", self.base)
         }
 
-        fn requests(&self) -> Vec<String> {
+        fn seen(&self) -> Vec<Seen> {
             self.requests
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen().into_iter().map(|(path, _)| path).collect()
         }
     }
 
@@ -469,18 +583,33 @@ mod tests {
             b"new build",
         )])?;
         let server = release_server("v0.2.0", archive.clone(), Some(digest_of(&archive)))?;
+        let token = GithubToken("secret-token".to_owned());
         let prepared = prepare(
             &agent(false),
             &server.latest(),
             &Version::new(0, 1, 0),
             TARGET,
+            Some(&token),
         )?;
         let Prepared::Install { version, binary } = prepared else {
             return Err(format!("expected install, got {prepared:?}").into());
         };
         assert_eq!(version, Version::new(0, 2, 0));
         assert_eq!(binary, b"new build");
+        let seen = server.seen();
         assert_eq!(server.requests(), ["/latest", "/download"]);
+        for ((_, headers), accept) in seen.iter().zip([
+            "accept: application/vnd.github+json",
+            "accept: application/octet-stream",
+        ]) {
+            assert!(headers.iter().any(|h| h == accept), "{headers:?}");
+            assert!(
+                headers
+                    .iter()
+                    .any(|h| h == "authorization: bearer secret-token"),
+                "{headers:?}"
+            );
+        }
         Ok(())
     }
 
@@ -507,12 +636,21 @@ mod tests {
                 &server.latest(),
                 &Version::new(0, 2, 0),
                 TARGET,
+                None,
             )?;
             let Prepared::Skip(outcome) = prepared else {
                 return Err(format!("expected skip, got {prepared:?}").into());
             };
             assert_eq!(outcome, expected);
             assert_eq!(server.requests(), ["/latest"]);
+            assert!(
+                server
+                    .seen()
+                    .iter()
+                    .flat_map(|(_, headers)| headers)
+                    .all(|h| !h.starts_with("authorization:")),
+                "anonymous requests must not send credentials"
+            );
         }
         Ok(())
     }
@@ -526,6 +664,7 @@ mod tests {
             &server.latest(),
             &Version::new(0, 1, 0),
             TARGET,
+            None,
         );
         assert!(
             matches!(result, Err(UpdateError::DigestMismatch { ref name }) if *name == asset_name()),
@@ -543,6 +682,7 @@ mod tests {
             &server.latest(),
             &Version::new(0, 1, 0),
             TARGET,
+            None,
         );
         assert!(
             matches!(result, Err(UpdateError::MissingDigest { .. })),
@@ -554,6 +694,7 @@ mod tests {
             &server.latest(),
             &Version::new(0, 1, 0),
             "riscv64gc-unknown-linux-gnu",
+            None,
         );
         assert!(
             matches!(result, Err(UpdateError::MissingAsset { .. })),
@@ -576,6 +717,7 @@ mod tests {
             &server.latest(),
             &Version::new(0, 1, 0),
             TARGET,
+            None,
         );
         assert!(matches!(result, Err(UpdateError::NoRelease)), "{result:?}");
 
@@ -588,6 +730,7 @@ mod tests {
                 &format!("{}{path}", server.base),
                 &Version::new(0, 1, 0),
                 TARGET,
+                None,
             );
             let Err(error @ UpdateError::Http { .. }) = result else {
                 return Err(format!("expected HTTP error, got {result:?}").into());
@@ -605,6 +748,7 @@ mod tests {
             &server.latest(),
             &Version::new(0, 1, 0),
             TARGET,
+            None,
         );
         assert!(
             matches!(result, Err(UpdateError::Http { .. })),
@@ -688,6 +832,59 @@ mod tests {
             extract_binary(b"not gzip", "kitchen"),
             Err(UpdateError::Archive(_))
         ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn script(dir: &Path, body: &str) -> Result<PathBuf, io::Error> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("candidate");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n"))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_check_requires_the_expected_version_line() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let version = Version::new(0, 2, 0);
+        let timeout = Duration::from_secs(5);
+
+        let good = script(dir.path(), &format!("echo '{BINARY_NAME} 0.2.0'"))?;
+        self_check(&good, &version, timeout)?;
+
+        let stale = script(dir.path(), &format!("echo '{BINARY_NAME} 0.1.0'"))?;
+        let result = self_check(&stale, &version, timeout);
+        assert!(
+            matches!(result, Err(SelfCheckError::Version { ref actual, .. }) if *actual == format!("{BINARY_NAME} 0.1.0")),
+            "{result:?}"
+        );
+
+        let failing = script(dir.path(), "exit 3")?;
+        let result = self_check(&failing, &version, timeout);
+        assert!(
+            matches!(result, Err(SelfCheckError::Status(status)) if status.code() == Some(3)),
+            "{result:?}"
+        );
+
+        let result = self_check(&dir.path().join("missing"), &version, timeout);
+        assert!(matches!(result, Err(SelfCheckError::Run(_))), "{result:?}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_check_kills_a_hanging_binary() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let hanging = script(dir.path(), "exec sleep 30")?;
+        let started = Instant::now();
+        let result = self_check(&hanging, &Version::new(0, 2, 0), Duration::from_millis(200));
+        assert!(
+            matches!(result, Err(SelfCheckError::TimedOut(_))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
         Ok(())
     }
 }

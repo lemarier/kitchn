@@ -1,19 +1,23 @@
-//! Shared contract checks every [`ExecutionBackend`] must pass.
+//! Shared contract checks every [`EffectExecutor`] must pass, plus the
+//! worker checks every [`WorkerBackend`] must pass.
 //!
-//! The suite performs real effects: it launches one worker (when supported)
-//! and cancels it (when supported). Run it against the fake backend offline
-//! and against a real backend only in a controlled environment where that
-//! launch is authorized. A passing run is evidence about the backend it ran
-//! against, and only for the paths it exercised.
+//! The suite performs real effects: [`run`] applies the caller's probe effect
+//! once, and [`run_worker`] launches one worker and cancels it (when
+//! supported). Run it against fakes offline and against a real executor only
+//! in a controlled environment where those effects are authorized. A passing
+//! run is evidence about the executor it ran against, and only for the paths
+//! it exercised.
 
 use std::fmt;
 
 use crate::{
-    BackendId, CredentialId, HouseId, TaskId,
+    BackendId, ConsumerId, CredentialId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, BackendUnavailable, Capability, EffectFailure, EffectRequest,
-        ExecutionBackend, ExternalRef, IdempotencyKey, Lookup, NotAppliedReason, Operation,
-        Receipt, ResourceKind, ResourceRef, Role, Text, WorkerState, Workspace,
+        AttemptNumber, BackendUnavailable, Capability, DecisionBinding, Effect, EffectExecutor,
+        EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, GitHubEffect, IdempotencyKey,
+        Liveness, Lookup, MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation, Permission,
+        Receipt, Repository, ResourceKind, ResourceRef, RogerEffect, Role, ScheduleEffect, Text,
+        WorkerBackend, WorkerState, Workspace,
     },
 };
 
@@ -29,18 +33,22 @@ pub enum Check {
     CrossHouseRefused,
     /// A request persisted for another backend namespace is refused without effect.
     ForeignBackendRefused,
-    /// Operations without full capability support are refused without effect.
+    /// Effects without full capability support are refused without effect.
     UnsupportedRefused,
     /// A never-used key is not reported as applied.
     UnknownKeyNotApplied,
-    /// A launch returns a receipt naming a worker on this backend.
-    LaunchReceipt,
-    /// Lookup of the launch key returns the launch receipt.
+    /// The probe effect returns a receipt.
+    ProbeReceipt,
+    /// Lookup of the probe key returns the probe receipt.
     LookupMatchesReceipt,
-    /// Resubmitting the launch key returns the same receipt.
+    /// Resubmitting the probe key returns the same receipt.
     IdempotentResubmission,
+    /// A launch receipt names a worker on this backend.
+    LaunchReceipt,
     /// The launched worker is observable and not reported as settled.
     LaunchObservable,
+    /// The inventory lists the launched worker as live, within its bound.
+    InventoryListsLaunch,
     /// A cancelled worker is no longer reported as running.
     CancelObserved,
 }
@@ -52,12 +60,14 @@ impl fmt::Display for Check {
             Self::DescriptorHouse => "descriptor house",
             Self::CrossHouseRefused => "cross-house request refused",
             Self::ForeignBackendRefused => "foreign-backend request refused",
-            Self::UnsupportedRefused => "unsupported operation refused",
+            Self::UnsupportedRefused => "unsupported effect refused",
             Self::UnknownKeyNotApplied => "unknown key not applied",
-            Self::LaunchReceipt => "launch receipt",
+            Self::ProbeReceipt => "probe receipt",
             Self::LookupMatchesReceipt => "lookup matches receipt",
             Self::IdempotentResubmission => "idempotent resubmission",
+            Self::LaunchReceipt => "launch receipt",
             Self::LaunchObservable => "launch observable",
+            Self::InventoryListsLaunch => "inventory lists launch",
             Self::CancelObserved => "cancel observed",
         })
     }
@@ -66,9 +76,9 @@ impl fmt::Display for Check {
 /// How a check ended when it did not fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CheckResult {
-    /// The backend met the contract.
+    /// The executor met the contract.
     Passed,
-    /// Not exercised: the backend does not declare the capability.
+    /// Not exercised: the executor does not declare the capability.
     NotApplicable {
         /// The undeclared capability.
         requires: Capability,
@@ -77,7 +87,7 @@ pub enum CheckResult {
 
 /// A contract violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("backend contract check '{check}' failed: {problem}")]
+#[error("executor contract check '{check}' failed: {problem}")]
 pub struct ConformanceFailure {
     /// The failed check.
     pub check: Check,
@@ -106,7 +116,7 @@ impl ConformanceReport {
 /// Inputs for one conformance run.
 #[derive(Debug, Clone)]
 pub struct ConformanceFixture {
-    /// The house the backend serves.
+    /// The house the executor serves.
     pub house: HouseId,
     /// Another house, used to check cross-house refusal.
     pub foreign_house: HouseId,
@@ -116,14 +126,16 @@ pub struct ConformanceFixture {
     pub credential: CredentialId,
     /// A disposable task identity for the run's requests.
     pub task: TaskId,
+    /// A repository for sample forge effects.
+    pub repository: Repository,
     /// A tag unique to this run, so idempotency keys never collide with earlier runs.
     pub run_tag: ExternalRef,
-    /// The brief for the launched worker.
+    /// Text for briefs, questions, and label names.
     pub brief: Text,
 }
 
 struct Runner<'a> {
-    backend: &'a dyn ExecutionBackend,
+    executor: &'a dyn EffectExecutor,
     fixture: &'a ConformanceFixture,
     report: ConformanceReport,
 }
@@ -132,71 +144,189 @@ fn fail<T>(check: Check, problem: &'static str) -> Result<T, ConformanceFailure>
     Err(ConformanceFailure { check, problem })
 }
 
-/// Run every check against `backend`.
+/// Run the executor checks, applying `probe` once where its capability is
+/// declared.
 ///
 /// # Errors
 /// Returns the first [`ConformanceFailure`].
 pub fn run(
-    backend: &dyn ExecutionBackend,
+    executor: &dyn EffectExecutor,
     fixture: &ConformanceFixture,
+    probe: &Effect,
 ) -> Result<ConformanceReport, ConformanceFailure> {
-    let mut runner = Runner {
-        backend,
-        fixture,
-        report: ConformanceReport::default(),
-    };
-    runner.run()?;
+    let mut runner = Runner::new(executor, fixture);
+    runner.executor_checks(probe)?;
     Ok(runner.report)
 }
 
-impl Runner<'_> {
+/// Run the executor checks with a worker launch as the probe, then the
+/// worker checks: the receipt names a worker, which is observable, listed
+/// by the inventory, and stops when cancelled.
+///
+/// # Errors
+/// Returns the first [`ConformanceFailure`].
+pub fn run_worker(
+    backend: &dyn WorkerBackend,
+    fixture: &ConformanceFixture,
+) -> Result<ConformanceReport, ConformanceFailure> {
+    let mut runner = Runner::new(backend, fixture);
+    let launch = runner.launch();
+    let Some(receipt) = runner.executor_checks(&launch)? else {
+        for check in [
+            Check::LaunchReceipt,
+            Check::LaunchObservable,
+            Check::InventoryListsLaunch,
+            Check::CancelObserved,
+        ] {
+            runner.record(
+                check,
+                CheckResult::NotApplicable {
+                    requires: Capability::WorkerLaunchIsolated,
+                },
+            );
+        }
+        return Ok(runner.report);
+    };
+    let own = &backend.descriptor().backend;
+    let worker = receipt
+        .resources()
+        .iter()
+        .find(|resource| resource.kind == ResourceKind::Worker && &resource.backend == own)
+        .cloned();
+    let Some(worker) = worker else {
+        return fail(
+            Check::LaunchReceipt,
+            "receipt names no worker on this backend",
+        );
+    };
+    runner.record(Check::LaunchReceipt, CheckResult::Passed);
+    runner.observable(backend, &worker)?;
+    runner.inventory(backend, &worker)?;
+    runner.cancel(backend, &worker)?;
+    Ok(runner.report)
+}
+
+impl<'a> Runner<'a> {
+    fn new(executor: &'a dyn EffectExecutor, fixture: &'a ConformanceFixture) -> Self {
+        Self {
+            executor,
+            fixture,
+            report: ConformanceReport::default(),
+        }
+    }
+
     fn supports(&self, capability: Capability) -> bool {
-        self.backend.descriptor().capabilities.supports(capability)
+        self.executor.descriptor().capabilities.supports(capability)
     }
 
     fn record(&mut self, check: Check, result: CheckResult) {
         self.report.results.push((check, result));
     }
 
-    fn key(&self, suffix: &str) -> Result<IdempotencyKey, ConformanceFailure> {
+    fn reference(&self, suffix: &str) -> Result<ExternalRef, ConformanceFailure> {
         ExternalRef::new(&format!("{}-{suffix}", self.fixture.run_tag))
-            .map(IdempotencyKey::from_ref)
             .or_else(|_| fail(Check::Fixture, "run tag too long for a key"))
+    }
+
+    fn key(&self, suffix: &str) -> Result<IdempotencyKey, ConformanceFailure> {
+        self.reference(suffix).map(IdempotencyKey::from_ref)
     }
 
     fn request(
         &self,
         house: &HouseId,
+        backend: &BackendId,
         suffix: &str,
-        operation: Operation,
+        effect: Effect,
     ) -> Result<EffectRequest, ConformanceFailure> {
         Ok(EffectRequest::new(
             house.clone(),
-            self.backend.descriptor().backend.clone(),
+            backend.clone(),
             self.fixture.credential.clone(),
             self.fixture.task.clone(),
             AttemptNumber::FIRST,
             self.key(suffix)?,
-            operation,
+            effect,
         ))
     }
 
-    fn launch(&self) -> Operation {
-        Operation::LaunchWorker {
+    fn own_request(
+        &self,
+        suffix: &str,
+        effect: Effect,
+    ) -> Result<EffectRequest, ConformanceFailure> {
+        let backend = self.executor.descriptor().backend.clone();
+        self.request(&self.fixture.house, &backend, suffix, effect)
+    }
+
+    fn launch(&self) -> Effect {
+        Effect::Worker(Operation::LaunchWorker {
             role: Role::StationCook,
             workspace: Workspace::Isolated,
             brief: self.fixture.brief.clone(),
-        }
+        })
     }
 
-    fn absent_worker(&self) -> Result<ResourceRef, ConformanceFailure> {
-        let handle = ExternalRef::new(&format!("{}-absent-worker", self.fixture.run_tag))
-            .or_else(|_| fail(Check::Fixture, "run tag too long for a handle"))?;
-        Ok(ResourceRef {
+    /// One sample of every effect, for refusal checks.
+    fn samples(&self) -> Result<Vec<(&'static str, Effect)>, ConformanceFailure> {
+        let worker = ResourceRef {
             kind: ResourceKind::Worker,
-            backend: self.backend.descriptor().backend.clone(),
-            handle,
-        })
+            backend: self.executor.descriptor().backend.clone(),
+            handle: self.reference("absent-worker")?,
+        };
+        let consumer = ConsumerId::new("conformance")
+            .or_else(|_| fail(Check::Fixture, "invalid sample consumer"))?;
+        Ok(vec![
+            ("unsupported-launch", self.launch()),
+            (
+                "unsupported-message",
+                Effect::Worker(Operation::MessageWorker {
+                    worker: worker.clone(),
+                    body: self.fixture.brief.clone(),
+                }),
+            ),
+            (
+                "unsupported-reply",
+                Effect::Worker(Operation::ReplyToWorker {
+                    worker: worker.clone(),
+                    question: self.reference("absent-question")?,
+                    body: self.fixture.brief.clone(),
+                }),
+            ),
+            (
+                "unsupported-cancel",
+                Effect::Worker(Operation::CancelWorker {
+                    worker: worker.clone(),
+                }),
+            ),
+            (
+                "unsupported-release",
+                Effect::Worker(Operation::ReleaseResource { resource: worker }),
+            ),
+            (
+                "unsupported-label",
+                Effect::GitHub(GitHubEffect::CreateLabel {
+                    repository: self.fixture.repository.clone(),
+                    name: self.fixture.brief.clone(),
+                }),
+            ),
+            (
+                "unsupported-ask",
+                Effect::Roger(RogerEffect::Ask {
+                    binding: DecisionBinding {
+                        house: self.fixture.house.clone(),
+                        task: self.fixture.task.clone(),
+                        action: Permission::Merge,
+                        revision: EvidenceRevision::INITIAL,
+                    },
+                    question: self.fixture.brief.clone(),
+                }),
+            ),
+            (
+                "unsupported-schedule",
+                Effect::Schedule(ScheduleEffect::InstallDisabled { consumer }),
+            ),
+        ])
     }
 
     /// A lookup must not report an effect that the check expected to be refused.
@@ -208,56 +338,50 @@ impl Runner<'_> {
         if !self.supports(Capability::EffectLookup) {
             return Ok(());
         }
-        match self.backend.lookup(key) {
+        match self.executor.lookup(key) {
             Ok(Lookup::Applied(_)) => fail(check, "refused request was applied"),
             Ok(Lookup::Absent | Lookup::Unknown) => Ok(()),
             Err(_) => fail(check, "lookup failed after a refused request"),
         }
     }
 
-    fn run(&mut self) -> Result<(), ConformanceFailure> {
-        if self.backend.descriptor().house != self.fixture.house {
+    /// The checks every executor passes. Returns the probe receipt when the
+    /// probe's capability is declared.
+    fn executor_checks(&mut self, probe: &Effect) -> Result<Option<Receipt>, ConformanceFailure> {
+        if self.executor.descriptor().house != self.fixture.house {
             return fail(Check::DescriptorHouse, "descriptor serves another house");
         }
         self.record(Check::DescriptorHouse, CheckResult::Passed);
-        self.cross_house()?;
-        self.foreign_backend()?;
+        self.cross_house(probe)?;
+        self.foreign_backend(probe)?;
         self.unsupported()?;
         self.unknown_key()?;
-        let Some((request, receipt)) = self.launch_receipt()? else {
-            for check in [
-                Check::LookupMatchesReceipt,
-                Check::IdempotentResubmission,
-                Check::LaunchObservable,
-                Check::CancelObserved,
-            ] {
+        let Some((request, receipt)) = self.probe_receipt(probe)? else {
+            for check in [Check::LookupMatchesReceipt, Check::IdempotentResubmission] {
                 self.record(
                     check,
                     CheckResult::NotApplicable {
-                        requires: Capability::WorkerLaunchIsolated,
+                        requires: probe.required_capability(),
                     },
                 );
             }
-            return Ok(());
+            return Ok(None);
         };
         self.lookup_matches(&request, &receipt)?;
         self.idempotent(&request, &receipt)?;
-        let worker = receipt
-            .resources()
-            .iter()
-            .find(|resource| resource.kind == ResourceKind::Worker)
-            .cloned();
-        let Some(worker) = worker else {
-            return fail(Check::LaunchReceipt, "receipt names no worker");
-        };
-        self.observable(&worker)?;
-        self.cancel(&worker)
+        Ok(Some(receipt))
     }
 
-    fn cross_house(&mut self) -> Result<(), ConformanceFailure> {
+    fn cross_house(&mut self, probe: &Effect) -> Result<(), ConformanceFailure> {
         let check = Check::CrossHouseRefused;
-        let request = self.request(&self.fixture.foreign_house, "foreign", self.launch())?;
-        match self.backend.execute(&request) {
+        let backend = self.executor.descriptor().backend.clone();
+        let request = self.request(
+            &self.fixture.foreign_house,
+            &backend,
+            "foreign",
+            probe.clone(),
+        )?;
+        match self.executor.execute(&request) {
             Err(EffectFailure::NotApplied(NotAppliedReason::CrossHouse)) => {}
             Err(_) => return fail(check, "refusal did not name the house mismatch"),
             Ok(_) => return fail(check, "request for another house was applied"),
@@ -267,25 +391,21 @@ impl Runner<'_> {
         Ok(())
     }
 
-    fn foreign_backend(&mut self) -> Result<(), ConformanceFailure> {
+    fn foreign_backend(&mut self, probe: &Effect) -> Result<(), ConformanceFailure> {
         let check = Check::ForeignBackendRefused;
-        let own = self.request(&self.fixture.house, "foreign-backend", self.launch())?;
-        let request = EffectRequest::new(
-            own.house().clone(),
-            self.fixture.foreign_backend.clone(),
-            own.credential().clone(),
-            own.task().clone(),
-            own.attempt(),
-            own.key().clone(),
-            own.operation().clone(),
-        );
-        if request.backend() == &self.backend.descriptor().backend {
+        if self.fixture.foreign_backend == self.executor.descriptor().backend {
             return fail(
                 Check::Fixture,
-                "foreign backend matches the backend under test",
+                "foreign backend matches the executor under test",
             );
         }
-        match self.backend.execute(&request) {
+        let request = self.request(
+            &self.fixture.house,
+            &self.fixture.foreign_backend,
+            "foreign-backend",
+            probe.clone(),
+        )?;
+        match self.executor.execute(&request) {
             Err(EffectFailure::NotApplied(NotAppliedReason::ForeignBackend)) => {}
             Err(_) => return fail(check, "refusal did not name the backend mismatch"),
             Ok(_) => return fail(check, "request for another backend was applied"),
@@ -297,38 +417,17 @@ impl Runner<'_> {
 
     fn unsupported(&mut self) -> Result<(), ConformanceFailure> {
         let check = Check::UnsupportedRefused;
-        let worker = self.absent_worker()?;
-        let operations = [
-            ("unsupported-launch", self.launch()),
-            (
-                "unsupported-message",
-                Operation::MessageWorker {
-                    worker: worker.clone(),
-                    body: self.fixture.brief.clone(),
-                },
-            ),
-            (
-                "unsupported-cancel",
-                Operation::CancelWorker {
-                    worker: worker.clone(),
-                },
-            ),
-            (
-                "unsupported-release",
-                Operation::ReleaseResource { resource: worker },
-            ),
-        ];
-        for (suffix, operation) in operations {
-            let capability = operation.required_capability();
+        for (suffix, effect) in self.samples()? {
+            let capability = effect.required_capability();
             if self.supports(capability) {
                 continue;
             }
-            let request = self.request(&self.fixture.house, suffix, operation)?;
-            match self.backend.execute(&request) {
+            let request = self.own_request(suffix, effect)?;
+            match self.executor.execute(&request) {
                 Err(EffectFailure::NotApplied(NotAppliedReason::Unsupported(named)))
                     if named == capability => {}
                 Err(_) => return fail(check, "refusal did not name the missing capability"),
-                Ok(_) => return fail(check, "operation without declared support was applied"),
+                Ok(_) => return fail(check, "effect without declared support was applied"),
             }
             self.assert_not_applied(check, request.key())?;
         }
@@ -340,7 +439,7 @@ impl Runner<'_> {
         let check = Check::UnknownKeyNotApplied;
         let key = self.key("never-used")?;
         if !self.supports(Capability::EffectLookup) {
-            return match self.backend.lookup(&key) {
+            return match self.executor.lookup(&key) {
                 Err(BackendUnavailable::Unsupported(Capability::EffectLookup)) => {
                     self.record(
                         check,
@@ -353,7 +452,7 @@ impl Runner<'_> {
                 Ok(_) | Err(_) => fail(check, "undeclared lookup did not report unsupported"),
             };
         }
-        match self.backend.lookup(&key) {
+        match self.executor.lookup(&key) {
             Ok(Lookup::Absent | Lookup::Unknown) => {
                 self.record(check, CheckResult::Passed);
                 Ok(())
@@ -363,31 +462,22 @@ impl Runner<'_> {
         }
     }
 
-    fn launch_receipt(&mut self) -> Result<Option<(EffectRequest, Receipt)>, ConformanceFailure> {
-        let check = Check::LaunchReceipt;
-        if !self.supports(Capability::WorkerLaunchIsolated) {
-            self.record(
-                check,
-                CheckResult::NotApplicable {
-                    requires: Capability::WorkerLaunchIsolated,
-                },
-            );
+    fn probe_receipt(
+        &mut self,
+        probe: &Effect,
+    ) -> Result<Option<(EffectRequest, Receipt)>, ConformanceFailure> {
+        let check = Check::ProbeReceipt;
+        let requires = probe.required_capability();
+        if !self.supports(requires) {
+            self.record(check, CheckResult::NotApplicable { requires });
             return Ok(None);
         }
-        let request = self.request(&self.fixture.house, "launch", self.launch())?;
-        let receipt = match self.backend.execute(&request) {
+        let request = self.own_request("probe", probe.clone())?;
+        let receipt = match self.executor.execute(&request) {
             Ok(receipt) => receipt,
-            Err(EffectFailure::NotApplied(_)) => return fail(check, "launch was refused"),
-            Err(EffectFailure::Uncertain(_)) => return fail(check, "launch outcome was uncertain"),
+            Err(EffectFailure::NotApplied(_)) => return fail(check, "probe was refused"),
+            Err(EffectFailure::Uncertain(_)) => return fail(check, "probe outcome was uncertain"),
         };
-        let backend = &self.backend.descriptor().backend;
-        let names_worker = receipt
-            .resources()
-            .iter()
-            .any(|resource| resource.kind == ResourceKind::Worker && &resource.backend == backend);
-        if !names_worker {
-            return fail(check, "receipt names no worker on this backend");
-        }
         self.record(check, CheckResult::Passed);
         Ok(Some((request, receipt)))
     }
@@ -407,14 +497,14 @@ impl Runner<'_> {
             );
             return Ok(());
         }
-        match self.backend.lookup(request.key()) {
+        match self.executor.lookup(request.key()) {
             Ok(Lookup::Applied(found)) if &found == receipt => {
                 self.record(check, CheckResult::Passed);
                 Ok(())
             }
             Ok(Lookup::Applied(_)) => fail(check, "lookup returned a different receipt"),
-            Ok(Lookup::Absent) => fail(check, "applied launch reported as absent"),
-            Ok(Lookup::Unknown) | Err(_) => fail(check, "applied launch could not be looked up"),
+            Ok(Lookup::Absent) => fail(check, "applied probe reported as absent"),
+            Ok(Lookup::Unknown) | Err(_) => fail(check, "applied probe could not be looked up"),
         }
     }
 
@@ -433,7 +523,7 @@ impl Runner<'_> {
             );
             return Ok(());
         }
-        match self.backend.execute(request) {
+        match self.executor.execute(request) {
             Ok(repeat) if &repeat == receipt => {
                 self.record(check, CheckResult::Passed);
                 Ok(())
@@ -443,7 +533,11 @@ impl Runner<'_> {
         }
     }
 
-    fn observable(&mut self, worker: &ResourceRef) -> Result<(), ConformanceFailure> {
+    fn observable(
+        &mut self,
+        backend: &dyn WorkerBackend,
+        worker: &ResourceRef,
+    ) -> Result<(), ConformanceFailure> {
         let check = Check::LaunchObservable;
         if !self.supports(Capability::WorkerStatusAndOutcome) {
             self.record(
@@ -454,7 +548,7 @@ impl Runner<'_> {
             );
             return Ok(());
         }
-        match self.backend.observe_worker(worker) {
+        match backend.observe_worker(worker) {
             Ok(WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply) => {
                 self.record(check, CheckResult::Passed);
                 Ok(())
@@ -467,7 +561,54 @@ impl Runner<'_> {
         }
     }
 
-    fn cancel(&mut self, worker: &ResourceRef) -> Result<(), ConformanceFailure> {
+    fn inventory(
+        &mut self,
+        backend: &dyn WorkerBackend,
+        worker: &ResourceRef,
+    ) -> Result<(), ConformanceFailure> {
+        let check = Check::InventoryListsLaunch;
+        if !self.supports(Capability::ResourceInventory) {
+            return match backend.inventory() {
+                Err(BackendUnavailable::Unsupported(Capability::ResourceInventory)) => {
+                    self.record(
+                        check,
+                        CheckResult::NotApplicable {
+                            requires: Capability::ResourceInventory,
+                        },
+                    );
+                    Ok(())
+                }
+                Ok(_) | Err(_) => fail(check, "undeclared inventory did not report unsupported"),
+            };
+        }
+        let observations = match backend.inventory() {
+            Ok(observations) => observations,
+            Err(_) => return fail(check, "declared inventory was unavailable"),
+        };
+        if observations.len() > MAX_INVENTORY_RESOURCES {
+            return fail(check, "inventory exceeded its bound");
+        }
+        match observations
+            .iter()
+            .find(|observation| &observation.resource == worker)
+            .map(|observation| observation.liveness)
+        {
+            Some(Liveness::Live) => {
+                self.record(check, CheckResult::Passed);
+                Ok(())
+            }
+            Some(Liveness::Exited) => fail(check, "new worker listed as exited"),
+            Some(Liveness::Unverifiable) | None => {
+                fail(check, "launched worker not listed as live")
+            }
+        }
+    }
+
+    fn cancel(
+        &mut self,
+        backend: &dyn WorkerBackend,
+        worker: &ResourceRef,
+    ) -> Result<(), ConformanceFailure> {
         let check = Check::CancelObserved;
         for requires in [Capability::WorkerCancel, Capability::WorkerStatusAndOutcome] {
             if !self.supports(requires) {
@@ -475,21 +616,20 @@ impl Runner<'_> {
                 return Ok(());
             }
         }
-        let request = self.request(
-            &self.fixture.house,
+        let request = self.own_request(
             "cancel",
-            Operation::CancelWorker {
+            Effect::Worker(Operation::CancelWorker {
                 worker: worker.clone(),
-            },
+            }),
         )?;
-        match self.backend.execute(&request) {
+        match backend.execute(&request) {
             // An uncertain cancel is allowed; the observation below decides.
             Ok(_) | Err(EffectFailure::Uncertain(_)) => {}
             Err(EffectFailure::NotApplied(_)) => {
                 return fail(check, "cancel of a launched worker was refused");
             }
         }
-        match self.backend.observe_worker(worker) {
+        match backend.observe_worker(worker) {
             Ok(WorkerState::Ready | WorkerState::AwaitingReply | WorkerState::Starting) => {
                 fail(check, "cancelled worker still reported as running")
             }

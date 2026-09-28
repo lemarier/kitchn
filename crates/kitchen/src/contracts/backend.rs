@@ -1,9 +1,10 @@
-//! The orchestrator-neutral execution boundary.
+//! The executor-neutral execution boundary.
 //!
 //! Kitchen persists an [`EffectRequest`] before handing it to an
-//! [`ExecutionBackend`], then records what the backend reports. Backends keep
-//! their native execution state; they return receipts and observations rather
-//! than becoming a second source of truth for task ownership.
+//! [`EffectExecutor`], then records what the executor reports. A
+//! [`WorkerBackend`] is an executor that also runs and observes workers.
+//! Executors keep their native state; they return receipts and observations
+//! rather than becoming a second source of truth for task ownership.
 
 use std::fmt;
 
@@ -12,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BackendId, CredentialId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, BackendDescriptor, Capability, ContractError, ExternalRef, Permission,
-        ResourceRef, Role, Text, ValueKind,
+        AttemptNumber, BackendDescriptor, Capability, ContractError, Effect, ExternalRef,
+        Permission, ResourceRef, Role, Text, ValueKind,
     },
 };
 
@@ -49,6 +50,15 @@ pub enum Operation {
         /// Message body.
         body: Text,
     },
+    /// Answer a question a worker asked.
+    ReplyToWorker {
+        /// Target worker.
+        worker: ResourceRef,
+        /// The backend's reference for the question being answered.
+        question: ExternalRef,
+        /// Reply body.
+        body: Text,
+    },
     /// Stop a worker. Cancellation does not prove rollback of its effects.
     CancelWorker {
         /// Target worker.
@@ -67,7 +77,7 @@ impl Operation {
     pub const fn required_capability(&self) -> Capability {
         match self {
             Self::LaunchWorker { .. } => Capability::WorkerLaunchIsolated,
-            Self::MessageWorker { .. } => Capability::WorkerMessaging,
+            Self::MessageWorker { .. } | Self::ReplyToWorker { .. } => Capability::WorkerMessaging,
             Self::CancelWorker { .. } => Capability::WorkerCancel,
             Self::ReleaseResource { .. } => Capability::ResourceRelease,
         }
@@ -78,7 +88,7 @@ impl Operation {
     pub const fn required_permission(&self) -> Permission {
         match self {
             Self::LaunchWorker { .. } => Permission::LaunchWorker,
-            Self::MessageWorker { .. } => Permission::MessageWorker,
+            Self::MessageWorker { .. } | Self::ReplyToWorker { .. } => Permission::MessageWorker,
             Self::CancelWorker { .. } => Permission::CancelWorker,
             Self::ReleaseResource { .. } => Permission::ReleaseResource,
         }
@@ -121,7 +131,7 @@ pub struct EffectRequest {
     task: TaskId,
     attempt: AttemptNumber,
     key: IdempotencyKey,
-    operation: Operation,
+    effect: Effect,
 }
 
 impl EffectRequest {
@@ -136,7 +146,7 @@ impl EffectRequest {
         task: TaskId,
         attempt: AttemptNumber,
         key: IdempotencyKey,
-        operation: Operation,
+        effect: Effect,
     ) -> Self {
         Self {
             house,
@@ -145,7 +155,7 @@ impl EffectRequest {
             task,
             attempt,
             key,
-            operation,
+            effect,
         }
     }
 
@@ -189,8 +199,8 @@ impl EffectRequest {
 
     /// The requested effect.
     #[must_use]
-    pub const fn operation(&self) -> &Operation {
-        &self.operation
+    pub const fn effect(&self) -> &Effect {
+        &self.effect
     }
 }
 
@@ -366,21 +376,51 @@ pub enum BackendUnavailable {
     /// The backend does not declare the capability the call needs.
     #[error("backend does not support {0}")]
     Unsupported(Capability),
+    /// The answer would exceed its bound, such as
+    /// [`MAX_INVENTORY_RESOURCES`].
+    #[error("backend answer exceeds its bound")]
+    LimitExceeded,
 }
 
-/// An execution backend serving exactly one house.
+/// Maximum resources one [`WorkerBackend::inventory`] call returns.
+pub const MAX_INVENTORY_RESOURCES: usize = 1024;
+
+/// Whether an inventoried resource is in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Liveness {
+    /// The backend has positive evidence the resource is in use.
+    Live,
+    /// The backend has positive evidence its process or session ended.
+    Exited,
+    /// The backend cannot tell; never treat as exited.
+    Unverifiable,
+}
+
+/// One resource as the backend sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceObservation {
+    /// The resource.
+    pub resource: ResourceRef,
+    /// The backend's record of what owns it, such as the idempotency key of
+    /// the request that created it; `None` when the backend records none.
+    pub owner: Option<ExternalRef>,
+    /// Whether it is in use.
+    pub liveness: Liveness,
+}
+
+/// Performs persisted effects for exactly one house in one namespace.
 ///
-/// Contract, checked by [`crate::contracts::conformance`]:
+/// Contract, checked by [`crate::contracts::conformance::run`]:
 ///
-/// - Every call is bounded by a deadline; an expired call reports
-///   [`EffectFailure::Uncertain`] or [`BackendUnavailable::Timeout`], never success.
 /// - [`BackendDescriptor::backend`] names one provider namespace: the
 ///   instance and account whose idempotency keys and lookups it uses.
+/// - Every call is bounded by a deadline; an expired call reports
+///   [`EffectFailure::Uncertain`] or [`BackendUnavailable::Timeout`], never success.
 /// - `execute` refuses a request for another house with
 ///   [`NotAppliedReason::CrossHouse`], a request persisted for another
-///   backend namespace with [`NotAppliedReason::ForeignBackend`], and an operation whose capability is not
-///   fully supported with [`NotAppliedReason::Unsupported`], in both cases
-///   without acting.
+///   backend namespace with [`NotAppliedReason::ForeignBackend`], and an
+///   effect whose capability is not fully supported with
+///   [`NotAppliedReason::Unsupported`], in each case without acting.
 /// - `execute` returns [`EffectFailure::NotApplied`] only when the effect
 ///   definitely did not happen.
 /// - With [`Capability::EffectIdempotentRequests`], resubmitting a key returns
@@ -388,11 +428,10 @@ pub enum BackendUnavailable {
 /// - With [`Capability::EffectLookup`], `lookup` reports an applied key's
 ///   receipt and returns [`Lookup::Absent`] only with proof that the key was
 ///   not applied and cannot be applied later, including by an earlier
-///   invocation that is still in flight; otherwise [`Lookup::Unknown`]. Without it, `lookup` returns
-///   [`BackendUnavailable::Unsupported`].
-/// - `observe_worker` reports readiness only on positive evidence.
-pub trait ExecutionBackend {
-    /// Identity, house, and declared capabilities.
+///   invocation that is still in flight; otherwise [`Lookup::Unknown`].
+///   Without it, `lookup` returns [`BackendUnavailable::Unsupported`].
+pub trait EffectExecutor {
+    /// Namespace, house, and declared capabilities.
     fn descriptor(&self) -> &BackendDescriptor;
 
     /// Perform one effect.
@@ -405,12 +444,32 @@ pub trait ExecutionBackend {
     /// Look up an effect by key without performing it.
     ///
     /// # Errors
-    /// Returns [`BackendUnavailable`] when the backend cannot be queried.
+    /// Returns [`BackendUnavailable`] when the executor cannot be queried.
     fn lookup(&self, key: &IdempotencyKey) -> Result<Lookup, BackendUnavailable>;
+}
 
+/// An executor that runs and observes workers.
+///
+/// Contract, checked by [`crate::contracts::conformance::run_worker`]:
+/// `observe_worker` reports readiness only on positive evidence, and
+/// `inventory` returns at most [`MAX_INVENTORY_RESOURCES`] observations,
+/// reporting [`Liveness::Unverifiable`] rather than guessing.
+pub trait WorkerBackend: EffectExecutor {
     /// Observe a worker's state without changing it.
     ///
     /// # Errors
     /// Returns [`BackendUnavailable`] when the backend cannot be queried.
     fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable>;
+
+    /// List the resources this backend manages for the house, read-only.
+    ///
+    /// # Errors
+    /// The default reports [`BackendUnavailable::Unsupported`] for
+    /// [`Capability::ResourceInventory`]; implementations return
+    /// [`BackendUnavailable::LimitExceeded`] rather than truncating.
+    fn inventory(&self) -> Result<Vec<ResourceObservation>, BackendUnavailable> {
+        Err(BackendUnavailable::Unsupported(
+            Capability::ResourceInventory,
+        ))
+    }
 }

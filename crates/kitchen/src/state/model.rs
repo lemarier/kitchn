@@ -15,10 +15,10 @@ use crate::{
     ConsumerId, EffectName, Error, HolderId, HouseId, TaskId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Capability,
-        Claimant, Consent, ContractError, Disposition, EffectRequest, EffectSeq, Evidence,
-        EvidenceRevision, EvidenceSubject, ExternalRef, FailureClass, Fence, HouseGrants,
-        IdempotencyKey, LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef, RetryPolicy,
-        Settlement, TaskSpec, Timestamp, Trigger, UncertainReason,
+        Claimant, Consent, ContractError, Disposition, Effect, EffectContext, EffectRequest,
+        EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef, FailureClass, Fence,
+        HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef,
+        RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Timestamp, Trigger, UncertainReason,
     },
     state::{ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, StateError},
 };
@@ -628,7 +628,7 @@ impl TaskRecord {
         let Some(existing) = self.effects.get_mut(index) else {
             return fail(StateError::CorruptState(Corruption::EffectSequence));
         };
-        if existing.request.operation() != &plan.operation {
+        if existing.request.effect() != &plan.effect {
             return fail(StateError::EffectNameConflict(existing.seq));
         }
         if existing.request.backend() != &backend.backend {
@@ -708,6 +708,23 @@ impl TaskRecord {
             return fail(StateError::ConsentReused);
         }
         Ok(())
+    }
+
+    /// Effects submitted, or possibly submitted, per executor family: every
+    /// recorded effect except those established as not applied.
+    fn submitted_effects(&self) -> SubmittedEffects {
+        let mut submitted = SubmittedEffects::default();
+        for effect in &self.effects {
+            match effect.state {
+                EffectState::NotApplied { .. } => {}
+                EffectState::Intended
+                | EffectState::Uncertain { .. }
+                | EffectState::Applied { .. }
+                | EffectState::Unresolvable { .. }
+                | EffectState::Waived { .. } => submitted.add(effect.request.effect().executor()),
+            }
+        }
+        submitted
     }
 
     /// Whether an applied effect of this task reported `resource`.
@@ -837,7 +854,7 @@ pub struct EffectPlan {
     /// Evidence revision the decision was based on.
     pub decided_at: EvidenceRevision,
     /// The effect.
-    pub operation: Operation,
+    pub effect: Effect,
     /// The person's consent for exactly this effect. Required under an
     /// interactive claim and refused under a scheduled one.
     pub consent: Option<Consent>,
@@ -1350,19 +1367,28 @@ impl StoreState {
                 .requires
                 .iter()
                 .copied()
-                .chain([plan.operation.required_capability()]),
+                .chain([plan.effect.required_capability()]),
         )?;
         let trigger = task.owned_lease(plan.fence, now, true)?.trigger;
         // After a cancellation request, only stopping a worker this task
         // launched may start; it may start while other effects are unresolved.
         let stopping = task.cancel.is_some();
         if stopping {
-            match &plan.operation {
-                Operation::CancelWorker { worker } if task.owns_resource(worker) => {}
-                Operation::CancelWorker { .. } => return fail(StateError::ResourceNotOwned),
-                Operation::LaunchWorker { .. }
-                | Operation::MessageWorker { .. }
-                | Operation::ReleaseResource { .. } => return fail(StateError::CancelRequested),
+            match &plan.effect {
+                Effect::Worker(Operation::CancelWorker { worker })
+                    if task.owns_resource(worker) => {}
+                Effect::Worker(Operation::CancelWorker { .. }) => {
+                    return fail(StateError::ResourceNotOwned);
+                }
+                Effect::Worker(
+                    Operation::LaunchWorker { .. }
+                    | Operation::MessageWorker { .. }
+                    | Operation::ReplyToWorker { .. }
+                    | Operation::ReleaseResource { .. },
+                )
+                | Effect::GitHub(_)
+                | Effect::Roger(_)
+                | Effect::Schedule(_) => return fail(StateError::CancelRequested),
             }
         }
         let attempt = match task.running_attempt_mut(plan.fence) {
@@ -1375,8 +1401,16 @@ impl StoreState {
                 current: task.evidence.revision,
             });
         }
-        let permission = plan.operation.required_permission();
-        let scope = task.spec.scope();
+        let permission = plan.effect.required_permission();
+        let task_scope = task.spec.scope();
+        let scope = plan.effect.scope(&task_scope);
+        if !task_scope.covers(&scope) {
+            return Err(ContractError::OutOfTaskScope {
+                effect: scope,
+                task: task_scope,
+            }
+            .into());
+        }
         let (credential, authorization) = match (trigger, &plan.consent) {
             (Trigger::Scheduled, None) => (
                 task.spec
@@ -1389,7 +1423,7 @@ impl StoreState {
                 return Err(ContractError::ConsentRequired { permission }.into());
             }
             (Trigger::Interactive, Some(consent)) => {
-                consent.check(&house, &plan.task, &plan.operation, plan.decided_at)?;
+                consent.check(&house, &plan.task, &plan.effect, plan.decided_at)?;
                 let credential = grants.permitted(permission, &scope, &backend.backend)?;
                 task.check_consent_unused(consent, &plan.name, attempt)?;
                 (
@@ -1420,6 +1454,13 @@ impl StoreState {
         }
         let seq = EffectSeq::new(u32::try_from(task.effects.len()).unwrap_or(u32::MAX));
         task.check_submission_budget(&plan.name, attempt, seq, now)?;
+        plan.effect.admit(&EffectContext {
+            house: &house,
+            task: &plan.task,
+            task_scope: &task_scope,
+            revision: task.evidence.revision,
+            submitted: &task.submitted_effects(),
+        })?;
         let key = ExternalRef::new(&format!(
             "kitchen-{house}-{}-{nonce:016x}-{}",
             plan.task,
@@ -1437,7 +1478,7 @@ impl StoreState {
                 plan.task,
                 attempt,
                 IdempotencyKey::from_ref(key),
-                plan.operation,
+                plan.effect,
             ),
             authorization,
             submissions: 1,

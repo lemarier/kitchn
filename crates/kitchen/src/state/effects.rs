@@ -1,9 +1,9 @@
-//! Running effects through a backend with intent persisted first.
+//! Running effects through an executor with intent persisted first.
 
 use crate::{
     Error, TaskId,
     contracts::{
-        Capability, Clock, ContractError, EffectFailure, ExecutionBackend, Fence, HouseGrants,
+        Capability, Clock, ContractError, EffectExecutor, EffectFailure, Fence, HouseGrants,
         Lookup, NotAppliedReason, UncertainReason,
     },
     state::{
@@ -13,8 +13,9 @@ use crate::{
 
 type Result<T> = std::result::Result<T, Error>;
 
-/// Execute one logical effect: check the backend, persist intent, call the
-/// backend without holding the store lock, then record the outcome.
+/// Execute one logical effect: check the executor, persist intent, call the
+/// executor without holding the store lock, then record the outcome. Only the
+/// executor namespace recorded with an intent may resubmit it.
 ///
 /// Delivery is at most once per idempotency key only when the backend
 /// declares [`Capability::EffectIdempotentRequests`]; otherwise an uncertain
@@ -31,19 +32,19 @@ type Result<T> = std::result::Result<T, Error>;
 /// before anything is persisted) or [`HouseStore::record_effect_outcome`].
 pub fn run_effect(
     store: &HouseStore,
-    backend: &dyn ExecutionBackend,
+    executor: &dyn EffectExecutor,
     grants: &HouseGrants,
     plan: EffectPlan,
     clock: &dyn Clock,
 ) -> Result<EffectRecord> {
     let task = plan.task.clone();
     let fence = plan.fence;
-    let descriptor = backend.descriptor();
+    let descriptor = executor.descriptor();
     let record = match store.begin_effect(plan.clone(), grants, descriptor, clock.now())? {
         EffectStart::Resolved(record) => return Ok(record),
         EffectStart::Execute(record) => record,
         EffectStart::ReconcileFirst(pending) => {
-            let outcome = look_up(backend, &pending);
+            let outcome = look_up(executor, &pending);
             store.record_effect_outcome(&task, fence, pending.seq(), outcome, clock.now())?;
             match store.begin_effect(plan, grants, descriptor, clock.now())? {
                 EffectStart::Execute(record) => record,
@@ -54,7 +55,7 @@ pub fn run_effect(
             }
         }
     };
-    let outcome = match backend.execute(record.request()) {
+    let outcome = match executor.execute(record.request()) {
         Ok(receipt) => EffectOutcome::Applied(receipt),
         Err(EffectFailure::NotApplied(reason)) => EffectOutcome::NotApplied(reason),
         Err(EffectFailure::Uncertain(reason)) => EffectOutcome::Uncertain(reason),
@@ -70,15 +71,15 @@ pub fn run_effect(
 }
 
 /// What a lookup establishes about one persisted effect.
-fn look_up(backend: &dyn ExecutionBackend, effect: &EffectRecord) -> EffectOutcome {
-    if !backend
+fn look_up(executor: &dyn EffectExecutor, effect: &EffectRecord) -> EffectOutcome {
+    if !executor
         .descriptor()
         .capabilities
         .supports(Capability::EffectLookup)
     {
         return EffectOutcome::Uncertain(UncertainReason::LookupUnsupported);
     }
-    match backend.lookup(effect.request().key()) {
+    match executor.lookup(effect.request().key()) {
         Ok(Lookup::Applied(receipt)) => EffectOutcome::Applied(receipt),
         Ok(Lookup::Absent) => EffectOutcome::NotApplied(NotAppliedReason::ConfirmedAbsent),
         Ok(Lookup::Unknown) | Err(_) => {
@@ -103,7 +104,7 @@ pub struct ReconcileReport {
     pub foreign: Vec<EffectRecord>,
 }
 
-/// Ask the backend what happened to each unresolved effect of `task` and
+/// Ask the executor what happened to each unresolved effect of `task` and
 /// record the answers under `fence`.
 ///
 /// Lookups use the persisted idempotency key and never re-execute an effect.
@@ -118,12 +119,12 @@ pub struct ReconcileReport {
 /// does not own the task.
 pub fn reconcile(
     store: &HouseStore,
-    backend: &dyn ExecutionBackend,
+    executor: &dyn EffectExecutor,
     task: &TaskId,
     fence: Fence,
     clock: &dyn Clock,
 ) -> Result<ReconcileReport> {
-    let descriptor = backend.descriptor();
+    let descriptor = executor.descriptor();
     if &descriptor.house != store.house() {
         return Err(ContractError::CrossHouse {
             expected: store.house().clone(),
@@ -152,7 +153,7 @@ pub fn reconcile(
             report.foreign.push(effect);
             continue;
         }
-        let outcome = look_up(backend, &effect);
+        let outcome = look_up(executor, &effect);
         let updated =
             store.record_effect_outcome(task, fence, effect.seq(), outcome, clock.now())?;
         if updated.state().is_resolved() {

@@ -3,7 +3,7 @@
 //! [`HouseStore`] records tasks, fenced claims, attempts, effect intents and
 //! outcomes, evidence revisions, consumed messages, and single-consumer
 //! leases in runtime storage the caller selects. [`run_effect`] and
-//! [`reconcile`] connect the store to an [`crate::contracts::ExecutionBackend`].
+//! [`reconcile`] connect the store to an [`crate::contracts::EffectExecutor`].
 //!
 //! Ownership rules:
 //!

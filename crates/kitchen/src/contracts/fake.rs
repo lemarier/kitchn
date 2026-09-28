@@ -1,6 +1,7 @@
-//! An in-memory, non-Orca backend for offline tests.
+//! An in-memory, non-Orca executor for offline tests.
 //!
-//! It follows the [`ExecutionBackend`] contract and can inject faults (lost
+//! It follows the [`EffectExecutor`] and [`WorkerBackend`] contracts for
+//! every effect family its capabilities declare and can inject faults (lost
 //! responses, timeouts, refusals, lookup outages) so recovery paths can be
 //! tested without a live orchestrator. Results from it are simulated
 //! evidence, never live runtime evidence.
@@ -13,10 +14,11 @@ use std::{
 use crate::{
     BackendId, HouseId,
     contracts::{
-        BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, EffectFailure,
-        EffectRequest, ExecutionBackend, ExternalRef, IdempotencyKey, Lookup, NotAppliedReason,
-        Operation, Receipt, ResourceKind, ResourceRef, UncertainReason, WorkerOutcome, WorkerState,
-        Workspace,
+        BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, Effect, EffectExecutor,
+        EffectFailure, EffectRequest, ExternalRef, GitHubEffect, IdempotencyKey, Liveness, Lookup,
+        MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation, Receipt, ResourceKind,
+        ResourceObservation, ResourceRef, RogerEffect, ScheduleEffect, UncertainReason,
+        WorkerBackend, WorkerOutcome, WorkerState, Workspace,
     },
 };
 
@@ -35,6 +37,7 @@ pub enum ExecuteFault {
 struct FakeState {
     applied: BTreeMap<IdempotencyKey, Receipt>,
     workers: BTreeMap<ExternalRef, WorkerState>,
+    owners: BTreeMap<ExternalRef, ExternalRef>,
     execute_faults: VecDeque<ExecuteFault>,
     lookup_outages: usize,
     effects_performed: usize,
@@ -127,8 +130,8 @@ impl FakeBackend {
         request: &EffectRequest,
     ) -> Result<Receipt, EffectFailure> {
         let rejected = EffectFailure::NotApplied(NotAppliedReason::Rejected);
-        let resources = match request.operation() {
-            Operation::LaunchWorker { workspace, .. } => {
+        let resources = match request.effect() {
+            Effect::Worker(Operation::LaunchWorker { workspace, .. }) => {
                 let worker = self.handle(state, "worker")?;
                 let mut resources = vec![self.resource(ResourceKind::Worker, worker.clone())];
                 match workspace {
@@ -138,16 +141,21 @@ impl FakeBackend {
                     }
                     Workspace::Existing(existing) => resources.push(existing.clone()),
                 }
+                if let Ok(owner) = ExternalRef::new(request.key().as_str()) {
+                    state.owners.insert(worker.clone(), owner);
+                }
                 state.workers.insert(worker, WorkerState::Starting);
                 resources
             }
-            Operation::MessageWorker { worker, .. } => {
+            Effect::Worker(
+                Operation::MessageWorker { worker, .. } | Operation::ReplyToWorker { worker, .. },
+            ) => {
                 if !self.owns_live_worker(state, worker) {
                     return Err(rejected);
                 }
                 vec![worker.clone()]
             }
-            Operation::CancelWorker { worker } => {
+            Effect::Worker(Operation::CancelWorker { worker }) => {
                 if !self.owns_live_worker(state, worker) {
                     return Err(rejected);
                 }
@@ -157,12 +165,19 @@ impl FakeBackend {
                 );
                 vec![worker.clone()]
             }
-            Operation::ReleaseResource { resource } => {
+            Effect::Worker(Operation::ReleaseResource { resource }) => {
                 if resource.backend != self.descriptor.backend {
                     return Err(rejected);
                 }
                 state.workers.remove(&resource.handle);
+                state.owners.remove(&resource.handle);
                 vec![resource.clone()]
+            }
+            Effect::GitHub(GitHubEffect::CreateLabel { .. })
+            | Effect::Roger(RogerEffect::Ask { .. }) => Vec::new(),
+            Effect::Schedule(ScheduleEffect::InstallDisabled { .. }) => {
+                let schedule = self.handle(state, "schedule")?;
+                vec![self.resource(ResourceKind::Schedule, schedule)]
             }
         };
         let reference = self.handle(state, "request")?;
@@ -181,7 +196,7 @@ impl FakeBackend {
     }
 }
 
-impl ExecutionBackend for FakeBackend {
+impl EffectExecutor for FakeBackend {
     fn descriptor(&self) -> &BackendDescriptor {
         &self.descriptor
     }
@@ -197,7 +212,7 @@ impl ExecutionBackend for FakeBackend {
         if request.backend() != &self.descriptor.backend {
             return Err(EffectFailure::NotApplied(NotAppliedReason::ForeignBackend));
         }
-        let capability = request.operation().required_capability();
+        let capability = request.effect().required_capability();
         if !self.descriptor.capabilities.supports(capability) {
             return Err(EffectFailure::NotApplied(NotAppliedReason::Unsupported(
                 capability,
@@ -245,7 +260,9 @@ impl ExecutionBackend for FakeBackend {
             .get(key)
             .map_or(Lookup::Absent, |receipt| Lookup::Applied(receipt.clone())))
     }
+}
 
+impl WorkerBackend for FakeBackend {
     fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
         if !self
             .descriptor
@@ -265,5 +282,36 @@ impl ExecutionBackend for FakeBackend {
             .get(&worker.handle)
             .copied()
             .unwrap_or(WorkerState::Missing))
+    }
+
+    fn inventory(&self) -> Result<Vec<ResourceObservation>, BackendUnavailable> {
+        if !self
+            .descriptor
+            .capabilities
+            .supports(Capability::ResourceInventory)
+        {
+            return Err(BackendUnavailable::Unsupported(
+                Capability::ResourceInventory,
+            ));
+        }
+        let state = self.lock();
+        if state.workers.len() > MAX_INVENTORY_RESOURCES {
+            return Err(BackendUnavailable::LimitExceeded);
+        }
+        Ok(state
+            .workers
+            .iter()
+            .map(|(handle, worker)| ResourceObservation {
+                resource: self.resource(ResourceKind::Worker, handle.clone()),
+                owner: state.owners.get(handle).cloned(),
+                liveness: match worker {
+                    WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply => {
+                        Liveness::Live
+                    }
+                    WorkerState::Settled(_) | WorkerState::Missing => Liveness::Exited,
+                    WorkerState::Unknown => Liveness::Unverifiable,
+                },
+            })
+            .collect())
     }
 }

@@ -1,7 +1,7 @@
 //! Kitchen's reusable library for portable agent workflows.
 //!
 //! Domain contracts and policy belong here. Orchestrator-specific execution
-//! belongs behind the [`contracts::ExecutionBackend`] boundary. Durable task
+//! belongs behind the [`contracts::EffectExecutor`] boundary. Durable task
 //! ownership lives in [`state::HouseStore`], in house-scoped runtime storage
 //! chosen by the caller. The library grants no authority by itself: effects
 //! need task authority delegated from explicit house grants.

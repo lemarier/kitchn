@@ -48,12 +48,13 @@ fn interactive_task(fixture: &Fixture, id: &str) -> TestResult<(TaskId, Fence)> 
 }
 
 fn consent(id: &str, task: &TaskId, operation: Operation) -> TestResult<Consent> {
+    let effect = operation.into();
     Ok(Consent {
         id: ExternalRef::new(id)?,
         given_by: holder("person")?,
         house: house()?,
         task: task.clone(),
-        operation,
+        effect,
         revision: EvidenceRevision::INITIAL,
     })
 }

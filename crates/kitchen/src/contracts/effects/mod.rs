@@ -1,0 +1,195 @@
+//! Durable external effects, split by the executor family that performs them.
+//!
+//! Every effect goes through the same path: the state store persists an
+//! [`crate::contracts::EffectRequest`] carrying an [`Effect`], then an
+//! [`crate::contracts::EffectExecutor`] performs it. Each payload maps
+//! exhaustively to the [`Permission`] and [`Capability`] it needs and to the
+//! scope its authority is checked against. Before a new effect's intent is
+//! persisted, its admission hook ([`Effect::admit`]) sees an
+//! [`EffectContext`] computed in the same store transaction, so per-task
+//! budgets hold even under concurrent callers.
+//!
+//! The payload modules are owned by the workflows that use them: `github`
+//! and `roger` by #7, `schedule` by #6. They start with the minimal payloads
+//! needed to exercise the mechanism.
+
+mod github;
+mod roger;
+mod schedule;
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+pub use github::GitHubEffect;
+pub use roger::{DecisionBinding, MAX_ASKS_PER_TASK, RogerEffect};
+pub use schedule::ScheduleEffect;
+
+use crate::{
+    HouseId, TaskId,
+    contracts::{Capability, ContractError, EvidenceRevision, GrantScope, Operation, Permission},
+};
+
+/// The executor family that performs an effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutorKind {
+    /// An orchestrator running workers.
+    Worker,
+    /// A forge such as GitHub.
+    #[serde(rename = "github")]
+    GitHub,
+    /// A human-decision service such as Roger.
+    Roger,
+    /// A scheduler.
+    Schedule,
+}
+
+/// One external effect, persisted with its intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "executor", content = "effect", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum Effect {
+    /// A worker operation.
+    Worker(Operation),
+    /// A forge mutation.
+    #[serde(rename = "github")]
+    GitHub(GitHubEffect),
+    /// A human decision request.
+    Roger(RogerEffect),
+    /// A schedule change.
+    Schedule(ScheduleEffect),
+}
+
+impl Effect {
+    /// The executor family that performs this effect.
+    #[must_use]
+    pub const fn executor(&self) -> ExecutorKind {
+        match self {
+            Self::Worker(_) => ExecutorKind::Worker,
+            Self::GitHub(_) => ExecutorKind::GitHub,
+            Self::Roger(_) => ExecutorKind::Roger,
+            Self::Schedule(_) => ExecutorKind::Schedule,
+        }
+    }
+
+    /// The executor capability this effect needs.
+    #[must_use]
+    pub const fn required_capability(&self) -> Capability {
+        match self {
+            Self::Worker(operation) => operation.required_capability(),
+            Self::GitHub(effect) => effect.required_capability(),
+            Self::Roger(effect) => effect.required_capability(),
+            Self::Schedule(effect) => effect.required_capability(),
+        }
+    }
+
+    /// The task permission this effect needs.
+    #[must_use]
+    pub const fn required_permission(&self) -> Permission {
+        match self {
+            Self::Worker(operation) => operation.required_permission(),
+            Self::GitHub(effect) => effect.required_permission(),
+            Self::Roger(effect) => effect.required_permission(),
+            Self::Schedule(effect) => effect.required_permission(),
+        }
+    }
+
+    /// The scope authority is checked against. Worker and Roger effects act
+    /// within the task's scope; a forge effect names its repository; a
+    /// schedule is house-wide. The store refuses an effect whose scope the
+    /// task's own scope does not cover.
+    #[must_use]
+    pub fn scope(&self, task_scope: &GrantScope) -> GrantScope {
+        match self {
+            Self::Worker(_) | Self::Roger(_) => task_scope.clone(),
+            Self::GitHub(effect) => effect.scope(),
+            Self::Schedule(effect) => effect.scope(),
+        }
+    }
+
+    /// The admission hook, run inside the transaction that persists a new
+    /// effect's intent (not for a repeat of an existing logical effect).
+    ///
+    /// # Errors
+    /// Returns the payload's refusal, such as
+    /// [`ContractError::EffectBudgetExhausted`] or
+    /// [`ContractError::DecisionBindingMismatch`].
+    pub fn admit(&self, context: &EffectContext<'_>) -> Result<(), ContractError> {
+        match self {
+            Self::Worker(_) => Ok(()),
+            Self::GitHub(effect) => effect.admit(context),
+            Self::Roger(effect) => effect.admit(context),
+            Self::Schedule(effect) => effect.admit(context),
+        }
+    }
+}
+
+impl From<Operation> for Effect {
+    fn from(operation: Operation) -> Self {
+        Self::Worker(operation)
+    }
+}
+
+impl From<GitHubEffect> for Effect {
+    fn from(effect: GitHubEffect) -> Self {
+        Self::GitHub(effect)
+    }
+}
+
+impl From<RogerEffect> for Effect {
+    fn from(effect: RogerEffect) -> Self {
+        Self::Roger(effect)
+    }
+}
+
+impl From<ScheduleEffect> for Effect {
+    fn from(effect: ScheduleEffect) -> Self {
+        Self::Schedule(effect)
+    }
+}
+
+/// Effects of one task that were already submitted, or may have been:
+/// every recorded effect except those established as not applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubmittedEffects {
+    counts: BTreeMap<ExecutorKind, u32>,
+}
+
+impl SubmittedEffects {
+    /// Count one more effect for `executor`.
+    pub(crate) fn add(&mut self, executor: ExecutorKind) {
+        let count = self.counts.entry(executor).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    /// All submitted effects of the task.
+    #[must_use]
+    pub fn total(&self) -> u32 {
+        self.counts
+            .values()
+            .fold(0, |total, count| total.saturating_add(*count))
+    }
+
+    /// Submitted effects of the task for one executor family.
+    #[must_use]
+    pub fn for_executor(&self, executor: ExecutorKind) -> u32 {
+        self.counts.get(&executor).copied().unwrap_or(0)
+    }
+}
+
+/// What an admission hook sees, computed in the same store transaction that
+/// persists the new intent.
+#[derive(Debug, Clone, Copy)]
+pub struct EffectContext<'a> {
+    /// The store's house.
+    pub house: &'a HouseId,
+    /// The task.
+    pub task: &'a TaskId,
+    /// The task's scope.
+    pub task_scope: &'a GrantScope,
+    /// The task's current evidence revision.
+    pub revision: EvidenceRevision,
+    /// The task's effects already submitted, before this one.
+    pub submitted: &'a SubmittedEffects,
+}

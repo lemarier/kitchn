@@ -53,10 +53,10 @@ dependency coordinates the root manifest and lockfile with the other active owne
 
 | Owner | Library paths under `crates/kitchen/src/` | Other boundaries |
 | --- | --- | --- |
-| #4 core contracts and durable ownership | `id.rs`, `error.rs`, `contracts/`, `state/` | Shared exports; state-store integration tests |
+| #4 core contracts and durable ownership | `id.rs`, `error.rs`, `contracts/` (except payload files owned by #6 and #7), `state/` | Shared exports; state-store integration tests |
 | #5 house configuration and adoption | `house/`, `adoption/` | House/repository config adoption and safe-write installer; role cards and instruction assets in root `roles/` |
-| #6 Orca adapter and scheduling | `adapters/orca/`, `scheduling/` | Backend execution only; generic capability contracts belong to #4 |
-| #7 GitHub and Roger | `integrations/github/`, `integrations/roger/` | House-scoped external access |
+| #6 Orca adapter and scheduling | `adapters/orca/`, `scheduling/`, `contracts/effects/schedule.rs` | Backend execution only; generic capability contracts belong to #4 |
+| #7 GitHub and Roger | `integrations/github/`, `integrations/roger/`, `contracts/effects/github.rs`, `contracts/effects/roger.rs` | House-scoped external access |
 | #8 pickup, coordination and repair | `workflows/pickup.rs`, `workflows/coordination.rs`, `workflows/repair.rs` | Workflow integration tests |
 | #9 exact-head gate | `workflows/gate.rs` | Gate evidence and approval tests |
 | #10 triage and gardener | `workflows/triage.rs`, `workflows/gardener.rs` | Hygiene tests |

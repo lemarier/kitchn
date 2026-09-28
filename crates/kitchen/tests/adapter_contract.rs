@@ -12,10 +12,10 @@ use kitchen::{
     BackendId, Error, HouseId, TaskId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, BackendUnavailable,
-        Capability, CapabilitySet, ContractError, Disposition, EffectFailure, EffectRequest,
-        ExecutionBackend, ExternalRef, Fence, Grant, HouseGrants, IdempotencyKey, Lookup,
+        Capability, CapabilitySet, ContractError, Disposition, EffectExecutor, EffectFailure,
+        EffectRequest, ExternalRef, Fence, Grant, HouseGrants, IdempotencyKey, Lookup,
         NotAppliedReason, Operation, Permission, Receipt, ResourceKind, ResourceRef, Settlement,
-        TaskAuthority, Text, UncertainReason, WorkerState,
+        TaskAuthority, Text, UncertainReason, WorkerBackend, WorkerState,
         conformance::{self, Check, CheckResult, ConformanceFixture},
         fake::{ExecuteFault, FakeBackend},
     },
@@ -28,6 +28,7 @@ fn conformance_fixture() -> TestResult<ConformanceFixture> {
         foreign_house: other_house()?,
         foreign_backend: BackendId::new("fake-other")?,
         credential: common::credential()?,
+        repository: kitchen::contracts::Repository::new("origin89hq/km43")?,
         task: task_id("conformance")?,
         run_tag: ExternalRef::new("run-1")?,
         brief: Text::new("Conformance probe; exit immediately.")?,
@@ -65,17 +66,19 @@ fn started(fixture: &Fixture, id: &str) -> TestResult<(TaskId, Fence)> {
 #[test]
 fn fake_backend_passes_the_shared_contract() -> TestResult {
     let backend = FakeBackend::fully_capable(backend_id()?, house()?);
-    let report = conformance::run(&backend, &conformance_fixture()?)?;
+    let report = conformance::run_worker(&backend, &conformance_fixture()?)?;
     for check in [
         Check::DescriptorHouse,
         Check::CrossHouseRefused,
         Check::ForeignBackendRefused,
         Check::UnsupportedRefused,
         Check::UnknownKeyNotApplied,
-        Check::LaunchReceipt,
+        Check::ProbeReceipt,
         Check::LookupMatchesReceipt,
         Check::IdempotentResubmission,
+        Check::LaunchReceipt,
         Check::LaunchObservable,
+        Check::InventoryListsLaunch,
         Check::CancelObserved,
     ] {
         assert_eq!(report.result(check), Some(CheckResult::Passed), "{check}");
@@ -87,7 +90,7 @@ fn fake_backend_passes_the_shared_contract() -> TestResult {
 #[test]
 fn minimal_backend_passes_with_checks_marked_not_applicable() -> TestResult {
     let backend = fake([])?;
-    let report = conformance::run(&backend, &conformance_fixture()?)?;
+    let report = conformance::run_worker(&backend, &conformance_fixture()?)?;
     assert_eq!(
         report.result(Check::UnsupportedRefused),
         Some(CheckResult::Passed)
@@ -114,7 +117,7 @@ struct OverreachingBackend {
     declared: BackendDescriptor,
 }
 
-impl ExecutionBackend for OverreachingBackend {
+impl EffectExecutor for OverreachingBackend {
     fn descriptor(&self) -> &BackendDescriptor {
         &self.declared
     }
@@ -124,6 +127,9 @@ impl ExecutionBackend for OverreachingBackend {
     fn lookup(&self, key: &IdempotencyKey) -> Result<Lookup, BackendUnavailable> {
         self.inner.lookup(key)
     }
+}
+
+impl WorkerBackend for OverreachingBackend {
     fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
         self.inner.observe_worker(worker)
     }
@@ -132,7 +138,7 @@ impl ExecutionBackend for OverreachingBackend {
 /// Ignores the request's house, acting with its own credentials.
 struct HouseBlindBackend(FakeBackend);
 
-impl ExecutionBackend for HouseBlindBackend {
+impl EffectExecutor for HouseBlindBackend {
     fn descriptor(&self) -> &BackendDescriptor {
         self.0.descriptor()
     }
@@ -144,13 +150,16 @@ impl ExecutionBackend for HouseBlindBackend {
             request.task().clone(),
             request.attempt(),
             request.key().clone(),
-            request.operation().clone(),
+            request.effect().clone(),
         );
         self.0.execute(&rewritten)
     }
     fn lookup(&self, key: &IdempotencyKey) -> Result<Lookup, BackendUnavailable> {
         self.0.lookup(key)
     }
+}
+
+impl WorkerBackend for HouseBlindBackend {
     fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
         self.0.observe_worker(worker)
     }
@@ -159,7 +168,7 @@ impl ExecutionBackend for HouseBlindBackend {
 /// Claims every key it is asked about was applied.
 struct OptimisticLookupBackend(FakeBackend);
 
-impl ExecutionBackend for OptimisticLookupBackend {
+impl EffectExecutor for OptimisticLookupBackend {
     fn descriptor(&self) -> &BackendDescriptor {
         self.0.descriptor()
     }
@@ -174,6 +183,9 @@ impl ExecutionBackend for OptimisticLookupBackend {
         .map_err(|_| BackendUnavailable::Transport)?;
         Ok(Lookup::Applied(receipt))
     }
+}
+
+impl WorkerBackend for OptimisticLookupBackend {
     fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
         self.0.observe_worker(worker)
     }
@@ -190,19 +202,19 @@ fn contract_detects_misbehaving_backends() -> TestResult {
             capabilities: CapabilitySet::supporting([Capability::EffectLookup]),
         },
     };
-    let failure = conformance::run(&overreaching, &fixture)
+    let failure = conformance::run_worker(&overreaching, &fixture)
         .err()
         .ok_or("overreach passed")?;
     assert_eq!(failure.check, Check::UnsupportedRefused);
 
     let blind = HouseBlindBackend(FakeBackend::fully_capable(backend_id()?, house()?));
-    let failure = conformance::run(&blind, &fixture)
+    let failure = conformance::run_worker(&blind, &fixture)
         .err()
         .ok_or("house-blind backend passed")?;
     assert_eq!(failure.check, Check::CrossHouseRefused);
 
     let optimistic = OptimisticLookupBackend(FakeBackend::fully_capable(backend_id()?, house()?));
-    let failure = conformance::run(&optimistic, &fixture)
+    let failure = conformance::run_worker(&optimistic, &fixture)
         .err()
         .ok_or("optimistic lookup passed")?;
     assert_eq!(
@@ -213,7 +225,7 @@ fn contract_detects_misbehaving_backends() -> TestResult {
 
     let mut long_tag = fixture.clone();
     long_tag.run_tag = ExternalRef::new(&"t".repeat(250))?;
-    let failure = conformance::run(
+    let failure = conformance::run_worker(
         &FakeBackend::fully_capable(backend_id()?, house()?),
         &long_tag,
     )
@@ -222,7 +234,7 @@ fn contract_detects_misbehaving_backends() -> TestResult {
     assert_eq!(failure.check, Check::Fixture);
 
     let foreign = FakeBackend::fully_capable(backend_id()?, other_house()?);
-    let failure = conformance::run(&foreign, &fixture)
+    let failure = conformance::run_worker(&foreign, &fixture)
         .err()
         .ok_or("foreign descriptor passed")?;
     assert_eq!(failure.check, Check::DescriptorHouse);
@@ -1067,7 +1079,7 @@ fn cancelling_an_uncertain_launch_keeps_its_uncertainty() -> TestResult {
 /// anything reaches a provider.
 struct ExitingBackend(FakeBackend);
 
-impl ExecutionBackend for ExitingBackend {
+impl EffectExecutor for ExitingBackend {
     fn descriptor(&self) -> &BackendDescriptor {
         self.0.descriptor()
     }
@@ -1077,6 +1089,9 @@ impl ExecutionBackend for ExitingBackend {
     fn lookup(&self, key: &IdempotencyKey) -> Result<Lookup, BackendUnavailable> {
         self.0.lookup(key)
     }
+}
+
+impl WorkerBackend for ExitingBackend {
     fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
         self.0.observe_worker(worker)
     }

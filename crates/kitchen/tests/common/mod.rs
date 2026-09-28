@@ -8,9 +8,9 @@ use std::{cell::Cell, time::Duration};
 use kitchen::{
     BackendId, CredentialId, EffectName, HolderId, HouseId, TaskId,
     contracts::{
-        BackendDescriptor, Capability, CapabilitySet, Claimant, Clock, CommitId, EvidenceRevision,
-        Fence, Grant, HouseGrants, LeaseTtl, Operation, Permission, Provenance, RetryPolicy, Role,
-        TaskAuthority, TaskSpec, Text, Timestamp, Workspace,
+        BackendDescriptor, Capability, CapabilitySet, Claimant, Clock, CommitId, Effect,
+        EvidenceRevision, Fence, Grant, HouseGrants, LeaseTtl, Operation, Permission, Provenance,
+        RetryPolicy, Role, TaskAuthority, TaskSpec, Text, Timestamp, Workspace,
     },
     state::{EffectPlan, HouseStore, StoreOptions},
 };
@@ -141,14 +141,14 @@ pub fn plan(
     task: &TaskId,
     fence: Fence,
     name: &str,
-    operation: Operation,
+    action: impl Into<Effect>,
 ) -> TestResult<EffectPlan> {
     Ok(EffectPlan {
         task: task.clone(),
         fence,
         name: effect(name)?,
         decided_at: EvidenceRevision::INITIAL,
-        operation,
+        effect: action.into(),
         consent: None,
     })
 }

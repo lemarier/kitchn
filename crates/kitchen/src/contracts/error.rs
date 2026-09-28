@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::{
     ErrorClass, HouseId,
-    contracts::{Capability, GrantScope, Permission, ValueKind},
+    contracts::{Capability, ExecutorKind, GrantScope, Permission, ValueKind},
 };
 
 /// A rejected value or a policy refusal. Input text is never echoed.
@@ -61,6 +61,25 @@ pub enum ContractError {
     /// The consent is for a different house, task, operation, or revision.
     #[error("consent does not cover this effect")]
     ConsentMismatch,
+    /// The effect acts outside the task's scope, such as another repository.
+    #[error("effect scope {effect} is outside the task scope {task}")]
+    OutOfTaskScope {
+        /// The effect's scope.
+        effect: GrantScope,
+        /// The task's scope.
+        task: GrantScope,
+    },
+    /// A decision request names another house, task, or evidence revision.
+    #[error("decision binding does not match this task")]
+    DecisionBindingMismatch,
+    /// The task used its budget of effects for one executor family.
+    #[error("the task used its budget of {limit} {executor:?} effects")]
+    EffectBudgetExhausted {
+        /// The executor family.
+        executor: ExecutorKind,
+        /// The budget.
+        limit: u32,
+    },
     /// A value from one house was used with another house.
     #[error("house mismatch: expected {expected}, found {found}")]
     CrossHouse {
@@ -84,6 +103,9 @@ impl ContractError {
             | Self::ConsentNotAccepted
             | Self::ConsentRequired { .. }
             | Self::ConsentMismatch
+            | Self::OutOfTaskScope { .. }
+            | Self::DecisionBindingMismatch
+            | Self::EffectBudgetExhausted { .. }
             | Self::CrossHouse { .. } => ErrorClass::Refused,
         }
     }

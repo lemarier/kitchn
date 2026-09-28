@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     HolderId, HouseId, TaskId,
-    contracts::{ContractError, EvidenceRevision, ExternalRef, Operation},
+    contracts::{ContractError, Effect, EvidenceRevision, ExternalRef},
 };
 
 /// What started a piece of work.
@@ -71,7 +71,7 @@ impl Claimant {
     }
 }
 
-/// A person's approval of exactly one effect: this house, task, operation,
+/// A person's approval of exactly one effect: this house, task, effect,
 /// and evidence revision. The caller obtains it from the person for each
 /// action; it is not a grant and is recorded only as audit on the effect it
 /// authorized.
@@ -85,8 +85,8 @@ pub struct Consent {
     pub house: HouseId,
     /// The task.
     pub task: TaskId,
-    /// The exact operation approved.
-    pub operation: Operation,
+    /// The exact effect approved.
+    pub effect: Effect,
     /// The evidence revision the person saw.
     pub revision: EvidenceRevision,
 }
@@ -100,12 +100,12 @@ impl Consent {
         &self,
         house: &HouseId,
         task: &TaskId,
-        operation: &Operation,
+        effect: &Effect,
         revision: EvidenceRevision,
     ) -> Result<(), ContractError> {
         if &self.house == house
             && &self.task == task
-            && &self.operation == operation
+            && &self.effect == effect
             && self.revision == revision
         {
             Ok(())

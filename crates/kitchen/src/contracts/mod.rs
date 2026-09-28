@@ -60,6 +60,7 @@ mod authority;
 mod backend;
 mod capability;
 pub mod conformance;
+mod effects;
 mod error;
 mod evidence;
 pub mod fake;
@@ -71,11 +72,15 @@ mod value;
 
 pub use authority::{Grant, GrantScope, HouseGrants, Permission, TaskAuthority};
 pub use backend::{
-    BackendUnavailable, EffectFailure, EffectRequest, ExecutionBackend, IdempotencyKey, Lookup,
-    MAX_RECEIPT_RESOURCES, NotAppliedReason, Operation, Receipt, UncertainReason, WorkerOutcome,
-    WorkerState, Workspace,
+    BackendUnavailable, EffectExecutor, EffectFailure, EffectRequest, IdempotencyKey, Liveness,
+    Lookup, MAX_INVENTORY_RESOURCES, MAX_RECEIPT_RESOURCES, NotAppliedReason, Operation, Receipt,
+    ResourceObservation, UncertainReason, WorkerBackend, WorkerOutcome, WorkerState, Workspace,
 };
 pub use capability::{BackendDescriptor, Capability, CapabilitySet, Support};
+pub use effects::{
+    DecisionBinding, Effect, EffectContext, ExecutorKind, GitHubEffect, MAX_ASKS_PER_TASK,
+    RogerEffect, ScheduleEffect, SubmittedEffects,
+};
 pub use error::ContractError;
 pub use evidence::{Evidence, EvidenceKind, EvidenceRevision, EvidenceSubject, EvidenceVerdict};
 pub use resource::{ResourceKind, ResourceRef};

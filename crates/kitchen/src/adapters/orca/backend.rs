@@ -740,6 +740,25 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .ok_or_else(response_lost)
     }
 
+    /// Refuse a workspace this backend cannot start a worker in.
+    ///
+    /// An existing workspace must be a worktree of this backend. Whether the
+    /// task owns it is decided before the request reaches a backend, by the
+    /// state store. `launch` calls this before a Task exists, so a refusal
+    /// leaves nothing in the Run; `start` repeats it as a guard.
+    fn check_workspace(&self, workspace: &Workspace) -> Result<(), EffectFailure> {
+        match workspace {
+            Workspace::Isolated => Ok(()),
+            Workspace::Existing(resource)
+                if resource.kind == ResourceKind::Worktree
+                    && resource.backend == self.config.backend =>
+            {
+                Ok(())
+            }
+            Workspace::Existing(_) => Err(not_applied()),
+        }
+    }
+
     fn start(
         &self,
         key: &IdempotencyKey,
@@ -747,6 +766,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         workspace: &Workspace,
         name: Option<&str>,
     ) -> Result<Receipt, EffectFailure> {
+        self.check_workspace(workspace)?;
         let timeout_ms = u64::try_from(self.config.launch_timeout.as_millis()).unwrap_or(u64::MAX);
         let mut args = wire::Args::command(&["orchestration", "worker-start"])
             .value("task", task)
@@ -769,11 +789,6 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 }
             }
             Workspace::Existing(resource) => {
-                if resource.kind != ResourceKind::Worktree
-                    || resource.backend != self.config.backend
-                {
-                    return Err(not_applied());
-                }
                 args.value("worktree", &format!("id:{}", resource.handle))
             }
         };
@@ -822,7 +837,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         brief: &Text,
         branch: Option<&BranchName>,
     ) -> Result<Receipt, EffectFailure> {
-        // A branch no worktree name can yield is refused before anything exists.
+        // A workspace or branch no launch can honor is refused before
+        // anything exists: no reservation, no Task.
+        self.check_workspace(workspace)?;
         let name = match (workspace, branch) {
             (Workspace::Isolated, Some(branch)) => Some(
                 branch::worktree_name(self.config.branch_prefix.as_ref(), branch)

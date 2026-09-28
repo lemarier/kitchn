@@ -2135,6 +2135,48 @@ fn an_existing_workspace_is_verified_not_renamed() -> TestResult {
 }
 
 #[test]
+fn an_unusable_existing_workspace_is_refused_before_a_task_exists() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let unusable = [
+        (
+            "not-a-worktree",
+            ResourceRef {
+                kind: ResourceKind::Worker,
+                backend: orca_id()?,
+                handle: ExternalRef::new("ctx_1")?,
+            },
+        ),
+        (
+            "other-backend",
+            ResourceRef {
+                kind: ResourceKind::Worktree,
+                backend: BackendId::new("orca-other")?,
+                handle: ExternalRef::new("wt-9")?,
+            },
+        ),
+    ];
+    for (label, resource) in unusable {
+        let launch = launch_on("lemarier/issue-6", Workspace::Existing(resource))?;
+        // A resubmission of the same key is refused the same way.
+        for attempt in 0..2 {
+            assert_eq!(
+                backend.execute(&request(launch.clone(), label)?),
+                Err(EffectFailure::NotApplied(NotAppliedReason::Rejected)),
+                "{label} attempt {attempt}"
+            );
+        }
+    }
+    assert!(
+        sim.calls_to(&["orchestration"]).is_empty(),
+        "no Task, no listing, no start"
+    );
+    assert!(sim.state().tasks.is_empty(), "no orphan Task in the Run");
+    assert_eq!(sim.state().effects, 0);
+    Ok(())
+}
+
+#[test]
 fn a_launch_without_a_requested_branch_is_not_constrained() -> TestResult {
     let sim = SimOrca::default();
     // Even on a host whose prefix disagrees with the configured one.

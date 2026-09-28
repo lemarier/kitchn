@@ -41,7 +41,8 @@ enum CleanupCommand {
         store: PathBuf,
         #[arg(long)]
         house: HouseId,
-        /// Inventory snapshot exported from the backend (JSON).
+        /// Inventory snapshot exported from the backend (JSON). Trusted input:
+        /// Git reads each listed worktree path.
         #[arg(long)]
         inventory: PathBuf,
         /// Who is recording the preview.

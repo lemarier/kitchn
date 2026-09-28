@@ -17,6 +17,7 @@
 //! # }
 //! ```
 
+pub mod adapters;
 pub mod adoption;
 pub mod contracts;
 mod error;

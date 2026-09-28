@@ -5,7 +5,8 @@
 //! new variant in one area never forces edits to unrelated callers.
 
 use crate::{
-    IdentifierError, contracts::ContractError, scaffold::ScaffoldError, state::StateError,
+    IdentifierError, adapters::orca::OrcaError, contracts::ContractError, scaffold::ScaffoldError,
+    state::StateError,
 };
 
 /// Broad handling class for an [`Error`], for exit codes and retry decisions.
@@ -37,6 +38,9 @@ pub enum Error {
     /// A durable state operation failed.
     #[error(transparent)]
     State(#[from] StateError),
+    /// An Orca adapter call failed.
+    #[error(transparent)]
+    Orca(#[from] OrcaError),
     /// A house-scoped integration failed.
     #[error(transparent)]
     Integration(#[from] crate::integrations::github::IntegrationError),
@@ -53,6 +57,7 @@ impl Error {
             Self::Identifier(_) => ErrorClass::InvalidInput,
             Self::Contract(error) => error.class(),
             Self::State(error) => error.class(),
+            Self::Orca(error) => error.class(),
             Self::House(error) => error.class(),
             Self::Integration(error) => error.class(),
             Self::Scaffold(error) => error.class(),

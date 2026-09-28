@@ -86,6 +86,9 @@ pub enum Error {
     /// A deliberation thread, record, or pin was refused.
     #[error(transparent)]
     Deliberation(#[from] crate::workflows::deliberation::DeliberationError),
+    /// An interactive entrypoint refused its input.
+    #[error(transparent)]
+    Interactive(#[from] crate::workflows::interactive::InteractiveError),
 }
 
 impl Error {
@@ -113,6 +116,7 @@ impl Error {
             Self::HouseInit(error) => error.class(),
             Self::Forge(error) => error.class(),
             Self::Deliberation(error) => error.class(),
+            Self::Interactive(error) => error.class(),
         }
     }
 }

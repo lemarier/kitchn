@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     WorkflowId,
-    contracts::{Claimant, EvidenceSubject, EvidenceVerdict, ExternalRef, Repository, Timestamp},
+    contracts::{
+        Claimant, EvidenceSubject, EvidenceVerdict, ExternalRef, Repository, ResourceRef, Timestamp,
+    },
     state::{Corruption, StateError},
 };
 
@@ -28,6 +30,7 @@ pub const MAX_MARKER_HISTORY: usize = 16;
 /// The work item a marker is about.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum WorkItem {
     /// An issue.
     Issue {
@@ -42,6 +45,11 @@ pub enum WorkItem {
         repository: Repository,
         /// The pull-request number.
         number: NonZeroU64,
+    },
+    /// A backend resource, such as a worktree the dishwasher inspected.
+    Resource {
+        /// The resource.
+        resource: ResourceRef,
     },
 }
 
@@ -61,11 +69,16 @@ pub struct IssueRevision {
 /// The exact revision a marker's fact is about.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "revision", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MarkerSubject {
     /// A Git head and optional base, such as a pull request under review.
     Git(EvidenceSubject),
     /// An issue's provider revision, such as an issue under triage.
     Issue(IssueRevision),
+    /// An opaque digest of observed evidence, such as a resource's owner,
+    /// liveness, and worktree state. Any change to the evidence is a new
+    /// digest and therefore a different key.
+    Observation(ExternalRef),
 }
 
 /// What a marker is keyed by: the workflow, the work item, and the exact

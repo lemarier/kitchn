@@ -34,6 +34,8 @@ enum Command {
     Init(commands::scaffold::ScaffoldArgs),
     /// Preview house template additions or revisions in an existing repository.
     Adopt(commands::scaffold::ScaffoldArgs),
+    /// Preview dishwasher cleanup decisions and record a person's approval; releases nothing.
+    Cleanup(commands::cleanup::CleanupArgs),
 }
 
 fn main() -> ExitCode {
@@ -62,6 +64,7 @@ fn main() -> ExitCode {
         Some(Command::House(args)) => commands::house::run(args),
         Some(Command::Init(args)) => commands::scaffold::run(args, false),
         Some(Command::Adopt(args)) => commands::scaffold::run(args, true),
+        Some(Command::Cleanup(args)) => commands::cleanup::run(args),
         None => return output_status(Cli::command().print_help()),
     };
     match result {

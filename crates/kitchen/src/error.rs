@@ -47,6 +47,9 @@ pub enum Error {
     /// A template, rendering, or scaffold planning operation failed.
     #[error(transparent)]
     Scaffold(#[from] ScaffoldError),
+    /// A dishwasher inspection or cleanup failed.
+    #[error(transparent)]
+    Cleanup(#[from] crate::workflows::cleanup::CleanupError),
 }
 
 impl Error {
@@ -61,6 +64,7 @@ impl Error {
             Self::House(error) => error.class(),
             Self::Integration(error) => error.class(),
             Self::Scaffold(error) => error.class(),
+            Self::Cleanup(error) => error.class(),
         }
     }
 }

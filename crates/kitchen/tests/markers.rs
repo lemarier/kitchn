@@ -8,7 +8,9 @@ use std::{fs, num::NonZeroU64};
 use common::{Fixture, TestResult, at, commit, scheduled, ttl};
 use kitchen::{
     ConsumerId, Error, WorkflowId,
-    contracts::{EvidenceSubject, EvidenceVerdict, ExternalRef, Repository},
+    contracts::{
+        EvidenceSubject, EvidenceVerdict, ExternalRef, Repository, ResourceKind, ResourceRef,
+    },
     state::{
         Corruption, IssueRevision, MAX_MARKERS, MarkerFact, MarkerKey, MarkerRecording,
         MarkerSubject, StateError, WorkItem,
@@ -768,4 +770,79 @@ fn syntax(error: &Error) -> bool {
         error,
         Error::State(StateError::CorruptState(Corruption::Syntax { .. }))
     )
+}
+
+fn resource_key(handle: &str, digest: &str) -> TestResult<MarkerKey> {
+    Ok(MarkerKey {
+        workflow: WorkflowId::new("dishwasher")?,
+        item: WorkItem::Resource {
+            resource: ResourceRef {
+                kind: ResourceKind::Worktree,
+                backend: kitchen::BackendId::new("fake")?,
+                handle: ExternalRef::new(handle)?,
+            },
+        },
+        subject: MarkerSubject::Observation(ExternalRef::new(digest)?),
+    })
+}
+
+#[test]
+fn resource_observations_are_distinct_keys_and_persist() -> TestResult {
+    let fixture = Fixture::new()?;
+    let fact = verdict(EvidenceVerdict::Pass);
+    let recorder = scheduled("dishwasher")?;
+    let first = resource_key("wt-1", "sha256:aa")?;
+    fixture
+        .store
+        .record_marker(first.clone(), fact.clone(), &recorder, at(1))?;
+    // Changed evidence or another resource is a different key.
+    for other in [
+        resource_key("wt-1", "sha256:bb")?,
+        resource_key("wt-2", "sha256:aa")?,
+    ] {
+        assert_eq!(fixture.store.marker(&other)?, None);
+    }
+    let reopened = fixture.reopen()?;
+    let stored = reopened.marker(&first)?.ok_or("marker lost")?;
+    assert_eq!(stored.key(), &first);
+    let valid: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fixture.state_path())?)?;
+    assert_eq!(valid["markers"][0]["key"]["item"]["type"], "resource");
+    assert_eq!(valid["markers"][0]["key"]["subject"]["type"], "observation");
+    Ok(())
+}
+
+#[test]
+fn corrupt_resource_markers_are_rejected_without_reset() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.store.record_marker(
+        resource_key("wt-1", "sha256:aa")?,
+        verdict(EvidenceVerdict::Pass),
+        &scheduled("dishwasher")?,
+        at(1),
+    )?;
+    let path = fixture.state_path();
+    let valid: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let mut bad_kind = valid.clone();
+    bad_kind["markers"][0]["key"]["item"]["resource"]["kind"] = "disk".into();
+    let mut bad_handle = valid.clone();
+    bad_handle["markers"][0]["key"]["item"]["resource"]["handle"] = "has space".into();
+    let mut bad_digest = valid.clone();
+    bad_digest["markers"][0]["key"]["subject"]["revision"] = "has space".into();
+    let mut observation_as_issue = valid;
+    observation_as_issue["markers"][0]["key"]["subject"]["type"] = "issue".into();
+    for corrupt in [bad_kind, bad_handle, bad_digest, observation_as_issue] {
+        let bytes = serde_json::to_vec_pretty(&corrupt)?;
+        fs::write(&path, &bytes)?;
+        let error = fixture
+            .reopen()
+            .err()
+            .ok_or("corrupt resource marker was accepted")?;
+        let error = error
+            .downcast::<Error>()
+            .map_err(|_| "unexpected error type")?;
+        assert!(syntax(&error), "{error:?}");
+        assert_eq!(fs::read(&path)?, bytes, "rejected state is not rewritten");
+    }
+    Ok(())
 }

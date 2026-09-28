@@ -12,6 +12,7 @@ pub mod gate;
 pub mod inspector;
 pub mod pickup;
 pub mod push;
+pub mod ready;
 pub mod recovery;
 pub mod repair;
 pub mod stack;

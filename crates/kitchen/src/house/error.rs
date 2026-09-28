@@ -39,6 +39,26 @@ pub enum HouseError {
         /// Files or directories requiring inspection; never removed without ownership proof.
         remaining: Vec<std::path::PathBuf>,
     },
+    /// The path is not inside a checkout, or none of its Git remotes names a
+    /// GitHub `owner/name` repository.
+    #[error("no Git remote of this checkout names a GitHub owner/name repository")]
+    RepositoryUnidentified,
+    /// More than one house claims the checkout and no choice is stored in the
+    /// registry. Choosing a house with setup stores the choice.
+    #[error("more than one house claims this repository ({}); choose one with house setup", list(.houses))]
+    AmbiguousHouse {
+        /// Every house that claims one of the checkout's repositories.
+        houses: Vec<crate::HouseId>,
+    },
+    /// The checkout's remotes name more than one candidate repository.
+    #[error("the checkout's remotes name more than one candidate repository ({}); select one explicitly", list(.repositories))]
+    AmbiguousRepository {
+        /// Candidate repositories, as the house allowlists name them.
+        repositories: Vec<crate::contracts::Repository>,
+    },
+    /// A bounded Git read failed; nothing was decided from it.
+    #[error("git could not be read: {0}")]
+    Git(crate::git::GitReadError),
     /// Bounded filesystem I/O failed.
     #[error("house storage operation failed ({0:?})")]
     Io(std::io::ErrorKind),
@@ -54,13 +74,25 @@ impl HouseError {
             | Self::PolicyRelaxation
             | Self::InsideRepository
             | Self::RedirectedPath
-            | Self::PinMismatch => ErrorClass::Refused,
+            | Self::PinMismatch
+            | Self::RepositoryUnidentified
+            | Self::AmbiguousHouse { .. }
+            | Self::AmbiguousRepository { .. } => ErrorClass::Refused,
             Self::Conflict | Self::Conflicts(_) | Self::Busy => ErrorClass::Conflict,
-            Self::UnverifiedSnapshot | Self::PartialInstallation { .. } | Self::Io(_) => {
-                ErrorClass::Execution
-            }
+            Self::UnverifiedSnapshot
+            | Self::PartialInstallation { .. }
+            | Self::Git(_)
+            | Self::Io(_) => ErrorClass::Execution,
         }
     }
+}
+
+fn list(values: &[impl std::fmt::Display]) -> String {
+    values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl From<std::io::Error> for HouseError {

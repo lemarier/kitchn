@@ -131,6 +131,10 @@ pub enum OrcaError {
     /// The reservation file or directory is a symlink or not a regular file.
     #[error("the reservation directory or file is redirected")]
     ReservationRedirected,
+    /// The runtime directory is inside a Git checkout; Kitchen writes nothing
+    /// into a working tree. Nothing was sent to Orca.
+    #[error("the reservation directory is inside a Git checkout")]
+    ReservationInsideRepository,
     /// The reservation could not be taken for another I/O reason; nothing was
     /// sent to Orca.
     #[error("the reservation could not be taken: {0}")]
@@ -163,6 +167,7 @@ impl OrcaError {
             | Self::NotKitchenOwned
             | Self::TrialRequiresPaused
             | Self::ReservationRedirected
+            | Self::ReservationInsideRepository
             | Self::BranchUnobtainable { .. }
             | Self::Refused { .. } => ErrorClass::Refused,
             Self::DuplicateSchedules { .. }

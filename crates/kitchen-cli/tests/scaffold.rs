@@ -136,6 +136,11 @@ impl Fixture {
         command
     }
 }
+/// The registry binding for the fixture repository.
+fn binding(f: &Fixture) -> PathBuf {
+    f.root
+        .join("registry/repositories/crabnebula/tauri-fixture.json")
+}
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -144,7 +149,10 @@ fn preview_apply_and_bound_rerun() -> Result {
     let f = Fixture::new()?;
     let output = f.selected("init").output()?;
     assert!(output.status.success(), "{output:?}");
-    assert!(stdout(&output).contains("3 to add"));
+    assert!(stdout(&output).contains("2 to add"));
+    assert!(stdout(&output).contains(
+        "Registry binding crabnebula/tauri-fixture -> house crabnebula: add (stored outside the working tree)"
+    ));
     assert!(stdout(&output).contains(
         "No additions match known automation paths. Kitchen activates nothing. Matching is best-effort: other files may still be run by tools."
     ));
@@ -154,13 +162,17 @@ fn preview_apply_and_bound_rerun() -> Result {
     assert!(
         fs::read_to_string(f.root.join("consumer/AGENTS.md"))?.ends_with("content revision 1\n")
     );
+    assert!(binding(&f).is_file());
+    // The stored binding supplies the house on a rerun.
     let output = f
         .command("adopt", &f.root.join("consumer"))
-        .arg("--yes")
+        .args(["--repository", "crabnebula/tauri-fixture", "--yes"])
         .output()?;
     assert!(output.status.success(), "{output:?}");
-    assert!(stdout(&output).contains("0 to add, 3 unchanged, 0 withheld, 0 conflicts"));
+    assert!(stdout(&output).contains("0 to add, 2 unchanged, 0 withheld, 0 conflicts"));
+    assert!(stdout(&output).contains("house crabnebula: unchanged"));
     assert!(!f.root.join("consumer/.git").exists());
+    assert!(!f.root.join("consumer/.kitchen.json").exists());
     Ok(())
 }
 #[test]
@@ -186,7 +198,8 @@ fn confirmation_requires_complete_explicit_yes() -> Result {
             .write_all(answer.as_bytes())?;
         let output = child.wait_with_output()?;
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(f.root.join("consumer/.kitchen.json").exists(), applied);
+        assert_eq!(binding(&f).exists(), applied);
+        assert!(!f.root.join("consumer/.kitchen.json").exists());
     }
     Ok(())
 }
@@ -243,10 +256,16 @@ fn mismatched_existing_house_is_refused() -> Result {
     assert!(f.selected("init").arg("--yes").output()?.status.success());
     let output = f
         .command("adopt", &f.root.join("consumer"))
-        .args(["--house", "other", "--yes"])
+        .args([
+            "--house",
+            "other",
+            "--repository",
+            "crabnebula/tauri-fixture",
+            "--yes",
+        ])
         .output()?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(fs::read_to_string(f.root.join("consumer/.kitchen.json"))?.contains("crabnebula"));
+    assert!(fs::read_to_string(binding(&f))?.contains("crabnebula"));
     Ok(())
 }
 #[cfg(unix)]
@@ -314,7 +333,7 @@ fn destination_created_after_preview_blocks_confirmed_apply() -> Result {
         "concurrent local file"
     );
     assert!(!f.root.join("consumer/AGENTS.md").exists());
-    assert!(!f.root.join("consumer/.kitchen.json").exists());
+    assert!(!binding(&f).exists());
     Ok(())
 }
 
@@ -429,7 +448,8 @@ fn init_refuses_a_non_empty_root_and_adopt_accepts_it() -> Result {
     fs::create_dir(f.root.join("consumer"))?;
     let output = f.selected("init").arg("--yes").output()?;
     assert!(output.status.success(), "empty root: {output:?}");
-    assert!(f.root.join("consumer/.kitchen.json").exists());
+    assert!(binding(&f).exists());
+    assert!(!f.root.join("consumer/.kitchen.json").exists());
 
     fs::remove_dir_all(f.root.join("consumer"))?;
     fs::create_dir(f.root.join("consumer"))?;
@@ -449,7 +469,7 @@ fn init_refuses_a_non_empty_root_and_adopt_accepts_it() -> Result {
         fs::read_to_string(f.root.join("consumer/local.txt"))?,
         "local"
     );
-    assert!(f.root.join("consumer/.kitchen.json").exists());
+    assert!(!f.root.join("consumer/.kitchen.json").exists());
     Ok(())
 }
 
@@ -511,20 +531,20 @@ fn a_workflow_needing_a_conflicting_justfile_is_withheld_and_nothing_activates()
 fn adopt_retains_existing_workflows_checks_and_reviewers() -> Result {
     let f = Fixture::new()?;
     assert!(f.selected("init").arg("--yes").output()?.status.success());
-    let path = f.root.join("consumer/.kitchen.json");
-    let mut binding: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
-    binding["workflows"] = serde_json::json!(["gate", "pickup"]);
-    binding["additionalChecks"] = serde_json::json!(["local-check"]);
-    binding["additionalReviewers"] = serde_json::json!(["local-reviewer"]);
-    let stricter = serde_json::to_string_pretty(&binding)?;
+    let path = binding(&f);
+    let mut stored: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    stored["workflows"] = serde_json::json!(["gate", "pickup"]);
+    stored["additionalChecks"] = serde_json::json!(["local-check"]);
+    stored["additionalReviewers"] = serde_json::json!(["local-reviewer"]);
+    let stricter = serde_json::to_string_pretty(&stored)?;
     fs::write(&path, &stricter)?;
     fs::remove_file(f.root.join("consumer/README.md"))?;
     let output = f
         .command("adopt", &f.root.join("consumer"))
-        .arg("--yes")
+        .args(["--repository", "crabnebula/tauri-fixture", "--yes"])
         .output()?;
     assert!(output.status.success(), "{output:?}");
-    assert!(stdout(&output).contains("  unchanged  .kitchen.json"));
+    assert!(stdout(&output).contains("house crabnebula: unchanged"));
     assert_eq!(fs::read_to_string(&path)?, stricter);
     assert!(f.root.join("consumer/README.md").exists());
     Ok(())
@@ -559,16 +579,21 @@ fn selection_mismatches_and_partial_selection_write_nothing() -> Result {
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(!f.root.join("consumer").exists());
-    // A bound repository refuses a different repository selection.
+    // An unbound repository selection still needs a house after another is bound.
     assert!(f.selected("init").arg("--yes").output()?.status.success());
-    let binding = fs::read(f.root.join("consumer/.kitchen.json"))?;
+    let stored = fs::read(binding(&f))?;
     fs::remove_file(f.root.join("consumer/README.md"))?;
     let output = f
         .command("adopt", &f.root.join("consumer"))
         .args(["--repository", "crabnebula/other", "--yes"])
         .output()?;
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_eq!(fs::read(f.root.join("consumer/.kitchen.json"))?, binding);
+    assert_eq!(fs::read(binding(&f))?, stored);
+    assert!(
+        !f.root
+            .join("registry/repositories/crabnebula/other.json")
+            .exists()
+    );
     assert!(!f.root.join("consumer/README.md").exists());
     Ok(())
 }
@@ -628,5 +653,42 @@ fn printed_doctor_command_survives_quotes_and_spaces_in_paths() -> Result {
             target.display()
         )
     );
+    Ok(())
+}
+
+#[test]
+fn adopt_in_a_checkout_reads_its_remote_and_adds_only_template_files() -> Result {
+    let f = Fixture::new()?;
+    let consumer = f.root.join("consumer");
+    fs::create_dir(&consumer)?;
+    for args in [
+        vec!["init", "--quiet"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:crabnebula/tauri-fixture.git",
+        ],
+    ] {
+        let status = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .arg("-C")
+            .arg(&consumer)
+            .args(&args)
+            .status()?;
+        assert!(status.success());
+    }
+    let output = f
+        .command("adopt", &consumer)
+        .args(["--house", "crabnebula", "--yes"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(binding(&f).is_file());
+    let mut names: Vec<_> = fs::read_dir(&consumer)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::result::Result<_, _>>()?;
+    names.sort();
+    assert_eq!(names, [".git", "AGENTS.md", "README.md"]);
     Ok(())
 }

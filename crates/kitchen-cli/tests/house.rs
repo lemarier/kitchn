@@ -1,4 +1,5 @@
-//! Guided adoption and diagnostics exercised through the real CLI in disposable roots.
+//! Guided adoption and diagnostics exercised through the real CLI in disposable
+//! roots. Bindings live in the registry; working trees must stay unchanged.
 use kitchen::{
     adoption::{HouseRegistry, InstructionBundle},
     house::HouseConfig,
@@ -7,10 +8,12 @@ use std::{
     fs,
     io::Write,
     path::Path,
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
 };
-type TestResult = Result<(), Box<dyn std::error::Error>>;
-fn initialize(root: &Path) -> Result<HouseRegistry, Box<dyn std::error::Error>> {
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+const BINDING: &str = "repositories/crabnebula/tauri-fixture.json";
+
+fn initialize(root: &Path) -> TestResult<HouseRegistry> {
     let registry = HouseRegistry::new(root.join("registry"))?;
     let house: HouseConfig = serde_json::from_str(include_str!(
         "../../kitchen/tests/fixtures/house/crabnebula.json"
@@ -22,8 +25,85 @@ fn initialize(root: &Path) -> Result<HouseRegistry, Box<dyn std::error::Error>> 
     registry.sync(&house.house, &bundle)?;
     Ok(registry)
 }
+/// Register a second house that also claims the crabnebula fixture repository.
+fn second_claimant(registry: &HouseRegistry) -> TestResult {
+    let mut house: HouseConfig = serde_json::from_str(include_str!(
+        "../../kitchen/tests/fixtures/house/origin89.json"
+    ))?;
+    house
+        .repositories
+        .insert("crabnebula/tauri-fixture".parse()?);
+    registry.initialize(&house)?;
+    Ok(())
+}
+fn git(path: &Path, args: &[&str]) -> TestResult<String> {
+    // Fixture setup ignores the person's Git configuration, such as signing.
+    let output = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-C")
+        .arg(path)
+        .args([
+            "-c",
+            "user.name=Kitchen Test",
+            "-c",
+            "user.email=test@example.com",
+        ])
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("git {args:?}: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+/// A checkout with one commit whose `origin` names `url`.
+fn checkout(path: &Path, url: &str) -> TestResult {
+    fs::create_dir_all(path)?;
+    git(path, &["init", "--quiet"])?;
+    git(path, &["commit", "--quiet", "--allow-empty", "-m", "init"])?;
+    git(path, &["remote", "add", "origin", url])?;
+    Ok(())
+}
+/// Every path Git sees in the working tree, including ignored ones.
+fn tree_status(path: &Path) -> TestResult<String> {
+    git(
+        path,
+        &[
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=all",
+        ],
+    )
+}
+fn kitchen(current_dir: &Path, registry: &HouseRegistry, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kitchen"));
+    command
+        .current_dir(current_dir)
+        .args(args.iter().take(2))
+        .arg("--registry")
+        .arg(registry.root())
+        .args(args.iter().skip(2));
+    command
+}
+fn setup(current_dir: &Path, registry: &HouseRegistry, extra: &[&str]) -> TestResult<Output> {
+    let mut args = vec![
+        "house",
+        "setup",
+        "--house",
+        "crabnebula",
+        "--workflows",
+        "none",
+    ];
+    args.extend_from_slice(extra);
+    Ok(kitchen(current_dir, registry, &args).output()?)
+}
+fn json(output: &Output) -> TestResult<serde_json::Value> {
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
 #[test]
-fn guided_setup_asks_two_choices_and_ends_with_exact_next_steps() -> TestResult {
+fn guided_setup_asks_two_choices_and_leaves_the_tree_unchanged() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let registry = initialize(&root)?;
@@ -31,14 +111,10 @@ fn guided_setup_asks_two_choices_and_ends_with_exact_next_steps() -> TestResult 
     fs::write(registry.root().join("houses/.DS_Store"), "stray")?;
     fs::write(registry.root().join("houses/broken.json"), "damaged")?;
     let consumer = root.join("consumer");
-    fs::create_dir(&consumer)?;
+    checkout(&consumer, "git@github.com:crabnebula/tauri-fixture.git")?;
     fs::write(consumer.join("AGENTS.md"), "local instructions")?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kitchen"))
-        .args(["house", "setup", "--registry"])
-        .arg(registry.root())
-        .arg("--repository-path")
-        .arg(&consumer)
-        .args(["--repository", "crabnebula/tauri-fixture"])
+    let before = tree_status(&consumer)?;
+    let mut child = kitchen(&consumer, &registry, &["house", "setup"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -55,72 +131,61 @@ fn guided_setup_asks_two_choices_and_ends_with_exact_next_steps() -> TestResult 
     assert!(stderr.contains("House (crabnebula):"));
     assert!(stderr.contains("House broken unavailable:"));
     assert!(stderr.contains("Workflows ("));
+    assert!(stdout.contains("Bound crabnebula/tauri-fixture to house crabnebula"));
     assert!(stdout.contains("Doctor: setup incomplete"));
     assert!(stdout.contains("Next: Configure crabnebula access"));
     assert!(stdout.contains("Pinned instructions:"));
     assert!(!stdout.contains("Origin89"));
+    assert_eq!(tree_status(&consumer)?, before);
     assert_eq!(
         fs::read_to_string(consumer.join("AGENTS.md"))?,
         "local instructions"
     );
-    let binding = fs::read_to_string(consumer.join(".kitchen.json"))?;
+    assert!(!consumer.join(".kitchen.json").exists());
+    let binding = fs::read_to_string(registry.root().join(BINDING))?;
+    assert!(binding.contains("\"schema\": 2"));
     assert!(!binding.contains("grants"));
     assert!(!registry.root().join("private").exists());
     Ok(())
 }
+
 #[test]
 fn preview_is_read_only_and_json_doctor_does_not_claim_live_access() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let registry = initialize(&root)?;
     let consumer = root.join("consumer");
-    fs::create_dir(&consumer)?;
+    checkout(&consumer, "https://github.com/crabnebula/tauri-fixture")?;
     for preview in [true, false] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kitchen"));
-        command
-            .args(["house", "setup", "--registry"])
-            .arg(registry.root())
-            .arg("--repository-path")
-            .arg(&consumer)
-            .args([
-                "--repository",
-                "crabnebula/tauri-fixture",
-                "--house",
-                "crabnebula",
-                "--workflows",
-                "pickup,gate",
-                "--json",
-            ]);
+        let mut args = vec![
+            "house",
+            "setup",
+            "--house",
+            "crabnebula",
+            "--workflows",
+            "pickup,gate",
+            "--json",
+        ];
         if preview {
-            command.arg("--preview");
+            args.push("--preview");
         }
-        let output = command.output()?;
-        assert_eq!(output.status.code(), Some(0));
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let output = kitchen(&consumer, &registry, &args).output()?;
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let report = json(&output)?;
         assert_eq!(report["access"], "unobserved");
         assert_eq!(report["preview"], preview);
         assert_eq!(report["binding"], "created");
         assert_eq!(report["written"], !preview);
         assert_eq!(report["labels"].as_array().ok_or("labels absent")?.len(), 5);
-        if preview {
-            assert!(!consumer.join(".kitchen.json").exists());
-        } else {
-            assert!(consumer.join(".kitchen.json").exists());
-        }
+        assert_eq!(registry.root().join(BINDING).exists(), !preview);
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
-        .args(["house", "doctor", "--registry"])
-        .arg(registry.root())
-        .arg("--repository-path")
-        .arg(&consumer)
-        .arg("--json")
-        .output()?;
+    let output = kitchen(&consumer, &registry, &["house", "doctor", "--json"]).output()?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout)?["instructions"].is_object()
-    );
+    assert!(json(&output)?["instructions"].is_object());
+    assert_eq!(tree_status(&consumer)?, "");
     Ok(())
 }
+
 #[test]
 fn invalid_secret_input_and_missing_house_fail_without_echo_or_writes() -> TestResult {
     let temp = tempfile::tempdir()?;
@@ -137,30 +202,35 @@ fn invalid_secret_input_and_missing_house_fail_without_echo_or_writes() -> TestR
     assert!(!String::from_utf8(output.stderr)?.contains("SECRET-MUST-NOT-APPEAR"));
     assert!(!root.join("registry").exists());
     let registry = initialize(&root)?;
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
-        .args(["house", "setup", "--registry"])
-        .arg(registry.root())
-        .arg("--repository-path")
-        .arg(root.join("consumer"))
-        .args([
+    let output = kitchen(
+        &root,
+        &registry,
+        &[
+            "house",
+            "setup",
             "--repository",
             "crabnebula/tauri-fixture",
             "--house",
             "unknown",
             "--workflows",
             "none",
-        ])
-        .output()?;
+        ],
+    )
+    .output()?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(!root.join("consumer").exists());
+    assert!(!registry.root().join("repositories").exists());
     Ok(())
 }
 
 #[test]
-fn relative_registry_is_resolved_without_erasing_redirects() -> TestResult {
+fn relative_registry_and_repository_path_are_resolved() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     initialize(&root)?;
+    checkout(
+        &root.join("consumer"),
+        "https://github.com/crabnebula/tauri-fixture.git",
+    )?;
     let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
         .current_dir(&root)
         .args([
@@ -170,164 +240,209 @@ fn relative_registry_is_resolved_without_erasing_redirects() -> TestResult {
             "registry",
             "--repository-path",
             "consumer",
-            "--repository",
-            "crabnebula/tauri-fixture",
             "--house",
             "crabnebula",
             "--workflows",
             "none",
         ])
         .output()?;
-    assert_eq!(output.status.code(), Some(0));
-    assert!(root.join("consumer/.kitchen.json").is_file());
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(root.join("registry").join(BINDING).is_file());
     assert!(String::from_utf8(output.stdout)?.contains("Doctor: setup incomplete"));
+    assert_eq!(tree_status(&root.join("consumer"))?, "");
     Ok(())
 }
 
-fn setup_command(root: &Path, registry: &HouseRegistry) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kitchen"));
-    command
-        .current_dir(root)
-        .args(["house", "setup", "--registry"])
-        .arg(registry.root())
-        .args([
-            "--repository",
-            "crabnebula/tauri-fixture",
-            "--house",
-            "crabnebula",
-            "--workflows",
-            "none",
-        ]);
-    command
-}
-
 #[test]
-fn setup_and_doctor_find_the_git_root_from_subdirectories() -> TestResult {
+fn subdirectories_and_other_worktrees_resolve_the_same_house() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let registry = initialize(&root)?;
     let consumer = root.join("consumer");
+    checkout(&consumer, "https://github.com/crabnebula/tauri-fixture.git")?;
     fs::create_dir_all(consumer.join("src/deep"))?;
-    fs::create_dir(consumer.join(".git"))?;
-    let output = setup_command(&consumer.join("src/deep"), &registry).output()?;
-    assert!(consumer.join(".kitchen.json").is_file(), "{output:?}");
-    assert!(!consumer.join("src/deep/.kitchen.json").exists());
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
-        .current_dir(consumer.join("src/deep"))
-        .args(["house", "doctor", "--registry"])
-        .arg(registry.root())
-        .arg("--json")
-        .output()?;
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout)?["house"],
-        "crabnebula"
-    );
+    let second = root.join("second");
+    git(
+        &consumer,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "other",
+            second.to_str().ok_or("path")?,
+        ],
+    )?;
+    let output = setup(&consumer.join("src/deep"), &registry, &[])?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    for start in [consumer.join("src/deep"), second.clone()] {
+        let output = kitchen(&start, &registry, &["house", "doctor", "--json"]).output()?;
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(json(&output)?["house"], "crabnebula");
+        assert_eq!(json(&output)?["repository"], "crabnebula/tauri-fixture");
+    }
+    assert_eq!(tree_status(&consumer)?, "");
+    assert_eq!(tree_status(&second)?, "");
     Ok(())
 }
 
 #[test]
-fn preview_refuses_rebinding_without_promising_adoption() -> TestResult {
+fn two_claiming_houses_require_one_stored_choice() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let registry = initialize(&root)?;
+    second_claimant(&registry)?;
+    let consumer = root.join("consumer");
+    checkout(&consumer, "https://github.com/crabnebula/tauri-fixture.git")?;
+    let output = kitchen(&consumer, &registry, &["house", "doctor"]).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)?.contains("crabnebula, origin89"));
+    let mut child = kitchen(
+        &consumer,
+        &registry,
+        &["house", "setup", "--workflows", "none"],
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("stdin unavailable")?
+        .write_all(b"origin89\n")?;
+    let output = child.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(String::from_utf8(output.stderr)?.contains("House (crabnebula, origin89):"));
+    let output = kitchen(&consumer, &registry, &["house", "doctor", "--json"]).output()?;
+    assert_eq!(json(&output)?["house"], "origin89");
+    // The stored choice is not silently replaced by another house.
+    let before = fs::read(registry.root().join(BINDING))?;
+    for preview in [true, false] {
+        let mut extra = vec!["--json"];
+        if preview {
+            extra.push("--preview");
+        }
+        let output = setup(&consumer, &registry, &extra)?;
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(json(&output)?["binding"], "refused");
+        assert_eq!(json(&output)?["written"], false);
+        assert_eq!(fs::read(registry.root().join(BINDING))?, before);
+    }
+    assert_eq!(tree_status(&consumer)?, "");
+    Ok(())
+}
+
+#[test]
+fn unidentified_and_unclaimed_checkouts_are_refused_without_writes() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let registry = initialize(&root)?;
+    let plain = root.join("plain");
+    fs::create_dir(&plain)?;
+    let output = setup(&plain, &registry, &[])?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)?.contains("no Git remote"));
+    let other = root.join("other");
+    checkout(&other, "https://gitlab.com/crabnebula/tauri-fixture.git")?;
+    assert_eq!(setup(&other, &registry, &[])?.status.code(), Some(1));
+    let unclaimed = root.join("unclaimed");
+    checkout(&unclaimed, "https://github.com/someone/else.git")?;
+    assert_eq!(setup(&unclaimed, &registry, &[])?.status.code(), Some(1));
+    assert!(!registry.root().join("repositories").exists());
+    assert!(!plain.join(".kitchen.json").exists());
+    // An explicit repository needs no checkout; still nothing lands in the tree.
+    let output = setup(
+        &plain,
+        &registry,
+        &["--repository", "crabnebula/tauri-fixture"],
+    )?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(registry.root().join(BINDING).is_file());
+    assert_eq!(fs::read_dir(&plain)?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn setup_json_distinguishes_unchanged_and_updated_without_preview_writes() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let registry = initialize(&root)?;
     let consumer = root.join("consumer");
-    fs::create_dir_all(consumer.join(".git"))?;
-    setup_command(&consumer, &registry).output()?;
-    let path = consumer.join(".kitchen.json");
-    let mut binding: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
-    binding["house"] = serde_json::json!("other-house");
-    fs::write(&path, serde_json::to_vec(&binding)?)?;
-    let before = fs::read(&path)?;
-    let output = setup_command(&consumer, &registry)
+    checkout(&consumer, "https://github.com/crabnebula/tauri-fixture.git")?;
+    setup(&consumer, &registry, &[])?;
+    let path = registry.root().join(BINDING);
+    let original = fs::read(&path)?;
+    let output = setup(&consumer, &registry, &["--json"])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json(&output)?["binding"], "unchanged");
+    assert_eq!(json(&output)?["written"], false);
+    let args = ["house", "setup", "--workflows", "pickup", "--json"];
+    let output = kitchen(&consumer, &registry, &args)
         .arg("--preview")
         .output()?;
-    assert!(!String::from_utf8(output.stdout)?.contains("Would adopt"));
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(fs::read(path)?, before);
-    Ok(())
-}
-
-#[test]
-fn implicit_setup_requires_git_but_explicit_uninitialized_directory_is_allowed() -> TestResult {
-    let temp = tempfile::tempdir()?;
-    let root = temp.path().canonicalize()?;
-    let registry = initialize(&root)?;
-    let output = setup_command(&root, &registry).output()?;
-    assert_eq!(output.status.code(), Some(1));
-    assert!(!root.join(".kitchen.json").exists());
-    let output = setup_command(&root, &registry)
-        .args(["--repository-path", "consumer"])
-        .output()?;
+    assert_eq!(json(&output)?["binding"], "updated");
+    assert_eq!(json(&output)?["written"], false);
+    assert_eq!(fs::read(&path)?, original);
+    let output = kitchen(&consumer, &registry, &args).output()?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(root.join("consumer/.kitchen.json").is_file());
+    assert_eq!(json(&output)?["binding"], "updated");
+    assert_eq!(json(&output)?["written"], true);
+    let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    assert_eq!(stored["workflows"], serde_json::json!(["pickup"]));
+    assert_eq!(tree_status(&consumer)?, "");
     Ok(())
 }
 
 #[test]
-fn setup_json_distinguishes_unchanged_updated_and_refused_without_preview_writes() -> TestResult {
+fn doctor_reports_unbound_repositories_and_legacy_files() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let registry = initialize(&root)?;
     let consumer = root.join("consumer");
-    fs::create_dir_all(consumer.join(".git"))?;
-    setup_command(&consumer, &registry).output()?;
+    checkout(&consumer, "https://github.com/crabnebula/tauri-fixture.git")?;
+    let output = kitchen(&consumer, &registry, &["house", "doctor"]).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stdout)?.contains("not set up"));
+    let legacy = serde_json::json!({
+        "schema": 1,
+        "house": "crabnebula",
+        "repository": "crabnebula/tauri-fixture",
+        "workflows": ["pickup"],
+        "additionalReviewers": [],
+        "additionalChecks": ["local-check"],
+    });
     let path = consumer.join(".kitchen.json");
-    let original = fs::read(&path)?;
-    let output = setup_command(&consumer, &registry).arg("--json").output()?;
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(report["binding"], "unchanged");
-    assert_eq!(report["written"], false);
-    let mut binding: serde_json::Value = serde_json::from_slice(&original)?;
-    binding["workflows"] = serde_json::json!(["pickup"]);
-    fs::write(&path, serde_json::to_vec(&binding)?)?;
-    let before = fs::read(&path)?;
-    let output = setup_command(&consumer, &registry)
-        .args(["--json", "--preview"])
-        .output()?;
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(report["binding"], "updated");
-    assert_eq!(report["written"], false);
-    assert_eq!(fs::read(&path)?, before);
-    let output = setup_command(&consumer, &registry).arg("--json").output()?;
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(report["binding"], "updated");
-    assert_eq!(report["written"], true);
-    assert_eq!(fs::read(&path)?, original);
-    binding["house"] = serde_json::json!("different");
-    fs::write(&path, serde_json::to_vec(&binding)?)?;
-    let before = fs::read(&path)?;
-    for preview in [true, false] {
-        let mut command = setup_command(&consumer, &registry);
-        command.arg("--json");
-        if preview {
-            command.arg("--preview");
-        }
-        let output = command.output()?;
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        assert_eq!(output.status.code(), Some(1));
-        assert_eq!(report["binding"], "refused");
-        assert_eq!(report["written"], false);
-        assert_eq!(fs::read(&path)?, before);
-    }
-    Ok(())
-}
-
-#[test]
-fn setup_respects_nested_worktree_git_file() -> TestResult {
-    let temp = tempfile::tempdir()?;
-    let root = temp.path().canonicalize()?;
-    let registry = initialize(&root)?;
-    let parent = root.join("parent");
-    fs::create_dir_all(parent.join(".git"))?;
-    let child = parent.join("child");
-    fs::create_dir_all(child.join("src"))?;
-    fs::write(child.join(".git"), "gitdir: /external/worktree-metadata")?;
-    let output = setup_command(&child.join("src"), &registry).output()?;
-    assert_eq!(output.status.code(), Some(0));
-    assert!(child.join(".kitchen.json").exists());
-    assert!(!parent.join(".kitchen.json").exists());
-    assert!(!child.join("src/.kitchen.json").exists());
+    let bytes = serde_json::to_vec(&legacy)?;
+    fs::write(&path, &bytes)?;
+    let before = tree_status(&consumer)?;
+    // Preview by default: nothing is stored.
+    let output = kitchen(&consumer, &registry, &["house", "import"]).output()?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(String::from_utf8(output.stdout)?.contains("Would import"));
+    assert!(!registry.root().join(BINDING).exists());
+    let output = kitchen(
+        &consumer,
+        &registry,
+        &["house", "import", "--yes", "--json"],
+    )
+    .output()?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(json(&output)?["status"], "created");
+    assert_eq!(json(&output)?["binding"]["schema"], 2);
+    let output = kitchen(&consumer, &registry, &["house", "doctor", "--json"]).output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let report = json(&output)?;
+    assert!(
+        report["findings"]
+            .as_array()
+            .ok_or("findings absent")?
+            .iter()
+            .any(|finding| finding["code"] == "legacy-binding")
+    );
+    assert_eq!(report["repository"], "crabnebula/tauri-fixture");
+    // Kitchen never deletes or rewrites the file.
+    assert_eq!(fs::read(&path)?, bytes);
+    assert_eq!(tree_status(&consumer)?, before);
     Ok(())
 }

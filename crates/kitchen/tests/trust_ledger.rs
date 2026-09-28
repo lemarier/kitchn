@@ -1412,6 +1412,7 @@ fn storage_rejects_symlinks_public_permissions_and_repository_paths() -> TestRes
         Ledger::initialize(repo.join("private"), house()?),
         Err(TrustError::Storage(StateError::StorageInsideRepository))
     ));
+    assert!(!repo.join("private").exists());
     let original = fs::read(&snapshot)?;
     fs::remove_file(&snapshot)?;
     let elsewhere = f.dir.path().join("outside");

@@ -2,13 +2,13 @@ use clap::{Args, Subcommand};
 use kitchen::{
     HouseId,
     adoption::{
-        FileMode, HouseRegistry, InstructionBundle, NewFile, RelativePath, SafeInstaller,
-        adopt_repository, decode, encode, git_repository_root, read_repository,
-        repository_from_path,
+        HouseRegistry, InstructionBundle, LegacyImportStatus, RepositoryMatch, decode, encode,
+        legacy_binding,
     },
     contracts::Repository,
     house::{
-        DoctorEvidence, DoctorReport, HouseConfig, HouseError, RepositoryConfig, Workflow, doctor,
+        DoctorEvidence, DoctorFinding, DoctorReport, HouseConfig, HouseError,
+        REPOSITORY_BINDING_SCHEMA, RepositoryConfig, Workflow, doctor,
     },
 };
 use std::{
@@ -31,20 +31,24 @@ enum HouseCommand {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Adopt a repository; prompt only for house and selected workflows.
+    /// Bind a repository in the registry; prompt only for house and workflows.
+    /// Nothing is written to the repository's working tree.
     Setup {
         #[arg(long)]
         registry: PathBuf,
-        #[arg(long)]
+        /// Checkout whose Git remotes identify the repository (default: the current directory).
+        #[arg(long, conflicts_with = "repository")]
         repository_path: Option<PathBuf>,
+        /// GitHub owner/name, instead of reading a checkout's remotes.
         #[arg(long)]
-        repository: Repository,
+        repository: Option<Repository>,
+        /// The house to bind; stored in the registry as the one-time choice.
         #[arg(long)]
         house: Option<HouseId>,
         /// Comma-separated workflows, or 'none' for interactive-only use.
         #[arg(long)]
         workflows: Option<String>,
-        /// Preview without writing the repository binding.
+        /// Preview without storing the registry binding.
         #[arg(long)]
         preview: bool,
         /// Optional scoped read-only integration observations.
@@ -71,6 +75,19 @@ enum HouseCommand {
         #[arg(long)]
         bundle: PathBuf,
     },
+    /// Copy a legacy .kitchen.json binding into the registry; previews unless --yes.
+    /// The file is never modified or deleted.
+    Import {
+        #[arg(long)]
+        registry: PathBuf,
+        #[arg(long, default_value = ".")]
+        repository_path: PathBuf,
+        /// Store the previewed binding.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Diagnose pins, scoped access, labels, and scheduled capabilities.
     Doctor {
         #[arg(long)]
@@ -92,7 +109,7 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             registry.initialize(&config)?;
             Ok((
                 format!(
-                    "Registered house {}. No authority or workflows activated.\nNext: kitchen house setup --registry '{}' --repository <owner/name>",
+                    "Registered house {}. No authority or workflows activated.\nNext: from a checkout of an allowed repository, run kitchen house setup --registry '{}'",
                     config.house,
                     registry.root().display()
                 ),
@@ -127,9 +144,69 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             json,
         } => {
             let registry = HouseRegistry::new(canonical_root(registry)?)?;
-            let root = canonical_root(repository_path)?;
-            let (_, config) = repository_from_path(&root)?;
-            diagnose(&registry, &config, evidence, json)
+            let start = canonical_root(repository_path)?;
+            // Only a hint: when the checkout cannot be read, resolution below
+            // fails with that error instead.
+            let legacy = legacy_binding(&start).ok().flatten();
+            match registry.resolve_repository(&start) {
+                Ok(RepositoryMatch::Bound(config)) => {
+                    diagnose(&registry, &config, legacy.as_deref(), evidence, json)
+                }
+                Ok(RepositoryMatch::Unbound { repository, house }) => Ok((
+                    format!(
+                        "Repository {repository} is claimed by house {house} but not set up.\nNext: kitchen house setup --registry '{}' --repository {repository} --house {house}",
+                        registry.root().display()
+                    ),
+                    false,
+                )),
+                Err(error) => {
+                    if let Some(legacy) = legacy {
+                        writeln!(
+                            io::stderr().lock(),
+                            "Found legacy binding {}; import it with kitchen house import --registry '{}'.",
+                            legacy.display(),
+                            registry.root().display()
+                        )
+                        .map_err(HouseError::from)?;
+                    }
+                    Err(error.into())
+                }
+            }
+        }
+        HouseCommand::Import {
+            registry,
+            repository_path,
+            yes,
+            json,
+        } => {
+            let registry = HouseRegistry::new(canonical_root(registry)?)?;
+            let start = canonical_root(repository_path)?;
+            let import = registry.import_legacy(&start, yes)?;
+            let accepted = import.status != LegacyImportStatus::Conflict;
+            if json {
+                return Ok((json_text(&import)?, accepted));
+            }
+            let source = import.source.display();
+            let binding = format!(
+                "{} -> house {}",
+                import.binding.repository, import.binding.house
+            );
+            let text = match import.status {
+                LegacyImportStatus::WouldCreate => format!(
+                    "Would import {source} into the registry as {binding}.\nNext: rerun with --yes to store it."
+                ),
+                LegacyImportStatus::Created => format!(
+                    "Imported {source} into the registry as {binding}.\nNext: delete {source} yourself when no older Kitchen needs it; Kitchen does not delete repository files."
+                ),
+                LegacyImportStatus::Unchanged => format!(
+                    "The registry already holds {binding}.\nNext: delete {source} yourself; Kitchen does not delete repository files."
+                ),
+                LegacyImportStatus::Conflict => format!(
+                    "The registry holds a different binding for {}; nothing imported.\nNext: compare it with {source} and change the registry binding with kitchen house setup.",
+                    import.binding.repository
+                ),
+            };
+            Ok((text, accepted))
         }
         HouseCommand::Setup {
             registry,
@@ -142,13 +219,24 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             json,
         } => {
             let registry = HouseRegistry::new(canonical_root(registry)?)?;
-            let root = match repository_path {
-                Some(path) => canonical_root(path)?,
-                None => git_repository_root(&std::env::current_dir().map_err(HouseError::from)?)?,
-            };
-            let house = match house {
-                Some(house) => house,
+            let (repository, existing) = match repository {
+                Some(repository) => {
+                    let existing = registry.binding(&repository)?;
+                    // Keys ignore case; keep the stored spelling of a bound repository.
+                    let repository = existing
+                        .as_ref()
+                        .map_or(repository, |existing| existing.repository.clone());
+                    (repository, existing)
+                }
                 None => {
+                    let start = canonical_root(repository_path.unwrap_or_else(|| ".".into()))?;
+                    registry.claims(&start)?.setup_target()?
+                }
+            };
+            let house = match (house, &existing) {
+                (Some(house), _) => house,
+                (None, Some(existing)) => existing.house.clone(),
+                (None, None) => {
                     let listing = registry.houses()?;
                     for (house, error) in &listing.unavailable {
                         writeln!(io::stderr().lock(), "House {house} unavailable: {error}")
@@ -173,13 +261,8 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
                     "Workflows (pickup,triage,gate,gardener,dishwasher,inspector; or none): ",
                 )?)?,
             };
-            let existing = match read_repository(&root) {
-                Ok(config) => Some(config),
-                Err(HouseError::HouseSelection) => None,
-                Err(error) => return Err(error.into()),
-            };
             let config = RepositoryConfig {
-                schema: 1,
+                schema: REPOSITORY_BINDING_SCHEMA,
                 house,
                 repository,
                 workflows,
@@ -195,40 +278,30 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             let evidence: Option<DoctorEvidence> = evidence.as_deref().map(decode).transpose()?;
             // Scope-check observations and preview label changes before any write.
             let report = doctor(&registry, &config, evidence.as_ref())?;
-            let binding = if let Some(existing) = &existing {
-                if existing.house != config.house || existing.repository != config.repository {
+            let binding = match &existing {
+                Some(existing)
+                    if existing.house != config.house
+                        || existing.repository != config.repository =>
+                {
                     BindingStatus::Refused
-                } else if existing == &config {
-                    BindingStatus::Unchanged
-                } else {
-                    BindingStatus::Updated
                 }
-            } else {
-                let path = RelativePath::new(".kitchen.json")?;
-                let contents = encode(&config)?;
-                let plan = SafeInstaller::preview(
-                    &root,
-                    &[NewFile {
-                        path: &path,
-                        contents: &contents,
-                        mode: FileMode::Regular,
-                    }],
-                )?;
-                if plan.has_conflicts() {
-                    BindingStatus::Conflict
-                } else {
-                    BindingStatus::Created
-                }
+                Some(existing) if existing == &config => BindingStatus::Unchanged,
+                Some(_) => BindingStatus::Updated,
+                None => BindingStatus::Created,
             };
             let accepted = matches!(
                 binding,
                 BindingStatus::Created | BindingStatus::Unchanged | BindingStatus::Updated
             );
-            if !preview && accepted {
-                if let Some(existing) = &existing {
-                    registry.configure_repository(&root, existing, &config)?;
-                } else {
-                    adopt_repository(&root, &config, &house)?;
+            if !preview {
+                match (&existing, binding) {
+                    (Some(existing), BindingStatus::Updated) => {
+                        registry.configure_repository(existing, &config)?;
+                    }
+                    (None, BindingStatus::Created) => {
+                        registry.bind_repository(&config)?;
+                    }
+                    _ => {}
                 }
             }
             let result = if json {
@@ -242,16 +315,16 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             } else {
                 let action = match (binding, preview) {
                     (BindingStatus::Refused, _) => "Refused rebinding",
-                    (BindingStatus::Conflict, _) => "Conflicting binding",
                     (BindingStatus::Unchanged, _) => "Unchanged binding",
-                    (BindingStatus::Created, true) => "Would adopt",
+                    (BindingStatus::Created, true) => "Would bind",
                     (BindingStatus::Updated, true) => "Would update",
-                    (BindingStatus::Created, false) => "Adopted",
+                    (BindingStatus::Created, false) => "Bound",
                     (BindingStatus::Updated, false) => "Updated",
                 };
                 format!(
-                    "{action} .kitchen.json for {}.\n{}",
+                    "{action} {} to house {} in the registry; the working tree is unchanged.\n{}",
                     config.repository,
+                    config.house,
                     report.human_readable()
                 )
             };
@@ -262,11 +335,15 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
 fn diagnose(
     registry: &HouseRegistry,
     config: &RepositoryConfig,
+    legacy: Option<&std::path::Path>,
     evidence: Option<PathBuf>,
     json: bool,
 ) -> Result<(String, bool), kitchen::Error> {
     let evidence: Option<DoctorEvidence> = evidence.as_deref().map(decode).transpose()?;
-    let report = doctor(registry, config, evidence.as_ref())?;
+    let mut report = doctor(registry, config, evidence.as_ref())?;
+    report
+        .findings
+        .extend(legacy.map(DoctorFinding::legacy_binding));
     Ok((
         if json {
             json_text(&report)?
@@ -323,7 +400,6 @@ enum BindingStatus {
     Created,
     Unchanged,
     Updated,
-    Conflict,
     Refused,
 }
 #[derive(serde::Serialize)]

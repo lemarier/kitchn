@@ -42,13 +42,15 @@ the repository directory and files, without running `git init` or activating
 workflow files.
 
 `init` accepts a missing or empty directory and refuses one with content. For an
-existing directory, use `kitchen adopt` with the same arguments. Once
-`.kitchen.json` exists, omit `--house` and `--repository` to use that exact
-binding. Missing selection fails closed, even with only one registered house.
-Existing workflow selections and additional checks/reviewers are retained;
-new bindings select no workflows. Templates cannot replace the binding. A
-reformatted `.kitchen.json` with the same settings is unchanged; its exact bytes
-are rechecked before apply, so any edit after the preview blocks the apply.
+existing directory, use `kitchen adopt` with the same arguments. The repository
+binding is stored in the house registry, never in the repository: the target
+receives only template files. Without `--repository`, `adopt` reads the GitHub
+`owner/name` from the target checkout's Git remotes. Once a repository is bound,
+omit `--house` to use the stored choice. Missing selection fails closed, even
+with only one registered house. Existing workflow selections and additional
+checks/reviewers are retained; new bindings select no workflows. Templates
+cannot render the legacy `.kitchen.json`. The stored binding is rechecked
+before apply, so a change after the preview blocks the apply.
 
 After `kitchen house update` selects a newer guidance revision, rerun `adopt` to
 preview its template updates; earlier snapshots are retained for active tasks
@@ -97,8 +99,8 @@ Kitchen ships only `example/`. Copy it into your house guidance as
 `templates/<name>/`, with `template.toml` and its `files/` tree as bundle assets,
 set the house identity and a manifest `name` matching the directory, declare all
 files, and bump the template revision when content changes. A template renders
-at most 255 files and 8 MiB minus 64 KiB in total, leaving one installer slot and
-64 KiB for `.kitchen.json`; an instruction bundle holds at most 200 assets across
+at most 255 files and 8 MiB minus 64 KiB in total, one file and 64 KiB below the
+installer's batch limits; an instruction bundle holds at most 200 assets across
 all of its guidance and templates.
 Keep product policy separate from Kitchen's development standards.
 

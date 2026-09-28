@@ -132,8 +132,8 @@ pub struct OrcaConfig {
     pub call_timeout: Duration,
     /// How long Orca waits for a launched worker to become ready.
     pub launch_timeout: Duration,
-    /// House-scoped runtime storage, outside any Git checkout and private to
-    /// the Kitchen user, where reservation files serialize launches and
+    /// House-scoped runtime storage, outside any Git checkout (a directory
+    /// inside one is refused) and private to the Kitchen user, where reservation files serialize launches and
     /// schedule installs across callers and processes. Every caller acting on
     /// one house and Orca host must use the same directory.
     pub runtime_dir: PathBuf,
@@ -476,6 +476,7 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
         }
         OrcaError::Io(_) => EffectFailure::Uncertain(UncertainReason::Transport),
         OrcaError::ReservationRedirected
+        | OrcaError::ReservationInsideRepository
         | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::ScheduleActive
@@ -524,6 +525,7 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::ScheduleDiffers { .. }
         | OrcaError::ReservationBusy
         | OrcaError::ReservationRedirected
+        | OrcaError::ReservationInsideRepository
         | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::InstallUncertain

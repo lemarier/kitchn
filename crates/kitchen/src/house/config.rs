@@ -123,15 +123,21 @@ impl HouseConfig {
     }
 }
 
-/// Public repository settings contain no credential, private context, or grants.
-/// Unknown keys (including attempted house-policy overrides such as `agents`)
-/// are rejected.
+/// Schema of a repository binding stored in the house registry. Schema 1 was
+/// the `.kitchen.json` file in a working tree; it is accepted only by the
+/// explicit legacy import and rejected everywhere else.
+pub const REPOSITORY_BINDING_SCHEMA: u32 = 2;
+
+/// A repository binding, stored in the house registry outside every working
+/// tree and keyed by the repository. It contains no credential, private
+/// context, or grants. Unknown keys (including attempted house-policy
+/// overrides such as `agents`) are rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RepositoryConfig {
-    /// Schema version; currently one.
+    /// Schema version; currently [`REPOSITORY_BINDING_SCHEMA`].
     pub schema: u32,
-    /// Explicit house; never inferred from the only available credential.
+    /// The chosen house; never inferred from the only available credential.
     pub house: HouseId,
     /// Forge identity, checked against the house allowlist.
     pub repository: Repository,
@@ -147,7 +153,7 @@ impl RepositoryConfig {
     /// Validate this repository under the selected house.
     pub fn validate(&self, house: &HouseConfig) -> Result<(), HouseError> {
         house.validate()?;
-        if self.schema != 1 {
+        if self.schema != REPOSITORY_BINDING_SCHEMA {
             return Err(HouseError::InvalidInput);
         }
         if self.house != house.house || !house.repositories.contains(&self.repository) {

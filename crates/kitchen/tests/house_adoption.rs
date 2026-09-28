@@ -1,9 +1,6 @@
 //! House isolation, immutable pins, setup diagnoses and recovery using synthetic fixtures.
 use kitchen::{
-    adoption::{
-        HouseRegistry, InstructionBundle, adopt_repository, repository_from_path,
-        resolve_instructions,
-    },
+    adoption::{HouseRegistry, InstructionBundle, remote_repositories, resolve_instructions},
     contracts::{Capability, CapabilitySet, CommitId},
     house::{
         AccessStatus, DoctorCode, DoctorEvidence, HouseConfig, HouseError, LabelStatus,
@@ -11,7 +8,7 @@ use kitchen::{
         workflow_requirements,
     },
 };
-use std::{collections::BTreeSet, fs};
+use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 fn config(name: &str) -> Result<HouseConfig, Box<dyn std::error::Error>> {
@@ -30,13 +27,38 @@ fn bundle(name: &str) -> Result<InstructionBundle, Box<dyn std::error::Error>> {
 }
 fn repo(house: &HouseConfig) -> Result<RepositoryConfig, Box<dyn std::error::Error>> {
     Ok(RepositoryConfig {
-        schema: 1,
+        schema: 2,
         house: house.house.clone(),
         repository: house.repositories.first().ok_or("empty fixture")?.clone(),
         workflows: BTreeSet::from([Workflow::Pickup, Workflow::Gate]),
         additional_reviewers: BTreeSet::new(),
         additional_checks: BTreeSet::new(),
     })
+}
+/// A Git checkout at `path` whose `origin` names `repository` on GitHub.
+fn checkout(path: &Path, repository: &str) -> TestResult {
+    fs::create_dir_all(path)?;
+    for args in [
+        vec!["init", "--quiet"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            &format!("https://github.com/{repository}.git"),
+        ],
+    ] {
+        let status = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .arg("-C")
+            .arg(path)
+            .args(&args)
+            .status()?;
+        if !status.success() {
+            return Err(format!("git {args:?} failed").into());
+        }
+    }
+    Ok(())
 }
 #[test]
 fn two_houses_resolve_without_guidance_or_authority_leakage() -> TestResult {
@@ -48,10 +70,9 @@ fn two_houses_resolve_without_guidance_or_authority_leakage() -> TestResult {
         registry.initialize(&house)?;
         registry.sync(&house.house, &bundle(name)?)?;
         let consumer = root.join(name);
-        fs::create_dir(&consumer)?;
-        fs::create_dir(consumer.join(".git"))?;
         let repository = repo(&house)?;
-        assert!(!adopt_repository(&consumer, &repository, &house)?.has_conflicts());
+        checkout(&consumer, repository.repository.as_str())?;
+        assert!(!registry.bind_repository(&repository)?.has_conflicts());
         let resolved = registry.resolve(&consumer, CommitId::new(&"c".repeat(40))?)?;
         let guidance = fs::read_to_string(&resolved.entrypoint)?;
         if name == "crabnebula" {
@@ -336,26 +357,10 @@ fn doctor_unknown_is_not_success_and_scoped_evidence_can_complete_it() -> TestRe
     Ok(())
 }
 #[test]
-fn repository_resolution_stops_at_nested_git_and_rejects_ambiguity() -> TestResult {
+fn registries_inside_a_checkout_are_refused() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     fs::create_dir(root.join(".git"))?;
-    let house = config("origin89")?;
-    let repository = repo(&house)?;
-    adopt_repository(&root, &repository, &house)?;
-    fs::create_dir(root.join("src"))?;
-    assert_eq!(repository_from_path(&root.join("src"))?.1, repository);
-    adopt_repository(&root.join("src"), &repository, &house)?;
-    assert!(matches!(
-        repository_from_path(&root.join("src")),
-        Err(HouseError::HouseSelection)
-    ));
-    fs::create_dir(root.join("nested"))?;
-    fs::create_dir(root.join("nested/.git"))?;
-    assert!(matches!(
-        repository_from_path(&root.join("nested")),
-        Err(HouseError::HouseSelection)
-    ));
     assert!(matches!(
         HouseRegistry::new(root.join("private")),
         Err(HouseError::InsideRepository)
@@ -372,21 +377,24 @@ fn explicit_workflow_change_preserves_strengthening_and_detects_stale_setup() ->
     registry.initialize(&house)?;
     let mut original = repo(&house)?;
     original.additional_checks.insert("local-check".into());
-    let consumer = root.join("consumer");
-    adopt_repository(&consumer, &original, &house)?;
+    registry.bind_repository(&original)?;
     let mut next = original.clone();
     next.workflows.clear();
-    registry.configure_repository(&consumer, &original, &next)?;
-    assert_eq!(kitchen::adoption::read_repository(&consumer)?, next);
+    registry.configure_repository(&original, &next)?;
+    assert_eq!(registry.binding(&original.repository)?, Some(next.clone()));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            fs::metadata(consumer.join(".kitchen.json"))?
-                .permissions()
-                .mode()
+            fs::metadata(
+                registry
+                    .root()
+                    .join("repositories/origin89hq/firmware.json")
+            )?
+            .permissions()
+            .mode()
                 & 0o777,
-            0o644
+            0o600
         );
         assert_eq!(
             fs::metadata(registry.root().join("houses/origin89.json"))?
@@ -399,7 +407,7 @@ fn explicit_workflow_change_preserves_strengthening_and_detects_stale_setup() ->
     assert!(next.checks(&house)?.contains("local-check"));
     assert!(doctor(&registry, &next, None)?.labels.is_empty());
     assert!(matches!(
-        registry.configure_repository(&consumer, &original, &next),
+        registry.configure_repository(&original, &next),
         Err(HouseError::Conflict)
     ));
     Ok(())
@@ -507,7 +515,8 @@ fn pending_and_stray_files_do_not_block_other_houses() -> TestResult {
     registry.initialize(&house)?;
     registry.sync(&house.house, &bundle("crabnebula")?)?;
     let consumer = root.join("consumer");
-    adopt_repository(&consumer, &repo(&house)?, &house)?;
+    checkout(&consumer, "crabnebula/tauri-fixture")?;
+    registry.bind_repository(&repo(&house)?)?;
     for stray in ["origin89.pending", ".DS_Store", "broken.json"] {
         fs::write(registry.root().join("houses").join(stray), b"interrupted")?;
         assert_eq!(
@@ -643,7 +652,7 @@ fn role_digest_rejects_invalid_input_and_changed_manifest_role_bytes() -> TestRe
 #[test]
 fn repository_lookup_rejects_relative_input() -> TestResult {
     assert!(matches!(
-        repository_from_path(std::path::Path::new(".")),
+        remote_repositories(Path::new(".")),
         Err(HouseError::InvalidInput)
     ));
     Ok(())

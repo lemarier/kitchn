@@ -619,6 +619,7 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::ScheduleActive
         | OrcaError::ScheduleDiffers { .. }
         | OrcaError::ReservationRedirected
+        | OrcaError::ReservationInsideRepository
         | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::Schedule(_)

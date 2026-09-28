@@ -74,6 +74,7 @@ pub(crate) struct StoreLayout {
     /// Write the snapshot as indented JSON.
     pub pretty: bool,
     /// Refuse a store directory or managed file readable by other users.
+    /// Enforced on Unix; other platforms have no mode bits to check.
     pub require_private: bool,
     /// A file whose held lock makes ordinary lockers yield to a priority
     /// writer. `None` disables priority writes.

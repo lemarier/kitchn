@@ -2033,9 +2033,15 @@ fn persisted_records_follow_core_serialization_conventions() -> TestResult {
     // Tagged records reject unknown fields and unknown kinds.
     let mut extra = serde_json::to_value(measured(true)?)?;
     extra["extra"] = serde_json::json!(1);
-    assert!(serde_json::from_value::<Measurement<bool>>(extra).is_err());
+    assert!(
+        serde_json::from_value::<Measurement<bool>>(extra).is_err_and(|error| error.is_data()),
+        "an unknown field is a data error"
+    );
     let unknown = serde_json::json!({ "type": "estimated" });
-    assert!(serde_json::from_value::<Measurement<bool>>(unknown).is_err());
+    assert!(
+        serde_json::from_value::<Measurement<bool>>(unknown).is_err_and(|error| error.is_data()),
+        "an unknown kind is a data error"
+    );
     let round_trip: Measurement<bool> =
         serde_json::from_value(serde_json::to_value(Measurement::<bool>::Untested)?)?;
     assert_eq!(round_trip, Measurement::Untested);

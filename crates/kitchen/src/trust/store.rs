@@ -577,6 +577,7 @@ impl Ledger {
             for audit in &doc.grants {
                 let GrantAudit::Issued(grant) = audit else { continue; };
                 if grant.scope != binding.scope { continue; }
+                // A stale, incomplete, or mismatched stream adds no grant.
                 let valid = grant.evidence.iter().all(|(id, revision)| {
                     doc.latest(id).is_ok_and(|observed| {
                         observed.revision == *revision
@@ -647,6 +648,9 @@ fn audit_identity(audit: &GrantAudit) -> (&crate::contracts::ExternalRef, &House
         GrantAudit::Revoked { grant, .. } => (&grant.id, &grant.house),
     }
 }
+/// A station named after a role binds only tasks of that role. Any other
+/// station name is a house-defined domain that accepts every role; earned
+/// standing still requires the acting task's role to equal the evidence task's.
 fn role_matches_station(role: Role, scope: &StationScope) -> bool {
     !Role::ALL
         .iter()

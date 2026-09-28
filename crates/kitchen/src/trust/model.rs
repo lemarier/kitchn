@@ -40,6 +40,7 @@ pub enum Measurement<T> {
 }
 
 /// Runtime evidence must never be confused with fixtures or local simulation.
+/// The adapter declares the mode; the ledger cannot verify it against a runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -216,6 +217,9 @@ impl Observation {
     /// is not a pass, or that concerns another head or base, blocks trust.
     #[must_use]
     pub fn trust_eligible(&self) -> bool {
+        let Measurement::Observed { value: pr, .. } = &self.pull_request else {
+            return false;
+        };
         self.mode == EvidenceMode::Live
             && matches!(self.attribution.agent, Measurement::Observed { .. })
             && matches!(self.attribution.model, Measurement::Observed { .. })
@@ -227,18 +231,16 @@ impl Observation {
                     ..
                 }
             )
-            && matches!(&self.pull_request, Measurement::Observed { value: pr, .. }
-                if matches!(pr.first_pass, Measurement::Observed { value: true, .. })
-                    && matches!(&pr.findings, Measurement::Observed { value, .. } if value.is_empty())
-                    && matches!(&pr.reverts, Measurement::Observed { value, .. } if value.is_empty())
-                    && matches!(&pr.regressions, Measurement::Observed { value, .. } if value.is_empty()))
-            && matches!(&self.pull_request, Measurement::Observed { value: pr, .. }
-                if matches!(&pr.checks, Measurement::Observed { value, .. }
-                    if !value.is_empty() && value.iter().all(|check| check.verdict == EvidenceVerdict::Pass)))
-            && matches!(&self.pull_request, Measurement::Observed { value: pr, .. }
-            if self.evidence.iter().all(|item| {
-                item.verdict == EvidenceVerdict::Pass && item.subject == pr.subject
-            }))
+            && matches!(pr.first_pass, Measurement::Observed { value: true, .. })
+            && [&pr.findings, &pr.reverts, &pr.regressions]
+                .into_iter()
+                .all(|list| matches!(list, Measurement::Observed { value, .. } if value.is_empty()))
+            && matches!(&pr.checks, Measurement::Observed { value, .. }
+                if !value.is_empty() && value.iter().all(|check| check.verdict == EvidenceVerdict::Pass))
+            && self
+                .evidence
+                .iter()
+                .all(|item| item.verdict == EvidenceVerdict::Pass && item.subject == pr.subject)
             && !matches!(&self.bench, Measurement::Observed { value, .. } if value.iter().any(|result| !result.passed))
             && !matches!(
                 &self.appropriate_escalation,

@@ -145,6 +145,9 @@ fn preview_apply_and_bound_rerun() -> Result {
     let output = f.selected("init").output()?;
     assert!(output.status.success(), "{output:?}");
     assert!(stdout(&output).contains("3 to add"));
+    assert!(stdout(&output).contains(
+        "No additions match known automation paths. Kitchen activates nothing. Matching is best-effort: other files may still be run by tools."
+    ));
     assert!(!f.root.join("consumer").exists());
     let output = f.selected("init").arg("--yes").output()?;
     assert!(output.status.success(), "{output:?}");

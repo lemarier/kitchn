@@ -7,6 +7,9 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
+    time::Duration,
 };
 
 use kitchen::{
@@ -19,9 +22,9 @@ use kitchen::{
     house::HouseError,
     scaffold::{
         Activation, Conflict, FilePlan, MAX_RENDERED_BYTES, MAX_TEMPLATE_OUTPUT_BYTES,
-        ManagedState, Manifest, MissingVariable, PlanAction, PlanKind, RenderedFile,
-        RenderedTemplate, ScaffoldError, ScaffoldLimit, Template, TemplateProblem, VariableName,
-        inspect_managed,
+        MAX_WORKFLOW_YAML_DEPTH, ManagedState, Manifest, MissingVariable, PlanAction, PlanKind,
+        RenderedFile, RenderedTemplate, ScaffoldError, ScaffoldLimit, Template, TemplateProblem,
+        VariableName, inspect_managed,
     },
 };
 use tempfile::TempDir;
@@ -195,10 +198,10 @@ fn new_repository_plan_adds_every_file_and_previews_it() -> TestResult {
     assert!(preview.starts_with("Template origin89/rust-workspace revision 2, guidance aaaa"));
     assert!(preview.contains("(new repository)"));
     assert!(preview.contains(
-        "  add        .github/workflows/check.yml  [CI workflow: runs on the forge once pushed]\n"
+        "  add        .github/workflows/check.yml  [CI workflow: runs in CI once pushed]\n"
     ));
     assert!(preview.contains(
-        "  add        .github/workflows/security.yml  [scheduled workflow: runs on the forge once pushed, then on its schedule from the default branch]\n"
+        "  add        .github/workflows/security.yml  [scheduled workflow: runs in CI once pushed, then on its schedule from the default branch]\n"
     ));
     assert!(preview.contains(
         "  add        .github/dependabot.yml  [dependency updates: opens forge pull requests once pushed]\n"
@@ -208,7 +211,7 @@ fn new_repository_plan_adds_every_file_and_previews_it() -> TestResult {
     ));
     assert!(preview.contains("  add        README.md\n"));
     assert!(preview.contains(
-        "4 additions can activate automation once pushed or opened; Kitchen activates none of them."
+        "4 additions match known automation paths and can activate automation once pushed or opened. Kitchen activates none of them. Matching is best-effort: other files may still be run by tools.\n"
     ));
     assert!(preview.contains(&format!(
         "{} to add, 0 unchanged, 0 withheld, 0 conflicts.",
@@ -286,8 +289,361 @@ fn authority_bearing_paths_are_classified_with_their_boundary() -> TestResult {
     }
     assert_eq!(
         format!("{}: {}", CiWorkflow, CiWorkflow.boundary()),
-        "CI workflow: runs on the forge once pushed"
+        "CI workflow: runs in CI once pushed"
     );
+    Ok(())
+}
+
+fn classify(path: &str, text: &str) -> TestResult<Option<Activation>> {
+    Ok(Activation::of(&RelativePath::new(path)?, text))
+}
+
+/// Classify on another thread so an implementation that expands aliases fails
+/// by timeout instead of hanging the run.
+fn classify_within_ten_seconds(path: &str, text: String) -> TestResult<Option<Activation>> {
+    let path = RelativePath::new(path)?;
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let _ = sender.send(Activation::of(&path, &text));
+    });
+    let classified = receiver.recv_timeout(Duration::from_secs(10))?;
+    worker.join().map_err(|_| "classifier thread panicked")?;
+    Ok(classified)
+}
+
+/// Nine references per level to the level below: 9^levels leaves if expanded.
+fn alias_bomb(levels: usize) -> String {
+    let mut lines = vec!["l0: &l0 [x, x, x, x, x, x, x, x, x]".to_owned()];
+    for level in 1..=levels {
+        let refs = vec![format!("*l{}", level - 1); 9].join(", ");
+        lines.push(format!("l{level}: &l{level} [{refs}]"));
+    }
+    lines.join("\n") + "\n"
+}
+
+#[test]
+fn schedules_are_found_in_every_yaml_form_and_only_as_triggers() -> TestResult {
+    use Activation::{CiWorkflow, ScheduledWorkflow};
+    let workflow = ".github/workflows/w.yml";
+    for (form, text, expected) in [
+        (
+            "block mapping",
+            "on:\n  push:\n  schedule:\n    - cron: \"0 0 * * *\"\n",
+            ScheduledWorkflow,
+        ),
+        (
+            "flow mapping",
+            "on: {push: {}, schedule: [{cron: \"0 0 * * *\"}]}\n",
+            ScheduledWorkflow,
+        ),
+        (
+            "multi-line flow mapping",
+            "on: {\n  push: {},\n  schedule: [{cron: '0 0 * * *'}],\n}\n",
+            ScheduledWorkflow,
+        ),
+        (
+            "quoted keys",
+            "\"on\":\n  \"schedule\":\n    - cron: x\n",
+            ScheduledWorkflow,
+        ),
+        (
+            "single-quoted key",
+            "on:\n  'schedule':\n    - cron: x\n",
+            ScheduledWorkflow,
+        ),
+        (
+            "space before the colon",
+            "on:\n  schedule :\n    - cron: x\n",
+            ScheduledWorkflow,
+        ),
+        ("event list", "on: [push, schedule]\n", ScheduledWorkflow),
+        ("single event", "on: schedule\n", ScheduledWorkflow),
+        (
+            "later document",
+            "on: push\n---\non:\n  schedule:\n    - cron: x\n",
+            ScheduledWorkflow,
+        ),
+        (
+            "alias for the triggers",
+            "x-triggers: &t\n  push:\n  schedule:\n    - cron: x\non: *t\n",
+            ScheduledWorkflow,
+        ),
+        (
+            "merge key",
+            "x: &t\n  schedule:\n    - cron: x\non:\n  <<: *t\n  push:\n",
+            ScheduledWorkflow,
+        ),
+        ("push only", "on: push\n", CiWorkflow),
+        (
+            "commented out",
+            "on:\n  push:\n  # schedule: disabled\n",
+            CiWorkflow,
+        ),
+        (
+            "a job named schedule",
+            "on: push\njobs:\n  schedule:\n    runs-on: ubuntu-latest\n",
+            CiWorkflow,
+        ),
+        (
+            "another top-level key",
+            "on: push\nenv:\n  schedule: nightly\n",
+            CiWorkflow,
+        ),
+        (
+            "script text",
+            "on: push\njobs:\n  j:\n    steps:\n      - run: |\n          schedule: text\n",
+            CiWorkflow,
+        ),
+        (
+            "a value that is not a trigger",
+            "on:\n  push:\n    branches: [schedule]\n",
+            CiWorkflow,
+        ),
+        ("no trigger key", "name: x\n", CiWorkflow),
+        ("empty", "", CiWorkflow),
+        ("root is a list", "- on: {schedule: x}\n", CiWorkflow),
+    ] {
+        assert_eq!(classify(workflow, text)?, Some(expected), "{form}");
+    }
+    let flow = "on: {push: {}, schedule: [{cron: \"0 0 * * *\"}]}\n";
+    for path in [".forgejo/workflows/ci.yml", ".gitea/workflows/ci.yml"] {
+        assert_eq!(classify(path, flow)?, Some(ScheduledWorkflow), "{path}");
+    }
+    // GitLab pipelines have no `on` trigger; schedules live in project settings.
+    assert_eq!(
+        classify(".gitlab-ci.yml", "schedule: x\n")?,
+        Some(CiWorkflow)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_workflow_that_cannot_be_read_within_bounds_is_assumed_scheduled() -> TestResult {
+    use Activation::{CiWorkflow, ScheduledWorkflow};
+    let workflow = ".github/workflows/w.yml";
+    let padded = |len: usize| {
+        let head = "on: push\n# ";
+        format!("{head}{}\n", "x".repeat(len - head.len() - 1))
+    };
+    assert_eq!(padded(MAX_RENDERED_BYTES).len(), MAX_RENDERED_BYTES);
+    assert_eq!(
+        classify(workflow, &padded(MAX_RENDERED_BYTES))?,
+        Some(CiWorkflow)
+    );
+    assert_eq!(
+        classify(workflow, &padded(MAX_RENDERED_BYTES + 1))?,
+        Some(ScheduledWorkflow)
+    );
+
+    for (form, text) in [
+        ("unterminated flow sequence", "on: [push\n".to_owned()),
+        ("tab indentation", "on:\n\tpush:\n".to_owned()),
+        ("unknown alias", "on: *missing\n".to_owned()),
+        // The YAML scanner treats NUL as the end of the stream.
+        (
+            "NUL before a schedule",
+            "on: push\n\0\non:\n  schedule:\n    - cron: x\n".to_owned(),
+        ),
+    ] {
+        assert_eq!(
+            classify(workflow, &text)?,
+            Some(ScheduledWorkflow),
+            "{form}"
+        );
+    }
+
+    let nested = |levels: usize| {
+        format!(
+            "on: push\nx: {}{}\n",
+            "[".repeat(levels),
+            "]".repeat(levels)
+        )
+    };
+    // The root mapping is the first level of nesting.
+    assert_eq!(
+        classify(workflow, &nested(MAX_WORKFLOW_YAML_DEPTH - 1))?,
+        Some(CiWorkflow)
+    );
+    assert_eq!(
+        classify(workflow, &nested(MAX_WORKFLOW_YAML_DEPTH))?,
+        Some(ScheduledWorkflow)
+    );
+    assert_eq!(
+        classify(workflow, &nested(10_000))?,
+        Some(ScheduledWorkflow)
+    );
+    Ok(())
+}
+
+#[test]
+fn aliases_are_never_expanded_while_looking_for_a_schedule() -> TestResult {
+    let workflow = ".github/workflows/w.yml";
+    // Unrelated keys hold the bomb; the trigger is plain.
+    let text = format!("{}on: push\n", alias_bomb(12));
+    assert_eq!(
+        classify_within_ten_seconds(workflow, text)?,
+        Some(Activation::CiWorkflow)
+    );
+    // The trigger itself is the bomb; its innermost list names a schedule.
+    let text = format!(
+        "l0: &l0 [schedule]\n{}on: *l12\n",
+        alias_bomb(12).split_once('\n').map_or("", |(_, rest)| rest)
+    );
+    assert_eq!(
+        classify_within_ten_seconds(workflow, text)?,
+        Some(Activation::ScheduledWorkflow)
+    );
+    // Without a schedule anywhere, the same shape is a plain workflow.
+    let text = format!("{}on: *l12\n", alias_bomb(12));
+    assert_eq!(
+        classify_within_ten_seconds(workflow, text)?,
+        Some(Activation::CiWorkflow)
+    );
+    Ok(())
+}
+
+#[test]
+fn editor_agent_and_hook_directories_match_where_tools_read_them() -> TestResult {
+    use Activation::{AgentSettings, DevContainer, GitHooks};
+    for (path, expected) in [
+        ("apps/x/.vscode/tasks.json", Some(AgentSettings)),
+        ("apps/x/.claude/settings.json", Some(AgentSettings)),
+        ("a/b/c/.idea/workspace.xml", Some(AgentSettings)),
+        ("x/.cursor/rules/a.mdc", Some(AgentSettings)),
+        ("x/.zed/settings.json", Some(AgentSettings)),
+        ("x/.codex/config.toml", Some(AgentSettings)),
+        ("x/.gemini/settings.json", Some(AgentSettings)),
+        ("x/.agents/skills/a/SKILL.md", Some(AgentSettings)),
+        ("x/.opencode/agent/a.md", Some(AgentSettings)),
+        ("x/.DevContainer/devcontainer.json", Some(DevContainer)),
+        ("packages/y/.husky/pre-commit", Some(GitHooks)),
+        // Forges and Git read these only at the repository root.
+        ("apps/x/.github/workflows/ci.yml", None),
+        ("apps/x/.github/dependabot.yml", None),
+        ("apps/x/.githooks/pre-commit", None),
+        // A component must be the whole directory name, and a directory.
+        ("src/vscode/tasks.json", None),
+        ("docs/.vscode-notes/tasks.json", None),
+        ("x/.vscodeignore", None),
+        ("x/.claude", None),
+        ("x/claude/settings.json", None),
+        ("docs/.husky.md", None),
+    ] {
+        assert_eq!(classify(path, "")?, expected, "{path}");
+    }
+    Ok(())
+}
+
+#[test]
+fn further_automation_paths_are_classified() -> TestResult {
+    use Activation::{AgentSettings, CargoConfig, CiWorkflow, DependencyUpdates, DevContainer};
+    for (path, expected) in [
+        (".renovaterc.json", Some(DependencyUpdates)),
+        ("x/.renovaterc.json5", Some(DependencyUpdates)),
+        ("opencode.json", Some(AgentSettings)),
+        ("x/opencode.jsonc", Some(AgentSettings)),
+        (".devcontainer.json", Some(DevContainer)),
+        (".cargo/config.toml", Some(CargoConfig)),
+        ("crates/x/.cargo/config", Some(CargoConfig)),
+        (".circleci/config.yml", Some(CiWorkflow)),
+        (".buildkite/pipeline.yml", Some(CiWorkflow)),
+        (".travis.yml", Some(CiWorkflow)),
+        ("bitbucket-pipelines.yml", Some(CiWorkflow)),
+        ("azure-pipelines.yml", Some(CiWorkflow)),
+        ("ci/azure-pipelines.yaml", Some(CiWorkflow)),
+        ("Jenkinsfile", Some(CiWorkflow)),
+        ("services/api/Jenkinsfile", Some(CiWorkflow)),
+        // Not configuration those tools read as such.
+        (".cargo/audit.toml", None),
+        ("docs/Jenkinsfile.md", None),
+        ("services/.circleci/config.yml", None),
+        ("services/.travis.yml", None),
+        ("docs/opencode.md", None),
+    ] {
+        assert_eq!(classify(path, "")?, expected, "{path}");
+    }
+    Ok(())
+}
+
+#[test]
+fn the_preview_tags_each_class_and_says_matching_is_best_effort() -> TestResult {
+    let files = [
+        ".github/workflows/flow.yml",
+        "apps/web/.claude/settings.json",
+        "apps/web/.husky/pre-commit",
+        ".mcp.json",
+        ".env",
+        ".devcontainer/devcontainer.json",
+        ".cargo/config.toml",
+        "Jenkinsfile",
+        "README.md",
+    ];
+    let manifest = minimal_with(
+        &files
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                format!("[[files]]\nsource = \"s{index}\"\npath = \"{path}\"\nrender = false\n")
+            })
+            .collect::<String>(),
+    );
+    let flow = "on: {push: {}, schedule: [{cron: \"0 0 * * *\"}]}\n";
+    let sources: Vec<(String, &str)> = files
+        .iter()
+        .enumerate()
+        .map(|(index, _)| (format!("s{index}"), if index == 0 { flow } else { "x\n" }))
+        .collect();
+    let sources: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(source, text)| (source.as_str(), *text))
+        .collect();
+    let workspace = TempDir::new()?;
+    let target = real(&workspace)?.join("new-repo");
+    let plan = FilePlan::new(render_minimal(&manifest, &sources, &[])??, &target)?;
+    let preview = plan.to_string();
+    for line in [
+        "  add        .github/workflows/flow.yml  [scheduled workflow: runs in CI once pushed, then on its schedule from the default branch]\n",
+        "  add        apps/web/.claude/settings.json  [agent or editor settings: applies when an agent or editor opens the repository]\n",
+        "  add        apps/web/.husky/pre-commit  [Git hooks: runs on Git operations once hooks are configured]\n",
+        "  add        .mcp.json  [MCP servers: can start servers when an agent client opens the repository]\n",
+        "  add        .env  [environment file: loaded by tools that read it, such as direnv]\n",
+        "  add        .devcontainer/devcontainer.json  [dev container: runs its lifecycle commands when opened in a dev container]\n",
+        "  add        .cargo/config.toml  [Cargo configuration: applies to Cargo commands run in or below its directory, and can set runners and wrappers]\n",
+        "  add        Jenkinsfile  [CI workflow: runs in CI once pushed]\n",
+        "  add        README.md\n",
+        "8 additions match known automation paths and can activate automation once pushed or opened. Kitchen activates none of them. Matching is best-effort: other files may still be run by tools.\n",
+    ] {
+        assert!(preview.contains(line), "{line}\n{preview}");
+    }
+    Ok(())
+}
+
+#[test]
+fn the_preview_never_implies_that_unmatched_files_are_inert() -> TestResult {
+    let workspace = TempDir::new()?;
+    let target = real(&workspace)?.join("new-repo");
+    let plan = FilePlan::new(render_example('a')?, &target)?;
+    assert!(plan.files().iter().all(|p| p.activation().is_none()));
+    assert!(plan.to_string().contains(
+        "No additions match known automation paths. Kitchen activates nothing. Matching is best-effort: other files may still be run by tools.\n"
+    ));
+
+    // Exactly one match reads in the singular.
+    let manifest = minimal_with(
+        "[[files]]\nsource = \"a\"\npath = \".env\"\nrender = false\n[[files]]\nsource = \"b\"\n",
+    );
+    let sources = [("a", "x\n"), ("b", "y\n")];
+    let target = real(&workspace)?.join("second");
+    let plan = FilePlan::new(render_minimal(&manifest, &sources, &[])??, &target)?;
+    assert!(plan.to_string().contains(
+        "1 addition matches known automation paths and can activate automation once pushed or opened. Kitchen activates none of them."
+    ));
+
+    // With nothing left to add there is nothing to classify.
+    plan.apply()?;
+    let plan = FilePlan::new(render_minimal(&manifest, &sources, &[])??, &target)?;
+    assert!(plan.is_noop());
+    assert!(!plan.to_string().contains("known automation paths"));
     Ok(())
 }
 

@@ -21,11 +21,17 @@ the first `=`. A missing-value error lists every required variable with its
 description.
 
 The default is a preview of every addition, identical file, withheld file, and
-conflict. Additions that can start automation later are flagged with when that
+conflict. Additions at known automation paths are flagged with when that
 happens: CI and scheduled workflows run once pushed, dependency-update
 configuration opens pull requests once pushed, agent/editor settings and MCP
-configuration apply when a client opens the repository, environment files load
-through tools such as direnv, and Git hooks run once configured. Kitchen crosses
+configuration apply when a client opens the repository, dev containers run
+their lifecycle commands when opened, Cargo configuration applies to Cargo
+commands run beneath it, environment files load through tools such as direnv,
+and Git hooks run once configured. Forge configuration matches at the repository
+root; editor, agent, dev container, Husky, and Cargo directories match at any
+depth. A workflow is scheduled when its top-level `on` names `schedule`, however
+the YAML spells it; one that cannot be read is assumed scheduled. Matching is
+best-effort: a file with no flag can still be run by some tool. Kitchen crosses
 none of these boundaries itself. Repeat
 with `--confirm` to answer `yes`, or `--yes` for non-interactive confirmation.
 EOF, a negative answer, or an incomplete answer grants no consent. Invalid input

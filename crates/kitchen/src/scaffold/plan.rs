@@ -380,10 +380,18 @@ impl fmt::Display for FilePlan {
                 }
             }
         }
-        if activating > 0 {
+        if added > 0 {
+            let matched = match activating {
+                0 => "No additions match known automation paths. Kitchen activates nothing."
+                    .to_owned(),
+                1 => "1 addition matches known automation paths and can activate automation once pushed or opened. Kitchen activates none of them.".to_owned(),
+                many => format!(
+                    "{many} additions match known automation paths and can activate automation once pushed or opened. Kitchen activates none of them."
+                ),
+            };
             writeln!(
                 formatter,
-                "{activating} additions can activate automation once pushed or opened; Kitchen activates none of them."
+                "{matched} Matching is best-effort: other files may still be run by tools."
             )?;
         }
         write!(

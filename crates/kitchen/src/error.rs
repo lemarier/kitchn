@@ -77,6 +77,9 @@ pub enum Error {
     /// An intake source or report was refused or malformed.
     #[error(transparent)]
     Intake(#[from] crate::workflows::intake::IntakeError),
+    /// Guided house registration failed or had missing answers.
+    #[error(transparent)]
+    HouseInit(#[from] crate::house::HouseInitError),
 }
 
 impl Error {
@@ -101,6 +104,7 @@ impl Error {
             Self::Coordination(error) => error.class(),
             Self::Budget(error) => error.class(),
             Self::Intake(error) => error.class(),
+            Self::HouseInit(error) => error.class(),
         }
     }
 }

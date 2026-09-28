@@ -4,5 +4,6 @@ pub mod cleanup;
 pub mod decompose;
 pub mod gardener;
 pub mod house;
+pub mod house_init;
 pub mod pickup;
 pub mod scaffold;

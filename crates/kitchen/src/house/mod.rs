@@ -6,6 +6,7 @@ mod error;
 mod readiness;
 mod requirements;
 mod roles;
+mod wizard;
 
 pub use config::*;
 pub use doctor::*;
@@ -13,3 +14,4 @@ pub use error::HouseError;
 pub use readiness::*;
 pub use requirements::*;
 pub use roles::*;
+pub use wizard::*;

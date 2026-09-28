@@ -13,11 +13,35 @@ description: Every kitchn command, its flags and exit codes.
 
 ## `kitchn house init`
 
-Register a reviewed house policy. Grants no authority.
+Register a house and pin its guidance. Grants no authority and activates no
+workflows.
 
 ```sh
+kitchn house init [options]
 kitchn house init --registry <dir> --config <house.json>
 ```
+
+Without `--config`, it asks only for what it can't infer, prints the resulting
+policy, and registers it after you confirm. Press Enter to take the default in
+brackets. Each question has a flag:
+
+| Flag | Default |
+| --- | --- |
+| `--registry <dir>` | `~/.kitchn` |
+| `--house <id>` | none: always asked |
+| `--repositories <owner/name,...>` | the checkout's GitHub remote |
+| `--posting-destinations <owner/name,...>` | the repositories |
+| `--sous-chef`, `--station-cook`, `--expediter` `<claude\|codex>` | Claude Code at the pass, Codex at the stations |
+| `--required-checks <name,...\|none>` | the default branch's required checks, when `--github-requester`, `--github-credential`, `--github-credential-file` and `--gh` can read them; otherwise asked |
+| `--required-reviewers <name,...\|none>` | `expediter` |
+| `--kitchen <commit>` | the commit the binary was built from, when it records one |
+| `--bundle <bundle.json>` | kitchn's default guidance, pinned at the kitchn commit |
+| `--yes` | ask before registering |
+
+Grants and policy limits stay empty. When standard input is not a terminal,
+answers come only from flags and defaults, and any missing answer fails with
+exit 2 naming the flags to pass. Rerunning with the same answers changes
+nothing; different answers for an existing house are refused.
 
 ## `kitchn house sync`
 

@@ -73,6 +73,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #46 report intake | `workflows/intake.rs` | Intake source, grouping, and redaction tests |
 | #149 fake-executable test helper | `crates/kitchen/tests/common/executable.rs` | Test support only; `tests/fake_executable.rs` covers it |
 | #47 project decomposition | `workflows/decomposition.rs` | Decomposition tests; `kitchen decompose` CLI command |
+| #98 guided house init | `house/wizard/` | `kitchen house init` without `--config` in `crates/kitchen-cli/src/commands/house_init.rs`; `tests/house_init.rs` in both crates |
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.

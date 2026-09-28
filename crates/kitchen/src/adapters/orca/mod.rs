@@ -22,7 +22,8 @@
 //!   dispatched Task again, so resubmitting a launch key returns the original
 //!   Dispatch. A response lost before the Task exists stays unknown: a
 //!   missing Task is not proof the create will not land. Messages and replies
-//!   carry no key, so lookup and idempotency are declared partial.
+//!   carry no key, and a trial starts a new run each time, so lookup and
+//!   idempotency are declared per effect kind and not for those.
 //! - Concurrent first submissions. A Task title is a marker, not a uniqueness
 //!   constraint, so two callers that both list before either creates would
 //!   both create. Launches and schedule installs therefore hold a per-key
@@ -41,17 +42,22 @@
 //!   each run with Kitchen's own [`crate::scheduling::ReadinessSignal`]s and
 //!   a deadline, so a swallowed launch is reported as
 //!   [`crate::scheduling::RunVerdict::LaunchFailed`].
-//! - Branches. Orca prefixes the worktree name it is given. A launch with a
-//!   requested branch ([`RequestedBranch`], supplied through
-//!   [`OrcaBackend::with_branch_source`] until the launch contract carries
-//!   it) passes the name that yields it and verifies the branch Orca created.
-//!   Orca offers no way to start a worker only after checking its branch, so
-//!   on a mismatch the adapter stops the worker it just started, and holds
-//!   the launch as uncertain; [`OrcaBackend::verify_launch_branch`] reports
-//!   both branches. Receipts always name the branch Orca created, and
+//! - Branches. Orca puts its branch-prefix setting in front of the worktree
+//!   name it is given, and its CLI can neither override that nor rename the
+//!   branch. A launch with a requested branch (`LaunchWorker`'s `branch`)
+//!   therefore needs that branch to be [`OrcaConfig::branch_prefix`] plus one
+//!   name, which the adapter passes as the worktree name; any other branch is
+//!   refused before anything is created. The branch Orca reports is then
+//!   verified. Orca offers no way to start a worker only after checking its
+//!   branch, so on a mismatch the adapter stops the worker it just started
+//!   and holds the launch as uncertain; [`OrcaBackend::verify_launch_branch`]
+//!   reports both branches. Receipts always name the branch Orca created, and
 //!   [`verify_branch`] checks any receipt.
-//! - A terminal a person took over (`user_takeover`) is retained, not
-//!   failed; the adapter sends such a worker no messages.
+//! - A terminal a person took over (`user_takeover`) reads as
+//!   [`crate::contracts::WorkerState::UserTakeover`], unless the worker
+//!   already reported its own outcome.
+//! - The adapter sends a worker whose terminal a person took over no
+//!   messages, replies, or stops.
 //! - Mailbox waits return whole batches, heartbeats included; heartbeats are
 //!   liveness only ([`Delivery::actionable`]).
 //! - Settlement comes from an accepted worker report or an explicit stop.
@@ -92,7 +98,6 @@ pub use backend::{
     DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, MAX_RUN_TASKS,
     OrcaBackend, OrcaConfig, launch_marker, verify_branch,
 };
-pub use branch::RequestedBranch;
 pub use error::OrcaError;
 pub use inspect::{
     Delivery, MAX_INVENTORY_PAGES, MAX_MAILBOX_WAIT, MailMessage, MessageKind, RetainedReason,

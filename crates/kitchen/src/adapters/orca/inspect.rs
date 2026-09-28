@@ -302,11 +302,16 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                         .task_id
                         .as_ref()
                         .and_then(|task| owners.get(task).cloned()),
-                    state: backend::worker_state(
-                        &row.worker_state,
-                        &row.projection.outcome,
-                        &row.projection.liveness.verdict,
-                        false,
+                    state: backend::with_takeover(
+                        backend::worker_state(
+                            &row.worker_state,
+                            &row.projection.outcome,
+                            &row.projection.liveness.verdict,
+                            false,
+                        ),
+                        row.resource
+                            .as_ref()
+                            .is_some_and(backend::TerminalResource::person_owns),
                     ),
                     liveness: liveness(&row.projection.liveness.verdict),
                     terminal: terminal(row.terminal_state.as_deref()),

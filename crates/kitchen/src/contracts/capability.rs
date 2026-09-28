@@ -123,6 +123,18 @@ closed_names! {
         LookupInstallDisabledSchedule = "effect.lookup.install_disabled_schedule",
         /// Resubmitting a `install_disabled_schedule` effect's key never repeats it.
         IdempotentInstallDisabledSchedule = "effect.idempotent.install_disabled_schedule",
+        /// Look up a `set_schedule_state` effect's outcome by its persisted request.
+        LookupSetScheduleState = "effect.lookup.set_schedule_state",
+        /// Resubmitting a `set_schedule_state` effect's key never repeats it.
+        IdempotentSetScheduleState = "effect.idempotent.set_schedule_state",
+        /// Look up a `remove_schedule` effect's outcome by its persisted request.
+        LookupRemoveSchedule = "effect.lookup.remove_schedule",
+        /// Resubmitting a `remove_schedule` effect's key never repeats it.
+        IdempotentRemoveSchedule = "effect.idempotent.remove_schedule",
+        /// Look up a `trial_schedule` effect's outcome by its persisted request.
+        LookupTrialSchedule = "effect.lookup.trial_schedule",
+        /// Resubmitting a `trial_schedule` effect's key never repeats it.
+        IdempotentTrialSchedule = "effect.idempotent.trial_schedule",
     }
 }
 

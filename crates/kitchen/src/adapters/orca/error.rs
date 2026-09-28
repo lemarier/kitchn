@@ -123,10 +123,8 @@ pub enum OrcaError {
     /// sent to Orca.
     #[error("the reservation could not be taken: {0}")]
     ReservationUnavailable(io::ErrorKind),
-    /// A requested branch is not a valid branch name.
-    #[error("invalid branch name")]
-    InvalidBranch,
-    /// No worktree name makes Orca create the requested branch on this host,
+    /// No worktree name makes Orca create the requested branch on this host
+    /// (see [`OrcaConfig::branch_prefix`](crate::adapters::orca::OrcaConfig::branch_prefix)),
     /// so the launch was refused before anything was created.
     #[error("no worktree name makes Orca create the requested branch {requested}")]
     BranchUnobtainable {
@@ -146,7 +144,7 @@ impl OrcaError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
-            Self::Schedule(_) | Self::InvalidBranch => ErrorClass::InvalidInput,
+            Self::Schedule(_) => ErrorClass::InvalidInput,
             Self::Contract(error) => error.class(),
             Self::UnsupportedVersion { .. }
             | Self::MissingRuntimeFeature(_)

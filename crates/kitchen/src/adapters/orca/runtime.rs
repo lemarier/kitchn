@@ -165,11 +165,25 @@ pub fn capabilities() -> CapabilitySet {
         // `--reuse-session` for existing-workspace schedules.
         C::SessionReuse,
     ])
-    // Launches, stops, releases, and schedule changes can be looked up and
-    // resubmitted safely; messages and trials cannot, because Orca records no
-    // caller key for them. Full support waits for per-operation declarations.
-    .with(C::EffectLookup, Support::Partial)
-    .with(C::EffectIdempotentRequests, Support::Partial)
+    // Lookup and same-key idempotency are declared per effect kind, and only
+    // where the adapter can prove them from Orca's own records: a launch
+    // through its Task, a cancel and a release through the Dispatch's state
+    // (a repeat is answered from that record), and a schedule install, state
+    // change, and removal through the automation listing. Messages and
+    // replies carry no key Orca records, and a trial starts a new run each
+    // time, so those kinds declare neither.
+    .with(C::LookupLaunchWorker, Support::Supported)
+    .with(C::IdempotentLaunchWorker, Support::Supported)
+    .with(C::LookupCancelWorker, Support::Supported)
+    .with(C::IdempotentCancelWorker, Support::Supported)
+    .with(C::LookupReleaseResource, Support::Supported)
+    .with(C::IdempotentReleaseResource, Support::Supported)
+    .with(C::LookupInstallDisabledSchedule, Support::Supported)
+    .with(C::IdempotentInstallDisabledSchedule, Support::Supported)
+    .with(C::LookupSetScheduleState, Support::Supported)
+    .with(C::IdempotentSetScheduleState, Support::Supported)
+    .with(C::LookupRemoveSchedule, Support::Supported)
+    .with(C::IdempotentRemoveSchedule, Support::Supported)
     // A non-zero precheck exit is recorded as a skip: idle and error look alike.
     .with(C::SchedulePrecheck, Support::Partial)
     // `run-use` binds a terminal but records no relinquish; Kitchen owns the checkpoint.
@@ -212,11 +226,30 @@ mod tests {
             declared.support(Capability::SchedulePrecheck),
             Some(Support::Partial)
         );
-        assert_eq!(
-            declared.support(Capability::EffectLookup),
-            Some(Support::Partial),
-            "messages cannot be looked up by key"
-        );
+        // The all-kinds shorthands stay undeclared: messages, replies, and
+        // trials cannot be looked up or deduplicated by key.
+        for shorthand in [
+            Capability::EffectLookup,
+            Capability::EffectIdempotentRequests,
+            Capability::LookupMessageWorker,
+            Capability::IdempotentMessageWorker,
+            Capability::LookupReplyToWorker,
+            Capability::IdempotentReplyToWorker,
+            Capability::LookupTrialSchedule,
+            Capability::IdempotentTrialSchedule,
+        ] {
+            assert_eq!(declared.support(shorthand), None, "{shorthand}");
+        }
+        for declared_kind in [
+            Capability::LookupLaunchWorker,
+            Capability::IdempotentLaunchWorker,
+            Capability::LookupCancelWorker,
+            Capability::IdempotentCancelWorker,
+            Capability::LookupReleaseResource,
+            Capability::IdempotentReleaseResource,
+        ] {
+            assert!(declared.supports(declared_kind), "{declared_kind}");
+        }
         assert!(declared.supports(Capability::ResourceInventory));
     }
 }

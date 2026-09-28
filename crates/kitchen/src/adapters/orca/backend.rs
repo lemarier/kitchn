@@ -13,16 +13,19 @@
 //! an Orca Task instead: one Task per key, titled with [`launch_marker`], and Orca
 //! refuses to dispatch a dispatched Task again. Resubmitting a launch key
 //! therefore returns the original Dispatch without starting a second worker,
-//! and [`OrcaBackend::lookup_launch`] finds it after a lost response. Messages
-//! carry no key and cannot be deduplicated or looked up, so the backend
-//! declares lookup and idempotent requests as partial and `lookup` reports
-//! them unsupported.
+//! and [`OrcaBackend::lookup_launch`] finds it after a lost response. Lookup
+//! and same-key idempotency are declared per effect kind, for launches,
+//! cancels, releases, and schedule installs, state changes, and removals.
+//! Messages and replies carry no key Orca records and a trial starts a new
+//! run each time, so those kinds declare neither and `lookup` reports them
+//! unsupported.
 //!
 //! A launch holds a per-key reservation (see [`OrcaConfig::runtime_dir`])
 //! across listing, creating, and starting, so concurrent first submissions of
-//! one key create one Task, not two. A launch with a requested branch passes
-//! the worktree name that yields it, verifies the branch Orca created, and
-//! stops the worker it just started when they differ.
+//! one key create one Task, not two. A launch with a requested branch
+//! ([`Operation::LaunchWorker`]'s `branch`) passes the worktree name that
+//! yields it under [`OrcaConfig::branch_prefix`], verifies the branch Orca
+//! created, and stops the worker it just started when they differ.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -32,11 +35,10 @@ use serde_json::Value;
 use crate::{
     BackendId, CredentialId, HouseId,
     adapters::orca::{
-        Invocation, OrcaError, OrcaRunner, RequestedBranch, RuntimeInfo, branch::BranchSource,
-        reserve::Reservation, runtime, wire,
+        Invocation, OrcaError, OrcaRunner, RuntimeInfo, branch, reserve::Reservation, runtime, wire,
     },
     contracts::{
-        BackendDescriptor, BackendUnavailable, Capability, Effect, EffectExecutor, EffectFailure,
+        BackendDescriptor, BackendUnavailable, BranchName, Effect, EffectExecutor, EffectFailure,
         EffectRequest, ExternalRef, IdempotencyKey, Lookup, MAX_INVENTORY_RESOURCES,
         MAX_RECEIPT_RESOURCES, NotAppliedReason, Operation, Receipt, ResourceKind,
         ResourceObservation, ResourceRef, Text, UncertainReason, WorkerBackend, WorkerOutcome,
@@ -91,6 +93,13 @@ pub struct OrcaConfig {
     pub repo: ExternalRef,
     /// Base ref for isolated workspaces; Orca's repository default when unset.
     pub base_branch: Option<ExternalRef>,
+    /// The prefix Orca's Git branch-prefix setting puts before the branch of
+    /// every worktree it creates, as a branch name without the trailing `/`;
+    /// `None` when the setting is off. Orca's CLI cannot override it, so a
+    /// launch's requested branch must be this prefix and one more name (or a
+    /// single name when there is no prefix); any other branch is refused
+    /// before anything is created.
+    pub branch_prefix: Option<BranchName>,
     /// The agent family workers start with.
     pub agent: AgentFamily,
     /// Deadline for each non-launch call.
@@ -115,7 +124,6 @@ pub struct OrcaBackend<R> {
     descriptor: BackendDescriptor,
     runtime: RuntimeInfo,
     runner: R,
-    branches: BranchSource,
 }
 
 #[derive(Deserialize)]
@@ -341,6 +349,32 @@ pub(crate) fn worker_state(
     }
 }
 
+/// Whether Orca's record shows the Dispatch stopped.
+fn is_stopped(shown: &WorkerShow) -> bool {
+    shown.worker.state == "stopped" || shown.projection.outcome == "stopped"
+}
+
+/// A person who took over a worker's terminal keeps it: that is neither
+/// failure nor settlement, unless the worker itself reported one.
+pub(crate) const fn with_takeover(state: WorkerState, person_owns: bool) -> WorkerState {
+    match state {
+        WorkerState::Settled(WorkerOutcome::Succeeded | WorkerOutcome::Failed) => state,
+        WorkerState::Starting
+        | WorkerState::Ready
+        | WorkerState::AwaitingReply
+        | WorkerState::UserTakeover
+        | WorkerState::Settled(WorkerOutcome::Cancelled)
+        | WorkerState::Missing
+        | WorkerState::Unknown => {
+            if person_owns {
+                WorkerState::UserTakeover
+            } else {
+                state
+            }
+        }
+    }
+}
+
 fn external(value: &str) -> Option<ExternalRef> {
     ExternalRef::new(value).ok()
 }
@@ -366,7 +400,6 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
         OrcaError::Io(_) => EffectFailure::Uncertain(UncertainReason::Transport),
         OrcaError::ReservationRedirected
         | OrcaError::ReservationUnavailable(_)
-        | OrcaError::InvalidBranch
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::ScheduleActive
         | OrcaError::ScheduleDiffers { .. } => not_applied(),
@@ -413,7 +446,6 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::ReservationBusy
         | OrcaError::ReservationRedirected
         | OrcaError::ReservationUnavailable(_)
-        | OrcaError::InvalidBranch
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::InstallUncertain
         | OrcaError::StateMismatch
@@ -452,24 +484,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             descriptor,
             runtime,
             runner,
-            branches: BranchSource::default(),
         })
-    }
-
-    /// Ask `source` which branch each launch must land on.
-    ///
-    /// A shim until [`Operation::LaunchWorker`] carries a requested branch:
-    /// the source reads it from wherever the caller keeps it, such as the
-    /// task, and returns `None` for launches that need no particular branch.
-    /// Once the contract has the field, `requested_branch` reads it from the
-    /// operation and this method goes away.
-    #[must_use]
-    pub fn with_branch_source(
-        mut self,
-        source: impl Fn(&EffectRequest) -> Option<RequestedBranch> + Send + Sync + 'static,
-    ) -> Self {
-        self.branches = BranchSource::new(source);
-        self
     }
 
     /// What the runtime probe established.
@@ -708,13 +723,12 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         key: &IdempotencyKey,
         workspace: &Workspace,
         brief: &Text,
-        branch: Option<&RequestedBranch>,
+        branch: Option<&BranchName>,
     ) -> Result<Receipt, EffectFailure> {
         // A branch no worktree name can yield is refused before anything exists.
         let name = match (workspace, branch) {
             (Workspace::Isolated, Some(branch)) => Some(
-                branch
-                    .worktree_name()
+                branch::worktree_name(self.config.branch_prefix.as_ref(), branch)
                     .map_err(|error| call_failure(&error))?,
             ),
             (Workspace::Isolated | Workspace::Existing(_), _) => None,
@@ -777,12 +791,6 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         )
     }
 
-    /// The branch a launch must land on. A shim: the contract has no such
-    /// field yet, so the caller's [`Self::with_branch_source`] answers.
-    fn requested_branch(&self, request: &EffectRequest) -> Option<RequestedBranch> {
-        self.branches.requested(request)
-    }
-
     /// A receipt for a mutation on one Dispatch, referenced by that Dispatch
     /// so a later lookup derives the same receipt.
     fn dispatch_receipt(&self, worker: &ResourceRef) -> Result<Receipt, EffectFailure> {
@@ -801,7 +809,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// backend's Run, and no person took its terminal over. A person's
     /// terminal gets no messages and is not stopped without asking. Nothing
     /// was sent when this refuses.
-    fn check_target(&self, dispatch: &str) -> Result<(), EffectFailure> {
+    fn check_target(&self, dispatch: &str) -> Result<WorkerShow, EffectFailure> {
         let Ok(Some(shown)) = self.show(dispatch) else {
             return Err(not_applied());
         };
@@ -815,7 +823,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .as_ref()
             .is_some_and(TerminalResource::person_owns);
         if in_run && !person_owned {
-            Ok(())
+            Ok(shown)
         } else {
             Err(not_applied())
         }
@@ -868,7 +876,11 @@ impl<R: OrcaRunner> OrcaBackend<R> {
 
     fn cancel(&self, worker: &ResourceRef) -> Result<Receipt, EffectFailure> {
         let dispatch = self.dispatch_or_reject(worker)?;
-        self.check_target(dispatch)?;
+        // A repeat is answered from Orca's record, so cancel is idempotent
+        // without depending on how Orca answers a second stop.
+        if is_stopped(&self.check_target(dispatch)?) {
+            return self.dispatch_receipt(worker);
+        }
         let args = wire::Args::command(&["orchestration", "worker-stop"])
             .value("dispatch", dispatch)
             .json();
@@ -953,7 +965,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     pub fn verify_launch_branch(
         &self,
         key: &IdempotencyKey,
-        requested: &RequestedBranch,
+        requested: &BranchName,
     ) -> Result<(), OrcaError> {
         match self.task_launch(key)? {
             TaskLaunch::Dispatched(receipt) => verify_branch(&receipt, requested.as_str()),
@@ -971,8 +983,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// Launches are found through their Task, stops and releases through the
     /// Dispatch's recorded state. Messages and replies carry no key Orca
     /// records, so they stay [`Lookup::Unknown`]. [`EffectExecutor::lookup`]
-    /// delegates here once the contract can declare lookup per operation;
-    /// until then the backend declares lookup as partial.
+    /// delegates here for the kinds the backend declares lookup for.
     ///
     /// # Errors
     /// [`BackendUnavailable`] when Orca cannot be queried or the effect is
@@ -988,10 +999,10 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             }
         };
         match operation {
-            Operation::LaunchWorker { .. } => {
+            Operation::LaunchWorker { branch, .. } => {
                 let found = self.lookup_launch(request.key())?;
                 // A launch on the wrong branch was held, not accepted.
-                Ok(match (&found, self.requested_branch(request)) {
+                Ok(match (&found, branch) {
                     (Lookup::Applied(receipt), Some(branch))
                         if verify_branch(receipt, branch.as_str()).is_err() =>
                     {
@@ -1010,9 +1021,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 };
                 let shown = self.show(dispatch).map_err(|error| read_failure(&error))?;
                 let applied = shown.is_some_and(|shown| match operation {
-                    Operation::CancelWorker { .. } => {
-                        shown.worker.state == "stopped" || shown.projection.outcome == "stopped"
-                    }
+                    Operation::CancelWorker { .. } => is_stopped(&shown),
                     _ => shown.terminal_resource.is_some_and(|terminal| {
                         terminal.release_state.as_deref() == Some("released")
                     }),
@@ -1066,12 +1075,8 @@ impl<R: OrcaRunner> EffectExecutor for OrcaBackend<R> {
                 role: _,
                 workspace,
                 brief,
-            } => self.launch(
-                request.key(),
-                workspace,
-                brief,
-                self.requested_branch(request).as_ref(),
-            ),
+                branch,
+            } => self.launch(request.key(), workspace, brief, branch.as_ref()),
             Operation::MessageWorker { worker, body } => self.message(worker, body),
             Operation::ReplyToWorker {
                 worker,
@@ -1084,12 +1089,10 @@ impl<R: OrcaRunner> EffectExecutor for OrcaBackend<R> {
     }
 
     fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
-        if !self
-            .descriptor
-            .capabilities
-            .supports(Capability::EffectLookup)
-        {
-            return Err(BackendUnavailable::Unsupported(Capability::EffectLookup));
+        if !self.descriptor.supports_lookup(request.effect()) {
+            return Err(BackendUnavailable::Unsupported(
+                request.effect().kind().lookup_capability(),
+            ));
         }
         self.resolve(request)
     }
@@ -1105,13 +1108,21 @@ impl<R: OrcaRunner> WorkerBackend for OrcaBackend<R> {
         };
         let waiting = shown
             .observation
-            .and_then(|observation| observation.agent_wait)
+            .as_ref()
+            .and_then(|observation| observation.agent_wait.as_ref())
             .is_some_and(|wait| !wait.is_null());
-        Ok(worker_state(
-            &shown.worker.state,
-            &shown.projection.outcome,
-            &shown.projection.liveness.verdict,
-            waiting,
+        let person_owns = shown
+            .terminal_resource
+            .as_ref()
+            .is_some_and(TerminalResource::person_owns);
+        Ok(with_takeover(
+            worker_state(
+                &shown.worker.state,
+                &shown.projection.outcome,
+                &shown.projection.liveness.verdict,
+                waiting,
+            ),
+            person_owns,
         ))
     }
 

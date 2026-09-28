@@ -6,6 +6,13 @@
 //!   such as `id:<repo-id>`.
 //! - `KITCHEN_ORCA_WORKTREE`: path of an Orca worktree where the throwaway
 //!   coordinator terminal is opened.
+//! - `KITCHEN_ORCA_BRANCH_PREFIX`: must be `kitchen`, and must be what Orca's
+//!   Git branch-prefix setting is on this host. The shared suite launches on
+//!   the exact branch `kitchen/<tag>`, and Orca's CLI can only create a
+//!   branch as the host's prefix plus a name, so on a host with another
+//!   prefix (or none) the adapter refuses that launch. Setting this without
+//!   changing Orca's setting makes the launch fail its branch check and stop
+//!   the worker; the test then fails.
 //! - `KITCHEN_ORCA_BASE_BRANCH` (optional): base ref for the worktree.
 //! - `KITCHEN_ORCA_AGENT` (optional): `claude` (default) or `codex`.
 //!
@@ -29,9 +36,9 @@ use kitchen::{
         OrcaBackend, OrcaConfig, OrcaRunner, SystemRunner, redact, verify_branch,
     },
     contracts::{
-        AttemptNumber, EffectExecutor, EffectRequest, ExternalRef, IdempotencyKey, Lookup,
-        Operation, Repository, ResourceKind, Role, Text, WorkerBackend, WorkerOutcome, WorkerState,
-        Workspace,
+        AttemptNumber, BranchName, EffectExecutor, EffectRequest, ExternalRef, IdempotencyKey,
+        Lookup, Operation, Repository, ResourceKind, Role, Text, WorkerBackend, WorkerOutcome,
+        WorkerState, Workspace,
         conformance::{self, ConformanceFixture},
     },
     scheduling::AgentFamily,
@@ -46,6 +53,7 @@ struct LiveSettings {
     repo: ExternalRef,
     worktree: String,
     base_branch: Option<ExternalRef>,
+    branch_prefix: BranchName,
     agent: AgentFamily,
 }
 
@@ -61,6 +69,12 @@ fn settings() -> TestResult<Option<LiveSettings>> {
             .ok()
             .map(|base| ExternalRef::new(&base))
             .transpose()?,
+        branch_prefix: match required("KITCHEN_ORCA_BRANCH_PREFIX")?.as_str() {
+            "kitchen" => BranchName::new("kitchen")?,
+            _ => {
+                return Err("KITCHEN_ORCA_BRANCH_PREFIX must be kitchen: the shared suite launches on kitchen/<tag>".into());
+            }
+        },
         agent: match env::var("KITCHEN_ORCA_AGENT").ok().as_deref() {
             None | Some("claude") => AgentFamily::Claude,
             Some("codex") => AgentFamily::Codex,
@@ -188,6 +202,7 @@ fn exercise(
         coordinator: ExternalRef::new(handle)?,
         repo: settings.repo.clone(),
         base_branch: settings.base_branch.clone(),
+        branch_prefix: Some(settings.branch_prefix.clone()),
         agent: settings.agent,
         call_timeout: DEFAULT_CALL_TIMEOUT,
         launch_timeout: DEFAULT_LAUNCH_TIMEOUT,
@@ -307,6 +322,7 @@ fn adapter_checks(
             role: Role::StationCook,
             workspace: Workspace::Isolated,
             brief: fixture.brief.clone(),
+            branch: None,
         },
     )?;
     let receipt = backend.execute(&launch)?;

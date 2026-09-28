@@ -15,15 +15,16 @@ use common::{
 use kitchen::{
     BackendId, ConsumerId, CredentialId, EffectName,
     adapters::orca::{
-        MAX_INVENTORY_PAGES, MessageKind, OrcaBackend, OrcaConfig, OrcaError, RequestedBranch,
-        RetainedReason, TerminalAccounting, launch_marker, verify_branch,
+        MAX_INVENTORY_PAGES, MessageKind, OrcaBackend, OrcaConfig, OrcaError, RetainedReason,
+        TerminalAccounting, launch_marker, verify_branch,
     },
     contracts::{
-        AttemptNumber, BackendUnavailable, Capability, Effect, EffectExecutor, EffectFailure,
-        EffectRequest, EvidenceRevision, ExternalRef, Grant, HouseGrants, IdempotencyKey, Liveness,
-        Lookup, NotAppliedReason, Operation, Permission, Provenance, Repository, ResourceKind,
-        ResourceRef, RetryPolicy, Role, ScheduleEffect, TaskAuthority, TaskSpec, Text,
-        UncertainReason, WorkerBackend, WorkerOutcome, WorkerState, Workspace,
+        AttemptNumber, BackendUnavailable, BranchName, Capability, CapabilityRequirements, Effect,
+        EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, Grant,
+        HouseGrants, IdempotencyKey, Liveness, Lookup, NotAppliedReason, Operation, Permission,
+        Provenance, Repository, ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleEffect,
+        TaskAuthority, TaskSpec, Text, UncertainReason, WorkerBackend, WorkerOutcome, WorkerState,
+        Workspace,
         conformance::{self, Check, CheckResult, ConformanceFixture},
     },
     scheduling::{
@@ -53,6 +54,7 @@ fn config(sim: &SimOrca) -> TestResult<OrcaConfig> {
         coordinator: ExternalRef::new("term_coordinator")?,
         repo: ExternalRef::new("id:repo-1")?,
         base_branch: Some(ExternalRef::new("main")?),
+        branch_prefix: Some(BranchName::new("lemarier")?),
         agent: AgentFamily::Claude,
         call_timeout: Duration::from_secs(5),
         launch_timeout: Duration::from_secs(60),
@@ -86,6 +88,7 @@ fn launch_op(brief: &str) -> TestResult<Operation> {
         role: Role::StationCook,
         workspace: Workspace::Isolated,
         brief: Text::new(brief)?,
+        branch: None,
     })
 }
 
@@ -114,27 +117,24 @@ fn flag<'a>(call: &'a [String], name: &str) -> Option<&'a str> {
 #[test]
 fn simulated_orca_passes_the_shared_worker_contract() -> TestResult {
     let sim = SimOrca::default();
-    let backend = connect(&sim)?;
-    let fixture = ConformanceFixture {
-        house: house()?,
-        foreign_house: other_house()?,
-        foreign_backend: BackendId::new("orca-other")?,
-        credential: credential()?,
-        task: task_id("conformance")?,
-        repository: Repository::new("lemarier/kitchen")?,
-        run_tag: ExternalRef::new("sim-run-1")?,
-        brief: Text::new("Conformance probe; exit immediately.")?,
-    };
-    let report = conformance::run_worker(&backend, &fixture)?;
+    // The suite launches on `kitchen/<run tag>`: a host whose branch prefix
+    // is `kitchen`.
+    sim.state().branch_prefix = "kitchen/";
+    let backend = OrcaBackend::connect(conformance_config(&sim)?, &sim)?;
+    let report = conformance::run_worker(&backend, &conformance_fixture()?)?;
     for check in [
         Check::DescriptorHouse,
         Check::CrossHouseRefused,
         Check::ForeignBackendRefused,
         Check::UnsupportedRefused,
         Check::ProbeReceipt,
+        Check::UnknownKeyNotApplied,
+        Check::LookupMatchesReceipt,
+        Check::IdempotentResubmission,
         Check::LaunchReceipt,
         Check::LaunchObservable,
         Check::InventoryListsLaunch,
+        Check::MessageRecovery,
         Check::CancelObserved,
     ] {
         assert_eq!(report.result(check), Some(CheckResult::Passed), "{check}");
@@ -147,22 +147,45 @@ fn simulated_orca_passes_the_shared_worker_contract() -> TestResult {
             .all(|arg| !arg.starts_with("--retry-request")),
         "Kitchen keys never reach --retry-request"
     );
-    // Lookup and idempotency are partial until the contract declares them
-    // per operation; the suite must see them as not applicable.
-    for (check, requires) in [
-        (Check::UnknownKeyNotApplied, Capability::EffectLookup),
-        (Check::LookupMatchesReceipt, Capability::EffectLookup),
-        (
-            Check::IdempotentResubmission,
-            Capability::EffectIdempotentRequests,
-        ),
-    ] {
-        assert_eq!(
-            report.result(check),
-            Some(CheckResult::NotApplicable { requires }),
-            "{check}"
-        );
-    }
+    // The exact branch was requested by name, under the host's prefix.
+    let starts = sim.calls_to(&["orchestration", "worker-start"]);
+    assert_eq!(
+        starts.first().and_then(|call| flag(call, "name")),
+        Some("sim-run-1")
+    );
+    Ok(())
+}
+
+fn conformance_fixture() -> TestResult<ConformanceFixture> {
+    Ok(ConformanceFixture {
+        house: house()?,
+        foreign_house: other_house()?,
+        foreign_backend: BackendId::new("orca-other")?,
+        credential: credential()?,
+        task: task_id("conformance")?,
+        repository: Repository::new("lemarier/kitchen")?,
+        run_tag: ExternalRef::new("sim-run-1")?,
+        brief: Text::new("Conformance probe; exit immediately.")?,
+    })
+}
+
+fn conformance_config(sim: &SimOrca) -> TestResult<OrcaConfig> {
+    Ok(OrcaConfig {
+        branch_prefix: Some(BranchName::new("kitchen")?),
+        ..config(sim)?
+    })
+}
+
+#[test]
+fn the_shared_suite_is_refused_on_a_host_that_prefixes_otherwise() -> TestResult {
+    // Orca's CLI cannot create `kitchen/<tag>` on a host that prefixes
+    // `lemarier/`, so the exact-branch launch is refused before anything
+    // exists rather than run on another branch.
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    assert!(conformance::run_worker(&backend, &conformance_fixture()?).is_err());
+    assert!(sim.calls_to(&["orchestration", "task-create"]).is_empty());
+    assert!(sim.calls_to(&["orchestration", "worker-start"]).is_empty());
     Ok(())
 }
 
@@ -407,12 +430,26 @@ fn requests_outside_this_instance_are_refused_before_any_call() -> TestResult {
         backend.observe_worker(&foreign_worker)?,
         WorkerState::Missing
     );
+    // Lookup is declared per kind: a message has no key Orca records.
     assert_eq!(
-        backend.lookup(&request(launch_op("x")?, "k")?),
-        Err(BackendUnavailable::Unsupported(Capability::EffectLookup)),
-        "partial lookup is reported as unsupported"
+        backend.lookup(&request(
+            Operation::MessageWorker {
+                worker: worker("ctx_1")?,
+                body: Text::new("hello")?,
+            },
+            "k"
+        )?),
+        Err(BackendUnavailable::Unsupported(
+            Capability::LookupMessageWorker
+        )),
+        "an undeclared kind is reported as unsupported"
     );
     assert_eq!(sim.state().calls.len(), calls_before);
+    // A declared kind is looked up, and a key Orca never saw is unknown.
+    assert_eq!(
+        backend.lookup(&request(launch_op("x")?, "k")?),
+        Ok(Lookup::Unknown)
+    );
     Ok(())
 }
 
@@ -667,7 +704,7 @@ fn replies_answer_the_question_and_are_not_deduplicated() -> TestResult {
     assert_eq!(
         sim.calls_to(&["orchestration", "reply"]).len(),
         2,
-        "Orca sends a resubmitted reply again, which is why idempotency is partial"
+        "Orca sends a resubmitted reply again, which is why replies declare no idempotency"
     );
     Ok(())
 }
@@ -697,41 +734,66 @@ fn store_spec(id: &str) -> TestResult<TaskSpec> {
             house_guidance: commit('b')?,
             repository_instructions: None,
         },
-        requires: BTreeSet::new(),
+        requires: CapabilityRequirements::new(),
         resources: BTreeSet::new(),
     })
 }
 
-#[test]
-fn durable_uncertain_launch_is_held_not_relaunched() -> TestResult {
-    let fixture = Fixture::new()?;
-    let task = task_id("task-orca")?;
-    fixture
-        .store
-        .create_task(store_spec("task-orca")?, &creator()?, at(0))?;
+/// A claimed task with an attempt running, holding `permissions`.
+fn running_task(
+    fixture: &Fixture,
+    id: &str,
+    permissions: &[Permission],
+) -> TestResult<(kitchen::TaskId, kitchen::contracts::Fence)> {
+    let task = task_id(id)?;
+    let requested = permissions
+        .iter()
+        .map(|permission| Ok(Grant::house(*permission, orca_id()?, credential()?)))
+        .collect::<TestResult<Vec<_>>>()?;
+    let spec = TaskSpec {
+        authority: TaskAuthority::delegate(&house_grants(permissions)?, requested)?,
+        ..store_spec(id)?
+    };
+    fixture.store.create_task(spec, &creator()?, at(0))?;
     let fence = fixture
         .store
         .claim(&task, &scheduled("coordinator-a")?, ttl(60)?, at(0))?
         .fence();
     fixture.store.start_attempt(&task, fence, at(0))?;
+    Ok((task, fence))
+}
+
+fn plan(
+    task: &kitchen::TaskId,
+    fence: kitchen::contracts::Fence,
+    name: &str,
+    effect: impl Into<Effect>,
+) -> TestResult<EffectPlan> {
+    Ok(EffectPlan {
+        task: task.clone(),
+        fence,
+        name: EffectName::new(name)?,
+        decided_at: EvidenceRevision::INITIAL,
+        effect: effect.into(),
+        consent: None,
+    })
+}
+
+#[test]
+fn a_lost_launch_response_is_recovered_by_lookup_without_relaunching() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = running_task(&fixture, "task-orca", &[Permission::LaunchWorker])?;
     let sim = SimOrca::default();
     let backend = connect(&sim)?;
     let clock = ManualClock::starting_at(1);
     let grants = house_grants(&[Permission::LaunchWorker])?;
-    let plan = EffectPlan {
-        task: task.clone(),
-        fence,
-        name: EffectName::new("launch")?,
-        decided_at: EvidenceRevision::INITIAL,
-        effect: launch_op("Implement the issue.")?.into(),
-        consent: None,
-    };
+    let launch = plan(&task, fence, "launch", launch_op("Implement the issue.")?)?;
 
     sim.fault_on(
         &["orchestration", "worker-start"],
         Fault::TimeoutAfterEffect,
     );
-    let record = run_effect(&fixture.store, &backend, &grants, plan.clone(), &clock)?;
+    let record = run_effect(&fixture.store, &backend, &grants, launch.clone(), &clock)?;
     assert!(matches!(
         record.state(),
         EffectState::Uncertain {
@@ -739,18 +801,66 @@ fn durable_uncertain_launch_is_held_not_relaunched() -> TestResult {
             ..
         }
     ));
-    // A restarted coordinator cannot reconcile through partial lookup, so
-    // the effect stays unresolved for a decision instead of relaunching.
+    // A restarted coordinator reconciles through the declared lookup: the
+    // launch did land, so it resolves as applied.
+    let report = reconcile(&fixture.reopen()?, &backend, &task, fence, &clock)?;
+    assert!(report.unresolved.is_empty());
+    let [resolved] = report.resolved.as_slice() else {
+        return Err("expected one resolved effect".into());
+    };
+    let EffectState::Applied { receipt, .. } = resolved.state() else {
+        return Err("the launch was not resolved as applied".into());
+    };
+    assert_eq!(
+        backend.lookup_launch(record.request().key())?,
+        Lookup::Applied(receipt.clone())
+    );
+    // Running the effect again finds it resolved and starts nothing.
+    let again = run_effect(&fixture.store, &backend, &grants, launch, &clock)?;
+    assert!(matches!(again.state(), EffectState::Applied { .. }));
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
+    assert_eq!(sim.calls_to(&["orchestration", "task-create"]).len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_lost_message_response_is_held_and_never_resent() -> TestResult {
+    let fixture = Fixture::new()?;
+    let permissions = [Permission::LaunchWorker, Permission::MessageWorker];
+    let (task, fence) = running_task(&fixture, "task-message", &permissions)?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let clock = ManualClock::starting_at(1);
+    let grants = house_grants(&permissions)?;
+    let landed = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "launch", launch_op("Implement the issue.")?)?,
+        &clock,
+    )?;
+    let EffectState::Applied { receipt, .. } = landed.state() else {
+        return Err("the launch was not applied".into());
+    };
+    let message = plan(
+        &task,
+        fence,
+        "message",
+        Operation::MessageWorker {
+            worker: launched(receipt)?,
+            body: Text::new("Start the next step.")?,
+        },
+    )?;
+    sim.fault_on(&["orchestration", "send"], Fault::TimeoutAfterEffect);
+    let record = run_effect(&fixture.store, &backend, &grants, message.clone(), &clock)?;
+    assert!(matches!(record.state(), EffectState::Uncertain { .. }));
+    // Orca records no key for a message: it cannot be looked up, so the
+    // effect stays unresolved, and resubmitting could send it twice.
     let report = reconcile(&fixture.reopen()?, &backend, &task, fence, &clock)?;
     assert!(report.resolved.is_empty());
     assert!(!report.unresolved.is_empty());
-    assert!(run_effect(&fixture.store, &backend, &grants, plan, &clock).is_err());
-    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
-    // The evidence a decision needs is available: the launch did land.
-    assert!(matches!(
-        backend.lookup_launch(record.request().key())?,
-        Lookup::Applied(_)
-    ));
+    assert!(run_effect(&fixture.store, &backend, &grants, message, &clock).is_err());
+    assert_eq!(sim.calls_to(&["orchestration", "send"]).len(), 1);
     Ok(())
 }
 
@@ -1282,8 +1392,26 @@ fn a_terminal_a_person_took_over_is_retained_and_left_alone() -> TestResult {
     assert_eq!(record.terminal, TerminalAccounting::Retained);
     assert_eq!(
         record.state,
-        WorkerState::Ready,
-        "a takeover is not a failure"
+        WorkerState::UserTakeover,
+        "a takeover is neither a failure nor a settlement"
+    );
+    assert_eq!(
+        backend.observe_worker(&target)?,
+        WorkerState::UserTakeover,
+        "observing it says so, whatever the agent looked like before"
+    );
+    // A worker that already reported its own outcome stays settled.
+    sim.set_worker(
+        "ctx_done",
+        SimWorker {
+            ownership: "user_owned",
+            retained_reason: Some("user_takeover"),
+            ..SimWorker::new("ready", "succeeded", "exited", false)
+        },
+    );
+    assert_eq!(
+        backend.observe_worker(&worker("ctx_done")?)?,
+        WorkerState::Settled(WorkerOutcome::Succeeded)
     );
     sim.state().release_action = "retained";
     assert_eq!(
@@ -1642,29 +1770,32 @@ fn a_swallowed_scheduled_launch_is_reported_as_failed() -> TestResult {
     Ok(())
 }
 
-fn branch(value: &str) -> TestResult<RequestedBranch> {
-    Ok(RequestedBranch::new(value)?)
+fn branch(value: &str) -> TestResult<BranchName> {
+    Ok(BranchName::new(value)?)
 }
 
-/// A backend whose every launch must land on `requested`.
-fn on_branch<'a>(sim: &'a SimOrca, requested: &str) -> TestResult<OrcaBackend<&'a SimOrca>> {
-    let requested = branch(requested)?;
-    Ok(connect(sim)?.with_branch_source(move |_| Some(requested.clone())))
-}
-
-fn launch_in(workspace: Workspace) -> TestResult<Operation> {
+/// A launch that must land on `requested`.
+fn launch_on(requested: &str, workspace: Workspace) -> TestResult<Operation> {
     Ok(Operation::LaunchWorker {
         role: Role::StationCook,
         workspace,
         brief: Text::new("Implement it.")?,
+        branch: Some(branch(requested)?),
     })
+}
+
+fn stops(sim: &SimOrca) -> usize {
+    sim.calls_to(&["orchestration", "worker-stop"]).len()
 }
 
 #[test]
 fn a_requested_branch_is_passed_as_the_name_that_yields_it() -> TestResult {
     let sim = SimOrca::default();
-    let backend = on_branch(&sim, "lemarier/issue-6")?;
-    let launch = request(launch_op("Implement it.")?, "on-branch")?;
+    let backend = connect(&sim)?;
+    let launch = request(
+        launch_on("lemarier/issue-6", Workspace::Isolated)?,
+        "on-branch",
+    )?;
     let receipt = backend.execute(&launch)?;
     let starts = sim.calls_to(&["orchestration", "worker-start"]);
     let [start] = starts.as_slice() else {
@@ -1675,7 +1806,7 @@ fn a_requested_branch_is_passed_as_the_name_that_yields_it() -> TestResult {
     assert!(receipt.created().iter().any(|resource| {
         resource.kind == ResourceKind::Branch && resource.handle.as_str() == "lemarier/issue-6"
     }));
-    assert!(sim.calls_to(&["orchestration", "worker-stop"]).is_empty());
+    assert_eq!(stops(&sim), 0);
     assert_eq!(
         backend.verify_launch_branch(launch.key(), &branch("lemarier/issue-6")?),
         Ok(())
@@ -1686,19 +1817,29 @@ fn a_requested_branch_is_passed_as_the_name_that_yields_it() -> TestResult {
         receipt,
         "resubmission verifies again"
     );
-    // On a host that adds no prefix, a branch without one is the whole name.
+
+    // A host that adds no prefix: a single name is the whole branch.
     sim.state().branch_prefix = "";
-    let bare = on_branch(&sim, "hotfix")?;
-    bare.execute(&request(launch_op("Implement it.")?, "bare")?)?;
+    let unprefixed = OrcaBackend::connect(
+        OrcaConfig {
+            branch_prefix: None,
+            ..config(&sim)?
+        },
+        &sim,
+    )?;
+    unprefixed.execute(&request(launch_on("hotfix", Workspace::Isolated)?, "bare")?)?;
     let starts = sim.calls_to(&["orchestration", "worker-start"]);
     assert_eq!(
         starts.last().and_then(|call| flag(call, "name")),
         Some("hotfix")
     );
-    // The same request on a host that does prefix is caught by verification.
+    // Configuration that disagrees with what Orca does is caught afterwards.
     sim.state().branch_prefix = "lemarier/";
     assert_eq!(
-        bare.execute(&request(launch_op("Implement it.")?, "bare-prefixed")?),
+        unprefixed.execute(&request(
+            launch_on("hotfix-2", Workspace::Isolated)?,
+            "bare-prefixed"
+        )?),
         Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
     );
     Ok(())
@@ -1707,17 +1848,19 @@ fn a_requested_branch_is_passed_as_the_name_that_yields_it() -> TestResult {
 #[test]
 fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
     let sim = SimOrca::default();
-    // The host prefixes with something other than the requested first segment.
+    // Configured `lemarier`, but Orca prefixes `other/`.
     sim.state().branch_prefix = "other/";
-    let backend = on_branch(&sim, "lemarier/issue-6")?;
-    let launch = request(launch_op("Implement it.")?, "wrong-branch")?;
+    let backend = connect(&sim)?;
+    let launch = request(
+        launch_on("lemarier/issue-6", Workspace::Isolated)?,
+        "wrong-branch",
+    )?;
     assert_eq!(
         backend.execute(&launch),
         Err(EffectFailure::Uncertain(UncertainReason::ResponseLost)),
         "a worker on the wrong branch is not an accepted launch"
     );
-    let stops = sim.calls_to(&["orchestration", "worker-stop"]);
-    assert_eq!(stops.len(), 1, "the worker is stopped before it can push");
+    assert_eq!(stops(&sim), 1, "the worker is stopped before it can push");
     let workers: Vec<_> = sim.state().workers.keys().cloned().collect();
     let [dispatch] = workers.as_slice() else {
         return Err("expected one worker".into());
@@ -1734,8 +1877,8 @@ fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
             actual: Some("other/issue-6".to_owned()),
         })
     );
-    // Resubmitting starts nothing new and is held again; lookup does not
-    // call the launch applied.
+    // Resubmitting starts nothing new, stops nothing again, and is held
+    // again; lookup does not call the launch applied.
     assert_eq!(
         backend.execute(&launch),
         Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
@@ -1743,6 +1886,7 @@ fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
     assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
     assert_eq!(sim.calls_to(&["orchestration", "task-create"]).len(), 1);
     assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
+    assert_eq!(stops(&sim), 1);
     // A key that never dispatched a launch cannot be confirmed either.
     assert_eq!(
         backend.verify_launch_branch(&key("never-launched")?, &branch("lemarier/issue-6")?),
@@ -1751,11 +1895,6 @@ fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
             actual: None,
         })
     );
-    // Without the constraint the same launch is an ordinary applied one.
-    assert!(matches!(
-        connect(&sim)?.lookup_launch(launch.key())?,
-        Lookup::Applied(_)
-    ));
     Ok(())
 }
 
@@ -1763,13 +1902,16 @@ fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
 fn a_stop_that_fails_still_reports_the_wrong_branch() -> TestResult {
     let sim = SimOrca::default();
     sim.state().branch_prefix = "other/";
-    let backend = on_branch(&sim, "lemarier/issue-6")?;
+    let backend = connect(&sim)?;
     sim.fault_on(
         &["orchestration", "worker-stop"],
         Fault::TimeoutBeforeEffect,
     );
     assert_eq!(
-        backend.execute(&request(launch_op("Implement it.")?, "stop-fails")?),
+        backend.execute(&request(
+            launch_on("lemarier/issue-6", Workspace::Isolated)?,
+            "stop-fails"
+        )?),
         Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
     );
     let dispatch = sim
@@ -1790,30 +1932,33 @@ fn a_stop_that_fails_still_reports_the_wrong_branch() -> TestResult {
 #[test]
 fn a_branch_no_name_yields_is_refused_before_anything_is_created() -> TestResult {
     let sim = SimOrca::default();
-    let backend = on_branch(&sim, "lemarier/area/topic")?;
-    assert_eq!(
-        backend.execute(&request(launch_op("Implement it.")?, "deep")?),
-        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
-    );
+    let backend = connect(&sim)?;
+    // Another prefix, more than one name, and no name after the prefix.
+    for (index, requested) in ["kitchen/x", "lemarier/area/topic", "lemarier"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            backend.execute(&request(
+                launch_on(requested, Workspace::Isolated)?,
+                &format!("unobtainable-{index}")
+            )?),
+            Err(EffectFailure::NotApplied(NotAppliedReason::Rejected)),
+            "{requested}"
+        );
+    }
     assert!(
         sim.calls_to(&["orchestration"]).is_empty(),
         "no Task, no worktree, not even a listing"
     );
-    for invalid in ["", "a b", "x..y", "-x", "a//b"] {
-        assert_eq!(
-            RequestedBranch::new(invalid),
-            Err(OrcaError::InvalidBranch),
-            "{invalid:?}"
-        );
-    }
     Ok(())
 }
 
 #[test]
 fn an_existing_workspace_is_verified_not_renamed() -> TestResult {
     let sim = SimOrca::default();
-    let backend = on_branch(&sim, "lemarier/issue-6")?;
-    let existing = launch_in(Workspace::Existing(worktree("wt-9")?))?;
+    let backend = connect(&sim)?;
+    let existing = launch_on("lemarier/issue-6", Workspace::Existing(worktree("wt-9")?))?;
     sim.state().existing_branch = Some("lemarier/issue-6");
     backend.execute(&request(existing.clone(), "repair-ok")?)?;
     let starts = sim.calls_to(&["orchestration", "worker-start"]);
@@ -1824,7 +1969,7 @@ fn an_existing_workspace_is_verified_not_renamed() -> TestResult {
         backend.execute(&request(existing.clone(), "repair-wrong")?),
         Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
     );
-    assert_eq!(sim.calls_to(&["orchestration", "worker-stop"]).len(), 1);
+    assert_eq!(stops(&sim), 1);
 
     // Orca reporting no branch at all cannot confirm the request.
     sim.state().existing_branch = None;
@@ -1832,24 +1977,44 @@ fn an_existing_workspace_is_verified_not_renamed() -> TestResult {
         backend.execute(&request(existing, "repair-unknown")?),
         Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
     );
-    assert_eq!(sim.calls_to(&["orchestration", "worker-stop"]).len(), 2);
+    assert_eq!(stops(&sim), 2);
     Ok(())
 }
 
 #[test]
 fn a_launch_without_a_requested_branch_is_not_constrained() -> TestResult {
     let sim = SimOrca::default();
-    let backend = connect(&sim)?.with_branch_source(|request| {
-        // A source answers per request: this one only constrains one task.
-        (request.task().as_str() == "task-with-branch").then(|| RequestedBranch::new("x/y").ok())?
-    });
+    // Even on a host whose prefix disagrees with the configured one.
+    sim.state().branch_prefix = "other/";
+    let backend = connect(&sim)?;
     let receipt = backend.execute(&request(launch_op("Implement it.")?, "free")?)?;
     let starts = sim.calls_to(&["orchestration", "worker-start"]);
     assert_eq!(
         starts.last().and_then(|call| flag(call, "name")),
         Some(format!("kitchen-{}", receipt.reference()).as_str())
     );
-    assert!(sim.calls_to(&["orchestration", "worker-stop"]).is_empty());
+    assert_eq!(stops(&sim), 0);
+    Ok(())
+}
+
+#[test]
+fn a_repeated_cancel_is_answered_from_orcas_record() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let receipt = backend.execute(&request(launch_op("Implement it.")?, "to-cancel")?)?;
+    let target = launched(&receipt)?;
+    let cancel = request(
+        Operation::CancelWorker {
+            worker: target.clone(),
+        },
+        "cancel-twice",
+    )?;
+    let first = backend.execute(&cancel)?;
+    // However Orca answers a second stop, a repeat does not send one.
+    sim.state().stop_state = "stop_unknown";
+    assert_eq!(backend.execute(&cancel)?, first);
+    assert_eq!(stops(&sim), 1);
+    assert_eq!(backend.resolve(&cancel)?, Lookup::Applied(first));
     Ok(())
 }
 

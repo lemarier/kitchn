@@ -46,7 +46,9 @@ existing directory, use `kitchen adopt` with the same arguments. Once
 `.kitchen.json` exists, omit `--house` and `--repository` to use that exact
 binding. Missing selection fails closed, even with only one registered house.
 Existing workflow selections and additional checks/reviewers are retained;
-new bindings select no workflows. Templates cannot replace the binding.
+new bindings select no workflows. Templates cannot replace the binding. A
+reformatted `.kitchen.json` with the same settings is unchanged; its exact bytes
+are rechecked before apply, so any edit after the preview blocks the apply.
 
 After `kitchen house update` selects a newer guidance revision, rerun `adopt` to
 preview its template updates; earlier snapshots are retained for active tasks

@@ -6,7 +6,7 @@ use super::{
 use crate::{
     HouseId,
     adoption::{
-        FileMode, HouseRegistry, REPOSITORY_CONFIG, RelativePath, encode, read_repository,
+        FileMode, HouseRegistry, REPOSITORY_CONFIG, RelativePath, encode, read_bounded,
         verified_snapshot,
     },
     contracts::Repository,
@@ -37,8 +37,13 @@ pub fn plan_repository(
     template: &TemplateName,
     variables: &BTreeMap<VariableName, String>,
 ) -> crate::Result<FilePlan> {
-    let config = match read_repository(target) {
-        Ok(existing) => {
+    // Keep the validated original bytes: re-encoding would turn a
+    // formatting-only difference into a permanent conflict, and apply
+    // rechecks these exact bytes before adding anything.
+    let (config, binding) = match read_bounded(&target.join(REPOSITORY_CONFIG)) {
+        Ok(bytes) => {
+            let existing: RepositoryConfig =
+                serde_json::from_slice(&bytes).map_err(|_| HouseError::InvalidInput)?;
             if house.as_ref().is_some_and(|house| *house != existing.house)
                 || repository
                     .as_ref()
@@ -46,16 +51,21 @@ pub fn plan_repository(
             {
                 return Err(HouseError::HouseSelection.into());
             }
-            existing
+            let text = String::from_utf8(bytes).map_err(|_| HouseError::InvalidInput)?;
+            (existing, text)
         }
-        Err(HouseError::HouseSelection) => RepositoryConfig {
-            schema: 1,
-            house: house.ok_or(HouseError::HouseSelection)?,
-            repository: repository.ok_or(HouseError::HouseSelection)?,
-            workflows: BTreeSet::new(),
-            additional_reviewers: BTreeSet::new(),
-            additional_checks: BTreeSet::new(),
-        },
+        Err(HouseError::Io(std::io::ErrorKind::NotFound)) => {
+            let config = RepositoryConfig {
+                schema: 1,
+                house: house.ok_or(HouseError::HouseSelection)?,
+                repository: repository.ok_or(HouseError::HouseSelection)?,
+                workflows: BTreeSet::new(),
+                additional_reviewers: BTreeSet::new(),
+                additional_checks: BTreeSet::new(),
+            };
+            let text = String::from_utf8(encode(&config)?).map_err(|_| HouseError::InvalidInput)?;
+            (config, text)
+        }
         Err(error) => return Err(error.into()),
     };
     let houses = registry.houses()?;
@@ -73,7 +83,6 @@ pub fn plan_repository(
     }) {
         return Err(HouseError::InvalidInput.into());
     }
-    let binding = String::from_utf8(encode(&config)?).map_err(|_| HouseError::InvalidInput)?;
     // Rendering keeps template output within the installer batch minus this reserve.
     if binding.len() > MAX_BINDING_BYTES {
         return Err(ScaffoldError::Limit {

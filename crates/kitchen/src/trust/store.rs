@@ -56,9 +56,10 @@ const LAYOUT: StoreLayout = StoreLayout {
     priority_intent: Some("revoke.pending"),
     priority_reserve_bytes: REVOCATION_RESERVE,
 };
-// Version 2 added the inspector task and fence to inspections. Older stores
-// are refused as unsupported before decoding; there is no migration.
-const SCHEMA: u64 = 2;
+// Older stores are refused as unsupported before decoding; there is no
+// migration. Version 2 added the inspector task and fence to inspections;
+// version 3 requires every binding's model to come from its agent selection.
+const SCHEMA: u64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

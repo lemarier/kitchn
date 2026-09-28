@@ -3230,3 +3230,49 @@ fn the_bound_model_comes_from_the_tasks_agent_selection() -> TestResult {
     assert_corrupt(try_open(&f)?, "binding model differs from its selection");
     Ok(())
 }
+
+#[test]
+fn a_schema_two_ledger_with_an_unselected_binding_reports_its_version() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    // Before version 3, `bind_task` stored the adapter's model for a task
+    // with no agent selection.
+    let legacy = |schema: u64| -> TestResult {
+        tamper(&f, |d| {
+            d["schema"] = serde_json::json!(schema);
+            d["bindings"][0]["spec"]["agent"] = serde_json::Value::Null;
+            d["bindings"][0]["model"] = serde_json::json!("adapter-reported-model");
+            Ok(())
+        })?;
+        let marker = f.dir.path().join("trust/store.json");
+        let mut stored: serde_json::Value = serde_json::from_slice(&fs::read(&marker)?)?;
+        stored["schema"] = serde_json::json!(schema);
+        fs::write(&marker, serde_json::to_vec(&stored)?)?;
+        Ok(())
+    };
+    legacy(2)?;
+    let before = fs::read(ledger_path(&f))?;
+    let error = try_open(&f)?.err();
+    assert!(
+        matches!(
+            error,
+            Some(TrustError::Storage(StateError::UnsupportedSchema {
+                found: 2
+            }))
+        ),
+        "{error:?}"
+    );
+    assert!(matches!(
+        l.history(),
+        Err(TrustError::Storage(StateError::UnsupportedSchema {
+            found: 2
+        }))
+    ));
+    assert_eq!(fs::read(ledger_path(&f))?, before);
+    // The same binding in a current ledger breaks its invariant.
+    legacy(3)?;
+    assert_corrupt(try_open(&f)?, "current binding without a selection");
+    Ok(())
+}

@@ -380,7 +380,7 @@ fn mode_matches(metadata: &fs::Metadata, mode: FileMode) -> bool {
         true
     }
 }
-fn same_file(path: &Path, handle: &File) -> bool {
+pub(crate) fn same_file(path: &Path, handle: &File) -> bool {
     handle
         .metadata()
         .is_ok_and(|metadata| same_metadata(path, &metadata))

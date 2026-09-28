@@ -146,6 +146,13 @@ fn update_preserves_old_task_pins_and_failure_preserves_current() -> TestResult 
     ));
     let updated = registry.update(&old, &next)?;
     assert_ne!(updated.snapshot, active.snapshot);
+    active.verify(&registry)?;
+    let mut redirected_task = active.clone();
+    redirected_task.snapshot = updated.snapshot.clone();
+    assert!(matches!(
+        redirected_task.verify(&registry),
+        Err(HouseError::UnverifiedSnapshot)
+    ));
     assert_eq!(
         fs::read_to_string(&active.entrypoint)?,
         original.assets[0].contents
@@ -397,5 +404,68 @@ fn interactive_policy_limits_never_become_standing_grants() -> TestResult {
         Err(HouseError::PolicyRelaxation)
     ));
     assert!(matches!(grant.scope, GrantScope::Repository(_)));
+    Ok(())
+}
+
+#[test]
+fn missing_role_or_guidance_file_is_an_unverified_snapshot() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let registry = HouseRegistry::new(temp.path().canonicalize()?.join("registry"))?;
+    let house = config("origin89")?;
+    let bundle = bundle("origin89")?;
+    registry.initialize(&house)?;
+    let resolved = registry.sync(&house.house, &bundle)?;
+    for path in [
+        resolved.snapshot.join("roles/commis.md"),
+        resolved.entrypoint.clone(),
+    ] {
+        fs::remove_file(&path)?;
+        assert!(matches!(
+            resolve_instructions(registry.root(), &house, None),
+            Err(HouseError::UnverifiedSnapshot)
+        ));
+        registry.sync(&house.house, &bundle)?;
+        assert!(path.is_file());
+    }
+    Ok(())
+}
+
+#[test]
+fn posting_grants_cannot_bypass_repository_and_destination_allowlists() -> TestResult {
+    use kitchen::contracts::{Grant, Permission};
+    let mut house = config("crabnebula")?;
+    let destination = kitchen::BackendId::new("forge")?;
+    let credential = kitchen::CredentialId::new("crabnebula-forge")?;
+    for permission in [
+        Permission::PostComment,
+        Permission::EditLabels,
+        Permission::CreateIssue,
+        Permission::EditIssueRelationships,
+        Permission::Merge,
+    ] {
+        house.policy_limits = BTreeSet::from([Grant::house(
+            permission,
+            destination.clone(),
+            credential.clone(),
+        )]);
+        assert!(matches!(
+            house.validate(),
+            Err(HouseError::PolicyRelaxation)
+        ));
+        house.policy_limits = BTreeSet::from([Grant::repository(
+            permission,
+            repo(&house)?.repository,
+            destination.clone(),
+            credential.clone(),
+        )]);
+        house.validate()?;
+        let saved = house.posting_destinations.clone();
+        house.posting_destinations.clear();
+        assert!(matches!(
+            house.validate(),
+            Err(HouseError::PolicyRelaxation)
+        ));
+        house.posting_destinations = saved;
+    }
     Ok(())
 }

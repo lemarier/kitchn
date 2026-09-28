@@ -60,7 +60,8 @@ signatures. Required notice paths must be included in the bundle and are kept
 verbatim. Snapshots retain their exact manifest and content; a fresh agent
 resolves them through `HouseRegistry::resolve`, using the task's repository
 instruction commit. Existing tasks keep their `ResolvedInstructions` path and
-core `Provenance`; updates do not delete their snapshots.
+core `Provenance`; `ResolvedInstructions::verify` rechecks those retained pins
+before a fresh agent joins the task. Updates do not delete old snapshots.
 
 A failed update retains the previous pins. An interrupted create-only snapshot
 can be completed by rerunning the same verified bundle. A mismatched file is a

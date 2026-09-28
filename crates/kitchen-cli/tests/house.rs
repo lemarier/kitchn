@@ -148,3 +148,31 @@ fn invalid_secret_input_and_missing_house_fail_without_echo_or_writes() -> TestR
     assert!(!root.join("consumer").exists());
     Ok(())
 }
+
+#[test]
+fn relative_registry_is_resolved_without_erasing_redirects() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    initialize(&root)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        .current_dir(&root)
+        .args([
+            "house",
+            "setup",
+            "--registry",
+            "registry",
+            "--repository-path",
+            "consumer",
+            "--repository",
+            "crabnebula/tauri-fixture",
+            "--house",
+            "crabnebula",
+            "--workflows",
+            "none",
+        ])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(root.join("consumer/.kitchen.json").is_file());
+    assert!(String::from_utf8(output.stdout)?.contains("Doctor: setup incomplete"));
+    Ok(())
+}

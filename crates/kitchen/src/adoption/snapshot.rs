@@ -94,6 +94,26 @@ pub struct ResolvedInstructions {
     pub entrypoint: PathBuf,
 }
 
+impl ResolvedInstructions {
+    /// Reverify the retained snapshot before a fresh agent joins an active task.
+    /// Current policy is loaded only to confirm the house still exists; the
+    /// task's original instruction pins remain unchanged by later updates.
+    pub fn verify(&self, registry: &super::HouseRegistry) -> Result<(), HouseError> {
+        let mut house = registry.load(&self.house)?;
+        house.kitchen = self.provenance.kitchen.clone();
+        house.guidance = self.provenance.house_guidance.clone();
+        let verified = resolve_instructions(
+            registry.root(),
+            &house,
+            self.provenance.repository_instructions.clone(),
+        )?;
+        if verified != *self {
+            return Err(HouseError::UnverifiedSnapshot);
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn snapshot_path(root: &Path, house: &HouseConfig) -> PathBuf {
     root.join("snapshots")
         .join(house.house.as_str())

@@ -124,7 +124,7 @@ impl HouseRegistry {
         next.kitchen = bundle.kitchen.clone();
         next.guidance = bundle.guidance.clone();
         let resolved = install_snapshot(&self.root, &next, bundle)?;
-        atomic_config(&self.config_path(&next.house), &encode(&next)?)?;
+        atomic_config(&self.config_path(&next.house), &current, &next)?;
         Ok(resolved)
     }
     /// Resolve and verify pins for a new task in an adopted repository.
@@ -158,7 +158,7 @@ impl HouseRegistry {
             return Err(HouseError::Conflict);
         }
         if expected != next {
-            atomic_config(&root.join(REPOSITORY_CONFIG), &encode(next)?)?;
+            atomic_config(&root.join(REPOSITORY_CONFIG), expected, next)?;
         }
         Ok(())
     }
@@ -272,7 +272,12 @@ fn path_present(path: &Path) -> Result<bool, HouseError> {
         Err(error) => Err(error.into()),
     }
 }
-fn atomic_config(path: &Path, bytes: &[u8]) -> Result<(), HouseError> {
+fn atomic_config<T: Serialize + DeserializeOwned + PartialEq>(
+    path: &Path,
+    expected: &T,
+    next: &T,
+) -> Result<(), HouseError> {
+    let bytes = encode(next)?;
     check_path(path)?;
     let parent = path.parent().ok_or(HouseError::InvalidInput)?;
     let temporary = path.with_extension("pending");
@@ -291,9 +296,18 @@ fn atomic_config(path: &Path, bytes: &[u8]) -> Result<(), HouseError> {
             error.into()
         }
     })?;
+    // The pending name also fences independent registries targeting the same
+    // public binding. Recheck the expected document after taking that slot.
+    if decode::<T>(path)? != *expected {
+        check_path(&temporary)?;
+        if super::installer::same_file(&temporary, &file) && fs::metadata(&temporary)?.len() == 0 {
+            fs::remove_file(&temporary)?;
+        }
+        return Err(HouseError::Conflict);
+    }
     // A crash leaves a pending file for explicit inspection; never delete a
     // pre-existing pending file, and never activate a partial snapshot.
-    file.write_all(bytes)?;
+    file.write_all(&bytes)?;
     file.sync_all()?;
     check_path(path)?;
     check_path(&temporary)?;

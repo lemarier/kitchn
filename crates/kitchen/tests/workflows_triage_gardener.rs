@@ -250,6 +250,7 @@ fn triage_input() -> triage::Evidence {
         ready_label_present: false,
         ready_label: "agent-ready".into(),
         needs_spec_label: "needs-spec".into(),
+        agent: None,
     }
 }
 /// Marker history supplied directly; the store-backed view has its own tests.
@@ -435,6 +436,33 @@ fn unresolved_issue_requests_one_bounded_gardener_worker() -> common::TestResult
             &triage::History::read(&Recorded::default(), &input)?
         ),
         Ok(None)
+    );
+    Ok(())
+}
+
+#[test]
+fn the_judgment_launch_carries_the_gardener_tasks_recorded_selection() -> common::TestResult {
+    use kitchen::{
+        contracts::Operation,
+        scheduling::AgentFamily,
+        selection::{AgentModel, AgentSelection},
+    };
+    let mut input = triage_input();
+    input.factual_resolution = None;
+    let recorded = AgentSelection {
+        agent: AgentFamily::Claude,
+        model: Some(AgentModel::new("sonnet")?),
+        effort: None,
+    };
+    input.agent = Some(recorded.clone());
+    let changes = fresh_plan(&input)?;
+    assert!(
+        matches!(
+            &changes[..],
+            [triage::Change::Judgment(Operation::LaunchWorker { agent: Some(agent), .. })]
+                if agent == &recorded
+        ),
+        "{changes:?}"
     );
     Ok(())
 }

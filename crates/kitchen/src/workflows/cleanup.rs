@@ -55,9 +55,13 @@
 //!   Neither run writes a marker, so a full marker table cannot stop them, and
 //!   recovery never depends on one.
 //! - An interactive [`apply`] needs no stored approval. A person present
-//!   gives one consent per release ([`ConsentSource`]), bound to the digest of
-//!   the evidence they previewed; evidence that changed since has a different
-//!   digest and needs a new consent.
+//!   gives one consent per release ([`ConsentSource`]), and each consent
+//!   ([`ReleaseConsent`]) carries the digest of the preview they were shown.
+//!   `apply` compares it with the digest of the evidence it is about to act
+//!   on and refuses, before writing anything, a consent for other evidence
+//!   ([`ReleaseOutcome::ConsentMismatch`]) or naming none
+//!   ([`ReleaseOutcome::ConsentUnbound`]). Evidence that changed since the
+//!   person looked has a different digest and needs a new consent.
 //!
 //! The approval marker is not a grant: no [`Permission`] names it, so nothing
 //! in a house's grants says who may approve. A house `approve-cleanup` grant
@@ -82,6 +86,16 @@
 //! disk pressure the preview lists commands a person may run instead.
 //! Every step reports the space it measured before acting; that is an upper
 //! bound on what it frees, not a measurement afterwards.
+//!
+//! # Backend requirements
+//!
+//! The pushed check examines `HEAD` only, so it is sound only if a backend's
+//! release of a worktree removes the checkout and never deletes the branch
+//! that was checked out in it: an attached `HEAD` is protected because its
+//! branch survives the release. An adapter must not delete that branch, and
+//! must document that it does not. The `ResourceRelease` capability calls a
+//! release only "safety-retaining" and does not name the branch, so this is
+//! not yet part of the contract. The dishwasher itself never removes a branch.
 
 mod build;
 mod git;
@@ -203,7 +217,9 @@ impl WorktreeLocator for BTreeMap<ResourceRef, PathBuf> {
 pub struct Inspector<'a> {
     /// The house's durable task store: the source of task ownership.
     pub store: &'a HouseStore,
-    /// The backend whose resources are inspected.
+    /// The backend whose resources are inspected. Its release of a worktree
+    /// must remove the checkout and never delete the branch (see the module's
+    /// backend requirements): the pushed check relies on the branch surviving.
     pub backend: &'a dyn WorkerBackend,
     /// Where worktrees are checked out.
     pub worktrees: &'a dyn WorktreeLocator,
@@ -664,33 +680,63 @@ pub struct ApplyOptions {
     pub max_releases: usize,
 }
 
+/// A person's consent to one release, with the digest of the preview they gave
+/// it for.
+///
+/// [`apply`] compares that digest with the digest of the evidence it is about
+/// to act on and refuses the release, before writing anything, unless the two
+/// are equal. A consent that names no digest is refused too: it does not say
+/// what the person saw. The digest is the `observation` of the
+/// [`PreviewEntry`] they were shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseConsent {
+    consent: Consent,
+    digest: Option<ExternalRef>,
+}
+
+impl ReleaseConsent {
+    /// A consent that names no digest yet; bind it with [`Self::for_digest`].
+    #[must_use]
+    pub const fn new(consent: Consent) -> Self {
+        Self {
+            consent,
+            digest: None,
+        }
+    }
+
+    /// The consent, given for the preview whose evidence digest is `digest`.
+    #[must_use]
+    pub fn for_digest(mut self, digest: ExternalRef) -> Self {
+        self.digest = Some(digest);
+        self
+    }
+}
+
 /// Supplies a person's consent for one release under an interactive claim.
 ///
 /// An interactive [`apply`] needs nothing else: no stored approval. It asks
-/// for a consent before it writes anything. What binds the consent to the
-/// evidence has two parts. The library enforces that the release task is
-/// derived from the evidence's digest, so a [`Consent`] minted for one digest
-/// names another task than the release of different evidence and is refused,
-/// and it checks the evidence again immediately before the effect. That the
-/// person actually read that digest is attested by the implementation, which is
-/// given the digest in `observation` for that purpose: `apply` inspects again,
-/// so this is the digest of the evidence as it is now, and an implementation
-/// that consents to whatever it is asked consents to evidence nobody saw.
+/// for a consent before it writes anything, and it is given no digest to echo
+/// back: the [`ReleaseConsent`] must carry the digest of a preview the person
+/// was actually shown, taken from an earlier [`inspect`]. `apply` inspects
+/// again and compares that digest with the evidence it executes, so evidence
+/// that changed since the person looked is refused instead of released. The
+/// release task is derived from the same digest, so a [`Consent`] minted for
+/// other evidence names another task and is refused as well, and the evidence
+/// is checked once more immediately before the effect.
 ///
 /// The library cannot tell a person from a script: an implementation must
 /// return a consent only for something a person present agreed to, the same
 /// trust boundary as consent for any other effect. Scheduled workflows never
 /// build one.
 pub trait ConsentSource {
-    /// The consent for exactly `effect` on `task` at `revision`, if the person
-    /// gave it for the evidence with digest `observation`.
+    /// The consent for exactly `effect` on `task` at `revision`, if a person
+    /// gave it, together with the digest of the preview they gave it for.
     fn consent(
         &self,
         task: &TaskId,
         effect: &Effect,
         revision: EvidenceRevision,
-        observation: &ExternalRef,
-    ) -> Option<Consent>;
+    ) -> Option<ReleaseConsent>;
 }
 
 /// No consent: the source for scheduled runs.
@@ -698,13 +744,7 @@ pub trait ConsentSource {
 pub struct NoConsent;
 
 impl ConsentSource for NoConsent {
-    fn consent(
-        &self,
-        _: &TaskId,
-        _: &Effect,
-        _: EvidenceRevision,
-        _: &ExternalRef,
-    ) -> Option<Consent> {
+    fn consent(&self, _: &TaskId, _: &Effect, _: EvidenceRevision) -> Option<ReleaseConsent> {
         None
     }
 }
@@ -728,9 +768,15 @@ pub enum ReleaseOutcome {
     /// Another run holds the release task, or an earlier release of this
     /// resource that another run holds.
     HeldElsewhere,
-    /// An interactive run had no consent for this release and this evidence.
-    /// Nothing was written: no task exists and the release bound is untouched.
+    /// An interactive run had no consent for this release. Nothing was
+    /// written: no task exists and the release bound is untouched.
     ConsentMissing,
+    /// The consent names no digest, so it does not say what the person saw.
+    /// Nothing was written.
+    ConsentUnbound,
+    /// The consent was given for a preview whose digest differs from the
+    /// evidence now: it changed since the person looked. Nothing was written.
+    ConsentMismatch,
     /// The backend did not apply the release.
     NotApplied(NotAppliedReason),
     /// The outcome is unknown, here or in an earlier release of this
@@ -740,6 +786,17 @@ pub enum ReleaseOutcome {
     AlreadySettled(Settlement),
     /// Over this call's release bound.
     Deferred,
+}
+
+impl ReleaseOutcome {
+    /// Whether an interactive run refused the release for want of a usable
+    /// consent, before it wrote anything.
+    const fn consent_refused(self) -> bool {
+        matches!(
+            self,
+            Self::ConsentMissing | Self::ConsentUnbound | Self::ConsentMismatch
+        )
+    }
 }
 
 /// One resource's result.
@@ -775,7 +832,9 @@ pub struct ApplyReport {
 /// Reconcile interrupted releases, then release each eligible resource whose
 /// exact evidence a person approved with [`approve`] (a scheduled `claimant`)
 /// or consented to through `consents` (an interactive `claimant`, which needs
-/// no stored approval). Writes no marker.
+/// no stored approval). A consent counts only if the digest it carries equals
+/// the digest of the evidence this call inspected; otherwise the release is
+/// refused before anything is written. Writes no marker.
 ///
 /// # Errors
 /// As [`inspect`]; [`CleanupError::GrantMismatch`] for a grant that is not
@@ -899,8 +958,8 @@ pub fn apply(
                     (None, ReleaseOutcome::Deferred)
                 } else {
                     let outcome = run.drive(task.clone(), &entry.resource, Some(entry))?;
-                    if outcome == ReleaseOutcome::ConsentMissing {
-                        // Declined before anything was written: no task, and
+                    if outcome.consent_refused() {
+                        // Refused before anything was written: no task, and
                         // no share of the bound, so a person can refuse some
                         // releases and still consent to others in one run.
                         (None, outcome)
@@ -1142,12 +1201,16 @@ impl Run<'_> {
                     .map_or(EvidenceRevision::INITIAL, |record| {
                         record.evidence().revision()
                     });
-                match self
-                    .consents
-                    .consent(&id, &effect, revision, &entry.observation)
-                {
-                    Some(consent) => Some(consent),
-                    None => return Ok(ReleaseOutcome::ConsentMissing),
+                let Some(given) = self.consents.consent(&id, &effect, revision) else {
+                    return Ok(ReleaseOutcome::ConsentMissing);
+                };
+                // The person's consent must name the evidence this run is
+                // about to act on. Compared before anything is written, so a
+                // consent for other or unstated evidence leaves no task.
+                match given.digest {
+                    Some(digest) if digest == entry.observation => Some(given.consent),
+                    Some(_) => return Ok(ReleaseOutcome::ConsentMismatch),
+                    None => return Ok(ReleaseOutcome::ConsentUnbound),
                 }
             }
         };

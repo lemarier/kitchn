@@ -6,9 +6,10 @@
 //! `preview` writes nothing. `approve` records one approval marker per named
 //! digest, as an interactive claimant, so a scheduled run cannot approve for
 //! itself; an interactive session that releases through the library consents
-//! per release instead and needs no marker. Neither subcommand releases
-//! anything: this command has no path to a backend effect. The command cannot
-//! tell a person from a script, so scheduled jobs must not run `approve`.
+//! per release instead, for the digest it was shown, and needs no marker.
+//! Neither subcommand releases anything: this command has no path to a backend
+//! effect. The command cannot tell a person from a script, so scheduled jobs
+//! must not run `approve`.
 
 use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
 

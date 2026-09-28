@@ -29,6 +29,9 @@ pub enum Error {
     /// A contract value or policy check failed.
     #[error(transparent)]
     Contract(#[from] ContractError),
+    /// House configuration or adoption failed.
+    #[error(transparent)]
+    House(#[from] crate::house::HouseError),
     /// A durable state operation failed.
     #[error(transparent)]
     State(#[from] StateError),
@@ -42,6 +45,7 @@ impl Error {
             Self::Identifier(_) => ErrorClass::InvalidInput,
             Self::Contract(error) => error.class(),
             Self::State(error) => error.class(),
+            Self::House(error) => error.class(),
         }
     }
 }

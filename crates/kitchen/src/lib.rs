@@ -17,8 +17,10 @@
 //! # }
 //! ```
 
+pub mod adoption;
 pub mod contracts;
 mod error;
+pub mod house;
 mod id;
 pub mod state;
 

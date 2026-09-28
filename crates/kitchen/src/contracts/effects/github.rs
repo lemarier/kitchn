@@ -120,6 +120,8 @@ pub struct GitHubMutation {
 pub enum GitHubAction {
     /// Close one issue with an explicit provider reason.
     CloseIssue {
+        /// Destination repository; must agree with the enclosing mutation.
+        repository: Repository,
         /// Destination issue.
         number: IssueNumber,
         /// Reason recorded by GitHub.
@@ -202,9 +204,13 @@ impl GitHubMutation {
     /// Rejects self-links, malformed labels, and oversized titles/bodies.
     pub fn validate(&self) -> Result<(), ContractError> {
         match &self.action {
+            GitHubAction::CloseIssue { repository, .. } if repository != &self.repository => {
+                Err(invalid())
+            }
             GitHubAction::CloseIssue {
                 number,
                 reason: CloseReason::Duplicate(of),
+                ..
             } if number == of => Err(invalid()),
             GitHubAction::CloseIssue { .. } => Ok(()),
             GitHubAction::MergePullRequest { .. } => Ok(()),

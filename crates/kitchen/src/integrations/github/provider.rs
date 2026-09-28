@@ -244,7 +244,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
         let root = format!("repos/{}", mutation.repository);
         let reference = receipt(key)?;
         match &mutation.action {
-            GitHubAction::CloseIssue { number, reason } => {
+            GitHubAction::CloseIssue { number, reason, .. } => {
                 let issue = self.read(format!("{root}/issues/{}", number.get()))?;
                 if issue.get("number").and_then(Value::as_u64) != Some(number.get())
                     || issue.get("pull_request").is_some()
@@ -420,7 +420,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
     ) -> Result<MutationRequest, IntegrationError> {
         let root = format!("repos/{}", mutation.repository);
         let (method, endpoint, body) = match &mutation.action {
-            GitHubAction::CloseIssue { number, reason } => {
+            GitHubAction::CloseIssue { number, reason, .. } => {
                 let (state_reason, duplicate_issue_id) = match reason {
                     CloseReason::Completed => ("completed", None),
                     CloseReason::NotPlanned => ("not_planned", None),
@@ -646,10 +646,16 @@ mod mutation_tests {
         let mutation = GitHubMutation {
             repository: Repository::new("sample/project")?,
             action: GitHubAction::CloseIssue {
+                repository: Repository::new("sample/project")?,
                 number: IssueNumber::new(1)?,
                 reason: CloseReason::Completed,
             },
         };
+        let mut foreign = mutation.clone();
+        if let GitHubAction::CloseIssue { repository, .. } = &mut foreign.action {
+            *repository = Repository::new("foreign/project")?;
+        }
+        assert!(foreign.validate().is_err());
         let key = IdempotencyKey::from_ref(ExternalRef::new("close-fixture")?);
         let read = ReadFixture(RefCell::new(VecDeque::from([
             json!({"number":1,"state":"closed","state_reason":"completed"}),
@@ -720,6 +726,7 @@ mod mutation_tests {
         let mutation = GitHubMutation {
             repository: Repository::new("sample/project")?,
             action: GitHubAction::CloseIssue {
+                repository: Repository::new("sample/project")?,
                 number: IssueNumber::new(1)?,
                 reason: CloseReason::Duplicate(IssueNumber::new(2)?),
             },

@@ -624,8 +624,7 @@ impl TaskRecord {
         resubmission: Resubmission,
         now: Timestamp,
     ) -> Result<EffectStart> {
-        let retry = self.spec.retry;
-        let Some(existing) = self.effects.get_mut(index) else {
+        let Some(existing) = self.effects.get(index) else {
             return fail(StateError::CorruptState(Corruption::EffectSequence));
         };
         if existing.request.effect() != &plan.effect {
@@ -655,19 +654,25 @@ impl TaskRecord {
                 Ok(EffectStart::ReconcileFirst(existing.clone()))
             }
             Resubmission::SameKey => {
-                let elapsed = now.saturating_since(existing.intended_at);
-                if existing.submissions >= retry.max_attempts() || elapsed > retry.max_elapsed() {
-                    return fail(StateError::SubmissionBudgetExhausted(existing.seq));
-                }
+                let (name, attempt, seq) = (
+                    existing.name.clone(),
+                    existing.request.attempt(),
+                    existing.seq,
+                );
+                // One budget for the logical effect, across every key it used.
+                self.check_submission_budget(&name, attempt, seq, now)?;
+                let Some(existing) = self.effects.get_mut(index) else {
+                    return fail(StateError::CorruptState(Corruption::EffectSequence));
+                };
                 existing.submissions = existing.submissions.saturating_add(1);
                 Ok(EffectStart::Execute(existing.clone()))
             }
         }
     }
 
-    /// Check the retry policy's submission bound for a new key of the
-    /// logical effect `name` in `attempt`: submissions of earlier keys that
-    /// were established as not applied count, and time runs from the first.
+    /// Check the retry policy's submission bound before another submission
+    /// of the logical effect `name` in `attempt`: submissions under every key
+    /// it used count, and time runs from its first intent.
     fn check_submission_budget(
         &self,
         name: &EffectName,

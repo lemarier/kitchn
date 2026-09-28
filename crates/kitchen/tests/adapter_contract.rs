@@ -1224,3 +1224,69 @@ fn a_missing_worker_is_not_evidence_of_cancellation() -> TestResult {
     assert_eq!(failure.check, Check::CancelObserved);
     Ok(())
 }
+
+#[test]
+fn fresh_and_same_key_retries_share_one_budget() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = started(&fixture, "task-1")?;
+    let backend = FakeBackend::fully_capable(backend_id()?, house()?);
+    let clock = ManualClock::starting_at(1);
+    let run = || {
+        run_effect(
+            &fixture.store,
+            &backend,
+            &grants()?,
+            plan(&task, fence, "launch", launch()?)?,
+            &clock,
+        )
+        .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+    };
+    backend.inject(ExecuteFault::Reject);
+    run()?; // key A: refused, one submission
+    backend.inject(ExecuteFault::TimeoutWithoutApplying);
+    run()?; // key B: second submission
+    backend.fail_lookups(100);
+    backend.inject(ExecuteFault::TimeoutWithoutApplying);
+    run()?; // key B resubmitted: third submission
+    backend.inject(ExecuteFault::TimeoutWithoutApplying);
+    let fourth = run();
+    assert!(
+        matches!(&fourth, Err(error) if matches!(error.downcast_ref::<Error>(), Some(Error::State(StateError::SubmissionBudgetExhausted(_))))),
+        "{fourth:?}"
+    );
+    assert_eq!(backend.execute_calls(), 3);
+    Ok(())
+}
+
+#[test]
+fn the_elapsed_budget_runs_from_the_first_key() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = started(&fixture, "task-1")?;
+    fixture.store.renew(&task, fence, ttl(7200)?, at(0))?;
+    let backend = FakeBackend::fully_capable(backend_id()?, house()?);
+    let clock = ManualClock::starting_at(1);
+    let run = || {
+        run_effect(
+            &fixture.store,
+            &backend,
+            &grants()?,
+            plan(&task, fence, "launch", launch()?)?,
+            &clock,
+        )
+        .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+    };
+    backend.inject(ExecuteFault::Reject);
+    run()?; // key A at t=1
+    clock.advance(3500);
+    backend.inject(ExecuteFault::TimeoutWithoutApplying);
+    run()?; // key B at t=3501, inside the hour
+    clock.advance(101);
+    backend.fail_lookups(100);
+    let late = run(); // t=3602: past one hour from key A
+    assert!(
+        matches!(&late, Err(error) if matches!(error.downcast_ref::<Error>(), Some(Error::State(StateError::SubmissionBudgetExhausted(_))))),
+        "{late:?}"
+    );
+    assert_eq!(backend.execute_calls(), 2);
+    Ok(())
+}

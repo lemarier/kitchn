@@ -2,9 +2,17 @@
 
 use std::error::Error;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
+
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+fn spawn_guard() -> MutexGuard<'static, ()> {
+    SPAWN_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
 
 #[test]
 fn help_and_default_invocation_explain_the_available_surface() -> Result<(), Box<dyn Error>> {
+    let _spawn_guard = spawn_guard();
     for args in [vec![], vec!["--help"], vec!["-h"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
             .args(args)
@@ -20,6 +28,7 @@ fn help_and_default_invocation_explain_the_available_surface() -> Result<(), Box
 
 #[test]
 fn version_is_machine_readable() -> Result<(), Box<dyn Error>> {
+    let _spawn_guard = spawn_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
         .arg("--version")
         .output()?;
@@ -34,6 +43,7 @@ fn version_is_machine_readable() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn unknown_commands_fail_without_claiming_execution() -> Result<(), Box<dyn Error>> {
+    let _spawn_guard = spawn_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
         .arg("pickup")
         .output()?;
@@ -45,6 +55,7 @@ fn unknown_commands_fail_without_claiming_execution() -> Result<(), Box<dyn Erro
 
 #[test]
 fn unknown_flags_are_rejected() -> Result<(), Box<dyn Error>> {
+    let _spawn_guard = spawn_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
         .arg("--unknown")
         .output()?;
@@ -56,6 +67,7 @@ fn unknown_flags_are_rejected() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn identifiers_are_validated_by_the_library() -> Result<(), Box<dyn Error>> {
+    let _spawn_guard = spawn_guard();
     for command in ["validate-house", "validate-task"] {
         for id in [
             "a".to_owned(),
@@ -103,6 +115,9 @@ fn closed_output_is_a_failure() -> Result<(), Box<dyn Error>> {
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
     use std::process::Stdio;
+
+    // Another test must not fork while the socket reader is open, before we drop it.
+    let _spawn_guard = spawn_guard();
 
     for args in [
         vec![],

@@ -15,6 +15,7 @@ use kitchen::{
         ScheduleSpec, ScheduleWorkspace, TimeOfDay, Timezone, Weekday, WorkflowName, plan_install,
         run_verdict,
     },
+    trust::Measurement,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -255,6 +256,7 @@ fn an_agent_that_never_became_ready_is_a_launch_failure() {
     let reported = ScheduleRun {
         outcome: RunOutcome::LaunchReported,
         scheduled_for: Some(due),
+        usage: Measurement::Missing,
     };
     let within = due.saturating_add(Duration::from_secs(60));
     let past = due.saturating_add(Duration::from_secs(601));
@@ -274,6 +276,7 @@ fn an_agent_that_never_became_ready_is_a_launch_failure() {
     let undated = ScheduleRun {
         outcome: RunOutcome::LaunchReported,
         scheduled_for: None,
+        usage: Measurement::Missing,
     };
     assert_eq!(
         run_verdict(&undated, false, past, deadline),
@@ -289,6 +292,7 @@ fn an_agent_that_never_became_ready_is_a_launch_failure() {
         let run = ScheduleRun {
             outcome,
             scheduled_for: Some(due),
+            usage: Measurement::Missing,
         };
         assert_eq!(
             run_verdict(&run, true, past, deadline),
@@ -332,6 +336,7 @@ fn run(outcome: RunOutcome, due_seconds: Option<u64>) -> ScheduleRun {
     ScheduleRun {
         outcome,
         scheduled_for: due_seconds.map(at),
+        usage: Measurement::Missing,
     }
 }
 

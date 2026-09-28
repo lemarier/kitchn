@@ -25,6 +25,8 @@
 //! because creating one needs authorization; the definition check fails
 //! closed, naming the fields that differ, if it does not.
 
+use std::num::NonZeroU32;
+
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -40,6 +42,7 @@ use crate::{
         Readiness, RunOutcome, ScheduleField, ScheduleObservation, ScheduleRun, ScheduleSpec,
         ScheduleState, ScheduleWorkspace, plan_install,
     },
+    trust::Measurement,
 };
 
 /// Most automations one listing may hold before it is refused as incomplete.
@@ -134,11 +137,25 @@ struct RunList {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireRun {
+    #[serde(default)]
+    id: Option<String>,
     status: String,
     #[serde(default)]
     scheduled_for: Option<u64>,
     #[serde(default)]
     precheck_result: Option<WirePrecheck>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+}
+
+/// A run's usage as Orca 1.4.212 reports it: `status` is `known` with token
+/// counts, or `unavailable` with a reason such as `no_matching_session`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireUsage {
+    status: String,
+    #[serde(default)]
+    total_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +198,27 @@ fn run_outcome(run: &WireRun) -> RunOutcome {
         }
         "dispatch_failed" => RunOutcome::LaunchFailed,
         _ => RunOutcome::Unknown,
+    }
+}
+
+/// A run's reported tokens. Only a `known` report with a total is an
+/// observation; an unavailable report stays unavailable and an absent one
+/// missing, never zero.
+fn run_usage(run: &WireRun) -> Measurement<u64> {
+    let Some(usage) = &run.usage else {
+        return Measurement::Missing;
+    };
+    let source = run
+        .id
+        .as_deref()
+        .and_then(|id| ExternalRef::new(&format!("orca-run:{id}")).ok());
+    match (usage.status.as_str(), usage.total_tokens, source) {
+        ("known", Some(value), Some(source)) => Measurement::Observed {
+            value,
+            samples: NonZeroU32::MIN,
+            source,
+        },
+        _ => Measurement::Unavailable,
     }
 }
 
@@ -431,6 +469,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             backend::key_digest(&self.config().house, consumer.as_str())
         ))?;
         let listed = self.automations()?;
+        if let Some(policy) = self.schedule_policy() {
+            policy.check_install(spec, &self.installed_from(&listed)?)?;
+        }
         if let Some(existing) = self.existing_install(spec, &listed)? {
             reservation.settle();
             return Ok(existing);
@@ -522,6 +563,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .map(|run| ScheduleRun {
                 outcome: run_outcome(run),
                 scheduled_for: run.scheduled_for.map(Timestamp::from_unix_millis),
+                usage: run_usage(run),
             })
             .collect();
         Ok(ScheduleObservation {
@@ -623,6 +665,7 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::Schedule(_)
+        | OrcaError::ScheduleLimit(_)
         | OrcaError::Contract(_) => EffectFailure::NotApplied(NotAppliedReason::Rejected),
         // Nothing was sent, but the holder may be about to install it.
         OrcaError::Timeout | OrcaError::ReservationBusy => {

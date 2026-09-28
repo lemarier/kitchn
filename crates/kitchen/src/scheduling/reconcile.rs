@@ -2,17 +2,22 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     ConsumerId,
     contracts::{ResourceRef, Timestamp},
     state::{ConsumerEvent, ConsumerRecord},
+    trust::Measurement,
 };
 
-/// Most recent runs one observation reports.
-pub const MAX_SCHEDULE_RUNS: usize = 20;
+/// Most recent runs one observation reports. Budgets count runs over a
+/// window, so this covers a day of runs every 15 minutes.
+pub const MAX_SCHEDULE_RUNS: usize = 100;
 
 /// A schedule's state as a backend reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ObservedScheduleState {
     /// Installed and firing.
     Active,
@@ -29,7 +34,8 @@ pub enum ObservedScheduleState {
 /// No variant says the agent started: a backend's "completed launch" is not
 /// readiness evidence. [`run_verdict`] combines this with Kitchen's own
 /// readiness evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RunOutcome {
     /// Queued or still starting.
     Pending,
@@ -50,16 +56,22 @@ pub enum RunOutcome {
 }
 
 /// One scheduled run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScheduleRun {
     /// What the run did.
     pub outcome: RunOutcome,
     /// When it was due, when the backend reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_for: Option<Timestamp>,
+    /// Tokens the run used as the backend reports them. A backend that
+    /// reports no usage leaves it missing or unavailable, never zero.
+    pub usage: Measurement<u64>,
 }
 
 /// How a scheduled run ended, once readiness evidence is taken into account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RunVerdict {
     /// Still within its readiness deadline.
     Pending,
@@ -193,7 +205,7 @@ impl<'a> Readiness<'a> {
                     })
                 });
                 JudgedRun {
-                    run: *run,
+                    run: run.clone(),
                     verdict: run_verdict(run, ready, self.now, self.deadline),
                 }
             })
@@ -202,7 +214,8 @@ impl<'a> Readiness<'a> {
 }
 
 /// A run and how it ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JudgedRun {
     /// What the backend recorded.
     pub run: ScheduleRun,
@@ -211,7 +224,8 @@ pub struct JudgedRun {
 }
 
 /// A read-only view of one schedule.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScheduleObservation {
     /// Its state.
     pub state: ObservedScheduleState,

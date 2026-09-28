@@ -47,7 +47,7 @@ use crate::{
         ResourceObservation, ResourceRef, Text, UncertainReason, WorkerBackend, WorkerOutcome,
         WorkerState, Workspace,
     },
-    scheduling::AgentFamily,
+    scheduling::{AgentFamily, SchedulePolicy},
     selection::{AgentSelection, EffortSupport, SelectionSupport},
 };
 
@@ -150,6 +150,7 @@ pub struct OrcaBackend<R> {
     descriptor: BackendDescriptor,
     runtime: RuntimeInfo,
     runner: R,
+    schedule_policy: Option<SchedulePolicy>,
 }
 
 #[derive(Deserialize)]
@@ -480,7 +481,8 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::ScheduleActive
-        | OrcaError::ScheduleDiffers { .. } => not_applied(),
+        | OrcaError::ScheduleDiffers { .. }
+        | OrcaError::ScheduleLimit(_) => not_applied(),
         OrcaError::Refused { .. }
         | OrcaError::OutputLimit { .. }
         | OrcaError::NoResult { .. }
@@ -524,6 +526,7 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::TrialRequiresPaused
         | OrcaError::ScheduleActive
         | OrcaError::ScheduleDiffers { .. }
+        | OrcaError::ScheduleLimit(_)
         | OrcaError::ReservationBusy
         | OrcaError::ReservationRedirected
         | OrcaError::ReservationUnavailable(_)
@@ -566,7 +569,22 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             descriptor,
             runtime,
             runner,
+            schedule_policy: None,
         })
+    }
+
+    /// Enforce the house's schedule limits: installs that break them are
+    /// refused with [`OrcaError::ScheduleLimit`] before anything is created.
+    #[must_use]
+    pub fn with_schedule_policy(mut self, policy: SchedulePolicy) -> Self {
+        self.schedule_policy = Some(policy);
+        self
+    }
+
+    /// The schedule limits installs are checked against, if any.
+    #[must_use]
+    pub const fn schedule_policy(&self) -> Option<&SchedulePolicy> {
+        self.schedule_policy.as_ref()
     }
 
     /// What the runtime probe established.

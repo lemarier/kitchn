@@ -6,6 +6,7 @@ use crate::{
     HouseId,
     adoption::{HouseRegistry, ResolvedInstructions, resolve_instructions},
     contracts::{Capability, CapabilitySet, Repository},
+    scheduling::{BudgetError, ScheduleEvidence, SchedulePolicy, TokenUsage},
     selection::OfferedModels,
 };
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,9 @@ pub struct DoctorEvidence {
     /// was not probed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack_tool: Option<StackToolStatus>,
+    /// The house's schedules and their recent runs; `None` means not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedules: Option<ScheduleEvidence>,
 }
 
 /// Whether the house's stack tool is usable on this host.
@@ -87,6 +91,10 @@ pub enum DoctorCode {
     LegacyBinding,
     /// The configured stack tool is missing or was not probed.
     StackTool,
+    /// Schedule limits cannot be checked or enforced as configured.
+    ScheduleBudget,
+    /// A schedule's precheck mostly reports idle; a recommendation only.
+    IdleSchedule,
 }
 impl DoctorFinding {
     /// Report a leftover legacy binding file. Kitchen never deletes it.
@@ -121,6 +129,10 @@ pub struct DoctorReport {
     pub access: AccessStatus,
     /// Every known incomplete setup item and its next step.
     pub findings: Vec<DoctorFinding>,
+    /// Suggestions that do not make setup incomplete, such as mostly idle
+    /// schedules. Kitchen acts on none of them.
+    #[serde(default)]
+    pub recommendations: Vec<DoctorFinding>,
 }
 impl DoctorReport {
     /// Whether all supplied diagnostic requirements were satisfied.
@@ -153,6 +165,12 @@ impl DoctorReport {
             text.push_str(&format!(
                 "\n{}\nNext: {}\n",
                 finding.message, finding.next_step
+            ));
+        }
+        for recommendation in &self.recommendations {
+            text.push_str(&format!(
+                "\nRecommendation: {}\nConsider: {}\n",
+                recommendation.message, recommendation.next_step
             ));
         }
         if let Some(instructions) = &self.instructions {
@@ -263,6 +281,12 @@ pub fn doctor(
     {
         findings.push(finding);
     }
+    let recommendations = diagnose_schedules(
+        house.schedules.as_ref(),
+        &house.house,
+        evidence.and_then(|evidence| evidence.schedules.as_ref()),
+        &mut findings,
+    )?;
     let access = evidence.map_or(AccessStatus::Unobserved, |evidence| evidence.access);
     if access != AccessStatus::Available {
         findings.push(DoctorFinding { code: DoctorCode::Access, message: format!("House-scoped repository access: {access:?}."), next_step: format!("Configure {} access in the external credential provider, then probe {} through the house-scoped integration and rerun doctor; never put credential values in repository files.", house.house, repository.repository) });
@@ -275,6 +299,7 @@ pub fn doctor(
         missing_capabilities,
         access,
         findings,
+        recommendations,
     })
 }
 
@@ -323,4 +348,55 @@ pub fn stack_tool_finding(
         ),
         next_step,
     })
+}
+
+/// Schedule limit findings, and idle-schedule recommendations.
+fn diagnose_schedules(
+    policy: Option<&SchedulePolicy>,
+    house: &HouseId,
+    evidence: Option<&ScheduleEvidence>,
+    findings: &mut Vec<DoctorFinding>,
+) -> Result<Vec<DoctorFinding>, HouseError> {
+    let Some(policy) = policy else {
+        if evidence.is_some_and(|evidence| !evidence.schedules.is_empty()) {
+            findings.push(DoctorFinding { code: DoctorCode::ScheduleBudget, message: format!("House {house} has schedules but no schedule policy; their intervals and usage are not limited."), next_step: "Add a schedules policy with a minimum interval, a usage window, and house and per-schedule budgets to the house configuration.".into() });
+        }
+        return Ok(Vec::new());
+    };
+    let Some(evidence) = evidence else {
+        findings.push(DoctorFinding { code: DoctorCode::ScheduleBudget, message: "Schedule usage was not observed; budgets and idle schedules were not checked.".into(), next_step: "Observe this house's schedules and their recent runs through the backend adapter, then rerun doctor with that evidence.".into() });
+        return Ok(Vec::new());
+    };
+    let unenforceable = policy
+        .unenforceable_token_budgets(house, evidence)
+        .map_err(|error| {
+            if matches!(error, BudgetError::HouseMismatch) {
+                HouseError::HouseSelection
+            } else if matches!(error, BudgetError::Relaxation { .. }) {
+                HouseError::PolicyRelaxation
+            } else {
+                HouseError::InvalidInput
+            }
+        })?;
+    for schedule in unenforceable {
+        findings.push(DoctorFinding { code: DoctorCode::ScheduleBudget, message: format!("Schedule {}: usage was unknown for most of its {} agent runs this window ({}), so its token budget cannot be enforced; its run budget is the effective limit.", schedule.consumer, schedule.usage.runs, describe_tokens(schedule.usage.tokens)), next_step: "Use a backend that reports run usage, or set the run budget to the spend you accept; unknown usage is never counted as zero.".into() });
+    }
+    Ok(policy
+        .idle_schedules(evidence)
+        .into_iter()
+        .map(|idle| DoctorFinding { code: DoctorCode::IdleSchedule, message: format!("Schedule {}: the precheck reported idle on {} of its {} recent runs, which used {}.", idle.consumer, idle.idle_runs, idle.runs, describe_tokens(idle.tokens)), next_step: "Lengthen its interval or make its precheck cheaper; Kitchen changes nothing.".into() })
+        .collect())
+}
+
+fn describe_tokens(tokens: TokenUsage) -> String {
+    match tokens {
+        TokenUsage::Known { tokens } => format!("{tokens} tokens"),
+        TokenUsage::Unknown {
+            known_tokens,
+            unknown_runs,
+        } => format!(
+            "at least {known_tokens} tokens, with usage unknown for {unknown_runs} {}",
+            if unknown_runs == 1 { "run" } else { "runs" }
+        ),
+    }
 }

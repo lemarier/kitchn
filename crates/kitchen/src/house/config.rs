@@ -6,6 +6,7 @@ use super::{HouseError, Workflow};
 use crate::{
     HouseId,
     contracts::{CommitId, Grant, HouseGrants, Repository},
+    scheduling::{BudgetError, SchedulePolicy},
     selection::{AgentPolicy, SelectionError},
 };
 
@@ -60,6 +61,10 @@ pub struct HouseConfig {
     /// The stack tool dependent branches must go through, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack_tool: Option<StackTool>,
+    /// Minimum interval and usage budgets for scheduled work. Absent means
+    /// schedule installs are not limited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedules: Option<SchedulePolicy>,
 }
 
 impl HouseConfig {
@@ -131,6 +136,15 @@ impl HouseConfig {
             .any(|grant| !self.policy_limits.iter().any(|limit| limit.covers(grant)))
         {
             return Err(HouseError::PolicyRelaxation);
+        }
+        if let Some(schedules) = &self.schedules {
+            schedules.validate().map_err(|error| {
+                if matches!(error, BudgetError::Relaxation { .. }) {
+                    HouseError::PolicyRelaxation
+                } else {
+                    HouseError::InvalidInput
+                }
+            })?;
         }
         Ok(())
     }

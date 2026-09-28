@@ -1889,32 +1889,32 @@ fn runs_without_a_due_time_survive_the_cut_to_the_newest_runs() -> TestResult {
     let with_undated = |count: usize, dated: Vec<Option<Timestamp>>| -> Vec<Option<Timestamp>> {
         std::iter::repeat_n(None, count).chain(dated).collect()
     };
-    assert_eq!(MAX_SCHEDULE_RUNS, 20);
+    let cap = u64::try_from(MAX_SCHEDULE_RUNS)?;
 
     // Listed last, the undated run is the one a plain truncation would drop.
-    let mut listing: Vec<_> = (1..=25).map(dated).collect();
+    let mut listing: Vec<_> = (1..=cap + 5).map(dated).collect();
     listing.push(undated());
     assert_eq!(
         observe(listing)?,
-        with_undated(1, newest_first(7..=25)),
+        with_undated(1, newest_first(7..=cap + 5)),
         "the undated run counts as the newest; the oldest dated runs are cut"
     );
 
     // Several undated runs take their places before any dated run does.
-    let mut listing: Vec<_> = (1..=22).map(dated).collect();
+    let mut listing: Vec<_> = (1..=cap + 2).map(dated).collect();
     listing.extend([undated(), undated(), undated()]);
     assert_eq!(
         observe(listing)?,
-        with_undated(3, newest_first(6..=22)),
-        "three undated runs leave room for the 17 newest dated runs"
+        with_undated(3, newest_first(6..=cap + 2)),
+        "three undated runs leave room for the newest dated runs after them"
     );
 
     // Exactly the cap: nothing is dropped, and an undated run is not moved out.
-    let mut listing: Vec<_> = (1..=19).map(dated).collect();
+    let mut listing: Vec<_> = (1..cap).map(dated).collect();
     listing.insert(0, undated());
     assert_eq!(
         observe(listing)?,
-        with_undated(1, newest_first(1..=19)),
+        with_undated(1, newest_first(1..=cap - 1)),
         "a listing at the cap keeps every run"
     );
 
@@ -1926,8 +1926,8 @@ fn runs_without_a_due_time_survive_the_cut_to_the_newest_runs() -> TestResult {
 
     // Without undated runs the newest dated runs are kept, as before.
     assert_eq!(
-        observe((1..=21).map(dated).collect())?,
-        newest_first(2..=21)
+        observe((1..=cap + 1).map(dated).collect())?,
+        newest_first(2..=cap + 1)
     );
     Ok(())
 }

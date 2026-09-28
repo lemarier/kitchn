@@ -18,12 +18,24 @@
 //! return runs already judged, so a swallowed launch is a
 //! [`RunVerdict::LaunchFailed`] instead of a completed run.
 //!
+//! A house's [`SchedulePolicy`] limits how often schedules fire and how much
+//! they spend per window; installs that break it are refused, and exhausted
+//! budgets pause the schedule and are reported once.
+//!
 //! [`crate::contracts::ScheduleEffect`] carries these types in persisted
 //! effect intents.
 
+mod budget;
 mod reconcile;
 mod spec;
 
+pub use budget::{
+    BUDGET_WORKFLOW, Budget, BudgetAssessment, BudgetError, BudgetExhaustion, Exhausted,
+    ExhaustionReport, IdlePolicy, IdleSchedule, IntervalMinutes, MAX_EVIDENCE_SCHEDULES,
+    MAX_INTERVAL_MINUTES, MAX_SCHEDULE_LIMITS, MAX_WINDOW_HOURS, Percent, ScheduleAssessment,
+    ScheduleEvidence, ScheduleLimit, ScheduleLimits, SchedulePolicy, ScheduleUsage, TokenUsage,
+    UsageWindow, WindowHours, WindowUsage, shortest_interval_minutes,
+};
 pub use reconcile::{
     InstallPlan, InstalledSchedule, JudgedRun, MAX_SCHEDULE_RUNS, ObservedScheduleState, Readiness,
     ReadinessSignal, RunOutcome, RunVerdict, ScheduleField, ScheduleObservation, ScheduleRun,

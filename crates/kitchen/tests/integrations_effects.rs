@@ -6,7 +6,7 @@ use kitchen::{
     contracts::*,
     house::MergeSubject,
     integrations::{github::*, roger::*},
-    state::{EffectRecord, EffectState, HouseStore, StateError, run_effect},
+    state::{EffectRecord, EffectState, HouseStore, ReconcileReport, StateError, run_effect},
     workflows::gate::MergeGrant,
 };
 use serde_json::{Value, json};
@@ -1744,6 +1744,116 @@ fn merge_reconciliation_clears_a_moved_head_but_not_an_unchanged_one() -> TestRe
         follow_up("proceeds")??.state(),
         EffectState::Applied { .. }
     ));
+    Ok(())
+}
+
+fn merged_pull_request(head: &str, base_ref: &str) -> Value {
+    json!({"number":1,"merged":true,"merge_commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head":{"sha":head},"base":{"ref":base_ref}})
+}
+
+/// Loses a merge request's response, lets `landed` describe the pull request
+/// afterwards, and reconciles the uncertain merge.
+fn reconcile_lost_merge(landed: Value) -> TestResult<(ReconcileReport, usize)> {
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::Merge], "github")?;
+    let revision = record_subject(&fixture, &task, fence, HEAD, Some(BASE))?;
+    let remote = Rc::new(RefCell::new(Remote {
+        pull_request: Some(open_pull_request(HEAD, "main")),
+        fault: Some(Fault::LoseBeforeApply),
+        ..Remote::default()
+    }));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let clock = ManualClock::starting_at(1);
+    let lost = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan_at(
+            &task,
+            fence,
+            "merge",
+            backend.effect(mutation(merge(HEAD, Some(BASE))?)?)?,
+            revision,
+        )?,
+        &clock,
+    )?;
+    assert!(matches!(lost.state(), EffectState::Uncertain { .. }));
+    remote.borrow_mut().pull_request = Some(landed);
+    let report = kitchen::state::reconcile(&fixture.store, &backend, &task, fence, &clock)?;
+    let calls = remote.borrow().calls.len();
+    Ok((report, calls))
+}
+
+#[test]
+fn merge_into_a_retargeted_base_at_the_expected_head_is_applied() -> TestResult {
+    let (report, calls) = reconcile_lost_merge(merged_pull_request(HEAD, "release"))?;
+    assert!(report.unresolved.is_empty());
+    assert_eq!(report.resolved.len(), 1);
+    assert!(matches!(
+        report.resolved[0].state(),
+        EffectState::Applied { receipt, .. }
+            if receipt.reference().as_str() == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ));
+    assert_eq!(calls, 1, "reconciliation never writes");
+    Ok(())
+}
+
+#[test]
+fn merge_of_a_different_head_is_not_applied() -> TestResult {
+    let (report, _) = reconcile_lost_merge(merged_pull_request(MOVED, "release"))?;
+    assert!(report.unresolved.is_empty());
+    assert!(matches!(
+        report.resolved.as_slice(),
+        [record] if matches!(
+            record.state(),
+            EffectState::NotApplied {
+                reason: NotAppliedReason::ConfirmedAbsent,
+                ..
+            }
+        )
+    ));
+    Ok(())
+}
+
+#[test]
+fn merge_without_a_merged_state_stays_unresolved() -> TestResult {
+    let (report, _) =
+        reconcile_lost_merge(json!({"number":1,"head":{"sha":HEAD},"base":{"ref":"release"}}))?;
+    assert!(report.resolved.is_empty());
+    assert_eq!(report.unresolved.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn already_merged_retargeted_pull_request_is_applied_without_submission() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::Merge], "github")?;
+    let revision = record_subject(&fixture, &task, fence, HEAD, Some(BASE))?;
+    let remote = Rc::new(RefCell::new(Remote {
+        pull_request: Some(merged_pull_request(HEAD, "release")),
+        ..Remote::default()
+    }));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let effect = backend.effect(mutation(merge(HEAD, Some(BASE))?)?)?;
+    let record = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan_at(&task, fence, "merge", effect, revision)?,
+        &ManualClock::starting_at(1),
+    )?;
+    assert!(matches!(record.state(), EffectState::Applied { .. }));
+    assert!(remote.borrow().calls.is_empty());
     Ok(())
 }
 

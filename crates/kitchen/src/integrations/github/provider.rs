@@ -303,27 +303,29 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                     .pointer("/head/sha")
                     .and_then(Value::as_str)
                     .ok_or(IntegrationError::Unknown)?;
-                if head != expected_head.as_str()
-                    || pr.pointer("/base/ref").and_then(Value::as_str)
-                        != Some(expected_base.as_str())
-                {
+                // Read the merged state first: a merge of the expected head
+                // happened even if the base was retargeted before or after it.
+                let merged = pr
+                    .get("merged")
+                    .and_then(Value::as_bool)
+                    .ok_or(IntegrationError::Unknown)?;
+                if head != expected_head.as_str() {
                     return Ok(Inspection::Conflict);
                 }
-                match pr.get("merged").and_then(Value::as_bool) {
-                    Some(true) => {
-                        let sha = pr
-                            .get("merge_commit_sha")
-                            .and_then(Value::as_str)
-                            .ok_or(IntegrationError::Unknown)?;
-                        let merge = crate::contracts::CommitId::new(sha)
-                            .map_err(|_| IntegrationError::Unknown)?;
-                        let receipt =
-                            Receipt::new(ExternalRef::new(merge.as_str())?, vec![], vec![])?;
-                        Ok(Inspection::Applied(receipt))
-                    }
-                    Some(false) => Ok(Inspection::Missing),
-                    None => Err(IntegrationError::Unknown),
+                if merged {
+                    let sha = pr
+                        .get("merge_commit_sha")
+                        .and_then(Value::as_str)
+                        .ok_or(IntegrationError::Unknown)?;
+                    let merge = crate::contracts::CommitId::new(sha)
+                        .map_err(|_| IntegrationError::Unknown)?;
+                    let receipt = Receipt::new(ExternalRef::new(merge.as_str())?, vec![], vec![])?;
+                    return Ok(Inspection::Applied(receipt));
                 }
+                if pr.pointer("/base/ref").and_then(Value::as_str) != Some(expected_base.as_str()) {
+                    return Ok(Inspection::Conflict);
+                }
+                Ok(Inspection::Missing)
             }
             GitHubAction::PostComment { issue, body } => {
                 let expected = marked(body.as_str(), key);

@@ -557,6 +557,41 @@ const menu = [
             }
           </div>
         </div>
+        <div class="beyond">
+          <div class="beyond-card">
+            <h3>Don't memorize any of this</h3>
+            <p>
+              The <code>/kitchn</code> skill knows every command. Ask in plain words and it runs the right
+              one, shows you the preview and asks before anything changes.
+            </p>
+            <div class="chat">
+              <p class="chat-you">what's still missing for this repo?</p>
+              <p class="chat-kitchn">
+                Repository access for acme isn't observed yet, and the gate needs a backend with
+                scheduling. Want me to walk you through both?
+              </p>
+            </div>
+          </div>
+          <div class="beyond-side">
+            <div class="beyond-card soon">
+              <p class="stamp">Coming soon</p>
+              <h3>The dashboard</h3>
+              <p>
+                Every order on the line, what's waiting on you, and what each station has earned, for
+                your whole house in one place.
+              </p>
+            </div>
+            <div class="beyond-card soon">
+              <p class="stamp">Coming soon</p>
+              <h3>Roger</h3>
+              <p>
+                When a station needs a decision, Roger brings the question to you wherever you are. Your
+                answer goes straight back to the task and revision that asked, once, and never to
+                another house.
+              </p>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section class="autopilot" aria-labelledby="autopilot-title">
@@ -2172,6 +2207,80 @@ const menu = [
     color: var(--lamp);
   }
 
+  /* Beyond the terminal: the skill and the dashboard. */
+  .beyond {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+  .beyond-side {
+    display: grid;
+    gap: 1rem;
+  }
+  .beyond-card {
+    position: relative;
+    padding: 1.5rem clamp(1.25rem, 3vw, 1.75rem) 1.75rem;
+    background: var(--steel);
+    border: 1px solid var(--steel-edge);
+    border-radius: 10px;
+  }
+  .beyond-card h3 {
+    font-size: 1.9rem;
+    padding-right: 7rem;
+  }
+  .beyond-card > p {
+    margin: 0.6rem 0 0;
+    color: var(--ink-soft);
+  }
+  .beyond-card code {
+    font: 400 0.9em var(--mono);
+    color: var(--ink);
+  }
+  .chat {
+    display: grid;
+    gap: 0.5rem;
+    margin-top: 1.25rem;
+  }
+  .chat p {
+    margin: 0;
+    max-width: 85%;
+    padding: 0.6rem 0.85rem;
+    border-radius: 10px;
+    font-size: 0.9375rem;
+    line-height: 1.45;
+  }
+  .chat-you {
+    justify-self: end;
+    background: var(--steel-2);
+    border: 1px solid var(--steel-edge);
+    font-family: var(--mono) !important;
+    font-size: 0.8125rem !important;
+  }
+  .chat-kitchn {
+    background: var(--paper);
+    color: var(--print);
+  }
+  .beyond-card.soon {
+    border-style: dashed;
+    background: none;
+  }
+  .beyond-card .stamp {
+    position: absolute;
+    top: 1.25rem;
+    right: 1.25rem;
+    margin: 0;
+    font: 600 0.75rem/1 var(--mono);
+    color: var(--red);
+    border: 2px solid var(--red);
+    padding: 0.35rem 0.5rem;
+    transform: rotate(4deg);
+  }
+  .term-tabs button:focus-visible,
+  .term-seg:focus-visible {
+    outline-offset: -3px;
+  }
+
   /* Autopilot: the night shift and the morning report. */
   section.autopilot {
     margin-top: clamp(5rem, 11vw, 8.5rem);
@@ -2436,6 +2545,7 @@ const menu = [
   }
 
   @media (max-width: 60rem) {
+    .beyond,
     .factory-split,
     .shift,
     .guardrails {

@@ -12,6 +12,12 @@
 //! response is resolved by that lookup, and anything it cannot establish stays
 //! unknown rather than becoming a second create.
 //!
+//! A backend's record that a launch finished is not evidence that the agent
+//! started. [`Readiness`] joins each run with Kitchen's own
+//! [`ReadinessSignal`]s and a deadline into a [`RunVerdict`], and adapters
+//! return runs already judged, so a swallowed launch is a
+//! [`RunVerdict::LaunchFailed`] instead of a completed run.
+//!
 //! [`crate::contracts::ScheduleEffect`] carries these types in persisted
 //! effect intents.
 
@@ -19,8 +25,9 @@ mod reconcile;
 mod spec;
 
 pub use reconcile::{
-    InstallPlan, InstalledSchedule, MAX_SCHEDULE_RUNS, ObservedScheduleState, RunOutcome,
-    RunVerdict, ScheduleObservation, ScheduleRun, plan_install, run_verdict,
+    InstallPlan, InstalledSchedule, JudgedRun, MAX_SCHEDULE_RUNS, ObservedScheduleState, Readiness,
+    ReadinessSignal, RunOutcome, RunVerdict, ScheduleField, ScheduleObservation, ScheduleRun,
+    plan_install, run_verdict,
 };
 pub use spec::{
     AgentFamily, CronExpr, GraceMinutes, MAX_PRECHECK_ARGS, Precheck, PrecheckOutcome,

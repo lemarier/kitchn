@@ -5,13 +5,25 @@
 //! automations whose name decodes for its own house, so existing automations
 //! are never touched. Orca's automation commands take no request key, so:
 //!
-//! - an install first reconciles against a complete listing with
-//!   [`plan_install`] and reuses an existing schedule;
+//! - an install holds a reservation for the house and consumer, so two
+//!   installers cannot both list, find nothing, and both create;
+//! - it then reconciles against a complete listing with [`plan_install`]. An
+//!   existing schedule is reused only when it is paused and matches the
+//!   requested definition; an active or different one is refused, never
+//!   changed;
 //! - a create whose response is lost is resolved by listing again, and stays
 //!   [`OrcaError::InstallUncertain`] when the listing cannot show it;
 //! - every change is read back before it is reported as done.
 //!
-//! Installs are always created disabled. Enabling is a separate call.
+//! Installs are always created disabled. Enabling is a separate call that
+//! needs its own authority. Every recurrence is sent as one five-field cron
+//! expression ([`crate::scheduling::Recurrence::cron`]). Orca 1.4.212 lists a
+//! cron trigger unchanged in the automation's `rrule` (as its existing
+//! automations show), so an installed schedule can be compared with a
+//! requested one without knowing how Orca encodes presets. That a schedule
+//! this adapter creates lists back identically has not been observed live,
+//! because creating one needs authorization; the definition check fails
+//! closed, naming the fields that differ, if it does not.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -25,8 +37,8 @@ use crate::{
     },
     scheduling::{
         InstallPlan, InstalledSchedule, MAX_SCHEDULE_RUNS, ObservedScheduleState, PrecheckOutcome,
-        Recurrence, RunOutcome, ScheduleObservation, ScheduleRun, ScheduleSpec, ScheduleState,
-        ScheduleWorkspace, plan_install,
+        Readiness, RunOutcome, ScheduleField, ScheduleObservation, ScheduleRun, ScheduleSpec,
+        ScheduleState, ScheduleWorkspace, plan_install,
     },
 };
 
@@ -64,11 +76,46 @@ struct AutomationList {
     automations: Vec<Automation>,
 }
 
+/// One automation as `automations list` reports it. Fields Kitchen compares
+/// against a requested definition are optional: a listing that omits one
+/// cannot confirm it.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Automation {
     id: String,
     name: String,
     enabled: bool,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    timezone: Option<String>,
+    /// The trigger: a cron expression stays as given.
+    #[serde(default)]
+    rrule: Option<String>,
+    #[serde(default)]
+    missed_run_grace_minutes: Option<u64>,
+    #[serde(default)]
+    reuse_session: Option<bool>,
+    #[serde(default)]
+    precheck: Option<StoredPrecheck>,
+    #[serde(default)]
+    workspace_mode: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    base_branch: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredPrecheck {
+    command: String,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -169,14 +216,14 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         Ok(list.automations)
     }
 
-    /// Every Kitchen schedule installed for this house.
-    ///
-    /// # Errors
-    /// Call and parse failures, and [`OrcaError::ListingTooLong`].
-    pub fn installed_schedules(&self) -> Result<Vec<InstalledSchedule>, OrcaError> {
+    /// This house's schedules among `automations`.
+    fn installed_from(
+        &self,
+        automations: &[Automation],
+    ) -> Result<Vec<InstalledSchedule>, OrcaError> {
         let house = &self.config().house;
-        self.automations()?
-            .into_iter()
+        automations
+            .iter()
             .filter_map(|automation| {
                 decode_name(house, &automation.name).map(|consumer| {
                     Ok(InstalledSchedule {
@@ -187,6 +234,112 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 })
             })
             .collect()
+    }
+
+    /// Every Kitchen schedule installed for this house.
+    ///
+    /// # Errors
+    /// Call and parse failures, and [`OrcaError::ListingTooLong`].
+    pub fn installed_schedules(&self) -> Result<Vec<InstalledSchedule>, OrcaError> {
+        self.installed_from(&self.automations()?)
+    }
+
+    /// The schedule an install of `spec` may reuse, or `None` when it may
+    /// create one.
+    ///
+    /// Reuse needs the installed schedule to be paused, because a disabled
+    /// install must never leave a consumer firing, and to match the requested
+    /// definition, because reusing a different one would install nothing
+    /// that was asked for.
+    fn existing_install(
+        &self,
+        spec: &ScheduleSpec,
+        automations: &[Automation],
+    ) -> Result<Option<ResourceRef>, OrcaError> {
+        match plan_install(spec.consumer(), &self.installed_from(automations)?) {
+            InstallPlan::Create => Ok(None),
+            InstallPlan::Duplicates(duplicates) => Err(OrcaError::DuplicateSchedules {
+                count: duplicates.len(),
+            }),
+            InstallPlan::Installed(existing) => {
+                let automation = automations
+                    .iter()
+                    .find(|automation| automation.id == existing.handle.as_str())
+                    .ok_or(OrcaError::ScheduleNotFound)?;
+                if automation.enabled {
+                    return Err(OrcaError::ScheduleActive);
+                }
+                let fields = self.definition_gaps(spec, automation);
+                if fields.is_empty() {
+                    Ok(Some(existing))
+                } else {
+                    Err(OrcaError::ScheduleDiffers { fields })
+                }
+            }
+        }
+    }
+
+    /// The parts of `spec` that `automation` does not show. A part the
+    /// listing omits counts as a gap: it cannot be confirmed.
+    fn definition_gaps(&self, spec: &ScheduleSpec, automation: &Automation) -> Vec<ScheduleField> {
+        let config = self.config();
+        let precheck = match (spec.precheck(), &automation.precheck) {
+            (None, None) => true,
+            (Some(wanted), Some(stored)) => {
+                stored.command == shell_command(wanted.argv())
+                    && stored.timeout_seconds == Some(wanted.timeout().whole_seconds())
+            }
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        let workspace = match spec.workspace() {
+            ScheduleWorkspace::NewPerRun => {
+                automation.workspace_mode.as_deref() == Some("new-per-run")
+                    && automation.base_branch.as_deref()
+                        == config.base_branch.as_ref().map(ExternalRef::as_str)
+                    // Only an `id:` selector can be compared with the stored project.
+                    && config
+                        .repo
+                        .as_str()
+                        .strip_prefix("id:")
+                        .is_none_or(|id| automation.project_id.as_deref() == Some(id))
+            }
+            ScheduleWorkspace::Existing(existing) => {
+                automation.workspace_mode.as_deref() == Some("existing")
+                    && automation.workspace_id.as_deref() == Some(existing.handle.as_str())
+            }
+        };
+        [
+            (
+                automation.prompt.as_deref() == Some(spec.prompt().as_str()),
+                ScheduleField::Prompt,
+            ),
+            (
+                automation.agent_id.as_deref() == Some(spec.agent().as_str()),
+                ScheduleField::Agent,
+            ),
+            (
+                automation.rrule.as_deref() == Some(spec.recurrence().cron().as_str()),
+                ScheduleField::Recurrence,
+            ),
+            (
+                automation.timezone.as_deref() == Some(spec.timezone().as_str()),
+                ScheduleField::Timezone,
+            ),
+            (precheck, ScheduleField::Precheck),
+            (workspace, ScheduleField::Workspace),
+            (
+                automation.missed_run_grace_minutes
+                    == Some(u64::from(spec.missed_run_grace().get())),
+                ScheduleField::MissedRunGrace,
+            ),
+            (
+                automation.reuse_session == Some(spec.reuse_session()),
+                ScheduleField::SessionReuse,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(matches, field)| (!matches).then_some(field))
+        .collect()
     }
 
     /// Find `schedule` and confirm Kitchen installed it for this house.
@@ -219,21 +372,8 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 "missed-run-grace-minutes",
                 &spec.missed_run_grace().get().to_string(),
             )
+            .value("trigger", &spec.recurrence().cron())
             .switch("disabled");
-        args = match spec.recurrence() {
-            Recurrence::Hourly => args.value("trigger", "hourly"),
-            Recurrence::Daily(at) => args
-                .value("trigger", "daily")
-                .value("time", &at.to_string()),
-            Recurrence::Weekdays(at) => args
-                .value("trigger", "weekdays")
-                .value("time", &at.to_string()),
-            Recurrence::Weekly(day, at) => args
-                .value("trigger", "weekly")
-                .value("day", &day.number().to_string())
-                .value("time", &at.to_string()),
-            Recurrence::Cron(expr) => args.value("trigger", expr.as_str()),
-        };
         if let Some(precheck) = spec.precheck() {
             args = args
                 .value("precheck", &shell_command(precheck.argv()))
@@ -268,24 +408,32 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         Ok(args.json())
     }
 
-    /// Install `spec` paused, or return the schedule already installed for
-    /// its consumer.
+    /// Install `spec` paused, or return the paused schedule already installed
+    /// for its consumer with the same definition.
+    ///
+    /// Concurrent installers for one house and consumer take turns: the
+    /// listing, the create, and the read-back happen under a reservation, so
+    /// a second installer finds the schedule the first created.
     ///
     /// # Errors
-    /// [`OrcaError::DuplicateSchedules`] when several share the name,
-    /// [`OrcaError::InstallUncertain`] when a create may have happened but no
-    /// listing shows it, [`OrcaError::StateMismatch`] when a new schedule does
-    /// not read back paused, and call or parse failures.
+    /// [`OrcaError::ScheduleActive`] when the consumer's schedule is firing
+    /// and [`OrcaError::ScheduleDiffers`] when it is not the requested one;
+    /// neither changes anything. [`OrcaError::DuplicateSchedules`] when
+    /// several share the name, [`OrcaError::InstallUncertain`] when a create
+    /// may have happened but no listing shows it,
+    /// [`OrcaError::StateMismatch`] when a new schedule does not read back
+    /// paused, [`OrcaError::ReservationBusy`] when another installer held the
+    /// reservation for the whole wait, and call or parse failures.
     pub fn install_schedule(&self, spec: &ScheduleSpec) -> Result<ResourceRef, OrcaError> {
         let consumer = spec.consumer();
-        match plan_install(consumer, &self.installed_schedules()?) {
-            InstallPlan::Installed(existing) => return Ok(existing),
-            InstallPlan::Duplicates(duplicates) => {
-                return Err(OrcaError::DuplicateSchedules {
-                    count: duplicates.len(),
-                });
-            }
-            InstallPlan::Create => {}
+        let mut reservation = self.reserve(format!(
+            "schedule-{:032x}",
+            backend::key_digest(&self.config().house, consumer.as_str())
+        ))?;
+        let listed = self.automations()?;
+        if let Some(existing) = self.existing_install(spec, &listed)? {
+            reservation.settle();
+            return Ok(existing);
         }
         let args = self.create_args(spec)?;
         let created = match self.call(args, self.config().call_timeout) {
@@ -321,13 +469,21 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             schedule.resource == resource && schedule.state == ObservedScheduleState::Paused
         });
         if paused {
+            reservation.settle();
             Ok(resource)
         } else {
             Err(OrcaError::StateMismatch)
         }
     }
 
-    /// Observe a schedule's state and up to [`MAX_SCHEDULE_RUNS`] recent runs.
+    /// Observe a schedule's state and up to [`MAX_SCHEDULE_RUNS`] recent
+    /// runs, each judged against `readiness`.
+    ///
+    /// Orca's `completed` only means the launch step finished. A run whose
+    /// agent showed no [`crate::scheduling::ReadinessSignal`] within the
+    /// deadline is [`crate::scheduling::RunVerdict::LaunchFailed`], so a
+    /// launch swallowed by an interactive prompt is reported as one instead
+    /// of as a completed run.
     ///
     /// # Errors
     /// Call and parse failures. A schedule absent from a complete listing is
@@ -335,6 +491,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     pub fn inspect_schedule(
         &self,
         schedule: &ResourceRef,
+        readiness: &Readiness<'_>,
     ) -> Result<ScheduleObservation, OrcaError> {
         let automation = match self.owned(schedule) {
             Ok(automation) => automation,
@@ -355,17 +512,18 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         )?;
         runs.runs
             .sort_by_key(|run| std::cmp::Reverse(run.scheduled_for));
+        let recent: Vec<ScheduleRun> = runs
+            .runs
+            .iter()
+            .take(MAX_SCHEDULE_RUNS)
+            .map(|run| ScheduleRun {
+                outcome: run_outcome(run),
+                scheduled_for: run.scheduled_for.map(Timestamp::from_unix_millis),
+            })
+            .collect();
         Ok(ScheduleObservation {
             state: state_of(automation.enabled),
-            recent_runs: runs
-                .runs
-                .iter()
-                .take(MAX_SCHEDULE_RUNS)
-                .map(|run| ScheduleRun {
-                    outcome: run_outcome(run),
-                    scheduled_for: run.scheduled_for.map(Timestamp::from_unix_millis),
-                })
-                .collect(),
+            recent_runs: readiness.judge(&recent),
         })
     }
 
@@ -455,9 +613,18 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::DuplicateSchedules { .. }
         | OrcaError::BranchMismatch { .. }
         | OrcaError::TrialRequiresPaused
+        | OrcaError::ScheduleActive
+        | OrcaError::ScheduleDiffers { .. }
+        | OrcaError::ReservationRedirected
+        | OrcaError::ReservationUnavailable(_)
+        | OrcaError::InvalidBranch
+        | OrcaError::BranchUnobtainable { .. }
         | OrcaError::Schedule(_)
         | OrcaError::Contract(_) => EffectFailure::NotApplied(NotAppliedReason::Rejected),
-        OrcaError::Timeout => EffectFailure::Uncertain(UncertainReason::Timeout),
+        // Nothing was sent, but the holder may be about to install it.
+        OrcaError::Timeout | OrcaError::ReservationBusy => {
+            EffectFailure::Uncertain(UncertainReason::Timeout)
+        }
         OrcaError::Io(_) => EffectFailure::Uncertain(UncertainReason::Transport),
         OrcaError::OutputLimit { .. }
         | OrcaError::NoResult { .. }
@@ -530,10 +697,18 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         };
         match effect {
             ScheduleEffect::InstallDisabled { schedule } => {
-                let installed = self.installed_schedules().map_err(unavailable)?;
-                match plan_install(schedule.consumer(), &installed) {
-                    InstallPlan::Installed(schedule) => applied(&schedule, true),
-                    InstallPlan::Create | InstallPlan::Duplicates(_) => Ok(Lookup::Unknown),
+                let listed = self.automations().map_err(unavailable)?;
+                // Applied only when an install would reuse the schedule: one
+                // that is active or different is not what was requested.
+                match self.existing_install(schedule, &listed) {
+                    Ok(Some(existing)) => applied(&existing, true),
+                    Ok(None)
+                    | Err(
+                        OrcaError::ScheduleActive
+                        | OrcaError::ScheduleDiffers { .. }
+                        | OrcaError::DuplicateSchedules { .. },
+                    ) => Ok(Lookup::Unknown),
+                    Err(error) => Err(unavailable(error)),
                 }
             }
             ScheduleEffect::SetState { schedule, state } => match self.owned(schedule) {

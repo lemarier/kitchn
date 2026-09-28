@@ -8,8 +8,8 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Mutex, MutexGuard, PoisonError},
-    time::Duration,
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant},
 };
 
 use kitchen::adapters::orca::{Invocation, OrcaError, OrcaRunner, RawOutput};
@@ -76,11 +76,85 @@ pub struct SimTask {
     pub dispatch: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+/// One automation. Its definition is the flags it was created with; the
+/// listing derives Orca's stored fields from them, as `automations list`
+/// shows them on 1.4.212 (`agentId`, `rrule`, `precheck.timeoutSeconds`, ...).
+/// An automation built without flags has no readable definition.
+#[derive(Debug, Clone, Default)]
 pub struct SimAutomation {
     pub id: String,
     pub name: String,
     pub enabled: bool,
+    pub flags: BTreeMap<String, String>,
+}
+
+impl SimAutomation {
+    fn listing(&self) -> Value {
+        let flag = |name: &str| self.flags.get(name).map(String::as_str);
+        let selector = |name: &str| {
+            flag(name).map(|value| value.strip_prefix("id:").unwrap_or(value).to_owned())
+        };
+        let number = |name: &str| flag(name).and_then(|value| value.parse::<u64>().ok());
+        let precheck = flag("precheck").map(
+            |command| json!({"command": command, "timeoutSeconds": number("precheck-timeout")}),
+        );
+        json!({
+            "id": self.id,
+            "name": self.name,
+            "enabled": self.enabled,
+            "prompt": flag("prompt"),
+            "agentId": flag("provider"),
+            "timezone": flag("timezone"),
+            "rrule": flag("trigger"),
+            "missedRunGraceMinutes": number("missed-run-grace-minutes"),
+            "reuseSession": self.flags.contains_key("reuse-session"),
+            "precheck": precheck,
+            "workspaceMode": flag("workspace-mode"),
+            "workspaceId": selector("workspace"),
+            "baseBranch": flag("base-branch"),
+            "projectId": selector("repo"),
+        })
+    }
+}
+
+/// Holds the first `parties` callers of one command, after their calls took
+/// effect, until all of them arrived or `wait` passed. It makes concurrent
+/// callers interleave deterministically: each reads the state before any
+/// of them writes.
+#[derive(Debug, Clone)]
+struct Gate {
+    path: Vec<String>,
+    parties: usize,
+    wait: Duration,
+    arrived: Arc<(Mutex<usize>, Condvar)>,
+}
+
+impl Gate {
+    /// Count a caller in and return its arrival number.
+    fn arrive(&self) -> usize {
+        let (count, changed) = &*self.arrived;
+        let mut count = count.lock().unwrap_or_else(PoisonError::into_inner);
+        *count += 1;
+        changed.notify_all();
+        *count
+    }
+
+    /// Wait for the other parties, at most `wait`.
+    fn hold(&self) {
+        let (count, changed) = &*self.arrived;
+        let mut count = count.lock().unwrap_or_else(PoisonError::into_inner);
+        let end = Instant::now() + self.wait;
+        while *count < self.parties {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            count = changed
+                .wait_timeout(count, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -107,39 +181,54 @@ pub struct SimState {
     pub bound: Option<String>,
     /// How the next `worker-start` ends: `ready` or `failed`.
     pub start_state: &'static str,
+    /// The prefix Orca puts before the name of a worktree it creates.
+    pub branch_prefix: &'static str,
+    /// The branch an existing worktree is on, when Orca reports one.
+    pub existing_branch: Option<&'static str>,
+    gate: Option<Gate>,
     next: u64,
 }
 
-/// The simulated runtime.
+/// The simulated runtime, with the runtime directory its backends reserve
+/// keys in.
 #[derive(Debug)]
-pub struct SimOrca(Mutex<SimState>);
+pub struct SimOrca {
+    state: Mutex<SimState>,
+    dir: Option<tempfile::TempDir>,
+}
 
 impl Default for SimOrca {
     fn default() -> Self {
-        Self(Mutex::new(SimState {
-            version: "1.4.212",
-            ready: true,
-            features: vec![
-                "orchestration.contract.v1",
-                "orchestration.worker-stop-verdict.v1",
-            ],
-            tasks: Vec::new(),
-            workers: BTreeMap::new(),
-            automations: Vec::new(),
-            runs: Vec::new(),
-            worker_pages: Vec::new(),
-            mail: json!({"deliveryId": null, "messages": [], "count": 0}),
-            faults: VecDeque::new(),
-            calls: Vec::new(),
-            deadlines: Vec::new(),
-            effects: 0,
-            stop_state: "stopped",
-            release_action: "released",
-            ignore_edits: false,
-            bound: None,
-            start_state: "ready",
-            next: 0,
-        }))
+        Self {
+            dir: tempfile::tempdir().ok(),
+            state: Mutex::new(SimState {
+                version: "1.4.212",
+                ready: true,
+                features: vec![
+                    "orchestration.contract.v1",
+                    "orchestration.worker-stop-verdict.v1",
+                ],
+                tasks: Vec::new(),
+                workers: BTreeMap::new(),
+                automations: Vec::new(),
+                runs: Vec::new(),
+                worker_pages: Vec::new(),
+                mail: json!({"deliveryId": null, "messages": [], "count": 0}),
+                faults: VecDeque::new(),
+                calls: Vec::new(),
+                deadlines: Vec::new(),
+                effects: 0,
+                stop_state: "stopped",
+                release_action: "released",
+                ignore_edits: false,
+                bound: None,
+                start_state: "ready",
+                branch_prefix: "lemarier/",
+                existing_branch: None,
+                gate: None,
+                next: 0,
+            }),
+        }
     }
 }
 
@@ -187,7 +276,15 @@ fn parse(args: &[String]) -> Parsed {
 
 impl SimOrca {
     pub fn state(&self) -> MutexGuard<'_, SimState> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The directory backends of this simulator share for reservations.
+    pub fn runtime_dir(&self) -> Result<std::path::PathBuf, &'static str> {
+        self.dir
+            .as_ref()
+            .map(|dir| dir.path().to_path_buf())
+            .ok_or("no temporary directory")
     }
 
     /// Apply `fault` to the next call of any command.
@@ -199,6 +296,18 @@ impl SimOrca {
     pub fn fault_on(&self, path: &[&str], fault: Fault) {
         let path = path.iter().map(|part| (*part).to_owned()).collect();
         self.state().faults.push_back((Some(path), fault));
+    }
+
+    /// Hold the first `parties` calls of the command at `path` until all
+    /// of them were made (or `wait` passed), so they read state before any
+    /// of them writes.
+    pub fn interleave(&self, path: &[&str], parties: usize, wait: Duration) {
+        self.state().gate = Some(Gate {
+            path: path.iter().map(|part| (*part).to_owned()).collect(),
+            parties,
+            wait,
+            arrived: Arc::new((Mutex::new(0), Condvar::new())),
+        });
     }
 
     pub fn set_worker(&self, dispatch: &str, worker: SimWorker) {
@@ -302,10 +411,14 @@ impl SimState {
                 };
                 worker.task = Some(task_id.clone());
                 worker.worktree = Some(worktree.clone());
-                // Orca prefixes the requested worktree name and reports the full ref.
-                worker.branch = flags
-                    .get("name")
-                    .map(|name| format!("refs/heads/lemarier/{name}"));
+                // Orca prefixes the requested worktree name and reports the
+                // full ref; an existing worktree keeps the branch it has.
+                worker.branch = match flags.get("name") {
+                    Some(name) => Some(format!("refs/heads/{}{name}", self.branch_prefix)),
+                    None => self
+                        .existing_branch
+                        .map(|branch| format!("refs/heads/{branch}")),
+                };
                 self.workers.insert(dispatch.clone(), worker);
                 self.mutation(json!({
                     "runId": "run_sim",
@@ -438,12 +551,7 @@ impl SimState {
                 ok(self.mail.clone())
             }
             ["automations", "list"] => ok(json!({
-                "automations": self.automations.iter().map(|automation| json!({
-                    "id": automation.id,
-                    "name": automation.name,
-                    "enabled": automation.enabled,
-                    "prompt": "private prompt text",
-                })).collect::<Vec<_>>()
+                "automations": self.automations.iter().map(SimAutomation::listing).collect::<Vec<_>>()
             })),
             ["automations", "create"] => {
                 let id = self.next_id("auto-");
@@ -452,6 +560,7 @@ impl SimState {
                     id: id.clone(),
                     name: Self::flag(flags, "name"),
                     enabled: flags.contains_key("enabled"),
+                    flags: flags.clone(),
                 });
                 ok(json!({"automation": {"id": id, "name": flags.get("name"), "enabled": false}}))
             }
@@ -490,30 +599,44 @@ impl SimState {
 
 impl OrcaRunner for SimOrca {
     fn run(&self, invocation: &Invocation) -> Result<RawOutput, OrcaError> {
-        let mut state = self.state();
-        state.calls.push(invocation.args().to_vec());
-        state.deadlines.push(invocation.deadline());
         let parsed = parse(invocation.args());
-        let matching = state
-            .faults
-            .iter()
-            .position(|(path, _)| path.as_ref().is_none_or(|path| path == &parsed.path));
-        let fault = matching
-            .and_then(|index| state.faults.remove(index))
-            .map(|(_, fault)| fault);
-        match fault {
-            None => Ok(state.handle(&parsed)),
-            Some(Fault::Spawn) => Err(OrcaError::Spawn(std::io::ErrorKind::NotFound)),
-            Some(Fault::TimeoutBeforeEffect) => Err(OrcaError::Timeout),
-            Some(Fault::TimeoutAfterEffect) => {
-                let _ = state.handle(&parsed);
-                Err(OrcaError::Timeout)
-            }
-            Some(Fault::Refuse(code)) => Ok(refuse(code)),
-            Some(Fault::Garbage) => Ok(RawOutput {
-                exit_code: Some(0),
-                stdout: b"Orca is updating...".to_vec(),
-            }),
+        let (result, held) = {
+            let mut state = self.state();
+            state.calls.push(invocation.args().to_vec());
+            state.deadlines.push(invocation.deadline());
+            let matching = state
+                .faults
+                .iter()
+                .position(|(path, _)| path.as_ref().is_none_or(|path| path == &parsed.path));
+            let fault = matching
+                .and_then(|index| state.faults.remove(index))
+                .map(|(_, fault)| fault);
+            let result = match fault {
+                None => Ok(state.handle(&parsed)),
+                Some(Fault::Spawn) => Err(OrcaError::Spawn(std::io::ErrorKind::NotFound)),
+                Some(Fault::TimeoutBeforeEffect) => Err(OrcaError::Timeout),
+                Some(Fault::TimeoutAfterEffect) => {
+                    let _ = state.handle(&parsed);
+                    Err(OrcaError::Timeout)
+                }
+                Some(Fault::Refuse(code)) => Ok(refuse(code)),
+                Some(Fault::Garbage) => Ok(RawOutput {
+                    exit_code: Some(0),
+                    stdout: b"Orca is updating...".to_vec(),
+                }),
+            };
+            let held = state
+                .gate
+                .as_ref()
+                .filter(|gate| gate.path == parsed.path)
+                .filter(|gate| gate.arrive() <= gate.parties)
+                .cloned();
+            (result, held)
+        };
+        // Wait outside the state lock so the other callers can arrive.
+        if let Some(gate) = held {
+            gate.hold();
         }
+        result
     }
 }

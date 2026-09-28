@@ -249,7 +249,7 @@ impl CronExpr {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "at", rename_all = "kebab-case")]
 pub enum Recurrence {
-    /// Every hour.
+    /// Every hour, at minute 0.
     Hourly,
     /// Every day at a time.
     Daily(TimeOfDay),
@@ -259,6 +259,25 @@ pub enum Recurrence {
     Weekly(Weekday, TimeOfDay),
     /// A cron expression.
     Cron(CronExpr),
+}
+
+impl Recurrence {
+    /// The five-field cron expression that fires at these times, with
+    /// Sunday as day 0. Adapters that store a schedule as cron use this one
+    /// form for every recurrence, so an installed schedule can be compared
+    /// with a requested one without knowing a backend's preset encodings.
+    #[must_use]
+    pub fn cron(&self) -> String {
+        match self {
+            Self::Hourly => "0 * * * *".to_owned(),
+            Self::Daily(at) => format!("{} {} * * *", at.minute(), at.hour()),
+            Self::Weekdays(at) => format!("{} {} * * 1-5", at.minute(), at.hour()),
+            Self::Weekly(day, at) => {
+                format!("{} {} * * {}", at.minute(), at.hour(), day.number())
+            }
+            Self::Cron(expr) => expr.as_str().to_owned(),
+        }
+    }
 }
 
 /// Longest accepted time zone name in bytes.

@@ -23,13 +23,33 @@
 //!   Dispatch. A response lost before the Task exists stays unknown: a
 //!   missing Task is not proof the create will not land. Messages and replies
 //!   carry no key, so lookup and idempotency are declared partial.
+//! - Concurrent first submissions. A Task title is a marker, not a uniqueness
+//!   constraint, so two callers that both list before either creates would
+//!   both create. Launches and schedule installs therefore hold a per-key
+//!   reservation, an advisory lock file in [`OrcaConfig::runtime_dir`], across
+//!   list, create, and start. The state store serializes the effects of one
+//!   task, but a lookup that finds no Task may be looking at a first
+//!   submission still in flight, and the resubmission it allows then races
+//!   it. The adapter is also called without the store and by several
+//!   processes against one Orca, and the store never holds its lock across a
+//!   backend call. A wait that ends is reported as uncertain, never as proof
+//!   the effect did not happen.
 //! - Launch readiness is positive evidence: `worker-start` succeeds only for
 //!   a ready worker, and `Ready` also needs a `live` fleet verdict. A failed
 //!   start is a failed launch. For schedules, Orca's `completed` run only
-//!   means the launch step finished; see [`crate::scheduling::run_verdict`].
-//! - Branches. Orca prefixes the worktree name it is given; launch receipts
-//!   name the branch Orca created, and [`verify_branch`] reports a mismatch
-//!   before the first push.
+//!   means the launch step finished: [`OrcaBackend::inspect_schedule`] joins
+//!   each run with Kitchen's own [`crate::scheduling::ReadinessSignal`]s and
+//!   a deadline, so a swallowed launch is reported as
+//!   [`crate::scheduling::RunVerdict::LaunchFailed`].
+//! - Branches. Orca prefixes the worktree name it is given. A launch with a
+//!   requested branch ([`RequestedBranch`], supplied through
+//!   [`OrcaBackend::with_branch_source`] until the launch contract carries
+//!   it) passes the name that yields it and verifies the branch Orca created.
+//!   Orca offers no way to start a worker only after checking its branch, so
+//!   on a mismatch the adapter stops the worker it just started, and holds
+//!   the launch as uncertain; [`OrcaBackend::verify_launch_branch`] reports
+//!   both branches. Receipts always name the branch Orca created, and
+//!   [`verify_branch`] checks any receipt.
 //! - A terminal a person took over (`user_takeover`) is retained, not
 //!   failed; the adapter sends such a worker no messages.
 //! - Mailbox waits return whole batches, heartbeats included; heartbeats are
@@ -51,23 +71,28 @@
 //! - Schedules. `automations create`, `edit`, `remove`, and `run` take no
 //!   request key. Installs are named `kitchen:<house>:<consumer>`, created
 //!   disabled, reconciled against a complete listing before and after every
-//!   create, and every change is read back. Orca cannot tell an idle precheck
+//!   create, and every change is read back. An existing schedule is reused
+//!   only when it is paused and matches the requested definition; an active
+//!   or different one is refused and never changed. Orca cannot tell an idle precheck
 //!   from a failed one, and cannot prevent overlapping runs of one schedule;
 //!   Kitchen's consumer lease must.
 
 mod backend;
+mod branch;
 mod error;
 mod inspect;
 mod process;
 mod redact;
+mod reserve;
 mod runtime;
 mod schedule;
 mod wire;
 
 pub use backend::{
-    DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, MAX_RUN_TASKS, OrcaBackend, OrcaConfig,
-    launch_marker, verify_branch,
+    DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, MAX_RUN_TASKS,
+    OrcaBackend, OrcaConfig, launch_marker, verify_branch,
 };
+pub use branch::RequestedBranch;
 pub use error::OrcaError;
 pub use inspect::{
     Delivery, MAX_INVENTORY_PAGES, MAX_MAILBOX_WAIT, MailMessage, MessageKind, RetainedReason,

@@ -1,8 +1,11 @@
 //! Schedule observations and install reconciliation.
 
+use std::time::Duration;
+
 use crate::{
     ConsumerId,
     contracts::{ResourceRef, Timestamp},
+    state::{ConsumerEvent, ConsumerRecord},
 };
 
 /// Most recent runs one observation reports.
@@ -104,13 +107,137 @@ pub fn run_verdict(
     }
 }
 
+/// Kitchen's own record that a scheduled run's agent started, such as the
+/// workflow acquiring its consumer lease. A backend's report that a launch
+/// finished is not one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReadinessSignal {
+    at: Timestamp,
+}
+
+impl ReadinessSignal {
+    /// A signal recorded at `at`.
+    #[must_use]
+    pub const fn new(at: Timestamp) -> Self {
+        Self { at }
+    }
+
+    /// When Kitchen recorded it.
+    #[must_use]
+    pub const fn at(self) -> Timestamp {
+        self.at
+    }
+
+    /// The signals in a consumer scope's recorded history: each time a
+    /// consumer acquired, adopted, or took over the scope. Handing the scope
+    /// over (relinquish, release) is not readiness.
+    ///
+    /// Scheduled and interactive consumers share a scope, so a session that
+    /// acquired it inside a run's deadline counts for that run; pass only
+    /// the signals that belong to scheduled runs when they can be told apart.
+    #[must_use]
+    pub fn from_consumer(record: &ConsumerRecord) -> Vec<Self> {
+        record
+            .history()
+            .filter_map(|event| match event {
+                ConsumerEvent::Acquired { at, .. }
+                | ConsumerEvent::Adopted { at, .. }
+                | ConsumerEvent::TakenOver { at, .. } => Some(Self::new(*at)),
+                ConsumerEvent::Relinquished { .. } | ConsumerEvent::Released { .. } => None,
+            })
+            .collect()
+    }
+}
+
+/// The evidence and clock a schedule's runs are judged against.
+#[derive(Debug, Clone, Copy)]
+pub struct Readiness<'a> {
+    signals: &'a [ReadinessSignal],
+    now: Timestamp,
+    deadline: Duration,
+}
+
+impl<'a> Readiness<'a> {
+    /// Judge runs at `now`, allowing each run `deadline` after it was due to
+    /// show a signal in `signals`.
+    #[must_use]
+    pub const fn new(signals: &'a [ReadinessSignal], now: Timestamp, deadline: Duration) -> Self {
+        Self {
+            signals,
+            now,
+            deadline,
+        }
+    }
+
+    /// Judge each run with [`run_verdict`].
+    ///
+    /// A signal counts for the newest run due at or before it, and only when
+    /// it came within the deadline: a session that started long after a
+    /// swallowed launch does not vindicate that launch. A run with no due
+    /// time has nothing to join a signal to and stays pending.
+    #[must_use]
+    pub fn judge(&self, runs: &[ScheduleRun]) -> Vec<JudgedRun> {
+        runs.iter()
+            .map(|run| {
+                let ready = run.scheduled_for.is_some_and(|due| {
+                    let next_due = runs
+                        .iter()
+                        .filter_map(|other| other.scheduled_for)
+                        .filter(|other| *other > due)
+                        .min();
+                    let end = due.saturating_add(self.deadline);
+                    self.signals.iter().any(|signal| {
+                        signal.at >= due
+                            && signal.at <= end
+                            && next_due.is_none_or(|next| signal.at < next)
+                    })
+                });
+                JudgedRun {
+                    run: *run,
+                    verdict: run_verdict(run, ready, self.now, self.deadline),
+                }
+            })
+            .collect()
+    }
+}
+
+/// A run and how it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JudgedRun {
+    /// What the backend recorded.
+    pub run: ScheduleRun,
+    /// How it ended once readiness evidence is taken into account.
+    pub verdict: RunVerdict,
+}
+
 /// A read-only view of one schedule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleObservation {
     /// Its state.
     pub state: ObservedScheduleState,
-    /// Up to [`MAX_SCHEDULE_RUNS`] runs, newest first.
-    pub recent_runs: Vec<ScheduleRun>,
+    /// Up to [`MAX_SCHEDULE_RUNS`] runs with their verdicts, newest first.
+    pub recent_runs: Vec<JudgedRun>,
+}
+
+/// A part of a schedule definition an installed schedule can differ in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ScheduleField {
+    /// The prompt the agent receives.
+    Prompt,
+    /// The agent family.
+    Agent,
+    /// When it fires.
+    Recurrence,
+    /// The time zone it fires in.
+    Timezone,
+    /// The precheck command or its timeout.
+    Precheck,
+    /// Where runs happen, including the repository and base branch.
+    Workspace,
+    /// The missed-run grace window.
+    MissedRunGrace,
+    /// Whether runs reuse the previous session.
+    SessionReuse,
 }
 
 /// A schedule a backend reports as installed for this house.

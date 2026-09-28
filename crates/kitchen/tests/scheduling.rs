@@ -1,15 +1,19 @@
 //! Portable schedule definitions and install reconciliation.
 
+mod common;
+
 use std::time::Duration;
 
+use common::{Fixture, at, scheduled, ttl};
 use kitchen::{
     BackendId, ConsumerId,
     contracts::{ExternalRef, ResourceKind, ResourceRef, Text},
     scheduling::{
-        AgentFamily, CronExpr, GraceMinutes, InstallPlan, InstalledSchedule, MAX_PRECHECK_ARGS,
-        ObservedScheduleState, Precheck, PrecheckOutcome, PrecheckTimeout, Recurrence, RunOutcome,
-        RunVerdict, ScheduleError, ScheduleRun, ScheduleSpec, ScheduleWorkspace, TimeOfDay,
-        Timezone, WorkflowName, plan_install, run_verdict,
+        AgentFamily, CronExpr, GraceMinutes, InstallPlan, InstalledSchedule, JudgedRun,
+        MAX_PRECHECK_ARGS, ObservedScheduleState, Precheck, PrecheckOutcome, PrecheckTimeout,
+        Readiness, ReadinessSignal, Recurrence, RunOutcome, RunVerdict, ScheduleError, ScheduleRun,
+        ScheduleSpec, ScheduleWorkspace, TimeOfDay, Timezone, Weekday, WorkflowName, plan_install,
+        run_verdict,
     },
 };
 
@@ -292,4 +296,155 @@ fn an_agent_that_never_became_ready_is_a_launch_failure() {
             "{outcome:?}"
         );
     }
+}
+
+#[test]
+fn recurrences_have_one_canonical_cron_form() -> TestResult {
+    let nine_oh_five = TimeOfDay::new(9, 5)?;
+    let cases = [
+        (Recurrence::Hourly, "0 * * * *"),
+        (Recurrence::Daily(nine_oh_five), "5 9 * * *"),
+        (
+            Recurrence::Weekdays(TimeOfDay::new(17, 30)?),
+            "30 17 * * 1-5",
+        ),
+        (
+            Recurrence::Weekly(Weekday::Sunday, TimeOfDay::new(0, 0)?),
+            "0 0 * * 0",
+        ),
+        (
+            Recurrence::Weekly(Weekday::Saturday, TimeOfDay::new(23, 59)?),
+            "59 23 * * 6",
+        ),
+        (
+            Recurrence::Cron(CronExpr::new("17,37,57 * * * *")?),
+            "17,37,57 * * * *",
+        ),
+    ];
+    for (recurrence, cron) in cases {
+        assert_eq!(recurrence.cron(), cron);
+        assert!(CronExpr::new(&recurrence.cron()).is_ok(), "{cron}");
+    }
+    Ok(())
+}
+
+fn run(outcome: RunOutcome, due_seconds: Option<u64>) -> ScheduleRun {
+    ScheduleRun {
+        outcome,
+        scheduled_for: due_seconds.map(at),
+    }
+}
+
+fn verdicts(
+    runs: &[ScheduleRun],
+    signals: &[ReadinessSignal],
+    now_seconds: u64,
+) -> Vec<RunVerdict> {
+    Readiness::new(signals, at(now_seconds), Duration::from_secs(300))
+        .judge(runs)
+        .iter()
+        .map(|judged: &JudgedRun| judged.verdict)
+        .collect()
+}
+
+#[test]
+fn a_signal_counts_for_the_run_it_followed_within_the_deadline() {
+    let launched = [run(RunOutcome::LaunchReported, Some(1_000))];
+    let signal = |seconds| [ReadinessSignal::new(at(seconds))];
+    let late = 1_000 + 3_600;
+    // From the moment the run is due until the deadline, inclusive.
+    assert_eq!(
+        verdicts(&launched, &signal(1_000), late),
+        [RunVerdict::Started]
+    );
+    assert_eq!(
+        verdicts(&launched, &signal(1_300), late),
+        [RunVerdict::Started]
+    );
+    // Before it was due, or after the deadline, it is not evidence.
+    assert_eq!(
+        verdicts(&launched, &signal(999), late),
+        [RunVerdict::LaunchFailed]
+    );
+    assert_eq!(
+        verdicts(&launched, &signal(1_301), late),
+        [RunVerdict::LaunchFailed]
+    );
+    assert_eq!(verdicts(&launched, &[], late), [RunVerdict::LaunchFailed]);
+    // Within the deadline and without a signal the run is only pending.
+    assert_eq!(verdicts(&launched, &[], 1_100), [RunVerdict::Pending]);
+    assert_eq!(
+        verdicts(
+            &[run(RunOutcome::Pending, Some(1_000))],
+            &signal(1_010),
+            1_020
+        ),
+        [RunVerdict::Started]
+    );
+}
+
+#[test]
+fn a_signal_at_the_next_run_belongs_to_the_next_run() {
+    // Newest first, as Orca lists them. The signal falls inside both runs'
+    // deadlines, but only the newer run was due when it was recorded.
+    let runs = [
+        run(RunOutcome::LaunchReported, Some(1_200)),
+        run(RunOutcome::LaunchReported, Some(1_000)),
+    ];
+    let now = 1_200 + 3_600;
+    assert_eq!(
+        verdicts(&runs, &[ReadinessSignal::new(at(1_200))], now),
+        [RunVerdict::Started, RunVerdict::LaunchFailed]
+    );
+    assert_eq!(
+        verdicts(&runs, &[ReadinessSignal::new(at(1_199))], now),
+        [RunVerdict::LaunchFailed, RunVerdict::Started]
+    );
+}
+
+#[test]
+fn readiness_never_changes_what_the_backend_already_decided() {
+    let now = 100_000;
+    let signal = [ReadinessSignal::new(at(1_001))];
+    let decided = [
+        (RunOutcome::LaunchFailed, RunVerdict::LaunchFailed),
+        (RunOutcome::PrecheckIdle, RunVerdict::Idle),
+        (RunOutcome::PrecheckFailed, RunVerdict::PrecheckFailed),
+        (RunOutcome::Skipped, RunVerdict::Skipped),
+        (RunOutcome::Unknown, RunVerdict::Unknown),
+    ];
+    for (outcome, verdict) in decided {
+        assert_eq!(
+            verdicts(&[run(outcome, Some(1_000))], &signal, now),
+            [verdict],
+            "{outcome:?}"
+        );
+    }
+    // A run with no due time has nothing to join a signal to.
+    assert_eq!(
+        verdicts(&[run(RunOutcome::LaunchReported, None)], &signal, now),
+        [RunVerdict::Pending]
+    );
+    assert_eq!(verdicts(&[], &signal, now), []);
+}
+
+#[test]
+fn consumer_history_supplies_readiness_signals() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let pickup = ConsumerId::new("pickup")?;
+    let first = store.acquire_consumer(&pickup, &scheduled("tick-1")?, ttl(60)?, at(10))?;
+    store.relinquish_consumer(&pickup, first.fence(), at(20))?;
+    let adopted = store.acquire_consumer(&pickup, &scheduled("tick-2")?, ttl(60)?, at(30))?;
+    store.release_consumer(&pickup, adopted.fence(), at(40))?;
+    store.acquire_consumer(&pickup, &scheduled("tick-3")?, ttl(60)?, at(50))?;
+    store.take_over_consumer(&pickup, &scheduled("tick-4")?, ttl(60)?, at(200))?;
+    let record = store.consumer(&pickup)?.ok_or("a recorded scope")?;
+    let signals = ReadinessSignal::from_consumer(&record);
+    assert_eq!(
+        signals.iter().map(|signal| signal.at()).collect::<Vec<_>>(),
+        [at(10), at(30), at(50), at(200)],
+        "acquire, adopt, and takeover start work; relinquish and release do not"
+    );
+    Ok(())
 }

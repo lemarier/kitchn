@@ -17,15 +17,24 @@
 //! carry no key and cannot be deduplicated or looked up, so the backend
 //! declares lookup and idempotent requests as partial and `lookup` reports
 //! them unsupported.
+//!
+//! A launch holds a per-key reservation (see [`OrcaConfig::runtime_dir`])
+//! across listing, creating, and starting, so concurrent first submissions of
+//! one key create one Task, not two. A launch with a requested branch passes
+//! the worktree name that yields it, verifies the branch Orca created, and
+//! stops the worker it just started when they differ.
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
     BackendId, CredentialId, HouseId,
-    adapters::orca::{Invocation, OrcaError, OrcaRunner, RuntimeInfo, runtime, wire},
+    adapters::orca::{
+        Invocation, OrcaError, OrcaRunner, RequestedBranch, RuntimeInfo, branch::BranchSource,
+        reserve::Reservation, runtime, wire,
+    },
     contracts::{
         BackendDescriptor, BackendUnavailable, Capability, Effect, EffectExecutor, EffectFailure,
         EffectRequest, ExternalRef, IdempotencyKey, Lookup, MAX_INVENTORY_RESOURCES,
@@ -41,6 +50,11 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default readiness wait Orca applies to a worker launch.
 pub const DEFAULT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Default longest wait for a reservation another caller holds: longer than
+/// one launch ([`DEFAULT_LAUNCH_TIMEOUT`] plus its margin) and the calls
+/// around it.
+pub const DEFAULT_RESERVATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Most Orca Tasks one Run listing may hold before it is refused as incomplete.
 pub const MAX_RUN_TASKS: usize = 1000;
@@ -83,6 +97,15 @@ pub struct OrcaConfig {
     pub call_timeout: Duration,
     /// How long Orca waits for a launched worker to become ready.
     pub launch_timeout: Duration,
+    /// House-scoped runtime storage, outside any Git checkout and private to
+    /// the Kitchen user, where reservation files serialize launches and
+    /// schedule installs across callers and processes. Every caller acting on
+    /// one house and Orca host must use the same directory.
+    pub runtime_dir: PathBuf,
+    /// Longest wait for a reservation another caller holds; it should outlast
+    /// a launch. A wait that ends sent nothing to Orca and reports the effect
+    /// as uncertain, because the holder may be about to apply it.
+    pub reservation_timeout: Duration,
 }
 
 /// An Orca-backed [`WorkerBackend`] and schedule executor for one house.
@@ -92,6 +115,7 @@ pub struct OrcaBackend<R> {
     descriptor: BackendDescriptor,
     runtime: RuntimeInfo,
     runner: R,
+    branches: BranchSource,
 }
 
 #[derive(Deserialize)]
@@ -236,6 +260,22 @@ pub(crate) struct Liveness {
 /// Prefix of every launch marker.
 const MARKER_PREFIX: &str = "kitchen:";
 
+/// The FNV-1a 128-bit hash of `house` and `name`, which are separated so
+/// neither can run into the other. Stable across releases: the launch marker
+/// persists in Orca Task titles.
+pub(crate) fn key_digest(house: &HouseId, name: &str) -> u128 {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    house
+        .as_str()
+        .bytes()
+        .chain(std::iter::once(b'\n'))
+        .chain(name.bytes())
+        .fold(OFFSET, |hash, byte| {
+            (hash ^ u128::from(byte)).wrapping_mul(PRIME)
+        })
+}
+
 /// The Orca Task title that marks the launch for `key` in `house`.
 ///
 /// Orca truncates Task titles to 80 characters, and idempotency keys can be
@@ -245,17 +285,7 @@ const MARKER_PREFIX: &str = "kitchen:";
 /// Inventory reports this marker as a worker's owner.
 #[must_use]
 pub fn launch_marker(house: &HouseId, key: &IdempotencyKey) -> String {
-    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
-    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
-    let digest = house
-        .as_str()
-        .bytes()
-        .chain(std::iter::once(b'\n'))
-        .chain(key.as_str().bytes())
-        .fold(OFFSET, |hash, byte| {
-            (hash ^ u128::from(byte)).wrapping_mul(PRIME)
-        });
-    format!("{MARKER_PREFIX}{digest:032x}")
+    format!("{MARKER_PREFIX}{:032x}", key_digest(house, key.as_str()))
 }
 
 /// Check that a launch receipt names exactly the `requested` branch.
@@ -329,8 +359,17 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
         OrcaError::Refused { code, .. } if PREFLIGHT_REFUSALS.contains(&code.as_str()) => {
             not_applied()
         }
-        OrcaError::Timeout => EffectFailure::Uncertain(UncertainReason::Timeout),
+        // Nothing was sent, but the holder may be about to apply the effect.
+        OrcaError::Timeout | OrcaError::ReservationBusy => {
+            EffectFailure::Uncertain(UncertainReason::Timeout)
+        }
         OrcaError::Io(_) => EffectFailure::Uncertain(UncertainReason::Transport),
+        OrcaError::ReservationRedirected
+        | OrcaError::ReservationUnavailable(_)
+        | OrcaError::InvalidBranch
+        | OrcaError::BranchUnobtainable { .. }
+        | OrcaError::ScheduleActive
+        | OrcaError::ScheduleDiffers { .. } => not_applied(),
         OrcaError::Refused { .. }
         | OrcaError::OutputLimit { .. }
         | OrcaError::NoResult { .. }
@@ -369,6 +408,13 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::DuplicateSchedules { .. }
         | OrcaError::BranchMismatch { .. }
         | OrcaError::TrialRequiresPaused
+        | OrcaError::ScheduleActive
+        | OrcaError::ScheduleDiffers { .. }
+        | OrcaError::ReservationBusy
+        | OrcaError::ReservationRedirected
+        | OrcaError::ReservationUnavailable(_)
+        | OrcaError::InvalidBranch
+        | OrcaError::BranchUnobtainable { .. }
         | OrcaError::InstallUncertain
         | OrcaError::StateMismatch
         | OrcaError::Schedule(_)
@@ -406,7 +452,24 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             descriptor,
             runtime,
             runner,
+            branches: BranchSource::default(),
         })
+    }
+
+    /// Ask `source` which branch each launch must land on.
+    ///
+    /// A shim until [`Operation::LaunchWorker`] carries a requested branch:
+    /// the source reads it from wherever the caller keeps it, such as the
+    /// task, and returns `None` for launches that need no particular branch.
+    /// Once the contract has the field, `requested_branch` reads it from the
+    /// operation and this method goes away.
+    #[must_use]
+    pub fn with_branch_source(
+        mut self,
+        source: impl Fn(&EffectRequest) -> Option<RequestedBranch> + Send + Sync + 'static,
+    ) -> Self {
+        self.branches = BranchSource::new(source);
+        self
     }
 
     /// What the runtime probe established.
@@ -570,6 +633,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         key: &IdempotencyKey,
         task: &str,
         workspace: &Workspace,
+        name: Option<&str>,
     ) -> Result<Receipt, EffectFailure> {
         let timeout_ms = u64::try_from(self.config.launch_timeout.as_millis()).unwrap_or(u64::MAX);
         let mut args = wire::Args::command(&["orchestration", "worker-start"])
@@ -583,7 +647,10 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 let args = args
                     .value("worktree", "new-top-level")
                     .value("repo", self.config.repo.as_str())
-                    .value("name", &format!("kitchen-{task}"));
+                    .value(
+                        "name",
+                        &name.map_or_else(|| format!("kitchen-{task}"), str::to_owned),
+                    );
                 match &self.config.base_branch {
                     Some(base) => args.value("base-branch", base.as_str()),
                     None => args,
@@ -629,11 +696,65 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }
     }
 
+    /// Launch, or return the launch this key already made.
+    ///
+    /// The reservation for the key is held across listing, creating, and
+    /// starting: without it two first submissions could both list, both find
+    /// no Task, and both create one. A launch that reached Orca as a
+    /// dispatched Task settles the reservation, since no later submission can
+    /// repeat it.
     fn launch(
         &self,
         key: &IdempotencyKey,
         workspace: &Workspace,
         brief: &Text,
+        branch: Option<&RequestedBranch>,
+    ) -> Result<Receipt, EffectFailure> {
+        // A branch no worktree name can yield is refused before anything exists.
+        let name = match (workspace, branch) {
+            (Workspace::Isolated, Some(branch)) => Some(
+                branch
+                    .worktree_name()
+                    .map_err(|error| call_failure(&error))?,
+            ),
+            (Workspace::Isolated | Workspace::Existing(_), _) => None,
+        };
+        let mut reservation = self
+            .reserve(format!(
+                "launch-{:032x}",
+                key_digest(&self.config.house, key.as_str())
+            ))
+            .map_err(|error| call_failure(&error))?;
+        let receipt = self.launch_reserved(key, workspace, brief, name)?;
+        reservation.settle();
+        let Some(branch) = branch else {
+            return Ok(receipt);
+        };
+        if verify_branch(&receipt, branch.as_str()).is_ok() {
+            return Ok(receipt);
+        }
+        // The worker already runs on another branch and could push to it.
+        // Stop it while the reservation still keeps other callers out. The
+        // launch is uncertain whether or not the stop took effect, because a
+        // worker, its worktree, and its branch exist, so the stop's result is
+        // not reported here: `observe_worker` shows a worker that still runs,
+        // and `verify_launch_branch` reports why the launch was held.
+        if let Some(worker) = receipt
+            .created()
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::Worker)
+        {
+            let _ = self.cancel(worker);
+        }
+        Err(response_lost())
+    }
+
+    fn launch_reserved(
+        &self,
+        key: &IdempotencyKey,
+        workspace: &Workspace,
+        brief: &Text,
+        name: Option<String>,
     ) -> Result<Receipt, EffectFailure> {
         let task = match self
             .task_launch(key)
@@ -644,7 +765,22 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             TaskLaunch::Undispatched(task) => task,
             TaskLaunch::None => self.create_task(key, brief)?,
         };
-        self.start(key, &task, workspace)
+        self.start(key, &task, workspace, name.as_deref())
+    }
+
+    /// Reserve `stem` under this instance's runtime directory.
+    pub(crate) fn reserve(&self, stem: String) -> Result<Reservation, OrcaError> {
+        Reservation::acquire(
+            &self.config.runtime_dir,
+            &stem,
+            self.config.reservation_timeout,
+        )
+    }
+
+    /// The branch a launch must land on. A shim: the contract has no such
+    /// field yet, so the caller's [`Self::with_branch_source`] answers.
+    fn requested_branch(&self, request: &EffectRequest) -> Option<RequestedBranch> {
+        self.branches.requested(request)
     }
 
     /// A receipt for a mutation on one Dispatch, referenced by that Dispatch
@@ -803,6 +939,33 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }
     }
 
+    /// Check that the launch `key` started is on the `requested` branch.
+    ///
+    /// This is how a caller learns why a launch with a requested branch was
+    /// held: [`EffectExecutor::execute`] reports only that the launch is
+    /// uncertain.
+    ///
+    /// # Errors
+    /// [`OrcaError::BranchMismatch`] naming both branches. `actual` is `None`
+    /// when Orca records no branch or the key has no dispatched launch: the
+    /// request cannot be confirmed either way. Other errors when Orca cannot
+    /// be read.
+    pub fn verify_launch_branch(
+        &self,
+        key: &IdempotencyKey,
+        requested: &RequestedBranch,
+    ) -> Result<(), OrcaError> {
+        match self.task_launch(key)? {
+            TaskLaunch::Dispatched(receipt) => verify_branch(&receipt, requested.as_str()),
+            TaskLaunch::None | TaskLaunch::Undispatched(_) | TaskLaunch::Unclear => {
+                Err(OrcaError::BranchMismatch {
+                    requested: requested.to_string(),
+                    actual: None,
+                })
+            }
+        }
+    }
+
     /// Look up a persisted request, operation by operation.
     ///
     /// Launches are found through their Task, stops and releases through the
@@ -825,7 +988,18 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             }
         };
         match operation {
-            Operation::LaunchWorker { .. } => self.lookup_launch(request.key()),
+            Operation::LaunchWorker { .. } => {
+                let found = self.lookup_launch(request.key())?;
+                // A launch on the wrong branch was held, not accepted.
+                Ok(match (&found, self.requested_branch(request)) {
+                    (Lookup::Applied(receipt), Some(branch))
+                        if verify_branch(receipt, branch.as_str()).is_err() =>
+                    {
+                        Lookup::Unknown
+                    }
+                    _ => found,
+                })
+            }
             Operation::MessageWorker { .. } | Operation::ReplyToWorker { .. } => {
                 Ok(Lookup::Unknown)
             }
@@ -892,7 +1066,12 @@ impl<R: OrcaRunner> EffectExecutor for OrcaBackend<R> {
                 role: _,
                 workspace,
                 brief,
-            } => self.launch(request.key(), workspace, brief),
+            } => self.launch(
+                request.key(),
+                workspace,
+                brief,
+                self.requested_branch(request).as_ref(),
+            ),
             Operation::MessageWorker { worker, body } => self.message(worker, body),
             Operation::ReplyToWorker {
                 worker,

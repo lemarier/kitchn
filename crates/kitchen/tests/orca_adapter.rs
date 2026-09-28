@@ -15,8 +15,8 @@ use common::{
 use kitchen::{
     BackendId, ConsumerId, CredentialId, EffectName,
     adapters::orca::{
-        MAX_INVENTORY_PAGES, MessageKind, OrcaBackend, OrcaConfig, OrcaError, RetainedReason,
-        TerminalAccounting, launch_marker, verify_branch,
+        MAX_INVENTORY_PAGES, MessageKind, OrcaBackend, OrcaConfig, OrcaError, RequestedBranch,
+        RetainedReason, TerminalAccounting, launch_marker, verify_branch,
     },
     contracts::{
         AttemptNumber, BackendUnavailable, Capability, Effect, EffectExecutor, EffectFailure,
@@ -27,8 +27,9 @@ use kitchen::{
         conformance::{self, Check, CheckResult, ConformanceFixture},
     },
     scheduling::{
-        AgentFamily, CronExpr, ObservedScheduleState, Precheck, PrecheckTimeout, Recurrence,
-        RunOutcome, ScheduleSpec, ScheduleState, Timezone, WorkflowName,
+        AgentFamily, CronExpr, GraceMinutes, ObservedScheduleState, Precheck, PrecheckTimeout,
+        Readiness, ReadinessSignal, Recurrence, RunOutcome, RunVerdict, ScheduleField,
+        ScheduleSpec, ScheduleState, ScheduleWorkspace, TimeOfDay, Timezone, WorkflowName,
     },
     state::{EffectPlan, EffectState, reconcile, run_effect},
 };
@@ -43,7 +44,7 @@ fn credential() -> TestResult<CredentialId> {
     Ok(CredentialId::new("orca-host-session")?)
 }
 
-fn config() -> TestResult<OrcaConfig> {
+fn config(sim: &SimOrca) -> TestResult<OrcaConfig> {
     Ok(OrcaConfig {
         backend: orca_id()?,
         house: house()?,
@@ -55,11 +56,13 @@ fn config() -> TestResult<OrcaConfig> {
         agent: AgentFamily::Claude,
         call_timeout: Duration::from_secs(5),
         launch_timeout: Duration::from_secs(60),
+        runtime_dir: sim.runtime_dir()?,
+        reservation_timeout: Duration::from_secs(10),
     })
 }
 
 fn connect(sim: &SimOrca) -> TestResult<OrcaBackend<&SimOrca>> {
-    Ok(OrcaBackend::connect(config()?, sim)?)
+    Ok(OrcaBackend::connect(config(sim)?, sim)?)
 }
 
 fn key(value: &str) -> TestResult<IdempotencyKey> {
@@ -168,21 +171,21 @@ fn connect_refuses_unsupported_runtimes() -> TestResult {
     let old = SimOrca::default();
     old.state().version = "1.4.211";
     assert!(matches!(
-        OrcaBackend::connect(config()?, &old),
+        OrcaBackend::connect(config(&old)?, &old),
         Err(OrcaError::UnsupportedVersion { found, .. }) if found == "1.4.211"
     ));
 
     let next_minor = SimOrca::default();
     next_minor.state().version = "1.5.0";
     assert!(matches!(
-        OrcaBackend::connect(config()?, &next_minor),
+        OrcaBackend::connect(config(&next_minor)?, &next_minor),
         Err(OrcaError::UnsupportedVersion { .. })
     ));
 
     let missing = SimOrca::default();
     missing.state().features = vec!["orchestration.contract.v1"];
     assert_eq!(
-        OrcaBackend::connect(config()?, &missing).err(),
+        OrcaBackend::connect(config(&missing)?, &missing).err(),
         Some(OrcaError::MissingRuntimeFeature(
             "orchestration.worker-stop-verdict.v1"
         ))
@@ -191,14 +194,14 @@ fn connect_refuses_unsupported_runtimes() -> TestResult {
     let down = SimOrca::default();
     down.state().ready = false;
     assert_eq!(
-        OrcaBackend::connect(config()?, &down).err(),
+        OrcaBackend::connect(config(&down)?, &down).err(),
         Some(OrcaError::RuntimeNotReady)
     );
 
     let garbled = SimOrca::default();
     garbled.fault(Fault::Garbage);
     assert_eq!(
-        OrcaBackend::connect(config()?, &garbled).err(),
+        OrcaBackend::connect(config(&garbled)?, &garbled).err(),
         Some(OrcaError::Malformed { what: "envelope" })
     );
 
@@ -875,7 +878,7 @@ fn adoption_moves_the_mailbox_to_the_new_coordinator() -> TestResult {
     let adopting = OrcaBackend::connect(
         OrcaConfig {
             coordinator: ExternalRef::new("term_adopter")?,
-            ..config()?
+            ..config(&sim)?
         },
         &sim,
     )?;
@@ -928,6 +931,7 @@ fn automation(id: &str, name: &str, enabled: bool) -> SimAutomation {
         id: id.to_owned(),
         name: name.to_owned(),
         enabled,
+        ..SimAutomation::default()
     }
 }
 
@@ -1133,18 +1137,24 @@ fn schedule_changes_are_owned_and_read_back() -> TestResult {
                "precheckResult": {"exitCode": null, "timedOut": true, "error": null}}),
         json!({"status": "surprise"}),
     ];
-    let observed = backend.inspect_schedule(&ours)?;
+    let readiness = Readiness::new(&[], at(0), Duration::from_secs(300));
+    let observed = backend.inspect_schedule(&ours, &readiness)?;
     assert_eq!(observed.state, ObservedScheduleState::Paused);
-    let outcomes: Vec<_> = observed.recent_runs.iter().map(|run| run.outcome).collect();
+    let judged: Vec<_> = observed
+        .recent_runs
+        .iter()
+        .map(|judged| (judged.run.outcome, judged.verdict))
+        .collect();
     assert_eq!(
-        outcomes,
+        judged,
         [
-            RunOutcome::LaunchFailed,
-            RunOutcome::PrecheckIdle,
-            RunOutcome::PrecheckFailed,
-            RunOutcome::PrecheckFailed,
-            RunOutcome::LaunchReported,
-            RunOutcome::Unknown
+            (RunOutcome::LaunchFailed, RunVerdict::LaunchFailed),
+            (RunOutcome::PrecheckIdle, RunVerdict::Idle),
+            (RunOutcome::PrecheckFailed, RunVerdict::PrecheckFailed),
+            (RunOutcome::PrecheckFailed, RunVerdict::PrecheckFailed),
+            // Not yet due for a verdict: the deadline has not passed.
+            (RunOutcome::LaunchReported, RunVerdict::Pending),
+            (RunOutcome::Unknown, RunVerdict::Unknown)
         ]
     );
 
@@ -1156,7 +1166,7 @@ fn schedule_changes_are_owned_and_read_back() -> TestResult {
     )?;
     let removed = backend.execute(&remove)?;
     assert_eq!(
-        backend.inspect_schedule(&ours)?.state,
+        backend.inspect_schedule(&ours, &readiness)?.state,
         ObservedScheduleState::Missing
     );
     assert_eq!(
@@ -1342,5 +1352,611 @@ fn heartbeats_do_not_end_a_wait() -> TestResult {
         actionable,
         [(MessageKind::WorkerDone, Some(WorkerOutcome::Failed))]
     );
+    Ok(())
+}
+
+/// Run `first` and `second` at the same time and return both results.
+fn concurrently<T: Send>(
+    first: impl FnOnce() -> T + Send,
+    second: impl FnOnce() -> T + Send,
+) -> TestResult<(T, T)> {
+    std::thread::scope(|scope| {
+        let first = scope.spawn(first);
+        let second = scope.spawn(second);
+        Ok((
+            first.join().map_err(|_| "the first caller panicked")?,
+            second.join().map_err(|_| "the second caller panicked")?,
+        ))
+    })
+}
+
+#[test]
+fn concurrent_first_submissions_create_one_task() -> TestResult {
+    let sim = SimOrca::default();
+    // Both callers list the Tasks before either creates one.
+    sim.interleave(
+        &["orchestration", "task-list"],
+        2,
+        Duration::from_millis(400),
+    );
+    let launch = request(launch_op("Implement it.")?, "launch-race")?;
+    let (first, second) = (connect(&sim)?, connect(&sim)?);
+    let (a, b) = concurrently(|| first.execute(&launch), || second.execute(&launch))?;
+    assert_eq!(a, b, "both callers get the one launch");
+    assert!(a.is_ok(), "{a:?}");
+    assert_eq!(sim.calls_to(&["orchestration", "task-create"]).len(), 1);
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
+    assert_eq!(sim.state().workers.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn concurrent_installers_create_one_schedule() -> TestResult {
+    let sim = SimOrca::default();
+    // Both installers list the automations before either creates one.
+    sim.interleave(&["automations", "list"], 2, Duration::from_millis(400));
+    let spec = schedule_spec("pickup")?;
+    let (first, second) = (connect(&sim)?, connect(&sim)?);
+    let (a, b) = concurrently(
+        || first.install_schedule(&spec),
+        || second.install_schedule(&spec),
+    )?;
+    assert_eq!(a, b, "both installers get the one schedule");
+    assert!(a.is_ok(), "{a:?}");
+    assert_eq!(sim.calls_to(&["automations", "create"]).len(), 1);
+    assert_eq!(sim.state().automations.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn duplicates_created_outside_the_reservation_are_still_an_explicit_error() -> TestResult {
+    // Two installers that do not share a reservation directory stand in for
+    // an older process, or a person creating the automation by hand.
+    let sim = SimOrca::default();
+    sim.interleave(&["automations", "list"], 2, Duration::from_millis(400));
+    let elsewhere = tempfile::tempdir()?;
+    let spec = schedule_spec("pickup")?;
+    let first = connect(&sim)?;
+    let second = OrcaBackend::connect(
+        OrcaConfig {
+            runtime_dir: elsewhere.path().to_path_buf(),
+            ..config(&sim)?
+        },
+        &sim,
+    )?;
+    let (a, b) = concurrently(
+        || first.install_schedule(&spec),
+        || second.install_schedule(&spec),
+    )?;
+    assert_eq!(sim.state().automations.len(), 2, "both created one");
+    let duplicates = Err(OrcaError::DuplicateSchedules { count: 2 });
+    assert!(
+        a == duplicates || b == duplicates,
+        "a read-back that shows both is an error, not an install: {a:?} / {b:?}"
+    );
+    // Nothing installs or activates on top of the duplicates afterwards.
+    assert_eq!(first.install_schedule(&spec), duplicates);
+    assert_eq!(
+        first.execute(&request(install("pickup")?, "install-after")?),
+        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+    );
+    Ok(())
+}
+
+#[test]
+fn installing_disabled_never_settles_for_an_active_schedule() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let installed = backend.install_schedule(&schedule_spec("pickup")?)?;
+    // A person switched the installed schedule on.
+    for automation in &mut sim.state().automations {
+        automation.enabled = true;
+    }
+    let effect = request(install("pickup")?, "install-active")?;
+    assert_eq!(
+        backend.execute(&effect),
+        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected)),
+        "an active schedule is not a disabled install"
+    );
+    assert_eq!(
+        backend.install_schedule(&schedule_spec("pickup")?),
+        Err(OrcaError::ScheduleActive)
+    );
+    assert_eq!(
+        backend.resolve(&effect)?,
+        Lookup::Unknown,
+        "lookup does not report an install that would be refused"
+    );
+    // Refusing is not activating or pausing: nothing changed.
+    assert!(sim.calls_to(&["automations", "edit"]).is_empty());
+    assert_eq!(sim.calls_to(&["automations", "create"]).len(), 1);
+    assert_eq!(
+        backend.installed_schedules()?.first().map(|s| s.state),
+        Some(ObservedScheduleState::Active)
+    );
+    // Paused again, the same definition installs (reuses) as before.
+    backend.set_schedule_state(&installed, ScheduleState::Paused)?;
+    assert_eq!(
+        backend.install_schedule(&schedule_spec("pickup")?)?,
+        installed
+    );
+    Ok(())
+}
+
+#[test]
+fn installing_disabled_refuses_a_schedule_that_differs_from_the_request() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    backend.install_schedule(&schedule_spec("pickup")?)?;
+    let changed = |edit: &dyn Fn(ScheduleSpec) -> TestResult<ScheduleSpec>| -> TestResult<_> {
+        Ok(backend.install_schedule(&edit(schedule_spec("pickup")?)?))
+    };
+    let differs = |fields: &[ScheduleField]| {
+        Err(OrcaError::ScheduleDiffers {
+            fields: fields.to_vec(),
+        })
+    };
+    assert_eq!(
+        changed(&|spec| Ok(ScheduleSpec::new(
+            spec.workflow().clone(),
+            spec.consumer().clone(),
+            Recurrence::Cron(CronExpr::new("0 9 * * *")?),
+            spec.timezone().clone(),
+            Text::new("A different prompt.")?,
+            AgentFamily::Codex,
+        )))?,
+        differs(&[
+            ScheduleField::Prompt,
+            ScheduleField::Agent,
+            ScheduleField::Recurrence,
+            ScheduleField::Precheck,
+        ])
+    );
+    assert_eq!(
+        changed(&|spec| Ok(spec.with_missed_run_grace(GraceMinutes::new(45)?)))?,
+        differs(&[ScheduleField::MissedRunGrace])
+    );
+    assert_eq!(
+        changed(&|spec| Ok(spec.with_workspace(ScheduleWorkspace::Existing(worktree("wt-9")?))))?,
+        differs(&[ScheduleField::Workspace])
+    );
+    // A listing that omits the definition cannot confirm it either.
+    sim.state()
+        .automations
+        .push(automation("bare", "kitchen:origin89:gardener", false));
+    assert_eq!(
+        backend.install_schedule(&schedule_spec("gardener")?),
+        differs(&[
+            ScheduleField::Prompt,
+            ScheduleField::Agent,
+            ScheduleField::Recurrence,
+            ScheduleField::Timezone,
+            ScheduleField::Precheck,
+            ScheduleField::Workspace,
+            ScheduleField::MissedRunGrace,
+        ]),
+        "Orca always reports session reuse, so only that field matches"
+    );
+    assert_eq!(
+        backend.execute(&request(install("gardener")?, "install-bare")?),
+        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+    );
+    assert!(sim.calls_to(&["automations", "edit"]).is_empty());
+    assert_eq!(sim.calls_to(&["automations", "create"]).len(), 1);
+    Ok(())
+}
+
+fn worktree(handle: &str) -> TestResult<ResourceRef> {
+    Ok(ResourceRef {
+        kind: ResourceKind::Worktree,
+        backend: orca_id()?,
+        handle: ExternalRef::new(handle)?,
+    })
+}
+
+#[test]
+fn presets_are_sent_and_compared_as_cron() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let spec = |recurrence| -> TestResult<ScheduleSpec> {
+        Ok(ScheduleSpec::new(
+            WorkflowName::new("pickup")?,
+            ConsumerId::new("daily")?,
+            recurrence,
+            Timezone::new("UTC")?,
+            Text::new("Run it.")?,
+            AgentFamily::Claude,
+        ))
+    };
+    let daily = spec(Recurrence::Daily(TimeOfDay::new(9, 5)?))?;
+    let installed = backend.install_schedule(&daily)?;
+    let creates = sim.calls_to(&["automations", "create"]);
+    let create = creates.first().ok_or("one create")?;
+    assert_eq!(flag(create, "trigger"), Some("5 9 * * *"));
+    assert!(flag(create, "time").is_none() && flag(create, "day").is_none());
+    assert_eq!(backend.install_schedule(&daily)?, installed);
+    // The same consumer requested at another time is a different schedule.
+    assert_eq!(
+        backend.install_schedule(&spec(Recurrence::Weekdays(TimeOfDay::new(9, 5)?))?),
+        Err(OrcaError::ScheduleDiffers {
+            fields: vec![ScheduleField::Recurrence]
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn a_swallowed_scheduled_launch_is_reported_as_failed() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let installed = backend.install_schedule(&schedule_spec("pickup")?)?;
+    let deadline = Duration::from_secs(300);
+    let due = |seconds| json!({"status": "completed", "scheduledFor": seconds * 1000});
+    // Orca recorded three launch steps as completed. Only the second run's
+    // agent reported in, inside the deadline; a session that started long
+    // after the third run does not vindicate it.
+    sim.state().runs = vec![due(10_000), due(20_000), due(30_000)];
+    let signals = [
+        ReadinessSignal::new(at(20_010)),
+        ReadinessSignal::new(at(30_000 + 301)),
+    ];
+    let inspect = |now, signals: &[ReadinessSignal]| -> TestResult<Vec<RunVerdict>> {
+        let readiness = Readiness::new(signals, now, deadline);
+        Ok(backend
+            .inspect_schedule(&installed, &readiness)?
+            .recent_runs
+            .iter()
+            .map(|judged| judged.verdict)
+            .collect())
+    };
+    assert_eq!(
+        inspect(at(30_000 + 3_600), &signals)?,
+        [
+            RunVerdict::LaunchFailed,
+            RunVerdict::Started,
+            RunVerdict::LaunchFailed
+        ],
+        "newest first: the first and last launches never became ready"
+    );
+    // Before the deadline the newest run is still pending, not failed.
+    assert_eq!(
+        inspect(at(30_000 + 60), &[])?,
+        [
+            RunVerdict::Pending,
+            RunVerdict::LaunchFailed,
+            RunVerdict::LaunchFailed
+        ]
+    );
+    // A signal recorded before the run was due is not evidence for it.
+    assert_eq!(
+        inspect(at(30_000 + 3_600), &[ReadinessSignal::new(at(29_999))])?
+            .first()
+            .copied(),
+        Some(RunVerdict::LaunchFailed)
+    );
+    // A run without a due time cannot be joined or aged out.
+    sim.state().runs = vec![json!({"status": "completed"})];
+    assert_eq!(inspect(at(999_999), &signals)?, [RunVerdict::Pending]);
+    Ok(())
+}
+
+fn branch(value: &str) -> TestResult<RequestedBranch> {
+    Ok(RequestedBranch::new(value)?)
+}
+
+/// A backend whose every launch must land on `requested`.
+fn on_branch<'a>(sim: &'a SimOrca, requested: &str) -> TestResult<OrcaBackend<&'a SimOrca>> {
+    let requested = branch(requested)?;
+    Ok(connect(sim)?.with_branch_source(move |_| Some(requested.clone())))
+}
+
+fn launch_in(workspace: Workspace) -> TestResult<Operation> {
+    Ok(Operation::LaunchWorker {
+        role: Role::StationCook,
+        workspace,
+        brief: Text::new("Implement it.")?,
+    })
+}
+
+#[test]
+fn a_requested_branch_is_passed_as_the_name_that_yields_it() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = on_branch(&sim, "lemarier/issue-6")?;
+    let launch = request(launch_op("Implement it.")?, "on-branch")?;
+    let receipt = backend.execute(&launch)?;
+    let starts = sim.calls_to(&["orchestration", "worker-start"]);
+    let [start] = starts.as_slice() else {
+        return Err("expected one launch".into());
+    };
+    // Orca puts its own `lemarier/` in front of the name.
+    assert_eq!(flag(start, "name"), Some("issue-6"));
+    assert!(receipt.created().iter().any(|resource| {
+        resource.kind == ResourceKind::Branch && resource.handle.as_str() == "lemarier/issue-6"
+    }));
+    assert!(sim.calls_to(&["orchestration", "worker-stop"]).is_empty());
+    assert_eq!(
+        backend.verify_launch_branch(launch.key(), &branch("lemarier/issue-6")?),
+        Ok(())
+    );
+    assert_eq!(backend.resolve(&launch)?, Lookup::Applied(receipt.clone()));
+    assert_eq!(
+        backend.execute(&launch)?,
+        receipt,
+        "resubmission verifies again"
+    );
+    // On a host that adds no prefix, a branch without one is the whole name.
+    sim.state().branch_prefix = "";
+    let bare = on_branch(&sim, "hotfix")?;
+    bare.execute(&request(launch_op("Implement it.")?, "bare")?)?;
+    let starts = sim.calls_to(&["orchestration", "worker-start"]);
+    assert_eq!(
+        starts.last().and_then(|call| flag(call, "name")),
+        Some("hotfix")
+    );
+    // The same request on a host that does prefix is caught by verification.
+    sim.state().branch_prefix = "lemarier/";
+    assert_eq!(
+        bare.execute(&request(launch_op("Implement it.")?, "bare-prefixed")?),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
+    let sim = SimOrca::default();
+    // The host prefixes with something other than the requested first segment.
+    sim.state().branch_prefix = "other/";
+    let backend = on_branch(&sim, "lemarier/issue-6")?;
+    let launch = request(launch_op("Implement it.")?, "wrong-branch")?;
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost)),
+        "a worker on the wrong branch is not an accepted launch"
+    );
+    let stops = sim.calls_to(&["orchestration", "worker-stop"]);
+    assert_eq!(stops.len(), 1, "the worker is stopped before it can push");
+    let workers: Vec<_> = sim.state().workers.keys().cloned().collect();
+    let [dispatch] = workers.as_slice() else {
+        return Err("expected one worker".into());
+    };
+    assert_eq!(
+        backend.observe_worker(&worker(dispatch)?)?,
+        WorkerState::Settled(WorkerOutcome::Cancelled)
+    );
+    // The report: both branches, named.
+    assert_eq!(
+        backend.verify_launch_branch(launch.key(), &branch("lemarier/issue-6")?),
+        Err(OrcaError::BranchMismatch {
+            requested: "lemarier/issue-6".to_owned(),
+            actual: Some("other/issue-6".to_owned()),
+        })
+    );
+    // Resubmitting starts nothing new and is held again; lookup does not
+    // call the launch applied.
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
+    assert_eq!(sim.calls_to(&["orchestration", "task-create"]).len(), 1);
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
+    // A key that never dispatched a launch cannot be confirmed either.
+    assert_eq!(
+        backend.verify_launch_branch(&key("never-launched")?, &branch("lemarier/issue-6")?),
+        Err(OrcaError::BranchMismatch {
+            requested: "lemarier/issue-6".to_owned(),
+            actual: None,
+        })
+    );
+    // Without the constraint the same launch is an ordinary applied one.
+    assert!(matches!(
+        connect(&sim)?.lookup_launch(launch.key())?,
+        Lookup::Applied(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_stop_that_fails_still_reports_the_wrong_branch() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().branch_prefix = "other/";
+    let backend = on_branch(&sim, "lemarier/issue-6")?;
+    sim.fault_on(
+        &["orchestration", "worker-stop"],
+        Fault::TimeoutBeforeEffect,
+    );
+    assert_eq!(
+        backend.execute(&request(launch_op("Implement it.")?, "stop-fails")?),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    let dispatch = sim
+        .state()
+        .workers
+        .keys()
+        .next()
+        .cloned()
+        .ok_or("a worker")?;
+    assert_eq!(
+        backend.observe_worker(&worker(&dispatch)?)?,
+        WorkerState::Ready,
+        "the worker still runs, and the launch is held as uncertain"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_branch_no_name_yields_is_refused_before_anything_is_created() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = on_branch(&sim, "lemarier/area/topic")?;
+    assert_eq!(
+        backend.execute(&request(launch_op("Implement it.")?, "deep")?),
+        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+    );
+    assert!(
+        sim.calls_to(&["orchestration"]).is_empty(),
+        "no Task, no worktree, not even a listing"
+    );
+    for invalid in ["", "a b", "x..y", "-x", "a//b"] {
+        assert_eq!(
+            RequestedBranch::new(invalid),
+            Err(OrcaError::InvalidBranch),
+            "{invalid:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_existing_workspace_is_verified_not_renamed() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = on_branch(&sim, "lemarier/issue-6")?;
+    let existing = launch_in(Workspace::Existing(worktree("wt-9")?))?;
+    sim.state().existing_branch = Some("lemarier/issue-6");
+    backend.execute(&request(existing.clone(), "repair-ok")?)?;
+    let starts = sim.calls_to(&["orchestration", "worker-start"]);
+    assert_eq!(starts.last().and_then(|call| flag(call, "name")), None);
+
+    sim.state().existing_branch = Some("lemarier/somebody-else");
+    assert_eq!(
+        backend.execute(&request(existing.clone(), "repair-wrong")?),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    assert_eq!(sim.calls_to(&["orchestration", "worker-stop"]).len(), 1);
+
+    // Orca reporting no branch at all cannot confirm the request.
+    sim.state().existing_branch = None;
+    assert_eq!(
+        backend.execute(&request(existing, "repair-unknown")?),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    assert_eq!(sim.calls_to(&["orchestration", "worker-stop"]).len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_launch_without_a_requested_branch_is_not_constrained() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_branch_source(|request| {
+        // A source answers per request: this one only constrains one task.
+        (request.task().as_str() == "task-with-branch").then(|| RequestedBranch::new("x/y").ok())?
+    });
+    let receipt = backend.execute(&request(launch_op("Implement it.")?, "free")?)?;
+    let starts = sim.calls_to(&["orchestration", "worker-start"]);
+    assert_eq!(
+        starts.last().and_then(|call| flag(call, "name")),
+        Some(format!("kitchen-{}", receipt.reference()).as_str())
+    );
+    assert!(sim.calls_to(&["orchestration", "worker-stop"]).is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_held_reservation_reports_uncertain_and_resubmission_finds_the_launch() -> TestResult {
+    let sim = SimOrca::default();
+    // The first launch holds its reservation while it waits after listing.
+    sim.interleave(
+        &["orchestration", "task-list"],
+        2,
+        Duration::from_millis(600),
+    );
+    let launch = request(launch_op("Implement it.")?, "held")?;
+    let holder = connect(&sim)?;
+    let impatient = OrcaBackend::connect(
+        OrcaConfig {
+            reservation_timeout: Duration::from_millis(100),
+            ..config(&sim)?
+        },
+        &sim,
+    )?;
+    let (held, waited) = concurrently(
+        || holder.execute(&launch),
+        || {
+            // Start once the holder is inside its reservation.
+            for _ in 0..500 {
+                if !sim.calls_to(&["orchestration", "task-list"]).is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            impatient.execute(&launch)
+        },
+    )?;
+    assert_eq!(
+        waited,
+        Err(EffectFailure::Uncertain(UncertainReason::Timeout)),
+        "nothing was sent, but the holder may be about to apply the launch"
+    );
+    let receipt = held?;
+    assert_eq!(sim.calls_to(&["orchestration", "task-create"]).len(), 1);
+    assert_eq!(
+        impatient.execute(&launch)?,
+        receipt,
+        "resubmission finds it"
+    );
+    assert_eq!(sim.calls_to(&["orchestration", "task-create"]).len(), 1);
+    Ok(())
+}
+
+#[test]
+fn an_unusable_runtime_directory_stops_launches_and_installs_before_orca() -> TestResult {
+    let sim = SimOrca::default();
+    let occupied = sim.runtime_dir()?.join("occupied");
+    std::fs::write(&occupied, b"")?;
+    let backend = OrcaBackend::connect(
+        OrcaConfig {
+            runtime_dir: occupied,
+            ..config(&sim)?
+        },
+        &sim,
+    )?;
+    assert_eq!(
+        backend.execute(&request(launch_op("Implement it.")?, "no-dir")?),
+        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+    );
+    assert!(matches!(
+        backend.install_schedule(&schedule_spec("pickup")?),
+        Err(OrcaError::ReservationUnavailable(_))
+    ));
+    assert_eq!(
+        backend.execute(&request(install("pickup")?, "no-dir-install")?),
+        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+    );
+    assert!(
+        sim.calls_to(&["orchestration", "task-create"]).is_empty()
+            && sim.calls_to(&["automations"]).is_empty(),
+        "an unreserved effect never reaches Orca"
+    );
+    Ok(())
+}
+
+#[test]
+fn reservation_files_do_not_outlive_a_settled_effect() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let reservations = || -> TestResult<usize> {
+        let directory = sim.runtime_dir()?.join("reservations");
+        Ok(std::fs::read_dir(directory)?.count())
+    };
+    backend.execute(&request(launch_op("Implement it.")?, "settled")?)?;
+    backend.install_schedule(&schedule_spec("pickup")?)?;
+    assert_eq!(
+        reservations()?,
+        0,
+        "a dispatched launch and an install leave none"
+    );
+    // A launch that never reached a dispatched Task keeps its key reservable.
+    sim.fault_on(
+        &["orchestration", "task-create"],
+        Fault::TimeoutBeforeEffect,
+    );
+    assert!(
+        backend
+            .execute(&request(launch_op("Implement it.")?, "unsettled")?)
+            .is_err()
+    );
+    assert_eq!(reservations()?, 1);
+    backend.execute(&request(launch_op("Implement it.")?, "unsettled")?)?;
+    assert_eq!(reservations()?, 0);
     Ok(())
 }

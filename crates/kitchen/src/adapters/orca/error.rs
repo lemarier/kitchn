@@ -2,7 +2,11 @@
 
 use std::io;
 
-use crate::{ErrorClass, contracts::ContractError, scheduling::ScheduleError};
+use crate::{
+    ErrorClass,
+    contracts::ContractError,
+    scheduling::{ScheduleError, ScheduleField},
+};
 
 /// An Orca adapter failure. Messages from Orca are redacted and truncated;
 /// raw command output is never included.
@@ -76,6 +80,18 @@ pub enum OrcaError {
         /// How many share the name.
         count: usize,
     },
+    /// The schedule for this consumer is already active. Installing disabled
+    /// never counts an active schedule as installed, and only the separate
+    /// activation authority changes state; nothing was changed.
+    #[error("the schedule for this consumer is already active; nothing was installed")]
+    ScheduleActive,
+    /// The schedule installed for this consumer is not the one requested.
+    /// Nothing was changed; remove or edit it deliberately, then install again.
+    #[error("the installed schedule differs from the requested one in {fields:?}")]
+    ScheduleDiffers {
+        /// Which parts differ, or could not be read back to compare.
+        fields: Vec<ScheduleField>,
+    },
     /// A trial run needs a paused schedule.
     #[error("a trial run needs a paused schedule")]
     TrialRequiresPaused,
@@ -95,6 +111,28 @@ pub enum OrcaError {
         /// The branch Orca created, if the receipt names one.
         actual: Option<String>,
     },
+    /// Another caller held the reservation for this key for the whole wait.
+    /// Nothing was sent to Orca; the effect may still be in flight under that
+    /// caller, so reconcile before submitting it again.
+    #[error("another caller holds the reservation for this key")]
+    ReservationBusy,
+    /// The reservation file or directory is a symlink or not a regular file.
+    #[error("the reservation directory or file is redirected")]
+    ReservationRedirected,
+    /// The reservation could not be taken for another I/O reason; nothing was
+    /// sent to Orca.
+    #[error("the reservation could not be taken: {0}")]
+    ReservationUnavailable(io::ErrorKind),
+    /// A requested branch is not a valid branch name.
+    #[error("invalid branch name")]
+    InvalidBranch,
+    /// No worktree name makes Orca create the requested branch on this host,
+    /// so the launch was refused before anything was created.
+    #[error("no worktree name makes Orca create the requested branch {requested}")]
+    BranchUnobtainable {
+        /// The branch the caller wanted.
+        requested: String,
+    },
     /// A schedule value was rejected.
     #[error(transparent)]
     Schedule(#[from] ScheduleError),
@@ -108,14 +146,19 @@ impl OrcaError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
-            Self::Schedule(_) => ErrorClass::InvalidInput,
+            Self::Schedule(_) | Self::InvalidBranch => ErrorClass::InvalidInput,
             Self::Contract(error) => error.class(),
             Self::UnsupportedVersion { .. }
             | Self::MissingRuntimeFeature(_)
             | Self::NotKitchenOwned
             | Self::TrialRequiresPaused
+            | Self::ReservationRedirected
+            | Self::BranchUnobtainable { .. }
             | Self::Refused { .. } => ErrorClass::Refused,
             Self::DuplicateSchedules { .. }
+            | Self::ScheduleActive
+            | Self::ScheduleDiffers { .. }
+            | Self::ReservationBusy
             | Self::BranchMismatch { .. }
             | Self::InstallUncertain
             | Self::StateMismatch
@@ -127,6 +170,7 @@ impl OrcaError {
             | Self::NoResult { .. }
             | Self::Malformed { .. }
             | Self::RuntimeNotReady
+            | Self::ReservationUnavailable(_)
             | Self::ListingTooLong { .. } => ErrorClass::Execution,
         }
     }

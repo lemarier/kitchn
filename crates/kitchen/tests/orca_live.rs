@@ -25,8 +25,8 @@ use std::{
 use kitchen::{
     BackendId, CredentialId, HouseId, TaskId,
     adapters::orca::{
-        DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, Invocation, OrcaBackend, OrcaConfig,
-        OrcaRunner, SystemRunner, redact, verify_branch,
+        DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, Invocation,
+        OrcaBackend, OrcaConfig, OrcaRunner, SystemRunner, redact, verify_branch,
     },
     contracts::{
         AttemptNumber, EffectExecutor, EffectRequest, ExternalRef, IdempotencyKey, Lookup,
@@ -178,6 +178,8 @@ fn exercise(
         .ok_or("run-create returned no run id")?;
     println!("LIVE created run {run_id}");
     *created_run = Some(run_id.clone());
+    // Reservation files for this test's launches; removed with the directory.
+    let runtime = tempfile::tempdir()?;
     let config = OrcaConfig {
         backend: BackendId::new("orca-local")?,
         house: HouseId::new("kitchen-smoke")?,
@@ -189,6 +191,8 @@ fn exercise(
         agent: settings.agent,
         call_timeout: DEFAULT_CALL_TIMEOUT,
         launch_timeout: DEFAULT_LAUNCH_TIMEOUT,
+        runtime_dir: runtime.path().to_path_buf(),
+        reservation_timeout: DEFAULT_RESERVATION_TIMEOUT,
     };
     let backend = OrcaBackend::connect(config, runner)?;
     println!(

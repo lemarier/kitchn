@@ -19,7 +19,10 @@ use crate::{
 pub enum ScheduleEffect {
     /// Install a schedule, disabled, for the workflow consumer scope its
     /// spec names. Executors reuse the one already installed for that
-    /// consumer instead of creating a second, and refuse when several exist.
+    /// consumer only when it is paused and matches the spec, instead of
+    /// creating a second. They refuse, changing nothing, when it is active
+    /// (turning a schedule on is [`Permission::ActivateSchedule`]), when it
+    /// differs, or when several exist.
     #[serde(rename_all = "camelCase")]
     InstallDisabled {
         /// What to install, including its workflow and consumer scope.

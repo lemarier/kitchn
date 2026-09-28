@@ -167,6 +167,22 @@ fn closed_names_round_trip_and_reject_unknown_text() -> TestResult {
         Capability::ForgeMutation
     );
     assert_eq!("human.ask".parse::<Capability>()?, Capability::AskHuman);
+    // Every effect kind has its own lookup and idempotency capability.
+    let lookups: std::collections::BTreeSet<_> = kitchen::contracts::EffectKind::ALL
+        .iter()
+        .map(|kind| kind.lookup_capability())
+        .collect();
+    let idempotency: std::collections::BTreeSet<_> = kitchen::contracts::EffectKind::ALL
+        .iter()
+        .map(|kind| kind.idempotency_capability())
+        .collect();
+    assert_eq!(lookups.len(), kitchen::contracts::EffectKind::ALL.len());
+    assert_eq!(idempotency.len(), kitchen::contracts::EffectKind::ALL.len());
+    assert!(lookups.is_disjoint(&idempotency));
+    assert_eq!(
+        "effect.lookup.message_worker".parse::<Capability>()?,
+        Capability::LookupMessageWorker
+    );
     for (name, permission) in [
         ("manage-schedule", Permission::ManageSchedule),
         ("activate-schedule", Permission::ActivateSchedule),

@@ -14,12 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConsumerId, CredentialId, EffectName, Error, HolderId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Capability,
-        Claimant, Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext,
-        EffectRequest, EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef,
-        FailureClass, Fence, HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation,
-        Receipt, ResourceRef, RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Timestamp,
-        Trigger, UncertainReason,
+        AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Claimant,
+        Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext, EffectRequest,
+        EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef, FailureClass, Fence,
+        HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef,
+        RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Timestamp, Trigger, UncertainReason,
     },
     state::{ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, StateError},
 };
@@ -678,7 +677,7 @@ impl TaskRecord {
         current: std::result::Result<(), ContractError>,
         now: Timestamp,
     ) -> Result<EffectStart> {
-        let resubmission = Resubmission::for_backend(backend);
+        let resubmission = Resubmission::for_effect(backend, &plan.effect);
         let Some(existing) = self.effects.get(index) else {
             return fail(StateError::CorruptState(Corruption::EffectSequence));
         };
@@ -903,11 +902,10 @@ enum Resubmission {
 }
 
 impl Resubmission {
-    fn for_backend(backend: &BackendDescriptor) -> Self {
-        if backend
-            .capabilities
-            .supports(Capability::EffectIdempotentRequests)
-        {
+    /// Same-key resubmission only where the executor declares `effect`'s
+    /// kind idempotent.
+    fn for_effect(backend: &BackendDescriptor, effect: &Effect) -> Self {
+        if backend.idempotent(effect) {
             Self::SameKey
         } else {
             Self::Refuse

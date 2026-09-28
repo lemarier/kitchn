@@ -49,6 +49,9 @@ pub enum Check {
     LaunchObservable,
     /// The inventory lists the launched worker as live, within its bound.
     InventoryListsLaunch,
+    /// A message to the launched worker honors the executor's per-kind
+    /// lookup and idempotency declarations.
+    MessageRecovery,
     /// A cancelled worker is reported settled; a missing record is not evidence.
     CancelObserved,
 }
@@ -68,6 +71,7 @@ impl fmt::Display for Check {
             Self::LaunchReceipt => "launch receipt",
             Self::LaunchObservable => "launch observable",
             Self::InventoryListsLaunch => "inventory lists launch",
+            Self::MessageRecovery => "message recovery as declared",
             Self::CancelObserved => "cancel observed",
         })
     }
@@ -176,6 +180,7 @@ pub fn run_worker(
             Check::LaunchReceipt,
             Check::LaunchObservable,
             Check::InventoryListsLaunch,
+            Check::MessageRecovery,
             Check::CancelObserved,
         ] {
             runner.record(
@@ -202,6 +207,7 @@ pub fn run_worker(
     runner.record(Check::LaunchReceipt, CheckResult::Passed);
     runner.observable(backend, &worker)?;
     runner.inventory(backend, &worker)?;
+    runner.message_recovery(backend, &worker)?;
     runner.cancel(backend, &worker)?;
     Ok(runner.report)
 }
@@ -336,7 +342,7 @@ impl<'a> Runner<'a> {
         check: Check,
         request: &EffectRequest,
     ) -> Result<(), ConformanceFailure> {
-        if !self.supports(Capability::EffectLookup) {
+        if !self.executor.descriptor().supports_lookup(request.effect()) {
             return Ok(());
         }
         match self.executor.lookup(request) {
@@ -439,15 +445,13 @@ impl<'a> Runner<'a> {
     fn unknown_key(&mut self, probe: &Effect) -> Result<(), ConformanceFailure> {
         let check = Check::UnknownKeyNotApplied;
         let request = self.own_request("never-used", probe.clone())?;
-        if !self.supports(Capability::EffectLookup) {
+        let requires = probe.kind().lookup_capability();
+        if !self.executor.descriptor().supports_lookup(probe) {
             return match self.executor.lookup(&request) {
-                Err(BackendUnavailable::Unsupported(Capability::EffectLookup)) => {
-                    self.record(
-                        check,
-                        CheckResult::NotApplicable {
-                            requires: Capability::EffectLookup,
-                        },
-                    );
+                Err(BackendUnavailable::Unsupported(named))
+                    if named == requires || named == Capability::EffectLookup =>
+                {
+                    self.record(check, CheckResult::NotApplicable { requires });
                     Ok(())
                 }
                 Ok(_) | Err(_) => fail(check, "undeclared lookup did not report unsupported"),
@@ -489,11 +493,11 @@ impl<'a> Runner<'a> {
         receipt: &Receipt,
     ) -> Result<(), ConformanceFailure> {
         let check = Check::LookupMatchesReceipt;
-        if !self.supports(Capability::EffectLookup) {
+        if !self.executor.descriptor().supports_lookup(request.effect()) {
             self.record(
                 check,
                 CheckResult::NotApplicable {
-                    requires: Capability::EffectLookup,
+                    requires: request.effect().kind().lookup_capability(),
                 },
             );
             return Ok(());
@@ -515,11 +519,11 @@ impl<'a> Runner<'a> {
         receipt: &Receipt,
     ) -> Result<(), ConformanceFailure> {
         let check = Check::IdempotentResubmission;
-        if !self.supports(Capability::EffectIdempotentRequests) {
+        if !self.executor.descriptor().idempotent(request.effect()) {
             self.record(
                 check,
                 CheckResult::NotApplicable {
-                    requires: Capability::EffectIdempotentRequests,
+                    requires: request.effect().kind().idempotency_capability(),
                 },
             );
             return Ok(());
@@ -603,6 +607,51 @@ impl<'a> Runner<'a> {
                 fail(check, "launched worker not listed as live")
             }
         }
+    }
+
+    fn message_recovery(
+        &mut self,
+        backend: &dyn WorkerBackend,
+        worker: &ResourceRef,
+    ) -> Result<(), ConformanceFailure> {
+        let check = Check::MessageRecovery;
+        if !self.supports(Capability::WorkerMessaging) {
+            self.record(
+                check,
+                CheckResult::NotApplicable {
+                    requires: Capability::WorkerMessaging,
+                },
+            );
+            return Ok(());
+        }
+        let request = self.own_request(
+            "message",
+            Effect::Worker(Operation::MessageWorker {
+                worker: worker.clone(),
+                body: self.fixture.brief.clone(),
+            }),
+        )?;
+        let receipt = match backend.execute(&request) {
+            Ok(receipt) => receipt,
+            Err(_) => return fail(check, "message to a launched worker failed"),
+        };
+        let descriptor = backend.descriptor();
+        if descriptor.supports_lookup(request.effect()) {
+            match backend.lookup(&request) {
+                Ok(Lookup::Applied(found)) if found == receipt => {}
+                Ok(_) | Err(_) => return fail(check, "declared message lookup did not match"),
+            }
+        }
+        if descriptor.idempotent(request.effect()) {
+            match backend.execute(&request) {
+                Ok(repeat) if repeat == receipt => {}
+                Ok(_) | Err(_) => {
+                    return fail(check, "declared idempotent message was not deduplicated");
+                }
+            }
+        }
+        self.record(check, CheckResult::Passed);
+        Ok(())
     }
 
     fn cancel(

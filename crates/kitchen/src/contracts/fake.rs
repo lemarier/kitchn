@@ -223,10 +223,7 @@ impl EffectExecutor for FakeBackend {
             )));
         }
         let mut state = self.lock();
-        if self
-            .descriptor
-            .capabilities
-            .supports(Capability::EffectIdempotentRequests)
+        if self.descriptor.idempotent(request.effect())
             && let Some(receipt) = state.applied.get(request.key())
         {
             return Ok(receipt.clone());
@@ -247,12 +244,10 @@ impl EffectExecutor for FakeBackend {
     }
 
     fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
-        if !self
-            .descriptor
-            .capabilities
-            .supports(Capability::EffectLookup)
-        {
-            return Err(BackendUnavailable::Unsupported(Capability::EffectLookup));
+        if !self.descriptor.supports_lookup(request.effect()) {
+            return Err(BackendUnavailable::Unsupported(
+                request.effect().kind().lookup_capability(),
+            ));
         }
         let mut state = self.lock();
         if state.lookup_outages > 0 {

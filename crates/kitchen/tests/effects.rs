@@ -897,3 +897,101 @@ fn an_ask_must_name_the_exact_evidence_subject() -> TestResult {
     assert!(matches!(asked.state(), EffectState::Applied { .. }));
     Ok(())
 }
+
+/// Like Orca: launches, cancels, and releases can be looked up and deduplicated; messages cannot.
+fn orca_like() -> TestResult<FakeBackend> {
+    Ok(FakeBackend::new(
+        backend_id()?,
+        house()?,
+        CapabilitySet::supporting([
+            Capability::WorkerLaunchIsolated,
+            Capability::WorkerMessaging,
+            Capability::WorkerCancel,
+            Capability::WorkerStatusAndOutcome,
+            Capability::ResourceRelease,
+            Capability::LookupLaunchWorker,
+            Capability::IdempotentLaunchWorker,
+            Capability::LookupCancelWorker,
+            Capability::IdempotentCancelWorker,
+            Capability::LookupReleaseResource,
+            Capability::IdempotentReleaseResource,
+        ]),
+    ))
+}
+
+#[test]
+fn recovery_follows_the_per_kind_declaration() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = task_for(&fixture, "task-1", None)?;
+    let orca = orca_like()?;
+    let grants = grants_everywhere()?;
+    let clock = ManualClock::starting_at(1);
+    let message = |worker: &ResourceRef| -> TestResult<Operation> {
+        Ok(Operation::MessageWorker {
+            worker: worker.clone(),
+            body: Text::new("status?")?,
+        })
+    };
+    assert!(orca.descriptor().supports_lookup(&launch()?.into()));
+    assert!(orca.descriptor().idempotent(&launch()?.into()));
+
+    // A lost launch is looked up and resolved without a second launch.
+    orca.inject(ExecuteFault::ApplyThenLoseResponse);
+    let lost = run_effect(
+        &fixture.store,
+        &orca,
+        &grants,
+        plan(&task, fence, "launch", launch()?)?,
+        &clock,
+    )?;
+    assert!(matches!(lost.state(), EffectState::Uncertain { .. }));
+    let found = run_effect(
+        &fixture.store,
+        &orca,
+        &grants,
+        plan(&task, fence, "launch", launch()?)?,
+        &clock,
+    )?;
+    let EffectState::Applied { receipt, .. } = found.state() else {
+        return Err(format!("launch not recovered: {:?}", found.state()).into());
+    };
+    assert_eq!(orca.execute_calls(), 1);
+    let worker = receipt
+        .created()
+        .iter()
+        .find(|resource| resource.kind == ResourceKind::Worker)
+        .cloned()
+        .ok_or("receipt names no worker")?;
+
+    // A lost message can be neither looked up nor resubmitted.
+    let body: Effect = message(&worker)?.into();
+    assert!(!orca.descriptor().supports_lookup(&body));
+    assert!(!orca.descriptor().idempotent(&body));
+    orca.inject(ExecuteFault::TimeoutWithoutApplying);
+    let unsent = run_effect(
+        &fixture.store,
+        &orca,
+        &grants,
+        plan(&task, fence, "message", message(&worker)?)?,
+        &clock,
+    )?;
+    assert!(matches!(unsent.state(), EffectState::Uncertain { .. }));
+    assert!(matches!(
+        run_effect(&fixture.store, &orca, &grants, plan(&task, fence, "message", message(&worker)?)?, &clock),
+        Err(Error::State(kitchen::state::StateError::UnsafeRetry(seq))) if seq == unsent.seq()
+    ));
+    assert_eq!(orca.execute_calls(), 2);
+    let report = reconcile(&fixture.store, &orca, &task, fence, &clock)?;
+    assert!(matches!(
+        report.unresolved.as_slice(),
+        [effect] if matches!(effect.state(), EffectState::Uncertain { reason: kitchen::contracts::UncertainReason::LookupUnsupported, .. })
+    ));
+    // The fake refuses the lookup it did not declare.
+    assert_eq!(
+        orca.lookup(unsent.request()),
+        Err(kitchen::contracts::BackendUnavailable::Unsupported(
+            Capability::LookupMessageWorker
+        ))
+    );
+    Ok(())
+}

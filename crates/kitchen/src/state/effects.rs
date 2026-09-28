@@ -3,8 +3,8 @@
 use crate::{
     Error, TaskId,
     contracts::{
-        Capability, Clock, ContractError, EffectExecutor, EffectFailure, Fence, HouseGrants,
-        Lookup, NotAppliedReason, UncertainReason,
+        Clock, ContractError, EffectExecutor, EffectFailure, Fence, HouseGrants, Lookup,
+        NotAppliedReason, UncertainReason,
     },
     state::{
         EffectOutcome, EffectPlan, EffectRecord, EffectStart, HouseStore, StateError, TaskState,
@@ -18,7 +18,8 @@ type Result<T> = std::result::Result<T, Error>;
 /// executor namespace recorded with an intent may resubmit it.
 ///
 /// Delivery is at most once per idempotency key only when the backend
-/// declares [`Capability::EffectIdempotentRequests`]; otherwise an uncertain
+/// declares the effect's kind idempotent
+/// ([`crate::contracts::BackendDescriptor::idempotent`]); otherwise an uncertain
 /// outcome is never resubmitted and must be reconciled with [`reconcile`].
 /// With idempotent requests, a repeated call first looks the key up and
 /// resubmits it only when the lookup cannot establish the outcome, within
@@ -82,8 +83,7 @@ pub fn run_effect(
 fn look_up(executor: &dyn EffectExecutor, effect: &EffectRecord) -> EffectOutcome {
     if !executor
         .descriptor()
-        .capabilities
-        .supports(Capability::EffectLookup)
+        .supports_lookup(effect.request().effect())
     {
         return EffectOutcome::Uncertain(UncertainReason::LookupUnsupported);
     }
@@ -118,7 +118,8 @@ pub struct ReconcileReport {
 /// Lookups use the persisted idempotency key and never re-execute an effect.
 /// Only effects persisted for this backend's namespace are looked up.
 /// [`Lookup::Absent`] is trusted only because the backend contract reserves
-/// it for proven absence. Without [`Capability::EffectLookup`], outcomes stay
+/// it for proven absence. Where the executor does not declare lookup for the
+/// effect's kind ([`crate::contracts::BackendDescriptor::supports_lookup`]), outcomes stay
 /// unknown.
 ///
 /// # Errors

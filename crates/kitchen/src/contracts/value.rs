@@ -34,6 +34,8 @@ pub enum ValueKind {
     Permission,
     /// A backend receipt.
     Receipt,
+    /// An effect kind name.
+    EffectKind,
 }
 
 impl fmt::Display for ValueKind {
@@ -49,6 +51,7 @@ impl fmt::Display for ValueKind {
             Self::Role => "role",
             Self::Permission => "permission",
             Self::Receipt => "receipt",
+            Self::EffectKind => "effect kind",
         })
     }
 }

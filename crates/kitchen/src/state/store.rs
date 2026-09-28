@@ -361,7 +361,8 @@ impl HouseStore {
     /// unresolved. The intent records the backend namespace; a repeated
     /// request for the same logical effect must come from that backend.
     /// An uncertain effect is resubmitted with its key only when the backend
-    /// declares [`crate::contracts::Capability::EffectIdempotentRequests`].
+    /// declares the effect's kind idempotent
+    /// ([`crate::contracts::BackendDescriptor::idempotent`]).
     ///
     /// # Errors
     /// Returns the first failed check.

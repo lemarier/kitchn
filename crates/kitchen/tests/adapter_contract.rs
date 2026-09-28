@@ -79,11 +79,16 @@ fn fake_backend_passes_the_shared_contract() -> TestResult {
         Check::LaunchReceipt,
         Check::LaunchObservable,
         Check::InventoryListsLaunch,
+        Check::MessageRecovery,
         Check::CancelObserved,
     ] {
         assert_eq!(report.result(check), Some(CheckResult::Passed), "{check}");
     }
-    assert_eq!(backend.effects_performed(), 2, "one launch and one cancel");
+    assert_eq!(
+        backend.effects_performed(),
+        3,
+        "one launch, one message, and one cancel"
+    );
     Ok(())
 }
 
@@ -104,7 +109,7 @@ fn minimal_backend_passes_with_checks_marked_not_applicable() -> TestResult {
     assert_eq!(
         report.result(Check::UnknownKeyNotApplied),
         Some(CheckResult::NotApplicable {
-            requires: Capability::EffectLookup
+            requires: Capability::LookupLaunchWorker
         })
     );
     assert_eq!(backend.effects_performed(), 0);
@@ -1449,6 +1454,86 @@ fn a_new_owner_can_stop_the_worker_after_cancellation() -> TestResult {
             .store
             .settle_cancelled(&task, owner.fence(), at(63))?;
         assert_eq!(fixture.store.task(&task)?.attempts().len(), 1);
+    }
+    Ok(())
+}
+
+/// Like Orca: launches, cancels, and releases can be looked up and deduplicated; messages cannot.
+fn orca_like_capabilities() -> CapabilitySet {
+    CapabilitySet::supporting([
+        Capability::WorkerLaunchIsolated,
+        Capability::WorkerMessaging,
+        Capability::WorkerCancel,
+        Capability::WorkerStatusAndOutcome,
+        Capability::ResourceRelease,
+        Capability::LookupLaunchWorker,
+        Capability::IdempotentLaunchWorker,
+        Capability::LookupCancelWorker,
+        Capability::IdempotentCancelWorker,
+        Capability::LookupReleaseResource,
+        Capability::IdempotentReleaseResource,
+    ])
+}
+
+#[test]
+fn per_kind_declarations_pass_the_shared_contract() -> TestResult {
+    let backend = FakeBackend::new(backend_id()?, house()?, orca_like_capabilities());
+    let report = conformance::run_worker(&backend, &conformance_fixture()?)?;
+    for check in [
+        Check::UnknownKeyNotApplied,
+        Check::LookupMatchesReceipt,
+        Check::IdempotentResubmission,
+        Check::MessageRecovery,
+        Check::CancelObserved,
+    ] {
+        assert_eq!(report.result(check), Some(CheckResult::Passed), "{check}");
+    }
+    Ok(())
+}
+
+/// Declares lookup and idempotency for messages that it cannot honor.
+struct OverclaimingMessages {
+    inner: FakeBackend,
+    declared: BackendDescriptor,
+}
+
+impl EffectExecutor for OverclaimingMessages {
+    fn descriptor(&self) -> &BackendDescriptor {
+        &self.declared
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        self.inner.execute(request)
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.inner.lookup(request)
+    }
+}
+
+impl WorkerBackend for OverclaimingMessages {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.inner.observe_worker(worker)
+    }
+}
+
+#[test]
+fn an_overclaimed_message_declaration_fails_the_contract() -> TestResult {
+    for claim in [
+        Capability::LookupMessageWorker,
+        Capability::IdempotentMessageWorker,
+    ] {
+        let backend = OverclaimingMessages {
+            inner: FakeBackend::new(backend_id()?, house()?, orca_like_capabilities()),
+            declared: BackendDescriptor {
+                backend: backend_id()?,
+                house: house()?,
+                capabilities: orca_like_capabilities()
+                    .with(claim, kitchen::contracts::Support::Supported),
+            },
+        };
+        let failure = conformance::run_worker(&backend, &conformance_fixture()?)
+            .err()
+            .ok_or("an overclaimed message declaration passed")?;
+        assert_eq!(failure.check, Check::MessageRecovery, "{claim}");
     }
     Ok(())
 }

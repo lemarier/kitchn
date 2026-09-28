@@ -78,8 +78,8 @@ pub use backend::{
 };
 pub use capability::{BackendDescriptor, Capability, CapabilitySet, Support};
 pub use effects::{
-    DecisionBinding, Effect, EffectContext, ExecutorKind, GitHubEffect, MAX_ASKS_PER_TASK,
-    RogerEffect, ScheduleEffect, SubmittedEffects,
+    DecisionBinding, Effect, EffectContext, EffectKind, ExecutorKind, GitHubEffect,
+    MAX_ASKS_PER_TASK, RogerEffect, ScheduleEffect, SubmittedEffects,
 };
 pub use error::ContractError;
 pub use evidence::{Evidence, EvidenceKind, EvidenceRevision, EvidenceSubject, EvidenceVerdict};

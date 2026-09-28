@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BackendId, HouseId,
-    contracts::{ContractError, ValueKind},
+    contracts::{ContractError, Effect, ValueKind},
 };
 
 closed_names! {
@@ -57,10 +57,44 @@ closed_names! {
         ForgeMutation = "forge.mutation",
         /// Ask a human through a decision service and read the answer.
         AskHuman = "human.ask",
-        /// Look up an effect's outcome by idempotency key.
+        /// Look up any effect's outcome by its persisted request; shorthand
+        /// for every per-kind lookup capability.
         EffectLookup = "effect.lookup",
-        /// Resubmitting an idempotency key never repeats the effect.
+        /// Resubmitting any effect's key never repeats it; shorthand for
+        /// every per-kind idempotency capability.
         EffectIdempotentRequests = "effect.idempotent_requests",
+        /// Look up a `launch_worker` effect's outcome by its persisted request.
+        LookupLaunchWorker = "effect.lookup.launch_worker",
+        /// Resubmitting a `launch_worker` effect's key never repeats it.
+        IdempotentLaunchWorker = "effect.idempotent.launch_worker",
+        /// Look up a `message_worker` effect's outcome by its persisted request.
+        LookupMessageWorker = "effect.lookup.message_worker",
+        /// Resubmitting a `message_worker` effect's key never repeats it.
+        IdempotentMessageWorker = "effect.idempotent.message_worker",
+        /// Look up a `reply_to_worker` effect's outcome by its persisted request.
+        LookupReplyToWorker = "effect.lookup.reply_to_worker",
+        /// Resubmitting a `reply_to_worker` effect's key never repeats it.
+        IdempotentReplyToWorker = "effect.idempotent.reply_to_worker",
+        /// Look up a `cancel_worker` effect's outcome by its persisted request.
+        LookupCancelWorker = "effect.lookup.cancel_worker",
+        /// Resubmitting a `cancel_worker` effect's key never repeats it.
+        IdempotentCancelWorker = "effect.idempotent.cancel_worker",
+        /// Look up a `release_resource` effect's outcome by its persisted request.
+        LookupReleaseResource = "effect.lookup.release_resource",
+        /// Resubmitting a `release_resource` effect's key never repeats it.
+        IdempotentReleaseResource = "effect.idempotent.release_resource",
+        /// Look up a `create_label` effect's outcome by its persisted request.
+        LookupCreateLabel = "effect.lookup.create_label",
+        /// Resubmitting a `create_label` effect's key never repeats it.
+        IdempotentCreateLabel = "effect.idempotent.create_label",
+        /// Look up a `ask` effect's outcome by its persisted request.
+        LookupAsk = "effect.lookup.ask",
+        /// Resubmitting a `ask` effect's key never repeats it.
+        IdempotentAsk = "effect.idempotent.ask",
+        /// Look up a `install_disabled_schedule` effect's outcome by its persisted request.
+        LookupInstallDisabledSchedule = "effect.lookup.install_disabled_schedule",
+        /// Resubmitting a `install_disabled_schedule` effect's key never repeats it.
+        IdempotentInstallDisabledSchedule = "effect.idempotent.install_disabled_schedule",
     }
 }
 
@@ -143,6 +177,31 @@ impl CapabilitySet {
         } else {
             Err(ContractError::UnsupportedCapabilities { missing, partial })
         }
+    }
+}
+
+impl BackendDescriptor {
+    /// Whether the executor can look up `effect`'s outcome by its persisted
+    /// request: [`Capability::EffectLookup`] or the effect kind's own lookup
+    /// capability is fully supported.
+    #[must_use]
+    pub fn supports_lookup(&self, effect: &Effect) -> bool {
+        self.capabilities.supports(Capability::EffectLookup)
+            || self
+                .capabilities
+                .supports(effect.kind().lookup_capability())
+    }
+
+    /// Whether resubmitting `effect`'s key never repeats it:
+    /// [`Capability::EffectIdempotentRequests`] or the effect kind's own
+    /// idempotency capability is fully supported.
+    #[must_use]
+    pub fn idempotent(&self, effect: &Effect) -> bool {
+        self.capabilities
+            .supports(Capability::EffectIdempotentRequests)
+            || self
+                .capabilities
+                .supports(effect.kind().idempotency_capability())
     }
 }
 

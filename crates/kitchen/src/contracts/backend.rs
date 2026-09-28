@@ -459,9 +459,13 @@ pub struct ResourceObservation {
 ///   [`NotAppliedReason::Unsupported`], in each case without acting.
 /// - `execute` returns [`EffectFailure::NotApplied`] only when the effect
 ///   definitely did not happen.
-/// - With [`Capability::EffectIdempotentRequests`], resubmitting a key returns
+/// - Lookup and idempotency are declared per effect kind
+///   ([`BackendDescriptor::supports_lookup`], [`BackendDescriptor::idempotent`]);
+///   the global [`Capability::EffectLookup`] and
+///   [`Capability::EffectIdempotentRequests`] declare them for every kind.
+/// - Where declared idempotent, resubmitting a key returns
 ///   the original receipt without repeating the effect.
-/// - With [`Capability::EffectLookup`], `lookup` reports an applied request's
+/// - Where lookup is declared, `lookup` reports an applied request's
 ///   receipt and returns [`Lookup::Absent`] only with proof that the key was
 ///   not applied and cannot be applied later, including by an earlier
 ///   invocation that is still in flight; otherwise [`Lookup::Unknown`].

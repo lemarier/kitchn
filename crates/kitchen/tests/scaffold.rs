@@ -906,6 +906,45 @@ fn provenance_separates_unedited_managed_files_from_local_edits() -> TestResult 
 }
 
 #[test]
+fn torn_writes_are_reported_apart_from_content_that_differs() -> TestResult {
+    let workspace = TempDir::new()?;
+    let target = real(&workspace)?;
+    let rendered = render_example('a')?;
+    let planned = contents(&rendered, "AGENTS.md").ok_or("AGENTS.md rendered")?;
+    let marker_end = planned.find('\n').ok_or("marker line")?;
+    for (torn, label) in [
+        (&planned[..planned.len() / 2], "half the file"),
+        (&planned[..marker_end / 2], "inside the marker line"),
+        ("", "empty file"),
+    ] {
+        fs::write(target.join("AGENTS.md"), torn)?;
+        let plan = FilePlan::new(render_example('a')?, &target)?;
+        assert_eq!(
+            action(&plan, "AGENTS.md"),
+            Some(&PlanAction::Conflict(Conflict::Incomplete)),
+            "{label}"
+        );
+        assert!(plan.to_string().contains(
+            "  conflict   AGENTS.md: existing file is the start of the planned content (an interrupted write or a truncation); left untouched"
+        ));
+        assert_eq!(fs::read_to_string(target.join("AGENTS.md"))?, torn);
+    }
+    // A marked file whose body no longer matches its digest is not proven to
+    // be a local edit; the preview says so.
+    fs::write(target.join("AGENTS.md"), format!("{planned}Local rule.\n"))?;
+    let plan = FilePlan::new(render_example('a')?, &target)?;
+    assert!(matches!(
+        action(&plan, "AGENTS.md"),
+        Some(PlanAction::Conflict(Conflict::ManagedEdited(_)))
+    ));
+    assert!(
+        plan.to_string()
+            .contains("content differs from its marker (local edits or damage)")
+    );
+    Ok(())
+}
+
+#[test]
 fn markers_record_house_template_and_both_revisions() -> TestResult {
     let rendered = render_origin89('c')?;
     let agents = contents(&rendered, "AGENTS.md").ok_or("AGENTS.md rendered")?;

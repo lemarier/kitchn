@@ -1,10 +1,17 @@
 //! Exact-revision merge gate policy. All observations are supplied by a scoped reader;
 //! this module performs no I/O and never runs code from a proposed change.
-use crate::contracts::{CommitId, IssueNumber};
+use crate::{
+    HouseId,
+    contracts::{CommitId, ExternalRef, IssueNumber, Repository, Text},
+};
 
 /// Evidence for one PR, collected completely at a single head and base.
 #[derive(Debug, Clone)]
 pub struct GateEvidence {
+    /// Selected house whose policy and credentials apply.
+    pub house: HouseId,
+    /// House-authorized destination repository.
+    pub repository: Repository,
     /// PR identity.
     pub number: IssueNumber,
     /// Exact proposed commit.
@@ -39,6 +46,10 @@ pub struct GateEvidence {
     pub no_change_request: Option<bool>,
     /// Gate semantic inspection, read-only and based on committed diff content.
     pub semantic_review: SemanticReview,
+    /// Demonstrated findings worth fixing on this branch.
+    pub verified_findings: Vec<VerifiedFinding>,
+    /// Findings the gate disproved with linked evidence.
+    pub disproved_findings: Vec<DisprovedFinding>,
     /// Commit actually inspected by the gate reviewer.
     pub semantic_head: Option<CommitId>,
     /// Base actually compared for the gate review.
@@ -51,8 +62,8 @@ pub struct GateEvidence {
     pub acceptance_met: Option<bool>,
     /// Required bench, flashing, and other hardware work is complete.
     pub hardware_complete: Option<bool>,
-    /// Risk classes detected in the exact diff.
-    pub risky: Option<bool>,
+    /// Complete risk classification for the exact diff; `None` is unknown.
+    pub risk_classes: Option<Vec<RiskClass>>,
     /// Human write-access approval scoped to both exact head and base.
     pub risk_approval: Option<RiskApproval>,
     /// Branch writer is still working.
@@ -105,9 +116,33 @@ pub enum SemanticReview {
     /// The reviewer or inspection could not complete.
     Unavailable,
 }
+/// Risk classes requiring human write-access approval at this revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskClass {
+    /// Equipment control, firmware, or safety logic.
+    EquipmentSafety,
+    /// Authorization, secrets, or token permissions.
+    AuthorizationSecrets,
+    /// Data deletion, migrations, or persisted formats.
+    DurableData,
+    /// Public APIs, schemas, protocols, or releases.
+    PublicContractRelease,
+    /// Workflows, CI, CODEOWNERS, agent instructions, or gate rules.
+    WorkflowRules,
+    /// Added dependencies or major upgrades.
+    Dependencies,
+    /// Deleted or weakened tests and checks.
+    WeakenedValidation,
+    /// More than 500 changed lines excluding lockfiles and generated output.
+    LargeDiff,
+}
 /// Human decision checked against the house, action, revision, and write permission.
 #[derive(Debug, Clone)]
 pub struct RiskApproval {
+    /// House that made the decision.
+    pub house: HouseId,
+    /// Repository where the decision applies.
+    pub repository: Repository,
     /// Approved head.
     pub head: CommitId,
     /// Approved base.
@@ -115,8 +150,34 @@ pub struct RiskApproval {
     /// Positive repository write-permission evidence for the approver.
     pub write_access: bool,
 }
+/// Review priority for a demonstrated finding within this PR's scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingPriority {
+    /// Must be changed before merge.
+    ActOn,
+    /// Needs a considered change or a documented resolution.
+    Consider,
+}
+/// A verified reviewer or gate finding, with its source and reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedFinding {
+    /// Stable link to the finding.
+    pub source: ExternalRef,
+    /// Concrete trigger and consequence.
+    pub reason: Text,
+    /// Reviewer's priority.
+    pub priority: FindingPriority,
+}
+/// A reviewer finding the gate disproved; the worker may reply with this evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisprovedFinding {
+    /// Stable link to the original finding.
+    pub source: ExternalRef,
+    /// Evidence showing why no branch change is needed.
+    pub evidence: Text,
+}
 /// Explicit grants are independent of one another.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GateGrants {
     /// Permit exact-head squash merge.
     pub merge: bool,
@@ -124,6 +185,22 @@ pub struct GateGrants {
     pub fix_request: bool,
     /// Permit asking specifically configured reviewers for a fresh review.
     pub reviewer_invocation: bool,
+    /// Exact reviewer triggers granted by house policy for this subject.
+    pub review_triggers: Vec<ReviewTrigger>,
+}
+/// One explicitly permitted reviewer invocation, carried as data to the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewTrigger {
+    /// Selected house.
+    pub house: HouseId,
+    /// Reviewer identity.
+    pub reviewer: String,
+    /// Exact granted trigger text; the adapter must not invent a command.
+    pub command: Text,
+    /// Repository where the command may be posted.
+    pub repository: Repository,
+    /// Head for which the request is allowed.
+    pub head: CommitId,
 }
 /// Persistent per-PR accounting supplied from a house-scoped store.
 #[derive(Debug, Clone, Default)]
@@ -154,6 +231,8 @@ pub enum Gap {
     Checks,
     /// A required current-head review is missing.
     ReviewerPending,
+    /// A required review covers only an older commit.
+    ReviewerStale,
     /// A required reviewer reported inability to review.
     ReviewerUnavailable,
     /// Review thread resolution is unproven.
@@ -198,6 +277,10 @@ pub enum Verdict {
 /// A decision and the exact revision to recheck before any effect.
 #[derive(Debug, Clone)]
 pub struct GateDecision {
+    /// Selected house.
+    pub house: HouseId,
+    /// Destination repository.
+    pub repository: Repository,
     /// PR number.
     pub number: IssueNumber,
     /// Pinned head.
@@ -206,6 +289,10 @@ pub struct GateDecision {
     pub base: CommitId,
     /// Chosen outcome.
     pub verdict: Verdict,
+    /// Verified findings carried to a worker or handover.
+    pub verified_findings: Vec<VerifiedFinding>,
+    /// Disproved findings with reply evidence.
+    pub disproved_findings: Vec<DisprovedFinding>,
 }
 
 /// Evaluate a fully supplied observation. Missing evidence always fails closed.
@@ -233,10 +320,10 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     for reviewer in &e.reviewers {
         if reviewer.outcome == ReviewerOutcome::Unavailable {
             gaps.push(Gap::ReviewerUnavailable);
-        } else if reviewer.reviewed_head.as_ref() != Some(&e.head)
-            || reviewer.outcome == ReviewerOutcome::Pending
-        {
+        } else if reviewer.outcome == ReviewerOutcome::Pending {
             gaps.push(Gap::ReviewerPending);
+        } else if reviewer.reviewed_head.as_ref() != Some(&e.head) {
+            gaps.push(Gap::ReviewerStale);
         } else if reviewer.outcome == ReviewerOutcome::Findings {
             gaps.push(Gap::ChangeRequest);
         }
@@ -255,8 +342,12 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
         gaps.push(Gap::SemanticCoverage);
     }
     match e.semantic_review {
-        SemanticReview::Clean => (),
-        SemanticReview::Findings => gaps.push(Gap::SemanticFindings),
+        SemanticReview::Clean if e.verified_findings.is_empty() => (),
+        SemanticReview::Clean => gaps.push(Gap::SemanticFindings),
+        SemanticReview::Findings if !e.verified_findings.is_empty() => {
+            gaps.push(Gap::SemanticFindings)
+        }
+        SemanticReview::Findings => gaps.push(Gap::SemanticCoverage),
         SemanticReview::Partial | SemanticReview::Unavailable => gaps.push(Gap::SemanticCoverage),
     }
     if e.acceptance_met != Some(true) {
@@ -265,8 +356,12 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     if e.hardware_complete != Some(true) {
         gaps.push(Gap::Hardware);
     }
-    if e.risky != Some(false)
-        && !matches!(&e.risk_approval, Some(approval) if e.risky == Some(true) && approval.write_access && approval.head == e.head && approval.base == e.base)
+    if e.risk_classes.is_none()
+        || (e
+            .risk_classes
+            .as_ref()
+            .is_some_and(|classes| !classes.is_empty())
+            && !matches!(&e.risk_approval, Some(approval) if approval.write_access && approval.house == e.house && approval.repository == e.repository && approval.head == e.head && approval.base == e.base))
     {
         gaps.push(Gap::RiskApproval);
     }
@@ -303,11 +398,12 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
                 | Gap::Threads
                 | Gap::SemanticFindings
                 | Gap::ReviewerPending
+                | Gap::ReviewerStale
         )
     }) && grants.fix_request
         && history.fix_rounds < 2
         && !history.requested_this_head
-        && (!gaps.contains(&Gap::ReviewerPending) || grants.reviewer_invocation)
+        && (!gaps.contains(&Gap::ReviewerStale) || can_invoke_missing(e, &grants))
     {
         Verdict::FixRequest { gaps }
     } else if history.requested_this_head
@@ -321,11 +417,32 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
         Verdict::HandOver { gaps }
     };
     GateDecision {
+        house: e.house.clone(),
+        repository: e.repository.clone(),
         number: e.number,
         head: e.head.clone(),
         base: e.base.clone(),
         verdict,
+        verified_findings: e.verified_findings.clone(),
+        disproved_findings: e.disproved_findings.clone(),
     }
+}
+
+fn can_invoke_missing(e: &GateEvidence, grants: &GateGrants) -> bool {
+    grants.reviewer_invocation
+        && e.reviewers
+            .iter()
+            .filter(|reviewer| {
+                reviewer.reviewed_head.as_ref() != Some(&e.head)
+                    || reviewer.outcome == ReviewerOutcome::Pending
+            })
+            .all(|reviewer| {
+                grants.review_triggers.iter().any(|trigger| {
+                    trigger.reviewer.eq_ignore_ascii_case(&reviewer.name)
+                        && trigger.repository == e.repository
+                        && trigger.head == e.head
+                })
+            })
 }
 
 /// An effect boundary must re-read both refs immediately before a merge.
@@ -337,6 +454,10 @@ pub fn still_current(decision: &GateDecision, head: &CommitId, base: &CommitId) 
 /// Fixed merge operation; the executor must use a head match and read back the merged PR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeRequest {
+    /// Authorized house.
+    pub house: HouseId,
+    /// Authorized repository.
+    pub repository: Repository,
     /// PR to merge.
     pub number: IssueNumber,
     /// Exact head supplied to the provider's match-head guard.
@@ -385,6 +506,8 @@ pub fn merge_request(
         return Err(RequestRefusal::MergeLimit);
     }
     Ok(MergeRequest {
+        house: decision.house.clone(),
+        repository: decision.repository.clone(),
         number: decision.number,
         match_head: decision.head.clone(),
         checked_base: decision.base.clone(),
@@ -394,6 +517,10 @@ pub fn merge_request(
 /// Narrow work request sent through a capable worker backend, never a shell command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixRequest {
+    /// Authorized house.
+    pub house: HouseId,
+    /// Authorized repository.
+    pub repository: Repository,
     /// PR to repair.
     pub number: IssueNumber,
     /// Head on which the findings were established.
@@ -402,8 +529,12 @@ pub struct FixRequest {
     pub base: CommitId,
     /// Only failed fixable conditions; the worker receives no merge or publication grant.
     pub gaps: Vec<Gap>,
+    /// Demonstrated findings to address.
+    pub verified_findings: Vec<VerifiedFinding>,
+    /// Findings to reply to with disproving evidence.
+    pub disproved_findings: Vec<DisprovedFinding>,
     /// The requested worker may invoke only the explicitly granted reviewers.
-    pub invoke_reviewers: bool,
+    pub review_triggers: Vec<ReviewTrigger>,
 }
 /// Construct a bounded repair request from a fix verdict.
 ///
@@ -411,7 +542,7 @@ pub struct FixRequest {
 /// Other verdicts cannot start a repair worker.
 pub fn fix_request(
     recorded: &RecordedDecision,
-    invoke_reviewers: bool,
+    grants: &GateGrants,
 ) -> Result<FixRequest, RequestRefusal> {
     if recorded.mode != GateMode::Active || !recorded.new_record {
         return Err(RequestRefusal::EffectsDisabled);
@@ -420,12 +551,30 @@ pub fn fix_request(
     let Verdict::FixRequest { gaps } = &decision.verdict else {
         return Err(RequestRefusal::WrongVerdict);
     };
+    if !grants.reviewer_invocation && !grants.review_triggers.is_empty() {
+        return Err(RequestRefusal::EffectsDisabled);
+    }
+    if grants.review_triggers.iter().any(|trigger| {
+        trigger.house != decision.house
+            || trigger.repository != decision.repository
+            || trigger.head != decision.head
+    }) {
+        return Err(RequestRefusal::MovedRevision);
+    }
     Ok(FixRequest {
+        house: decision.house.clone(),
+        repository: decision.repository.clone(),
         number: decision.number,
         head: decision.head.clone(),
         base: decision.base.clone(),
         gaps: gaps.clone(),
-        invoke_reviewers,
+        verified_findings: decision.verified_findings.clone(),
+        disproved_findings: decision.disproved_findings.clone(),
+        review_triggers: if gaps.contains(&Gap::ReviewerStale) {
+            grants.review_triggers.clone()
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -440,6 +589,10 @@ pub enum GateMode {
 /// Small typed payload for the generic house-scoped workflow marker store.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GateVerdictRecord {
+    /// Selected house.
+    pub house: HouseId,
+    /// House-authorized repository.
+    pub repository: Repository,
     /// PR number within its house-scoped repository key.
     pub number: IssueNumber,
     /// Revision judged.
@@ -462,6 +615,8 @@ pub trait GateMarkerStore {
     /// Fails when history cannot be read completely.
     fn history(
         &self,
+        house: &HouseId,
+        repository: &Repository,
         number: IssueNumber,
         head: &CommitId,
         base: &CommitId,
@@ -492,7 +647,13 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
     grants: GateGrants,
     mode: GateMode,
 ) -> Result<RecordedDecision, S::Error> {
-    let history = store.history(evidence.number, &evidence.head, &evidence.base)?;
+    let history = store.history(
+        &evidence.house,
+        &evidence.repository,
+        evidence.number,
+        &evidence.head,
+        &evidence.base,
+    )?;
     let mut decision = evaluate(evidence, grants, history);
     if decision.verdict == Verdict::Skip {
         return Ok(RecordedDecision {
@@ -502,6 +663,8 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
         });
     }
     let recorded = store.record_if_absent(GateVerdictRecord {
+        house: decision.house.clone(),
+        repository: decision.repository.clone(),
         number: decision.number,
         head: decision.head.clone(),
         base: decision.base.clone(),

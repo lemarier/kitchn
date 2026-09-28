@@ -1,12 +1,17 @@
 //! Exact-revision gate policy scenarios.
 mod common;
 use common::{TestResult, commit};
-use kitchen::contracts::IssueNumber;
 use kitchen::workflows::gate::{self, *};
+use kitchen::{
+    HouseId,
+    contracts::{ExternalRef, IssueNumber, Repository, Text},
+};
 
 fn ready() -> TestResult<GateEvidence> {
     let head = commit('a')?;
     Ok(GateEvidence {
+        house: HouseId::new("kitchen")?,
+        repository: Repository::new("lemarier/kitchen")?,
         number: IssueNumber::new(9)?,
         head: head.clone(),
         base: commit('b')?,
@@ -28,13 +33,15 @@ fn ready() -> TestResult<GateEvidence> {
         threads_resolved: Some(true),
         no_change_request: Some(true),
         semantic_review: SemanticReview::Clean,
+        verified_findings: Vec::new(),
+        disproved_findings: Vec::new(),
         semantic_head: Some(head.clone()),
         semantic_base: Some(commit('b')?),
         semantic_read_only: true,
         semantic_independent: true,
         acceptance_met: Some(true),
         hardware_complete: Some(true),
-        risky: Some(false),
+        risk_classes: Some(Vec::new()),
         risk_approval: None,
         writer_working: false,
     })
@@ -44,6 +51,7 @@ fn grants() -> GateGrants {
         merge: true,
         fix_request: true,
         reviewer_invocation: true,
+        review_triggers: Vec::new(),
     }
 }
 #[test]
@@ -77,15 +85,17 @@ fn stale_reviews_and_approvals_do_not_pass() -> TestResult {
     e.reviewers[0].reviewed_head = Some(commit('c')?);
     assert!(matches!(
         gate::evaluate(&e, grants(), GateHistory::default()).verdict,
-        Verdict::Skip
+        Verdict::HandOver { gaps } if gaps.contains(&Gap::ReviewerStale)
     ));
     e.head_age_secs = 86400;
     assert!(
-        matches!(gate::evaluate(&e,grants(),GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::ReviewerPending))
+        matches!(gate::evaluate(&e,grants(),GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::ReviewerStale))
     );
     e.reviewers[0].reviewed_head = Some(e.head.clone());
-    e.risky = Some(true);
+    e.risk_classes = Some(vec![RiskClass::AuthorizationSecrets]);
     e.risk_approval = Some(RiskApproval {
+        house: e.house.clone(),
+        repository: e.repository.clone(),
         head: commit('c')?,
         base: e.base.clone(),
         write_access: true,
@@ -158,8 +168,10 @@ fn report_marker_suppresses_repeat_and_fix_is_once_per_head() -> TestResult {
 #[test]
 fn risk_approval_cannot_override_other_rules() -> TestResult {
     let mut e = ready()?;
-    e.risky = Some(true);
+    e.risk_classes = Some(vec![RiskClass::AuthorizationSecrets]);
     e.risk_approval = Some(RiskApproval {
+        house: e.house.clone(),
+        repository: e.repository.clone(),
         head: e.head.clone(),
         base: e.base.clone(),
         write_access: true,
@@ -202,7 +214,7 @@ fn repair_request_only_from_fix_verdict() -> TestResult {
         new_record: true,
     };
     assert_eq!(
-        gate::fix_request(&d, false).map(|r| r.gaps)?,
+        gate::fix_request(&d, &grants()).map(|r| r.gaps)?,
         vec![Gap::BaseBehind]
     );
     e.contains_base = Some(true);
@@ -212,7 +224,7 @@ fn repair_request_only_from_fix_verdict() -> TestResult {
         new_record: true,
     };
     assert_eq!(
-        gate::fix_request(&d, true),
+        gate::fix_request(&d, &grants()),
         Err(RequestRefusal::WrongVerdict)
     );
     Ok(())
@@ -239,12 +251,14 @@ fn semantic_review_must_be_independent_complete_and_exact() -> TestResult {
 #[test]
 fn unknown_risk_and_unverified_permission_block_merge() -> TestResult {
     let mut e = ready()?;
-    e.risky = None;
+    e.risk_classes = None;
     assert!(
         matches!(gate::evaluate(&e, grants(), GateHistory::default()).verdict, Verdict::HandOver { gaps } if gaps.contains(&Gap::RiskApproval))
     );
-    e.risky = Some(true);
+    e.risk_classes = Some(vec![RiskClass::AuthorizationSecrets]);
     e.risk_approval = Some(RiskApproval {
+        house: e.house.clone(),
+        repository: e.repository.clone(),
         head: e.head.clone(),
         base: e.base.clone(),
         write_access: false,
@@ -264,7 +278,9 @@ impl GateMarkerStore for FakeMarkers {
     type Error = std::io::Error;
     fn history(
         &self,
-        _number: IssueNumber,
+        house: &HouseId,
+        repository: &Repository,
+        number: IssueNumber,
         head: &kitchen::contracts::CommitId,
         base: &kitchen::contracts::CommitId,
     ) -> Result<GateHistory, Self::Error> {
@@ -272,7 +288,13 @@ impl GateMarkerStore for FakeMarkers {
             reported_subject: self
                 .records
                 .iter()
-                .find(|r| &r.head == head && &r.base == base)
+                .find(|r| {
+                    &r.house == house
+                        && &r.repository == repository
+                        && r.number == number
+                        && &r.head == head
+                        && &r.base == base
+                })
                 .map(|r| (r.head.clone(), r.base.clone())),
             ..GateHistory::default()
         })
@@ -281,11 +303,13 @@ impl GateMarkerStore for FakeMarkers {
         if self.fail {
             return Err(std::io::Error::other("fake persistence failure"));
         }
-        if self
-            .records
-            .iter()
-            .any(|r| r.number == record.number && r.head == record.head && r.base == record.base)
-        {
+        if self.records.iter().any(|r| {
+            r.house == record.house
+                && r.repository == record.repository
+                && r.number == record.number
+                && r.head == record.head
+                && r.base == record.base
+        }) {
             return Ok(false);
         }
         self.records.push(record);
@@ -306,10 +330,18 @@ fn report_only_records_once_per_exact_subject_without_effect() -> TestResult {
     let second = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly)?;
     assert_eq!(second.decision.verdict, Verdict::Skip);
     assert_eq!(store.records.len(), 1);
+    e.repository = Repository::new("other/repository")?;
+    let other = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly)?;
+    assert!(other.new_record);
+    assert_eq!(store.records.len(), 2);
+    e.house = HouseId::new("other-house")?;
+    let cross = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly)?;
+    assert!(cross.new_record);
+    assert_eq!(store.records.len(), 3);
     e.base = commit('c')?;
     let moved = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly)?;
     assert!(moved.new_record);
-    assert_eq!(store.records.len(), 2);
+    assert_eq!(store.records.len(), 4);
     Ok(())
 }
 #[test]
@@ -367,7 +399,81 @@ fn reviewer_request_needs_its_separate_grant() -> TestResult {
         ..grants()
     };
     assert!(
-        matches!(gate::evaluate(&e,grants,GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::ReviewerPending))
+        matches!(gate::evaluate(&e,grants,GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::ReviewerStale))
+    );
+    Ok(())
+}
+#[test]
+fn reviewer_trigger_is_exactly_granted_and_head_scoped() -> TestResult {
+    let mut e = ready()?;
+    e.reviewers[0].reviewed_head = Some(commit('c')?);
+    let trigger = ReviewTrigger {
+        house: e.house.clone(),
+        reviewer: "reviewer".into(),
+        command: Text::new("@reviewer review")?,
+        repository: e.repository.clone(),
+        head: e.head.clone(),
+    };
+    let mut granted = grants();
+    granted.review_triggers.push(trigger.clone());
+    let mut history = GateHistory::default();
+    e.head_age_secs = 3600;
+    let recorded = RecordedDecision {
+        decision: gate::evaluate(&e, granted.clone(), history.clone()),
+        mode: GateMode::Active,
+        new_record: true,
+    };
+    assert_eq!(
+        gate::fix_request(&recorded, &granted)?.review_triggers,
+        vec![trigger.clone()]
+    );
+    e.reviewers[0].reviewed_head = Some(e.head.clone());
+    e.reviewers[0].outcome = ReviewerOutcome::Findings;
+    let findings = RecordedDecision {
+        decision: gate::evaluate(&e, granted.clone(), history.clone()),
+        mode: GateMode::Active,
+        new_record: true,
+    };
+    assert!(
+        gate::fix_request(&findings, &granted)?
+            .review_triggers
+            .is_empty()
+    );
+    let mut wrong = granted;
+    wrong.review_triggers[0].head = commit('d')?;
+    assert_eq!(
+        gate::fix_request(&recorded, &wrong),
+        Err(RequestRefusal::MovedRevision)
+    );
+    history.reported_subject = Some((e.head.clone(), e.base.clone()));
+    assert_eq!(gate::evaluate(&e, grants(), history).verdict, Verdict::Skip);
+    Ok(())
+}
+#[test]
+fn fix_request_carries_verified_and_disproved_finding_evidence() -> TestResult {
+    let mut e = ready()?;
+    e.semantic_review = SemanticReview::Findings;
+    e.verified_findings.push(VerifiedFinding {
+        source: ExternalRef::new("https://github.com/lemarier/kitchen/pull/23#discussion_r1")?,
+        reason: Text::new("unbounded retry after ambiguous merge")?,
+        priority: FindingPriority::ActOn,
+    });
+    e.disproved_findings.push(DisprovedFinding {
+        source: ExternalRef::new("https://github.com/lemarier/kitchen/pull/23#discussion_r2")?,
+        evidence: Text::new("caller bounds attempts to two")?,
+    });
+    let recorded = RecordedDecision {
+        decision: gate::evaluate(&e, grants(), GateHistory::default()),
+        mode: GateMode::Active,
+        new_record: true,
+    };
+    let request = gate::fix_request(&recorded, &grants())?;
+    assert_eq!(request.verified_findings, e.verified_findings);
+    assert_eq!(request.disproved_findings, e.disproved_findings);
+    assert!(request.review_triggers.is_empty());
+    e.verified_findings.clear();
+    assert!(
+        matches!(gate::evaluate(&e,grants(),GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::SemanticCoverage))
     );
     Ok(())
 }

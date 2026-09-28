@@ -1,0 +1,87 @@
+---
+import type { Role } from "../lib/roles";
+
+interface Props {
+  slug: Role["slug"];
+}
+
+const { slug } = Astro.props;
+
+// Each station's headwear and prop, drawn as single-weight strokes.
+const props: Record<Role["slug"], string[]> = {
+  "chef-owner": [
+    "M32 44v-9c-9-2-10-15 0-17 1-11 14-13 17-5 4-9 17-6 17 5 10 2 9 15 0 17v9",
+    "M32 44h34",
+    "M40 30v9M49 28v11M58 30v9",
+  ],
+  "sous-chef": [
+    "M33 44v-6c-8-2-8-12 0-13 2-8 13-9 15-3 3-6 14-4 14 3 8 1 8 11 0 13v6",
+    "M33 44h29",
+    "M70 60h15v21H70Z",
+    "M74 58h7v4h-7Z",
+    "M73 68h9M73 73h9M73 77h6",
+  ],
+  "station-cook": [
+    "M33 44v-5c-6-2-6-10 1-10 3-6 25-6 28 0 7 0 7 8 1 10v5",
+    "M33 44h30",
+    "M4 70c0-6 6-9 12-9s12 3 12 9-6 7-12 7-12-1-12-7Z",
+    "M27 68l9-4",
+    "M10 58c1-3 0-5-1-7M16 57c1-3 0-5-1-7",
+  ],
+  commis: [
+    "M31 45c1-11 34-11 35 0",
+    "M28 45h41",
+    "M48 35v4",
+    "M72 82l13-24c3 5 1 11-5 16",
+    "M72 82l-4 5",
+  ],
+  expediter: [
+    "M38 40a10 10 0 0 1 20 0",
+    "M35 40h26",
+    "M48 27v3",
+    "M70 55h15v25l-2.5-2-2.5 2-2.5-2-2.5 2-2.5-2-2.5 2Z",
+    "M73 61h9M73 66h9M73 71h6",
+  ],
+  inspector: [
+    "M30 44c0-10 36-10 36 0",
+    "M30 44c-4 0-6 2-6 3h20",
+    "M68 54a9 9 0 1 0 0.1 0",
+    "M74 67l9 10",
+  ],
+  gardener: [
+    "M35 42c0-10 26-10 26 0",
+    "M26 45c7-4 37-4 44 0",
+    "M80 84c-1-10 0-20 2-28",
+    "M81 68c-7-1-10-5-10-11 7 0 10 4 10 11Z",
+    "M82 60c3-5 8-6 11-4-2 5-6 6-11 4Z",
+  ],
+  dishwasher: [
+    "M31 48c4-12 30-12 34 0",
+    "M31 48h34",
+    "M65 46l8 3-7 3",
+    "M77 36a5 5 0 1 0 0.1 0M87 26a3 3 0 1 0 0.1 0M84 48a3.5 3.5 0 1 0 0.1 0",
+  ],
+};
+---
+
+<svg class="avatar" viewBox="0 0 96 96" aria-hidden="true">
+  <path d="M30 60c0-11 8-18 18-18s18 7 18 18-8 21-18 21-18-10-18-21Z" />
+  <circle class="fill" cx="42" cy="59" r="2.3" />
+  <circle class="fill" cx="54" cy="59" r="2.3" />
+  <path d="M43 68c3 3 7 3 10 0" />
+  {props[slug].map((d) => <path d={d} />)}
+</svg>
+
+<style>
+  .avatar {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .fill {
+    fill: currentColor;
+    stroke: none;
+  }
+</style>

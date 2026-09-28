@@ -1,0 +1,49 @@
+/* Matches the landing page: steel, ticket paper and printer red. */
+:root {
+  --sl-font: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --kn-font-display: "Big Shoulders Display", "Arial Narrow", sans-serif;
+
+  --sl-color-accent-low: #3d1411;
+  --sl-color-accent: #ff3b2f;
+  --sl-color-accent-high: #ffc4bf;
+  --sl-color-white: #eef1f2;
+  --sl-color-gray-1: #d8dee1;
+  --sl-color-gray-2: #b2bdc3;
+  --sl-color-gray-3: #8593a0;
+  --sl-color-gray-4: #56636c;
+  --sl-color-gray-5: #3a464d;
+  --sl-color-gray-6: #1b2226;
+  --sl-color-black: #121719;
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #ffe0dc;
+  --sl-color-accent: #cf1d12;
+  --sl-color-accent-high: #6e0e08;
+  --sl-color-white: #182026;
+  --sl-color-gray-1: #252e33;
+  --sl-color-gray-2: #3a464d;
+  --sl-color-gray-3: #56636c;
+  --sl-color-gray-4: #8593a0;
+  --sl-color-gray-5: #c5ced4;
+  --sl-color-gray-6: #e4e9ec;
+  --sl-color-gray-7: #f1f4f5;
+  --sl-color-black: #fbfcfc;
+}
+
+.site-title {
+  color: var(--sl-color-white);
+  font-family: var(--kn-font-display);
+  font-weight: 900;
+  font-size: 1.6rem;
+}
+
+.sl-markdown-content :is(h1, h2),
+h1#_top {
+  font-family: var(--kn-font-display);
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0;
+  line-height: 1;
+}

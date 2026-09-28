@@ -1,0 +1,11 @@
+{
+  "name": "kitchen-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14"
+  }
+}

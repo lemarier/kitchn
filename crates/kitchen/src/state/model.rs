@@ -17,7 +17,8 @@ use crate::{
         AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Capability, CommitId,
         ContractError, Disposition, EffectRequest, EffectSeq, Evidence, EvidenceRevision,
         ExternalRef, FailureClass, Fence, HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason,
-        Operation, Receipt, RetryPolicy, Settlement, TaskSpec, Timestamp, UncertainReason,
+        Operation, Receipt, ResourceRef, RetryPolicy, Settlement, TaskSpec, Timestamp,
+        UncertainReason,
     },
     state::{Corruption, Limit, StateError},
 };
@@ -653,6 +654,14 @@ impl TaskRecord {
         Ok(())
     }
 
+    /// Whether an applied effect of this task reported `resource`.
+    fn owns_resource(&self, resource: &ResourceRef) -> bool {
+        self.effects.iter().any(|effect| {
+            matches!(&effect.state, EffectState::Applied { receipt, .. }
+                if receipt.resources().contains(resource))
+        })
+    }
+
     fn attempt(&self, number: AttemptNumber) -> Option<&AttemptRecord> {
         let index = usize::try_from(number.get()).ok()?.checked_sub(1)?;
         self.attempts.get(index)
@@ -1249,8 +1258,17 @@ impl StoreState {
                 .chain([plan.operation.required_capability()]),
         )?;
         task.owned_lease(plan.fence, now, true)?;
-        if task.cancel.is_some() {
-            return fail(StateError::CancelRequested);
+        // After a cancellation request, only stopping a worker this task
+        // launched may start; it may start while other effects are unresolved.
+        let stopping = task.cancel.is_some();
+        if stopping {
+            match &plan.operation {
+                Operation::CancelWorker { worker } if task.owns_resource(worker) => {}
+                Operation::CancelWorker { .. } => return fail(StateError::ResourceNotOwned),
+                Operation::LaunchWorker { .. }
+                | Operation::MessageWorker { .. }
+                | Operation::ReleaseResource { .. } => return fail(StateError::CancelRequested),
+            }
         }
         let attempt = match task.running_attempt_mut(plan.fence) {
             Some(attempt) => attempt.number,
@@ -1276,7 +1294,7 @@ impl StoreState {
             return task.repeat_effect(index, &plan, backend, resubmission, now);
         }
         let unresolved = task.blocking_work();
-        if unresolved > 0 {
+        if unresolved > 0 && !stopping {
             return fail(StateError::UnresolvedEffects { count: unresolved });
         }
         if task.effects.len() >= MAX_EFFECTS_PER_TASK {

@@ -179,6 +179,9 @@ pub enum StateError {
     /// Cancellation was requested; no new attempts or effects may start.
     #[error("cancellation requested")]
     CancelRequested,
+    /// The target resource was not reported by an applied effect of this task.
+    #[error("the task does not own the target resource")]
+    ResourceNotOwned,
     /// Effects with unknown outcomes must be reconciled first.
     #[error("{count} effect(s) have unresolved outcomes; reconcile before continuing")]
     UnresolvedEffects {
@@ -298,6 +301,7 @@ impl StateError {
             | Self::AttemptNotFound(_)
             | Self::NoRunningAttempt
             | Self::CancelRequested
+            | Self::ResourceNotOwned
             | Self::UnresolvedEffects { .. }
             | Self::EffectNotFound(_)
             | Self::EffectNameConflict(_)

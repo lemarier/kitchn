@@ -900,3 +900,141 @@ fn same_key_resubmission_is_bounded_by_count() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn a_requested_cancellation_can_stop_the_task_worker() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = started(&fixture, "task-1")?;
+    let backend = FakeBackend::fully_capable(backend_id()?, house()?);
+    let clock = ManualClock::starting_at(1);
+    let launched = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(&task, fence, "launch", launch()?)?,
+        &clock,
+    )?;
+    let EffectState::Applied { receipt, .. } = launched.state() else {
+        return Err("launch was not applied".into());
+    };
+    let worker = receipt
+        .resources()
+        .iter()
+        .find(|resource| resource.kind == ResourceKind::Worker)
+        .cloned()
+        .ok_or("receipt names no worker")?;
+    fixture
+        .store
+        .request_cancel(&task, &holder("operator")?, at(2))?;
+    assert!(matches!(
+        run_effect(
+            &fixture.store,
+            &backend,
+            &grants()?,
+            plan(&task, fence, "more", launch()?)?,
+            &clock
+        ),
+        Err(Error::State(StateError::CancelRequested))
+    ));
+    let stranger = ResourceRef {
+        kind: ResourceKind::Worker,
+        backend: backend_id()?,
+        handle: ExternalRef::new("someone-elses-worker")?,
+    };
+    assert!(matches!(
+        run_effect(
+            &fixture.store,
+            &backend,
+            &grants()?,
+            plan(
+                &task,
+                fence,
+                "cancel-other",
+                Operation::CancelWorker { worker: stranger }
+            )?,
+            &clock
+        ),
+        Err(Error::State(StateError::ResourceNotOwned))
+    ));
+
+    let cancelled = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(
+            &task,
+            fence,
+            "cancel",
+            Operation::CancelWorker {
+                worker: worker.clone(),
+            },
+        )?,
+        &clock,
+    )?;
+    assert!(matches!(cancelled.state(), EffectState::Applied { .. }));
+    assert_eq!(
+        backend.observe_worker(&worker)?,
+        WorkerState::Settled(kitchen::contracts::WorkerOutcome::Cancelled)
+    );
+    fixture.store.settle_cancelled(&task, fence, at(3))?;
+    Ok(())
+}
+
+#[test]
+fn cancelling_an_uncertain_launch_keeps_its_uncertainty() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = started(&fixture, "task-1")?;
+    let backend = fake([Capability::WorkerLaunchIsolated, Capability::WorkerCancel])?;
+    let clock = ManualClock::starting_at(1);
+    backend.inject(ExecuteFault::ApplyThenLoseResponse);
+    let lost = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(&task, fence, "launch", launch()?)?,
+        &clock,
+    )?;
+    assert_eq!(
+        fixture
+            .store
+            .request_cancel(&task, &holder("operator")?, at(2))?,
+        kitchen::state::CancelStatus::Pending
+    );
+    assert!(matches!(
+        fixture.store.settle_cancelled(&task, fence, at(3)),
+        Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+    ));
+    fixture.store.record_effect_outcome(
+        &task,
+        fence,
+        lost.seq(),
+        kitchen::state::EffectOutcome::Unresolvable,
+        at(3),
+    )?;
+    fixture.store.accept_risk(
+        &task,
+        fence,
+        lost.seq(),
+        kitchen::state::RiskDecision {
+            effect: lost.request().key().clone(),
+            decided_by: holder("operator")?,
+            revision: kitchen::contracts::EvidenceRevision::INITIAL,
+            action: kitchen::state::RiskAction::SettleUnsuccessfully,
+        },
+        at(4),
+    )?;
+    fixture.store.settle_cancelled(&task, fence, at(5))?;
+    let record = fixture.store.task(&task)?;
+    assert!(matches!(
+        record.state(),
+        kitchen::state::TaskState::Settled {
+            settlement: Settlement::Cancelled,
+            ..
+        }
+    ));
+    assert!(
+        matches!(record.effects(), [effect] if matches!(effect.state(), EffectState::Waived { .. })),
+        "the launch stays recorded as unknown"
+    );
+    Ok(())
+}

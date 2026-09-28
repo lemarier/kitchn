@@ -50,13 +50,13 @@ fn scope() -> Result<HouseScope> {
         house.clone(),
         [Repository::new("sample/project")?],
         requester.clone(),
-        CredentialRef::new(house, ExternalRef::new("github-read")?, requester),
+        CredentialRef::new(house, kitchen::CredentialId::new("github-read")?, requester),
         PostingBudget::new(2)?,
         [Permission::PostComment],
     )?)
 }
 fn issue(number: u64) -> Value {
-    json!({"id":number,"number":number,"title":"sanitized issue","state":"open","assignees":[],"labels":[]})
+    json!({"repository_url":"https://api.github.com/repos/sample/project","id":number,"number":number,"title":"sanitized issue","state":"open","assignees":[],"labels":[]})
 }
 #[test]
 fn scope_rejects_foreign_house_repository_requester_and_budget() -> Result {
@@ -266,7 +266,10 @@ fn label_setup_preserves_present_and_conflicting_definitions() -> Result {
         name: "bad\nlabel".into(),
         ..wanted
     };
-    assert_eq!(bad.validate(), Err(IntegrationError::InvalidInput));
+    assert_eq!(
+        bad.validate().map_err(IntegrationError::from),
+        Err(IntegrationError::InvalidInput)
+    );
     Ok(())
 }
 
@@ -293,7 +296,7 @@ fn gh_cli_clears_environment_and_checks_requester_before_repository_read() -> Re
 if [ "$4" = user ]; then
   printf '%s' '{"login":"sample-bot"}'
 else
-  printf '%s' '{"id":1,"number":1,"title":"sample","state":"open","assignees":[],"labels":[]}'
+  printf '%s' '{"repository_url":"https://api.github.com/repos/sample/project","id":1,"number":1,"title":"sample","state":"open","assignees":[],"labels":[]}'
 fi
 "#,
     )?;
@@ -425,9 +428,50 @@ fn bounded_mutation_payloads_reject_self_links_and_bad_labels() -> Result {
                 repository: repo.clone(),
                 action
             }
-            .validate(),
+            .validate()
+            .map_err(IntegrationError::from),
             Err(IntegrationError::InvalidInput)
         );
     }
+    Ok(())
+}
+
+#[test]
+fn provider_identity_substitution_is_unknown_and_dependency_source_is_retained() -> Result {
+    let mut foreign = issue(4);
+    foreign["repository_url"] = json!("https://api.github.com/repos/foreign/project");
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![
+            Ok(foreign.clone()),
+            Ok(json!([foreign])),
+            Ok(
+                json!({"check_runs":[{"name":"ci","head_sha":"b".repeat(40),"status":"completed","conclusion":"success"}]}),
+            ),
+        ])?,
+        ReadLimits::default(),
+    );
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    assert_eq!(
+        client.issue(&house, &repo, IssueNumber::new(4)?),
+        Observation::Unknown
+    );
+    let Observation::Known(dependencies) = client.dependencies(&house, &repo, IssueNumber::new(7)?)
+    else {
+        return Err("expected dependency reference".into());
+    };
+    assert_eq!(
+        dependencies[0].repository,
+        Repository::new("foreign/project")?
+    );
+    assert_eq!(
+        client.checks(
+            &house,
+            &repo,
+            &kitchen::contracts::CommitId::new(&"a".repeat(40))?
+        ),
+        Observation::Unknown
+    );
     Ok(())
 }

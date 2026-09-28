@@ -15,10 +15,10 @@ use crate::{
     BackendId, HouseId,
     contracts::{
         BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, Effect, EffectExecutor,
-        EffectFailure, EffectRequest, ExternalRef, GitHubEffect, IdempotencyKey, Liveness, Lookup,
+        EffectFailure, EffectRequest, ExternalRef, IdempotencyKey, Liveness, Lookup,
         MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation, Receipt, ResourceKind,
-        ResourceObservation, ResourceRef, RogerEffect, ScheduleEffect, UncertainReason,
-        WorkerBackend, WorkerOutcome, WorkerState, Workspace,
+        ResourceObservation, ResourceRef, ScheduleEffect, UncertainReason, WorkerBackend,
+        WorkerOutcome, WorkerState, Workspace,
     },
 };
 
@@ -180,8 +180,7 @@ impl FakeBackend {
                 state.owners.remove(&resource.handle);
                 (Vec::new(), vec![resource.clone()])
             }
-            Effect::GitHub(GitHubEffect::CreateLabel { .. })
-            | Effect::Roger(RogerEffect::Ask { .. }) => (Vec::new(), Vec::new()),
+            Effect::GitHub(_) | Effect::Roger(_) => (Vec::new(), Vec::new()),
             Effect::Schedule(ScheduleEffect::InstallDisabled { .. }) => {
                 let schedule = self.handle(state, "schedule")?;
                 (

@@ -1,71 +1,14 @@
 //! Bounded Roger CLI access with explicit requester identity evidence.
 use super::{DecisionBinding, DecisionStatus, validate_answer};
-use crate::contracts::{ExternalRef, Text};
+use crate::contracts::ExternalRef;
 use crate::integrations::github::{
     CredentialFile, CredentialRef, HouseScope, IntegrationError, ReadLimits, process::run,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-
-/// Human decision kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AskKind {
-    /// Exact action approval with approve/reject options.
-    Approval,
-    /// Instructions only; answers cannot approve an action.
-    Question,
-}
-/// Explicit operator-selected consequence level; never inferred downward.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AskRisk {
-    /// Reversible routine work.
-    Routine,
-    /// Secrets, money, authorization, or data loss.
-    Sensitive,
-    /// Irreversible production, release, or equipment effects.
-    Irreversible,
-}
-/// Payload to be persisted before asking a human.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RogerAsk {
-    /// Exact decision scope.
-    pub binding: DecisionBinding,
-    /// Approval or question.
-    pub kind: AskKind,
-    /// Consequence level.
-    pub risk: AskRisk,
-    /// One-line title.
-    pub title: Text,
-    /// Sanitized question context.
-    pub body: Text,
-    /// Existing open request replaced after a revision change.
-    pub supersedes: Option<ExternalRef>,
-}
-impl RogerAsk {
-    /// Validate input before persistence and any effect.
-    ///
-    /// # Errors
-    /// Refuses invalid binding, titles, body size, and Ask references.
-    pub fn validate(&self) -> Result<(), IntegrationError> {
-        self.binding.decision_key()?;
-        if self.title.as_str().chars().count() > 120
-            || self.title.as_str().chars().any(char::is_control)
-            || self.body.as_str().len() > 16 * 1024
-        {
-            return Err(IntegrationError::InvalidInput);
-        }
-        if let Some(id) = &self.supersedes {
-            validate_id(id)?;
-        }
-        Ok(())
-    }
-}
 
 /// Roger read boundary for deterministic offline tests and bounded CLI use.
 pub trait RogerReadTransport {
@@ -117,6 +60,17 @@ impl<T: RogerReadTransport> RogerClient<T> {
     }
 }
 
+/// Local optional Roger capability. Detection never reads credentials or contacts Roger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RogerAvailability {
+    /// The local CLI advertises the bounded adapter's required arguments.
+    Available,
+    /// No binary exists at the explicitly selected path.
+    NotInstalled,
+    /// A binary exists but does not advertise the required interface.
+    Unsupported,
+}
+
 /// Roger binary and verified requester probe, selected from private configuration.
 /// A probe is a pre-existing Ask owned by this requester. If no probe is known,
 /// provisioning remains incomplete; this adapter never guesses a token's owner.
@@ -127,6 +81,54 @@ pub struct RogerCli {
     probe: ExternalRef,
 }
 impl RogerCli {
+    /// Detect the optional local CLI without credentials, network calls, or installation.
+    ///
+    /// # Errors
+    /// Invalid paths, unreadable files, failed help calls and deadlines remain errors.
+    pub fn detect(executable: &Path) -> Result<RogerAvailability, IntegrationError> {
+        if !executable.is_absolute() {
+            return Err(IntegrationError::InvalidInput);
+        }
+        match std::fs::metadata(executable) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RogerAvailability::NotInstalled);
+            }
+            Err(_) => return Err(IntegrationError::Unavailable),
+            Ok(metadata) if !metadata.is_file() => return Ok(RogerAvailability::Unsupported),
+            Ok(_) => {}
+        }
+        let output = run(
+            executable,
+            &["ask".into(), "--help".into()],
+            &[],
+            &[],
+            Duration::from_secs(2),
+            32 * 1024,
+        )?;
+        if output.code != Some(0) {
+            return Err(IntegrationError::Unavailable);
+        }
+        let help = std::str::from_utf8(&output.stdout).map_err(|_| IntegrationError::Unknown)?;
+        Ok(
+            if [
+                "--idem",
+                "--decision-key",
+                "--action-rev",
+                "--action-target",
+                "--action-limits",
+                "--resume-task",
+                "--resume-rev",
+                "--body-file",
+            ]
+            .iter()
+            .all(|flag| help.contains(flag))
+            {
+                RogerAvailability::Available
+            } else {
+                RogerAvailability::Unsupported
+            },
+        )
+    }
     /// Configure bounded Roger calls. No network request occurs here.
     ///
     /// # Errors
@@ -140,6 +142,9 @@ impl RogerCli {
             return Err(IntegrationError::InvalidInput);
         }
         validate_id(&probe)?;
+        if Self::detect(&executable)? != RogerAvailability::Available {
+            return Err(IntegrationError::Unavailable);
+        }
         Ok(Self {
             executable,
             credential,

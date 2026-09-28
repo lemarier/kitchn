@@ -22,8 +22,12 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub use github::GitHubEffect;
-pub use roger::{DecisionBinding, MAX_ASKS_PER_TASK, RogerEffect};
+pub use github::{
+    GitHubAction, GitHubEffect, GitHubMutation, IssueNumber, LabelDefinition, PostingBudget,
+};
+pub use roger::{
+    AskKind, AskRisk, DecisionBinding, DecisionOwner, MAX_ASKS_PER_TASK, RogerAsk, RogerEffect,
+};
 pub use schedule::ScheduleEffect;
 
 use crate::{

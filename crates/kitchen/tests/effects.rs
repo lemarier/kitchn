@@ -11,11 +11,12 @@ use common::{
 use kitchen::{
     BackendId, ConsumerId, Error, TaskId,
     contracts::{
-        Capability, CapabilitySet, ContractError, DecisionBinding, Effect, EffectExecutor,
-        EvidenceRevision, ExecutorKind, ExternalRef, Fence, GitHubEffect, Grant, GrantScope,
-        HouseGrants, Liveness, MAX_ASKS_PER_TASK, NotAppliedReason, Operation, Permission,
-        Repository, ResourceKind, ResourceRef, RogerEffect, ScheduleEffect, TaskAuthority, Text,
-        WorkerBackend,
+        AskKind, AskRisk, Capability, CapabilitySet, CommitId, ContractError, DecisionBinding,
+        DecisionOwner, Effect, EffectExecutor, EvidenceRevision, ExecutorKind, ExternalRef, Fence,
+        GitHubAction, GitHubEffect, GitHubMutation, Grant, GrantScope, HouseGrants,
+        LabelDefinition, Liveness, MAX_ASKS_PER_TASK, NotAppliedReason, Operation, Permission,
+        PostingBudget, Repository, ResourceKind, ResourceRef, RogerAsk, RogerEffect,
+        ScheduleEffect, TaskAuthority, Text, WorkerBackend,
         conformance::{self, Check, CheckResult, ConformanceFixture},
         fake::{ExecuteFault, FakeBackend},
     },
@@ -49,31 +50,46 @@ fn executor(kind: ExecutorKind, capability: Capability) -> TestResult<FakeBacken
 }
 
 fn label(repository: Repository, name: &str) -> TestResult<Effect> {
-    Ok(GitHubEffect::CreateLabel {
-        repository,
-        name: Text::new(name)?,
+    Ok(GitHubEffect {
+        requester: ExternalRef::new("fixture")?,
+        mutation: GitHubMutation {
+            repository,
+            action: GitHubAction::CreateLabel {
+                label: LabelDefinition {
+                    name: name.into(),
+                    color: "aabbcc".into(),
+                    description: String::new(),
+                },
+            },
+        },
+        posting_budget: PostingBudget::new(100)?,
     }
     .into())
 }
 
 fn ask(task: &TaskId, revision: EvidenceRevision) -> TestResult<Effect> {
-    ask_about(task, revision, None)
-}
 
-fn ask_about(
-    task: &TaskId,
-    revision: EvidenceRevision,
-    subject: Option<kitchen::contracts::EvidenceSubject>,
-) -> TestResult<Effect> {
-    Ok(RogerEffect::Ask {
-        binding: DecisionBinding {
-            house: house()?,
-            task: task.clone(),
-            action: Permission::Merge,
-            revision,
-            subject,
+    Ok(RogerEffect {
+        requester: ExternalRef::new("fixture")?,
+        ask: RogerAsk {
+            binding: DecisionBinding {
+                house: house()?,
+                task: task.clone(),
+                action: Permission::Merge,
+                revision,
+                subject: CommitId::new(&"a".repeat(40))?,
+                owner: DecisionOwner::Merge,
+                repository: km43()?,
+                target: ExternalRef::new("pr:origin89hq/km43#1")?,
+                limits: Text::new("squash into main")?,
+            },
+            kind: AskKind::Approval,
+            risk: AskRisk::Routine,
+            title: Text::new("Merge at this head?")?,
+            body: Text::new("Merge at this head?")?,
+            supersedes: None,
         },
-        question: Text::new("Merge the PR at this head?")?,
+        posting_budget: PostingBudget::new(MAX_ASKS_PER_TASK)?,
     }
     .into())
 }

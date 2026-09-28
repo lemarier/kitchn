@@ -1,6 +1,6 @@
 //! Bounded evidence collection; partial pages are never reported complete.
 
-use super::{CredentialRef, HouseScope, IntegrationError, evidence::*};
+use super::{CredentialRef, HouseScope, IntegrationError, IssueNumber, evidence::*};
 use crate::{
     HouseId,
     contracts::{CommitId, Repository},
@@ -131,11 +131,21 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
         repo: &Repository,
         number: IssueNumber,
     ) -> Observation<Issue> {
-        self.single(house, repo, format!("issues/{}", number.get()))
+        match self.single::<Issue>(house, repo, format!("issues/{}", number.get())) {
+            Observation::Known(issue) if &issue.repository != repo || issue.number != number => {
+                Observation::Unknown
+            }
+            result => result,
+        }
     }
     /// Read all issue pages (pull requests are excluded).
     pub fn issues(&self, house: &HouseId, repo: &Repository) -> Observation<Vec<Issue>> {
-        self.pages(house, repo, "issues?state=all", None, true)
+        match self.pages::<Issue>(house, repo, "issues?state=all", None, true) {
+            Observation::Known(issues) if issues.iter().any(|issue| &issue.repository != repo) => {
+                Observation::Unknown
+            }
+            result => result,
+        }
     }
     /// Read explicit blocked-by relationships.
     pub fn dependencies(
@@ -174,7 +184,10 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
         repo: &Repository,
         number: IssueNumber,
     ) -> Observation<PullRequest> {
-        self.single(house, repo, format!("pulls/{}", number.get()))
+        match self.single::<PullRequest>(house, repo, format!("pulls/{}", number.get())) {
+            Observation::Known(pr) if pr.number != number => Observation::Unknown,
+            result => result,
+        }
     }
     /// Read check runs at the explicitly selected commit.
     pub fn checks(
@@ -183,13 +196,18 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
         repo: &Repository,
         head: &CommitId,
     ) -> Observation<Vec<CheckRun>> {
-        self.pages(
+        match self.pages::<CheckRun>(
             house,
             repo,
             &format!("commits/{head}/check-runs"),
             Some("check_runs"),
             false,
-        )
+        ) {
+            Observation::Known(checks) if checks.iter().any(|check| &check.head_sha != head) => {
+                Observation::Unknown
+            }
+            result => result,
+        }
     }
     /// Read submitted reviews with their actual commit ids.
     pub fn reviews(

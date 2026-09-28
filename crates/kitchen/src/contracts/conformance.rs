@@ -13,10 +13,12 @@ use std::fmt;
 use crate::{
     BackendId, ConsumerId, CredentialId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, BackendUnavailable, BranchName, Capability, DecisionBinding, Effect,
-        EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, GitHubEffect,
-        IdempotencyKey, Liveness, Lookup, MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation,
-        Permission, Receipt, Repository, ResourceKind, ResourceRef, RogerEffect, Role,
+
+        AskKind, AskRisk, AttemptNumber, BackendUnavailable, Capability, CommitId, DecisionBinding,
+        DecisionOwner, Effect, EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision,
+        ExternalRef, GitHubAction, GitHubEffect, GitHubMutation, IdempotencyKey, LabelDefinition,
+        Liveness, Lookup, MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation, Permission,
+        PostingBudget, Receipt, Repository, ResourceKind, ResourceRef, RogerAsk, RogerEffect, Role,
         ScheduleEffect, Text, WorkerBackend, WorkerState, Workspace,
     },
 };
@@ -339,22 +341,51 @@ impl<'a> Runner<'a> {
             ),
             (
                 "unsupported-label",
-                Effect::GitHub(GitHubEffect::CreateLabel {
-                    repository: self.fixture.repository.clone(),
-                    name: self.fixture.brief.clone(),
+                Effect::GitHub(GitHubEffect {
+                    requester: ExternalRef::new("fixture")
+                        .or_else(|_| fail(Check::Fixture, "invalid requester"))?,
+                    mutation: GitHubMutation {
+                        repository: self.fixture.repository.clone(),
+                        action: GitHubAction::CreateLabel {
+                            label: LabelDefinition {
+                                name: "conformance".into(),
+                                color: "aabbcc".into(),
+                                description: String::new(),
+                            },
+                        },
+                    },
+                    posting_budget: PostingBudget::new(3)
+                        .or_else(|_| fail(Check::Fixture, "invalid budget"))?,
                 }),
             ),
             (
                 "unsupported-ask",
-                Effect::Roger(RogerEffect::Ask {
-                    binding: DecisionBinding {
-                        house: self.fixture.house.clone(),
-                        task: self.fixture.task.clone(),
-                        action: Permission::Merge,
-                        revision: EvidenceRevision::INITIAL,
-                        subject: None,
+
+                Effect::Roger(RogerEffect {
+                    requester: ExternalRef::new("fixture")
+                        .or_else(|_| fail(Check::Fixture, "invalid requester"))?,
+                    ask: RogerAsk {
+                        binding: DecisionBinding {
+                            house: self.fixture.house.clone(),
+                            task: self.fixture.task.clone(),
+                            action: Permission::Merge,
+                            revision: EvidenceRevision::INITIAL,
+                            subject: CommitId::new(&"a".repeat(40))
+                                .or_else(|_| fail(Check::Fixture, "invalid subject"))?,
+                            owner: DecisionOwner::Merge,
+                            repository: self.fixture.repository.clone(),
+                            target: ExternalRef::new(&format!("pr:{}#1", self.fixture.repository))
+                                .or_else(|_| fail(Check::Fixture, "invalid target"))?,
+                            limits: self.fixture.brief.clone(),
+                        },
+                        kind: AskKind::Approval,
+                        risk: AskRisk::Routine,
+                        title: self.fixture.brief.clone(),
+                        body: self.fixture.brief.clone(),
+                        supersedes: None,
                     },
-                    question: self.fixture.brief.clone(),
+                    posting_budget: PostingBudget::new(3)
+                        .or_else(|_| fail(Check::Fixture, "invalid budget"))?,
                 }),
             ),
             (

@@ -1,6 +1,6 @@
 //! Typed provider responses. Missing or unrecognized facts remain unknown.
 
-use crate::contracts::{CommitId, Text};
+use crate::contracts::{CommitId, IssueNumber, Repository, Text};
 use serde::Deserialize;
 
 /// Whether a complete observation was obtained.
@@ -12,39 +12,6 @@ pub enum Observation<T> {
     Unavailable(super::IntegrationError),
     /// The provider returned incomplete, ambiguous, or malformed evidence.
     Unknown,
-}
-
-/// An issue or pull request number, excluding zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
-#[serde(try_from = "u64", into = "u64")]
-pub struct IssueNumber(u64);
-impl IssueNumber {
-    /// Validate a provider number.
-    ///
-    /// # Errors
-    /// Zero and values outside signed provider integer range are refused.
-    pub fn new(value: u64) -> Result<Self, super::IntegrationError> {
-        if value == 0 || value > i64::MAX as u64 {
-            return Err(super::IntegrationError::InvalidInput);
-        }
-        Ok(Self(value))
-    }
-    /// Numeric value.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-impl TryFrom<u64> for IssueNumber {
-    type Error = super::IntegrationError;
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-impl From<IssueNumber> for u64 {
-    fn from(value: IssueNumber) -> Self {
-        value.0
-    }
 }
 
 /// Provider lifecycle, preserving future or unsupported values.
@@ -81,6 +48,9 @@ pub struct User {
 /// Issue evidence; relationships are fetched separately with pagination.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Issue {
+    /// Source repository, retained for cross-repository dependency evidence.
+    #[serde(rename = "repository_url", deserialize_with = "repository_url")]
+    pub repository: Repository,
     /// Provider database id used for relationship endpoints.
     pub id: u64,
     /// Repository-local issue number.
@@ -253,4 +223,14 @@ pub enum RepositoryPermission {
     /// Unsupported evidence, never approval.
     #[serde(other)]
     Unknown,
+}
+
+fn repository_url<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Repository, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    let name = value
+        .strip_prefix("https://api.github.com/repos/")
+        .ok_or_else(|| serde::de::Error::custom("invalid repository reference"))?;
+    Repository::new(name).map_err(serde::de::Error::custom)
 }

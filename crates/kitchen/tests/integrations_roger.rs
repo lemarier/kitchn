@@ -17,7 +17,11 @@ fn fixture() -> Result<(HouseScope, DecisionBinding, Value)> {
         house.clone(),
         [repo.clone()],
         requester.clone(),
-        CredentialRef::new(house.clone(), ExternalRef::new("roger-gate")?, requester),
+        CredentialRef::new(
+            house.clone(),
+            kitchen::CredentialId::new("roger-gate")?,
+            requester,
+        ),
         PostingBudget::new(3)?,
         [Permission::AskHuman],
     )?;
@@ -28,7 +32,8 @@ fn fixture() -> Result<(HouseScope, DecisionBinding, Value)> {
         repository: repo,
         action: Permission::Merge,
         target: ExternalRef::new("pr:sample/project#1")?,
-        revision: CommitId::new(&"a".repeat(40))?,
+        revision: kitchen::contracts::EvidenceRevision::INITIAL,
+        subject: CommitId::new(&"a".repeat(40))?,
         limits: Text::new("squash into main")?,
     };
     let action = json!({"verb":"merge","target":"pr:sample/project#1","rev":"a".repeat(40),"limits":"squash into main"});
@@ -210,6 +215,29 @@ fn offline_recovery_does_not_create_a_new_ask() -> Result {
     assert_eq!(
         client.poll(&foreign, &id),
         Err(IntegrationError::ScopeMismatch)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn optional_roger_capability_detection_needs_no_credentials() -> Result {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir()?;
+    let binary = dir.path().join("roger");
+    assert_eq!(RogerCli::detect(&binary)?, RogerAvailability::NotInstalled);
+    std::fs::write(&binary, "#!/bin/sh\nprintf '%s' 'unsupported old cli'\n")?;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))?;
+    assert_eq!(RogerCli::detect(&binary)?, RogerAvailability::Unsupported);
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\n[ -z \"$ROGER_TOKEN\" ] || exit 2\nprintf '%s' '--idem --decision-key --action-rev --action-target --action-limits --resume-task --resume-rev --body-file'\n",
+    )?;
+    assert_eq!(RogerCli::detect(&binary)?, RogerAvailability::Available);
+    std::fs::write(&binary, "#!/bin/sh\nexit 1\n")?;
+    assert_eq!(
+        RogerCli::detect(&binary),
+        Err(IntegrationError::Unavailable)
     );
     Ok(())
 }

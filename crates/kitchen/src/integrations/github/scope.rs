@@ -3,24 +3,24 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    HouseId,
+    CredentialId, HouseId,
     contracts::{ExternalRef, Permission, Repository},
 };
 
-use super::IntegrationError;
+use super::{IntegrationError, PostingBudget};
 
 /// Reference to a credential selected in private house storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialRef {
     house: HouseId,
-    name: ExternalRef,
+    name: CredentialId,
     requester: ExternalRef,
 }
 
 impl CredentialRef {
     /// Associate a private credential reference with its house and requester.
     #[must_use]
-    pub const fn new(house: HouseId, name: ExternalRef, requester: ExternalRef) -> Self {
+    pub const fn new(house: HouseId, name: CredentialId, requester: ExternalRef) -> Self {
         Self {
             house,
             name,
@@ -36,7 +36,7 @@ impl CredentialRef {
 
     /// Name resolved by the private credential provider, never a secret value.
     #[must_use]
-    pub const fn name(&self) -> &ExternalRef {
+    pub const fn name(&self) -> &CredentialId {
         &self.name
     }
 
@@ -44,29 +44,6 @@ impl CredentialRef {
     #[must_use]
     pub const fn requester(&self) -> &ExternalRef {
         &self.requester
-    }
-}
-
-/// Maximum submissions for one persisted workflow task, including uncertain ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PostingBudget(u32);
-
-impl PostingBudget {
-    /// Zero explicitly disables posting; at most 100 submissions per task.
-    ///
-    /// # Errors
-    /// Returns an invalid-input error above the fixed ceiling.
-    pub fn new(limit: u32) -> Result<Self, IntegrationError> {
-        if limit > 100 {
-            return Err(IntegrationError::InvalidInput);
-        }
-        Ok(Self(limit))
-    }
-
-    /// Configured maximum submissions.
-    #[must_use]
-    pub const fn limit(self) -> u32 {
-        self.0
     }
 }
 
@@ -165,7 +142,7 @@ impl HouseScope {
         if !self.permitted.contains(&permission) {
             return Err(IntegrationError::PermissionDenied);
         }
-        if submissions >= self.budget.0 {
+        if submissions >= self.budget.limit() {
             return Err(IntegrationError::BudgetExhausted);
         }
         Ok(())

@@ -1,16 +1,40 @@
 //! GitHub access constrained by an explicit house selection.
+//!
+//! Configuration supplies [`HouseScope`], an allowlist, requester identity,
+//! core credential ID, permitted effects, and a per-task logical posting ceiling.
+//! It never supplies secret values through a workflow payload. [`CredentialFile`]
+//! resolves the private token only at the CLI boundary; [`GhCli`] clears ambient
+//! CLI configuration and verifies the authenticated GitHub login before each call.
+//! GitHub credentials that cannot authenticate `/user` are explicitly unavailable.
+//!
+//! Build a [`GitHubExecutor::effect`], put it in a [`crate::state::EffectPlan`],
+//! and call [`crate::state::run_effect`]. The core owns claims, current authority,
+//! revision checks, atomic posting budgets, and intent durability. After an
+//! uncertain result call [`crate::state::reconcile`]; never submit it directly
+//! again. GitHub offers no native idempotency guarantee, so an absent marker is
+//! inconclusive and cannot authorize another post. Receipts for created issues
+//! and comments contain their forge URL; other receipts identify the intent.
+//!
+//! Setup first previews [`LabelDefinition::inspect`]. Only missing labels need
+//! intents, and execution rechecks the inventory. Conflicting existing labels
+//! are refused without renaming, recoloring, or deleting them. Budgets count
+//! distinct admitted effects conservatively, including unresolved or no-op
+//! effects, rather than promising a wall-clock posting rate limit.
 
 mod mutation;
 pub(crate) mod process;
 mod scope;
-pub use mutation::{GitHubAction, GitHubMutation, LabelDefinition, LabelSetup};
+pub use crate::contracts::{
+    GitHubAction, GitHubMutation, IssueNumber, LabelDefinition, PostingBudget,
+};
+pub use mutation::LabelSetup;
 pub use process::{CredentialFile, GhCli};
 mod client;
 mod evidence;
 pub use client::{GitHubClient, GitHubReadTransport, ReadLimits, ReadRequest};
 pub use evidence::*;
 
-pub use scope::{CredentialRef, HouseScope, PostingBudget};
+pub use scope::{CredentialRef, HouseScope};
 
 use crate::ErrorClass;
 
@@ -62,3 +86,18 @@ impl IntegrationError {
         }
     }
 }
+
+impl From<crate::contracts::ContractError> for IntegrationError {
+    fn from(error: crate::contracts::ContractError) -> Self {
+        match error.class() {
+            ErrorClass::InvalidInput => Self::InvalidInput,
+            ErrorClass::Refused => Self::ScopeMismatch,
+            ErrorClass::Conflict => Self::StaleDecision,
+            ErrorClass::Execution => Self::Unknown,
+        }
+    }
+}
+mod executor;
+mod provider;
+pub use executor::GitHubExecutor;
+pub use provider::{GitHubMutationTransport, MutationRequest};

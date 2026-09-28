@@ -1,96 +1,11 @@
-//! Decision identity and strict response validation.
-
+//! Strictly scoped Roger answer parsing.
 use crate::integrations::github::{HouseScope, IntegrationError};
 use crate::{
-    HouseId, TaskId,
-    contracts::{CommitId, ExternalRef, Permission, Repository, Text},
+    TaskId,
+    contracts::{CommitId, DecisionBinding, ExternalRef, Repository, Text},
 };
-use serde::{Deserialize, Serialize};
-
-/// Exactly one declared workflow owns each decision family.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DecisionOwner {
-    /// Task coordinator.
-    Task,
-    /// Specification inbox.
-    Spec,
-    /// Exact-head gate.
-    Merge,
-}
-impl DecisionOwner {
-    /// Stable closed prefix; unknown legacy prefixes require an explicit migration.
-    #[must_use]
-    pub const fn prefix(self) -> &'static str {
-        match self {
-            Self::Task => "task",
-            Self::Spec => "spec",
-            Self::Merge => "merge",
-        }
-    }
-}
-
-/// Exact authority condition a human is asked to decide; never itself a grant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DecisionBinding {
-    /// Selected house.
-    pub house: HouseId,
-    /// Durable task.
-    pub task: TaskId,
-    /// Sole consumer of this decision family.
-    pub owner: DecisionOwner,
-    /// Allowed repository.
-    pub repository: Repository,
-    /// The action being considered.
-    pub action: Permission,
-    /// Exact destination within the repository.
-    pub target: ExternalRef,
-    /// Exact revision of the subject.
-    pub revision: CommitId,
-    /// Human-visible action constraints.
-    pub limits: Text,
-}
+use serde::Deserialize;
 impl DecisionBinding {
-    /// Stable name for this house/task/action, independent of process lifetime.
-    ///
-    /// # Errors
-    /// Refuses oversized keys or action constraints.
-    pub fn decision_key(&self) -> Result<String, IntegrationError> {
-        let target = self.target.as_str();
-        let task_target = target == format!("task:{}", self.task);
-        let repository_target = target.split_once('#').is_some_and(|(prefix, number)| {
-            (prefix == format!("pr:{}", self.repository)
-                || prefix == format!("issue:{}", self.repository))
-                && number
-                    .parse::<u64>()
-                    .is_ok_and(|value| value > 0 && value <= i64::MAX as u64)
-        });
-        if !task_target && !repository_target {
-            return Err(IntegrationError::ScopeMismatch);
-        }
-        if self.action == Permission::Merge
-            && !target.starts_with(&format!("pr:{}#", self.repository))
-        {
-            return Err(IntegrationError::ScopeMismatch);
-        }
-        let key = format!(
-            "{}:{}:{}:{}:{}",
-            self.owner.prefix(),
-            self.house,
-            self.task,
-            self.action,
-            self.target
-        );
-        if key.len() > 200
-            || self.target.as_str().len() > 200
-            || self.limits.as_str().len() > 500
-            || self.limits.as_str().chars().any(char::is_control)
-        {
-            return Err(IntegrationError::InvalidInput);
-        }
-        Ok(key)
-    }
     /// Validate the selected house before reading an answer or submitting an Ask.
     ///
     /// # Errors
@@ -101,7 +16,6 @@ impl DecisionBinding {
         Ok(())
     }
 }
-
 /// An answer's state. Only an exact, consistent approved answer can approve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecisionStatus {
@@ -180,17 +94,17 @@ pub fn validate_answer(
     {
         return Err(IntegrationError::ScopeMismatch);
     }
-    if ask.resume.rev != binding.revision {
+    if ask.resume.rev != binding.subject {
         return Err(IntegrationError::StaleDecision);
     }
     let action = Action {
         verb: binding.action.as_str().into(),
         target: binding.target.clone(),
-        rev: binding.revision.clone(),
+        rev: binding.subject.clone(),
         limits: Some(binding.limits.clone()),
     };
     if let Some(received) = &ask.action {
-        if received.rev != binding.revision {
+        if received.rev != binding.subject {
             return Err(IntegrationError::StaleDecision);
         }
         if received != &action {

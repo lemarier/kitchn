@@ -48,7 +48,7 @@ pub fn plan_repository(
         Err(error) => return Err(error.into()),
     };
     let houses = registry.houses()?;
-    let house = resolve_house(&config, &houses)?;
+    let house = resolve_house(&config, &houses.available)?;
     let mut rendered = template.render(&house.house, &house.guidance, variables)?;
     if rendered.files.iter().any(|file| {
         file.path.as_str().eq_ignore_ascii_case(REPOSITORY_CONFIG)

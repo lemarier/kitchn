@@ -209,3 +209,46 @@ fn symlinked_root_is_resolved_but_links_below_root_are_refused() -> Result {
     assert_eq!(fs::read_to_string(f.root.join("outside"))?, "preserved");
     Ok(())
 }
+
+#[test]
+fn destination_created_after_preview_blocks_confirmed_apply() -> Result {
+    use std::io::{BufRead, BufReader};
+    let f = Fixture::new()?;
+    let mut child = f
+        .selected("init")
+        .arg("--confirm")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut output = BufReader::new(child.stdout.take().ok_or("stdout")?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert_ne!(
+            output.read_line(&mut line)?,
+            0,
+            "preview must precede confirmation"
+        );
+        if line.contains("Nothing is written until") {
+            break;
+        }
+    }
+    fs::create_dir(f.root.join("consumer"))?;
+    fs::write(f.root.join("consumer/README.md"), "concurrent local file")?;
+    child.stdin.take().ok_or("stdin")?.write_all(b"yes\n")?;
+    let mut remaining = String::new();
+    std::io::Read::read_to_string(&mut output, &mut remaining)?;
+    let result = child.wait_with_output()?;
+    assert_eq!(result.status.code(), Some(1));
+    assert!(remaining.contains("Apply blocked:"));
+    assert!(remaining.contains("README.md"));
+    assert!(remaining.contains("No files added"));
+    assert_eq!(
+        fs::read_to_string(f.root.join("consumer/README.md"))?,
+        "concurrent local file"
+    );
+    assert!(!f.root.join("consumer/AGENTS.md").exists());
+    assert!(!f.root.join("consumer/.kitchen.json").exists());
+    Ok(())
+}

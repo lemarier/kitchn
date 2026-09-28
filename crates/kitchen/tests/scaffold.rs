@@ -297,8 +297,9 @@ fn apply_writes_nothing_if_a_planned_path_appeared_since_planning() -> TestResul
     let plan = FilePlan::new(render_example('a')?, &target)?;
     fs::write(target.join("README.md"), "written by someone else\n")?;
 
-    let report = plan.apply()?;
-
+    let Err(Error::House(HouseError::Conflicts(report))) = plan.apply() else {
+        return Err("changed destination must return a typed conflict".into());
+    };
     assert!(report.has_conflicts());
     assert_eq!(
         fs::read_to_string(target.join("README.md"))?,

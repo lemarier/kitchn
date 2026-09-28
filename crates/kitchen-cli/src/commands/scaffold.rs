@@ -2,7 +2,7 @@
 use clap::Args;
 use kitchen::{
     HouseId,
-    adoption::HouseRegistry,
+    adoption::{FileStatus, HouseRegistry},
     contracts::Repository,
     house::HouseError,
     scaffold::{Template, VariableName, plan_repository},
@@ -77,8 +77,26 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
             plan.conflicts().next().is_none(),
         ));
     }
-    let report = plan.apply()?;
-    let healthy = !report.has_conflicts() && plan.conflicts().next().is_none();
+    match plan.apply() {
+        Ok(_) => {}
+        Err(kitchen::Error::House(HouseError::Conflicts(report))) => {
+            let paths = report
+                .files
+                .iter()
+                .filter(|file| file.status == FileStatus::Conflict)
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok((
+                format!(
+                    "Apply blocked: destinations changed since preview: {paths}. No files added.\nNext: rerun the preview and resolve conflicts before confirming."
+                ),
+                false,
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    let healthy = plan.conflicts().next().is_none();
     Ok((
         format!(
             "{}\nNext: inspect the generated files{}; run kitchen house doctor --registry '{}' --repository-path '{}'.\nHouse guidance bootstrap assets must be supplied by the house template; see templates/README.md in Kitchen.",

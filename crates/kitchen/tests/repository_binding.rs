@@ -40,6 +40,12 @@ fn binding(house: &HouseConfig, repository: &str) -> TestResult<RepositoryConfig
 fn git(path: &Path, args: &[&str]) -> TestResult<String> {
     // Fixture setup ignores the person's Git configuration, such as signing.
     let output = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .arg("-C")

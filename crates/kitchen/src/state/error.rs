@@ -96,6 +96,8 @@ pub enum Corruption {
     StoreIdentity,
     /// Ownership history does not replay to the current claim.
     Ownership,
+    /// An effect's idempotency key differs from its canonical derivation.
+    EffectKey,
 }
 
 impl fmt::Display for Corruption {
@@ -116,6 +118,7 @@ impl fmt::Display for Corruption {
             Self::LimitExceeded => formatter.write_str("stored collection exceeds its bound"),
             Self::Marker => formatter.write_str("store marker is missing or invalid"),
             Self::Ownership => formatter.write_str("ownership history contradicts the claim"),
+            Self::EffectKey => formatter.write_str("effect key differs from its derivation"),
             Self::StoreIdentity => {
                 formatter.write_str("snapshot belongs to a different store than its marker")
             }

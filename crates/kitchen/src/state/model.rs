@@ -1461,11 +1461,7 @@ impl StoreState {
             revision: task.evidence.revision,
             submitted: &task.submitted_effects(),
         })?;
-        let key = ExternalRef::new(&format!(
-            "kitchen-{house}-{}-{nonce:016x}-{}",
-            plan.task,
-            seq.get()
-        ))?;
+        let key = effect_key(&house, &plan.task, nonce, seq)?;
         let record = EffectRecord {
             seq,
             name: plan.name,
@@ -1477,7 +1473,7 @@ impl StoreState {
                 credential,
                 plan.task,
                 attempt,
-                IdempotencyKey::from_ref(key),
+                key,
                 plan.effect,
             ),
             authorization,
@@ -1955,6 +1951,13 @@ impl StoreState {
                 return Err(Corruption::LimitExceeded);
             }
             let request = &effect.request;
+            if effect_key(&self.house, key, self.nonce, effect.seq)
+                .ok()
+                .as_ref()
+                != Some(request.key())
+            {
+                return Err(Corruption::EffectKey);
+            }
             if request.house() != &self.house
                 || request.task() != key
                 || usize::try_from(request.attempt().get())
@@ -2070,6 +2073,21 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
         return Err(Corruption::Ownership);
     }
     Ok(())
+}
+
+/// The canonical idempotency key of effect `seq`: unique per house, task,
+/// store incarnation (nonce), and effect number.
+fn effect_key(
+    house: &HouseId,
+    task: &TaskId,
+    nonce: u64,
+    seq: EffectSeq,
+) -> std::result::Result<IdempotencyKey, ContractError> {
+    ExternalRef::new(&format!(
+        "kitchen-{house}-{task}-{nonce:016x}-{}",
+        seq.get()
+    ))
+    .map(IdempotencyKey::from_ref)
 }
 
 fn state_for(outcome: EffectOutcome, at: Timestamp) -> EffectState {

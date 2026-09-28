@@ -1586,3 +1586,47 @@ fn a_moved_base_invalidates_evidence_for_the_same_head() -> TestResult {
     ));
     Ok(())
 }
+
+#[test]
+fn a_persisted_effect_key_must_match_its_derivation() -> TestResult {
+    let fixture = Fixture::new()?;
+    let fence = claimed_attempt(&fixture, "task-1", at(0))?;
+    let task = task_id("task-1")?;
+    let store = &fixture.store;
+    let EffectStart::Execute(first) = store.begin_effect(
+        plan(&task, fence, "launch", launch()?)?,
+        &grants()?,
+        &common::refusing()?,
+        at(1),
+    )?
+    else {
+        return Err("expected a new effect".into());
+    };
+    store.record_effect_outcome(
+        &task,
+        fence,
+        first.seq(),
+        EffectOutcome::Applied(receipt("request-1")?),
+        at(2),
+    )?;
+    store.begin_effect(
+        plan(&task, fence, "other", launch()?)?,
+        &grants()?,
+        &common::refusing()?,
+        at(3),
+    )?;
+    let path = fixture.state_path();
+    let mut state: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let alias = state["tasks"]["task-1"]["effects"][0]["request"]["key"].clone();
+    state["tasks"]["task-1"]["effects"][1]["request"]["key"] = alias;
+    let corrupt = serde_json::to_vec_pretty(&state)?;
+    fs::write(&path, &corrupt)?;
+    assert!(matches!(
+        open_error(&fixture),
+        Some(Error::State(StateError::CorruptState(
+            Corruption::EffectKey
+        )))
+    ));
+    assert_eq!(fs::read(&path)?, corrupt, "rejected state is not rewritten");
+    Ok(())
+}

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bounds accepted by the inspector, independent of backend capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InspectionPlan {
     /// Idempotent inspection identity.
     pub id: ExternalRef,
@@ -37,6 +38,7 @@ pub struct InspectionPlan {
 
 /// Where a confirmed finding should be consumed. This is intent, not a post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum FollowUpRoute {
     /// Existing issue/triage workflow.
     Issue,
@@ -48,6 +50,7 @@ pub enum FollowUpRoute {
 
 /// Sample outcome. A missing result is distinct from an unavailable result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SampleResult {
     /// Question checked with no confirmed finding; not general acceptance.
     NoFinding {
@@ -67,6 +70,7 @@ pub enum SampleResult {
 
 /// Durable reservation returned before launching any inspection work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sample {
     /// One-based sample number, stable across restart.
     pub number: u32,
@@ -89,6 +93,7 @@ pub enum SampleReservation {
 
 /// Audit record for one bounded inspection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Inspection {
     plan: InspectionPlan,
     revision: std::num::NonZeroU32,

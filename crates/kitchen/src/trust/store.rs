@@ -342,6 +342,9 @@ impl Ledger {
         let mut doc = self.load()?;
         let before = encode(&doc)?;
         let result = apply(&mut doc)?;
+        if doc.observations.len() + doc.grants.len() + doc.inspections.len() > MAX_HISTORY {
+            return Err(TrustError::Exhausted);
+        }
         doc.validate(&self.house)?;
         if encode(&doc)? != before {
             self.write(&doc)?;

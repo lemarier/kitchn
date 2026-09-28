@@ -689,3 +689,56 @@ fn collection_preserves_uncertain_effect_and_exact_core_evidence() -> TestResult
     assert!(!o.trust_eligible());
     Ok(())
 }
+
+#[test]
+fn unknown_authority_fields_and_dangling_persisted_evidence_are_rejected() -> TestResult {
+    let mut encoded = serde_json::to_value(grant()?)?;
+    encoded
+        .as_object_mut()
+        .ok_or("grant object")?
+        .insert("expired".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<AutonomyGrant>(encoded).is_err());
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let mut o = observation(&f)?;
+    o.mode = EvidenceMode::Live;
+    l.record(o)?;
+    l.grant(grant()?, &grants()?)?;
+    let path = f.dir.path().join("trust/ledger.json");
+    let mut document: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    document["observations"] = serde_json::json!([]);
+    fs::write(&path, serde_json::to_vec(&document)?)?;
+    assert!(reopen(&f).is_err());
+    Ok(())
+}
+
+#[test]
+fn moved_observation_stops_inspection_and_duplicate_findings_do_not_route_twice() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let mut o = with_pr(observation(&f)?)?;
+    l.record(o.clone())?;
+    l.start_inspection(plan()?, at(5))?;
+    l.reserve_sample(&plan()?.id, 1, 10, at(6))?;
+    let result = SampleResult::Confirmed {
+        finding: kitchen::trust::Finding {
+            source: source("fixture:single-finding")?,
+            subject: subject()?,
+            consequence: Text::new("Reproduced regression")?,
+        },
+        route: FollowUpRoute::Issue,
+    };
+    l.finish_sample(&plan()?.id, 1, result.clone())?;
+    l.reserve_sample(&plan()?.id, 2, 10, at(7))?;
+    assert!(l.finish_sample(&plan()?.id, 2, result).is_err());
+    assert_eq!(l.inspection(&plan()?.id)?.follow_ups().count(), 1);
+    o.revision = NonZeroU32::new(2).ok_or("revision")?;
+    o.correction = Some(source("fixture:new-head")?);
+    l.record(o)?;
+    assert!(
+        l.finish_sample(&plan()?.id, 2, SampleResult::Unavailable)
+            .is_err()
+    );
+    assert!(l.reserve_sample(&plan()?.id, 2, 10, at(8)).is_err());
+    Ok(())
+}

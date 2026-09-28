@@ -13,7 +13,7 @@
 //! before every external effect, so revocation takes effect immediately and a
 //! persisted record cannot expand authority on its own.
 
-use std::{collections::BTreeSet, fmt, str::FromStr};
+use std::{collections::BTreeSet, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -22,94 +22,46 @@ use crate::{
     contracts::{ContractError, Repository, ValueKind},
 };
 
-/// An action a task may be authorized to take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-#[non_exhaustive]
-pub enum Permission {
-    /// Launch a worker through an execution backend.
-    LaunchWorker,
-    /// Send a message to a running worker.
-    MessageWorker,
-    /// Cancel a running worker.
-    CancelWorker,
-    /// Release a backend resource such as a terminal or worktree.
-    ReleaseResource,
-    /// Ask a human for a decision.
-    AskHuman,
-    /// Post comments on issues or pull requests.
-    PostComment,
-    /// Change issue or pull-request labels.
-    EditLabels,
-    /// Push commits to a branch.
-    PushBranch,
-    /// Open a pull request.
-    OpenPullRequest,
-    /// Request a review from a reviewer.
-    RequestReview,
-    /// Merge a pull request.
-    Merge,
-    /// Publish a release or package.
-    Publish,
-    /// Operate physical equipment.
-    OperateEquipment,
-}
-
-impl Permission {
-    /// Every permission, in declaration order.
-    pub const ALL: [Self; 13] = [
-        Self::LaunchWorker,
-        Self::MessageWorker,
-        Self::CancelWorker,
-        Self::ReleaseResource,
-        Self::AskHuman,
-        Self::PostComment,
-        Self::EditLabels,
-        Self::PushBranch,
-        Self::OpenPullRequest,
-        Self::RequestReview,
-        Self::Merge,
-        Self::Publish,
-        Self::OperateEquipment,
-    ];
-
-    /// The stable kebab-case name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::LaunchWorker => "launch-worker",
-            Self::MessageWorker => "message-worker",
-            Self::CancelWorker => "cancel-worker",
-            Self::ReleaseResource => "release-resource",
-            Self::AskHuman => "ask-human",
-            Self::PostComment => "post-comment",
-            Self::EditLabels => "edit-labels",
-            Self::PushBranch => "push-branch",
-            Self::OpenPullRequest => "open-pull-request",
-            Self::RequestReview => "request-review",
-            Self::Merge => "merge",
-            Self::Publish => "publish",
-            Self::OperateEquipment => "operate-equipment",
-        }
-    }
-}
-
-impl fmt::Display for Permission {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Permission {
-    type Err = ContractError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|permission| permission.as_str() == value)
-            .ok_or(ContractError::InvalidValue {
-                kind: ValueKind::Permission,
-            })
+closed_names! {
+    /// An action a task may be authorized to take.
+    #[non_exhaustive]
+    pub enum Permission(ValueKind::Permission) {
+        /// Launch a worker through an execution backend.
+        LaunchWorker = "launch-worker",
+        /// Send a message or a reply to a running worker.
+        MessageWorker = "message-worker",
+        /// Cancel a running worker.
+        CancelWorker = "cancel-worker",
+        /// Release a backend resource such as a terminal or worktree.
+        ReleaseResource = "release-resource",
+        /// Ask a human for a decision.
+        AskHuman = "ask-human",
+        /// Post comments on issues or pull requests.
+        PostComment = "post-comment",
+        /// Create or change issue and pull-request labels.
+        EditLabels = "edit-labels",
+        /// Open an issue.
+        CreateIssue = "create-issue",
+        /// Change issue relationships such as blocked-by links and sub-issues.
+        EditIssueRelationships = "edit-issue-relationships",
+        /// Push commits to a branch.
+        PushBranch = "push-branch",
+        /// Open a pull request.
+        OpenPullRequest = "open-pull-request",
+        /// Request a review from a reviewer.
+        RequestReview = "request-review",
+        /// Merge a pull request.
+        Merge = "merge",
+        /// Install, inspect, pause, or remove a schedule without activating it.
+        ManageSchedule = "manage-schedule",
+        /// Activate a schedule so it runs unattended.
+        ActivateSchedule = "activate-schedule",
+        /// Run a schedule once as a trial.
+        TrialSchedule = "trial-schedule",
+        /// Publish a release or package.
+        Publish = "publish",
+        /// Operate physical equipment.
+        OperateEquipment = "operate-equipment",
     }
 }
 

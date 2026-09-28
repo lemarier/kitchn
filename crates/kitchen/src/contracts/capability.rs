@@ -4,7 +4,7 @@
 //! installed runtime version). A workflow names what it requires. Activation
 //! fails, naming every gap, unless each requirement is fully supported.
 
-use std::{collections::BTreeMap, fmt, str::FromStr};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -13,141 +13,54 @@ use crate::{
     contracts::{ContractError, ValueKind},
 };
 
-/// A backend capability, named as in the migration parity table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum Capability {
-    /// Install, inspect, enable, disable, and remove schedules.
-    #[serde(rename = "schedule.manage")]
-    ScheduleManage,
-    /// Prechecks with typed idle and error results.
-    #[serde(rename = "schedule.precheck")]
-    SchedulePrecheck,
-    /// No overlapping runs of one scheduled job.
-    #[serde(rename = "schedule.single_consumer")]
-    ScheduleSingleConsumer,
-    /// An enforced run timeout.
-    #[serde(rename = "schedule.run_timeout")]
-    ScheduleRunTimeout,
-    /// Launch a worker in an isolated or named workspace.
-    #[serde(rename = "worker.launch_isolated")]
-    WorkerLaunchIsolated,
-    /// Positive evidence that a launched agent actually started.
-    #[serde(rename = "worker.launch_readiness")]
-    WorkerLaunchReadiness,
-    /// Fenced worker messaging.
-    #[serde(rename = "worker.messaging")]
-    WorkerMessaging,
-    /// Worker status and settled outcome.
-    #[serde(rename = "worker.status_and_outcome")]
-    WorkerStatusAndOutcome,
-    /// Relinquish and adopt a supervised run.
-    #[serde(rename = "run.transfer")]
-    RunTransfer,
-    /// Cancel a worker.
-    #[serde(rename = "worker.cancel")]
-    WorkerCancel,
-    /// Inventory resources with ownership details.
-    #[serde(rename = "resource.inventory")]
-    ResourceInventory,
-    /// Idempotent, safety-retaining resource release.
-    #[serde(rename = "resource.release")]
-    ResourceRelease,
-    /// Close a console owned by a settled run.
-    #[serde(rename = "resource.close_console")]
-    ResourceCloseConsole,
-    /// Reuse an agent session across runs.
-    #[serde(rename = "session.reuse")]
-    SessionReuse,
-    /// Select the agent family.
-    #[serde(rename = "agent.select_family")]
-    AgentSelectFamily,
-    /// Select the agent model.
-    #[serde(rename = "agent.select_model")]
-    AgentSelectModel,
-    /// Report token and model usage per run.
-    #[serde(rename = "usage.attribution")]
-    UsageAttribution,
-    /// Inject house-scoped credentials per effect.
-    #[serde(rename = "house.credentials")]
-    HouseCredentials,
-    /// Look up an effect's outcome by idempotency key.
-    #[serde(rename = "effect.lookup")]
-    EffectLookup,
-    /// Resubmitting an idempotency key never repeats the effect.
-    #[serde(rename = "effect.idempotent_requests")]
-    EffectIdempotentRequests,
-}
-
-impl Capability {
-    /// Every capability, in declaration order.
-    pub const ALL: [Self; 20] = [
-        Self::ScheduleManage,
-        Self::SchedulePrecheck,
-        Self::ScheduleSingleConsumer,
-        Self::ScheduleRunTimeout,
-        Self::WorkerLaunchIsolated,
-        Self::WorkerLaunchReadiness,
-        Self::WorkerMessaging,
-        Self::WorkerStatusAndOutcome,
-        Self::RunTransfer,
-        Self::WorkerCancel,
-        Self::ResourceInventory,
-        Self::ResourceRelease,
-        Self::ResourceCloseConsole,
-        Self::SessionReuse,
-        Self::AgentSelectFamily,
-        Self::AgentSelectModel,
-        Self::UsageAttribution,
-        Self::HouseCredentials,
-        Self::EffectLookup,
-        Self::EffectIdempotentRequests,
-    ];
-
-    /// The stable dotted name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ScheduleManage => "schedule.manage",
-            Self::SchedulePrecheck => "schedule.precheck",
-            Self::ScheduleSingleConsumer => "schedule.single_consumer",
-            Self::ScheduleRunTimeout => "schedule.run_timeout",
-            Self::WorkerLaunchIsolated => "worker.launch_isolated",
-            Self::WorkerLaunchReadiness => "worker.launch_readiness",
-            Self::WorkerMessaging => "worker.messaging",
-            Self::WorkerStatusAndOutcome => "worker.status_and_outcome",
-            Self::RunTransfer => "run.transfer",
-            Self::WorkerCancel => "worker.cancel",
-            Self::ResourceInventory => "resource.inventory",
-            Self::ResourceRelease => "resource.release",
-            Self::ResourceCloseConsole => "resource.close_console",
-            Self::SessionReuse => "session.reuse",
-            Self::AgentSelectFamily => "agent.select_family",
-            Self::AgentSelectModel => "agent.select_model",
-            Self::UsageAttribution => "usage.attribution",
-            Self::HouseCredentials => "house.credentials",
-            Self::EffectLookup => "effect.lookup",
-            Self::EffectIdempotentRequests => "effect.idempotent_requests",
-        }
-    }
-}
-
-impl fmt::Display for Capability {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Capability {
-    type Err = ContractError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|capability| capability.as_str() == value)
-            .ok_or(ContractError::InvalidValue {
-                kind: ValueKind::Capability,
-            })
+closed_names! {
+    /// A backend capability, named as in the migration parity table.
+    #[non_exhaustive]
+    pub enum Capability(ValueKind::Capability) {
+        /// Install, inspect, enable, disable, and remove schedules.
+        ScheduleManage = "schedule.manage",
+        /// Prechecks with typed idle and error results.
+        SchedulePrecheck = "schedule.precheck",
+        /// No overlapping runs of one scheduled job.
+        ScheduleSingleConsumer = "schedule.single_consumer",
+        /// An enforced run timeout.
+        ScheduleRunTimeout = "schedule.run_timeout",
+        /// Launch a worker in an isolated or named workspace.
+        WorkerLaunchIsolated = "worker.launch_isolated",
+        /// Positive evidence that a launched agent actually started.
+        WorkerLaunchReadiness = "worker.launch_readiness",
+        /// Fenced worker messaging.
+        WorkerMessaging = "worker.messaging",
+        /// Worker status and settled outcome.
+        WorkerStatusAndOutcome = "worker.status_and_outcome",
+        /// Relinquish and adopt a supervised run.
+        RunTransfer = "run.transfer",
+        /// Cancel a worker.
+        WorkerCancel = "worker.cancel",
+        /// Inventory resources with ownership details.
+        ResourceInventory = "resource.inventory",
+        /// Idempotent, safety-retaining resource release.
+        ResourceRelease = "resource.release",
+        /// Close a console owned by a settled run.
+        ResourceCloseConsole = "resource.close_console",
+        /// Reuse an agent session across runs.
+        SessionReuse = "session.reuse",
+        /// Select the agent family.
+        AgentSelectFamily = "agent.select_family",
+        /// Select the agent model.
+        AgentSelectModel = "agent.select_model",
+        /// Report token and model usage per run.
+        UsageAttribution = "usage.attribution",
+        /// Inject house-scoped credentials per effect.
+        HouseCredentials = "house.credentials",
+        /// Mutate a forge: labels, issues, issue relationships.
+        ForgeMutation = "forge.mutation",
+        /// Ask a human through a decision service and read the answer.
+        AskHuman = "human.ask",
+        /// Look up an effect's outcome by idempotency key.
+        EffectLookup = "effect.lookup",
+        /// Resubmitting an idempotency key never repeats the effect.
+        EffectIdempotentRequests = "effect.idempotent_requests",
     }
 }
 

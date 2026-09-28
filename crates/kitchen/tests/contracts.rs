@@ -147,6 +147,39 @@ fn closed_names_round_trip_and_reject_unknown_text() -> TestResult {
         Err(invalid(ValueKind::Capability))
     );
     assert_eq!("Chef-Owner".parse::<Role>(), Err(invalid(ValueKind::Role)));
+    // `ALL` is generated from the same list as the enum; names are unique.
+    let unique = |names: Vec<&str>| {
+        names
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == names.len()
+    };
+    assert!(unique(
+        Capability::ALL.iter().map(|item| item.as_str()).collect()
+    ));
+    assert!(unique(
+        Permission::ALL.iter().map(|item| item.as_str()).collect()
+    ));
+    assert!(unique(Role::ALL.iter().map(|item| item.as_str()).collect()));
+    assert_eq!(
+        "forge.mutation".parse::<Capability>()?,
+        Capability::ForgeMutation
+    );
+    assert_eq!("human.ask".parse::<Capability>()?, Capability::AskHuman);
+    for (name, permission) in [
+        ("manage-schedule", Permission::ManageSchedule),
+        ("activate-schedule", Permission::ActivateSchedule),
+        ("trial-schedule", Permission::TrialSchedule),
+        ("create-issue", Permission::CreateIssue),
+        (
+            "edit-issue-relationships",
+            Permission::EditIssueRelationships,
+        ),
+        ("ask-human", Permission::AskHuman),
+    ] {
+        assert_eq!(name.parse::<Permission>()?, permission);
+    }
     assert_eq!(
         "admin".parse::<Permission>(),
         Err(invalid(ValueKind::Permission))

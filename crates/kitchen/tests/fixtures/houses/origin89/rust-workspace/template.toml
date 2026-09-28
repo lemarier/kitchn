@@ -5,7 +5,7 @@
 schema = 1
 name = "rust-workspace"
 house = "origin89"
-revision = 1
+revision = 2
 description = "Rust workspace with pinned toolchain, just checks, CI, security policy, and Origin89 agent instructions"
 
 [variables.project_name]
@@ -91,6 +91,26 @@ render = false
 [[files]]
 source = "gitignore"
 path = ".gitignore"
+render = false
+
+[[files]]
+source = "origin89/sync-engineering.py"
+path = ".origin89/sync-engineering.py"
+render = false
+
+[[files]]
+source = "origin89/NOTICE.md"
+path = ".origin89/NOTICE.md"
+render = false
+
+[[files]]
+source = "origin89/LICENSE-MIT"
+path = ".origin89/LICENSE-MIT"
+render = false
+
+[[files]]
+source = "origin89/LICENSE-APACHE"
+path = ".origin89/LICENSE-APACHE"
 render = false
 
 [[files]]

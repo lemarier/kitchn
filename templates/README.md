@@ -64,19 +64,12 @@ does not copy `.origin89/` into the consumer. `init` and `adopt` do not execute
 scripts, fetch guidance, or automatically import bundles. Doctor reports missing
 pinned instructions and unobserved access separately from scaffold success.
 
-A house template that offers a `skills-sync` recipe must supply its executable
-bootstrap and notices as declared template files, or instruct the operator to
-install them from the same reviewed guidance export before invoking the recipe.
-Specifically, the test-only Origin89 Rust fixture requires
-`.origin89/sync-engineering.py`, `.origin89/NOTICE.md`, `.origin89/LICENSE-MIT`,
-and `.origin89/LICENSE-APACHE` from the reviewed Origin89 bootstrap export.
-Preserve their bytes and notices; the script needs Python 3.11+ and network access
-for its first refresh. `skills-offline` requires a previously verified cache.
-The fixture intentionally omits these upstream assets and is not a standalone
-guidance installer. Its offline `just check` does not run `skills-sync` and does
-not establish that guidance was installed. For pinned tasks use the immutable
-snapshot returned by `house sync`; the legacy refresh script follows upstream
-and must not silently change an active task's pin.
+A house template that offers a guidance refresh recipe must ship the executable
+bootstrap it invokes and that bootstrap's licenses and notices as declared
+template files, preserving their bytes. Kitchen's offline checks do not run such
+a recipe and do not establish that guidance was installed. For pinned tasks use
+the immutable snapshot returned by `house sync`; a refresh script that follows
+upstream must not silently change an active task's pin.
 
 Kitchen ships only `example/`. Copy it into your house guidance as
 `templates/<name>/`, with `template.toml` and its `files/` tree as bundle assets,

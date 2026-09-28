@@ -191,7 +191,7 @@ fn new_repository_plan_adds_every_file_and_previews_it() -> TestResult {
             .any(|planned| planned.file.path.as_str() == "crates/kitchen/src/lib.rs")
     );
     let preview = plan.to_string();
-    assert!(preview.starts_with("Template origin89/rust-workspace revision 1, guidance aaaa"));
+    assert!(preview.starts_with("Template origin89/rust-workspace revision 2, guidance aaaa"));
     assert!(preview.contains("(new repository)"));
     assert!(preview.contains("  add        .github/workflows/check.yml\n"));
     assert!(preview.contains(&format!(
@@ -349,7 +349,7 @@ fn markers_record_house_template_and_both_revisions() -> TestResult {
     let agents = contents(&rendered, "AGENTS.md").ok_or("AGENTS.md rendered")?;
     let first_line = agents.lines().next().unwrap_or_default();
     assert!(first_line.starts_with(&format!(
-        "<!-- kitchen-managed: house=origin89 template=rust-workspace template-revision=1 guidance-revision={} content-sha256=",
+        "<!-- kitchen-managed: house=origin89 template=rust-workspace template-revision=2 guidance-revision={} content-sha256=",
         "c".repeat(40)
     )));
     let ManagedState::Pristine(marker) = inspect_managed(agents) else {
@@ -1013,7 +1013,101 @@ const DOCUMENTED_DIFFERENCES: &[(&str, &str)] = &[
         "justfile",
         "Kitchen keeps a temporary bootstrap-test recipe for its vendored .origin89 tests",
     ),
+    (
+        ".origin89/NOTICE.md",
+        "Kitchen's notice also covers its vendored bootstrap tests",
+    ),
 ];
+
+#[test]
+fn origin89_fixture_ships_its_bootstrap_and_notices() -> TestResult {
+    let rendered = render_origin89('a')?;
+    let justfile = contents(&rendered, "justfile").ok_or("justfile is rendered")?;
+    let scripts: Vec<&str> = justfile
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("python3 "))
+        .map(|command| command.split_whitespace().next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        scripts,
+        [
+            ".origin89/sync-engineering.py",
+            ".origin89/sync-engineering.py"
+        ]
+    );
+    for path in scripts {
+        assert!(contents(&rendered, path).is_some(), "{path} is not shipped");
+    }
+    let notice = contents(&rendered, ".origin89/NOTICE.md").ok_or("notice is shipped")?;
+    assert!(notice.contains("Origin89 contributors"));
+    for license in ["LICENSE-MIT", "LICENSE-APACHE"] {
+        assert!(
+            notice.contains(&format!("]({license})")),
+            "{license} is linked"
+        );
+    }
+    // Upstream bytes are preserved; Kitchen's vendored copies match upstream.
+    for path in [
+        ".origin89/sync-engineering.py",
+        ".origin89/LICENSE-MIT",
+        ".origin89/LICENSE-APACHE",
+    ] {
+        assert_eq!(
+            contents(&rendered, path),
+            Some(fs::read_to_string(repository_root().join(path))?.as_str()),
+            "{path}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn generated_origin89_bootstrap_reports_a_missing_cache_offline() -> TestResult {
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    match Command::new("python3").arg("--version").output() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"SKIP generated Origin89 offline bootstrap: python3 unavailable\n",
+            )?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let temp = TempDir::new()?;
+    let consumer = real(&temp)?.join("consumer");
+    FilePlan::new(render_origin89('a')?, &consumer)?.apply()?;
+    let mut child = Command::new("python3")
+        .args([".origin89/sync-engineering.py", "--offline"])
+        .current_dir(&consumer)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            return Err("offline bootstrap exceeded 30 seconds".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr.contains("No cached engineering skills available"),
+        "{stderr}"
+    );
+    assert!(!consumer.join(".agents").exists());
+    assert!(!consumer.join(".claude/skills").exists());
+    Ok(())
+}
 
 #[test]
 fn kitchen_layout_matches_the_origin89_template() -> TestResult {

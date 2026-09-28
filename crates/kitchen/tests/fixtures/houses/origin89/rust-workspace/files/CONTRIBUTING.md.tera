@@ -1,0 +1,24 @@
+# Contributing to {{ vars.project_name }}
+
+Use the Origin89 engineering standards through `just skills-sync` and the local
+rules in [AGENTS.md](AGENTS.md). Inspect existing contracts and callers before
+editing. Keep each issue and PR focused and preserve unrelated changes.
+
+Use enums for closed states, validated identifiers and units, and structured
+errors. Parse external data at the boundary. Expected I/O failures must not
+panic or silently become successful outcomes. Bound retries, queues,
+subprocesses, and waits.
+
+For nontrivial behavior, test distinct success, invalid input, boundaries, and
+failure/recovery paths. Check the current stable version and compatibility
+before adding a dependency, retain the lockfile, and test the declared MSRV.
+
+Run `just fmt`, then `just check`. Checks include formatting, Clippy, tests,
+builds, documentation, MSRV, and workflow syntax. Install tools explicitly;
+checks do not install them or perform credentialed operations. `just security`
+is a separate networked audit.
+
+Use short conventional commit and PR titles and branches such as
+`name/task-name`. Preserve Git authorship and signing settings. Do not add
+assistant attribution or co-author footers. Preparing work does not authorize
+committing, pushing, merging, publishing, or activating jobs.

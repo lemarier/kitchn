@@ -1,0 +1,19 @@
+//! {{ vars.summary }}
+//!
+//! ```
+//! assert_eq!({{ vars.crate_name }}::name(), "{{ vars.crate_name }}");
+//! ```
+
+/// The crate name.
+#[must_use]
+pub const fn name() -> &'static str {
+    "{{ vars.crate_name }}"
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn reports_its_name() {
+        assert_eq!(super::name(), "{{ vars.crate_name }}");
+    }
+}

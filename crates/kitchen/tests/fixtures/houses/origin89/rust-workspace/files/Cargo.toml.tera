@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/{{ vars.crate_name }}"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "{{ vars.rust_version }}"
+authors = ["{{ vars.copyright_holder }}"]
+license = "MIT OR Apache-2.0"
+repository = "{{ vars.repository_url }}"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

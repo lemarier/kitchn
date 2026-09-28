@@ -1,0 +1,37 @@
+# Working in {{ vars.project_name }}
+
+Read `CONTRIBUTING.md`. For local tasks, run `just skills-sync` and read
+`skills/origin89-working/SKILL.md`, `origin89-rust/SKILL.md`,
+`origin89-testing/SKILL.md`, and relevant domain skills under the immutable
+`path` it prints. Keep that snapshot for this task. Before Git publication,
+read `origin89-commits/SKILL.md` there. If refresh falls back to a verified
+cache, report that fact; if no verified cache exists, report the missing shared
+context and follow these local rules without claiming it loaded.
+
+- `crates/{{ vars.crate_name }}`: the Rust library.
+- `crates/*/tests/`: Rust integration tests.
+- `.github/workflows/check.yml`: host validation, without publication authority.
+
+Use `just --list` for exact commands and `just check` for required validation.
+Do not run skills refresh during hosted reviews; the ignored local cache is not
+guaranteed to exist there. The rules below are checked in and apply even when
+shared skills are unavailable. State that limitation.
+
+## Code Review Rules
+
+Read `origin89-review` and relevant domain skills when available; never claim a
+remote link or an ignored local cache was loaded by a hosted reviewer.
+
+- Review the requested revision and real callers. Report trigger, consequence,
+  and location; distinguish verified defects from speculation.
+- Use typed state, IDs, units, errors, and exhaustive transitions. Validate
+  external inputs; avoid production panics, stringly typed contracts, swallowed
+  errors, unbounded retries, and locks held across unrelated I/O.
+- Require meaningful success, invalid-input, boundary, and failure/recovery tests
+  for nontrivial behavior. Never confuse mocks, CI passes, or model agreement
+  with live runtime or physical evidence.
+- Workflows need bounded execution and minimal token permissions. Untrusted PR
+  code must not receive base-repository secrets. Review-only work cannot publish
+  or operate equipment. A review request authorizes findings, not fixes.
+- Preserve licenses and notices, avoid duplicate findings, and report validation
+  gaps.

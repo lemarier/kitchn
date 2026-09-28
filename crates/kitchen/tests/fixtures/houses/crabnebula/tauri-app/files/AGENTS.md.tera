@@ -1,0 +1,9 @@
+# Working on {{ vars.product_name }}
+
+Follow the {{ kitchen.house }} house rules for Tauri applications.
+
+- Pair every `#[tauri::command]` with `#[specta::specta]` and regenerate the
+  TypeScript bindings with `just bindings` after changing a command.
+- Keep plugin state in `State<'_, T>`; do not use global statics.
+- Run `just check` before publishing. Releases go through the release
+  workflow only.

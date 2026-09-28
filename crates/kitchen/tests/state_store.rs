@@ -19,8 +19,9 @@ use kitchen::{
     ConsumerId, Error, HouseId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, ContractError, Disposition, Evidence,
-        EvidenceKind, EvidenceRevision, EvidenceVerdict, ExternalRef, FailureClass, Fence,
-        NotAppliedReason, Permission, Receipt, RetryPolicy, Settlement, Timestamp, UncertainReason,
+        EvidenceKind, EvidenceRevision, EvidenceSubject, EvidenceVerdict, ExternalRef,
+        FailureClass, Fence, NotAppliedReason, Permission, Receipt, RetryPolicy, Settlement,
+        Timestamp, UncertainReason,
     },
     state::{
         AttemptState, CancelStatus, ConsumerEvent, ConsumerState, Consumption, Corruption,
@@ -56,7 +57,10 @@ fn evidence(subject: char, source: &str) -> TestResult<Evidence> {
     Ok(Evidence {
         kind: EvidenceKind::Check,
         verdict: EvidenceVerdict::Pass,
-        subject: commit(subject)?,
+        subject: EvidenceSubject {
+            head: commit(subject)?,
+            base: None,
+        },
         source: ExternalRef::new(source)?,
         observed_at: at(1),
     })
@@ -618,7 +622,10 @@ fn new_evidence_subject_invalidates_earlier_decisions() -> TestResult {
         1,
         "evidence for the old head is dropped"
     );
-    assert_eq!(record.evidence().subject(), Some(&commit('b')?));
+    assert_eq!(
+        record.evidence().subject().map(|subject| &subject.head),
+        Some(&commit('b')?)
+    );
 
     let mut stale = plan(&task, fence, "launch", launch()?)?;
     stale.decided_at = first;
@@ -1544,6 +1551,38 @@ fn consumer_history_is_bounded_and_validated() -> TestResult {
         Some(Error::State(StateError::CorruptState(
             Corruption::Ownership
         )))
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_moved_base_invalidates_evidence_for_the_same_head() -> TestResult {
+    let fixture = Fixture::new()?;
+    let fence = claimed_attempt(&fixture, "gate", at(0))?;
+    let task = task_id("gate")?;
+    let store = &fixture.store;
+    let at_base = |base: char, source: &str| -> TestResult<Evidence> {
+        Ok(Evidence {
+            subject: EvidenceSubject {
+                head: commit('a')?,
+                base: Some(commit(base)?),
+            },
+            ..evidence('a', source)?
+        })
+    };
+    let first = store.record_evidence(&task, fence, at_base('b', "ci-1")?, at(1))?;
+    assert_eq!(
+        store.record_evidence(&task, fence, at_base('b', "review-1")?, at(1))?,
+        first
+    );
+    let moved = store.record_evidence(&task, fence, at_base('c', "ci-2")?, at(2))?;
+    assert!(moved > first);
+    assert_eq!(store.task(&task)?.evidence().items().len(), 1);
+    let mut stale = plan(&task, fence, "launch", launch()?)?;
+    stale.decided_at = first;
+    assert!(matches!(
+        store.begin_effect(stale, &grants()?, &common::refusing()?, at(3)),
+        Err(Error::State(StateError::StaleDecision { .. }))
     ));
     Ok(())
 }

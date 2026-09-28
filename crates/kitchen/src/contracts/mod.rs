@@ -25,7 +25,7 @@ pub use backend::{
 };
 pub use capability::{BackendDescriptor, Capability, CapabilitySet, Support};
 pub use error::ContractError;
-pub use evidence::{Evidence, EvidenceKind, EvidenceRevision, EvidenceVerdict};
+pub use evidence::{Evidence, EvidenceKind, EvidenceRevision, EvidenceSubject, EvidenceVerdict};
 pub use resource::{ResourceKind, ResourceRef};
 pub use role::Role;
 pub use task::{

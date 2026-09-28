@@ -433,7 +433,7 @@ impl HouseStore {
         self.transact(|state| state.accept_risk(id, fence, seq, decision, now))
     }
 
-    /// Record evidence. A new subject revision starts a new evidence revision
+    /// Record evidence. A new subject (head or base) starts a new evidence revision
     /// and drops superseded evidence, invalidating decisions made earlier.
     ///
     /// # Errors

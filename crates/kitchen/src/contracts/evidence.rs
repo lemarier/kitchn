@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::{CommitId, ExternalRef, Timestamp};
 
 /// A per-task counter that increases whenever the evidence subject changes,
-/// for example when a pull-request head moves. Decisions record the revision
+/// for example when a pull-request head or its base moves. Decisions record the revision
 /// they were made at; effects decided at an older revision are rejected.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -36,21 +36,29 @@ impl fmt::Display for EvidenceRevision {
     }
 }
 
-/// What an evidence item attests.
+/// What an evidence item attests. Workflow owners add the kinds their
+/// policies evaluate, such as reviews or approvals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum EvidenceKind {
     /// A CI or local check result.
     Check,
-    /// A code review.
-    Review,
-    /// A scoped human or policy approval.
-    Approval,
     /// A worker's own completion report.
     WorkerReport,
-    /// A bench or hardware result.
-    Bench,
+}
+
+/// The exact revision evidence is about: a head commit and, for a change
+/// proposed against a base, that base. Moving either makes earlier evidence
+/// stale.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceSubject {
+    /// The head commit.
+    pub head: CommitId,
+    /// The base commit the head is compared against, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<CommitId>,
 }
 
 /// Whether the evidence supports or contradicts the subject.
@@ -74,7 +82,7 @@ pub struct Evidence {
     /// The result.
     pub verdict: EvidenceVerdict,
     /// The exact revision the evidence is about.
-    pub subject: CommitId,
+    pub subject: EvidenceSubject,
     /// Where the evidence can be read.
     pub source: ExternalRef,
     /// When the source produced it.

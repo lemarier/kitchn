@@ -15,10 +15,10 @@ use crate::{
     ConsumerId, EffectName, Error, HolderId, HouseId, TaskId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Capability,
-        Claimant, CommitId, Consent, ContractError, Disposition, EffectRequest, EffectSeq,
-        Evidence, EvidenceRevision, ExternalRef, FailureClass, Fence, HouseGrants, IdempotencyKey,
-        LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef, RetryPolicy, Settlement,
-        TaskSpec, Timestamp, Trigger, UncertainReason,
+        Claimant, Consent, ContractError, Disposition, EffectRequest, EffectSeq, Evidence,
+        EvidenceRevision, EvidenceSubject, ExternalRef, FailureClass, Fence, HouseGrants,
+        IdempotencyKey, LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef, RetryPolicy,
+        Settlement, TaskSpec, Timestamp, Trigger, UncertainReason,
     },
     state::{ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, StateError},
 };
@@ -438,7 +438,7 @@ pub enum OwnershipEvent {
 pub struct EvidenceLog {
     revision: EvidenceRevision,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    subject: Option<CommitId>,
+    subject: Option<EvidenceSubject>,
     items: Vec<Evidence>,
 }
 
@@ -451,7 +451,7 @@ impl EvidenceLog {
 
     /// The exact subject the current evidence is about.
     #[must_use]
-    pub const fn subject(&self) -> Option<&CommitId> {
+    pub const fn subject(&self) -> Option<&EvidenceSubject> {
         self.subject.as_ref()
     }
 

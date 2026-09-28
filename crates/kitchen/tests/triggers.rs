@@ -11,8 +11,8 @@ use kitchen::{
     Error, TaskId,
     contracts::{
         Authorization, Consent, ContractError, Evidence, EvidenceKind, EvidenceRevision,
-        EvidenceVerdict, ExternalRef, Fence, HouseGrants, Operation, Permission, Role,
-        TaskAuthority, Text, Trigger, Workspace, fake::FakeBackend,
+        EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, HouseGrants, Operation, Permission,
+        Role, TaskAuthority, Text, Trigger, Workspace, fake::FakeBackend,
     },
     state::{EffectPlan, EffectState, OwnershipEvent, StateError, TaskState, run_effect},
 };
@@ -135,7 +135,10 @@ fn consent_for_a_different_effect_is_rejected() -> TestResult {
         Evidence {
             kind: EvidenceKind::Check,
             verdict: EvidenceVerdict::Pass,
-            subject: commit('c')?,
+            subject: EvidenceSubject {
+                head: commit('c')?,
+                base: None,
+            },
             source: ExternalRef::new("ci-1")?,
             observed_at: at(1),
         },
@@ -148,7 +151,10 @@ fn consent_for_a_different_effect_is_rejected() -> TestResult {
         Evidence {
             kind: EvidenceKind::Check,
             verdict: EvidenceVerdict::Pass,
-            subject: commit('d')?,
+            subject: EvidenceSubject {
+                head: commit('d')?,
+                base: None,
+            },
             source: ExternalRef::new("ci-2")?,
             observed_at: at(2),
         },

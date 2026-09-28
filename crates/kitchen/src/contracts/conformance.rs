@@ -318,6 +318,7 @@ impl<'a> Runner<'a> {
                         task: self.fixture.task.clone(),
                         action: Permission::Merge,
                         revision: EvidenceRevision::INITIAL,
+                        subject: None,
                     },
                     question: self.fixture.brief.clone(),
                 }),

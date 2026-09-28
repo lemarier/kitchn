@@ -29,7 +29,8 @@ pub use schedule::ScheduleEffect;
 use crate::{
     HouseId, TaskId,
     contracts::{
-        Capability, ContractError, EvidenceRevision, GrantScope, Operation, Permission, ResourceRef,
+        Capability, ContractError, EvidenceRevision, EvidenceSubject, GrantScope, Operation,
+        Permission, ResourceRef,
     },
 };
 
@@ -219,6 +220,9 @@ pub struct EffectContext<'a> {
     pub task_scope: &'a GrantScope,
     /// The task's current evidence revision.
     pub revision: EvidenceRevision,
+    /// The exact subject (head and base) the current evidence is about;
+    /// `None` before any evidence was recorded.
+    pub subject: Option<&'a EvidenceSubject>,
     /// The task's effects already submitted, before this one.
     pub submitted: &'a SubmittedEffects,
 }

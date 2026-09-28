@@ -1582,6 +1582,7 @@ impl StoreState {
             task: &plan.task,
             task_scope: &task_scope,
             revision: task.evidence.revision,
+            subject: task.evidence.subject.as_ref(),
             submitted: &submitted,
         };
         // Checks every submission must pass, including a same-key retry of

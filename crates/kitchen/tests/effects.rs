@@ -57,12 +57,21 @@ fn label(repository: Repository, name: &str) -> TestResult<Effect> {
 }
 
 fn ask(task: &TaskId, revision: EvidenceRevision) -> TestResult<Effect> {
+    ask_about(task, revision, None)
+}
+
+fn ask_about(
+    task: &TaskId,
+    revision: EvidenceRevision,
+    subject: Option<kitchen::contracts::EvidenceSubject>,
+) -> TestResult<Effect> {
     Ok(RogerEffect::Ask {
         binding: DecisionBinding {
             house: house()?,
             task: task.clone(),
             action: Permission::Merge,
             revision,
+            subject,
         },
         question: Text::new("Merge the PR at this head?")?,
     }
@@ -699,7 +708,12 @@ fn a_same_key_ask_retry_is_checked_against_the_current_revision() -> TestResult 
         let asked_at = fixture
             .store
             .record_evidence(&task, fence, subject('a', 'b')?, at(1))?;
-        let mut first = plan(&task, fence, "ask", ask(&task, asked_at)?)?;
+        let mut first = plan(
+            &task,
+            fence,
+            "ask",
+            ask_about(&task, asked_at, Some(subject('a', 'b')?.subject))?,
+        )?;
         first.decided_at = asked_at;
         roger.inject(ExecuteFault::TimeoutWithoutApplying);
         let lost = run_effect(
@@ -721,7 +735,12 @@ fn a_same_key_ask_retry_is_checked_against_the_current_revision() -> TestResult 
                 .record_evidence(&task, fence, subject('d', 'b')?, at(3))?
         };
         roger.fail_lookups(100);
-        let mut retry = plan(&task, fence, "ask", ask(&task, asked_at)?)?;
+        let mut retry = plan(
+            &task,
+            fence,
+            "ask",
+            ask_about(&task, asked_at, Some(subject('a', 'b')?.subject))?,
+        )?;
         retry.decided_at = moved;
         let result = run_effect(
             &fixture.store,
@@ -818,5 +837,63 @@ fn a_same_key_ask_retry_does_not_count_against_its_own_budget() -> TestResult {
         ),
         Err(Error::Contract(ContractError::EffectBudgetExhausted { .. }))
     ));
+    Ok(())
+}
+
+#[test]
+fn an_ask_must_name_the_exact_evidence_subject() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = task_for(&fixture, "task-1", None)?;
+    let roger = executor(ExecutorKind::Roger, Capability::AskHuman)?;
+    let grants = grants_everywhere()?;
+    let clock = ManualClock::starting_at(1);
+    let at_head =
+        |head: char, base: Option<char>| -> TestResult<kitchen::contracts::EvidenceSubject> {
+            Ok(kitchen::contracts::EvidenceSubject {
+                head: common::commit(head)?,
+                base: base.map(common::commit).transpose()?,
+            })
+        };
+    let revision = fixture.store.record_evidence(
+        &task,
+        fence,
+        kitchen::contracts::Evidence {
+            kind: kitchen::contracts::EvidenceKind::Check,
+            verdict: kitchen::contracts::EvidenceVerdict::Pass,
+            subject: at_head('a', Some('b'))?,
+            source: ExternalRef::new("ci-1")?,
+            observed_at: at(1),
+        },
+        at(1),
+    )?;
+    // The counter matches, but the question names another head, another
+    // base, or no subject at all.
+    for (name, wrong) in [
+        ("other-head", Some(at_head('c', Some('b'))?)),
+        ("other-base", Some(at_head('a', Some('d'))?)),
+        ("no-base", Some(at_head('a', None)?)),
+        ("no-subject", None),
+    ] {
+        let mut attempt = plan(&task, fence, name, ask_about(&task, revision, wrong)?)?;
+        attempt.decided_at = revision;
+        let result = run_effect(&fixture.store, &roger, &grants, attempt, &clock);
+        assert!(
+            matches!(
+                result,
+                Err(Error::Contract(ContractError::DecisionBindingMismatch))
+            ),
+            "{name}: {result:?}"
+        );
+    }
+    assert_eq!(roger.execute_calls(), 0);
+    let mut exact = plan(
+        &task,
+        fence,
+        "exact",
+        ask_about(&task, revision, Some(at_head('a', Some('b'))?))?,
+    )?;
+    exact.decided_at = revision;
+    let asked = run_effect(&fixture.store, &roger, &grants, exact, &clock)?;
+    assert!(matches!(asked.state(), EffectState::Applied { .. }));
     Ok(())
 }

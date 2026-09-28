@@ -21,16 +21,16 @@ use common::{
 use kitchen::{
     Error, ErrorClass, TaskId,
     contracts::{
-        AttemptOutcome, AttemptStart, BackendDescriptor, BackendUnavailable, Capability,
-        CapabilitySet, Claimant, Clock, CommitId, Consent, Effect, EffectExecutor, EffectFailure,
-        EffectRequest, EvidenceRevision, ExternalRef, Grant, HouseGrants, Liveness, Lookup,
-        Operation, Permission, Provenance, Receipt, ResourceKind, ResourceObservation, ResourceRef,
-        WorkerBackend, WorkerOutcome, WorkerState,
+        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, BackendUnavailable,
+        Capability, CapabilitySet, Claimant, Clock, CommitId, Consent, Effect, EffectExecutor,
+        EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, Fence, Grant, HouseGrants,
+        Liveness, Lookup, NotAppliedReason, Operation, Permission, Provenance, Receipt,
+        ResourceKind, ResourceObservation, ResourceRef, WorkerBackend, WorkerOutcome, WorkerState,
         fake::{ExecuteFault, FakeBackend},
     },
     state::{
-        EffectState, HouseStore, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, WorkItem,
-        run_effect,
+        EffectOutcome, EffectStart, EffectState, HouseStore, MarkerFact, MarkerKey, MarkerSchema,
+        MarkerSubject, RiskAction, RiskDecision, WorkItem, run_effect,
     },
     workflows::cleanup::{
         ApplyOptions, ApplyReport, ApprovalOutcome, ApprovalResult, BuildOutcome, BuildReport,
@@ -180,6 +180,9 @@ struct Inventory {
     change_after: Cell<Option<usize>>,
     change: RefCell<Option<Box<Change>>>,
     outage: Cell<bool>,
+    /// While set, every launch's receipt names these resources as created,
+    /// instead of the ones the fake made: a reused or foreign identifier.
+    created_override: RefCell<Option<Vec<ResourceRef>>>,
 }
 
 impl Inventory {
@@ -191,6 +194,7 @@ impl Inventory {
             change_after: Cell::new(None),
             change: RefCell::new(None),
             outage: Cell::new(false),
+            created_override: RefCell::new(None),
         }
     }
 
@@ -215,7 +219,20 @@ impl EffectExecutor for Inventory {
     }
 
     fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
-        let result = self.fake.execute(request);
+        let mut result = self.fake.execute(request);
+        let created = self.created_override.borrow().clone();
+        if let (Effect::Worker(Operation::LaunchWorker { .. }), Some(created)) =
+            (request.effect(), created)
+        {
+            result = result.and_then(|receipt| {
+                Receipt::new(
+                    receipt.reference().clone(),
+                    created,
+                    receipt.touched().to_vec(),
+                )
+                .map_err(|_| EffectFailure::NotApplied(NotAppliedReason::Rejected))
+            });
+        }
         if let Effect::Worker(Operation::ReleaseResource { resource }) = request.effect() {
             // A lost response still means the release happened.
             let applied = result.is_ok()
@@ -270,6 +287,16 @@ struct Owned {
     key: ExternalRef,
 }
 
+/// A launched task before it settles or has a checkout.
+struct Launched {
+    task: TaskId,
+    fence: Fence,
+    attempt: AttemptNumber,
+    worker: ResourceRef,
+    worktree: ResourceRef,
+    key: ExternalRef,
+}
+
 struct Harness {
     fixture: Fixture,
     backend: Inventory,
@@ -316,8 +343,30 @@ impl Harness {
     /// A task that launched a worker in an isolated worktree, whose worker
     /// reported `outcome`. With `settle`, the task settles too.
     fn owner(&mut self, name: &str, settle: bool) -> TestResult<Owned> {
+        let launched = self.launch_task(name)?;
+        if settle {
+            self.store().finish_attempt(
+                &launched.task,
+                launched.fence,
+                launched.attempt,
+                AttemptOutcome::Succeeded,
+                self.clock.now(),
+            )?;
+        }
+        self.checkout(&launched)?;
+        Ok(Owned {
+            task: launched.task,
+            worker: launched.worker,
+            worktree: launched.worktree,
+            key: launched.key,
+        })
+    }
+
+    /// Create and claim a task, and apply its launch effect. The task stays
+    /// unsettled; its worker reports success.
+    fn launch_task(&self, name: &str) -> TestResult<Launched> {
         let task = TaskId::new(name)?;
-        let store = &self.fixture.store;
+        let store = self.store();
         store.create_task(spec(name)?, &scheduled("pickup")?, self.clock.now())?;
         let fence = store
             .claim(&task, &scheduled("pickup")?, ttl(600)?, self.clock.now())?
@@ -346,29 +395,30 @@ impl Harness {
         };
         let worker = find(ResourceKind::Worker)?;
         let worktree = find(ResourceKind::Worktree)?;
-        let key = ExternalRef::new(launched.request().key().as_str())?;
         self.backend
             .fake
             .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
-        if settle {
-            store.finish_attempt(
-                &task,
-                fence,
-                attempt,
-                AttemptOutcome::Succeeded,
-                self.clock.now(),
-            )?;
-        }
-        let path = self.repo.pushed_worktree(name)?;
-        self.backend
-            .add(worktree.clone(), Some(key.clone()), Liveness::Exited);
-        self.paths.insert(worktree.clone(), path);
-        Ok(Owned {
+        Ok(Launched {
             task,
+            fence,
+            attempt,
             worker,
             worktree,
-            key,
+            key: ExternalRef::new(launched.request().key().as_str())?,
         })
+    }
+
+    /// Give a launched task's worktree a pushed checkout and list it in the
+    /// backend's inventory, exited and owned by the launch.
+    fn checkout(&mut self, launched: &Launched) -> TestResult {
+        let path = self.repo.pushed_worktree(launched.task.as_str())?;
+        self.backend.add(
+            launched.worktree.clone(),
+            Some(launched.key.clone()),
+            Liveness::Exited,
+        );
+        self.paths.insert(launched.worktree.clone(), path);
+        Ok(())
     }
 
     fn path(&self, resource: &ResourceRef) -> TestResult<&Path> {
@@ -1538,6 +1588,294 @@ fn interactive_release_needs_consent_for_each_resource() -> TestResult {
         ReleaseOutcome::Released
     );
     assert_eq!(outcome(&approved, &owned.worker)?, ReleaseOutcome::Released);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Delete-or-retain gates: each has a distinct trigger and must perform no effect
+
+/// Approve everything eligible and apply once; return the effects performed.
+fn effects_from_applying(harness: &Harness) -> TestResult<usize> {
+    let before = harness.backend.fake.effects_performed();
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    harness.apply()?;
+    Ok(harness.backend.fake.effects_performed() - before)
+}
+
+#[test]
+fn a_handle_created_by_two_tasks_is_ambiguous_and_retained() -> TestResult {
+    let mut harness = Harness::new()?;
+    let first = harness.owner("task-1", true)?;
+    // A second task's launch also claims to have created the same handles, as
+    // when an identifier is reused after the first resource was removed.
+    *harness.backend.created_override.borrow_mut() =
+        Some(vec![first.worker.clone(), first.worktree.clone()]);
+    let second = harness.launch_task("task-2")?;
+    *harness.backend.created_override.borrow_mut() = None;
+    harness.store().finish_attempt(
+        &second.task,
+        second.fence,
+        second.attempt,
+        AttemptOutcome::Succeeded,
+        harness.clock.now(),
+    )?;
+    let preview = harness.inspect()?;
+    for resource in [&first.worker, &first.worktree] {
+        assert_eq!(reasons(&preview, resource)?, [Exclusion::AmbiguousOwner]);
+        let entry = preview.entry(resource).ok_or("resource")?;
+        let Ownership::Ambiguous { tasks } = &entry.ownership else {
+            return Err("ownership not ambiguous".into());
+        };
+        assert_eq!(tasks, &[first.task.clone(), second.task.clone()]);
+    }
+    assert_eq!(effects_from_applying(&harness)?, 0);
+    Ok(())
+}
+
+#[test]
+fn a_task_with_unresolved_or_waived_effects_keeps_its_resources() -> TestResult {
+    let mut harness = Harness::new()?;
+    // An effect still in flight: intent recorded, outcome unknown.
+    let pending = harness.launch_task("task-1")?;
+    harness.checkout(&pending)?;
+    let EffectStart::Execute(_) = harness.store().begin_effect(
+        plan(&pending.task, pending.fence, "relaunch", launch()?)?,
+        &grants()?,
+        harness.backend.descriptor(),
+        harness.clock.now(),
+    )?
+    else {
+        return Err("expected a new effect".into());
+    };
+
+    // A handed-over effect waived by a person, after which the task settles.
+    let waived = harness.launch_task("task-2")?;
+    harness.checkout(&waived)?;
+    let EffectStart::Execute(intent) = harness.store().begin_effect(
+        plan(&waived.task, waived.fence, "relaunch", launch()?)?,
+        &grants()?,
+        harness.backend.descriptor(),
+        harness.clock.now(),
+    )?
+    else {
+        return Err("expected a new effect".into());
+    };
+    harness.store().record_effect_outcome(
+        &waived.task,
+        waived.fence,
+        intent.seq(),
+        EffectOutcome::Unresolvable,
+        harness.clock.now(),
+    )?;
+    harness.store().accept_risk(
+        &waived.task,
+        waived.fence,
+        intent.seq(),
+        RiskDecision {
+            effect: intent.request().key().clone(),
+            decided_by: kitchen::HolderId::new("david")?,
+            revision: EvidenceRevision::INITIAL,
+            action: RiskAction::SettleUnsuccessfully,
+        },
+        harness.clock.now(),
+    )?;
+    harness.store().finish_attempt(
+        &waived.task,
+        waived.fence,
+        waived.attempt,
+        AttemptOutcome::Failed(kitchen::contracts::FailureClass::Permanent),
+        harness.clock.now(),
+    )?;
+
+    let preview = harness.inspect()?;
+    assert_eq!(
+        reasons(&preview, &pending.worktree)?,
+        [Exclusion::OwnerActive, Exclusion::UnresolvedEffects]
+    );
+    // The waived task is settled, yet its outcome was never established.
+    assert_eq!(
+        reasons(&preview, &waived.worktree)?,
+        [Exclusion::UnresolvedEffects]
+    );
+    assert_eq!(
+        reasons(&preview, &waived.worker)?,
+        [Exclusion::UnresolvedEffects]
+    );
+    assert_eq!(effects_from_applying(&harness)?, 0);
+    Ok(())
+}
+
+#[test]
+fn a_resource_whose_liveness_cannot_be_verified_is_not_treated_as_exited() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    for observation in harness.backend.extra.borrow_mut().iter_mut() {
+        if observation.resource == owned.worktree {
+            observation.liveness = Liveness::Unverifiable;
+        }
+    }
+    let preview = harness.inspect()?;
+    assert_eq!(
+        reasons(&preview, &owned.worktree)?,
+        [Exclusion::LivenessUnverifiable]
+    );
+    // The task's other resources wait for it too.
+    assert_eq!(reasons(&preview, &owned.worker)?, [Exclusion::SiblingInUse]);
+    assert_eq!(effects_from_applying(&harness)?, 0);
+    Ok(())
+}
+
+#[test]
+fn branches_and_schedules_are_never_reclaimed_even_when_a_task_created_them() -> TestResult {
+    let harness = Harness::new()?;
+    let branch = ResourceRef {
+        kind: ResourceKind::Branch,
+        backend: backend_id()?,
+        handle: ExternalRef::new("lemarier/task-1")?,
+    };
+    let schedule = ResourceRef {
+        kind: ResourceKind::Schedule,
+        backend: backend_id()?,
+        handle: ExternalRef::new("nightly-pickup")?,
+    };
+    // A settled task whose applied launch created both, so ownership is not
+    // in doubt: only the kind keeps them.
+    *harness.backend.created_override.borrow_mut() = Some(vec![
+        branch.clone(),
+        schedule.clone(),
+        ResourceRef {
+            kind: ResourceKind::Worker,
+            backend: backend_id()?,
+            handle: ExternalRef::new("worker-of-task-1")?,
+        },
+        ResourceRef {
+            kind: ResourceKind::Worktree,
+            backend: backend_id()?,
+            handle: ExternalRef::new("worktree-of-task-1")?,
+        },
+    ]);
+    let launched = harness.launch_task("task-1")?;
+    *harness.backend.created_override.borrow_mut() = None;
+    harness.store().finish_attempt(
+        &launched.task,
+        launched.fence,
+        launched.attempt,
+        AttemptOutcome::Succeeded,
+        harness.clock.now(),
+    )?;
+    harness
+        .backend
+        .add(branch.clone(), Some(launched.key.clone()), Liveness::Exited);
+    harness
+        .backend
+        .add(schedule.clone(), Some(launched.key), Liveness::Exited);
+    let preview = harness.inspect()?;
+    for resource in [&branch, &schedule] {
+        assert_eq!(reasons(&preview, resource)?, [Exclusion::NotReclaimable]);
+        let entry = preview.entry(resource).ok_or("resource")?;
+        assert!(matches!(entry.ownership, Ownership::Task(_)));
+    }
+    // The task's settled worker is released; the branch and schedule are not.
+    let before = harness.backend.fake.effects_performed();
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    let report = harness.apply()?;
+    let released: Vec<&ResourceRef> = report
+        .results
+        .iter()
+        .filter(|result| result.outcome == ReleaseOutcome::Released)
+        .map(|result| &result.resource)
+        .collect();
+    assert_eq!(
+        released
+            .iter()
+            .map(|resource| resource.kind)
+            .collect::<Vec<_>>(),
+        [ResourceKind::Worker]
+    );
+    assert_eq!(harness.backend.fake.effects_performed(), before + 1);
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|result| result.resource != branch && result.resource != schedule)
+    );
+    Ok(())
+}
+
+#[test]
+fn resources_of_another_backend_namespace_are_retained() -> TestResult {
+    let harness = Harness::new()?;
+    let foreign = ResourceRef {
+        kind: ResourceKind::Terminal,
+        backend: kitchen::BackendId::new("elsewhere")?,
+        handle: ExternalRef::new("their-terminal")?,
+    };
+    harness.backend.add(foreign.clone(), None, Liveness::Exited);
+    let preview = harness.inspect()?;
+    assert_eq!(
+        reasons(&preview, &foreign)?,
+        [Exclusion::ForeignBackend, Exclusion::UnknownOwner]
+    );
+    assert_eq!(effects_from_applying(&harness)?, 0);
+    Ok(())
+}
+
+#[test]
+fn releases_beyond_the_bound_are_deferred_and_finish_on_a_later_run() -> TestResult {
+    let mut harness = Harness::new()?;
+    harness.owner("task-1", true)?;
+    harness.owner("task-2", true)?;
+    // Two workers and two worktrees are eligible.
+    assert_eq!(harness.approve_all()?.len(), 4);
+    harness.clock.advance(60);
+    let before = harness.backend.fake.effects_performed();
+    let mut bounded = options()?;
+    bounded.max_releases = 1;
+    let first = apply(
+        &harness.inspector(),
+        &grants()?,
+        &scheduled("dishwasher")?,
+        &NoConsent,
+        &bounded,
+        &harness.clock,
+    )?;
+    let outcomes: Vec<ReleaseOutcome> = first.results.iter().map(|r| r.outcome).collect();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| **o == ReleaseOutcome::Released)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| **o == ReleaseOutcome::Deferred)
+            .count(),
+        3
+    );
+    assert_eq!(harness.backend.fake.effects_performed(), before + 1);
+    // A deferred resource has no release task yet.
+    for result in first
+        .results
+        .iter()
+        .filter(|r| r.outcome == ReleaseOutcome::Deferred)
+    {
+        assert_eq!(result.task, None);
+        assert_eq!(result.freed, None);
+    }
+    // The next run, within the same approvals, finishes the rest.
+    harness.clock.advance(60);
+    let second = harness.apply()?;
+    assert!(
+        second
+            .results
+            .iter()
+            .all(|r| r.outcome == ReleaseOutcome::Released)
+    );
+    assert_eq!(harness.backend.fake.effects_performed(), before + 4);
     Ok(())
 }
 

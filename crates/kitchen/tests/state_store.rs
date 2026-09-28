@@ -743,9 +743,21 @@ fn unresolved_effect_blocks_new_work_until_resolved() -> TestResult {
         ),
         Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
     ));
+    // An idempotent backend must reconcile before the key is resubmitted.
     assert!(matches!(
         store.begin_effect(plan(&task, fence, "launch", launch()?)?, &grants()?, &common::idempotent()?, at(3))?,
-        EffectStart::Execute(record) if record.request().key() == intent.request().key()
+        EffectStart::ReconcileFirst(record) if record.seq() == intent.seq() && record.submissions() == 1
+    ));
+    store.record_effect_outcome(
+        &task,
+        fence,
+        intent.seq(),
+        EffectOutcome::Uncertain(UncertainReason::LookupInconclusive),
+        at(3),
+    )?;
+    assert!(matches!(
+        store.begin_effect(plan(&task, fence, "launch", launch()?)?, &grants()?, &common::idempotent()?, at(3))?,
+        EffectStart::Execute(record) if record.request().key() == intent.request().key() && record.submissions() == 2
     ));
 
     store.record_effect_outcome(
@@ -1222,5 +1234,76 @@ fn a_replayed_finish_from_an_earlier_attempt_does_not_finish_the_current_one() -
         store.finish_attempt(&task, fence, SECOND, AttemptOutcome::Succeeded, at(5))?,
         Disposition::Settled(Settlement::Succeeded)
     );
+    Ok(())
+}
+
+#[test]
+fn a_late_response_from_an_older_submission_cannot_clear_a_newer_one() -> TestResult {
+    let fixture = Fixture::new()?;
+    let fence = claimed_attempt(&fixture, "task-1", at(0))?;
+    let task = task_id("task-1")?;
+    let store = &fixture.store;
+    let backend = common::idempotent()?;
+    let EffectStart::Execute(first) = store.begin_effect(
+        plan(&task, fence, "launch", launch()?)?,
+        &grants()?,
+        &backend,
+        at(1),
+    )?
+    else {
+        return Err("expected a new effect".into());
+    };
+    // Submission 1 is still in flight; the owner reconciles and resubmits.
+    assert!(matches!(
+        store.begin_effect(
+            plan(&task, fence, "launch", launch()?)?,
+            &grants()?,
+            &backend,
+            at(2)
+        )?,
+        EffectStart::ReconcileFirst(_)
+    ));
+    store.record_effect_outcome(
+        &task,
+        fence,
+        first.seq(),
+        EffectOutcome::Uncertain(UncertainReason::LookupInconclusive),
+        at(2),
+    )?;
+    let EffectStart::Execute(second) = store.begin_effect(
+        plan(&task, fence, "launch", launch()?)?,
+        &grants()?,
+        &backend,
+        at(3),
+    )?
+    else {
+        return Err("expected a resubmission".into());
+    };
+    assert_eq!(second.submissions(), 2);
+
+    let late = store.record_submission_outcome(
+        &task,
+        fence,
+        first.seq(),
+        first.submissions(),
+        EffectOutcome::NotApplied(NotAppliedReason::Rejected),
+        at(4),
+    )?;
+    assert!(matches!(
+        late.state(),
+        EffectState::Uncertain {
+            reason: UncertainReason::LookupInconclusive,
+            ..
+        }
+    ));
+    let current = store.record_submission_outcome(
+        &task,
+        fence,
+        second.seq(),
+        second.submissions(),
+        EffectOutcome::Applied(receipt("request-2")?),
+        at(5),
+    )?;
+    assert!(matches!(current.state(), EffectState::Applied { .. }));
     Ok(())
 }

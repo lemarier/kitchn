@@ -188,6 +188,10 @@ pub enum StateError {
     /// Resubmitting an uncertain effect is unsafe without provider idempotency.
     #[error("effect {0} has an uncertain outcome and the backend cannot deduplicate a retry")]
     UnsafeRetry(EffectSeq),
+    /// The logical effect used its submission budget (the task's retry
+    /// policy, by count and elapsed time) without an established outcome.
+    #[error("effect {0} exhausted its submission budget; hand it over for a decision")]
+    SubmissionBudgetExhausted(EffectSeq),
     /// No effect has this number.
     #[error("effect {0} not found")]
     EffectNotFound(EffectSeq),
@@ -276,6 +280,7 @@ impl StateError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
+            Self::SubmissionBudgetExhausted(_) => ErrorClass::Refused,
             Self::TaskNotFound(_)
             | Self::TaskConflict(_)
             | Self::TaskSettled { .. }

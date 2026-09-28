@@ -281,6 +281,18 @@ pub enum UncertainReason {
     LookupUnsupported,
 }
 
+impl UncertainReason {
+    /// Whether a reconciliation lookup, rather than a submission, produced
+    /// this state. Only then may an idempotent backend receive the key again.
+    #[must_use]
+    pub const fn is_from_lookup(self) -> bool {
+        match self {
+            Self::LookupInconclusive | Self::LookupUnsupported => true,
+            Self::Timeout | Self::Transport | Self::ResponseLost => false,
+        }
+    }
+}
+
 /// An `execute` failure. Only [`EffectFailure::NotApplied`] proves nothing happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum EffectFailure {
@@ -297,7 +309,8 @@ pub enum EffectFailure {
 pub enum Lookup {
     /// The effect was applied.
     Applied(Receipt),
-    /// The provider can prove it never applied this key.
+    /// The provider can prove it never applied this key and that no earlier
+    /// invocation can still apply it.
     Absent,
     /// The provider cannot establish the outcome.
     Unknown,
@@ -363,8 +376,9 @@ pub enum BackendUnavailable {
 /// - With [`Capability::EffectIdempotentRequests`], resubmitting a key returns
 ///   the original receipt without repeating the effect.
 /// - With [`Capability::EffectLookup`], `lookup` reports an applied key's
-///   receipt and returns [`Lookup::Absent`] only with proof; otherwise
-///   [`Lookup::Unknown`]. Without it, `lookup` returns
+///   receipt and returns [`Lookup::Absent`] only with proof that the key was
+///   not applied and cannot be applied later, including by an earlier
+///   invocation that is still in flight; otherwise [`Lookup::Unknown`]. Without it, `lookup` returns
 ///   [`BackendUnavailable::Unsupported`].
 /// - `observe_worker` reports readiness only on positive evidence.
 pub trait ExecutionBackend {

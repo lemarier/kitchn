@@ -38,6 +38,7 @@ struct FakeState {
     execute_faults: VecDeque<ExecuteFault>,
     lookup_outages: usize,
     effects_performed: usize,
+    execute_calls: usize,
     next_id: u64,
 }
 
@@ -83,6 +84,13 @@ impl FakeBackend {
     #[must_use]
     pub fn effects_performed(&self) -> usize {
         self.lock().effects_performed
+    }
+
+    /// How many times `execute` was called, including refused and
+    /// deduplicated calls.
+    #[must_use]
+    pub fn execute_calls(&self) -> usize {
+        self.lock().execute_calls
     }
 
     /// Set a worker's observed state, simulating agent progress.
@@ -179,6 +187,10 @@ impl ExecutionBackend for FakeBackend {
     }
 
     fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        {
+            let mut state = self.lock();
+            state.execute_calls = state.execute_calls.saturating_add(1);
+        }
         if request.house() != &self.descriptor.house {
             return Err(EffectFailure::NotApplied(NotAppliedReason::CrossHouse));
         }

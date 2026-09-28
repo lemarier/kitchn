@@ -4,7 +4,10 @@
 //! transaction. An error discards the copy, so a failed transition never
 //! persists a partial change.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +17,7 @@ use crate::{
         AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Capability, CommitId,
         ContractError, Disposition, EffectRequest, EffectSeq, Evidence, EvidenceRevision,
         ExternalRef, FailureClass, Fence, HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason,
-        Operation, Receipt, Settlement, TaskSpec, Timestamp, UncertainReason,
+        Operation, Receipt, RetryPolicy, Settlement, TaskSpec, Timestamp, UncertainReason,
     },
     state::{Corruption, Limit, StateError},
 };
@@ -234,6 +237,7 @@ pub struct EffectRecord {
     decided_at: EvidenceRevision,
     intended_at: Timestamp,
     request: EffectRequest,
+    submissions: u32,
     state: EffectState,
 }
 
@@ -266,6 +270,12 @@ impl EffectRecord {
     #[must_use]
     pub const fn request(&self) -> &EffectRequest {
         &self.request
+    }
+
+    /// How many times the request was handed to the backend under its key.
+    #[must_use]
+    pub const fn submissions(&self) -> u32 {
+        self.submissions
     }
 
     /// What is known about the outcome.
@@ -472,6 +482,82 @@ impl TaskRecord {
         }
     }
 
+    /// Handle a repeated request for the logical effect at `index`.
+    fn repeat_effect(
+        &mut self,
+        index: usize,
+        plan: &EffectPlan,
+        backend: &BackendDescriptor,
+        resubmission: Resubmission,
+        now: Timestamp,
+    ) -> Result<EffectStart> {
+        let retry = self.spec.retry;
+        let Some(existing) = self.effects.get_mut(index) else {
+            return fail(StateError::CorruptState(Corruption::EffectSequence));
+        };
+        if existing.request.operation() != &plan.operation {
+            return fail(StateError::EffectNameConflict(existing.seq));
+        }
+        if existing.request.backend() != &backend.backend {
+            return fail(StateError::BackendMismatch {
+                seq: existing.seq,
+                recorded: existing.request.backend().clone(),
+            });
+        }
+        let reconciled = match &existing.state {
+            EffectState::Applied { .. } | EffectState::Unresolvable { .. } => {
+                return Ok(EffectStart::Resolved(existing.clone()));
+            }
+            EffectState::NotApplied { .. } => {
+                return fail(StateError::EffectNameConflict(existing.seq));
+            }
+            EffectState::Intended => false,
+            EffectState::Uncertain { reason, .. } => reason.is_from_lookup(),
+        };
+        match resubmission {
+            Resubmission::Refuse => fail(StateError::UnsafeRetry(existing.seq)),
+            Resubmission::SameKey if !reconciled => {
+                Ok(EffectStart::ReconcileFirst(existing.clone()))
+            }
+            Resubmission::SameKey => {
+                let elapsed = now.saturating_since(existing.intended_at);
+                if existing.submissions >= retry.max_attempts() || elapsed > retry.max_elapsed() {
+                    return fail(StateError::SubmissionBudgetExhausted(existing.seq));
+                }
+                existing.submissions = existing.submissions.saturating_add(1);
+                Ok(EffectStart::Execute(existing.clone()))
+            }
+        }
+    }
+
+    /// Check the retry policy's submission bound for a new key of the
+    /// logical effect `name` in `attempt`: submissions of earlier keys that
+    /// were established as not applied count, and time runs from the first.
+    fn check_submission_budget(
+        &self,
+        name: &EffectName,
+        attempt: AttemptNumber,
+        seq: EffectSeq,
+        now: Timestamp,
+    ) -> Result<()> {
+        let retry = self.spec.retry;
+        let earlier = self
+            .effects
+            .iter()
+            .filter(|effect| &effect.name == name && effect.request.attempt() == attempt);
+        let mut submitted = 0_u32;
+        let mut first = None;
+        for effect in earlier {
+            submitted = submitted.saturating_add(effect.submissions);
+            first.get_or_insert(effect.intended_at);
+        }
+        let elapsed = first.map_or(Duration::ZERO, |first| now.saturating_since(first));
+        if submitted >= retry.max_attempts() || elapsed > retry.max_elapsed() {
+            return fail(StateError::SubmissionBudgetExhausted(seq));
+        }
+        Ok(())
+    }
+
     fn attempt(&self, number: AttemptNumber) -> Option<&AttemptRecord> {
         let index = usize::try_from(number.get()).ok()?.checked_sub(1)?;
         self.attempts.get(index)
@@ -569,7 +655,12 @@ enum Resubmission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectStart {
     /// Intent is persisted; execute this request and record the outcome.
+    /// For a resubmission, the record's submission count is already raised.
     Execute(EffectRecord),
+    /// The logical effect has an unknown outcome from a submission. Look up
+    /// its key and record the result before asking again; it is resubmitted
+    /// only if the lookup cannot establish the outcome.
+    ReconcileFirst(EffectRecord),
     /// This logical effect already has a resolved outcome; do not execute.
     Resolved(EffectRecord),
 }
@@ -1071,35 +1162,13 @@ impl StoreState {
             plan.operation.required_permission(),
             &task.spec.scope(),
         )?;
-        let same_name = task.effects.iter().rev().find(|effect| {
+        let same_name = task.effects.iter().rposition(|effect| {
             effect.name == plan.name
                 && effect.request.attempt() == attempt
                 && !matches!(effect.state, EffectState::NotApplied { .. })
         });
-        if let Some(existing) = same_name {
-            if existing.request.operation() != &plan.operation {
-                return fail(StateError::EffectNameConflict(existing.seq));
-            }
-            if existing.request.backend() != &backend.backend {
-                return fail(StateError::BackendMismatch {
-                    seq: existing.seq,
-                    recorded: existing.request.backend().clone(),
-                });
-            }
-            return match (&existing.state, resubmission) {
-                (EffectState::Applied { .. } | EffectState::Unresolvable { .. }, _) => {
-                    Ok(EffectStart::Resolved(existing.clone()))
-                }
-                (EffectState::Intended | EffectState::Uncertain { .. }, Resubmission::SameKey) => {
-                    Ok(EffectStart::Execute(existing.clone()))
-                }
-                (EffectState::Intended | EffectState::Uncertain { .. }, Resubmission::Refuse) => {
-                    fail(StateError::UnsafeRetry(existing.seq))
-                }
-                (EffectState::NotApplied { .. }, _) => {
-                    fail(StateError::EffectNameConflict(existing.seq))
-                }
-            };
+        if let Some(index) = same_name {
+            return task.repeat_effect(index, &plan, backend, resubmission, now);
         }
         let unresolved = task.unresolved_count();
         if unresolved > 0 {
@@ -1111,6 +1180,7 @@ impl StoreState {
             });
         }
         let seq = EffectSeq::new(u32::try_from(task.effects.len()).unwrap_or(u32::MAX));
+        task.check_submission_budget(&plan.name, attempt, seq, now)?;
         let key = ExternalRef::new(&format!(
             "kitchen-{house}-{}-{nonce:016x}-{}",
             plan.task,
@@ -1129,10 +1199,43 @@ impl StoreState {
                 IdempotencyKey::from_ref(key),
                 plan.operation,
             ),
+            submissions: 1,
             state: EffectState::Intended,
         };
         task.effects.push(record.clone());
         Ok(EffectStart::Execute(record))
+    }
+
+    /// Record the outcome of submission number `submission` of an effect.
+    /// A negative or uncertain result from an older submission is stale: a
+    /// newer submission may still apply, so it cannot clear that uncertainty.
+    pub(crate) fn record_submission_outcome(
+        &mut self,
+        id: &TaskId,
+        fence: Fence,
+        seq: EffectSeq,
+        submission: u32,
+        outcome: EffectOutcome,
+        now: Timestamp,
+    ) -> Result<EffectRecord> {
+        let task = self.task(id)?;
+        let effect = task
+            .effects
+            .iter()
+            .find(|effect| effect.seq == seq)
+            .ok_or(Error::State(StateError::EffectNotFound(seq)))?;
+        let stale = effect.submissions != submission
+            && match outcome {
+                EffectOutcome::Applied(_) => false,
+                EffectOutcome::NotApplied(_)
+                | EffectOutcome::Uncertain(_)
+                | EffectOutcome::Unresolvable => true,
+            };
+        if stale {
+            task.owned_lease(fence, now, false)?;
+            return Ok(effect.clone());
+        }
+        self.record_effect_outcome(id, fence, seq, outcome, now)
     }
 
     pub(crate) fn record_effect_outcome(
@@ -1412,6 +1515,9 @@ impl StoreState {
         for (index, effect) in task.effects.iter().enumerate() {
             if u32::try_from(index).ok() != Some(effect.seq.get()) {
                 return Err(Corruption::EffectSequence);
+            }
+            if effect.submissions == 0 || effect.submissions > RetryPolicy::MAX_ATTEMPTS {
+                return Err(Corruption::LimitExceeded);
             }
             let request = &effect.request;
             if request.house() != &self.house

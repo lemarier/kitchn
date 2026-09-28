@@ -380,31 +380,94 @@ fn idempotent_backend_resubmits_an_uncertain_effect_with_the_same_key() -> TestR
         )?)
     };
 
+    // A lost response is reconciled by lookup; nothing is resubmitted.
     backend.inject(ExecuteFault::ApplyThenLoseResponse);
     let lost = run("launch")?;
     assert!(matches!(lost.state(), EffectState::Uncertain { .. }));
-    let resubmitted = run("launch")?;
-    assert_eq!(resubmitted.request().key(), lost.request().key());
+    let recovered = run("launch")?;
+    assert_eq!(recovered.request().key(), lost.request().key());
+    assert!(matches!(recovered.state(), EffectState::Applied { .. }));
+    assert_eq!(recovered.submissions(), 1);
+    assert_eq!(backend.execute_calls(), 1);
+
+    // When the lookup is inconclusive, the same key is resubmitted and the
+    // provider deduplicates it.
+    backend.inject(ExecuteFault::ApplyThenLoseResponse);
+    let second = run("second")?;
+    backend.fail_lookups(1);
+    let resubmitted = run("second")?;
+    assert_eq!(resubmitted.request().key(), second.request().key());
     assert!(matches!(resubmitted.state(), EffectState::Applied { .. }));
+    assert_eq!(resubmitted.submissions(), 2);
+    assert_eq!(backend.execute_calls(), 3);
     assert_eq!(
         backend.effects_performed(),
-        1,
+        2,
         "the provider deduplicated the key"
     );
+    Ok(())
+}
 
+#[test]
+fn resubmission_is_bounded_by_elapsed_time() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = started(&fixture, "task-1")?;
+    let backend = FakeBackend::fully_capable(backend_id()?, house()?);
+    let clock = ManualClock::starting_at(1);
+    backend.fail_lookups(100);
     backend.inject(ExecuteFault::TimeoutWithoutApplying);
+    let lost = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(&task, fence, "launch", launch()?)?,
+        &clock,
+    )?;
+    fixture.store.renew(&task, fence, ttl(7200)?, at(2))?;
+    // The retry policy allows one hour from the first intent.
+    clock.advance(3601);
     assert!(matches!(
-        run("second")?.state(),
-        EffectState::Uncertain {
-            reason: UncertainReason::Timeout,
-            ..
-        }
+        run_effect(&fixture.store, &backend, &grants()?, plan(&task, fence, "launch", launch()?)?, &clock),
+        Err(Error::State(StateError::SubmissionBudgetExhausted(seq))) if seq == lost.seq()
     ));
+    assert_eq!(backend.execute_calls(), 1);
     assert!(matches!(
-        run("second")?.state(),
-        EffectState::Applied { .. }
+        fixture.store.task(&task)?.effects(),
+        [effect] if matches!(effect.state(), EffectState::Uncertain { reason: UncertainReason::LookupInconclusive, .. })
     ));
-    assert_eq!(backend.effects_performed(), 2);
+    Ok(())
+}
+
+#[test]
+fn absence_after_reconcile_still_counts_against_the_budget() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = started(&fixture, "task-1")?;
+    let backend = FakeBackend::fully_capable(backend_id()?, house()?);
+    let clock = ManualClock::starting_at(1);
+    for _ in 0..3 {
+        backend.inject(ExecuteFault::TimeoutWithoutApplying);
+        run_effect(
+            &fixture.store,
+            &backend,
+            &grants()?,
+            plan(&task, fence, "launch", launch()?)?,
+            &clock,
+        )?;
+    }
+    // Each timeout was confirmed absent and replaced by a fresh key; the
+    // logical effect still used its three submissions.
+    assert!(matches!(
+        run_effect(
+            &fixture.store,
+            &backend,
+            &grants()?,
+            plan(&task, fence, "launch", launch()?)?,
+            &clock
+        ),
+        Err(Error::State(StateError::SubmissionBudgetExhausted(_)))
+    ));
+    assert_eq!(backend.execute_calls(), 3);
+    assert_eq!(backend.effects_performed(), 0);
     Ok(())
 }
 
@@ -750,6 +813,37 @@ fn workflow_capability_requirements_are_checked_at_execution() -> TestResult {
             Capability::ScheduleRunTimeout,
             Capability::WorkerLaunchReadiness
         ]
+    );
+    Ok(())
+}
+
+#[test]
+fn same_key_resubmission_is_bounded_by_count() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = started(&fixture, "task-1")?;
+    let backend = FakeBackend::fully_capable(backend_id()?, house()?);
+    let clock = ManualClock::starting_at(1);
+    backend.fail_lookups(100);
+    let mut outcomes = Vec::new();
+    for _ in 0..5 {
+        backend.inject(ExecuteFault::TimeoutWithoutApplying);
+        outcomes.push(run_effect(
+            &fixture.store,
+            &backend,
+            &grants()?,
+            plan(&task, fence, "launch", launch()?)?,
+            &clock,
+        ));
+    }
+    // The retry policy allows three submissions of one logical effect.
+    assert!(outcomes.iter().take(3).all(Result::is_ok));
+    assert_eq!(backend.execute_calls(), 3);
+    assert!(
+        outcomes.iter().skip(3).all(|outcome| matches!(
+            outcome,
+            Err(Error::State(StateError::SubmissionBudgetExhausted(_)))
+        )),
+        "{outcomes:?}"
     );
     Ok(())
 }

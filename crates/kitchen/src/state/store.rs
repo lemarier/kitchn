@@ -376,6 +376,27 @@ impl HouseStore {
         self.transact(|state| state.record_effect_outcome(id, fence, seq, outcome, now))
     }
 
+    /// Record what the backend returned for submission number `submission`
+    /// of an effect (see [`EffectRecord::submissions`]). A not-applied or
+    /// uncertain result from an older submission is ignored, since a newer
+    /// submission may still apply; a receipt is accepted from any submission.
+    ///
+    /// # Errors
+    /// As [`Self::record_effect_outcome`].
+    pub fn record_submission_outcome(
+        &self,
+        id: &TaskId,
+        fence: Fence,
+        seq: EffectSeq,
+        submission: u32,
+        outcome: EffectOutcome,
+        now: Timestamp,
+    ) -> Result<EffectRecord> {
+        self.transact(|state| {
+            state.record_submission_outcome(id, fence, seq, submission, outcome, now)
+        })
+    }
+
     /// Record evidence. A new subject revision starts a new evidence revision
     /// and drops superseded evidence, invalidating decisions made earlier.
     ///

@@ -19,6 +19,9 @@ type Result<T> = std::result::Result<T, Error>;
 /// Delivery is at most once per idempotency key only when the backend
 /// declares [`Capability::EffectIdempotentRequests`]; otherwise an uncertain
 /// outcome is never resubmitted and must be reconciled with [`reconcile`].
+/// With idempotent requests, a repeated call first looks the key up and
+/// resubmits it only when the lookup cannot establish the outcome, within
+/// the task's retry policy (count and elapsed time) per logical effect.
 /// If recording the outcome fails (for example, the claim was taken over),
 /// the effect stays `Intended` and the next owner reconciles it.
 ///
@@ -35,16 +38,53 @@ pub fn run_effect(
 ) -> Result<EffectRecord> {
     let task = plan.task.clone();
     let fence = plan.fence;
-    let record = match store.begin_effect(plan, grants, backend.descriptor(), clock.now())? {
+    let descriptor = backend.descriptor();
+    let record = match store.begin_effect(plan.clone(), grants, descriptor, clock.now())? {
         EffectStart::Resolved(record) => return Ok(record),
         EffectStart::Execute(record) => record,
+        EffectStart::ReconcileFirst(pending) => {
+            let outcome = look_up(backend, &pending);
+            store.record_effect_outcome(&task, fence, pending.seq(), outcome, clock.now())?;
+            match store.begin_effect(plan, grants, descriptor, clock.now())? {
+                EffectStart::Execute(record) => record,
+                // Another handle changed the effect meanwhile; report it as is.
+                EffectStart::Resolved(record) | EffectStart::ReconcileFirst(record) => {
+                    return Ok(record);
+                }
+            }
+        }
     };
     let outcome = match backend.execute(record.request()) {
         Ok(receipt) => EffectOutcome::Applied(receipt),
         Err(EffectFailure::NotApplied(reason)) => EffectOutcome::NotApplied(reason),
         Err(EffectFailure::Uncertain(reason)) => EffectOutcome::Uncertain(reason),
     };
-    store.record_effect_outcome(&task, fence, record.seq(), outcome, clock.now())
+    store.record_submission_outcome(
+        &task,
+        fence,
+        record.seq(),
+        record.submissions(),
+        outcome,
+        clock.now(),
+    )
+}
+
+/// What a lookup establishes about one persisted effect.
+fn look_up(backend: &dyn ExecutionBackend, effect: &EffectRecord) -> EffectOutcome {
+    if !backend
+        .descriptor()
+        .capabilities
+        .supports(Capability::EffectLookup)
+    {
+        return EffectOutcome::Uncertain(UncertainReason::LookupUnsupported);
+    }
+    match backend.lookup(effect.request().key()) {
+        Ok(Lookup::Applied(receipt)) => EffectOutcome::Applied(receipt),
+        Ok(Lookup::Absent) => EffectOutcome::NotApplied(NotAppliedReason::ConfirmedAbsent),
+        Ok(Lookup::Unknown) | Err(_) => {
+            EffectOutcome::Uncertain(UncertainReason::LookupInconclusive)
+        }
+    }
 }
 
 /// The result of reconciling a task's unresolved effects.
@@ -103,7 +143,6 @@ pub fn reconcile(
             .into());
         }
     }
-    let can_lookup = descriptor.capabilities.supports(Capability::EffectLookup);
     let pending: Vec<EffectRecord> = record.unresolved_effects().cloned().collect();
     let mut report = ReconcileReport::default();
     for effect in pending {
@@ -111,17 +150,7 @@ pub fn reconcile(
             report.foreign.push(effect);
             continue;
         }
-        let outcome = if can_lookup {
-            match backend.lookup(effect.request().key()) {
-                Ok(Lookup::Applied(receipt)) => EffectOutcome::Applied(receipt),
-                Ok(Lookup::Absent) => EffectOutcome::NotApplied(NotAppliedReason::ConfirmedAbsent),
-                Ok(Lookup::Unknown) | Err(_) => {
-                    EffectOutcome::Uncertain(UncertainReason::LookupInconclusive)
-                }
-            }
-        } else {
-            EffectOutcome::Uncertain(UncertainReason::LookupUnsupported)
-        };
+        let outcome = look_up(backend, &effect);
         let updated =
             store.record_effect_outcome(task, fence, effect.seq(), outcome, clock.now())?;
         if updated.state().is_resolved() {

@@ -47,15 +47,19 @@ pub enum HouseError {
     /// registry. Choosing a house with setup stores the choice.
     #[error("more than one house claims this repository ({}); choose one with house setup", list(.houses))]
     AmbiguousHouse {
-        /// Every house that claims one of the checkout's repositories.
+        /// Every house that claims the checkout's repository.
         houses: Vec<crate::HouseId>,
     },
-    /// The checkout's remotes name more than one candidate repository.
-    #[error("the checkout's remotes name more than one candidate repository ({}); select one explicitly", list(.repositories))]
-    AmbiguousRepository {
-        /// Candidate repositories, as the house allowlists name them.
-        repositories: Vec<crate::contracts::Repository>,
+    /// Another remote belongs to a house, and the remote that identifies the
+    /// checkout does not belong to that same house.
+    #[error("remotes of this checkout do not agree on one house ({}); the first names the checkout, the others belong to another house or none", list(.remotes))]
+    RemotesDisagree {
+        /// The identifying remote first, then each remote that disagrees.
+        remotes: Vec<crate::adoption::RemoteName>,
     },
+    /// The legacy binding no longer matches the previewed one.
+    #[error("the legacy binding differs from the one that was approved; preview it again")]
+    LegacyChanged,
     /// A bounded Git read failed; nothing was decided from it.
     #[error("git could not be read: {0}")]
     Git(crate::git::GitReadError),
@@ -77,8 +81,10 @@ impl HouseError {
             | Self::PinMismatch
             | Self::RepositoryUnidentified
             | Self::AmbiguousHouse { .. }
-            | Self::AmbiguousRepository { .. } => ErrorClass::Refused,
-            Self::Conflict | Self::Conflicts(_) | Self::Busy => ErrorClass::Conflict,
+            | Self::RemotesDisagree { .. } => ErrorClass::Refused,
+            Self::Conflict | Self::Conflicts(_) | Self::LegacyChanged | Self::Busy => {
+                ErrorClass::Conflict
+            }
             Self::UnverifiedSnapshot
             | Self::PartialInstallation { .. }
             | Self::Git(_)

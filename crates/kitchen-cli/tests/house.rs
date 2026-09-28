@@ -418,20 +418,63 @@ fn doctor_reports_unbound_repositories_and_legacy_files() -> TestResult {
     let before = tree_status(&consumer)?;
     let output = kitchen(&consumer, &registry, &["house", "doctor"]).output()?;
     assert!(String::from_utf8(output.stdout)?.contains("Next: kitchen house import"));
-    // Preview by default: nothing is stored.
+    // Preview by default: nothing is stored, and everything to be stored shows.
     let output = kitchen(&consumer, &registry, &["house", "import"]).output()?;
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert!(String::from_utf8(output.stdout)?.contains("Would import"));
+    let preview = String::from_utf8(output.stdout)?;
+    for shown in [
+        "Would import",
+        "crabnebula/tauri-fixture",
+        "house crabnebula",
+        "workflows: pickup",
+        "additional reviewers: none",
+        "additional checks: local-check",
+        "--yes --digest ",
+    ] {
+        assert!(preview.contains(shown), "{shown}: {preview}");
+    }
     assert!(!registry.root().join(BINDING).exists());
+    let digest = preview
+        .split("--digest ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .ok_or("no digest in the preview")?
+        .to_owned();
+    // Consent without the previewed digest, or with another one, applies nothing.
+    let output = kitchen(&consumer, &registry, &["house", "import", "--yes"]).output()?;
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
     let output = kitchen(
         &consumer,
         &registry,
-        &["house", "import", "--yes", "--json"],
+        &["house", "import", "--yes", "--digest", &"0".repeat(64)],
+    )
+    .output()?;
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(!registry.root().join(BINDING).exists());
+    // The file changes after the preview: refused, nothing stored.
+    let mut changed = legacy.clone();
+    changed["additionalChecks"] = serde_json::json!(["local-check", "extra-check"]);
+    fs::write(&path, serde_json::to_vec(&changed)?)?;
+    let output = kitchen(
+        &consumer,
+        &registry,
+        &["house", "import", "--yes", "--digest", &digest],
+    )
+    .output()?;
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(String::from_utf8(output.stderr)?.contains("preview"));
+    assert!(!registry.root().join(BINDING).exists());
+    fs::write(&path, &bytes)?;
+    let output = kitchen(
+        &consumer,
+        &registry,
+        &["house", "import", "--yes", "--digest", &digest, "--json"],
     )
     .output()?;
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(json(&output)?["status"], "created");
     assert_eq!(json(&output)?["binding"]["schema"], 2);
+    assert_eq!(json(&output)?["digest"], digest);
     let output = kitchen(&consumer, &registry, &["house", "doctor", "--json"]).output()?;
     assert_eq!(output.status.code(), Some(1));
     let report = json(&output)?;

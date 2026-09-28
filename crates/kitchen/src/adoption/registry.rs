@@ -1,7 +1,8 @@
 use super::installer::check_path;
 use super::{
-    FileMode, InstallReport, InstructionBundle, NewFile, RelativePath, ResolvedInstructions,
-    checkout_root, install_snapshot, read_bounded, remote_repositories, resolve_instructions,
+    FileMode, InstallReport, InstructionBundle, NewFile, RelativePath, RemoteName,
+    ResolvedInstructions, checkout_remotes, checkout_root, install_snapshot, read_bounded,
+    resolve_instructions,
 };
 use crate::{
     HouseId,
@@ -9,6 +10,7 @@ use crate::{
     house::{HouseConfig, HouseError, REPOSITORY_BINDING_SCHEMA, RepositoryConfig},
 };
 use serde::{Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
@@ -236,35 +238,61 @@ impl HouseRegistry {
         Ok(())
     }
     /// Everything the registry says about the checkout containing `start`:
-    /// stored bindings for its remotes and the houses whose allowlists name
-    /// them. Reads the remotes with bounded `git` calls; writes nothing.
+    /// the stored binding for its identifying remote and the houses whose
+    /// allowlists name it. Reads the remotes with bounded `git` calls; writes
+    /// nothing.
     ///
     /// # Errors
-    /// See [`remote_repositories`]; a damaged binding is refused.
+    /// See [`checkout_remotes`]; a damaged binding is refused, and
+    /// [`HouseError::RemotesDisagree`] when another remote belongs to a
+    /// different house than the identifying one.
     pub fn claims(&self, start: &Path) -> Result<RepositoryClaims, HouseError> {
-        let remotes = remote_repositories(start)?;
+        let remotes = checkout_remotes(start)?;
         let listing = self.houses()?;
-        let mut claims = RepositoryClaims {
+        let owners = |repository: &Repository| -> Result<Owners, HouseError> {
+            let binding = self.binding(repository)?;
+            let claims: Vec<(Repository, HouseId)> = listing
+                .available
+                .iter()
+                .flat_map(|house| {
+                    house
+                        .repositories
+                        .iter()
+                        .filter(|allowed| key(allowed) == key(repository))
+                        .map(|allowed| (allowed.clone(), house.house.clone()))
+                })
+                .collect();
+            Ok(Owners { binding, claims })
+        };
+        let selected = owners(&remotes.selected.repository)?;
+        let selected_houses = selected.houses();
+        let mut disagreeing: Vec<RemoteName> = Vec::new();
+        for other in &remotes.others {
+            if key(&other.repository) == key(&remotes.selected.repository) {
+                continue;
+            }
+            let houses = owners(&other.repository)?.houses();
+            if !houses.is_empty()
+                && houses != selected_houses
+                && !disagreeing.contains(&other.remote)
+            {
+                disagreeing.push(other.remote.clone());
+            }
+        }
+        if !disagreeing.is_empty() {
+            let mut named = vec![remotes.selected.remote];
+            named.extend(disagreeing);
+            return Err(HouseError::RemotesDisagree { remotes: named });
+        }
+        Ok(RepositoryClaims {
+            binding: selected.binding,
+            claims: selected.claims,
             unavailable: listing
                 .unavailable
                 .into_iter()
                 .map(|(house, _)| house)
                 .collect(),
-            ..RepositoryClaims::default()
-        };
-        for remote in &remotes {
-            if let Some(binding) = self.binding(remote)? {
-                claims.bindings.push(binding);
-            }
-        }
-        for house in &listing.available {
-            for allowed in &house.repositories {
-                if remotes.iter().any(|remote| key(remote) == key(allowed)) {
-                    claims.claims.push((allowed.clone(), house.house.clone()));
-                }
-            }
-        }
-        Ok(claims)
+        })
     }
     /// Resolve the house for the checkout containing `start`. A stored binding
     /// decides; otherwise exactly one house may claim the checkout. Every
@@ -272,57 +300,50 @@ impl HouseRegistry {
     ///
     /// # Errors
     /// [`HouseError::AmbiguousHouse`] when several houses claim it without a
-    /// stored choice, [`HouseError::AmbiguousRepository`] when several of its
-    /// repositories are bound or claimed, and [`HouseError::HouseSelection`]
-    /// when no house claims it, a bound house no longer allows it, or an
-    /// unreadable house might also claim it.
+    /// stored choice, [`HouseError::RemotesDisagree`] when another remote
+    /// belongs to a different house, and [`HouseError::HouseSelection`] when
+    /// no house claims it, a bound house no longer allows it, or an unreadable
+    /// house might also claim it.
     pub fn resolve_repository(&self, start: &Path) -> Result<RepositoryMatch, HouseError> {
         let claims = self.claims(start)?;
-        match claims.bindings.as_slice() {
-            [binding] => {
-                let house = self.load(&binding.house)?;
-                binding.validate(&house)?;
-                return Ok(RepositoryMatch::Bound(binding.clone()));
-            }
-            [] => {}
-            bindings => {
-                return Err(HouseError::AmbiguousRepository {
-                    repositories: bindings
-                        .iter()
-                        .map(|binding| binding.repository.clone())
-                        .collect(),
-                });
-            }
+        if let Some(binding) = claims.binding {
+            let house = self.load(&binding.house)?;
+            binding.validate(&house)?;
+            return Ok(RepositoryMatch::Bound(binding));
         }
         if !claims.unavailable.is_empty() {
             return Err(HouseError::HouseSelection);
         }
-        let houses: BTreeSet<&HouseId> = claims.claims.iter().map(|(_, house)| house).collect();
         match claims.claims.as_slice() {
             [] => Err(HouseError::HouseSelection),
             [(repository, house)] => Ok(RepositoryMatch::Unbound {
                 repository: repository.clone(),
                 house: house.clone(),
             }),
-            _ if houses.len() > 1 => Err(HouseError::AmbiguousHouse {
-                houses: houses.into_iter().cloned().collect(),
-            }),
-            _ => Err(HouseError::AmbiguousRepository {
-                repositories: claims.repositories(),
+            claims => Err(HouseError::AmbiguousHouse {
+                houses: claims.iter().map(|(_, house)| house.clone()).collect(),
             }),
         }
     }
     /// Copy the legacy `.kitchen.json` at the top of the checkout containing
-    /// `start` into the registry. With `apply` false this only previews. The
-    /// file must name a repository this checkout's remotes name; it is never
-    /// modified or deleted.
+    /// `start` into the registry. With `approved` `None` this only previews.
+    /// With `Some`, the binding is stored only if it still has that digest, so
+    /// exactly what the person saw is what is stored; a file edited in between
+    /// (it is repository content, so a pull request can edit it) is refused.
+    /// The file must name the repository this checkout's identifying remote
+    /// names; it is never modified or deleted.
     ///
     /// # Errors
     /// [`HouseError::Io`] with `NotFound` when there is no legacy file,
     /// [`HouseError::InvalidInput`] for a file that is not a schema 1 binding,
-    /// and [`HouseError::HouseSelection`] when its repository is not one of the
-    /// checkout's remotes or its house does not allow it.
-    pub fn import_legacy(&self, start: &Path, apply: bool) -> Result<LegacyImport, HouseError> {
+    /// [`HouseError::HouseSelection`] when its repository is not the
+    /// checkout's or its house does not allow it, and
+    /// [`HouseError::LegacyChanged`] when `approved` is not its digest.
+    pub fn import_legacy(
+        &self,
+        start: &Path,
+        approved: Option<&BindingDigest>,
+    ) -> Result<LegacyImport, HouseError> {
         let source = checkout_root(start)?.join(LEGACY_REPOSITORY_CONFIG);
         check_path(&source)?;
         let mut binding: RepositoryConfig = decode(&source)?;
@@ -330,17 +351,18 @@ impl HouseRegistry {
             return Err(HouseError::InvalidInput);
         }
         binding.schema = REPOSITORY_BINDING_SCHEMA;
-        if !remote_repositories(start)?
-            .iter()
-            .any(|remote| key(remote) == key(&binding.repository))
-        {
+        if key(&checkout_remotes(start)?.selected.repository) != key(&binding.repository) {
             return Err(HouseError::HouseSelection);
         }
         binding.validate(&self.load(&binding.house)?)?;
+        let digest = BindingDigest::of(&binding)?;
+        if approved.is_some_and(|approved| *approved != digest) {
+            return Err(HouseError::LegacyChanged);
+        }
         let status = match self.binding(&binding.repository)? {
             Some(existing) if existing == binding => LegacyImportStatus::Unchanged,
             Some(_) => LegacyImportStatus::Conflict,
-            None if apply => {
+            None if approved.is_some() => {
                 self.bind_repository(&binding)?;
                 LegacyImportStatus::Created
             }
@@ -349,6 +371,7 @@ impl HouseRegistry {
         Ok(LegacyImport {
             source,
             binding,
+            digest,
             status,
         })
     }
@@ -503,56 +526,44 @@ pub enum RepositoryMatch {
     },
 }
 
-/// What the registry holds for one checkout's remotes.
+/// What the registry holds for a checkout's identifying repository.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepositoryClaims {
-    /// Stored bindings for the checkout's repositories.
-    pub bindings: Vec<RepositoryConfig>,
-    /// Each readable house allowing one of the repositories, with the
-    /// repository as that house's allowlist names it.
+    /// The stored binding for the repository, if any.
+    pub binding: Option<RepositoryConfig>,
+    /// Each readable house allowing the repository, with the repository as
+    /// that house's allowlist names it.
     pub claims: Vec<(Repository, HouseId)>,
     /// Houses that could not be read and might also claim the checkout.
     pub unavailable: Vec<HouseId>,
 }
 impl RepositoryClaims {
-    /// Distinct claimed repositories, in allowlist spelling.
-    #[must_use]
-    pub fn repositories(&self) -> Vec<Repository> {
-        let mut repositories: Vec<Repository> = Vec::new();
-        for (repository, _) in &self.claims {
-            if !repositories
-                .iter()
-                .any(|known| key(known) == key(repository))
-            {
-                repositories.push(repository.clone());
-            }
-        }
-        repositories
-    }
-    /// The one repository setup should bind, and its stored binding if any.
+    /// The repository setup should bind, and its stored binding if any.
     ///
     /// # Errors
-    /// [`HouseError::AmbiguousRepository`] when more than one repository is
-    /// bound or claimed, and [`HouseError::HouseSelection`] when none is.
+    /// [`HouseError::HouseSelection`] when neither a binding nor a house
+    /// allowlist names the repository.
     pub fn setup_target(&self) -> Result<(Repository, Option<RepositoryConfig>), HouseError> {
-        match self.bindings.as_slice() {
-            [binding] => return Ok((binding.repository.clone(), Some(binding.clone()))),
-            [] => {}
-            bindings => {
-                return Err(HouseError::AmbiguousRepository {
-                    repositories: bindings
-                        .iter()
-                        .map(|binding| binding.repository.clone())
-                        .collect(),
-                });
-            }
+        if let Some(binding) = &self.binding {
+            return Ok((binding.repository.clone(), Some(binding.clone())));
         }
-        match self.repositories().as_slice() {
-            [] => Err(HouseError::HouseSelection),
-            [repository] => Ok((repository.clone(), None)),
-            repositories => Err(HouseError::AmbiguousRepository {
-                repositories: repositories.to_vec(),
-            }),
+        self.claims
+            .first()
+            .map(|(repository, _)| (repository.clone(), None))
+            .ok_or(HouseError::HouseSelection)
+    }
+}
+/// Who the registry says owns one repository.
+struct Owners {
+    binding: Option<RepositoryConfig>,
+    claims: Vec<(Repository, HouseId)>,
+}
+impl Owners {
+    /// The stored house, else every house allowing the repository.
+    fn houses(&self) -> BTreeSet<HouseId> {
+        match &self.binding {
+            Some(binding) => BTreeSet::from([binding.house.clone()]),
+            None => self.claims.iter().map(|(_, house)| house.clone()).collect(),
         }
     }
 }
@@ -579,8 +590,51 @@ pub struct LegacyImport {
     pub source: PathBuf,
     /// The binding in the registry schema.
     pub binding: RepositoryConfig,
+    /// Digest of `binding`; approving it stores exactly this binding.
+    pub digest: BindingDigest,
     /// What happened in the registry.
     pub status: LegacyImportStatus,
+}
+
+/// SHA-256 of a repository binding as the registry would store it. Approving a
+/// digest approves that content and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingDigest([u8; 32]);
+impl BindingDigest {
+    /// Digest the canonical encoding of `binding`.
+    fn of(binding: &RepositoryConfig) -> Result<Self, HouseError> {
+        let mut hash = Sha256::new();
+        hash.update(b"kitchen repository binding\n");
+        hash.update(encode(binding)?);
+        Ok(Self(hash.finalize().into()))
+    }
+}
+impl std::fmt::Display for BindingDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0
+            .iter()
+            .try_for_each(|byte| write!(formatter, "{byte:02x}"))
+    }
+}
+impl std::str::FromStr for BindingDigest {
+    type Err = HouseError;
+    /// Exactly 64 hexadecimal digits.
+    fn from_str(text: &str) -> Result<Self, HouseError> {
+        if text.len() != 64 || !text.is_ascii() {
+            return Err(HouseError::InvalidInput);
+        }
+        let mut bytes = [0_u8; 32];
+        for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
+            let pair = std::str::from_utf8(pair).map_err(|_| HouseError::InvalidInput)?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| HouseError::InvalidInput)?;
+        }
+        Ok(Self(bytes))
+    }
+}
+impl Serialize for BindingDigest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
 }
 
 /// Case-insensitive repository key; GitHub owner and name ignore case.

@@ -1,6 +1,6 @@
 //! House isolation, immutable pins, setup diagnoses and recovery using synthetic fixtures.
 use kitchen::{
-    adoption::{HouseRegistry, InstructionBundle, remote_repositories, resolve_instructions},
+    adoption::{HouseRegistry, InstructionBundle, checkout_remotes, resolve_instructions},
     contracts::{Capability, CapabilitySet, CommitId},
     house::{
         AccessStatus, DoctorCode, DoctorEvidence, HouseConfig, HouseError, LabelStatus,
@@ -652,7 +652,7 @@ fn role_digest_rejects_invalid_input_and_changed_manifest_role_bytes() -> TestRe
 #[test]
 fn repository_lookup_rejects_relative_input() -> TestResult {
     assert!(matches!(
-        remote_repositories(Path::new(".")),
+        checkout_remotes(Path::new(".")),
         Err(HouseError::InvalidInput)
     ));
     Ok(())

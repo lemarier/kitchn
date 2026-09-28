@@ -3,8 +3,8 @@
 use kitchen::{
     HouseId,
     adoption::{
-        HouseRegistry, LEGACY_REPOSITORY_CONFIG, LegacyImportStatus, RepositoryMatch,
-        legacy_binding,
+        BindingDigest, HouseRegistry, LEGACY_REPOSITORY_CONFIG, LegacyImportStatus, RemoteName,
+        RepositoryMatch, legacy_binding,
     },
     contracts::{CommitId, Repository},
     house::{HouseConfig, HouseError, RepositoryConfig, Workflow},
@@ -299,51 +299,211 @@ fn rewritten_and_differently_cased_remotes_match_the_allowlist() -> TestResult {
     Ok(())
 }
 
+/// Make the current branch track `remote`, without needing that remote fetched.
+fn track(path: &Path, remote: &str) -> TestResult {
+    let branch = git(path, &["symbolic-ref", "--short", "HEAD"])?;
+    let branch = branch.trim();
+    git(
+        path,
+        &["config", &format!("branch.{branch}.remote"), remote],
+    )?;
+    git(
+        path,
+        &[
+            "config",
+            &format!("branch.{branch}.merge"),
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    Ok(())
+}
+/// A house that allows only the fork repository used by the fork tests.
+fn origin89_claiming_fork() -> TestResult<HouseConfig> {
+    let mut house: HouseConfig =
+        serde_json::from_str(include_str!("fixtures/house/origin89.json"))?;
+    house.repositories.insert("someone/tauri-fixture".parse()?);
+    Ok(house)
+}
+const FORK_REMOTES: [(&str, &str); 2] = [
+    ("origin", "git@github.com:someone/tauri-fixture.git"),
+    (
+        "upstream",
+        "https://github.com/crabnebula/tauri-fixture.git",
+    ),
+];
+
 #[test]
-fn forks_resolve_the_claimed_remote_and_refuse_two_bindings() -> TestResult {
+fn a_fork_identifies_itself_by_the_remote_its_branch_tracks() -> TestResult {
     let house = crabnebula()?;
     let f = fixture(std::slice::from_ref(&house))?;
     let fork = f.root.join("fork");
-    checkout(
-        &fork,
-        &[
-            ("origin", "git@github.com:someone/tauri-fixture.git"),
-            (
-                "upstream",
-                "https://github.com/crabnebula/tauri-fixture.git",
-            ),
-        ],
-    )?;
-    let claims = f.registry.claims(&fork)?;
+    checkout(&fork, &FORK_REMOTES)?;
+    // Untracked: `origin` is the fork, which no house claims, and it does not
+    // borrow the identity of the claimed upstream remote.
+    assert!(matches!(
+        f.registry.resolve_repository(&fork),
+        Err(HouseError::RemotesDisagree { remotes })
+            if remotes.iter().map(ToString::to_string).collect::<Vec<_>>() == ["origin", "upstream"]
+    ));
+    assert!(matches!(
+        f.registry.claims(&fork),
+        Err(HouseError::RemotesDisagree { .. })
+    ));
+    track(&fork, "upstream")?;
     assert_eq!(
-        claims.setup_target()?,
+        f.registry.claims(&fork)?.setup_target()?,
         ("crabnebula/tauri-fixture".parse::<Repository>()?, None)
     );
-    let mut house = house;
-    house.repositories.insert("someone/tauri-fixture".parse()?);
-    fs::write(
-        f.registry.root().join("houses/crabnebula.json"),
-        serde_json::to_vec(&house)?,
+    assert_eq!(
+        f.registry.resolve_repository(&fork)?,
+        RepositoryMatch::Unbound {
+            repository: "crabnebula/tauri-fixture".parse()?,
+            house: house.house.clone(),
+        }
+    );
+    let config = binding(&house, "crabnebula/tauri-fixture")?;
+    f.registry.bind_repository(&config)?;
+    assert_eq!(
+        f.registry.resolve_repository(&fork)?,
+        RepositoryMatch::Bound(config)
+    );
+    // Tracking the fork instead: the bound upstream repository does not apply.
+    track(&fork, "origin")?;
+    assert!(matches!(
+        f.registry.resolve_repository(&fork),
+        Err(HouseError::RemotesDisagree { .. })
+    ));
+    // With no other remote the fork is simply unclaimed.
+    git(&fork, &["remote", "remove", "upstream"])?;
+    assert!(matches!(
+        f.registry.resolve_repository(&fork),
+        Err(HouseError::HouseSelection)
+    ));
+    Ok(())
+}
+
+#[test]
+fn remotes_of_different_houses_fail_closed_and_are_named() -> TestResult {
+    let crab = crabnebula()?;
+    let other = origin89_claiming_fork()?;
+    let f = fixture(&[crab.clone(), other.clone()])?;
+    let fork = f.root.join("fork");
+    checkout(&fork, &FORK_REMOTES)?;
+    track(&fork, "upstream")?;
+    let names = |result: Result<RepositoryMatch, HouseError>| match result {
+        Err(HouseError::RemotesDisagree { remotes }) => {
+            Ok(remotes.iter().map(ToString::to_string).collect::<Vec<_>>())
+        }
+        other => Err(format!("expected disagreeing remotes, got {other:?}")),
+    };
+    assert_eq!(
+        names(f.registry.resolve_repository(&fork))?,
+        ["upstream", "origin"]
+    );
+    assert!(matches!(
+        f.registry.claims(&fork),
+        Err(HouseError::RemotesDisagree { .. })
+    ));
+    // Not even a stored binding for the identifying remote overrides it.
+    f.registry
+        .bind_repository(&binding(&crab, "crabnebula/tauri-fixture")?)?;
+    assert_eq!(
+        names(f.registry.resolve_repository(&fork))?,
+        ["upstream", "origin"]
+    );
+    let message = HouseError::RemotesDisagree { remotes: vec![] }.to_string();
+    assert!(message.contains("do not agree"), "{message}");
+    // The same houses agree once the other remote no longer names one.
+    git(
+        &fork,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:nobody/else.git",
+        ],
     )?;
     assert!(matches!(
-        f.registry.resolve_repository(&fork),
-        Err(HouseError::AmbiguousRepository { .. })
-    ));
-    assert!(matches!(
-        f.registry.claims(&fork)?.setup_target(),
-        Err(HouseError::AmbiguousRepository { .. })
-    ));
-    f.registry
-        .bind_repository(&binding(&house, "crabnebula/tauri-fixture")?)?;
-    assert!(matches!(
         f.registry.resolve_repository(&fork)?,
-        RepositoryMatch::Bound(config) if config.repository.as_str() == "crabnebula/tauri-fixture"
+        RepositoryMatch::Bound(_)
     ));
-    f.registry
-        .bind_repository(&binding(&house, "someone/tauri-fixture")?)?;
+    Ok(())
+}
+
+#[test]
+fn the_identifying_remote_is_the_push_destination() -> TestResult {
+    let house = crabnebula()?;
+    let f = fixture(std::slice::from_ref(&house))?;
+    let consumer = f.root.join("consumer");
+    checkout(
+        &consumer,
+        &[("origin", "https://github.com/crabnebula/tauri-fixture.git")],
+    )?;
+    // A push URL elsewhere is where the branch publishes: it decides.
+    git(
+        &consumer,
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "git@github.com:someone/else.git",
+        ],
+    )?;
+    assert!(matches!(
+        f.registry.resolve_repository(&consumer),
+        Err(HouseError::HouseSelection)
+    ));
+    // Two different push destinations name no single repository.
+    git(
+        &consumer,
+        &[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "origin",
+            "git@github.com:crabnebula/tauri-fixture.git",
+        ],
+    )?;
+    assert!(matches!(
+        f.registry.resolve_repository(&consumer),
+        Err(HouseError::RepositoryUnidentified)
+    ));
+    Ok(())
+}
+
+#[test]
+fn detached_head_and_local_upstreams_fall_back_to_origin() -> TestResult {
+    let house = crabnebula()?;
+    let f = fixture(std::slice::from_ref(&house))?;
+    let fork = f.root.join("fork");
+    checkout(&fork, &FORK_REMOTES)?;
+    track(&fork, "upstream")?;
+    git(&fork, &["checkout", "--quiet", "--detach"])?;
     assert!(matches!(
         f.registry.resolve_repository(&fork),
-        Err(HouseError::AmbiguousRepository { repositories }) if repositories.len() == 2
+        Err(HouseError::RemotesDisagree { remotes }) if remotes.first().map(RemoteName::as_str) == Some("origin")
+    ));
+    // Without `origin` and without a tracked remote there is nothing to trust.
+    let named = f.root.join("named");
+    checkout(
+        &named,
+        &[("github", "https://github.com/crabnebula/tauri-fixture.git")],
+    )?;
+    assert!(matches!(
+        f.registry.resolve_repository(&named),
+        Err(HouseError::RepositoryUnidentified)
+    ));
+    track(&named, ".")?;
+    assert!(matches!(
+        f.registry.resolve_repository(&named),
+        Err(HouseError::RepositoryUnidentified)
+    ));
+    track(&named, "github")?;
+    assert!(matches!(
+        f.registry.resolve_repository(&named)?,
+        RepositoryMatch::Unbound { .. }
     ));
     Ok(())
 }
@@ -369,18 +529,28 @@ fn legacy_file_is_imported_only_explicitly_and_never_touched() -> TestResult {
         f.registry.resolve_repository(&consumer)?,
         RepositoryMatch::Unbound { .. }
     ));
-    let preview = f.registry.import_legacy(&consumer.join("src"), false)?;
+    let preview = f.registry.import_legacy(&consumer.join("src"), None)?;
     assert_eq!(preview.status, LegacyImportStatus::WouldCreate);
     assert_eq!(preview.binding.schema, 2);
     assert_eq!(f.registry.binding(&preview.binding.repository)?, None);
-    let applied = f.registry.import_legacy(&consumer, true)?;
+    // Approving a different digest applies nothing.
+    let other: BindingDigest = "0".repeat(64).parse()?;
+    assert!(matches!(
+        f.registry.import_legacy(&consumer, Some(&other)),
+        Err(HouseError::LegacyChanged)
+    ));
+    assert_eq!(f.registry.binding(&preview.binding.repository)?, None);
+    let applied = f.registry.import_legacy(&consumer, Some(&preview.digest))?;
+    assert_eq!(applied.digest, preview.digest);
     assert_eq!(applied.status, LegacyImportStatus::Created);
     assert_eq!(
         f.registry.resolve_repository(&consumer)?,
         RepositoryMatch::Bound(applied.binding.clone())
     );
     assert_eq!(
-        f.registry.import_legacy(&consumer, true)?.status,
+        f.registry
+            .import_legacy(&consumer, Some(&applied.digest))?
+            .status,
         LegacyImportStatus::Unchanged
     );
     let mut changed = applied.binding.clone();
@@ -388,11 +558,59 @@ fn legacy_file_is_imported_only_explicitly_and_never_touched() -> TestResult {
     f.registry
         .configure_repository(&applied.binding, &changed)?;
     assert_eq!(
-        f.registry.import_legacy(&consumer, true)?.status,
+        f.registry
+            .import_legacy(&consumer, Some(&applied.digest))?
+            .status,
         LegacyImportStatus::Conflict
     );
     assert_eq!(f.registry.binding(&changed.repository)?, Some(changed));
     assert_eq!(fs::read(&path)?, bytes, "the legacy file is left as it was");
+    Ok(())
+}
+
+fn any_digest() -> TestResult<BindingDigest> {
+    Ok("1".repeat(64).parse()?)
+}
+
+#[test]
+fn a_legacy_file_changed_after_the_preview_is_not_imported() -> TestResult {
+    let house = crabnebula()?;
+    let f = fixture(std::slice::from_ref(&house))?;
+    let consumer = f.root.join("consumer");
+    checkout(
+        &consumer,
+        &[("origin", "https://github.com/crabnebula/tauri-fixture.git")],
+    )?;
+    let mut legacy = serde_json::to_value(binding(&house, "crabnebula/tauri-fixture")?)?;
+    legacy["schema"] = serde_json::json!(1);
+    let path = consumer.join(LEGACY_REPOSITORY_CONFIG);
+    fs::write(&path, serde_json::to_vec(&legacy)?)?;
+    let preview = f.registry.import_legacy(&consumer, None)?;
+    // A pull request edits the file between the preview and the approval.
+    legacy["additionalChecks"] = serde_json::json!(["local-check", "extra-check"]);
+    legacy["workflows"] = serde_json::json!(["pickup", "gate"]);
+    fs::write(&path, serde_json::to_vec(&legacy)?)?;
+    assert!(matches!(
+        f.registry.import_legacy(&consumer, Some(&preview.digest)),
+        Err(HouseError::LegacyChanged)
+    ));
+    assert_eq!(f.registry.binding(&preview.binding.repository)?, None);
+    // Re-previewing shows the new content and its own digest, which applies.
+    let again = f.registry.import_legacy(&consumer, None)?;
+    assert_ne!(again.digest, preview.digest);
+    assert!(again.binding.workflows.contains(&Workflow::Gate));
+    let applied = f.registry.import_legacy(&consumer, Some(&again.digest))?;
+    assert_eq!(applied.status, LegacyImportStatus::Created);
+    assert_eq!(
+        f.registry.binding(&applied.binding.repository)?,
+        Some(again.binding)
+    );
+    // Formatting-only changes keep the digest: it covers the binding, not bytes.
+    fs::write(&path, serde_json::to_vec_pretty(&legacy)?)?;
+    assert_eq!(
+        f.registry.import_legacy(&consumer, None)?.digest,
+        again.digest
+    );
     Ok(())
 }
 
@@ -408,7 +626,7 @@ fn legacy_import_refuses_other_repositories_and_schemas() -> TestResult {
     let path = consumer.join(LEGACY_REPOSITORY_CONFIG);
     assert_eq!(legacy_binding(&consumer)?, None);
     assert!(matches!(
-        f.registry.import_legacy(&consumer, true),
+        f.registry.import_legacy(&consumer, Some(&any_digest()?)),
         Err(HouseError::Io(std::io::ErrorKind::NotFound))
     ));
     let mut legacy = serde_json::to_value(binding(&house, "crabnebula/tauri-fixture")?)?;
@@ -416,20 +634,20 @@ fn legacy_import_refuses_other_repositories_and_schemas() -> TestResult {
     // A file naming a repository the checkout's remotes do not name.
     fs::write(&path, serde_json::to_vec(&legacy)?)?;
     assert!(matches!(
-        f.registry.import_legacy(&consumer, true),
+        f.registry.import_legacy(&consumer, Some(&any_digest()?)),
         Err(HouseError::HouseSelection)
     ));
     for schema in [0, 2, 3] {
         legacy["schema"] = serde_json::json!(schema);
         fs::write(&path, serde_json::to_vec(&legacy)?)?;
         assert!(matches!(
-            f.registry.import_legacy(&consumer, true),
+            f.registry.import_legacy(&consumer, Some(&any_digest()?)),
             Err(HouseError::InvalidInput)
         ));
     }
     fs::write(&path, br#"{"schema":1,"token":"SECRET"}"#)?;
     assert!(matches!(
-        f.registry.import_legacy(&consumer, true),
+        f.registry.import_legacy(&consumer, Some(&any_digest()?)),
         Err(HouseError::InvalidInput)
     ));
     assert!(

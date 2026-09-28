@@ -2,8 +2,8 @@ use clap::{Args, Subcommand};
 use kitchen::{
     HouseId,
     adoption::{
-        HouseRegistry, InstructionBundle, LegacyImportStatus, RepositoryMatch, decode, encode,
-        legacy_binding,
+        BindingDigest, HouseRegistry, InstructionBundle, LegacyImportStatus, RepositoryMatch,
+        decode, encode, legacy_binding,
     },
     contracts::Repository,
     house::{
@@ -75,16 +75,20 @@ enum HouseCommand {
         #[arg(long)]
         bundle: PathBuf,
     },
-    /// Copy a legacy .kitchen.json binding into the registry; previews unless --yes.
-    /// The file is never modified or deleted.
+    /// Copy a legacy .kitchen.json binding into the registry. Previews by
+    /// default; --yes --digest stores the previewed binding and refuses if the
+    /// file changed since. The file is never modified or deleted.
     Import {
         #[arg(long)]
         registry: PathBuf,
         #[arg(long, default_value = ".")]
         repository_path: PathBuf,
-        /// Store the previewed binding.
-        #[arg(long)]
+        /// Store the previewed binding; requires its --digest.
+        #[arg(long, requires = "digest")]
         yes: bool,
+        /// The digest the preview printed; approves exactly that content.
+        #[arg(long, requires = "yes")]
+        digest: Option<BindingDigest>,
         #[arg(long)]
         json: bool,
     },
@@ -187,30 +191,37 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
         HouseCommand::Import {
             registry,
             repository_path,
-            yes,
+            yes: _,
+            digest,
             json,
         } => {
             let registry = HouseRegistry::new(canonical_root(registry)?)?;
             let start = canonical_root(repository_path)?;
-            let import = registry.import_legacy(&start, yes)?;
+            let import = registry.import_legacy(&start, digest.as_ref())?;
             let accepted = import.status != LegacyImportStatus::Conflict;
             if json {
                 return Ok((json_text(&import)?, accepted));
             }
             let source = import.source.display();
+            // Everything that would be stored, so approval covers all of it.
             let binding = format!(
-                "{} -> house {}",
-                import.binding.repository, import.binding.house
+                "{} -> house {}\n  workflows: {}\n  additional reviewers: {}\n  additional checks: {}",
+                import.binding.repository,
+                import.binding.house,
+                joined(&import.binding.workflows),
+                joined(&import.binding.additional_reviewers),
+                joined(&import.binding.additional_checks),
             );
             let text = match import.status {
                 LegacyImportStatus::WouldCreate => format!(
-                    "Would import {source} into the registry as {binding}.\nNext: rerun with --yes to store it."
+                    "Would import {source} into the registry as {binding}\nNext: rerun with --yes --digest {} to store exactly this binding.",
+                    import.digest
                 ),
                 LegacyImportStatus::Created => format!(
-                    "Imported {source} into the registry as {binding}.\nNext: delete {source} yourself when no older Kitchen needs it; Kitchen does not delete repository files."
+                    "Imported {source} into the registry as {binding}\nNext: delete {source} yourself when no older Kitchen needs it; Kitchen does not delete repository files."
                 ),
                 LegacyImportStatus::Unchanged => format!(
-                    "The registry already holds {binding}.\nNext: delete {source} yourself; Kitchen does not delete repository files."
+                    "The registry already holds {binding}\nNext: delete {source} yourself; Kitchen does not delete repository files."
                 ),
                 LegacyImportStatus::Conflict => format!(
                     "The registry holds a different binding for {}; nothing imported.\nNext: compare it with {source} and change the registry binding with kitchen house setup.",
@@ -363,6 +374,17 @@ fn diagnose(
         },
         report.healthy(),
     ))
+}
+/// Comma-separated values in order, or `none`.
+fn joined(values: &BTreeSet<impl std::fmt::Display>) -> String {
+    if values.is_empty() {
+        return "none".to_owned();
+    }
+    values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 fn parse_workflows(value: &str) -> Result<BTreeSet<Workflow>, HouseError> {
     if value == "none" {

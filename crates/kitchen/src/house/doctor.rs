@@ -369,18 +369,10 @@ fn diagnose_schedules(
     };
     let unenforceable = policy
         .unenforceable_token_budgets(house, evidence)
-        .map_err(|error| {
-            if matches!(error, BudgetError::HouseMismatch) {
-                HouseError::HouseSelection
-            } else if matches!(error, BudgetError::Relaxation { .. }) {
-                HouseError::PolicyRelaxation
-            } else {
-                HouseError::InvalidInput
-            }
-        })?;
+        .map_err(house_error)?;
     for schedule in policy
         .unverifiable_run_budgets(house, evidence)
-        .map_err(|_| HouseError::InvalidInput)?
+        .map_err(house_error)?
     {
         findings.push(DoctorFinding { code: DoctorCode::ScheduleBudget, message: format!("Schedule {}: its {} observed agent runs this window may not be all of them, because the run history does not reach the window's start, so its run budget cannot be verified.", schedule.consumer, schedule.usage.runs), next_step: "Use a shorter usage window or a run budget below the retained run history; activation is refused until the window is fully observed.".into() });
     }
@@ -394,6 +386,23 @@ fn diagnose_schedules(
         .collect())
 }
 
+/// How a refused schedule assessment surfaces in doctor: evidence for
+/// another house and policy relaxation keep their own refusals.
+fn house_error(error: BudgetError) -> HouseError {
+    match error {
+        BudgetError::HouseMismatch => HouseError::HouseSelection,
+        BudgetError::Relaxation { .. } => HouseError::PolicyRelaxation,
+        BudgetError::InvalidPolicy
+        | BudgetError::UnreadableRecurrence
+        | BudgetError::IntervalTooShort { .. }
+        | BudgetError::Overcommitted { .. }
+        | BudgetError::Exhausted { .. }
+        | BudgetError::IncompleteEvidence { .. }
+        | BudgetError::UnobservedSchedule { .. }
+        | BudgetError::InvalidEvidence => HouseError::InvalidInput,
+    }
+}
+
 fn describe_tokens(tokens: TokenUsage) -> String {
     match tokens {
         TokenUsage::Known { tokens } => format!("{tokens} tokens"),
@@ -404,5 +413,37 @@ fn describe_tokens(tokens: TokenUsage) -> String {
             "at least {known_tokens} tokens, with usage unknown for {unknown_runs} {}",
             if unknown_runs == 1 { "run" } else { "runs" }
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduling::ScheduleLimit;
+
+    #[test]
+    fn budget_refusals_keep_their_house_error() {
+        assert!(matches!(
+            house_error(BudgetError::HouseMismatch),
+            HouseError::HouseSelection
+        ));
+        assert!(matches!(
+            house_error(BudgetError::Relaxation {
+                limit: ScheduleLimit::HouseRuns
+            }),
+            HouseError::PolicyRelaxation
+        ));
+    }
+
+    #[test]
+    fn other_budget_refusals_are_invalid_input() {
+        assert!(matches!(
+            house_error(BudgetError::InvalidEvidence),
+            HouseError::InvalidInput
+        ));
+        assert!(matches!(
+            house_error(BudgetError::InvalidPolicy),
+            HouseError::InvalidInput
+        ));
     }
 }

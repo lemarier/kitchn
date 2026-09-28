@@ -143,6 +143,8 @@ struct WireRun {
     #[serde(default)]
     scheduled_for: Option<u64>,
     #[serde(default)]
+    created_at: Option<u64>,
+    #[serde(default)]
     precheck_result: Option<WirePrecheck>,
     #[serde(default)]
     usage: Option<WireUsage>,
@@ -563,6 +565,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .map(|run| ScheduleRun {
                 outcome: run_outcome(run),
                 scheduled_for: run.scheduled_for.map(Timestamp::from_unix_millis),
+                created_at: run.created_at.map(Timestamp::from_unix_millis),
                 usage: run_usage(run),
             })
             .collect();

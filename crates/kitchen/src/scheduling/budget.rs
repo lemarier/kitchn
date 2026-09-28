@@ -43,7 +43,7 @@ use crate::{
     contracts::{Effect, ExternalRef, ResourceRef, ScheduleEffect, Timestamp},
     scheduling::{
         InstalledSchedule, JudgedRun, MAX_SCHEDULE_RUNS, ObservedScheduleState, Recurrence,
-        RunVerdict, ScheduleObservation, ScheduleSpec, ScheduleState,
+        RunVerdict, ScheduleObservation, ScheduleRun, ScheduleSpec, ScheduleState,
     },
     state::{MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, WorkItem},
     trust::Measurement,
@@ -952,6 +952,11 @@ fn run_cost(run: &JudgedRun) -> (u64, u32) {
     }
 }
 
+/// When a run belongs to: its due time, else when the backend recorded it.
+fn placed_at(run: &ScheduleRun) -> Option<Timestamp> {
+    run.scheduled_for.or(run.created_at)
+}
+
 /// Usage in one window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -967,13 +972,15 @@ pub struct WindowUsage {
 
 impl WindowUsage {
     /// Usage in `window` among `observation`'s runs. A run with no due time,
-    /// such as a trial, counts in the window being judged.
+    /// such as a trial, is placed by when the backend recorded it. With
+    /// neither time it cannot be placed and counts in the window being
+    /// judged, so an unplaceable run never hides usage.
     #[must_use]
     pub fn of(observation: &ScheduleObservation, window: UsageWindow) -> Self {
         let in_window: Vec<&JudgedRun> = observation
             .recent_runs
             .iter()
-            .filter(|run| run.run.scheduled_for.is_none_or(|at| window.contains(at)))
+            .filter(|run| placed_at(&run.run).is_none_or(|at| window.contains(at)))
             .collect();
         let runs = u32::try_from(
             in_window
@@ -985,7 +992,7 @@ impl WindowUsage {
         let reached_start = observation
             .recent_runs
             .iter()
-            .filter_map(|run| run.run.scheduled_for)
+            .filter_map(|run| placed_at(&run.run))
             .min()
             .is_some_and(|oldest| oldest < window.start);
         Self {

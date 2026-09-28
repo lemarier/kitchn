@@ -1932,6 +1932,39 @@ fn runs_without_a_due_time_survive_the_cut_to_the_newest_runs() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn a_run_reports_when_orca_recorded_it_beside_its_due_time() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let installed = backend.install_schedule(&schedule_spec("pickup")?)?;
+    let readiness = Readiness::new(&[], at(0), Duration::from_secs(300));
+    sim.state().runs = vec![
+        json!({"status": "completed", "scheduledFor": 9_000, "createdAt": 9_500}),
+        json!({"status": "completed", "createdAt": 5_000}),
+        json!({"status": "completed"}),
+    ];
+    let mut times: Vec<_> = backend
+        .inspect_schedule(&installed, &readiness)?
+        .recent_runs
+        .iter()
+        .map(|judged| (judged.run.scheduled_for, judged.run.created_at))
+        .collect();
+    times.sort_by_key(|(due, recorded)| (due.is_some(), recorded.is_some()));
+    assert_eq!(
+        times,
+        [
+            (None, None),
+            (None, Some(Timestamp::from_unix_millis(5_000))),
+            (
+                Some(Timestamp::from_unix_millis(9_000)),
+                Some(Timestamp::from_unix_millis(9_500))
+            ),
+        ],
+        "each run keeps the times Orca reported"
+    );
+    Ok(())
+}
+
 fn branch(value: &str) -> TestResult<BranchName> {
     Ok(BranchName::new(value)?)
 }

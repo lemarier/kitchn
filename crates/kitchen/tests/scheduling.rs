@@ -256,6 +256,7 @@ fn an_agent_that_never_became_ready_is_a_launch_failure() {
     let reported = ScheduleRun {
         outcome: RunOutcome::LaunchReported,
         scheduled_for: Some(due),
+        created_at: None,
         usage: Measurement::Missing,
     };
     let within = due.saturating_add(Duration::from_secs(60));
@@ -276,6 +277,7 @@ fn an_agent_that_never_became_ready_is_a_launch_failure() {
     let undated = ScheduleRun {
         outcome: RunOutcome::LaunchReported,
         scheduled_for: None,
+        created_at: None,
         usage: Measurement::Missing,
     };
     assert_eq!(
@@ -292,6 +294,7 @@ fn an_agent_that_never_became_ready_is_a_launch_failure() {
         let run = ScheduleRun {
             outcome,
             scheduled_for: Some(due),
+            created_at: None,
             usage: Measurement::Missing,
         };
         assert_eq!(
@@ -336,6 +339,7 @@ fn run(outcome: RunOutcome, due_seconds: Option<u64>) -> ScheduleRun {
     ScheduleRun {
         outcome,
         scheduled_for: due_seconds.map(at),
+        created_at: None,
         usage: Measurement::Missing,
     }
 }

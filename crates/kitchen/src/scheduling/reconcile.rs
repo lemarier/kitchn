@@ -64,6 +64,10 @@ pub struct ScheduleRun {
     /// When it was due, when the backend reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_for: Option<Timestamp>,
+    /// When the backend recorded the run. Places a run with no due time,
+    /// such as a trial, in a usage window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<Timestamp>,
     /// Tokens the run used as the backend reports them. A backend that
     /// reports no usage leaves it missing or unavailable, never zero.
     pub usage: Measurement<u64>,

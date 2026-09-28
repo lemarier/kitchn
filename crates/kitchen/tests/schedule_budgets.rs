@@ -119,6 +119,7 @@ fn run(due_ms: u64, verdict: RunVerdict, usage: Measurement<u64>) -> JudgedRun {
         run: ScheduleRun {
             outcome,
             scheduled_for: Some(Timestamp::from_unix_millis(due_ms)),
+            created_at: None,
             usage,
         },
         verdict,
@@ -498,6 +499,68 @@ fn a_token_budget_or_the_house_budget_can_exhaust_first() -> TestResult {
             ("triage".to_owned(), ScheduleLimit::HouseRuns, false),
         ]
     );
+    Ok(())
+}
+
+/// A started trial: no due time, recorded at `created_ms` when known.
+fn trial(created_ms: Option<u64>) -> TestResult<JudgedRun> {
+    let mut judged = run(0, RunVerdict::Started, tokens(10)?);
+    judged.run.scheduled_for = None;
+    judged.run.created_at = created_ms.map(Timestamp::from_unix_millis);
+    Ok(judged)
+}
+
+#[test]
+fn a_run_with_no_due_time_counts_in_the_window_it_was_recorded_in() -> TestResult {
+    let policy = policy()?;
+    let house = house()?;
+    let day = 100 * DAY_MS;
+    let today_runs = |trials: Vec<JudgedRun>| -> TestResult<u32> {
+        let today = evidence(
+            house.clone(),
+            day + HOUR_MS,
+            vec![usage("pickup", ObservedScheduleState::Paused, trials)?],
+        );
+        let assessment = policy.assess(&house, &today)?;
+        let [pickup] = assessment.schedules.as_slice() else {
+            return Err("one schedule".into());
+        };
+        Ok(pickup.usage.runs)
+    };
+    // Four trials recorded yesterday belong to yesterday's window.
+    let yesterday: Vec<JudgedRun> = (0..4)
+        .map(|index| trial(Some(day - (index + 1) * HOUR_MS)))
+        .collect::<TestResult<_>>()?;
+    assert_eq!(today_runs(yesterday.clone())?, 0);
+    // A trial recorded today counts, alongside yesterday's ignored ones.
+    let mut mixed = yesterday;
+    mixed.push(trial(Some(day + 30 * 60 * 1000))?);
+    assert_eq!(today_runs(mixed)?, 1);
+    // With no timestamp at all the run cannot be placed, so it counts.
+    assert_eq!(today_runs(vec![trial(None)?])?, 1);
+    Ok(())
+}
+
+#[test]
+fn a_trial_recorded_before_the_window_shows_the_observation_reached_back() -> TestResult {
+    let policy = policy()?;
+    let house = house()?;
+    let day = 100 * DAY_MS;
+    // The cap of retained runs, all trials, the oldest recorded yesterday.
+    let cap = u64::try_from(kitchen::scheduling::MAX_SCHEDULE_RUNS)?;
+    let trials: Vec<JudgedRun> = (0..cap)
+        .map(|index| trial(Some(day + HOUR_MS - index * 2 * HOUR_MS / cap)))
+        .collect::<TestResult<_>>()?;
+    let today = evidence(
+        house.clone(),
+        day + 2 * HOUR_MS,
+        vec![usage("pickup", ObservedScheduleState::Paused, trials)?],
+    );
+    let assessment = policy.assess(&house, &today)?;
+    let [pickup] = assessment.schedules.as_slice() else {
+        return Err("one schedule".into());
+    };
+    assert!(pickup.usage.complete);
     Ok(())
 }
 

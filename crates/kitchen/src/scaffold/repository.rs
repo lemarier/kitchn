@@ -110,7 +110,9 @@ impl RepositoryPlan {
 
     /// Recheck the registry binding, create the planned file additions, then
     /// store a new binding. A binding that changed since planning refuses the
-    /// apply before any file is written; a rerun of the same plan is safe.
+    /// apply before any file is written. If storing the binding fails after
+    /// the files were added, the files stay; rerunning the same preview finds
+    /// them unchanged and stores the binding.
     ///
     /// # Errors
     /// [`HouseError::Conflict`] for a changed binding, and the errors of

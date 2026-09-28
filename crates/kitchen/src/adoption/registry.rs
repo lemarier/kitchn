@@ -390,7 +390,8 @@ impl HouseRegistry {
                         .saturating_mul(2)
                         .min(std::time::Duration::from_millis(20));
                 }
-                Err(_) => return Err(HouseError::Busy),
+                Err(fs::TryLockError::WouldBlock) => return Err(HouseError::Busy),
+                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
             }
         }
     }

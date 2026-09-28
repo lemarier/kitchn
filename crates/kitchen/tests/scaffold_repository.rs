@@ -445,3 +445,17 @@ fn without_a_repository_the_target_checkout_remotes_decide() -> TestResult {
     ));
     Ok(())
 }
+
+#[test]
+fn files_added_without_their_binding_are_completed_by_a_rerun() -> TestResult {
+    let f = Fixture::with(template_assets("app", "pinned")?)?;
+    // As if storing the binding failed after the files were added.
+    f.plan("app")?.files().apply()?;
+    assert_eq!(stored(&f)?, None);
+    let rerun = f.plan("app")?;
+    assert_eq!(rerun.files().additions().count(), 0);
+    assert!(rerun.adds_binding());
+    rerun.apply()?;
+    assert_eq!(stored(&f)?.as_ref(), Some(rerun.binding()));
+    Ok(())
+}

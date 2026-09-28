@@ -152,13 +152,24 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
                 Ok(RepositoryMatch::Bound(config)) => {
                     diagnose(&registry, &config, legacy.as_deref(), evidence, json)
                 }
-                Ok(RepositoryMatch::Unbound { repository, house }) => Ok((
-                    format!(
-                        "Repository {repository} is claimed by house {house} but not set up.\nNext: kitchen house setup --registry '{}' --repository {repository} --house {house}",
-                        registry.root().display()
-                    ),
-                    false,
-                )),
+                Ok(RepositoryMatch::Unbound { repository, house }) => {
+                    let root = registry.root().display();
+                    let next = match &legacy {
+                        Some(legacy) => format!(
+                            "kitchen house import --registry '{root}' to keep the settings in {}",
+                            legacy.display()
+                        ),
+                        None => format!(
+                            "kitchen house setup --registry '{root}' --repository {repository} --house {house}"
+                        ),
+                    };
+                    Ok((
+                        format!(
+                            "Repository {repository} is claimed by house {house} but not set up.\nNext: {next}"
+                        ),
+                        false,
+                    ))
+                }
                 Err(error) => {
                     if let Some(legacy) = legacy {
                         writeln!(

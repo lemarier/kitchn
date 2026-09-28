@@ -416,6 +416,8 @@ fn doctor_reports_unbound_repositories_and_legacy_files() -> TestResult {
     let bytes = serde_json::to_vec(&legacy)?;
     fs::write(&path, &bytes)?;
     let before = tree_status(&consumer)?;
+    let output = kitchen(&consumer, &registry, &["house", "doctor"]).output()?;
+    assert!(String::from_utf8(output.stdout)?.contains("Next: kitchen house import"));
     // Preview by default: nothing is stored.
     let output = kitchen(&consumer, &registry, &["house", "import"]).output()?;
     assert_eq!(output.status.code(), Some(0), "{output:?}");

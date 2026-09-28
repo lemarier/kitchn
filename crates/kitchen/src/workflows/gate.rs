@@ -6,8 +6,8 @@ use crate::{
     BackendId, CredentialId, HouseId,
     contracts::{
         BackendDescriptor, BranchName, Capability, CommitId, ExternalRef, Grant, GrantScope,
-        HouseGrants, IdempotencyKey, IssueNumber, Permission, Repository, Retarget, Text,
-        Timestamp,
+        HouseGrants, IdempotencyKey, IssueNumber, Permission, Repository, Retarget, TaskAuthority,
+        Text, Timestamp,
     },
     house::{HouseError, IssuedAuthority, MergeSubject},
     integrations::github::MergeStatusValue,
@@ -241,10 +241,10 @@ pub struct GateGrants {
 /// Authority to send one bounded fix request for a repository: the house's
 /// standing [`Permission::PushBranch`] for the repository on the forge, and
 /// standing worker launch and messaging on a worker backend that supports
-/// isolated launch and messaging. Only [`FixGrant::resolve`] produces a
-/// grant, so a caller cannot authorize a fix by setting a flag. The durable
-/// store checks the owning task's push authority again before it persists
-/// the delivery.
+/// isolated launch and messaging, each also delegated to the gate task.
+/// Only [`FixGrant::resolve`] produces a grant, so a caller cannot authorize
+/// a fix by setting a flag. The durable store checks the owning task's push
+/// authority again before it persists the delivery.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FixGrant(Option<(HouseId, Repository)>);
 impl FixGrant {
@@ -254,11 +254,15 @@ impl FixGrant {
         Self(None)
     }
     /// Resolve the fix grant for `repository` from the house's standing
-    /// grants. `forge` is the backend the worker pushes to; `workers` is the
-    /// backend that delivers the request. Anything missing yields no grant.
+    /// grants and the gate task's own `task` authority. `forge` is the
+    /// backend the worker pushes to; `workers` is the backend that delivers
+    /// the request. Anything missing from either yields no grant, so a task
+    /// that the house allows to push but that was not delegated push hands
+    /// the PR over instead of deciding a fix the store would refuse.
     #[must_use]
     pub fn resolve(
         grants: &HouseGrants,
+        task: &TaskAuthority,
         repository: &Repository,
         forge: &BackendId,
         workers: &BackendDescriptor,
@@ -275,6 +279,9 @@ impl FixGrant {
                         credential,
                     ))
                 })
+                && task
+                    .authorize(grants, permission, &scope, destination)
+                    .is_ok()
         };
         if &workers.house == grants.house()
             && workers

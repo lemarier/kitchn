@@ -73,22 +73,30 @@ fn ready() -> TestResult<GateEvidence> {
         reopen_event: None,
     })
 }
-/// The standing grants a fix request needs in `house`: push on the forge and
-/// worker launch and messaging on the fake worker backend.
-fn fix_grants(house: &HouseId) -> TestResult<HouseGrants> {
+/// The grants a fix request needs: push on the forge and worker launch and
+/// messaging on the fake worker backend.
+fn fix_grant_list() -> TestResult<Vec<Grant>> {
     let repository = Repository::new("lemarier/kitchen")?;
     let credential = CredentialId::new("gate-credential")?;
     let grant = |permission, backend: BackendId| {
         Grant::repository(permission, repository.clone(), backend, credential.clone())
     };
-    Ok(HouseGrants::new(
-        house.clone(),
-        [
-            grant(Permission::PushBranch, BackendId::new("github")?),
-            grant(Permission::LaunchWorker, common::backend_id()?),
-            grant(Permission::MessageWorker, common::backend_id()?),
-        ],
-    ))
+    Ok(vec![
+        grant(Permission::PushBranch, BackendId::new("github")?),
+        grant(Permission::LaunchWorker, common::backend_id()?),
+        grant(Permission::MessageWorker, common::backend_id()?),
+    ])
+}
+/// [`fix_grant_list`] as standing grants in `house`.
+fn fix_grants(house: &HouseId) -> TestResult<HouseGrants> {
+    Ok(HouseGrants::new(house.clone(), fix_grant_list()?))
+}
+/// A gate task in `house` delegated every grant of [`fix_grant_list`].
+fn delegated_all(house: &HouseId) -> TestResult<TaskAuthority> {
+    Ok(TaskAuthority::delegate(
+        &fix_grants(house)?,
+        fix_grant_list()?,
+    )?)
 }
 /// A house that serves `lemarier/kitchen` with a standing merge grant on
 /// the forge and the given readiness policy.
@@ -143,6 +151,7 @@ fn grants_in(house: &HouseId) -> TestResult<GateGrants> {
         merge: merge_grant(house, &ready_subject()?)?,
         fix_request: FixGrant::resolve(
             &fix_grants(house)?,
+            &delegated_all(house)?,
             &Repository::new("lemarier/kitchen")?,
             &BackendId::new("github")?,
             workers.descriptor(),
@@ -1340,6 +1349,7 @@ fn fix_grant_without_backend_capability_hands_over() -> TestResult {
     let grants = GateGrants {
         fix_request: FixGrant::resolve(
             &fix_grants(&e.house)?,
+            &delegated_all(&e.house)?,
             &e.repository,
             &BackendId::new("github")?,
             &workers,
@@ -2932,8 +2942,10 @@ fn fix_grant_resolves_only_from_standing_push_and_worker_grants() -> TestResult 
     let repository = Repository::new("lemarier/kitchen")?;
     let github = BackendId::new("github")?;
     let workers = FakeBackend::fully_capable(common::backend_id()?, house.clone());
+    let task = delegated_all(&house)?;
     let granted = FixGrant::resolve(
         &fix_grants(&house)?,
+        &task,
         &repository,
         &github,
         workers.descriptor(),
@@ -2950,13 +2962,20 @@ fn fix_grant_resolves_only_from_standing_push_and_worker_grants() -> TestResult 
             .collect::<Result<Vec<_>, _>>()?,
     );
     assert_eq!(
-        FixGrant::resolve(&worker_only, &repository, &github, workers.descriptor()),
+        FixGrant::resolve(
+            &worker_only,
+            &task,
+            &repository,
+            &github,
+            workers.descriptor()
+        ),
         FixGrant::none()
     );
     // Push granted on another forge or for another repository is not enough.
     assert_eq!(
         FixGrant::resolve(
             &fix_grants(&house)?,
+            &task,
             &repository,
             &BackendId::new("gitlab")?,
             workers.descriptor(),
@@ -2966,6 +2985,7 @@ fn fix_grant_resolves_only_from_standing_push_and_worker_grants() -> TestResult 
     assert_eq!(
         FixGrant::resolve(
             &fix_grants(&house)?,
+            &task,
             &Repository::new("lemarier/other")?,
             &github,
             workers.descriptor(),
@@ -2977,9 +2997,38 @@ fn fix_grant_resolves_only_from_standing_push_and_worker_grants() -> TestResult 
     assert_eq!(
         FixGrant::resolve(
             &fix_grants(&house)?,
+            &task,
             &repository,
             &github,
             foreign.descriptor()
+        ),
+        FixGrant::none()
+    );
+    // The house allows push, but a task delegated only the worker grants
+    // cannot send a fix, nor can a task of another house.
+    let without_push = TaskAuthority::delegate(
+        &fix_grants(&house)?,
+        fix_grant_list()?
+            .into_iter()
+            .filter(|grant| grant.permission != Permission::PushBranch),
+    )?;
+    assert_eq!(
+        FixGrant::resolve(
+            &fix_grants(&house)?,
+            &without_push,
+            &repository,
+            &github,
+            workers.descriptor()
+        ),
+        FixGrant::none()
+    );
+    assert_eq!(
+        FixGrant::resolve(
+            &fix_grants(&house)?,
+            &delegated_all(&HouseId::new("other-house")?)?,
+            &repository,
+            &github,
+            workers.descriptor()
         ),
         FixGrant::none()
     );
@@ -3009,14 +3058,73 @@ fn fix_grant_resolves_only_from_standing_push_and_worker_grants() -> TestResult 
     Ok(())
 }
 #[test]
-fn durable_fix_needs_the_tasks_push_grant_before_writing() -> TestResult {
-    // The house grants push, so the fix grant resolves, but the gate task
-    // was not delegated it: core authority refuses before anything is written.
+fn gate_task_without_push_hands_over_instead_of_requesting_a_fix() -> TestResult {
+    // The house grants push, but the gate task was not delegated it: the fix
+    // grant does not resolve, so the gate hands the PR over with its reason
+    // instead of deciding a fix the store would refuse on every pass.
     let d = durable_with(false)?;
     let e = behind_at('a')?;
+    let task = TaskAuthority::delegate(&d.grants, d.delegated.clone())?;
     let granted = GateGrants {
         fix_request: FixGrant::resolve(
             &d.grants,
+            &task,
+            &e.repository,
+            &d.backend.descriptor().backend,
+            d.workers.descriptor(),
+        ),
+        ..dgrants()?
+    };
+    assert_eq!(granted.fix_request, FixGrant::none());
+    let recorded = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &e,
+        granted.clone(),
+        GateMode::Active,
+        secs(100),
+    )?;
+    assert_eq!(
+        recorded.decision.verdict,
+        Verdict::HandOver {
+            gaps: vec![Gap::BaseBehind]
+        }
+    );
+    assert!(matches!(recorded.admission, Admission::Submit(_)));
+    assert!(d.marker('a')?.is_some());
+    // The next pass finds the recorded handover instead of retrying.
+    let again = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &e,
+        granted.clone(),
+        GateMode::Active,
+        secs(160),
+    )?;
+    assert!(
+        !matches!(again.admission, Admission::Submit(_)),
+        "{:?}",
+        again.admission
+    );
+    // Other verdicts need no push authority: a merge still proceeds.
+    let fresh = durable_with(false)?;
+    let merge = gate::evaluate_and_record(
+        &mut fresh.gate(&fresh.fixture.store)?,
+        &durable_evidence()?,
+        granted,
+        GateMode::Active,
+        secs(100),
+    )?;
+    assert!(matches!(merge.admission, Admission::Submit(_)));
+    Ok(())
+}
+#[test]
+fn durable_fix_resolves_from_the_gate_tasks_push_grant() -> TestResult {
+    let d = durable_with(true)?;
+    let e = behind_at('a')?;
+    let task = TaskAuthority::delegate(&d.grants, d.delegated.clone())?;
+    let granted = GateGrants {
+        fix_request: FixGrant::resolve(
+            &d.grants,
+            &task,
             &e.repository,
             &d.backend.descriptor().backend,
             d.workers.descriptor(),
@@ -3024,31 +3132,18 @@ fn durable_fix_needs_the_tasks_push_grant_before_writing() -> TestResult {
         ..dgrants()?
     };
     assert!(granted.fix_request.covers(&e.house, &e.repository));
-    assert!(matches!(
-        gate::evaluate_and_record(
-            &mut d.gate(&d.fixture.store)?,
-            &e,
-            granted.clone(),
-            GateMode::Active,
-            secs(100),
-        ),
-        Err(GateStoreError::Kitchen(kitchen::Error::Contract(
-            kitchen::contracts::ContractError::PermissionDenied {
-                permission: Permission::PushBranch
-            }
-        )))
-    ));
-    assert!(d.effects()?.is_empty());
-    assert!(d.marker('a')?.is_none());
-    // Other verdicts need no push authority: a merge still proceeds.
-    let merge = gate::evaluate_and_record(
+    let recorded = gate::evaluate_and_record(
         &mut d.gate(&d.fixture.store)?,
-        &durable_evidence()?,
+        &e,
         granted,
         GateMode::Active,
         secs(100),
     )?;
-    assert!(matches!(merge.admission, Admission::Submit(_)));
+    assert!(matches!(
+        recorded.decision.verdict,
+        Verdict::FixRequest { .. }
+    ));
+    assert!(matches!(recorded.admission, Admission::Submit(_)));
     Ok(())
 }
 #[test]

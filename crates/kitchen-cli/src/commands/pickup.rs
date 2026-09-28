@@ -6,7 +6,7 @@ use kitchen::{
     workflows::pickup::{BranchName, IssueRef, issue_task_id},
 };
 
-/// Pickup, coordination, and repair diagnostics.
+/// Offline pickup diagnostics.
 #[derive(Args)]
 pub struct PickupArgs {
     #[command(subcommand)]

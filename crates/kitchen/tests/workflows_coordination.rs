@@ -13,7 +13,7 @@ use kitchen::{
         AskKind, AskRisk, Authorization, Capability, CapabilitySet, ContractError, Disposition,
         Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, Permission,
         PostingBudget, ResourceRef, Settlement, Text, WorkerOutcome, WorkerState, Workspace,
-        fake::ExecuteFault,
+        fake::{ExecuteFault, FakeBackend},
     },
     state::{ConsumerEvent, OwnershipEvent, RecoveryItem, TaskState},
     workflows::{
@@ -718,5 +718,43 @@ fn a_coordinator_does_not_start_on_a_backend_missing_required_capabilities() -> 
     ));
     assert_eq!(error.class(), ErrorClass::Refused);
     assert!(world.fixture.store.consumer(&consumer()?)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn a_refused_human_ask_stays_escalated_and_is_not_retried_silently() -> TestResult {
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    launched(&world, &task, fence, 1)?;
+    let roger = FakeBackend::new(
+        workflows_support::roger_backend_id()?,
+        common::house()?,
+        CapabilitySet::supporting([Capability::AskHuman]),
+    );
+    roger.inject(ExecuteFault::Reject);
+    let requester = ExternalRef::new("kitchen-origin89-pickup")?;
+    let channel = RogerChannel {
+        executor: &roger,
+        requester: &requester,
+        budget: PostingBudget::new(3)?,
+    };
+    let asked = question("msg-5", 1_000)?;
+    let human = Response::Human(decision(&task)?);
+    for _ in 0..2 {
+        assert_eq!(
+            handle_question(
+                &world.ctx(),
+                &task,
+                fence,
+                &supervision()?,
+                &asked,
+                &human,
+                Some(&channel)
+            )?,
+            QuestionRoute::Escalate(QuestionEscalation::NotApplied)
+        );
+    }
+    assert_eq!(roger.execute_calls(), 1);
+    assert_eq!(roger.effects_performed(), 0);
     Ok(())
 }

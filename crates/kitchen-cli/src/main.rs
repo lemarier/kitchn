@@ -38,7 +38,7 @@ enum Command {
     Cleanup(commands::cleanup::CleanupArgs),
     /// Daily issue hygiene: the scheduled precheck. Reads only.
     Gardener(commands::gardener::GardenerArgs),
-    /// Issue pickup, coordination, and repair diagnostics.
+    /// Offline issue pickup diagnostics.
     Pickup(commands::pickup::PickupArgs),
 }
 

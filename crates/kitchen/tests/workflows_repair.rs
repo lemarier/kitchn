@@ -419,6 +419,14 @@ fn every_push_is_checked_against_fresh_pr_and_branch_state() -> TestResult {
         check_push(&intent, &missing),
         Err(PushRefusal::PullRequestMissing)
     );
+    let other = PushObservation {
+        pull_request: open_pr(6, pushed.clone())?,
+        ..open.clone()
+    };
+    assert_eq!(
+        check_push(&intent, &other),
+        Err(PushRefusal::WrongPullRequest)
+    );
     let renamed = PushObservation {
         pull_request: Observed::Known(Some(PullRequestView {
             head_branch: "orca/lemarier/issue-5".to_owned(),

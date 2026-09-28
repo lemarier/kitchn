@@ -436,6 +436,8 @@ pub enum PushRefusal {
     WrongBranch,
     /// The named pull request does not exist.
     PullRequestMissing,
+    /// The observation is about another pull request.
+    WrongPullRequest,
     /// State could not be read.
     Unknown,
 }
@@ -465,7 +467,7 @@ pub fn check_push(
             return Err(PushRefusal::PullRequestMissing);
         };
         if pull_request.number != number {
-            return Err(PushRefusal::Unknown);
+            return Err(PushRefusal::WrongPullRequest);
         }
         match pull_request.state {
             PullRequestState::Open => {}

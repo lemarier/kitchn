@@ -127,8 +127,8 @@ impl Context<'_> {
         fence: Fence,
         name: &str,
         effect: Effect,
+        revision: EvidenceRevision,
     ) -> Result<EffectRecord> {
-        let revision = self.store.task(task)?.evidence().revision();
         let consent = self.consent.consent(task, &effect, revision);
         let plan = EffectPlan {
             task: task.clone(),
@@ -198,7 +198,9 @@ pub fn launch_worker(
         }
         Err(error) => return Err(error),
     };
-    let role = ctx.store.task(task)?.spec().role;
+    let record = ctx.store.task(task)?;
+    let role = record.spec().role;
+    let revision = record.evidence().revision();
     let effect = Effect::Worker(Operation::LaunchWorker {
         role,
         workspace,
@@ -211,6 +213,7 @@ pub fn launch_worker(
         fence,
         &format!("launch-{}", attempt.get()),
         effect,
+        revision,
     ) {
         Ok(record) => record,
         // An earlier submission's outcome is unknown and the backend cannot
@@ -493,6 +496,7 @@ fn stop_stalled(
     let Some(attempt) = running_attempt(ctx, task, fence)? else {
         return Ok(Supervision::Settled(Settlement::Exhausted));
     };
+    let revision = ctx.store.task(task)?.evidence().revision();
     let record = ctx.run(
         ctx.backend,
         task,
@@ -501,6 +505,7 @@ fn stop_stalled(
         Effect::Worker(Operation::CancelWorker {
             worker: worker.clone(),
         }),
+        revision,
     )?;
     if !record.state().is_resolved() {
         return Ok(Supervision::Reconciling { unresolved: 1 });
@@ -643,7 +648,8 @@ pub fn handle_question(
     let Some(view) = current_worker(&record) else {
         return Ok(QuestionRoute::Escalate(QuestionEscalation::NoWorker));
     };
-    let asked = named_effect(&record, &ask_name).is_some();
+    let revision = record.evidence().revision();
+    let asked = named_effect(&record, &ask_name).map(EffectRecord::state);
     let overdue = now.saturating_since(question.asked_at) > policy.question_deadline;
     match response {
         Response::Answer(body) => {
@@ -652,7 +658,7 @@ pub fn handle_question(
                 question: question.id.clone(),
                 body: body.clone(),
             });
-            let reply = ctx.run(ctx.backend, task, fence, &reply_name, effect)?;
+            let reply = ctx.run(ctx.backend, task, fence, &reply_name, effect, revision)?;
             Ok(match reply.state() {
                 EffectState::Applied { .. } => {
                     ctx.store.consume_message(task, fence, &question.id, now)?;
@@ -671,7 +677,18 @@ pub fn handle_question(
             Ok(QuestionRoute::Escalate(QuestionEscalation::Unanswered))
         }
         Response::Pending => Ok(QuestionRoute::Waiting),
-        Response::Human(_) if asked => Ok(QuestionRoute::Waiting),
+        Response::Human(_) if asked.is_some() => Ok(match asked {
+            Some(EffectState::NotApplied { .. }) => {
+                QuestionRoute::Escalate(QuestionEscalation::NotApplied)
+            }
+            Some(EffectState::Applied { .. }) | None => QuestionRoute::Waiting,
+            Some(
+                EffectState::Intended
+                | EffectState::Uncertain { .. }
+                | EffectState::Unresolvable { .. }
+                | EffectState::Waived { .. },
+            ) => QuestionRoute::Uncertain,
+        }),
         Response::Human(decision) => {
             let Some(roger) = roger else {
                 return Ok(QuestionRoute::Escalate(QuestionEscalation::NoHumanChannel));
@@ -691,7 +708,7 @@ pub fn handle_question(
                         repository,
                         action: decision.action,
                         target: decision.target.clone(),
-                        revision: record.evidence().revision(),
+                        revision,
                         subject: Some(crate::contracts::EvidenceSubject {
                             head: decision.subject.clone(),
                             base: None,
@@ -706,7 +723,7 @@ pub fn handle_question(
                 },
                 posting_budget: roger.budget,
             });
-            let ask = ctx.run(roger.executor, task, fence, &ask_name, effect)?;
+            let ask = ctx.run(roger.executor, task, fence, &ask_name, effect, revision)?;
             Ok(match ask.state() {
                 EffectState::Applied { .. } => QuestionRoute::AskedHuman,
                 EffectState::NotApplied { .. } => {

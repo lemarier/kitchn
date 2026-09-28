@@ -53,10 +53,10 @@ dependency coordinates the root manifest and lockfile with the other active owne
 
 | Owner | Library paths under `crates/kitchen/src/` | Other boundaries |
 | --- | --- | --- |
-| #4 core contracts and durable ownership | `id.rs`, `error.rs`, `contracts/`, `state/` | Shared exports; state-store integration tests |
+| #4 core contracts and durable ownership | `id.rs`, `error.rs`, `contracts/` (except payload files owned by #6 and #7), `state/` | Shared exports; state-store integration tests |
 | #5 house configuration and adoption | `house/`, `adoption/` | House/repository config adoption and safe-write installer; role cards and instruction assets in root `roles/` |
-| #6 Orca adapter and scheduling | `adapters/orca/`, `scheduling/` | Backend execution only; generic capability contracts belong to #4 |
-| #7 GitHub and Roger | `integrations/github/`, `integrations/roger/` | House-scoped external access |
+| #6 Orca adapter and scheduling | `adapters/orca/`, `scheduling/`, `contracts/effects/schedule.rs` | Backend execution only; generic capability contracts belong to #4 |
+| #7 GitHub and Roger | `integrations/github/`, `integrations/roger/`, `contracts/effects/github.rs`, `contracts/effects/roger.rs` | House-scoped external access |
 | #8 pickup, coordination and repair | `workflows/pickup.rs`, `workflows/coordination.rs`, `workflows/repair.rs` | Workflow integration tests |
 | #9 exact-head gate | `workflows/gate.rs` | Gate evidence and approval tests |
 | #10 triage and gardener | `workflows/triage.rs`, `workflows/gardener.rs` | Hygiene tests |
@@ -67,8 +67,6 @@ dependency coordinates the root manifest and lockfile with the other active owne
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.
-For shared parents (`workflows/mod.rs` and CLI command registration):
-#4 defines the pattern; until it lands, the first PR that needs a shared parent creates it and later PRs add one line.
 
 Each owner keeps its integration tests in `crates/kitchen/tests/` with a matching
 area name. Coordinate shared `mod.rs`, exports, CLI command registration, and
@@ -77,6 +75,23 @@ to those files. Keep domain decisions in the library. The CLI owns argument
 parsing, presentation, and exit codes: 0 for success, 2 for invalid input, and 1
 for execution or output failures. Library errors must remain structured and must
 not echo credentials or raw private input.
+
+Shared parents follow these rules:
+
+- Errors: each area owns its error type in its own module and adds one
+  `#[from]` variant to `kitchen::Error` in `error.rs`, with its `class()` mapped
+  to an `ErrorClass`. Callers such as the CLI branch on `Error::class()`, never on
+  individual variants, so a new area never edits unrelated callers.
+- Public paths: `lib.rs` declares each top-level module once. An area module is
+  either public (`kitchen::contracts::…`) or private with root re-exports, never
+  both. Submodules stay private and re-export through their parent `mod.rs`.
+- `workflows/`: the first workflow PR to land creates `workflows/mod.rs` and its
+  `pub mod workflows;` line in `lib.rs`. Later PRs rebase and add one line each.
+  The same rule applies to `integrations/` and `adapters/`.
+- CLI commands: each area adds `crates/kitchen-cli/src/commands/<area>.rs` with
+  its subcommand enum and handler. The shared `Command` enum and dispatch
+  gain one line per area; the first area to add a command creates
+  `commands/mod.rs`.
 
 ## Bounded execution conventions
 

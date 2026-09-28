@@ -6,7 +6,7 @@ use std::{
 };
 
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
-use kitchen::{HouseId, TaskId};
+use kitchen::{ErrorClass, HouseId, TaskId};
 
 #[derive(Parser)]
 #[command(
@@ -45,15 +45,20 @@ fn main() -> ExitCode {
         }
     };
     let result = match cli.command {
-        Some(Command::ValidateHouse { id }) => HouseId::new(&id).map(|id| id.to_string()),
-        Some(Command::ValidateTask { id }) => TaskId::new(&id).map(|id| id.to_string()),
+        Some(Command::ValidateHouse { id }) => HouseId::new(&id)
+            .map(|id| id.to_string())
+            .map_err(kitchen::Error::from),
+        Some(Command::ValidateTask { id }) => TaskId::new(&id)
+            .map(|id| id.to_string())
+            .map_err(kitchen::Error::from),
         None => return output_status(Cli::command().print_help()),
     };
     match result {
         Ok(id) => output_status(writeln!(io::stdout().lock(), "{id}")),
         Err(error) => {
-            let code = match error {
-                kitchen::Error::IdentifierLength { .. } | kitchen::Error::IdentifierCharacters => 2,
+            let code = match error.class() {
+                ErrorClass::InvalidInput => 2,
+                ErrorClass::Refused | ErrorClass::Conflict | ErrorClass::Execution => 1,
             };
             if writeln!(io::stderr().lock(), "error: {error}").is_err() {
                 return ExitCode::FAILURE;

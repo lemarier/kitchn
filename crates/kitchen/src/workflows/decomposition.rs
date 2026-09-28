@@ -754,6 +754,8 @@ fn find_cycle(proposal: &Proposal, blockers: &[Vec<usize>], placed: &[bool]) -> 
             .and_then(|before| before.iter().copied().find(|&blocker| unplaced(blocker)));
         match next {
             Some(next) => current = next,
+            // Unreachable while every unplaced issue has an unplaced blocker;
+            // return the walk rather than panic if that ever changes.
             None => return path.iter().filter_map(|&position| key(position)).collect(),
         }
     }
@@ -1052,7 +1054,9 @@ pub fn apply<T: GitHubMutationTransport>(
         return Ok(report(preview, None, ApplyOutcome::NotReady));
     }
     let steps = steps(&preview)?;
-    // Any write shows the house's per-task posting limit.
+    // Building an effect only validates it: this checks the house permits
+    // issue creation here and reads its per-task posting limit, before any
+    // task exists.
     let probe = writer.executor.effect(GitHubMutation {
         repository: preview.repository.clone(),
         action: create_action(&preview, 0)?,

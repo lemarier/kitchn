@@ -323,3 +323,51 @@ fn uncertain_marker_write_stops_decision() -> TestResult {
     assert!(store.records.is_empty());
     Ok(())
 }
+#[test]
+fn moving_and_conflicting_heads_skip_until_stalled() -> TestResult {
+    let mut e = ready()?;
+    e.head_age_secs = 1799;
+    assert_eq!(
+        gate::evaluate(&e, grants(), GateHistory::default()).verdict,
+        Verdict::Skip
+    );
+    e.head_age_secs = 3600;
+    e.merge_clean = Some(false);
+    assert_eq!(
+        gate::evaluate(&e, grants(), GateHistory::default()).verdict,
+        Verdict::Skip
+    );
+    e.head_age_secs = 86400;
+    assert!(
+        matches!(gate::evaluate(&e,grants(),GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::Mergeability))
+    );
+    Ok(())
+}
+#[test]
+fn unknown_rule_one_and_missing_checks_never_merge() -> TestResult {
+    let mut e = ready()?;
+    e.same_repository = None;
+    assert!(
+        matches!(gate::evaluate(&e,grants(),GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::Eligibility))
+    );
+    e.same_repository = Some(true);
+    e.checks = Checks::Missing;
+    assert!(
+        matches!(gate::evaluate(&e,grants(),GateHistory::default()).verdict,Verdict::FixRequest{gaps} if gaps.contains(&Gap::Checks))
+    );
+    Ok(())
+}
+#[test]
+fn reviewer_request_needs_its_separate_grant() -> TestResult {
+    let mut e = ready()?;
+    e.reviewers[0].reviewed_head = Some(commit('c')?);
+    e.head_age_secs = 86400;
+    let grants = GateGrants {
+        reviewer_invocation: false,
+        ..grants()
+    };
+    assert!(
+        matches!(gate::evaluate(&e,grants,GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::ReviewerPending))
+    );
+    Ok(())
+}

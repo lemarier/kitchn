@@ -31,10 +31,10 @@ use kitchen::{
         },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
         stack::{
-            BranchLayer, BranchOperation, Dependent, GhStack, LinkLayer, LocalBranches,
-            LowerLayerFault, MAX_STACK_LAYERS, MergedBase, RetargetStep, StackBoundary,
-            StackCommand, StackLayerView, StackLink, StackOutcome, StackPullRequest, StackRefusal,
-            StackResult, StackRunner, StackView, Upstack, check_plain, plan_retarget, upstack,
+            BranchLayer, BranchOperation, Dependent, GhStack, LocalBranches, LowerLayerFault,
+            MAX_STACK_LAYERS, MergedBase, RetargetStep, StackBoundary, StackCommand,
+            StackLayerView, StackLink, StackOutcome, StackPullRequest, StackRefusal, StackResult,
+            StackRunner, StackView, Upstack, check_plain, plan_retarget, upstack,
         },
     },
 };
@@ -89,7 +89,7 @@ impl Recording {
         Ok(Self {
             commands: RefCell::new(Vec::new()),
             links: RefCell::new(Vec::new()),
-            view: StackResult::Viewed(stack_view(&[("lemarier/issue-5", false)])?),
+            view: StackResult::Viewed(stack_with_prs(&[("lemarier/issue-5", false, Some(5))])?),
             answer,
         })
     }
@@ -405,7 +405,7 @@ fn the_stack_tool_path_runs_commands_bound_to_the_tasks_branch() -> TestResult {
     for ready in [false, true] {
         links.push(StackLink {
             trunk: branch("main")?,
-            layers: vec![LinkLayer::Branch(branch("lemarier/issue-5")?)],
+            pull_requests: vec![number(5)?],
             ready,
         });
     }
@@ -1109,15 +1109,11 @@ fn a_stack_push_leases_every_layer_to_its_checked_head_in_one_update() -> TestRe
         match command {
             StackCommand::Submit { .. } => {
                 // Every layer has a pull request: the tool pushes nothing.
-                let numbers: Vec<LinkLayer> = [3, 4, 5]
-                    .into_iter()
-                    .map(|pr| number(pr).map(LinkLayer::PullRequest))
-                    .collect::<TestResult<_>>()?;
                 assert_eq!(
                     links,
                     vec![StackLink {
                         trunk: branch("main")?,
-                        layers: numbers,
+                        pull_requests: vec![number(3)?, number(4)?, number(5)?],
                         ready: false,
                     }]
                 );
@@ -1178,7 +1174,7 @@ fn layers_above_move_from_their_remote_heads_and_unknown_ones_refuse() -> TestRe
         ("lemarier/issue-4", false, Some(4)),
         ("lemarier/issue-5", false, Some(5)),
         ("lemarier/issue-6", true, None),
-        ("lemarier/issue-7", false, None),
+        ("lemarier/issue-7", false, Some(7)),
     ])?;
     // A settled task owned issue-7, so the upstack is idle.
     settled_layer(&setup, 7, "lemarier/issue-7")?;
@@ -1193,8 +1189,8 @@ fn layers_above_move_from_their_remote_heads_and_unknown_ones_refuse() -> TestRe
         &StackCommand::Submit { ready: false },
     )?;
     assert_eq!(outcome, StackOutcome::Ran(StackResult::Done));
-    // The merged layer is skipped; issue-7 does not exist yet, so its lease
-    // requires that it still does not.
+    // The merged layer is skipped; issue-7's branch is not on the remote
+    // yet, so its lease requires that it still is not.
     assert_eq!(
         layers.updated.borrow().clone(),
         vec![vec![
@@ -1205,15 +1201,10 @@ fn layers_above_move_from_their_remote_heads_and_unknown_ones_refuse() -> TestRe
         ]]
     );
     let links = runner.linked();
-    let layers_linked = links.first().map(|link| link.layers.clone());
+    let layers_linked = links.first().map(|link| link.pull_requests.clone());
     assert_eq!(
         layers_linked,
-        Some(vec![
-            LinkLayer::PullRequest(number(3)?),
-            LinkLayer::PullRequest(number(4)?),
-            LinkLayer::PullRequest(number(5)?),
-            LinkLayer::Branch(branch("lemarier/issue-7")?),
-        ])
+        Some(vec![number(3)?, number(4)?, number(5)?, number(7)?,])
     );
     // A layer above that the checkout lacks, or whose remote head cannot be
     // read, refuses before anything is sent.
@@ -1241,7 +1232,7 @@ fn layers_above_move_from_their_remote_heads_and_unknown_ones_refuse() -> TestRe
 }
 
 #[test]
-fn a_stack_push_refuses_too_many_layers_and_a_numeric_branch_to_link() -> TestResult {
+fn a_stack_push_refuses_too_many_layers_and_a_submission_a_layer_without_a_pr() -> TestResult {
     let setup = stacking()?;
     let mut names: Vec<String> = (0..MAX_STACK_LAYERS)
         .map(|layer| format!("lemarier/below-{layer}"))
@@ -1259,26 +1250,36 @@ fn a_stack_push_refuses_too_many_layers_and_a_numeric_branch_to_link() -> TestRe
         &StackCommand::Push,
     )?;
     assert_eq!(outcome, StackOutcome::Refused(StackRefusal::InvalidLayers));
-    // `gh stack link` reads a numeric argument as a pull request first: a
-    // layer without one, named only by digits, is refused before the push.
-    settled_layer(&setup, 8, "12345")?;
+    // `gh stack link` pushes a layer it is given by branch name: a
+    // submission with a layer above that has no pull request is refused
+    // before the push, naming the lowest such layer.
+    settled_layer(&setup, 7, "lemarier/issue-7")?;
+    settled_layer(&setup, 8, "lemarier/issue-8")?;
     let view = stack_with_prs(&[
         ("lemarier/issue-3", false, Some(3)),
         ("lemarier/issue-4", false, Some(4)),
         ("lemarier/issue-5", false, Some(5)),
-        ("12345", false, None),
+        ("lemarier/issue-7", false, None),
+        ("lemarier/issue-8", false, None),
     ])?;
     let mut layers = Layers::consistent()?;
-    layers
-        .local
-        .insert("12345", Observed::Known(Some(commit('c')?)));
+    for name in ["lemarier/issue-7", "lemarier/issue-8"] {
+        layers
+            .local
+            .insert(name, Observed::Known(Some(commit('c')?)));
+    }
     let (outcome, runner) = run_layers_with(
         &setup,
         view.clone(),
         &layers,
         &StackCommand::Submit { ready: false },
     )?;
-    assert_eq!(outcome, StackOutcome::Refused(StackRefusal::InvalidLayers));
+    assert_eq!(
+        outcome,
+        StackOutcome::Refused(StackRefusal::NoPullRequest {
+            branch: branch("lemarier/issue-7")?,
+        })
+    );
     assert!(layers.updated.borrow().is_empty(), "pushed");
     assert!(runner.linked().is_empty());
     // A push links nothing, so the same stack pushes.
@@ -1645,23 +1646,17 @@ fn gh_stack_commands_are_non_interactive_with_an_explicit_remote() -> TestResult
     for (command, expected) in cases {
         assert_eq!(gh.args(&command).join(" "), expected);
     }
-    // Layers with a pull request by number, the others by branch.
+    // Every layer by pull-request number, never by branch.
     for (ready, expected) in [
-        (
-            false,
-            "stack link --base main --remote upstream 41 lemarier/b",
-        ),
+        (false, "stack link --base main --remote upstream 41 42"),
         (
             true,
-            "stack link --base main --open --remote upstream 41 lemarier/b",
+            "stack link --base main --open --remote upstream 41 42",
         ),
     ] {
         let link = StackLink {
             trunk: branch("main")?,
-            layers: vec![
-                LinkLayer::PullRequest(number(41)?),
-                LinkLayer::Branch(branch("lemarier/b")?),
-            ],
+            pull_requests: vec![number(41)?, number(42)?],
             ready,
         };
         assert_eq!(gh.link_args(&link).join(" "), expected);
@@ -1801,11 +1796,11 @@ mod gh_process {
             let (gh, _kitchen) = adapter(fake_gh(&dir, "not json", code)?, &dir)?;
             assert_eq!(gh.run(&command), expected, "exit {code}");
         }
-        // Linking can open pull requests and push new branches: a generic
+        // Linking can change pull-request bases before failing: a generic
         // failure is uncertain, a documented refusal is not.
         let link = StackLink {
             trunk: branch("main")?,
-            layers: vec![LinkLayer::PullRequest(number(4)?)],
+            pull_requests: vec![number(4)?],
             ready: false,
         };
         for (code, expected) in [
@@ -2196,6 +2191,57 @@ exec {GIT} \"$@\"
                 "stack link --base main --open --remote origin 4 5",
             ]
         );
+        Ok(())
+    }
+
+    /// Real Git: a submission whose task layer has no pull request is
+    /// refused before any push, so `gh stack` never receives a branch to
+    /// push. Every link it does receive names pull requests by number.
+    #[test]
+    fn a_layer_without_a_pull_request_refuses_a_submission_before_any_push() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (bare, worker, heads) = pushed_stack(&root)?;
+        let [_, lower, top, _] = heads.as_slice() else {
+            return Err("four heads".into());
+        };
+        let before = remote_heads(&bare)?;
+        let pull_requests = stack_pull_requests(lower, top)?;
+        let setup = stacking()?;
+        let view = r#"{"trunk":"main","branches":[{"name":"lemarier/issue-4","pr":{"number":4}},{"name":"lemarier/issue-5"}]}"#;
+        let (gh, _kitchen) = adapter(fake_gh(&root, view, 0)?, &worker)?;
+        let remote = gh
+            .git_remote(Path::new(GIT).to_path_buf(), Duration::from_secs(30))?
+            .with_url_bases(&[&format!("{}/", text(&root)?)])?;
+        let intent = PushIntent {
+            pull_request: None,
+            expected_remote: Some(top.clone()),
+        };
+        let outcome = StackBoundary {
+            store: &setup.world.fixture.store,
+            grants: &setup.world.grants,
+            destination: &setup.github,
+            clock: &setup.world.clock,
+            runner: &gh,
+            pull_requests: &pull_requests,
+            remote: &remote,
+            updater: &remote,
+            local: &remote,
+        }
+        .run(
+            &setup.task,
+            setup.fence,
+            &StackCommand::Submit { ready: false },
+            &intent,
+        )?;
+        assert_eq!(
+            outcome,
+            StackOutcome::Refused(StackRefusal::NoPullRequest {
+                branch: branch("lemarier/issue-5")?,
+            })
+        );
+        assert_eq!(remote_heads(&bare)?, before, "a layer was pushed");
+        assert_eq!(gh_calls(&root)?, vec!["stack view --json"]);
         Ok(())
     }
 

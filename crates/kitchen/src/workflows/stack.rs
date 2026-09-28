@@ -17,7 +17,9 @@
 //! or retargeted refuses the command with that layer named. The boundary
 //! then pushes the layers itself in one atomic update leased to the heads it
 //! checked, so a layer moved after the check fails the whole push, and uses
-//! the tool only to link and open the pull requests.
+//! the tool only to link pull requests that already exist, named by number.
+//! A submission with a layer that has no pull request is refused before any
+//! push ([`StackRefusal::NoPullRequest`]).
 //! [`GhStack`] runs `gh stack` with non-interactive flags and an explicit
 //! remote.
 //!
@@ -119,6 +121,14 @@ pub enum StackRefusal {
         branch: BranchName,
         /// What is wrong with it.
         fault: LowerLayerFault,
+    },
+    /// A submission reached a layer at or above the task's branch that has
+    /// no pull request. The stack tool opens one only by pushing the branch
+    /// itself, outside the boundary's leased push, so nothing is pushed.
+    #[error("stack layer {branch} has no pull request to link")]
+    NoPullRequest {
+        /// The layer.
+        branch: BranchName,
     },
 }
 
@@ -283,25 +293,16 @@ pub enum StackResult {
     Stale,
 }
 
-/// A layer as `gh stack link` takes it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LinkLayer {
-    /// A layer with a pull request, named by its number so the tool pushes
-    /// nothing for it.
-    PullRequest(IssueNumber),
-    /// A layer without a pull request yet: the tool opens one, and pushes
-    /// the branch by name first.
-    Branch(BranchName),
-}
-
-/// Link a stack's pull requests on the forge, opening those that are
-/// missing, after the boundary pushed the layers itself.
+/// Link a stack's existing pull requests on the forge after the boundary
+/// pushed the layers itself. Every layer is named by its pull-request
+/// number: `gh stack link` pushes a layer it is given by branch name, so the
+/// type cannot express one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackLink {
     /// The branch the bottom layer is based on.
     pub trunk: BranchName,
-    /// The unmerged layers, bottom to top.
-    pub layers: Vec<LinkLayer>,
+    /// The unmerged layers' pull requests, bottom to top.
+    pub pull_requests: Vec<IssueNumber>,
     /// Mark the pull requests ready for review.
     pub ready: bool,
 }
@@ -333,8 +334,7 @@ pub trait StackRunner {
     /// Run `command`.
     fn run(&self, command: &StackCommand) -> StackResult;
 
-    /// Link the stack's pull requests as `link` describes, opening missing
-    /// ones.
+    /// Link the stack's pull requests as `link` describes.
     fn link(&self, link: &StackLink) -> StackResult;
 }
 
@@ -446,8 +446,8 @@ impl GhStack {
         args
     }
 
-    /// The exact arguments for `link`: layers with a pull request by number,
-    /// which the tool does not push, and the others by branch name.
+    /// The exact arguments for `link`: every layer by pull-request number,
+    /// which the tool does not push.
     #[must_use]
     pub fn link_args(&self, link: &StackLink) -> Vec<String> {
         let mut args = vec![
@@ -460,10 +460,11 @@ impl GhStack {
             args.push("--open".to_owned());
         }
         args.extend(["--remote".to_owned(), self.remote.clone()]);
-        args.extend(link.layers.iter().map(|layer| match layer {
-            LinkLayer::PullRequest(number) => number.get().to_string(),
-            LinkLayer::Branch(branch) => branch.to_string(),
-        }));
+        args.extend(
+            link.pull_requests
+                .iter()
+                .map(|number| number.get().to_string()),
+        );
         args
     }
 
@@ -555,7 +556,8 @@ impl StackRunner for GhStack {
     }
 
     fn link(&self, link: &StackLink) -> StackResult {
-        // Linking can open pull requests and push new branches.
+        // Linking pushes nothing for layers named by number, but it can
+        // change pull-request bases before failing.
         self.call(&self.link_args(link))
             .map_or(StackResult::Uncertain, |(code, _)| exit_result(code, true))
     }
@@ -698,9 +700,10 @@ impl StackBoundary<'_> {
     /// the layers above move from their checked remote heads to the
     /// checkout's. A branch that moved after the check fails the whole
     /// update ([`StackResult::Stale`]) and nothing changes. A submission then
-    /// runs [`StackRunner::link`], which names every layer with a pull
-    /// request by number, so the tool pushes only branches that still need
-    /// one opened: the task's branch or a layer above it.
+    /// runs [`StackRunner::link`] with every layer's pull-request number, so
+    /// the tool pushes nothing. A submission with an unmerged layer that has
+    /// no pull request is refused before the push
+    /// ([`StackRefusal::NoPullRequest`]).
     ///
     /// # Errors
     /// Returns [`crate::state::StateError::StaleFence`] without a live claim
@@ -974,33 +977,28 @@ const fn publish(command: &StackCommand) -> Option<Publish> {
     }
 }
 
-/// The link for `view`'s unmerged layers: by pull-request number where the
-/// tool knows one, by branch otherwise.
+/// The link for `view`'s unmerged layers, by pull-request number.
 ///
 /// # Errors
-/// Returns [`StackRefusal::InvalidLayers`] for a branch named only by
-/// digits, which the tool would first read as a pull-request number.
+/// Returns [`StackRefusal::NoPullRequest`] naming the lowest unmerged layer
+/// without a pull request.
 fn link(view: &StackView, ready: bool) -> std::result::Result<StackLink, StackRefusal> {
-    let layers = view
+    let pull_requests = view
         .branches
         .iter()
         .filter(|layer| !layer.is_merged)
-        .map(|layer| match layer.pr {
-            Some(pr) => Ok(LinkLayer::PullRequest(pr.number)),
-            None if layer
-                .name
-                .as_str()
-                .bytes()
-                .all(|byte| byte.is_ascii_digit()) =>
-            {
-                Err(StackRefusal::InvalidLayers)
-            }
-            None => Ok(LinkLayer::Branch(layer.name.clone())),
+        .map(|layer| {
+            layer
+                .pr
+                .map(|pr| pr.number)
+                .ok_or_else(|| StackRefusal::NoPullRequest {
+                    branch: layer.name.clone(),
+                })
         })
         .collect::<std::result::Result<_, _>>()?;
     Ok(StackLink {
         trunk: view.trunk.clone(),
-        layers,
+        pull_requests,
         ready,
     })
 }

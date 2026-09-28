@@ -12,8 +12,8 @@ use kitchen::{
         EvidenceSubject, EvidenceVerdict, ExternalRef, Repository, ResourceKind, ResourceRef,
     },
     state::{
-        Corruption, IssueRevision, MAX_MARKERS, MarkerFact, MarkerKey, MarkerRecording,
-        MarkerSubject, StateError, WorkItem,
+        Corruption, IssueRevision, MAX_MARKERS, MarkerAttempt, MarkerFact, MarkerKey,
+        MarkerRecording, MarkerSubject, StateError, WorkItem,
     },
 };
 
@@ -844,5 +844,125 @@ fn corrupt_resource_markers_are_rejected_without_reset() -> TestResult {
         assert!(syntax(&error), "{error:?}");
         assert_eq!(fs::read(&path)?, bytes, "rejected state is not rewritten");
     }
+    Ok(())
+}
+
+#[test]
+fn a_guarded_record_reads_and_writes_in_one_transaction() -> TestResult {
+    let fixture = Fixture::new()?;
+    let recorder = scheduled("guard-tick")?;
+    let first = key("gate", pull_request(20)?, 'a', None)?;
+    let second = key("gate", pull_request(20)?, 'b', None)?;
+    let other_workflow = key("triage", pull_request(20)?, 'c', None)?;
+
+    // Nothing to object to: recorded, and the guard saw no siblings.
+    let attempt = fixture.store.record_marker_unless(
+        first.clone(),
+        verdict(EvidenceVerdict::Pass),
+        &recorder,
+        at(1),
+        |siblings| {
+            assert!(siblings.is_empty());
+            Ok(None::<()>)
+        },
+    )?;
+    assert!(matches!(attempt, MarkerAttempt::Recorded(_)));
+
+    // The guard sees the marker recorded just before, and only this
+    // workflow's: another workflow's marker is not a sibling.
+    fixture.store.record_marker(
+        other_workflow,
+        verdict(EvidenceVerdict::Pass),
+        &recorder,
+        at(2),
+    )?;
+    let attempt = fixture.store.record_marker_unless(
+        second.clone(),
+        verdict(EvidenceVerdict::Pass),
+        &recorder,
+        at(3),
+        |siblings| Ok((siblings.len() == 1).then_some(siblings[0].key().clone())),
+    )?;
+    assert_eq!(attempt, MarkerAttempt::Blocked(first.clone()));
+    assert_eq!(fixture.store.marker(&second)?, None, "nothing was written");
+    assert_eq!(fixture.store.markers(&first.workflow)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_guarded_record_of_an_existing_key_is_never_blocked() -> TestResult {
+    let fixture = Fixture::new()?;
+    let recorder = scheduled("guard-tick")?;
+    let gate = key("gate", pull_request(20)?, 'a', None)?;
+    fixture.store.record_marker(
+        gate.clone(),
+        verdict(EvidenceVerdict::Pass),
+        &recorder,
+        at(1),
+    )?;
+    let same = fixture.store.record_marker_unless(
+        gate.clone(),
+        verdict(EvidenceVerdict::Pass),
+        &recorder,
+        at(2),
+        |_| Ok(Some(())),
+    )?;
+    assert!(matches!(same, MarkerAttempt::AlreadyRecorded(_)));
+    let different = fixture.store.record_marker_unless(
+        gate,
+        verdict(EvidenceVerdict::Fail),
+        &recorder,
+        at(3),
+        |_| Ok(Some(())),
+    );
+    assert!(matches!(
+        different,
+        Err(Error::State(StateError::MarkerConflict))
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_guarded_record_refuses_a_stale_consumer_and_propagates_guard_errors() -> TestResult {
+    let fixture = Fixture::new()?;
+    let consumer = ConsumerId::new("gate-consumer")?;
+    let first = scheduled("first")?;
+    let second = scheduled("second")?;
+    let old = fixture
+        .store
+        .acquire_consumer(&consumer, &first, ttl(60)?, at(0))?
+        .fence();
+    let new = fixture
+        .store
+        .take_over_consumer(&consumer, &second, ttl(60)?, at(61))?
+        .fence();
+    let gate = key("gate", pull_request(20)?, 'a', None)?;
+
+    // The fence is checked before the guard runs.
+    let refused = fixture.store.record_marker_unless(
+        gate.clone(),
+        verdict(EvidenceVerdict::Pass),
+        &first.clone().under(consumer.clone(), old),
+        at(62),
+        |_| -> kitchen::Result<Option<()>> { Err(StateError::MarkerConflict.into()) },
+    );
+    assert!(matches!(
+        refused,
+        Err(Error::State(StateError::StaleFence { .. }))
+    ));
+
+    // A guard failure aborts the transaction without writing.
+    let failed = fixture.store.record_marker_unless(
+        gate.clone(),
+        verdict(EvidenceVerdict::Pass),
+        &second.under(consumer, new),
+        at(63),
+        |_| -> kitchen::Result<Option<()>> { Err(StateError::MarkerNotFound.into()) },
+    );
+    assert!(matches!(
+        failed,
+        Err(Error::State(StateError::MarkerNotFound))
+    ));
+    assert_eq!(fixture.store.marker(&gate)?, None);
     Ok(())
 }

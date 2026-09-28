@@ -14,8 +14,8 @@ use crate::{
     events::{EventError, ForgeEvent, ForgeEventKind, PolledWork},
     house::HouseConfig,
     state::{
-        Creation, HouseStore, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, StateError,
-        WorkItem,
+        Creation, HouseStore, MarkerAttempt, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject,
+        StateError, WorkItem, WorkflowMarker,
     },
 };
 
@@ -314,21 +314,22 @@ impl<'a> EventIntake<'a> {
             subject: subject.clone(),
             task: record.task.clone(),
         };
-        let recorded_now = match self.recorded(&key)? {
-            Some(_) => false,
-            None => {
-                if let Some(newer) = self.newer_event(&key, &record)? {
-                    return Ok(Admission::Stale(newer));
-                }
-                let fact = MarkerFact::workflow(self.schema.clone(), &record)?;
-                match self.store.record_marker(key.clone(), fact, claimant, now) {
-                    Ok(_) => true,
-                    // Another admission of the same work recorded it first.
-                    Err(Error::State(StateError::MarkerConflict)) => false,
-                    Err(error) => return Err(error),
-                }
-            }
-        };
+        // The stale scan and the write are one store transaction, so an older
+        // event cannot record after a newer one under the same live fence.
+        let fact = MarkerFact::workflow(self.schema.clone(), &record)?;
+        let recorded_now =
+            match self
+                .store
+                .record_marker_unless(key.clone(), fact, claimant, now, |markers| {
+                    self.newer_event(markers, &key, &record)
+                }) {
+                Ok(MarkerAttempt::Recorded(_)) => true,
+                Ok(MarkerAttempt::AlreadyRecorded(_)) => false,
+                Ok(MarkerAttempt::Blocked(newer)) => return Ok(Admission::Stale(newer)),
+                // Another admission of the same work recorded a different fact first.
+                Err(Error::State(StateError::MarkerConflict)) => false,
+                Err(error) => return Err(error),
+            };
         match self.store.task(&order.task) {
             Ok(_) => return Ok(Admission::Duplicate(order.task)),
             Err(Error::State(StateError::TaskNotFound(_))) => {}
@@ -345,25 +346,22 @@ impl<'a> EventIntake<'a> {
         }
     }
 
-    fn recorded(&self, key: &MarkerKey) -> Result<Option<AdmissionRecord>> {
-        self.store
-            .marker(key)?
-            .map(|marker| marker.fact().decode(&self.schema))
-            .transpose()
-            .map_err(Error::from)
-    }
-
     /// For an event, the task of the newest event admitted for the same item
     /// at another revision that occurred after it. Only events order each
     /// other: their times come from the same source, while a poll's
     /// observation time says nothing about when its revision was made, so a
     /// poll never makes an event stale and is never stale itself.
-    fn newer_event(&self, key: &MarkerKey, record: &AdmissionRecord) -> Result<Option<TaskId>> {
+    fn newer_event(
+        &self,
+        markers: &[&WorkflowMarker],
+        key: &MarkerKey,
+        record: &AdmissionRecord,
+    ) -> Result<Option<TaskId>> {
         if record.via == Via::Poll {
             return Ok(None);
         }
         let mut newest: Option<AdmissionRecord> = None;
-        for marker in self.store.markers(&key.workflow)? {
+        for marker in markers {
             let other = marker.key();
             let admission = matches!(
                 marker.fact(),

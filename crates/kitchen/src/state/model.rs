@@ -21,8 +21,8 @@ use crate::{
         RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Timestamp, Trigger, UncertainReason,
     },
     state::{
-        ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerFact, MarkerKey,
-        MarkerRecording, StateError, WorkflowMarker,
+        ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerAttempt, MarkerFact,
+        MarkerKey, MarkerRecording, StateError, WorkflowMarker,
         marker::{MarkerRefusal, Markers},
     },
 };
@@ -2012,6 +2012,33 @@ impl StoreState {
         self.markers
             .record(key, fact, recorded_by, now)
             .or_else(marker_refusal)
+    }
+
+    pub(crate) fn record_marker_unless<R>(
+        &mut self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+        guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
+    ) -> Result<MarkerAttempt<R>> {
+        self.check_claimant(recorded_by, now)?;
+        // A key that is already recorded is settled by `record`, never blocked.
+        if self.markers.get(&key).is_none() {
+            let siblings: Vec<&WorkflowMarker> = self.markers.for_workflow(&key.workflow).collect();
+            if let Some(blocked) = guard(&siblings)? {
+                return Ok(MarkerAttempt::Blocked(blocked));
+            }
+        }
+        match self.markers.record(key, fact, recorded_by, now) {
+            Ok(MarkerRecording::Recorded(marker)) => Ok(MarkerAttempt::Recorded(marker)),
+            Ok(MarkerRecording::AlreadyRecorded(marker)) => {
+                Ok(MarkerAttempt::AlreadyRecorded(marker))
+            }
+            // `record` never supersedes; the arm keeps the match exhaustive.
+            Ok(MarkerRecording::Superseded(_)) => fail(StateError::MarkerConflict),
+            Err(refusal) => marker_refusal(refusal),
+        }
     }
 
     pub(crate) fn supersede_marker(

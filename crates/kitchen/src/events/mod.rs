@@ -20,7 +20,19 @@
 //! an already admitted event about a newer revision of the same item is
 //! reported stale; polls do not take part in that ordering. Both the event
 //! receiver and the fallback schedule act under one consumer lease, so only
-//! one of them consumes the workflow scope at a time.
+//! one of them consumes the workflow scope at a time. The stale check and the
+//! marker write are one store transaction, so racing deliveries under the same
+//! live fence cannot record an older event after a newer one.
+//!
+//! # One task per revision
+//!
+//! Deduplication is per (workflow, item, revision), never per event: two
+//! distinct events about the same revision, such as a second review comment
+//! on one head or two labels applied within the same second, produce one task,
+//! and the later event is reported [`Admission::Duplicate`]. This is
+//! intentional. A workflow that needs a task for each event must include the
+//! event's identity (a comment id, for example) in the work item key it
+//! routes on, so each event is a different item.
 //!
 //! Event-started work is unattended: its tasks run on standing grants only and
 //! never accept a person's consent.

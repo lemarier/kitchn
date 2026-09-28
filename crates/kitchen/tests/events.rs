@@ -421,6 +421,67 @@ fn out_of_order_delivery_admits_each_revision_once_and_skips_stale_ones() -> Tes
     Ok(())
 }
 
+/// An older event never records after a newer one, even when both deliveries
+/// race under the same live consumer fence: the stale scan and the marker
+/// write are one store transaction. Each round is an independent race, so a
+/// scan separated from the write would fail some round.
+#[test]
+fn racing_deliveries_never_record_an_older_event_after_a_newer_one() -> TestResult {
+    let (config, source) = (house_config()?, delivering()?);
+    let older = pushed("delivery-1", 'c', 10)?;
+    let newer = pushed("delivery-2", 'd', 20)?;
+    let (older_head, newer_head) = (head('c')?, head('d')?);
+    for round in 0..40 {
+        let fixture = Fixture::new()?;
+        let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+        let fence = receiver_fence(&fixture.store, 0)?;
+        let (older_claim, newer_claim) = (receiver(&older, fence)?, receiver(&newer, fence)?);
+        let start = std::sync::Barrier::new(2);
+        let (from_older, from_newer) = std::thread::scope(|scope| {
+            let old = scope.spawn(|| {
+                start.wait();
+                admit(&intake, &older, &older_claim, 21)
+            });
+            let new = scope.spawn(|| {
+                start.wait();
+                admit(&intake, &newer, &newer_claim, 22)
+            });
+            (old.join(), new.join())
+        });
+        let (from_older, from_newer) = (
+            from_older.map_err(|_| "older delivery panicked")??,
+            from_newer.map_err(|_| "newer delivery panicked")??,
+        );
+        assert!(
+            matches!(from_newer, Admission::Admitted(_)),
+            "round {round}: {from_newer:?}"
+        );
+        let recorded: Vec<MarkerSubject> = fixture
+            .store
+            .markers(&route()?.workflow)?
+            .iter()
+            .map(|marker| marker.key().subject.clone())
+            .collect();
+        match from_older {
+            // The older event lost the race: it left no marker or task.
+            Admission::Stale(_) => {
+                assert_eq!(recorded, std::slice::from_ref(&newer_head), "round {round}");
+                assert_eq!(fixture.store.tasks()?.len(), 1, "round {round}");
+            }
+            // The older event won: it was recorded first.
+            Admission::Admitted(_) => {
+                assert_eq!(
+                    recorded,
+                    [older_head.clone(), newer_head.clone()],
+                    "round {round}"
+                );
+            }
+            other => return Err(format!("round {round}: unexpected {other:?}").into()),
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn restart_between_receipt_and_claim_resumes_the_same_task() -> TestResult {
     let fixture = Fixture::new()?;

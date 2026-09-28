@@ -29,6 +29,8 @@ pub enum TrustError {
     #[error("trust budget exhausted")]
     Exhausted,
     /// Persisted history violates a ledger invariant; never reset automatically.
+    /// Any snapshot that fails validation on load is reported as this, not as
+    /// the class the same violation would have at write time.
     #[error("invalid trust storage")]
     Corrupt,
     /// The shared snapshot store failed: lock deadline, unsafe path, missing

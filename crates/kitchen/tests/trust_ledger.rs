@@ -2155,7 +2155,7 @@ fn persisted_inspections_with_broken_sample_sequences_are_invalid() -> TestResul
     let mut out_of_sequence: serde_json::Value = serde_json::from_slice(&original)?;
     out_of_sequence["inspections"][0]["samples"][0]["number"] = serde_json::json!(2);
     fs::write(&path, serde_json::to_vec(&out_of_sequence)?)?;
-    assert!(matches!(open(), Err(TrustError::Invalid)));
+    assert!(matches!(open(), Err(TrustError::Corrupt)));
 
     // Three samples exceed a plan that allows two.
     let mut too_many: serde_json::Value = serde_json::from_slice(&original)?;
@@ -2169,9 +2169,163 @@ fn persisted_inspections_with_broken_sample_sequences_are_invalid() -> TestResul
             .push(sample);
     }
     fs::write(&path, serde_json::to_vec(&too_many)?)?;
-    assert!(matches!(open(), Err(TrustError::Invalid)));
+    assert!(matches!(open(), Err(TrustError::Corrupt)));
 
     fs::write(&path, &original)?;
     assert_eq!(open()?.inspection(&plan()?.id)?.samples().len(), 1);
+    Ok(())
+}
+
+/// Rewrite the persisted snapshot with `edit` and return its original bytes.
+fn tamper(
+    f: &Fixture,
+    edit: impl FnOnce(&mut serde_json::Value) -> TestResult,
+) -> TestResult<Vec<u8>> {
+    let path = ledger_path(f);
+    let original = fs::read(&path)?;
+    let mut document: serde_json::Value = serde_json::from_slice(&original)?;
+    edit(&mut document)?;
+    fs::write(&path, serde_json::to_vec(&document)?)?;
+    Ok(original)
+}
+/// Open the ledger, keeping the ledger's own error for classification.
+fn try_open(f: &Fixture) -> TestResult<Result<Ledger, TrustError>> {
+    Ok(Ledger::open(f.dir.path().join("trust"), house()?))
+}
+/// Persisted history that breaks an invariant is corrupt storage, handled as an
+/// execution failure that no retry or reconciliation can clear.
+fn assert_corrupt<T>(result: Result<T, TrustError>, label: &str) {
+    let error = result.err();
+    assert!(
+        matches!(error, Some(TrustError::Corrupt)),
+        "{label}: expected corrupt storage, got {error:?}"
+    );
+    assert_eq!(
+        error.map(|e| e.class()),
+        Some(kitchen::ErrorClass::Execution),
+        "{label}"
+    );
+}
+/// A ledger holding one eligible observation with its binding, one proposal,
+/// and one started inspection with one reserved sample of one token.
+fn populated(f: &Fixture) -> TestResult<(Ledger, Observation)> {
+    let l = ledger(f)?;
+    let o = eligible(observation(f)?)?;
+    l.record(&f.store, o.clone())?;
+    bind_evidence(&l, f)?;
+    l.propose(proposal()?, &grants()?)?;
+    l.start_inspection(plan()?, at(5))?;
+    l.reserve_sample(&plan()?.id, 1, 1, at(6))?;
+    Ok((l, o))
+}
+type Edit = fn(&mut serde_json::Value) -> TestResult;
+fn append_clone(document: &mut serde_json::Value, list: &str) -> TestResult {
+    let entries = document[list].as_array_mut().ok_or("list")?;
+    let first = entries.first().ok_or("entry")?.clone();
+    entries.push(first);
+    Ok(())
+}
+
+#[test]
+fn persisted_duplicate_identities_load_as_corrupt_not_conflict() -> TestResult {
+    let f = Fixture::new()?;
+    let (l, recorded) = populated(&f)?;
+    let shapes: [(&str, Edit); 4] = [
+        ("observation revision", |d| append_clone(d, "observations")),
+        ("task under two streams", |d| {
+            append_clone(d, "observations")?;
+            d["observations"][1]["id"] = serde_json::json!("fixture:other-stream");
+            Ok(())
+        }),
+        ("grant identity", |d| append_clone(d, "grants")),
+        ("inspection identity", |d| append_clone(d, "inspections")),
+    ];
+    for (label, edit) in shapes {
+        let original = tamper(&f, edit)?;
+        // A caller that retries on `Conflict` would never stop, so every entry
+        // point must report these as corrupt: a fresh open, a read, and a write.
+        assert_corrupt(try_open(&f)?, &format!("{label}: open"));
+        assert_corrupt(l.history(), &format!("{label}: read"));
+        assert_corrupt(
+            l.record(&f.store, recorded.clone()),
+            &format!("{label}: write"),
+        );
+        fs::write(ledger_path(&f), original)?;
+        assert_eq!(reopen(&f)?.history()?.len(), 1, "{label}: restored");
+    }
+    Ok(())
+}
+
+#[test]
+fn persisted_budget_overflow_loads_as_corrupt_not_exhausted() -> TestResult {
+    let f = Fixture::new()?;
+    let (l, _) = populated(&f)?;
+    let shapes: [(&str, Edit); 2] = [
+        ("token sum overflows u64", |d| {
+            let samples = d["inspections"][0]["samples"]
+                .as_array_mut()
+                .ok_or("samples")?;
+            let mut second = samples.first().ok_or("sample")?.clone();
+            second["number"] = serde_json::json!(2);
+            second["tokens"] = serde_json::json!(u64::MAX);
+            samples.push(second);
+            Ok(())
+        }),
+        ("tokens exceed the plan budget", |d| {
+            d["inspections"][0]["samples"][0]["tokens"] = serde_json::json!(101);
+            Ok(())
+        }),
+    ];
+    for (label, edit) in shapes {
+        let original = tamper(&f, edit)?;
+        assert_corrupt(try_open(&f)?, &format!("{label}: open"));
+        assert_corrupt(l.grant_history(), &format!("{label}: read"));
+        fs::write(ledger_path(&f), original)?;
+        assert_eq!(reopen(&f)?.inspection(&plan()?.id)?.samples().len(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn persisted_cross_house_records_load_as_corrupt_not_refused() -> TestResult {
+    let f = Fixture::new()?;
+    let (l, _) = populated(&f)?;
+    let foreign = serde_json::to_value(other_house()?)?;
+    let shapes = [
+        ("observation", "/observations/0/house"),
+        ("proposal", "/grants/0/house"),
+        ("inspection", "/inspections/0/plan/house"),
+    ];
+    for (label, pointer) in shapes {
+        let original = tamper(&f, |d| {
+            *d.pointer_mut(pointer).ok_or("house field")? = foreign.clone();
+            Ok(())
+        })?;
+        assert_corrupt(try_open(&f)?, &format!("{label}: open"));
+        assert_corrupt(l.history(), &format!("{label}: read"));
+        fs::write(ledger_path(&f), original)?;
+        assert_eq!(reopen(&f)?.history()?.len(), 1, "{label}: restored");
+    }
+    Ok(())
+}
+
+#[test]
+fn write_time_validation_keeps_its_own_error_class() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let first = observation(&f)?;
+    l.record(&f.store, first.clone())?;
+    let before = fs::read(ledger_path(&f))?;
+    // One task cannot appear under a second stream. `record` accepts the
+    // shape and the post-apply validation rejects it: a conflict the caller
+    // can reconcile, not corrupt storage.
+    let mut second = first;
+    second.id = source("fixture:other-stream")?;
+    assert!(matches!(
+        l.record(&f.store, second),
+        Err(TrustError::Conflict)
+    ));
+    assert_eq!(fs::read(ledger_path(&f))?, before);
+    assert_eq!(l.history()?.len(), 1);
     Ok(())
 }

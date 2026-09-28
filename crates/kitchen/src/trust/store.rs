@@ -198,8 +198,13 @@ impl Snapshot for Document {
         self.nonce
     }
 
+    /// Runs on every load. A stored snapshot that fails any check is corrupt
+    /// whatever class the write-time check would give it: a caller must not see
+    /// `Conflict`, `Refused`, `Invalid`, or `Exhausted` for a file it cannot
+    /// fix by retrying or changing its input. Writes validate through the
+    /// inherent method and keep those classes.
     fn validate(&self, house: &HouseId) -> Result<(), TrustError> {
-        Self::validate(self, house)
+        Self::validate(self, house).map_err(|_| TrustError::Corrupt)
     }
 }
 

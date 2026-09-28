@@ -431,12 +431,21 @@ fn budget_exhaustion_mid_window_pauses_once_and_reports_once() -> TestResult {
         &scheduled("budget-pass")?,
         at(1),
     )?;
-    assert!(policy.plan_exhaustion(&house, &four, reported)?.is_empty());
     assert!(
         policy
             .plan_exhaustion(&house, &paused, reported)?
             .is_empty()
     );
+
+    // A schedule re-activated in the same window is paused again on every
+    // pass, but its owner is not told twice.
+    let [repause] = policy
+        .plan_exhaustion(&house, &four, reported)?
+        .try_into()
+        .map_err(|_| "a pause without a second report")?;
+    assert!(repause.pause);
+    assert!(!repause.report_due);
+    assert_eq!(repause.pause_effect(), exhausted.pause_effect());
     Ok(())
 }
 
@@ -675,6 +684,129 @@ fn a_truncated_observation_is_a_lower_bound() -> TestResult {
     Ok(())
 }
 
+/// The observation cap of runs due a minute apart inside the window that
+/// starts at `day_ms`: `agents` started an agent, the rest were idle.
+fn capped_window(day_ms: u64, agents: usize) -> Vec<JudgedRun> {
+    (0..kitchen::scheduling::MAX_SCHEDULE_RUNS)
+        .map(|index| {
+            let verdict = if index < agents {
+                RunVerdict::Started
+            } else {
+                RunVerdict::Idle
+            };
+            run(
+                day_ms + HOUR_MS + u64::try_from(index).unwrap_or(0) * 60_000,
+                verdict,
+                Measurement::Missing,
+            )
+        })
+        .collect()
+}
+
+fn pickup_at(day_ms: u64, runs: Vec<JudgedRun>) -> TestResult<ScheduleEvidence> {
+    Ok(evidence(
+        house()?,
+        day_ms + 3 * HOUR_MS,
+        vec![usage("pickup", ObservedScheduleState::Active, runs)?],
+    ))
+}
+
+#[test]
+fn a_run_budget_is_enforced_when_the_window_holds_more_runs_than_are_retained() -> TestResult {
+    let house = house()?;
+    let who = consumer("pickup")?;
+    let day = 9 * DAY_MS;
+    let mut policy = policy()?;
+    policy.house_budget = budget(500, None)?;
+    policy.schedule_budget = budget(100, None)?;
+
+    // 100 agent runs fill the retention cap: the budget is reached.
+    let full = pickup_at(day, capped_window(day, 100))?;
+    let reached = BudgetError::Exhausted {
+        consumer: who.clone(),
+        limit: ScheduleLimit::ScheduleRuns,
+        used: 100,
+        allowed: 100,
+    };
+    assert_eq!(policy.check_activation(&house, &full, &who), Err(reached));
+    let [pause] = policy
+        .plan_exhaustion(&house, &full, |_| false)?
+        .try_into()
+        .map_err(|_| "one pause")?;
+    assert!(pause.pause);
+
+    // 99 agent runs in a window whose start is not visible may hide more:
+    // activation fails closed instead of counting 99 as the whole window.
+    let hidden = pickup_at(day, capped_window(day, 99))?;
+    let incomplete = BudgetError::IncompleteEvidence {
+        consumer: who.clone(),
+        observed: 99,
+        allowed: 100,
+    };
+    assert_eq!(
+        policy.check_activation(&house, &hidden, &who),
+        Err(incomplete)
+    );
+
+    // A budget above the retained runs can never be proven exhausted, so an
+    // incomplete window is refused too.
+    policy.schedule_budget = budget(101, None)?;
+    assert_eq!(
+        policy.check_activation(&house, &full, &who),
+        Err(BudgetError::IncompleteEvidence {
+            consumer: who.clone(),
+            observed: 100,
+            allowed: 101,
+        })
+    );
+
+    // The same 99 runs in a window whose start the listing reaches, or in a
+    // listing shorter than the cap, are the whole window.
+    policy.schedule_budget = budget(100, None)?;
+    let mut reaching = capped_window(day, 99);
+    reaching[kitchen::scheduling::MAX_SCHEDULE_RUNS - 1] =
+        run(day - HOUR_MS, RunVerdict::Started, Measurement::Missing);
+    policy.check_activation(&house, &pickup_at(day, reaching)?, &who)?;
+    let mut short = capped_window(day, 99);
+    short.pop();
+    policy.check_activation(&house, &pickup_at(day, short)?, &who)?;
+    Ok(())
+}
+
+#[test]
+fn another_schedules_incomplete_window_blocks_activation_under_the_house_budget() -> TestResult {
+    let house = house()?;
+    let day = 9 * DAY_MS;
+    let mut policy = policy()?;
+    policy.house_budget = budget(200, None)?;
+    policy.schedule_budget = budget(150, None)?;
+    let observed = evidence(
+        house.clone(),
+        day + 3 * HOUR_MS,
+        vec![
+            usage(
+                "pickup",
+                ObservedScheduleState::Paused,
+                started(day, 2, 10)?,
+            )?,
+            usage(
+                "gate",
+                ObservedScheduleState::Active,
+                capped_window(day, 60),
+            )?,
+        ],
+    );
+    assert_eq!(
+        policy.check_activation(&house, &observed, &consumer("pickup")?),
+        Err(BudgetError::IncompleteEvidence {
+            consumer: consumer("pickup")?,
+            observed: 62,
+            allowed: 200,
+        })
+    );
+    Ok(())
+}
+
 #[test]
 fn evidence_that_repeats_a_schedule_or_is_oversized_is_refused() -> TestResult {
     let policy = policy()?;
@@ -907,6 +1039,56 @@ fn doctor_reports_idle_schedules_as_recommendations_and_unenforceable_budgets() 
 }
 
 #[test]
+fn doctor_reports_a_run_budget_it_cannot_verify() -> TestResult {
+    let (_temp, registry, repository, mut doctor_evidence) = registry_with(Some(policy()?))?;
+    let day = 9 * DAY_MS;
+    // Three agent runs among a full retained history that stops inside the
+    // window: the budget of four is not shown exhausted, nor to hold.
+    doctor_evidence.schedules = Some(evidence(
+        house()?,
+        day + 12 * HOUR_MS,
+        vec![usage(
+            "pickup",
+            ObservedScheduleState::Active,
+            capped_window(day, 3),
+        )?],
+    ));
+    let report = doctor(&registry, &repository, Some(&doctor_evidence))?;
+    let finding = report
+        .findings
+        .iter()
+        .find(|finding| finding.message.contains("run budget cannot be verified"))
+        .ok_or("a finding for the unverifiable run budget")?;
+    assert_eq!(finding.code, DoctorCode::ScheduleBudget);
+    assert!(
+        finding.message.contains("3 observed agent runs"),
+        "{}",
+        finding.message
+    );
+
+    // Once the budget is reached the exhaustion is proven; no finding.
+    doctor_evidence.schedules = Some(evidence(
+        house()?,
+        day + 12 * HOUR_MS,
+        vec![usage(
+            "pickup",
+            ObservedScheduleState::Paused,
+            capped_window(day, 4),
+        )?],
+    ));
+    let proven = doctor(&registry, &repository, Some(&doctor_evidence))?;
+    assert!(
+        !proven
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("cannot be verified")),
+        "{:?}",
+        proven.findings
+    );
+    Ok(())
+}
+
+#[test]
 fn doctor_reports_schedules_without_a_policy() -> TestResult {
     let (_temp, registry, repository, mut doctor_evidence) = registry_with(None)?;
     assert!(doctor(&registry, &repository, Some(&doctor_evidence))?.healthy());
@@ -1006,6 +1188,104 @@ fn orca_refuses_an_install_that_breaks_a_limit_before_creating_anything() -> Tes
         "{overcommit:?}"
     );
     assert_eq!(sim.calls_to(&["automations", "create"]).len(), 2);
+    Ok(())
+}
+
+fn noon_on_day_twenty() -> Timestamp {
+    Timestamp::from_unix_millis(20 * DAY_MS + 12 * HOUR_MS)
+}
+
+fn noon_on_day_twenty_one() -> Timestamp {
+    Timestamp::from_unix_millis(21 * DAY_MS + 12 * HOUR_MS)
+}
+
+fn enabled(sim: &SimOrca, handle: &str) -> bool {
+    sim.state()
+        .automations
+        .iter()
+        .any(|automation| automation.id == handle && automation.enabled)
+}
+
+#[test]
+fn orca_refuses_activating_an_exhausted_schedule_before_editing_it() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = backend.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    let day = 20 * DAY_MS;
+    let full = |count: u64| {
+        (0..count)
+            .map(|index| {
+                json!({"id": format!("run-{index}"), "status": "completed",
+                    "scheduledFor": day + index * 60_000})
+            })
+            .collect::<Vec<_>>()
+    };
+    sim.state().runs = full(4);
+
+    let refused = backend.set_schedule_state(&installed, ScheduleState::Active);
+    assert_eq!(
+        refused,
+        Err(OrcaError::ScheduleLimit(BudgetError::Exhausted {
+            consumer: consumer("pickup")?,
+            limit: ScheduleLimit::ScheduleRuns,
+            used: 4,
+            allowed: 4,
+        }))
+    );
+    assert!(sim.calls_to(&["automations", "edit"]).is_empty());
+    assert!(!enabled(&sim, installed.handle.as_str()));
+
+    // As an effect the refusal is a definite rejection, never retried.
+    let activate = kitchen::contracts::EffectRequest::new(
+        house()?,
+        orca_id()?,
+        credential()?,
+        task_id("task-1")?,
+        kitchen::contracts::AttemptNumber::FIRST,
+        kitchen::contracts::IdempotencyKey::from_ref(ExternalRef::new("activate-1")?),
+        Effect::Schedule(ScheduleEffect::SetState {
+            schedule: installed.clone(),
+            state: ScheduleState::Active,
+        }),
+    );
+    assert_eq!(
+        backend.execute(&activate),
+        Err(kitchen::contracts::EffectFailure::NotApplied(
+            kitchen::contracts::NotAppliedReason::Rejected
+        ))
+    );
+    assert!(sim.calls_to(&["automations", "edit"]).is_empty());
+
+    // A run history that may hide runs is refused too.
+    sim.state().runs = full(u64::try_from(kitchen::scheduling::MAX_SCHEDULE_RUNS)?)
+        .into_iter()
+        .map(|mut run| {
+            run["status"] = json!("skipped_precheck");
+            run["precheckResult"] = json!({"exitCode": 1, "timedOut": false, "error": null});
+            run
+        })
+        .collect();
+    assert!(matches!(
+        backend.set_schedule_state(&installed, ScheduleState::Active),
+        Err(OrcaError::ScheduleLimit(BudgetError::IncompleteEvidence {
+            observed: 0,
+            ..
+        }))
+    ));
+    assert!(sim.calls_to(&["automations", "edit"]).is_empty());
+
+    // Headroom, or the next window, activates it.
+    sim.state().runs = full(3);
+    backend.set_schedule_state(&installed, ScheduleState::Active)?;
+    assert!(enabled(&sim, installed.handle.as_str()));
+    backend.set_schedule_state(&installed, ScheduleState::Paused)?;
+    sim.state().runs = full(4);
+    let next = connect(&sim)?.with_clock(noon_on_day_twenty_one);
+    next.set_schedule_state(&installed, ScheduleState::Active)?;
+    assert!(enabled(&sim, installed.handle.as_str()));
+
+    // Pausing is never refused.
+    backend.set_schedule_state(&installed, ScheduleState::Paused)?;
     Ok(())
 }
 

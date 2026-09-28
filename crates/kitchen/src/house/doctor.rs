@@ -378,6 +378,12 @@ fn diagnose_schedules(
                 HouseError::InvalidInput
             }
         })?;
+    for schedule in policy
+        .unverifiable_run_budgets(house, evidence)
+        .map_err(|_| HouseError::InvalidInput)?
+    {
+        findings.push(DoctorFinding { code: DoctorCode::ScheduleBudget, message: format!("Schedule {}: its {} observed agent runs this window may not be all of them, because the run history does not reach the window's start, so its run budget cannot be verified.", schedule.consumer, schedule.usage.runs), next_step: "Use a shorter usage window or a run budget below the retained run history; activation is refused until the window is fully observed.".into() });
+    }
     for schedule in unenforceable {
         findings.push(DoctorFinding { code: DoctorCode::ScheduleBudget, message: format!("Schedule {}: usage was unknown for most of its {} agent runs this window ({}), so its token budget cannot be enforced; its run budget is the effective limit.", schedule.consumer, schedule.usage.runs, describe_tokens(schedule.usage.tokens)), next_step: "Use a backend that reports run usage, or set the run budget to the spend you accept; unknown usage is never counted as zero.".into() });
     }

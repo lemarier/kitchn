@@ -41,11 +41,11 @@ use crate::{
         Invocation, OrcaError, OrcaRunner, RuntimeInfo, branch, reserve::Reservation, runtime, wire,
     },
     contracts::{
-        BackendDescriptor, BackendUnavailable, BranchName, Effect, EffectExecutor, EffectFailure,
-        EffectRequest, ExternalRef, IdempotencyKey, Lookup, MAX_INVENTORY_RESOURCES,
+        BackendDescriptor, BackendUnavailable, BranchName, Clock, Effect, EffectExecutor,
+        EffectFailure, EffectRequest, ExternalRef, IdempotencyKey, Lookup, MAX_INVENTORY_RESOURCES,
         MAX_RECEIPT_RESOURCES, NotAppliedReason, Operation, Receipt, ResourceKind,
-        ResourceObservation, ResourceRef, Text, UncertainReason, WorkerBackend, WorkerOutcome,
-        WorkerState, Workspace,
+        ResourceObservation, ResourceRef, SystemClock, Text, Timestamp, UncertainReason,
+        WorkerBackend, WorkerOutcome, WorkerState, Workspace,
     },
     scheduling::{AgentFamily, SchedulePolicy},
     selection::{AgentSelection, EffortSupport, SelectionSupport},
@@ -151,6 +151,11 @@ pub struct OrcaBackend<R> {
     runtime: RuntimeInfo,
     runner: R,
     schedule_policy: Option<SchedulePolicy>,
+    now: fn() -> Timestamp,
+}
+
+fn system_now() -> Timestamp {
+    SystemClock.now()
 }
 
 #[derive(Deserialize)]
@@ -570,6 +575,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             runtime,
             runner,
             schedule_policy: None,
+            now: system_now,
         })
     }
 
@@ -579,6 +585,19 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     pub fn with_schedule_policy(mut self, policy: SchedulePolicy) -> Self {
         self.schedule_policy = Some(policy);
         self
+    }
+
+    /// Read the current time from `now` instead of the host clock. Activation
+    /// checks judge usage in the window containing it.
+    #[must_use]
+    pub fn with_clock(mut self, now: fn() -> Timestamp) -> Self {
+        self.now = now;
+        self
+    }
+
+    /// The current time for budget windows.
+    pub(crate) fn now(&self) -> Timestamp {
+        (self.now)()
     }
 
     /// The schedule limits installs are checked against, if any.

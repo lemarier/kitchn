@@ -17,9 +17,13 @@
 //!   exhausted.
 //!
 //! Budgets count agent runs and, where the backend reports them, tokens. Run
-//! counts are always observable. Token usage the backend does not report is
-//! unknown, never zero: it can neither prove a budget exhausted nor prove it
-//! within bounds, and doctor reports a token budget it cannot enforce.
+//! counts come from the retained run history ([`MAX_SCHEDULE_RUNS`] runs per
+//! schedule), so a window that history does not reach back through holds lower
+//! bounds only: activation is refused, and doctor reports the run budget as
+//! unverifiable, unless the budget is already shown exhausted. Token usage
+//! the backend does not report is unknown, never zero: it can neither prove a
+//! budget exhausted nor prove it within bounds, and doctor reports a token
+//! budget it cannot enforce.
 //!
 //! Windows are fixed and aligned to the Unix epoch in UTC, so every caller
 //! computes the same window for the same instant. Intervals are measured in
@@ -148,6 +152,19 @@ pub enum BudgetError {
         /// The budget.
         allowed: u64,
     },
+    /// The observed runs may not be all of the window's runs, so the budget
+    /// cannot be shown to hold.
+    #[error(
+        "schedule {consumer}'s run history does not reach the start of the window ({observed} runs seen of {allowed} allowed), so it may already be over budget"
+    )]
+    IncompleteEvidence {
+        /// The schedule.
+        consumer: ConsumerId,
+        /// Runs observed in the window: a lower bound.
+        observed: u32,
+        /// The run budget that cannot be verified.
+        allowed: u64,
+    },
     /// No usage evidence was supplied for the schedule being checked.
     #[error("schedule {consumer} has no usage evidence")]
     UnobservedSchedule {
@@ -174,6 +191,7 @@ impl BudgetError {
             | Self::IntervalTooShort { .. }
             | Self::Overcommitted { .. }
             | Self::Exhausted { .. }
+            | Self::IncompleteEvidence { .. }
             | Self::UnobservedSchedule { .. }
             | Self::HouseMismatch => ErrorClass::Refused,
         }
@@ -598,8 +616,13 @@ impl SchedulePolicy {
     /// exhausted in the current window. Evidence must cover every schedule
     /// of the house, since the house budget counts them all.
     ///
+    /// A window whose start the observation did not reach
+    /// ([`WindowUsage::complete`] is `false`) holds lower bounds only, so
+    /// activation is refused unless the budget is already shown exhausted.
+    ///
     /// # Errors
     /// [`BudgetError::Exhausted`] naming the limit,
+    /// [`BudgetError::IncompleteEvidence`] for an incomplete window,
     /// [`BudgetError::UnobservedSchedule`] when `consumer` has no evidence,
     /// and any [`Self::assess`] refusal.
     pub fn check_activation(
@@ -616,24 +639,41 @@ impl SchedulePolicy {
             .ok_or_else(|| BudgetError::UnobservedSchedule {
                 consumer: consumer.clone(),
             })?;
-        match schedule.exhausted {
-            None => Ok(()),
-            Some(exhausted) => Err(BudgetError::Exhausted {
+        if let Some(exhausted) = schedule.exhausted {
+            return Err(BudgetError::Exhausted {
                 consumer: consumer.clone(),
                 limit: exhausted.limit,
                 used: exhausted.used,
                 allowed: exhausted.allowed,
-            }),
+            });
         }
+        // Not proven exhausted, but counts from a window whose start the
+        // observation did not reach are lower bounds: fail closed.
+        let (observed, allowed) = if !schedule.usage.complete {
+            (schedule.usage.runs, self.budget_for(consumer).runs)
+        } else if !assessment.house.complete {
+            (assessment.house.runs, self.house_budget.runs)
+        } else {
+            return Ok(());
+        };
+        Err(BudgetError::IncompleteEvidence {
+            consumer: consumer.clone(),
+            observed,
+            allowed: allowed.get().into(),
+        })
     }
 
     /// The schedules to pause and report for exhausted budgets.
     ///
-    /// Each exhausted schedule is reported once per window: `reported` says
-    /// whether a report was already recorded under a
-    /// [`BudgetExhaustion::marker_key`]. A schedule still active, or whose
-    /// state is unknown, is paused; a paused one is only reported. A missing
-    /// one is neither.
+    /// Every pass pauses an exhausted schedule that is still active or whose
+    /// state is unknown, including one re-activated after its report was
+    /// recorded; a paused one is only reported. A missing one is neither.
+    /// The owner report is sent once per window: `reported` says whether one
+    /// was already recorded under a [`BudgetExhaustion::marker_key`], and
+    /// [`BudgetExhaustion::report_due`] is `false` when it was.
+    ///
+    /// A run budget above the retained run history cannot be proven exhausted
+    /// from an incomplete window; see [`WindowUsage::complete`].
     ///
     /// The caller submits each pause effect, reports to the owner, and then
     /// records the marker. After an interruption, the next pass finds the
@@ -658,18 +698,39 @@ impl SchedulePolicy {
                 ObservedScheduleState::Paused => false,
                 ObservedScheduleState::Active | ObservedScheduleState::Unknown => true,
             };
-            let item = BudgetExhaustion {
+            let mut item = BudgetExhaustion {
                 consumer: schedule.consumer,
                 schedule: schedule.schedule,
                 window: assessment.window,
                 exhausted,
                 pause,
+                report_due: true,
             };
-            if !reported(&item.marker_key()?) {
+            item.report_due = !reported(&item.marker_key()?);
+            if item.pause || item.report_due {
                 plan.push(item);
             }
         }
         Ok(plan)
+    }
+
+    /// Schedules whose window the observed runs do not cover and whose run
+    /// budget is not shown exhausted. The observed count is a lower bound, so
+    /// the budget cannot be shown to hold.
+    ///
+    /// # Errors
+    /// Any [`Self::assess`] refusal.
+    pub fn unverifiable_run_budgets(
+        &self,
+        house: &HouseId,
+        evidence: &ScheduleEvidence,
+    ) -> Result<Vec<ScheduleAssessment>, BudgetError> {
+        Ok(self
+            .assess(house, evidence)?
+            .schedules
+            .into_iter()
+            .filter(|schedule| !schedule.usage.complete && schedule.exhausted.is_none())
+            .collect())
     }
 
     /// Schedules whose precheck reported idle for at least the policy's share
@@ -1000,6 +1061,9 @@ pub struct BudgetExhaustion {
     pub exhausted: Exhausted,
     /// Whether it must be paused; `false` when it already is.
     pub pause: bool,
+    /// Whether the owner has not yet been told about this window's
+    /// exhaustion. Independent of `pause`.
+    pub report_due: bool,
 }
 
 /// The fact recorded once a budget exhaustion was reported.

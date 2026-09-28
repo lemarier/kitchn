@@ -39,8 +39,8 @@ use crate::{
     },
     scheduling::{
         InstallPlan, InstalledSchedule, MAX_SCHEDULE_RUNS, ObservedScheduleState, PrecheckOutcome,
-        Readiness, RunOutcome, ScheduleField, ScheduleObservation, ScheduleRun, ScheduleSpec,
-        ScheduleState, ScheduleWorkspace, plan_install,
+        Readiness, RunOutcome, ScheduleEvidence, ScheduleField, ScheduleObservation, ScheduleRun,
+        ScheduleSpec, ScheduleState, ScheduleUsage, ScheduleWorkspace, plan_install,
     },
     trust::Measurement,
 };
@@ -575,9 +575,13 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// Pause or activate a Kitchen schedule and read the state back.
     ///
     /// Activation starts a live consumer; the caller must hold that authority.
+    /// With a schedule policy, activation is refused while the schedule's or
+    /// the house's budget is exhausted in the current window, or cannot be
+    /// shown to hold, before anything is edited. Pausing is never refused.
     ///
     /// # Errors
     /// [`OrcaError::NotKitchenOwned`], [`OrcaError::ScheduleNotFound`],
+    /// [`OrcaError::ScheduleLimit`] for a refused activation,
     /// [`OrcaError::StateMismatch`] when the read-back differs, and call failures.
     pub fn set_schedule_state(
         &self,
@@ -585,6 +589,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         state: ScheduleState,
     ) -> Result<(), OrcaError> {
         let automation = self.owned(schedule)?;
+        if state == ScheduleState::Active {
+            self.check_activation(&automation)?;
+        }
         let switch = match state {
             ScheduleState::Paused => "disabled",
             ScheduleState::Active => "enabled",
@@ -601,6 +608,41 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             Err(error) => Err(error),
             Ok(_) => Err(OrcaError::StateMismatch),
         }
+    }
+
+    /// Judge the house's usage in the window containing now, from a fresh
+    /// observation of every schedule, and refuse activating `automation`
+    /// when its budget is exhausted or unverifiable.
+    fn check_activation(&self, automation: &Automation) -> Result<(), OrcaError> {
+        let Some(policy) = self.schedule_policy() else {
+            return Ok(());
+        };
+        let house = &self.config().house;
+        let Some(consumer) = decode_name(house, &automation.name) else {
+            return Err(OrcaError::NotKitchenOwned);
+        };
+        let now = self.now();
+        // Counting runs does not depend on readiness: only the verdicts of
+        // launched runs do, and every one of those counts as a possible start.
+        let readiness = Readiness::new(&[], now, std::time::Duration::ZERO);
+        let schedules = self
+            .installed_schedules()?
+            .into_iter()
+            .map(|installed| {
+                Ok(ScheduleUsage {
+                    observation: self.inspect_schedule(&installed.resource, &readiness)?,
+                    consumer: installed.consumer,
+                    schedule: installed.resource,
+                })
+            })
+            .collect::<Result<Vec<_>, OrcaError>>()?;
+        let evidence = ScheduleEvidence {
+            house: house.clone(),
+            observed_at: now,
+            schedules,
+        };
+        policy.check_activation(house, &evidence, &consumer)?;
+        Ok(())
     }
 
     /// Remove a Kitchen schedule and its run history, and confirm it is gone.

@@ -67,7 +67,8 @@ pub enum Check {
     /// A cancelled worker is reported settled; a missing record is not evidence.
     CancelObserved,
     /// Releasing the cancelled worker names no branch in its receipt, and a
-    /// branch the inventory listed before is still listed after.
+    /// branch the inventory listed before is still listed after. Without a
+    /// declared inventory, only the receipt is checked.
     ReleaseKeepsBranch,
 }
 
@@ -884,7 +885,10 @@ impl<'a> Runner<'a> {
     /// Release the cancelled worker. A release removes what it releases and
     /// never the branch that was checked out: the dishwasher's pushed check
     /// relies on that branch outliving a released worktree. A release the
-    /// backend retains deletes nothing and passes.
+    /// backend retains deletes nothing and passes. Without a declared
+    /// inventory only the receipt is checked, so a backend that deletes the
+    /// branch without naming it in the receipt is caught only where its
+    /// inventory lists branches.
     fn release_keeps_branch(
         &mut self,
         backend: &dyn WorkerBackend,

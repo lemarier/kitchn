@@ -1358,8 +1358,15 @@ fn a_stale_issue_handled_at_its_revision_leaves_the_precheck_idle() -> common::T
         &tick,
         common::at(1),
     )?;
+    let foreign = gardener::StaleMarkers::new(&other.store)?;
     assert_eq!(
-        precheck(&gardener::StaleMarkers::new(&other.store)?, json!([old]))?,
+        precheck(&foreign, json!([old.clone()]))?,
+        Err(WorkflowError::IncompleteEvidence)
+    );
+    // An unhandled stale issue listed first does not hide it.
+    let unhandled = forge_issue(2, "open", "2025-12-01T00:00:00Z", &[]);
+    assert_eq!(
+        precheck(&foreign, json!([unhandled, old]))?,
         Err(WorkflowError::IncompleteEvidence)
     );
     Ok(())

@@ -3,6 +3,7 @@
 //! separate house grants.
 
 use std::{
+    collections::BTreeMap,
     num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
     time::Duration,
@@ -18,7 +19,7 @@ use crate::{
         GrantScope, HouseGrants, IssueNumber, Permission, Repository, ScheduleEffect, Text,
         Timestamp,
     },
-    integrations::github::{GitHubClient, GitHubReadTransport, IssueState},
+    integrations::github::{GitHubClient, GitHubReadTransport, Issue as GitHubIssue, IssueState},
     scheduling::{
         self, AgentFamily, PrecheckTimeout, Recurrence, ScheduleSpec, TimeOfDay, Timezone,
         WorkflowName,
@@ -319,12 +320,6 @@ pub fn signal<T: GitHubReadTransport>(
     window: Window,
     handled: Option<&StaleMarkers<'_>>,
 ) -> Result<Signal, WorkflowError> {
-    let unhandled = |number: IssueNumber, updated_at: Timestamp| match handled {
-        Some(markers) => markers
-            .handled(repo, number, updated_at)
-            .map(|handled| !handled),
-        None => Ok(true),
-    };
     let changed = known(client.issues_filtered(house, repo, None, Some(window.since)))?;
     let open = known(client.issues_filtered(house, repo, Some(IssueState::Open), None))?;
     let mut closed_agent_label = false;
@@ -343,23 +338,19 @@ pub fn signal<T: GitHubReadTransport>(
     if open.iter().any(|issue| issue.state != IssueState::Open) {
         return Err(WorkflowError::IncompleteEvidence);
     }
-    let mut daily_changes = false;
-    for issue in &changed {
-        if unhandled(issue.number, issue.updated_at)? {
-            daily_changes = true;
-            break;
-        }
-    }
-    let mut stale_issue = false;
-    for issue in open
+    // Every handled marker is read and checked, not only those of the
+    // issues looked at before the first unhandled one.
+    let revisions = match handled {
+        Some(markers) => markers.revisions(repo)?,
+        None => BTreeMap::new(),
+    };
+    let unhandled =
+        |issue: &&GitHubIssue| revisions.get(&issue.number.get()) != Some(&issue.updated_at);
+    let daily_changes = changed.iter().any(|issue| unhandled(&issue));
+    let stale_issue = open
         .iter()
         .filter(|issue| issue.updated_at < window.stale_before)
-    {
-        if unhandled(issue.number, issue.updated_at)? {
-            stale_issue = true;
-            break;
-        }
-    }
+        .any(|issue| unhandled(&issue));
     Ok(Signal {
         daily_changes,
         stale_issue,
@@ -390,6 +381,12 @@ impl StaleHandled {
         fact.decode(&stale_schema()?)
             .map_err(|_| WorkflowError::IncompleteEvidence)
     }
+}
+
+fn stale_subject() -> Result<MarkerSubject, WorkflowError> {
+    ExternalRef::new(STALE_SUBJECT)
+        .map(MarkerSubject::Observation)
+        .map_err(|_| WorkflowError::IncompleteEvidence)
 }
 
 fn stale_schema() -> Result<MarkerSchema, WorkflowError> {
@@ -425,10 +422,35 @@ impl<'a> StaleMarkers<'a> {
                 repository: repository.clone(),
                 number: NonZeroU64::new(issue.get()).ok_or(WorkflowError::IncompleteEvidence)?,
             },
-            subject: MarkerSubject::Observation(
-                ExternalRef::new(STALE_SUBJECT).map_err(|_| WorkflowError::IncompleteEvidence)?,
-            ),
+            subject: stale_subject()?,
         })
+    }
+
+    /// The handled revision of each issue number in `repository`, from one
+    /// store read. Every marker at a handled-stale key must decode; a
+    /// foreign fact there proves nothing and is
+    /// [`WorkflowError::IncompleteEvidence`].
+    fn revisions(
+        &self,
+        repository: &Repository,
+    ) -> Result<BTreeMap<u64, Timestamp>, WorkflowError> {
+        let subject = stale_subject()?;
+        self.store
+            .markers(&self.workflow)
+            .map_err(|_| WorkflowError::PrecheckFailed)?
+            .iter()
+            .filter(|marker| marker.key().subject == subject)
+            .filter_map(|marker| match &marker.key().item {
+                WorkItem::Issue {
+                    repository: owner,
+                    number,
+                } if owner == repository => Some((number.get(), marker.fact())),
+                WorkItem::Issue { .. }
+                | WorkItem::PullRequest { .. }
+                | WorkItem::Resource { .. } => None,
+            })
+            .map(|(number, fact)| Ok((number, StaleHandled::decode(fact)?.revision)))
+            .collect()
     }
 
     /// Whether `issue` was handled and has not been updated since: its last

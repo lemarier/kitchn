@@ -205,13 +205,21 @@ pub fn run_worker(
             "receipt names no worker on this backend",
         );
     };
+    // Exactly the requested branch: created once on this backend, and no
+    // other branch created or touched.
     let requested = runner.branch()?;
-    let names_branch = receipt.created().iter().any(|resource| {
-        resource.kind == ResourceKind::Branch
-            && &resource.backend == own
-            && resource.handle.as_str() == requested.as_str()
-    });
-    if !names_branch {
+    let mut branches = receipt
+        .created()
+        .iter()
+        .chain(receipt.touched())
+        .filter(|resource| resource.kind == ResourceKind::Branch);
+    let exact = matches!(
+        (branches.next(), branches.next()),
+        (Some(branch), None) if &branch.backend == own
+            && branch.handle.as_str() == requested.as_str()
+            && receipt.created().contains(branch)
+    );
+    if !exact {
         return fail(
             Check::LaunchReceipt,
             "receipt does not name exactly the requested branch",

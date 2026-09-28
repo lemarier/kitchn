@@ -1639,3 +1639,66 @@ fn a_backend_reporting_another_branch_fails_the_contract() -> TestResult {
     );
     Ok(())
 }
+
+/// Reports the requested branch plus another one it created or touched.
+struct ExtraBranch {
+    inner: FakeBackend,
+    created: bool,
+}
+
+impl EffectExecutor for ExtraBranch {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.inner.descriptor()
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        let receipt = self.inner.execute(request)?;
+        let lost = || EffectFailure::Uncertain(UncertainReason::ResponseLost);
+        let has_branch = receipt
+            .created()
+            .iter()
+            .any(|resource| resource.kind == ResourceKind::Branch);
+        if !has_branch {
+            return Ok(receipt);
+        }
+        let extra = ResourceRef {
+            kind: ResourceKind::Branch,
+            backend: self.inner.descriptor().backend.clone(),
+            handle: ExternalRef::new("kitchen/unrequested").map_err(|_| lost())?,
+        };
+        let mut created = receipt.created().to_vec();
+        let mut touched = receipt.touched().to_vec();
+        if self.created {
+            created.push(extra);
+        } else {
+            touched.push(extra);
+        }
+        Receipt::new(receipt.reference().clone(), created, touched).map_err(|_| lost())
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.inner.lookup(request)
+    }
+}
+
+impl WorkerBackend for ExtraBranch {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.inner.observe_worker(worker)
+    }
+}
+
+#[test]
+fn a_backend_reporting_an_extra_branch_fails_the_contract() -> TestResult {
+    for created in [true, false] {
+        let backend = ExtraBranch {
+            inner: fake([
+                Capability::WorkerLaunchIsolated,
+                Capability::WorkerStatusAndOutcome,
+            ])?,
+            created,
+        };
+        let failure = conformance::run_worker(&backend, &conformance_fixture()?)
+            .err()
+            .ok_or("a launch with an extra branch passed")?;
+        assert_eq!(failure.check, Check::LaunchReceipt, "created: {created}");
+    }
+    Ok(())
+}

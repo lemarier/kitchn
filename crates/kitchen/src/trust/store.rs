@@ -634,9 +634,10 @@ fn store_error(error: crate::Error) -> TrustError {
         crate::Error::Contract(error) => TrustError::Authority(error),
         crate::Error::Trust(error) => error,
         // A task read produces none of these; refuse rather than guess.
-        crate::Error::Identifier(_) | crate::Error::House(_) | crate::Error::Scaffold(_) => {
-            TrustError::Refused
-        }
+        crate::Error::Identifier(_)
+        | crate::Error::House(_)
+        | crate::Error::Integration(_)
+        | crate::Error::Scaffold(_) => TrustError::Refused,
     }
 }
 fn audit_identity(audit: &GrantAudit) -> (&crate::contracts::ExternalRef, &HouseId) {

@@ -130,8 +130,7 @@ impl FakeBackend {
         let resources = match request.operation() {
             Operation::LaunchWorker { workspace, .. } => {
                 let worker = self.handle(state, "worker")?;
-                state.workers.insert(worker.clone(), WorkerState::Starting);
-                let mut resources = vec![self.resource(ResourceKind::Worker, worker)];
+                let mut resources = vec![self.resource(ResourceKind::Worker, worker.clone())];
                 match workspace {
                     Workspace::Isolated => {
                         let worktree = self.handle(state, "worktree")?;
@@ -139,6 +138,7 @@ impl FakeBackend {
                     }
                     Workspace::Existing(existing) => resources.push(existing.clone()),
                 }
+                state.workers.insert(worker, WorkerState::Starting);
                 resources
             }
             Operation::MessageWorker { worker, .. } => {

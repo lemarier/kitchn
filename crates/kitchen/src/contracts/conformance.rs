@@ -482,8 +482,12 @@ impl Runner<'_> {
                 worker: worker.clone(),
             },
         )?;
-        if self.backend.execute(&request).is_err() {
-            return fail(check, "cancel of a launched worker failed");
+        match self.backend.execute(&request) {
+            // An uncertain cancel is allowed; the observation below decides.
+            Ok(_) | Err(EffectFailure::Uncertain(_)) => {}
+            Err(EffectFailure::NotApplied(_)) => {
+                return fail(check, "cancel of a launched worker was refused");
+            }
         }
         match self.backend.observe_worker(worker) {
             Ok(WorkerState::Ready | WorkerState::AwaitingReply | WorkerState::Starting) => {

@@ -1722,13 +1722,16 @@ impl StoreState {
         now: Timestamp,
     ) -> Result<()> {
         let record = self.held_consumer(consumer, fence)?;
-        if let ConsumerState::Held { lease } = &record.state {
-            let lease = lease.clone();
-            record.record(
-                ConsumerState::Relinquished { lease, at: now },
-                ConsumerEvent::Relinquished { fence, at: now },
-            );
-        }
+        let lease = match &record.state {
+            ConsumerState::Held { lease } => lease.clone(),
+            ConsumerState::Relinquished { .. } | ConsumerState::Idle => {
+                return fail(StateError::StaleFence { presented: fence });
+            }
+        };
+        record.record(
+            ConsumerState::Relinquished { lease, at: now },
+            ConsumerEvent::Relinquished { fence, at: now },
+        );
         Ok(())
     }
 

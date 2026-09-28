@@ -124,8 +124,7 @@ fn consent_for_a_different_effect_is_rejected() -> TestResult {
         workspace: Workspace::Isolated,
         brief: Text::new("A different brief.")?,
     };
-    let mut other_task = consent("c-task", &task_id("task-2")?, launch()?)?;
-    other_task.task = task_id("task-2")?;
+    let other_task = consent("c-task", &task_id("task-2")?, launch()?)?;
     let mut other_house_consent = consent("c-house", &task, launch()?)?;
     other_house_consent.house = other_house()?;
     let mut stale = consent("c-stale", &task, launch()?)?;

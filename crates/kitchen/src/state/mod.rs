@@ -48,8 +48,8 @@ pub use consumer::{ConsumerEvent, ConsumerRecord, ConsumerState, MAX_CONSUMER_HI
 pub use effects::{ReconcileReport, reconcile, run_effect};
 pub use error::{Corruption, Limit, StateError, StorageOperation};
 pub use marker::{
-    MAX_MARKER_HISTORY, MAX_MARKERS, MarkerFact, MarkerKey, MarkerRecording, SupersededFact,
-    WorkItem, WorkflowMarker,
+    MAX_MARKER_HISTORY, MAX_MARKER_PAYLOAD_BYTES, MAX_MARKERS, MarkerFact, MarkerKey,
+    MarkerPayload, MarkerRecording, MarkerSchema, SupersededFact, WorkItem, WorkflowMarker,
 };
 pub use model::{
     AttemptRecord, AttemptState, CancelRequest, CancelStatus, Consumption, Creation, EffectOutcome,

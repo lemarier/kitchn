@@ -6,14 +6,18 @@
 //! effects: a report-only run performs no effect but still records a marker,
 //! so the next run can skip the same head or avoid repeating a question.
 
-use std::num::NonZeroU64;
+use std::{
+    fmt,
+    num::{NonZeroU32, NonZeroU64},
+    str::FromStr,
+};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     WorkflowId,
     contracts::{Claimant, EvidenceSubject, EvidenceVerdict, ExternalRef, Repository, Timestamp},
-    state::Corruption,
+    state::{Corruption, StateError},
 };
 
 /// Markers per house store.
@@ -69,6 +73,184 @@ pub enum MarkerFact {
         /// The question's reference, such as a decision request id.
         question: ExternalRef,
     },
+    /// A fact owned by one workflow area, encoded by that area's own typed
+    /// serde struct. The core checks only the schema id and size; it never
+    /// interprets the payload.
+    Workflow {
+        /// The payload's schema and version.
+        schema: MarkerSchema,
+        /// The encoded payload.
+        payload: MarkerPayload,
+    },
+}
+
+impl MarkerFact {
+    /// Encode a workflow-owned fact with `schema`.
+    ///
+    /// # Errors
+    /// Returns [`StateError::MarkerPayloadInvalid`] when `value` does not
+    /// serialize or exceeds [`MAX_MARKER_PAYLOAD_BYTES`].
+    pub fn workflow<T: Serialize>(schema: MarkerSchema, value: &T) -> Result<Self, StateError> {
+        let text = serde_json::to_string(value).map_err(|_| StateError::MarkerPayloadInvalid)?;
+        Ok(Self::Workflow {
+            schema,
+            payload: MarkerPayload::new(text)?,
+        })
+    }
+
+    /// Decode a workflow-owned fact that must use `expected`.
+    ///
+    /// # Errors
+    /// Returns [`StateError::MarkerSchemaMismatch`] for another schema or
+    /// version or a different fact kind, and [`StateError::MarkerPayloadInvalid`]
+    /// when the payload does not decode into `T`.
+    pub fn decode<T: DeserializeOwned>(&self, expected: &MarkerSchema) -> Result<T, StateError> {
+        match self {
+            Self::Workflow { schema, payload } if schema == expected => {
+                serde_json::from_str(&payload.0).map_err(|_| StateError::MarkerPayloadInvalid)
+            }
+            Self::Workflow { schema, .. } => Err(StateError::MarkerSchemaMismatch {
+                expected: expected.clone(),
+                found: Some(schema.clone()),
+            }),
+            Self::Verdict { .. } | Self::QuestionAsked { .. } => {
+                Err(StateError::MarkerSchemaMismatch {
+                    expected: expected.clone(),
+                    found: None,
+                })
+            }
+        }
+    }
+}
+
+/// Maximum encoded size of a workflow-owned marker payload. The store's
+/// snapshot size limit also applies to the total.
+pub const MAX_MARKER_PAYLOAD_BYTES: usize = 4096;
+
+/// A workflow marker schema id and version, written `name/version`, such as
+/// `gate.verdict/1`. The name uses lowercase ASCII letters, digits, `.`, `_`,
+/// and `-` (1–64 bytes); the version is a positive integer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct MarkerSchema {
+    name: String,
+    version: NonZeroU32,
+}
+
+impl MarkerSchema {
+    /// Validate `name` and `version`.
+    ///
+    /// # Errors
+    /// Returns [`StateError::MarkerSchemaInvalid`] for an invalid name.
+    pub fn new(name: &str, version: NonZeroU32) -> Result<Self, StateError> {
+        let valid = (1..=64).contains(&name.len())
+            && name.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            });
+        if valid {
+            Ok(Self {
+                name: name.to_owned(),
+                version,
+            })
+        } else {
+            Err(StateError::MarkerSchemaInvalid)
+        }
+    }
+
+    /// The schema name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The schema version.
+    #[must_use]
+    pub const fn version(&self) -> NonZeroU32 {
+        self.version
+    }
+}
+
+impl fmt::Display for MarkerSchema {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.name, self.version)
+    }
+}
+
+impl FromStr for MarkerSchema {
+    type Err = StateError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (name, version) = value
+            .split_once('/')
+            .ok_or(StateError::MarkerSchemaInvalid)?;
+        let version = version
+            .parse::<NonZeroU32>()
+            .map_err(|_| StateError::MarkerSchemaInvalid)?;
+        if version.to_string() != value.split_once('/').map_or("", |(_, raw)| raw) {
+            return Err(StateError::MarkerSchemaInvalid);
+        }
+        Self::new(name, version)
+    }
+}
+
+impl TryFrom<String> for MarkerSchema {
+    type Error = StateError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<MarkerSchema> for String {
+    fn from(schema: MarkerSchema) -> Self {
+        schema.to_string()
+    }
+}
+
+/// An encoded workflow-owned payload, at most [`MAX_MARKER_PAYLOAD_BYTES`].
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct MarkerPayload(String);
+
+impl MarkerPayload {
+    /// Wrap an encoded payload.
+    ///
+    /// # Errors
+    /// Returns [`StateError::MarkerPayloadInvalid`] beyond the size bound.
+    pub fn new(encoded: String) -> Result<Self, StateError> {
+        if encoded.len() > MAX_MARKER_PAYLOAD_BYTES {
+            return Err(StateError::MarkerPayloadInvalid);
+        }
+        Ok(Self(encoded))
+    }
+
+    /// The encoded payload.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for MarkerPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "MarkerPayload({} bytes)", self.0.len())
+    }
+}
+
+impl TryFrom<String> for MarkerPayload {
+    type Error = StateError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<MarkerPayload> for String {
+    fn from(payload: MarkerPayload) -> Self {
+        payload.0
+    }
 }
 
 /// One recorded marker.
@@ -178,7 +360,7 @@ impl MarkerFact {
     /// stays recorded so it is never asked again.
     const fn supersedable(&self) -> bool {
         match self {
-            Self::Verdict { .. } => true,
+            Self::Verdict { .. } | Self::Workflow { .. } => true,
             Self::QuestionAsked { .. } => false,
         }
     }

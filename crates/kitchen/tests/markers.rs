@@ -495,3 +495,150 @@ fn corrupt_marker_history_is_rejected_without_reset() -> TestResult {
     assert_eq!(marker.history().len(), kitchen::state::MAX_MARKER_HISTORY);
     Ok(())
 }
+
+/// A gate's own typed verdict, as #9 would define it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct GateVerdict {
+    ready: bool,
+    missing_checks: Vec<String>,
+}
+
+fn gate_schema(version: u32) -> TestResult<kitchen::state::MarkerSchema> {
+    Ok(kitchen::state::MarkerSchema::new(
+        "gate.verdict",
+        std::num::NonZeroU32::new(version).ok_or("zero")?,
+    )?)
+}
+
+#[test]
+fn workflow_owned_facts_round_trip_through_their_schema() -> TestResult {
+    let fixture = Fixture::new()?;
+    let gate = key("merge-gate", pull_request(20)?, 'a', Some('b'))?;
+    let pending = GateVerdict {
+        ready: false,
+        missing_checks: vec!["ci".to_owned()],
+    };
+    let fact = MarkerFact::workflow(gate_schema(1)?, &pending)?;
+    fixture
+        .store
+        .record_marker(gate.clone(), fact.clone(), &scheduled("gate")?, at(1))?;
+    assert!(matches!(
+        fixture
+            .store
+            .record_marker(gate.clone(), fact.clone(), &scheduled("gate")?, at(2))?,
+        MarkerRecording::AlreadyRecorded(_)
+    ));
+    let stored = fixture.reopen()?.marker(&gate)?.ok_or("marker lost")?;
+    assert_eq!(
+        stored.fact().decode::<GateVerdict>(&gate_schema(1)?)?,
+        pending
+    );
+    assert_eq!(
+        "gate.verdict/1".parse::<kitchen::state::MarkerSchema>()?,
+        gate_schema(1)?
+    );
+
+    // A different version, or a core fact, is an explicit mismatch.
+    assert!(matches!(
+        stored.fact().decode::<GateVerdict>(&gate_schema(2)?),
+        Err(StateError::MarkerSchemaMismatch { found: Some(found), .. }) if found == gate_schema(1)?
+    ));
+    assert!(matches!(
+        verdict(EvidenceVerdict::Pass).decode::<GateVerdict>(&gate_schema(1)?),
+        Err(StateError::MarkerSchemaMismatch { found: None, .. })
+    ));
+    // Same schema, wrong shape: the owning area sees a decode error.
+    assert!(matches!(
+        stored.fact().decode::<Vec<u8>>(&gate_schema(1)?),
+        Err(StateError::MarkerPayloadInvalid)
+    ));
+
+    // The explicit supersede keeps the prior workflow fact in history.
+    let ready = MarkerFact::workflow(
+        gate_schema(1)?,
+        &GateVerdict {
+            ready: true,
+            missing_checks: Vec::new(),
+        },
+    )?;
+    let MarkerRecording::Superseded(updated) =
+        fixture
+            .store
+            .supersede_marker(&gate, &fact, ready.clone(), &scheduled("gate")?, at(3))?
+    else {
+        return Err("expected a supersession".into());
+    };
+    assert_eq!(updated.fact(), &ready);
+    assert!(matches!(updated.history(), [prior] if prior.fact == fact));
+    Ok(())
+}
+
+#[test]
+fn workflow_payloads_and_schemas_are_bounded_and_validated() -> TestResult {
+    let at_bound = "x".repeat(kitchen::state::MAX_MARKER_PAYLOAD_BYTES - 2);
+    assert!(
+        MarkerFact::workflow(gate_schema(1)?, &at_bound).is_ok(),
+        "quoted string at the bound"
+    );
+    let over = "x".repeat(kitchen::state::MAX_MARKER_PAYLOAD_BYTES);
+    assert!(matches!(
+        MarkerFact::workflow(gate_schema(1)?, &over),
+        Err(StateError::MarkerPayloadInvalid)
+    ));
+    for invalid in [
+        "gate.verdict",
+        "gate.verdict/0",
+        "gate.verdict/01",
+        "Gate/1",
+        "gate verdict/1",
+        "/1",
+        "gate/x",
+    ] {
+        assert!(
+            matches!(
+                invalid.parse::<kitchen::state::MarkerSchema>(),
+                Err(StateError::MarkerSchemaInvalid)
+            ),
+            "{invalid}"
+        );
+    }
+    assert!(kitchen::state::MarkerSchema::new(&"a".repeat(65), std::num::NonZeroU32::MIN).is_err());
+
+    // Oversized or mis-named persisted values are rejected on load.
+    let fixture = Fixture::new()?;
+    let gate = key("merge-gate", pull_request(20)?, 'a', None)?;
+    fixture.store.record_marker(
+        gate,
+        MarkerFact::workflow(gate_schema(1)?, &"ok")?,
+        &scheduled("gate")?,
+        at(1),
+    )?;
+    let path = fixture.state_path();
+    let valid: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let mut oversized = valid.clone();
+    oversized["markers"][0]["fact"]["payload"] = "x"
+        .repeat(kitchen::state::MAX_MARKER_PAYLOAD_BYTES + 1)
+        .into();
+    let mut misnamed = valid;
+    misnamed["markers"][0]["fact"]["schema"] = "Gate/1".into();
+    for corrupt in [oversized, misnamed] {
+        let bytes = serde_json::to_vec_pretty(&corrupt)?;
+        fs::write(&path, &bytes)?;
+        let error = fixture
+            .reopen()
+            .err()
+            .ok_or("invalid workflow fact was accepted")?;
+        let error = error
+            .downcast::<Error>()
+            .map_err(|_| "unexpected error type")?;
+        assert!(
+            matches!(
+                *error,
+                Error::State(StateError::CorruptState(Corruption::Syntax { .. }))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(fs::read(&path)?, bytes);
+    }
+    Ok(())
+}

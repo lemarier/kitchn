@@ -5,6 +5,7 @@ use std::{fmt, io};
 use crate::{
     BackendId, ConsumerId, ErrorClass, HolderId, TaskId,
     contracts::{AttemptNumber, EffectSeq, EvidenceRevision, Fence, Settlement, Timestamp},
+    state::MarkerSchema,
 };
 
 /// A bounded collection that reached its limit.
@@ -225,6 +226,20 @@ pub enum StateError {
         /// The backend namespace recorded with its intent.
         recorded: BackendId,
     },
+    /// A workflow marker schema id is not `name/version` with a valid name.
+    #[error("invalid workflow marker schema")]
+    MarkerSchemaInvalid,
+    /// A workflow-owned marker payload is too large or does not decode.
+    #[error("workflow marker payload is too large or does not decode")]
+    MarkerPayloadInvalid,
+    /// A workflow marker uses another schema or version than expected.
+    #[error("workflow marker uses schema {found:?}, expected {expected}")]
+    MarkerSchemaMismatch {
+        /// The schema the caller expected.
+        expected: MarkerSchema,
+        /// The recorded schema; `None` for a core fact kind.
+        found: Option<MarkerSchema>,
+    },
     /// No workflow marker is recorded under this key.
     #[error("no workflow marker is recorded for this key")]
     MarkerNotFound,
@@ -314,6 +329,7 @@ impl StateError {
     pub const fn class(&self) -> ErrorClass {
         match self {
             Self::SubmissionBudgetExhausted(_) | Self::ConsentReused => ErrorClass::Refused,
+            Self::MarkerSchemaInvalid | Self::MarkerPayloadInvalid => ErrorClass::InvalidInput,
             Self::TaskNotFound(_)
             | Self::TaskConflict(_)
             | Self::TaskSettled { .. }
@@ -332,6 +348,7 @@ impl StateError {
             | Self::BackendMismatch { .. }
             | Self::MarkerConflict
             | Self::MarkerNotFound
+            | Self::MarkerSchemaMismatch { .. }
             | Self::MarkerNotSupersedable
             | Self::NotHandedOver(_)
             | Self::DecisionScope(_)

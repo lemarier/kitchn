@@ -1198,11 +1198,12 @@ const menu = [
   h1,
   h2,
   h3 {
-    font-family: var(--display);
-    font-weight: 900;
-    line-height: 0.95;
+    font-family: var(--body);
+    font-weight: 700;
+    line-height: 1.05;
+    letter-spacing: -0.035em;
     margin: 0;
-    text-transform: uppercase;
+    text-wrap: balance;
   }
 
   .wrap {
@@ -1304,6 +1305,11 @@ const menu = [
     padding: clamp(4rem, 10vw, 7.5rem) 0 clamp(3rem, 6vw, 4.5rem);
   }
   .hero h1 {
+    font-family: var(--display);
+    font-weight: 900;
+    letter-spacing: -0.005em;
+    line-height: 0.95;
+    text-transform: uppercase;
     font-size: clamp(3.2rem, 9vw, 8.25rem);
     display: flex;
     flex-direction: column;
@@ -1599,8 +1605,8 @@ const menu = [
     padding-top: clamp(5rem, 11vw, 8.5rem);
   }
   section h2 {
-    font-size: clamp(2.5rem, 6vw, 4.75rem);
-    max-width: 16ch;
+    font-size: clamp(2.1rem, 4.2vw, 3.4rem);
+    max-width: 22ch;
   }
   .section-lede {
     max-width: var(--measure);
@@ -1713,7 +1719,7 @@ const menu = [
     border-left: 1px solid var(--steel-edge);
   }
   .step h3 {
-    font-size: 2.25rem;
+    font-size: 1.6rem;
     display: flex;
     align-items: baseline;
     gap: 0.6rem;
@@ -1923,6 +1929,10 @@ const menu = [
     color: var(--print-red);
   }
   .contract h3 {
+    font-family: var(--display);
+    font-weight: 900;
+    letter-spacing: 0;
+    text-transform: uppercase;
     margin-top: 0.4rem;
     font-size: 2.75rem;
   }
@@ -2008,7 +2018,7 @@ const menu = [
     border-top: 3px solid var(--ink);
   }
   .guest-list h3 {
-    font-size: 2rem;
+    font-size: 1.45rem;
     max-width: 18ch;
   }
   .guest-list p {
@@ -2042,7 +2052,7 @@ const menu = [
     margin-bottom: 2.5rem;
   }
   .menu h3 {
-    font-size: 1.75rem;
+    font-size: 1.4rem;
     padding-bottom: 0.6rem;
     border-bottom: 2px dashed var(--print);
   }
@@ -2291,7 +2301,7 @@ const menu = [
     border-radius: 10px;
   }
   .beyond-card h3 {
-    font-size: 1.9rem;
+    font-size: 1.45rem;
     padding-right: 7rem;
   }
   .beyond-card > p {
@@ -2354,7 +2364,7 @@ const menu = [
     border-block: 1px solid var(--steel-edge);
   }
   .autopilot h2 {
-    font-size: clamp(3rem, 8vw, 6.5rem);
+    font-size: clamp(2.6rem, 5.5vw, 4.5rem);
     max-width: none;
   }
   .shift {
@@ -2469,7 +2479,7 @@ const menu = [
     border-top: 3px solid var(--red);
   }
   .guardrails h3 {
-    font-size: 1.9rem;
+    font-size: 1.35rem;
   }
   .guardrails p {
     margin: 0.6rem 0 0;
@@ -2479,16 +2489,19 @@ const menu = [
   /* Feature rows: a file window with a result card laid over it. */
   .feature {
     display: grid;
-    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
     gap: 3rem clamp(3rem, 7vw, 6rem);
     align-items: center;
+  }
+  .feature.flip {
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
   }
   .feature.flip .feature-copy {
     order: 2;
   }
   .feature h2 {
-    font-size: clamp(2.4rem, 5vw, 3.75rem);
-    max-width: 12ch;
+    font-size: clamp(1.9rem, 3.2vw, 2.6rem);
+    max-width: 16ch;
   }
   .feature-copy p {
     color: var(--ink-soft);
@@ -2619,7 +2632,8 @@ const menu = [
     .terms {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
-    .feature {
+    .feature,
+    .feature.flip {
       grid-template-columns: minmax(0, 1fr);
     }
     .feature.flip .feature-copy {

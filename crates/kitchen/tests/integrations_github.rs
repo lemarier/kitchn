@@ -369,6 +369,60 @@ fn gh_cli_timeout_output_bound_and_failure_are_explicit() -> Result {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn gh_cli_reports_a_missing_resource_apart_from_other_failures() -> Result {
+    let identity = r#"if [ "$4" = user ]; then printf '%s' '{"login":"sample-bot"}'; exit 0; fi"#;
+    for (body, expected) in [
+        (
+            r#"{"message":"Branch not found","status":"404"}"#,
+            IntegrationError::NotFound,
+        ),
+        (
+            r#"{"message":"Server Error","status":"502"}"#,
+            IntegrationError::Unavailable,
+        ),
+        ("gh: connection refused", IntegrationError::Unavailable),
+        ("", IntegrationError::Unavailable),
+    ] {
+        let (_root, executable, credential) =
+            fake_cli(&format!("{identity}\nprintf '%s' '{body}'\nexit 1"))?;
+        let client = GitHubClient::new(
+            scope()?,
+            GhCli::new(executable, credential)?,
+            ReadLimits::default(),
+        );
+        let branch = kitchen::contracts::BranchName::new("gone")?;
+        assert_eq!(
+            client.branch_tip(
+                &HouseId::new("sample")?,
+                &Repository::new("sample/project")?,
+                &branch
+            ),
+            Observation::Unavailable(expected),
+            "{body}"
+        );
+    }
+    // A 404 body with a successful exit is still an answer, not absence.
+    let (_root, executable, credential) = fake_cli(&format!(
+        "{identity}\nprintf '%s' '{{\"message\":\"Not Found\",\"status\":\"404\"}}'"
+    ))?;
+    let client = GitHubClient::new(
+        scope()?,
+        GhCli::new(executable, credential)?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        client.branch_tip(
+            &HouseId::new("sample")?,
+            &Repository::new("sample/project")?,
+            &kitchen::contracts::BranchName::new("gone")?
+        ),
+        Observation::Unknown
+    );
+    Ok(())
+}
+
 #[test]
 fn exact_head_checks_reviews_dependencies_and_unknown_mergeability() -> Result {
     use kitchen::contracts::CommitId;
@@ -527,7 +581,7 @@ fn gate_reads_bind_exact_head_and_preserve_missing_protection() -> Result {
     );
     assert!(matches!(client.statuses(&house, &repo, &head), Observation::Known(v) if v.len() == 1));
     assert!(
-        matches!(client.required_checks(&house, &repo, "main"), Observation::Known(v) if v.contexts == ["ci"])
+        matches!(client.required_checks(&house, &repo, &kitchen::contracts::BranchName::new("main")?), Observation::Known(v) if v.contexts == ["ci"])
     );
     assert!(matches!(client.commit(&house, &repo, &head), Observation::Known(v) if v.sha == head));
     let missing = GitHubClient::new(
@@ -536,7 +590,7 @@ fn gate_reads_bind_exact_head_and_preserve_missing_protection() -> Result {
         ReadLimits::default(),
     );
     assert_eq!(
-        missing.required_checks(&house, &repo, "main"),
+        missing.required_checks(&house, &repo, &kitchen::contracts::BranchName::new("main")?),
         Observation::Unavailable(IntegrationError::Unavailable)
     );
     Ok(())
@@ -851,8 +905,7 @@ fn closing_pr_links_are_found_without_timeline_cross_reference() -> Result {
 }
 
 #[test]
-fn required_checks_rejects_path_segments_without_io() -> Result {
-    let client = GitHubClient::new(scope()?, Fake::default(), ReadLimits::default());
+fn required_checks_take_only_validated_branch_names() -> Result {
     for branch in [
         "",
         "..",
@@ -862,16 +915,41 @@ fn required_checks_rejects_path_segments_without_io() -> Result {
         "main//next",
         "main/.hidden",
     ] {
-        assert_eq!(
-            client.required_checks(
-                &HouseId::new("sample")?,
-                &Repository::new("sample/project")?,
-                branch
-            ),
-            Observation::Unavailable(IntegrationError::InvalidInput)
+        assert!(
+            kitchen::contracts::BranchName::new(branch).is_err(),
+            "{branch}"
         );
     }
-    assert!(client.transport().requests.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn required_checks_encode_the_branch_name() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    for (name, path) in [
+        ("main", "branches/main"),
+        ("release/v1.0", "branches/release/v1.0"),
+        ("feature#1", "branches/feature%231"),
+        ("a%b&c+d", "branches/a%25b%26c%2Bd"),
+    ] {
+        let client = GitHubClient::new(
+            scope()?,
+            Fake::new(vec![Ok(json!({"contexts":["ci"],"checks":[]}))])?,
+            ReadLimits::default(),
+        );
+        let branch = kitchen::contracts::BranchName::new(name)?;
+        assert!(
+            matches!(client.required_checks(&house, &repo, &branch), Observation::Known(v) if v.contexts == ["ci"]),
+            "{name}"
+        );
+        assert_eq!(
+            client.transport().requests.borrow().as_slice(),
+            [format!(
+                "repos/sample/project/{path}/protection/required_status_checks"
+            )],
+        );
+    }
     Ok(())
 }
 

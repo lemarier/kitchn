@@ -506,30 +506,15 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
         &self,
         house: &HouseId,
         repo: &Repository,
-        branch: &str,
+        branch: &BranchName,
     ) -> Observation<RequiredChecks> {
-        if branch.is_empty()
-            || branch.len() > 255
-            || branch.starts_with('/')
-            || branch.ends_with('/')
-            || branch.split('/').any(|part| {
-                part.is_empty()
-                    || part == "."
-                    || part == ".."
-                    || part.contains("..")
-                    || part.starts_with('.')
-                    || part.ends_with('.')
-                    || !part
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
-            })
-        {
-            return Observation::Unavailable(IntegrationError::InvalidInput);
-        }
         self.single(
             house,
             repo,
-            format!("branches/{branch}/protection/required_status_checks"),
+            format!(
+                "branches/{}/protection/required_status_checks",
+                encode_branch_path(branch)
+            ),
         )
     }
     /// Read the head commit's provider timestamp.

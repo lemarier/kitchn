@@ -15,7 +15,7 @@ use crate::{
 };
 
 mod store;
-pub use store::{GATE_WORKFLOW, GateStoreError, HouseGateStore};
+pub use store::{GATE_BASE_READ_WORKFLOW, GATE_WORKFLOW, GateStoreError, HouseGateStore};
 
 /// A new head waits this long before the gate judges it.
 pub const SETTLE_TIME: Duration = Duration::from_secs(30 * 60);
@@ -41,10 +41,9 @@ pub struct GateEvidence {
     pub base: CommitId,
     /// Validated base branch the merge must still target; absent if unknown.
     pub base_branch: Option<BranchName>,
-    /// The provider answered the base branch ref read, but not with a usable
-    /// tip, so `base` is the PR's recorded base. Retrying will not help; the
-    /// PR is handed over with [`Gap::BaseUnreadable`].
-    pub base_ref_unreadable: bool,
+    /// How the base branch's current tip was read. Unless it was, `base` is
+    /// the PR's recorded base and the PR gets [`Gap::BaseUnreadable`].
+    pub base_tip: BaseTipRead,
     /// Time since the head was committed.
     pub head_age: Option<Duration>,
     /// PR is currently open.
@@ -586,6 +585,19 @@ pub enum Gap {
     /// The base branch's current tip cannot be read.
     BaseUnreadable,
 }
+/// How the gate read the base branch's current tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BaseTipRead {
+    /// The tip was read, or the base name is invalid and is a gap of its own.
+    Read,
+    /// The ref is missing, or the provider's answer is unusable. Retrying
+    /// will not help, so the PR is handed over.
+    Unreadable,
+    /// A timeout or outage that may clear. [`evaluate_and_record`] retries on
+    /// later passes and hands over after [`MAX_BASE_READ_FAILURES`] at one head.
+    Retry,
+}
 /// One bounded decision at a pinned head and base.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Verdict {
@@ -653,8 +665,9 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     if e.head_branch.is_none() {
         gaps.push(Gap::BranchTarget);
     }
-    if e.base_ref_unreadable {
-        gaps.push(Gap::BaseUnreadable);
+    match e.base_tip {
+        BaseTipRead::Read => {}
+        BaseTipRead::Unreadable | BaseTipRead::Retry => gaps.push(Gap::BaseUnreadable),
     }
     if e.head_age.is_none() {
         gaps.push(Gap::HeadAge);
@@ -1411,6 +1424,9 @@ pub const GATE_VERDICT_VERSION: u32 = 1;
 /// Refused submissions at one subject before the gate stops proposing new
 /// effects there. The next refusal hands over; a refused handover stops.
 pub const MAX_REFUSED_EFFECTS: u8 = 2;
+/// Failed base tip reads at one PR head, counting the current one, before the
+/// gate hands the PR over instead of waiting for another pass.
+pub const MAX_BASE_READ_FAILURES: u8 = 3;
 /// Typed payload of the house-scoped `gate.verdict/1` workflow marker. One
 /// marker exists per workflow, PR, head, and base; a changed decision at the
 /// same subject supersedes it.
@@ -1529,6 +1545,20 @@ pub trait GateMarkerStore {
     /// # Errors
     /// Fails when the effect cannot be read; an absent key is an error.
     fn effect_state(&self, key: &IdempotencyKey) -> Result<GateEffectState, Self::Error>;
+    /// Count one more failed read of the base tip for the PR at `head` and
+    /// return the total at that head, including this one.
+    ///
+    /// # Errors
+    /// Fails when the count cannot be persisted; the pass then ends without a
+    /// decision.
+    fn record_base_read_failure(
+        &mut self,
+        house: &HouseId,
+        repository: &Repository,
+        number: IssueNumber,
+        head: &CommitId,
+        now: Timestamp,
+    ) -> Result<u8, Self::Error>;
     /// Record `record` for its subject if the current record is still
     /// `expected` (compare and supersede). False means another writer changed
     /// the marker first.
@@ -1685,6 +1715,9 @@ impl GateRun {
 /// decision becomes a handover, and a refused handover stops at that subject.
 /// For a new active decision, effect intent is persisted first and the marker
 /// then references its key, so a crash between the two finds the same intent.
+/// A base tip read marked [`BaseTipRead::Retry`] is counted per head first;
+/// below [`MAX_BASE_READ_FAILURES`] the pass records nothing and admits no
+/// effect, and at the limit the PR is handed over.
 ///
 /// # Errors
 /// Returns storage errors without admitting an effect.
@@ -1731,6 +1764,20 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
             GateEffectState::NotApplied => refused = record.refused.saturating_add(1),
             GateEffectState::Applied => refused = record.refused,
         }
+    }
+    // A base read that may clear waits for a later pass, but only a bounded
+    // number of times at one head; then the PR is handed over.
+    if evidence.base_tip == BaseTipRead::Retry
+        && store.record_base_read_failure(house, repository, number, &evidence.head, now)?
+            < MAX_BASE_READ_FAILURES
+    {
+        let mut decision = evaluate(evidence, grants, GateHistory::default());
+        decision.verdict = Verdict::Skip;
+        return Ok(RecordedDecision {
+            decision,
+            mode,
+            admission: Admission::None,
+        });
     }
     let mut history = store.history(
         house,
@@ -1999,40 +2046,44 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
     // The base tip comes from the branch ref; the PR object's `base.sha` can
     // lag it. An invalid base name is ineligible, so its recorded sha only
     // names the subject.
-    let (base, base_ref_unreadable) = match &base_branch {
+    let (base, base_tip) = match &base_branch {
         Some(branch) => match client.branch_tip(house, repository, branch) {
-            Observation::Known(tip) => (tip, false),
-            // The provider answered with another branch, an unusable
-            // response, or one over the read limit; retrying cannot change
-            // that, so hand the PR over.
+            Observation::Known(tip) => (tip, BaseTipRead::Read),
+            // The ref is missing, or the provider answered with another
+            // branch, an unusable response, or one over the read limit;
+            // retrying cannot change that, so hand the PR over.
             Observation::Unavailable(
-                IntegrationError::InvalidInput
+                IntegrationError::NotFound
+                | IntegrationError::InvalidInput
                 | IntegrationError::LimitExceeded
                 | IntegrationError::Unknown,
             )
-            | Observation::Unknown => (pr.base.sha.clone(), true),
-            // A timeout or transport failure may clear on the next pass. The
-            // transport cannot tell a missing ref from an outage, so both
-            // retry. Scope, permission, budget, and decision errors are not
-            // expected from a read the PR read already authorized; the pass
-            // ends without a verdict rather than posting under them.
+            | Observation::Unknown => (pr.base.sha.clone(), BaseTipRead::Unreadable),
+            // A timeout or outage may clear; the recorded pass retries a
+            // bounded number of times.
+            Observation::Unavailable(IntegrationError::Timeout | IntegrationError::Unavailable) => {
+                (pr.base.sha.clone(), BaseTipRead::Retry)
+            }
+            // Scope, permission, budget, and decision errors are not expected
+            // from a read the PR read already authorized; the pass ends
+            // without a verdict rather than posting under them.
             Observation::Unavailable(
-                error @ (IntegrationError::Timeout
-                | IntegrationError::Unavailable
-                | IntegrationError::ScopeMismatch
+                error @ (IntegrationError::ScopeMismatch
                 | IntegrationError::PermissionDenied
                 | IntegrationError::BudgetExhausted
                 | IntegrationError::StaleDecision),
             ) => return Err(error),
         },
-        None => (pr.base.sha.clone(), false),
+        None => (pr.base.sha.clone(), BaseTipRead::Read),
     };
     let repository_info = known(client.repository(house, repository));
     let merge_status = known(client.merge_status(house, repository, number, &head));
     let comparison = known(client.compare(house, repository, &base, &head));
     let runs = known(client.checks(house, repository, &head));
     let statuses = known(client.statuses(house, repository, &head));
-    let required = known(client.required_checks(house, repository, &pr.base.name));
+    let required = base_branch
+        .as_ref()
+        .and_then(|branch| known(client.required_checks(house, repository, branch)));
     let reviews = known(client.reviews(house, repository, number));
     let threads = known(client.threads(house, repository, number));
     let commit = known(client.commit(house, repository, &head));
@@ -2126,7 +2177,7 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
         head_branch: safe_branch(&pr.head.name),
         base,
         base_branch,
-        base_ref_unreadable,
+        base_tip,
         head_age,
         open: Some(pr.state == crate::integrations::github::IssueState::Open && !pr.merged),
         draft: Some(pr.draft),

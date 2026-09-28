@@ -78,6 +78,9 @@ pub enum IntegrationError {
     /// The provider could not be reached or returned an error.
     #[error("integration unavailable")]
     Unavailable,
+    /// The provider answered that the requested resource does not exist.
+    #[error("integration resource not found")]
+    NotFound,
     /// Input/output or pagination reached a configured bound.
     #[error("integration resource bound exceeded")]
     LimitExceeded,
@@ -99,9 +102,11 @@ impl IntegrationError {
                 ErrorClass::Refused
             }
             Self::StaleDecision => ErrorClass::Conflict,
-            Self::Timeout | Self::Unavailable | Self::LimitExceeded | Self::Unknown => {
-                ErrorClass::Execution
-            }
+            Self::Timeout
+            | Self::Unavailable
+            | Self::NotFound
+            | Self::LimitExceeded
+            | Self::Unknown => ErrorClass::Execution,
         }
     }
 }

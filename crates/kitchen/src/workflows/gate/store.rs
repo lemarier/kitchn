@@ -45,12 +45,23 @@ use crate::{
 
 use super::{
     GATE_VERDICT_SCHEMA, GATE_VERDICT_VERSION, Gap, GateDecision, GateEffectState, GateHistory,
-    GateIntent, GateMarkerStore, GateVerdictRecord, MergeGrant, Verdict, fix_brief, fix_marker,
-    handover_comment, merge_mutation,
+    GateIntent, GateMarkerStore, GateVerdictRecord, MAX_BASE_READ_FAILURES, MergeGrant, Verdict,
+    fix_brief, fix_marker, handover_comment, merge_mutation,
 };
 
 /// Workflow id under which gate verdict markers are recorded.
 pub const GATE_WORKFLOW: &str = "merge-gate";
+/// Workflow id under which failed base tip reads are counted per PR head,
+/// apart from verdicts so verdict history reads only verdicts.
+pub const GATE_BASE_READ_WORKFLOW: &str = "merge-gate-base-read";
+const BASE_READ_SCHEMA: &str = "gate.base-read-failures";
+
+/// Payload of the `gate.base-read-failures/1` marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BaseReadFailures {
+    failures: u8,
+}
 
 /// Why the durable gate store refused or failed.
 #[derive(Debug, thiserror::Error)]
@@ -603,6 +614,52 @@ impl GateMarkerStore for HouseGateStore<'_> {
         find_key(&tasks, key)
             .map(|effect| gate_state(effect.state()))
             .ok_or(GateStoreError::UnknownEffect)
+    }
+
+    /// Counts stop at [`MAX_BASE_READ_FAILURES`], so later passes at the
+    /// same head write nothing more. A concurrent count fails the pass with
+    /// the store's conflict; the next pass counts again.
+    fn record_base_read_failure(
+        &mut self,
+        house: &HouseId,
+        repository: &Repository,
+        number: IssueNumber,
+        head: &CommitId,
+        now: Timestamp,
+    ) -> Result<u8, Self::Error> {
+        self.check_house(house)?;
+        let schema = MarkerSchema::new(BASE_READ_SCHEMA, NonZeroU32::MIN)?;
+        let key = MarkerKey {
+            workflow: WorkflowId::new(GATE_BASE_READ_WORKFLOW)?,
+            item: pull_request(repository, number)?,
+            subject: MarkerSubject::Git(EvidenceSubject {
+                head: head.clone(),
+                base: None,
+            }),
+        };
+        let fact = |failures| MarkerFact::workflow(schema.clone(), &BaseReadFailures { failures });
+        match self.store.marker(&key)? {
+            None => {
+                self.store
+                    .record_marker(key, fact(1)?, &self.claimant, now)?;
+                Ok(1)
+            }
+            Some(marker) => {
+                let seen: BaseReadFailures = marker.fact().decode(&schema)?;
+                if seen.failures >= MAX_BASE_READ_FAILURES {
+                    return Ok(seen.failures);
+                }
+                let failures = seen.failures.saturating_add(1);
+                self.store.supersede_marker(
+                    &key,
+                    marker.fact(),
+                    fact(failures)?,
+                    &self.claimant,
+                    now,
+                )?;
+                Ok(failures)
+            }
+        }
     }
 
     fn record(

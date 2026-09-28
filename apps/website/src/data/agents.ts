@@ -15,6 +15,12 @@ import {
   siTrae,
 } from "simple-icons";
 
+/** Orchestrators kitchn runs on. Add a backend here when its adapter ships. */
+export const backends = ["Orca"] as const;
+
+/** Names the landing page cycles through: every backend, then well-known agents. */
+export const brigadeFor = [...backends, "Claude Code", "Codex", "Gemini", "Cursor", "your agents"];
+
 // Agents Orca can launch, from https://www.onorca.dev/docs/agents/supported
 // (checked 2026-09-28). kitchn reaches them through its Orca backend. Update
 // this list from that page; the count on the site is its length.

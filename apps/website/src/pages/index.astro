@@ -9,7 +9,7 @@ import {
 } from "simple-icons";
 import RoleAvatar from "../components/RoleAvatar.astro";
 import ToolChip from "../components/ToolChip.astro";
-import { orcaAgents } from "../data/agents";
+import { brigadeFor, orcaAgents } from "../data/agents";
 import { nightShift } from "../data/autopilot";
 import { glossary } from "../data/glossary";
 import { commands } from "../data/terminal";
@@ -740,7 +740,12 @@ const menu = [
       </section>
 
       <section class="byo wrap" aria-labelledby="byo-title">
-        <h2 id="byo-title">Bring your own orchestrator and agents</h2>
+        <h2 id="byo-title" aria-label="A brigade for your agents">
+          <span aria-hidden="true">A brigade for</span>
+          <span class="rotator" aria-hidden="true" data-rotator>
+            {brigadeFor.map((name, i) => <span class:list={["rot", { on: i === 0 }]}>{name}</span>)}
+          </span>
+        </h2>
         <p class="section-lede">
           kitchn doesn't launch agents itself. It sits on top of the orchestrators you already run and
           asks each one for the capabilities a workflow needs. If a backend can't provide one, the workflow
@@ -942,6 +947,24 @@ const menu = [
             tabs[next]?.focus();
           });
         });
+      }
+
+      // Cycles the name in "A brigade for ___" through backends and agents.
+      const rotator = document.querySelector<HTMLElement>("[data-rotator]");
+      if (rotator && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        const names = [...rotator.querySelectorAll<HTMLElement>(".rot")];
+        let at = 0;
+        window.setInterval(() => {
+          const current = names[at];
+          at = (at + 1) % names.length;
+          const next = names[at];
+          if (!current || !next) return;
+          current.classList.remove("on");
+          current.classList.add("out");
+          next.classList.remove("out");
+          next.classList.add("on");
+          window.setTimeout(() => current.classList.remove("out"), 400);
+        }, 2200);
       }
 
       // Station contracts open in a native dialog; Esc, Close or the backdrop dismiss it.
@@ -1161,6 +1184,10 @@ const menu = [
   li,
   dd {
     text-wrap: pretty;
+  }
+
+  h2[id] {
+    scroll-margin-top: 5.5rem;
   }
 
   :focus-visible {
@@ -1698,6 +1725,37 @@ const menu = [
   .step p {
     margin: 0.6rem 0 0;
     color: var(--ink-soft);
+  }
+
+  /* Rotating name in "A brigade for ___". */
+  .byo h2 {
+    max-width: none;
+    text-align: center;
+  }
+  .byo h2 + .section-lede {
+    margin-inline: auto;
+    text-align: center;
+  }
+  .rotator {
+    display: grid;
+    justify-items: center;
+    overflow: hidden;
+    color: var(--red);
+  }
+  .rot {
+    grid-area: 1 / 1;
+    white-space: nowrap;
+    opacity: 0;
+    transform: translateY(0.6em);
+    transition: opacity 350ms ease, transform 350ms ease;
+  }
+  .rot.on {
+    opacity: 1;
+    transform: none;
+  }
+  .rot.out {
+    opacity: 0;
+    transform: translateY(-0.6em);
   }
 
   /* Agent wall. */
@@ -2698,6 +2756,9 @@ const menu = [
   }
 
   @media (prefers-reduced-motion: reduce) {
+    .rot {
+      transition: none;
+    }
     .contract[open] {
       animation: none;
     }

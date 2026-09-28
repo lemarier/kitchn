@@ -493,3 +493,32 @@ fn the_branch_writer_comes_from_the_backend_observation() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn a_restacked_layer_still_gets_its_conflicts_repaired() -> TestResult {
+    let policy = repair_policy();
+    // The layer already contains its merged lower layer, but now conflicts
+    // with its new base.
+    let mut candidate = conflicting(2)?;
+    candidate.stack = Some(layer("stack-a", 2, Observed::Known(true))?);
+    assert_eq!(
+        assess(&policy, &candidate),
+        RepairDecision::Repair(RepairKind::Conflict)
+    );
+    // Unknown mergeability is rechecked, then handed over, as for any
+    // other pull request.
+    candidate.pull_request.mergeability = Mergeability::Unknown;
+    assert_eq!(assess(&policy, &candidate), RepairDecision::Recheck);
+    candidate.unknown_rechecks = policy.max_unknown_rechecks;
+    assert_eq!(
+        assess(&policy, &candidate),
+        RepairDecision::HandOver(HandOver::MergeabilityUnknown)
+    );
+    // A restack still wins over a conflict: the restack resolves the base.
+    candidate.pull_request.mergeability = Mergeability::Conflicting;
+    candidate.stack = Some(layer("stack-a", 2, Observed::Known(false))?);
+    assert_eq!(
+        assess(&policy, &candidate),
+        RepairDecision::Repair(RepairKind::Restack)
+    );
+    Ok(())
+}

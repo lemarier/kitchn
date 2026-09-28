@@ -306,15 +306,20 @@ pub fn assess(policy: &RepairPolicy, candidate: &RepairCandidate) -> RepairDecis
         Writer::Task(_) | Writer::Unknown => return RepairDecision::Skip(Skip::WriterActive),
         Writer::Person => return RepairDecision::HandOver(HandOver::PersonOwnsTerminal),
     }
-    let kind = match (&candidate.stack, candidate.pull_request.mergeability) {
-        (Some(layer), _) if layer.lower_merged => match layer.contains_lower_merge {
-            Observed::Known(true) => None,
-            Observed::Known(false) => Some(RepairKind::Restack),
+    // A layer whose lower layer merged is restacked first; once restacked,
+    // its mergeability against the new base is judged like any other.
+    let restack = match &candidate.stack {
+        Some(layer) if layer.lower_merged => match layer.contains_lower_merge {
+            Observed::Known(contains) => !contains,
             Observed::Unknown => return RepairDecision::HandOver(HandOver::StackUnknown),
         },
-        (_, Mergeability::Conflicting) => Some(RepairKind::Conflict),
-        (_, Mergeability::Clean | Mergeability::Behind) => None,
-        (_, Mergeability::Unknown) => {
+        Some(_) | None => false,
+    };
+    let kind = match candidate.pull_request.mergeability {
+        _ if restack => Some(RepairKind::Restack),
+        Mergeability::Conflicting => Some(RepairKind::Conflict),
+        Mergeability::Clean | Mergeability::Behind => None,
+        Mergeability::Unknown => {
             return if candidate.unknown_rechecks >= policy.max_unknown_rechecks {
                 RepairDecision::HandOver(HandOver::MergeabilityUnknown)
             } else {

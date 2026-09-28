@@ -1363,13 +1363,13 @@ fn the_first_run_is_preview_only_and_repeating_is_harmless() -> TestResult {
     assert_eq!(outcome(&second, &owned.worktree)?, ReleaseOutcome::Released);
     assert_eq!(harness.backend.fake.effects_performed(), before + 2);
     // The worktree's release reports the space measured before it.
-    let freed = second
+    let measured = second
         .results
         .iter()
         .find(|result| result.resource == owned.worktree)
-        .and_then(|result| result.freed)
-        .ok_or("no freed space reported")?;
-    assert!(freed.complete && freed.bytes > 0);
+        .and_then(|result| result.measured)
+        .ok_or("no measured size reported")?;
+    assert!(measured.complete && measured.bytes > 0);
     // Each release ran as a settled dishwasher task given that resource.
     for result in &second.results {
         let task = harness.store().task(result.task.as_ref().ok_or("task")?)?;
@@ -2208,7 +2208,7 @@ fn releases_beyond_the_bound_are_deferred_and_finish_on_a_later_run() -> TestRes
         .filter(|r| r.outcome == ReleaseOutcome::Deferred)
     {
         assert_eq!(result.task, None);
-        assert_eq!(result.freed, None);
+        assert_eq!(result.measured, None);
     }
     // The next run, within the same approvals, finishes the rest.
     harness.clock.advance(60);
@@ -2545,7 +2545,7 @@ fn build_output_of_settled_workers_is_reclaimed_without_touching_work() -> TestR
     let result = second.results.first().ok_or("no result")?;
     assert_eq!(result.outcome, BuildOutcome::Removed);
     assert_eq!(result.directory, "target");
-    assert!(second.freed().bytes >= 64 * 1024);
+    assert!(second.measured().bytes >= 64 * 1024);
     assert!(!target.exists());
     // Work and the worktree are untouched, and nothing went to the backend.
     assert!(path.join("notes.txt").is_file() && path.join("local.txt").is_file());
@@ -2575,8 +2575,12 @@ fn a_failed_removal_names_its_error_and_a_later_run_finishes_it() -> TestResult 
     let result = report.results.first().ok_or("no result")?;
     assert_eq!(result.outcome, BuildOutcome::Failed);
     assert_eq!(result.error.as_deref(), Some("permission denied"));
-    assert_eq!(result.freed, None);
-    assert_eq!(report.freed().bytes, 0, "nothing is reported as freed");
+    assert_eq!(result.measured, None);
+    assert_eq!(
+        report.measured().bytes,
+        0,
+        "nothing is reported as measured"
+    );
     // The directory still looks like build output, so the same approval
     // covers the next attempt once the obstacle is gone.
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700))?;

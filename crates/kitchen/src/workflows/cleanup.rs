@@ -61,7 +61,8 @@
 //! same evidence; the worktree itself stays until it passes every check
 //! above. Caches outside Kitchen-owned resources are never touched: under
 //! disk pressure the preview lists commands a person may run instead.
-//! Every step reports the space it measured before acting.
+//! Every step reports the space it measured before acting; that is an upper
+//! bound on what it frees, not a measurement afterwards.
 
 mod build;
 mod git;
@@ -703,9 +704,10 @@ pub struct ReleaseResult {
     /// The outcome.
     pub outcome: ReleaseOutcome,
     /// For a worktree released in this call: its size measured before the
-    /// release, which is what the release freed.
+    /// release. It is what the release should free, not proof of it: the
+    /// backend's response is the only evidence the release happened.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub freed: Option<DiskUsage>,
+    pub measured: Option<DiskUsage>,
 }
 
 /// The result of [`apply`].
@@ -817,7 +819,7 @@ pub fn apply(
             resource: resource.clone(),
             task: Some(id.clone()),
             outcome,
-            freed: None,
+            measured: None,
         });
     }
 
@@ -839,12 +841,12 @@ pub fn apply(
                 }
             }
         };
-        let freed = entry.usage.filter(|_| outcome == ReleaseOutcome::Released);
+        let measured = entry.usage.filter(|_| outcome == ReleaseOutcome::Released);
         results.push(ReleaseResult {
             resource: entry.resource.clone(),
             task,
             outcome,
-            freed,
+            measured,
         });
     }
     Ok(ApplyReport {
@@ -883,9 +885,11 @@ pub struct BuildResult {
     pub directory: String,
     /// The outcome.
     pub outcome: BuildOutcome,
-    /// Space measured just before removal, for a removed directory.
+    /// Space measured just before removal, for a removed directory. Removal
+    /// that succeeded should free it; hard links to files outside the
+    /// directory would not.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub freed: Option<DiskUsage>,
+    pub measured: Option<DiskUsage>,
     /// For a failed removal: the I/O error kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -904,17 +908,20 @@ pub struct BuildReport {
 impl BuildReport {
     /// Total space measured before the removals that succeeded.
     #[must_use]
-    pub fn freed(&self) -> DiskUsage {
-        self.results.iter().filter_map(|result| result.freed).fold(
-            DiskUsage {
-                bytes: 0,
-                complete: true,
-            },
-            |total, freed| DiskUsage {
-                bytes: total.bytes.saturating_add(freed.bytes),
-                complete: total.complete && freed.complete,
-            },
-        )
+    pub fn measured(&self) -> DiskUsage {
+        self.results
+            .iter()
+            .filter_map(|result| result.measured)
+            .fold(
+                DiskUsage {
+                    bytes: 0,
+                    complete: true,
+                },
+                |total, measured| DiskUsage {
+                    bytes: total.bytes.saturating_add(measured.bytes),
+                    complete: total.complete && measured.complete,
+                },
+            )
     }
 }
 
@@ -948,7 +955,7 @@ pub fn reclaim_build_output(
                 resource: entry.resource.clone(),
                 directory: directory.name.clone(),
                 outcome,
-                freed: None,
+                measured: None,
                 error: None,
             })
         };
@@ -990,7 +997,7 @@ pub fn reclaim_build_output(
         };
         for directory in &build.directories {
             let usage = disk_usage(&path.join(&directory.name));
-            let (outcome, freed, error) = match build::remove(&path, &directory.name) {
+            let (outcome, measured, error) = match build::remove(&path, &directory.name) {
                 Ok(()) => (BuildOutcome::Removed, Some(usage), None),
                 Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
                     (BuildOutcome::Refused, None, None)
@@ -1001,7 +1008,7 @@ pub fn reclaim_build_output(
                 resource: entry.resource.clone(),
                 directory: directory.name.clone(),
                 outcome,
-                freed,
+                measured,
                 error,
             });
         }

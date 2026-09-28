@@ -548,7 +548,7 @@ const menu = [
             </div>
             {
               commands.map((c, i) => (
-                <pre class="term-out" data-term-out={c.id} data-summary={c.summary} data-docs={c.docs} hidden={i !== 0}>
+                <pre class="term-out" data-term-out={c.id} data-summary={c.summary} data-docs={c.docs} hidden={i !== 0} aria-hidden={i !== 0 ? "true" : undefined}>
                   {c.lines.map((l) => (
                     <span class:list={["tl", l.tone]}>{l.tone === "cmd" && <span class="prompt">{l.text.startsWith("/") ? "› " : "$ "}</span>}{l.text}</span>
                   ))}
@@ -976,6 +976,7 @@ const menu = [
           });
           outs.forEach((o, i) => {
             o.hidden = i !== index;
+            o.setAttribute("aria-hidden", String(i !== index));
           });
           const screen = outs[index];
           if (!screen) return;
@@ -2130,8 +2131,20 @@ const menu = [
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
+  /* Every output shares one cell, so the terminal keeps the height of the
+     longest one and switching commands never resizes it. */
+  .term-screen {
+    display: grid;
+    grid-template-rows: auto 1fr;
+  }
+  .term-out {
+    grid-row: 2;
+    grid-column: 1;
+  }
   .term-out[hidden] {
-    display: none;
+    display: block;
+    opacity: 0;
+    pointer-events: none;
   }
   .tl {
     display: block;

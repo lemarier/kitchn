@@ -29,6 +29,11 @@ use kitchen::{
     },
 };
 
+const SECOND: AttemptNumber = match AttemptNumber::new(2) {
+    Some(number) => number,
+    None => AttemptNumber::FIRST,
+};
+
 fn claimed_attempt(fixture: &Fixture, id: &str, now: Timestamp) -> TestResult<Fence> {
     let task = task_id(id)?;
     fixture.store.create_task(spec(id)?, now)?;
@@ -61,10 +66,13 @@ fn successful_attempt_settles_and_releases_the_claim() -> TestResult {
     let fixture = Fixture::new()?;
     let fence = claimed_attempt(&fixture, "task-1", at(0))?;
     let task = task_id("task-1")?;
-    let disposition =
-        fixture
-            .store
-            .finish_attempt(&task, fence, AttemptOutcome::Succeeded, at(5))?;
+    let disposition = fixture.store.finish_attempt(
+        &task,
+        fence,
+        AttemptNumber::FIRST,
+        AttemptOutcome::Succeeded,
+        at(5),
+    )?;
     assert_eq!(disposition, Disposition::Settled(Settlement::Succeeded));
 
     let record = fixture.reopen()?.task(&task)?;
@@ -268,7 +276,13 @@ fn stale_owner_is_fenced_after_takeover() -> TestResult {
     assert!(stale(store.start_attempt(&task, old, at(62)).map(|_| ())));
     assert!(stale(
         store
-            .finish_attempt(&task, old, AttemptOutcome::Succeeded, at(62))
+            .finish_attempt(
+                &task,
+                old,
+                AttemptNumber::FIRST,
+                AttemptOutcome::Succeeded,
+                at(62)
+            )
             .map(|_| ())
     ));
     assert!(stale(store.relinquish(&task, old, at(62))));
@@ -400,18 +414,27 @@ fn repeated_events_are_idempotent_and_contradictions_rejected() -> TestResult {
     ));
 
     let failed = AttemptOutcome::Failed(FailureClass::Retryable);
-    let first = store.finish_attempt(&task, fence, failed, at(6))?;
+    let first = store.finish_attempt(&task, fence, AttemptNumber::FIRST, failed, at(6))?;
     assert_eq!(first, Disposition::RetryAvailable { remaining: 2 });
-    assert_eq!(store.finish_attempt(&task, fence, failed, at(7))?, first);
+    assert_eq!(
+        store.finish_attempt(&task, fence, AttemptNumber::FIRST, failed, at(7))?,
+        first
+    );
     assert!(matches!(
-        store.finish_attempt(&task, fence, AttemptOutcome::Succeeded, at(7)),
+        store.finish_attempt(
+            &task,
+            fence,
+            AttemptNumber::FIRST,
+            AttemptOutcome::Succeeded,
+            at(7)
+        ),
         Err(Error::State(StateError::ConflictingAttemptOutcome))
     ));
 
     store.start_attempt(&task, fence, at(8))?;
-    let done = store.finish_attempt(&task, fence, AttemptOutcome::Succeeded, at(9))?;
+    let done = store.finish_attempt(&task, fence, SECOND, AttemptOutcome::Succeeded, at(9))?;
     assert_eq!(
-        store.finish_attempt(&task, fence, AttemptOutcome::Succeeded, at(10))?,
+        store.finish_attempt(&task, fence, SECOND, AttemptOutcome::Succeeded, at(10))?,
         done
     );
     assert_eq!(
@@ -438,12 +461,12 @@ fn retry_budget_bounds_attempt_count_and_elapsed_time() -> TestResult {
         .fence();
     store.start_attempt(&counted, fence, at(0))?;
     assert_eq!(
-        store.finish_attempt(&counted, fence, retryable, at(1))?,
+        store.finish_attempt(&counted, fence, AttemptNumber::FIRST, retryable, at(1))?,
         Disposition::RetryAvailable { remaining: 1 }
     );
     store.start_attempt(&counted, fence, at(2))?;
     assert_eq!(
-        store.finish_attempt(&counted, fence, retryable, at(3))?,
+        store.finish_attempt(&counted, fence, SECOND, retryable, at(3))?,
         Disposition::Settled(Settlement::Exhausted)
     );
 
@@ -457,7 +480,7 @@ fn retry_budget_bounds_attempt_count_and_elapsed_time() -> TestResult {
         .fence();
     store.start_attempt(&timed, fence, at(0))?;
     assert_eq!(
-        store.finish_attempt(&timed, fence, retryable, at(10))?,
+        store.finish_attempt(&timed, fence, AttemptNumber::FIRST, retryable, at(10))?,
         Disposition::RetryAvailable { remaining: 1 }
     );
     assert_eq!(
@@ -485,6 +508,7 @@ fn retry_budget_bounds_attempt_count_and_elapsed_time() -> TestResult {
         store.finish_attempt(
             &permanent,
             fence,
+            AttemptNumber::FIRST,
             AttemptOutcome::Failed(FailureClass::Permanent),
             at(1)
         )?,
@@ -710,7 +734,13 @@ fn unresolved_effect_blocks_new_work_until_resolved() -> TestResult {
         Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
     ));
     assert!(matches!(
-        store.finish_attempt(&task, fence, AttemptOutcome::Succeeded, at(3)),
+        store.finish_attempt(
+            &task,
+            fence,
+            AttemptNumber::FIRST,
+            AttemptOutcome::Succeeded,
+            at(3)
+        ),
         Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
     ));
     assert!(matches!(
@@ -726,7 +756,13 @@ fn unresolved_effect_blocks_new_work_until_resolved() -> TestResult {
         at(4),
     )?;
     assert_eq!(
-        store.finish_attempt(&task, fence, AttemptOutcome::Succeeded, at(5))?,
+        store.finish_attempt(
+            &task,
+            fence,
+            AttemptNumber::FIRST,
+            AttemptOutcome::Succeeded,
+            at(5)
+        )?,
         Disposition::Settled(Settlement::Succeeded)
     );
     Ok(())
@@ -1143,5 +1179,48 @@ fn ownership_history_must_match_the_current_lease() -> TestResult {
     }
     fs::write(&path, serde_json::to_vec_pretty(&valid)?)?;
     assert!(fixture.reopen().is_ok());
+    Ok(())
+}
+
+#[test]
+fn a_replayed_finish_from_an_earlier_attempt_does_not_finish_the_current_one() -> TestResult {
+    let fixture = Fixture::new()?;
+    let fence = claimed_attempt(&fixture, "task-1", at(0))?;
+    let task = task_id("task-1")?;
+    let store = &fixture.store;
+    let retryable = AttemptOutcome::Failed(FailureClass::Retryable);
+    store.finish_attempt(&task, fence, AttemptNumber::FIRST, retryable, at(1))?;
+    store.start_attempt(&task, fence, at(2))?;
+    // Attempt 1's duplicate failure report arrives late: it replays attempt
+    // 1's result and leaves attempt 2 running.
+    assert_eq!(
+        store.finish_attempt(&task, fence, AttemptNumber::FIRST, retryable, at(3))?,
+        Disposition::RetryAvailable { remaining: 2 }
+    );
+    assert!(matches!(
+        store.finish_attempt(
+            &task,
+            fence,
+            AttemptNumber::FIRST,
+            AttemptOutcome::Succeeded,
+            at(3)
+        ),
+        Err(Error::State(StateError::ConflictingAttemptOutcome))
+    ));
+    let record = store.task(&task)?;
+    assert!(
+        matches!(record.attempts(), [_, second] if second.state() == AttemptState::Running),
+        "attempt 2 must still be running: {:?}",
+        record.attempts()
+    );
+    let third = AttemptNumber::new(3).ok_or("attempt 3")?;
+    assert!(matches!(
+        store.finish_attempt(&task, fence, third, retryable, at(4)),
+        Err(Error::State(StateError::AttemptNotFound(number))) if number == third
+    ));
+    assert_eq!(
+        store.finish_attempt(&task, fence, SECOND, AttemptOutcome::Succeeded, at(5))?,
+        Disposition::Settled(Settlement::Succeeded)
+    );
     Ok(())
 }

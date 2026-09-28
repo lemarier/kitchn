@@ -38,8 +38,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConsumerId, Error, HolderId, HouseId, TaskId,
     contracts::{
-        AttemptOutcome, AttemptStart, ContractError, Disposition, EffectSeq, Evidence,
-        EvidenceRevision, ExternalRef, Fence, HouseGrants, LeaseTtl, TaskSpec, Timestamp,
+        AttemptNumber, AttemptOutcome, AttemptStart, ContractError, Disposition, EffectSeq,
+        Evidence, EvidenceRevision, ExternalRef, Fence, HouseGrants, LeaseTtl, TaskSpec, Timestamp,
     },
     state::{
         CancelStatus, Consumption, Corruption, Creation, EffectOutcome, EffectPlan, EffectRecord,
@@ -294,19 +294,22 @@ impl HouseStore {
         self.transact(|state| state.start_attempt(id, fence, now))
     }
 
-    /// Finish the running attempt. Repeating the same report is a no-op.
+    /// Finish `attempt`, which must be the running attempt. Repeating the
+    /// same report for any earlier attempt replays that attempt's result and
+    /// changes nothing.
     ///
     /// # Errors
-    /// Refuses while effects are unresolved and when the report contradicts
-    /// an earlier one.
+    /// Refuses an unknown or interrupted attempt, unresolved effects, and a
+    /// report that contradicts the recorded one.
     pub fn finish_attempt(
         &self,
         id: &TaskId,
         fence: Fence,
+        attempt: AttemptNumber,
         outcome: AttemptOutcome,
         now: Timestamp,
     ) -> Result<Disposition> {
-        self.transact(|state| state.finish_attempt(id, fence, outcome, now))
+        self.transact(|state| state.finish_attempt(id, fence, attempt, outcome, now))
     }
 
     /// Request cancellation. Needs no claim; an open task without unresolved

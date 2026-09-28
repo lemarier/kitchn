@@ -4,7 +4,7 @@ use std::{fmt, io};
 
 use crate::{
     ConsumerId, ErrorClass, HolderId, TaskId,
-    contracts::{EffectSeq, EvidenceRevision, Fence, Settlement, Timestamp},
+    contracts::{AttemptNumber, EffectSeq, EvidenceRevision, Fence, Settlement, Timestamp},
 };
 
 /// A bounded collection that reached its limit.
@@ -170,6 +170,9 @@ pub enum StateError {
     /// No consumer lease exists for this scope.
     #[error("consumer {0} holds no lease")]
     ConsumerNotFound(ConsumerId),
+    /// The task has no attempt with this number.
+    #[error("{0} not found")]
+    AttemptNotFound(AttemptNumber),
     /// The operation needs a running attempt owned by the presented fence.
     #[error("no running attempt for this claim")]
     NoRunningAttempt,
@@ -272,6 +275,7 @@ impl StateError {
             | Self::StaleFence { .. }
             | Self::LeaseLive { .. }
             | Self::ConsumerNotFound(_)
+            | Self::AttemptNotFound(_)
             | Self::NoRunningAttempt
             | Self::CancelRequested
             | Self::UnresolvedEffects { .. }

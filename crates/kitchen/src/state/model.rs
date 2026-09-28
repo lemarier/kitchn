@@ -472,6 +472,16 @@ impl TaskRecord {
         }
     }
 
+    fn attempt(&self, number: AttemptNumber) -> Option<&AttemptRecord> {
+        let index = usize::try_from(number.get()).ok()?.checked_sub(1)?;
+        self.attempts.get(index)
+    }
+
+    /// Attempts left under the count bound after attempt `number` finished.
+    fn remaining_after(&self, number: AttemptNumber) -> u32 {
+        self.spec.retry.max_attempts().saturating_sub(number.get())
+    }
+
     fn running_attempt_mut(&mut self, fence: Fence) -> Option<&mut AttemptRecord> {
         self.attempts
             .last_mut()
@@ -899,21 +909,37 @@ impl StoreState {
         &mut self,
         id: &TaskId,
         fence: Fence,
+        number: AttemptNumber,
         outcome: AttemptOutcome,
         now: Timestamp,
     ) -> Result<Disposition> {
         let task = self.task_mut(id)?;
-        if let Some(repeat) = repeated_finish(task, fence, outcome) {
-            return repeat;
+        if matches!(&task.state, TaskState::Claimed { lease } if lease.fence != fence) {
+            return fail(StateError::StaleFence { presented: fence });
+        }
+        let Some(attempt) = task.attempt(number) else {
+            return fail(StateError::AttemptNotFound(number));
+        };
+        if attempt.fence != fence {
+            return fail(StateError::StaleFence { presented: fence });
+        }
+        match attempt.state {
+            AttemptState::Running => {}
+            AttemptState::Finished {
+                outcome: recorded, ..
+            } => return replayed_finish(task, number, recorded, outcome),
+            AttemptState::Interrupted { .. } | AttemptState::Cancelled { .. } => {
+                return fail(StateError::NoRunningAttempt);
+            }
         }
         task.owned_lease(fence, now, false)?;
         let unresolved = task.unresolved_count();
-        let Some(attempt) = task.running_attempt_mut(fence) else {
-            return fail(StateError::NoRunningAttempt);
-        };
         if unresolved > 0 {
             return fail(StateError::UnresolvedEffects { count: unresolved });
         }
+        let Some(attempt) = task.running_attempt_mut(fence) else {
+            return fail(StateError::NoRunningAttempt);
+        };
         attempt.state = AttemptState::Finished { outcome, at: now };
         let settlement = match outcome {
             AttemptOutcome::Succeeded => Some(Settlement::Succeeded),
@@ -932,11 +958,7 @@ impl StoreState {
                 Ok(Disposition::Settled(settlement))
             }
             None => Ok(Disposition::RetryAvailable {
-                remaining: task
-                    .spec
-                    .retry
-                    .max_attempts()
-                    .saturating_sub(task.attempt_count()),
+                remaining: task.remaining_after(number),
             }),
         }
     }
@@ -1466,37 +1488,22 @@ fn state_for(outcome: EffectOutcome, at: Timestamp) -> EffectState {
     }
 }
 
-/// Detect a repeated `finish_attempt` for the fence's most recent attempt.
-/// Returns `None` when this is not a repeat and normal processing applies.
-fn repeated_finish(
+/// The result of repeating `finish_attempt` for an attempt that already
+/// finished: the same disposition it produced, or a conflict.
+fn replayed_finish(
     task: &TaskRecord,
-    fence: Fence,
-    outcome: AttemptOutcome,
-) -> Option<Result<Disposition>> {
-    if matches!(&task.state, TaskState::Claimed { lease } if lease.fence != fence) {
-        return None;
+    number: AttemptNumber,
+    recorded: AttemptOutcome,
+    reported: AttemptOutcome,
+) -> Result<Disposition> {
+    if recorded != reported {
+        return fail(StateError::ConflictingAttemptOutcome);
     }
-    let last = task
-        .attempts
-        .last()
-        .filter(|attempt| attempt.fence == fence)?;
-    let AttemptState::Finished {
-        outcome: recorded, ..
-    } = last.state
-    else {
-        return None;
-    };
-    if recorded != outcome {
-        return Some(fail(StateError::ConflictingAttemptOutcome));
-    }
-    Some(Ok(match task.settlement() {
-        Some(settlement) => Disposition::Settled(settlement),
-        None => Disposition::RetryAvailable {
-            remaining: task
-                .spec
-                .retry
-                .max_attempts()
-                .saturating_sub(task.attempt_count()),
+    let is_last = task.attempts.last().map(AttemptRecord::number) == Some(number);
+    Ok(match task.settlement() {
+        Some(settlement) if is_last => Disposition::Settled(settlement),
+        Some(_) | None => Disposition::RetryAvailable {
+            remaining: task.remaining_after(number),
         },
-    }))
+    })
 }

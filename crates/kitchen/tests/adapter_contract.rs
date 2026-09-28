@@ -470,9 +470,13 @@ fn without_lookup_an_uncertain_effect_needs_an_explicit_owner_decision() -> Test
         [effect] if matches!(effect.state(), EffectState::Uncertain { reason: UncertainReason::LookupUnsupported, .. })
     ));
     assert!(matches!(
-        fixture
-            .store
-            .finish_attempt(&task, fence, AttemptOutcome::Succeeded, at(2)),
+        fixture.store.finish_attempt(
+            &task,
+            fence,
+            AttemptNumber::FIRST,
+            AttemptOutcome::Succeeded,
+            at(2)
+        ),
         Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
     ));
     fixture.store.record_effect_outcome(
@@ -483,9 +487,13 @@ fn without_lookup_an_uncertain_effect_needs_an_explicit_owner_decision() -> Test
         at(3),
     )?;
     assert_eq!(
-        fixture
-            .store
-            .finish_attempt(&task, fence, AttemptOutcome::Succeeded, at(4))?,
+        fixture.store.finish_attempt(
+            &task,
+            fence,
+            AttemptNumber::FIRST,
+            AttemptOutcome::Succeeded,
+            at(4)
+        )?,
         Disposition::Settled(Settlement::Succeeded)
     );
     Ok(())
@@ -610,9 +618,13 @@ fn settled_task_identity_is_never_reused() -> TestResult {
         plan(&task, fence, "launch", launch()?)?,
         &clock,
     )?;
-    fixture
-        .store
-        .finish_attempt(&task, fence, AttemptOutcome::Succeeded, at(2))?;
+    fixture.store.finish_attempt(
+        &task,
+        fence,
+        AttemptNumber::FIRST,
+        AttemptOutcome::Succeeded,
+        at(2),
+    )?;
 
     // The settled record keeps its identity and keys; nothing deletes it.
     assert_eq!(

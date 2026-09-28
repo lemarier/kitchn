@@ -266,6 +266,34 @@ fn a_backend_without_release_skips_the_branch_check() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn a_release_waits_for_a_cancel_that_was_observed() -> TestResult {
+    // Without status the cancel check is skipped and never sent, so the
+    // worker may still be running: the release must not be sent either.
+    let mut capabilities: Vec<Capability> = Capability::ALL.to_vec();
+    capabilities.retain(|capability| *capability != Capability::WorkerStatusAndOutcome);
+    let backend = fake(capabilities)?;
+    let report = conformance::run_worker(&backend, &conformance_fixture()?)?;
+    assert_eq!(
+        report.result(Check::CancelObserved),
+        Some(CheckResult::NotApplicable {
+            requires: Capability::WorkerStatusAndOutcome
+        })
+    );
+    assert_eq!(
+        report.result(Check::ReleaseKeepsBranch),
+        Some(CheckResult::NotApplicable {
+            requires: Capability::WorkerStatusAndOutcome
+        })
+    );
+    assert_eq!(
+        backend.effects_performed(),
+        2,
+        "one launch and one message; no cancel and no release"
+    );
+    Ok(())
+}
+
 /// Declares fewer capabilities than it actually exercises.
 struct OverreachingBackend {
     inner: FakeBackend,

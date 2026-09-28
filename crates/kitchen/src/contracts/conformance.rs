@@ -885,10 +885,14 @@ impl<'a> Runner<'a> {
     /// Release the cancelled worker. A release removes what it releases and
     /// never the branch that was checked out: the dishwasher's pushed check
     /// relies on that branch outliving a released worktree. A release the
-    /// backend retains deletes nothing and passes. Without a declared
-    /// inventory only the receipt is checked, so a backend that deletes the
-    /// branch without naming it in the receipt is caught only where its
-    /// inventory lists branches.
+    /// backend retains deletes nothing and passes. The release is sent only
+    /// after the cancel was sent and observed, so it never reaches a worker
+    /// that may still be running. The worker is the resource released: a
+    /// backend such as Orca releases a worktree through its worker and
+    /// refuses a release of the worktree itself. Only the receipt is checked
+    /// unless the declared inventory lists the branch before the release, so
+    /// a backend that deletes the branch without naming it in the receipt is
+    /// caught only where its inventory lists branches.
     fn release_keeps_branch(
         &mut self,
         backend: &dyn WorkerBackend,
@@ -896,7 +900,11 @@ impl<'a> Runner<'a> {
         branch: &ResourceRef,
     ) -> Result<(), ConformanceFailure> {
         let check = Check::ReleaseKeepsBranch;
-        for requires in [Capability::ResourceRelease, Capability::WorkerCancel] {
+        for requires in [
+            Capability::ResourceRelease,
+            Capability::WorkerCancel,
+            Capability::WorkerStatusAndOutcome,
+        ] {
             if !self.supports(requires) {
                 self.record(check, CheckResult::NotApplicable { requires });
                 return Ok(());

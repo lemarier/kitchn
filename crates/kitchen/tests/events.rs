@@ -60,6 +60,7 @@ fn house_config() -> TestResult<HouseConfig> {
         policy_limits: BTreeSet::new(),
         grants: BTreeSet::new(),
         agents: None,
+        stack_tool: None,
     })
 }
 

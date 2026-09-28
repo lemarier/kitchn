@@ -2,4 +2,5 @@
 pub mod cleanup;
 pub mod gardener;
 pub mod house;
+pub mod pickup;
 pub mod scaffold;

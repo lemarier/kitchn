@@ -65,6 +65,9 @@ pub enum Error {
     /// A verification environment declaration, policy, or access check failed.
     #[error(transparent)]
     Verification(#[from] crate::contracts::VerificationError),
+    /// A pickup, coordination, or repair workflow refused its input.
+    #[error(transparent)]
+    Coordination(#[from] crate::workflows::coordination::CoordinationError),
 }
 
 impl Error {
@@ -85,6 +88,7 @@ impl Error {
             Self::Selection(error) => error.class(),
             Self::Event(error) => error.class(),
             Self::Verification(error) => error.class(),
+            Self::Coordination(error) => error.class(),
         }
     }
 }

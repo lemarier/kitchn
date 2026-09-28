@@ -1837,3 +1837,68 @@ fn a_superseded_consumer_cannot_renew_its_task_lease() -> TestResult {
     store.renew(&task, recovered.fence(), ttl(600)?, at(640))?;
     Ok(())
 }
+
+#[test]
+fn a_taking_over_owner_continues_the_interrupted_attempt_without_spending_budget() -> TestResult {
+    let fixture = Fixture::new()?;
+    let old = claimed_attempt(&fixture, "task-1", at(0))?;
+    let task = task_id("task-1")?;
+    let store = &fixture.store;
+    let lease = store.take_over(&task, &scheduled("coordinator-b")?, ttl(60)?, at(61))?;
+    let fence = lease.fence();
+
+    // The interrupted attempt continues under the new fence, as the same
+    // attempt; repeating is a no-op.
+    assert_eq!(
+        store.continue_attempt(&task, fence, at(62))?,
+        Some(AttemptNumber::FIRST)
+    );
+    assert_eq!(
+        store.continue_attempt(&task, fence, at(63))?,
+        Some(AttemptNumber::FIRST)
+    );
+    let record = store.task(&task)?;
+    assert!(
+        matches!(record.attempts(), [first] if first.state() == AttemptState::Running && first.fence() == fence)
+    );
+    // The previous owner cannot finish it any more.
+    assert!(matches!(
+        store.finish_attempt(
+            &task,
+            old,
+            AttemptNumber::FIRST,
+            AttemptOutcome::Succeeded,
+            at(64)
+        ),
+        Err(Error::State(StateError::StaleFence { .. }))
+    ));
+    // Its outcome is recorded on attempt 1 and leaves the full remaining budget.
+    let failed = AttemptOutcome::Failed(kitchen::contracts::FailureClass::Retryable);
+    let disposition = store.finish_attempt(&task, fence, AttemptNumber::FIRST, failed, at(65))?;
+    assert!(matches!(
+        disposition,
+        kitchen::contracts::Disposition::RetryAvailable { remaining } if remaining > 0
+    ));
+    // A finished attempt is not continued; nothing changes.
+    assert_eq!(store.continue_attempt(&task, fence, at(66))?, None);
+    assert_eq!(store.task(&task)?.attempts().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn continuing_needs_a_live_claim_and_an_attempt() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task = task_id("task-2")?;
+    let store = &fixture.store;
+    store.create_task(spec("task-2")?, &creator()?, at(0))?;
+    let lease = store.claim(&task, &scheduled("coordinator-a")?, ttl(60)?, at(0))?;
+    // No attempt started yet: nothing to continue.
+    assert_eq!(store.continue_attempt(&task, lease.fence(), at(1))?, None);
+    assert!(store.task(&task)?.attempts().is_empty());
+    // An expired claim continues nothing.
+    assert!(matches!(
+        store.continue_attempt(&task, lease.fence(), at(61)),
+        Err(Error::State(StateError::LeaseExpired { .. }))
+    ));
+    Ok(())
+}

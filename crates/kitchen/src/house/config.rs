@@ -9,6 +9,26 @@ use crate::{
     selection::{AgentPolicy, SelectionError},
 };
 
+/// The tool a house requires for dependent branches and stacked pull
+/// requests. When one is configured, Kitchen creates, rebases, retargets,
+/// and pushes dependent branches only through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StackTool {
+    /// The `gh stack` GitHub CLI extension (`github/gh-stack`).
+    GhStack,
+}
+
+impl StackTool {
+    /// The command a person runs, for diagnostics.
+    #[must_use]
+    pub const fn command(self) -> &'static str {
+        match self {
+            Self::GhStack => "gh stack",
+        }
+    }
+}
+
 /// Strict house policy. Stored outside all repository checkouts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -37,6 +57,9 @@ pub struct HouseConfig {
     /// launches use the backend's default agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<AgentPolicy>,
+    /// The stack tool dependent branches must go through, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_tool: Option<StackTool>,
 }
 
 impl HouseConfig {

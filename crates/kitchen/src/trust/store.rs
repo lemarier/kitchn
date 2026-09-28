@@ -648,7 +648,8 @@ fn store_error(error: crate::Error) -> TrustError {
         | crate::Error::Workflow(_)
         | crate::Error::Selection(_)
         | crate::Error::Event(_)
-        | crate::Error::Verification(_) => TrustError::Refused,
+        | crate::Error::Verification(_)
+        | crate::Error::Coordination(_) => TrustError::Refused,
     }
 }
 fn audit_identity(audit: &GrantAudit) -> (&crate::contracts::ExternalRef, &HouseId) {

@@ -45,7 +45,7 @@ fn version_is_machine_readable() -> Result<(), Box<dyn Error>> {
 fn unknown_commands_fail_without_claiming_execution() -> Result<(), Box<dyn Error>> {
     let _spawn_guard = spawn_guard();
     let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
-        .arg("pickup")
+        .arg("launch-everything")
         .output()?;
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());

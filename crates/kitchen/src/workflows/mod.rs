@@ -1,9 +1,21 @@
 //! Workflow policy built on the core contracts and the durable house store.
+//!
+//! Workflows are trigger-neutral: the same code serves a scheduled run and an
+//! interactive session. The [`crate::contracts::Claimant`] passed in decides
+//! where effect authority comes from, and both triggers share the same
+//! durable claims.
 
 pub mod cleanup;
+pub mod coordination;
 pub mod gardener;
 pub mod gate;
 pub mod inspector;
+pub mod pickup;
+pub mod push;
+pub mod ready;
+pub mod recovery;
+pub mod repair;
+pub mod stack;
 pub mod triage;
 
 use crate::{integrations::github::Observation, scheduling::PrecheckOutcome};

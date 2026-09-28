@@ -198,6 +198,24 @@ impl HouseStore {
         self.transact(|state| state.start_attempt(id, fence, now))
     }
 
+    /// Continue the task's latest attempt under `fence` without spending the
+    /// retry budget: the running attempt, or the latest attempt when its
+    /// previous owner relinquished or lost the claim before finishing it. An
+    /// adopting or taking-over owner supervises the same attempt and its
+    /// worker under its own fence. `None` when the latest attempt ended or
+    /// none started; nothing changes then.
+    ///
+    /// # Errors
+    /// Refuses without a live claim at `fence`.
+    pub fn continue_attempt(
+        &self,
+        id: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<Option<AttemptNumber>> {
+        self.transact(|state| state.continue_attempt(id, fence, now))
+    }
+
     /// Finish `attempt`, which must be the running attempt. Repeating the
     /// same report for any earlier attempt replays that attempt's result and
     /// changes nothing.

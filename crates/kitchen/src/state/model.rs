@@ -552,6 +552,13 @@ pub struct TaskRecord {
 }
 
 impl TaskRecord {
+    /// Whether `message` was consumed for this task
+    /// ([`crate::state::HouseStore::consume_message`]).
+    #[must_use]
+    pub fn has_consumed(&self, message: &ExternalRef) -> bool {
+        self.consumed.contains(message)
+    }
+
     /// The immutable specification.
     #[must_use]
     pub const fn spec(&self) -> &TaskSpec {
@@ -1350,6 +1357,30 @@ impl StoreState {
             state: AttemptState::Running,
         });
         Ok(AttemptStart::Started(number))
+    }
+
+    pub(crate) fn continue_attempt(
+        &mut self,
+        id: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<Option<AttemptNumber>> {
+        let task = self.task_mut(id)?;
+        task.owned_lease(fence, now, true)?;
+        let Some(attempt) = task.attempts.last_mut() else {
+            return Ok(None);
+        };
+        match attempt.state {
+            AttemptState::Running if attempt.fence == fence => Ok(Some(attempt.number)),
+            AttemptState::Interrupted { .. } => {
+                attempt.fence = fence;
+                attempt.state = AttemptState::Running;
+                Ok(Some(attempt.number))
+            }
+            AttemptState::Running
+            | AttemptState::Finished { .. }
+            | AttemptState::Cancelled { .. } => Ok(None),
+        }
     }
 
     pub(crate) fn finish_attempt(

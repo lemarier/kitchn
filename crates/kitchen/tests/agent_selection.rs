@@ -425,6 +425,7 @@ fn doctor_reports_configured_models_the_agents_do_not_offer() -> TestResult {
                 models: BTreeSet::from([AgentModel::new("sonnet")?, AgentModel::new("opus")?]),
             },
         ]),
+        stack_tool: None,
     };
     let [unknown] = model_findings(Some(&evidence))?
         .try_into()

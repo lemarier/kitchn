@@ -210,6 +210,8 @@ impl Observation {
 
     /// Whether this record can support an explicit trust decision. Unknown
     /// agent/model/usage attribution and simulated runs never provide trust.
+    /// Core evidence must agree with the adapter's PR evidence: an item that
+    /// is not a pass, or that concerns another head or base, blocks trust.
     #[must_use]
     pub fn trust_eligible(&self) -> bool {
         self.mode == EvidenceMode::Live
@@ -231,6 +233,10 @@ impl Observation {
             && matches!(&self.pull_request, Measurement::Observed { value: pr, .. }
                 if matches!(&pr.checks, Measurement::Observed { value, .. }
                     if !value.is_empty() && value.iter().all(|check| check.verdict == EvidenceVerdict::Pass)))
+            && matches!(&self.pull_request, Measurement::Observed { value: pr, .. }
+            if self.evidence.iter().all(|item| {
+                item.verdict == EvidenceVerdict::Pass && item.subject == pr.subject
+            }))
             && !matches!(&self.bench, Measurement::Observed { value, .. } if value.iter().any(|result| !result.passed))
             && !matches!(
                 &self.appropriate_escalation,

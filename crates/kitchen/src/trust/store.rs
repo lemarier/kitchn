@@ -281,15 +281,22 @@ impl Ledger {
     /// Append one immutable revision; identical delivery is a no-op. Reordered
     /// revisions are retained, but the projection stays incomplete until gaps close.
     ///
+    /// The task must be settled and the observation must equal its stored
+    /// facts. When core holds evidence for the task, PR evidence must describe
+    /// that exact head and base; where core holds none, the adapter's PR
+    /// evidence is the only source. A core item that is not a pass keeps the
+    /// record out of trust (see [`Observation::trust_eligible`]).
+    ///
     /// # Errors
-    /// Rejects inconsistent evidence, cross-house writes, and conflicting identities.
+    /// Rejects inconsistent evidence, PR evidence for another head, a task
+    /// binding that differs from the stored task, cross-house writes, and
+    /// conflicting identities. An absent task is `Refused`; any other failure
+    /// reading the core store is reported as `Storage`.
     pub fn record(&self, store: &HouseStore, observation: Observation) -> Result<bool, TrustError> {
         if store.house() != self.house() {
             return Err(TrustError::Refused);
         }
-        let task = store
-            .task(&observation.task)
-            .map_err(|_| TrustError::Refused)?;
+        let task = store.task(&observation.task).map_err(store_error)?;
         if !matches!(task.state(), TaskState::Settled { .. })
             || task.spec().repository.as_ref() != Some(&observation.attribution.scope.project)
             || task.spec().provenance != observation.instructions
@@ -306,12 +313,28 @@ impl Ledger {
         {
             return Err(TrustError::Refused);
         }
+        // Adapter PR evidence must describe the exact head core recorded for the
+        // task. Where core holds no evidence, the adapter's is the only source.
+        if let Measurement::Observed { value: pr, .. } = &observation.pull_request
+            && task
+                .evidence()
+                .subject()
+                .is_some_and(|core| core != &pr.subject)
+        {
+            return Err(TrustError::Refused);
+        }
         self.transact(|doc| {
             observation.validate()?;
-            if let Some(binding) = doc.bindings.iter().find(|binding| binding.spec.id == observation.task)
-                && (binding.scope != observation.attribution.scope
+            if let Some(binding) = doc
+                .bindings
+                .iter()
+                .find(|binding| binding.spec.id == observation.task)
+                && (!binding.matches(task.spec())
+                    || binding.scope != observation.attribution.scope
                     || matches!(&observation.attribution.model, Measurement::Observed { value, .. } if value != &binding.model))
-            { return Err(TrustError::Refused); }
+            {
+                return Err(TrustError::Refused);
+            }
             if doc.observations.iter().any(|old| {
                 old.id == observation.id
                     && (old.attribution.scope != observation.attribution.scope
@@ -525,8 +548,17 @@ impl Ledger {
     /// pass the returned grants to the core executor. A plain house policy cannot
     /// acquire the earned grants, and revocation removes them on the next read.
     ///
+    /// A grant applies only when every evidence task has the acting task's
+    /// station scope, role, and bound model, and exactly its instruction pins
+    /// ([`Provenance`](crate::contracts::Provenance) is compared for equality).
+    /// Any change to the Kitchen, house-guidance, or repository-instruction pin
+    /// therefore voids earned standing until new evidence is earned under the
+    /// new pins. This fails closed; policy-based re-evaluation per guidance
+    /// revision belongs to the graduation work in #44.
+    ///
     /// # Errors
-    /// Rejects absent or altered bindings, cross-house tasks, and store failures.
+    /// Rejects absent or altered bindings and cross-house tasks. A failure
+    /// reading the core store is reported as `Storage`.
     pub fn standing_for_task(
         &self,
         store: &HouseStore,
@@ -542,7 +574,7 @@ impl Ledger {
         match store.task(&spec.id) {
             Ok(record) if record.spec() != spec => return Err(TrustError::Refused),
             Ok(_) | Err(crate::Error::State(StateError::TaskNotFound(_))) => {}
-            Err(_) => return Err(TrustError::Refused),
+            Err(error) => return Err(store_error(error)),
         }
         self.read(|doc| {
             let binding = doc.bindings.iter().find(|b| b.spec.id == spec.id)
@@ -559,6 +591,7 @@ impl Ledger {
                         observed.revision == *revision
                             && observed.trust_eligible()
                             && observed.instructions == spec.provenance
+                            && observed.role == spec.role
                             && observed.attribution.scope == binding.scope
                             && matches!(&observed.attribution.model, Measurement::Observed { value, .. } if value == &binding.model)
                     })
@@ -598,6 +631,20 @@ impl Ledger {
         f: impl FnOnce(&Document) -> Result<T, TrustError>,
     ) -> Result<T, TrustError> {
         self.engine.read(f)?
+    }
+}
+/// An absent task is a policy refusal; any other core-store failure keeps its
+/// own class so a caller can tell a transient fault from a refusal.
+fn store_error(error: crate::Error) -> TrustError {
+    match error {
+        crate::Error::State(StateError::TaskNotFound(_)) => TrustError::Refused,
+        crate::Error::State(error) => TrustError::Storage(error),
+        crate::Error::Contract(error) => TrustError::Authority(error),
+        crate::Error::Trust(error) => error,
+        // A task read produces none of these; refuse rather than guess.
+        crate::Error::Identifier(_) | crate::Error::House(_) | crate::Error::Scaffold(_) => {
+            TrustError::Refused
+        }
     }
 }
 fn audit_identity(audit: &GrantAudit) -> (&crate::contracts::ExternalRef, &HouseId) {

@@ -6,6 +6,10 @@
 //! value to the core executor. Revocation cannot cancel an effect already
 //! submitted. Interactive consent is never stored here. Runtime files must
 //! live outside repositories.
+//!
+//! Earned standing is tied to the exact instruction pins of the evidence tasks:
+//! changing any pin voids it until new evidence is earned. Re-evaluating trust
+//! per guidance revision by policy is planned in #44.
 mod error;
 mod model;
 mod store;

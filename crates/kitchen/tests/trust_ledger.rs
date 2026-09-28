@@ -6,10 +6,10 @@ use common::{
 };
 use kitchen::{
     contracts::{
-        AttemptNumber, AttemptOutcome, EvidenceSubject, ExternalRef, Grant, Permission, Repository,
-        Text,
+        AttemptNumber, AttemptOutcome, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
+        ExternalRef, Grant, Permission, Repository, Role, TaskSpec, Text,
     },
-    state::{Corruption, StateError},
+    state::{Corruption, HouseStore, StateError, StoreOptions},
     trust::{
         Attribution, AutonomyGrant, AutonomyProposal, EvidenceMode, Ledger, Measurement,
         Observation, PullRequestEvidence, StationScope, TrustError,
@@ -43,17 +43,29 @@ fn attribution() -> TestResult<Attribution> {
         tokens: measured(120)?,
     })
 }
-fn observation(f: &Fixture) -> TestResult<Observation> {
-    let mut task = spec("task")?;
+/// Settle `name` as a succeeded worker task in the example project and collect
+/// its observation. `edit` adjusts the spec before creation; `core` is recorded
+/// as the task's core evidence before it settles.
+fn settled(
+    f: &Fixture,
+    name: &str,
+    stream: &str,
+    edit: impl FnOnce(&mut TaskSpec),
+    core: Option<Evidence>,
+) -> TestResult<Observation> {
+    let mut task = spec(name)?;
     task.repository = Some(scope()?.project);
+    edit(&mut task);
+    let id = task_id(name)?;
     f.store.create_task(task, &creator()?, at(0))?;
-    let lease = f
-        .store
-        .claim(&task_id("task")?, &scheduled("owner")?, ttl(60)?, at(1))?;
-    f.store
-        .start_attempt(&task_id("task")?, lease.fence(), at(2))?;
+    let lease = f.store.claim(&id, &scheduled("owner")?, ttl(60)?, at(1))?;
+    f.store.start_attempt(&id, lease.fence(), at(2))?;
+    if let Some(evidence) = core {
+        f.store
+            .record_evidence(&id, lease.fence(), evidence, at(2))?;
+    }
     f.store.finish_attempt(
-        &task_id("task")?,
+        &id,
         lease.fence(),
         AttemptNumber::FIRST,
         AttemptOutcome::Succeeded,
@@ -61,12 +73,24 @@ fn observation(f: &Fixture) -> TestResult<Observation> {
     )?;
     Ok(Observation::collect(
         &f.store,
-        &task_id("task")?,
-        source("fixture:task")?,
+        &id,
+        source(stream)?,
         attribution()?,
         EvidenceMode::Simulated,
         at(4),
     )?)
+}
+fn observation(f: &Fixture) -> TestResult<Observation> {
+    settled(f, "task", "fixture:task", |_| {}, None)
+}
+fn core_check(verdict: EvidenceVerdict, subject: EvidenceSubject) -> TestResult<Evidence> {
+    Ok(Evidence {
+        kind: EvidenceKind::Check,
+        verdict,
+        subject,
+        source: source("fixture:core-check")?,
+        observed_at: at(2),
+    })
 }
 fn ledger(f: &Fixture) -> TestResult<Ledger> {
     Ok(Ledger::initialize(f.dir.path().join("trust"), house()?)?)
@@ -90,13 +114,13 @@ fn subject() -> TestResult<EvidenceSubject> {
         base: Some(commit('b')?),
     })
 }
-fn with_pr(mut o: Observation) -> TestResult<Observation> {
+fn with_pr_at(mut o: Observation, subject: EvidenceSubject) -> TestResult<Observation> {
     o.pull_request = measured(PullRequestEvidence {
         house: house()?,
         task: o.task.clone(),
         repository: scope()?.project,
         source: source("https://example.invalid/pr/1")?,
-        subject: subject()?,
+        subject,
         first_pass: Measurement::Missing,
         findings: Measurement::Missing,
         reverts: Measurement::Missing,
@@ -105,23 +129,30 @@ fn with_pr(mut o: Observation) -> TestResult<Observation> {
     })?;
     Ok(o)
 }
-fn eligible(mut o: Observation) -> TestResult<Observation> {
-    o = with_pr(o)?;
+fn with_pr(o: Observation) -> TestResult<Observation> {
+    with_pr_at(o, subject()?)
+}
+/// Live evidence with every positive measurement for the PR head `at`.
+fn eligible_at(o: Observation, at_head: EvidenceSubject) -> TestResult<Observation> {
+    let mut o = with_pr_at(o, at_head)?;
     o.mode = EvidenceMode::Live;
     if let Measurement::Observed { value, .. } = &mut o.pull_request {
         value.first_pass = measured(true)?;
         value.findings = measured(Vec::new())?;
         value.reverts = measured(Vec::new())?;
         value.regressions = measured(Vec::new())?;
-        value.checks = measured(vec![kitchen::contracts::Evidence {
-            kind: kitchen::contracts::EvidenceKind::Check,
-            verdict: kitchen::contracts::EvidenceVerdict::Pass,
+        value.checks = measured(vec![Evidence {
+            kind: EvidenceKind::Check,
+            verdict: EvidenceVerdict::Pass,
             subject: value.subject.clone(),
             source: source("fixture:passing-check")?,
             observed_at: at(4),
         }])?;
     }
     Ok(o)
+}
+fn eligible(o: Observation) -> TestResult<Observation> {
+    eligible_at(o, subject()?)
 }
 fn grant() -> TestResult<AutonomyGrant> {
     Ok(AutonomyGrant {
@@ -402,6 +433,132 @@ fn task_binding_is_write_once_and_rejects_role_confusion() -> TestResult {
         l.bind_task(&task, wrong_role, model, source("fixture:other")?),
         Err(TrustError::Refused)
     ));
+    Ok(())
+}
+
+#[test]
+fn record_refuses_a_task_binding_that_differs_from_the_stored_task() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let o = observation(&f)?;
+    // The adapter bound a prospective spec whose role is not the stored task's.
+    let mut prospective = f.store.task(&task_id("task")?)?.spec().clone();
+    prospective.role = Role::Commis;
+    l.bind_task(
+        &prospective,
+        scope()?,
+        Text::new("fixture-model-v1")?,
+        source("fixture:binding")?,
+    )?;
+    assert!(matches!(l.record(&f.store, o), Err(TrustError::Refused)));
+    assert!(l.history()?.is_empty());
+    let second = settled(&f, "second", "fixture:second", |_| {}, None)?;
+    let exact = f.store.task(&task_id("second")?)?.spec().clone();
+    l.bind_task(
+        &exact,
+        scope()?,
+        Text::new("fixture-model-v1")?,
+        source("fixture:second-binding")?,
+    )?;
+    assert!(l.record(&f.store, second)?);
+    Ok(())
+}
+
+#[test]
+fn pr_evidence_must_describe_the_head_core_recorded_and_agree_with_core_checks() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let head = subject()?;
+    let core = core_check(EvidenceVerdict::Pass, head.clone())?;
+    let recorded = settled(&f, "task", "fixture:task", |_| {}, Some(core))?;
+    for moved in [
+        EvidenceSubject {
+            head: commit('c')?,
+            base: head.base.clone(),
+        },
+        EvidenceSubject {
+            head: head.head.clone(),
+            base: Some(commit('c')?),
+        },
+        EvidenceSubject {
+            head: head.head.clone(),
+            base: None,
+        },
+    ] {
+        assert!(matches!(
+            l.record(&f.store, eligible_at(recorded.clone(), moved)?),
+            Err(TrustError::Refused)
+        ));
+    }
+    assert!(l.history()?.is_empty());
+    assert!(l.record(&f.store, eligible_at(recorded.clone(), head.clone())?)?);
+    assert!(l.latest(&recorded.id)?.trust_eligible());
+    // Where core holds no evidence, the adapter's PR evidence is the only source.
+    let bare = settled(&f, "bare", "fixture:bare", |_| {}, None)?;
+    let elsewhere = EvidenceSubject {
+        head: commit('c')?,
+        base: None,
+    };
+    assert!(l.record(&f.store, eligible_at(bare, elsewhere)?)?);
+    // A core check that is not a pass keeps the record out of trust even when
+    // the adapter reports passing checks for the same head.
+    for (name, verdict) in [
+        ("failed-check", EvidenceVerdict::Fail),
+        ("unavailable-check", EvidenceVerdict::Unavailable),
+    ] {
+        let core = core_check(verdict, head.clone())?;
+        let stream = format!("fixture:{name}");
+        let o = eligible_at(
+            settled(&f, name, &stream, |_| {}, Some(core))?,
+            head.clone(),
+        )?;
+        assert!(!o.trust_eligible());
+        assert!(l.record(&f.store, o.clone())?);
+        assert!(!l.latest(&o.id)?.trust_eligible());
+    }
+    Ok(())
+}
+
+#[test]
+fn core_store_faults_are_storage_errors_and_an_absent_task_is_a_refusal() -> TestResult {
+    use std::{fs::OpenOptions, time::Duration};
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let o = observation(&f)?;
+    let task_spec = f.store.task(&task_id("task")?)?.spec().clone();
+    l.bind_task(
+        &task_spec,
+        scope()?,
+        Text::new("fixture-model-v1")?,
+        source("fixture:binding")?,
+    )?;
+    let quick = HouseStore::open(
+        f.dir.path().join("house"),
+        house()?,
+        StoreOptions {
+            lock_timeout: Duration::from_millis(30),
+            ..StoreOptions::default()
+        },
+    )?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.dir.path().join("house/state.lock"))?;
+    lock.lock()?;
+    assert!(matches!(
+        l.record(&quick, o.clone()),
+        Err(TrustError::Storage(StateError::LockTimeout { .. }))
+    ));
+    assert!(matches!(
+        l.standing_for_task(&quick, &task_spec, &grants()?),
+        Err(TrustError::Storage(StateError::LockTimeout { .. }))
+    ));
+    drop(lock);
+    let mut absent = o.clone();
+    absent.task = task_id("absent")?;
+    assert!(matches!(l.record(&quick, absent), Err(TrustError::Refused)));
+    assert!(l.history()?.is_empty());
+    assert!(l.record(&quick, o)?);
     Ok(())
 }
 

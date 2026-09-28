@@ -433,13 +433,14 @@ const menu = [
           terminal in a couple of minutes.
         </p>
         <div class="term" data-term>
-          <svg class="doodle" viewBox="0 0 80 96" aria-hidden="true">
-            <path d="M14 40c-10-2-12-16-2-20 2-10 16-12 20-4 4-10 20-10 22 0 10-4 20 6 12 16 8 6 2 18-8 16" />
-            <path d="M18 40c0 10 2 30 4 50M58 42c0 10-1 30-3 48" />
-            <path d="M20 50h36" />
-            <circle cx="32" cy="64" r="2.5" />
-            <circle cx="46" cy="64" r="2.5" />
-            <path d="M33 74c4 4 10 4 13 0" />
+          <svg class="doodle" viewBox="0 0 96 72" aria-hidden="true">
+            <path d="M27 33c-8-2-9-14 1-15 2-9 13-11 17-4 4-7 15-5 17 4 10 1 9 13 1 15" />
+            <path d="M27 33v5h42v-5" />
+            <path d="M20 72V47a9 9 0 0 1 9-9h38a9 9 0 0 1 9 9v25" />
+            <circle cx="38" cy="55" r="3.5" />
+            <circle cx="58" cy="55" r="3.5" />
+            <path d="M42 65h12" />
+            <path d="M8 72c0-7 12-7 12 0M76 72c0-7 12-7 12 0" />
           </svg>
           <div class="term-list" role="tablist" aria-label="Commands" aria-orientation="vertical">
             {
@@ -1714,8 +1715,8 @@ const menu = [
   }
   .doodle {
     position: absolute;
-    width: 4.5rem;
-    top: -4.4rem;
+    width: 6rem;
+    top: calc(-4.5rem + 1px);
     right: 2.5rem;
     fill: none;
     stroke: var(--ink);
@@ -1995,8 +1996,8 @@ const menu = [
       padding-bottom: 0;
     }
     .doodle {
-      width: 3.5rem;
-      top: -3.4rem;
+      width: 4.5rem;
+      top: calc(-3.375rem + 1px);
       right: 1rem;
     }
   }

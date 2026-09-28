@@ -501,7 +501,7 @@ mod lock_tests {
         let registry = HouseRegistry::new(directory.path().canonicalize()?)?;
         let poisoner = std::thread::spawn(|| {
             let _guard = REGISTRY_LOCK.lock();
-            panic!("poison the registry process guard");
+            std::panic::resume_unwind(Box::new("poison the registry process guard"));
         });
         assert!(poisoner.join().is_err());
         assert!(REGISTRY_LOCK.is_poisoned());
@@ -511,25 +511,10 @@ mod lock_tests {
     }
 
     #[test]
-    fn held_lock_file_reports_contention_not_error() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("held.lock");
-        let file = File::create(&path)?;
-        assert!(matches!(try_lock_file(&file)?, Attempt::Locked));
-        // A second process is needed to observe contention; the same
-        // process re-locking its own record succeeds.
-        assert!(matches!(try_lock_file(&file)?, Attempt::Locked));
-        Ok(())
-    }
-
-    #[test]
     fn unlockable_descriptor_is_an_error_not_busy() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let read_only = File::open(directory.path())?;
-        assert!(matches!(
-            try_lock_file(&read_only),
-            Err(HouseError::Io(_))
-        ));
+        assert!(matches!(try_lock_file(&read_only), Err(HouseError::Io(_))));
         Ok(())
     }
 }

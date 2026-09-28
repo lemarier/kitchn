@@ -505,6 +505,7 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
 pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
     match error {
         OrcaError::Timeout => BackendUnavailable::Timeout,
+        OrcaError::ReservationInsideRepository => BackendUnavailable::LocalConfiguration,
         OrcaError::Spawn(_)
         | OrcaError::OutputLimit { .. }
         | OrcaError::Io(_)
@@ -525,7 +526,6 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::ScheduleDiffers { .. }
         | OrcaError::ReservationBusy
         | OrcaError::ReservationRedirected
-        | OrcaError::ReservationInsideRepository
         | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::InstallUncertain
@@ -1406,6 +1406,23 @@ mod tests {
             launch_marker(&home, &key)
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_local_reservation_refusal_is_local_configuration() {
+        assert_eq!(
+            read_failure(&OrcaError::ReservationInsideRepository),
+            BackendUnavailable::LocalConfiguration,
+            "the guard runs before any Orca request"
+        );
+        assert_eq!(
+            read_failure(&OrcaError::Io(std::io::ErrorKind::BrokenPipe)),
+            BackendUnavailable::Transport
+        );
+        assert_eq!(
+            read_failure(&OrcaError::Timeout),
+            BackendUnavailable::Timeout
+        );
     }
 
     #[test]

@@ -58,7 +58,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #6 Orca adapter and scheduling | `adapters/orca/`, `scheduling/`, `contracts/effects/schedule.rs` | Backend execution only; generic capability contracts belong to #4 |
 | #7 GitHub and Roger | `integrations/github/`, `integrations/roger/`, `contracts/effects/github.rs`, `contracts/effects/roger.rs` | House-scoped external access |
 | #8 pickup, coordination and repair | `workflows/pickup.rs`, `workflows/coordination.rs`, `workflows/repair.rs` | Workflow integration tests |
-| #9 exact-head gate | `workflows/gate.rs` | Gate evidence and approval tests |
+| #9 exact-head gate | `workflows/gate.rs`, `workflows/gate/` | Gate evidence and approval tests |
 | #10 triage and gardener | `workflows/triage.rs`, `workflows/gardener.rs` | Hygiene tests |
 | #11 dishwasher | `workflows/cleanup.rs` | Ownership and preservation tests |
 | #12 trust and inspector | `trust/`, `workflows/inspector.rs` | Evidence and autonomy tests |

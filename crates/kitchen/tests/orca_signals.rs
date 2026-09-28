@@ -194,6 +194,33 @@ fn a_launch_orca_recorded_as_failed_is_never_observed() -> TestResult {
 }
 
 #[test]
+fn a_worker_whose_process_exited_after_starting_is_not_a_failed_launch() -> TestResult {
+    // An hour in, the agent's process ended without a report or a stop, and
+    // its terminal is gone, so Orca refuses the read.
+    let exited = SimWorker {
+        stage_detail: Some("process_exited"),
+        ..SimWorker::new("failed", "failed", "exited", false)
+    };
+    let signals = signals_of(exited, 3_600_000)?;
+    assert_eq!(signals.start, StartOutcome::Unknown);
+    assert_eq!(signals.transcript, None);
+    assert_eq!(signals.liveness, Liveness::Exited);
+    assert_eq!(signals.dispatch, DispatchActivity::Ended);
+    Ok(())
+}
+
+#[test]
+fn a_closed_window_with_an_unreadable_output_is_not_a_swallowed_launch() -> TestResult {
+    // Orca refuses the read: nothing was seen, so nothing is concluded.
+    let refused = SimWorker {
+        output: None,
+        ..SimWorker::new("ready", "in_progress", "unverifiable", false)
+    };
+    assert_eq!(signals_of(refused, 90_000)?.start, StartOutcome::Unknown);
+    Ok(())
+}
+
+#[test]
 fn an_agent_at_its_prompt_without_a_report_is_idle_not_done() -> TestResult {
     let idle = SimWorker {
         activity: "done",
@@ -213,6 +240,7 @@ fn an_agent_at_its_prompt_without_a_report_is_idle_not_done() -> TestResult {
     let fresh = signals_of(
         SimWorker {
             activity: "idle",
+            output: transcript(vec![message("user", "do the task", 1_000)]),
             ..live()
         },
         300_000,
@@ -506,11 +534,24 @@ fn quoted_errors_in_tool_output_and_prompts_are_not_the_providers() -> TestResul
                 1_000,
             ),
             message("tool", "API Error: 401 authentication_error", 2_000),
-            message("assistant", "I will look into it.", 3_000),
+            message(
+                "assistant",
+                "The API rate limit is 100 per minute; I am handling the oauth token refresh.",
+                3_000,
+            ),
         ]),
+        preview: Some("You are not logged into any GitHub hosts. Run gh auth login"),
         ..live()
     };
     assert_eq!(signals_of(quoting, 1_000)?.provider_error, None);
+    let prose = SimWorker {
+        output: Some(SimOutput::Terminal(vec![
+            "● Too many requests reach the cache, so I added a limiter.".to_owned(),
+            "+    if body.contains(\"usage limit\") {".to_owned(),
+        ])),
+        ..live()
+    };
+    assert_eq!(signals_of(prose, 1_000)?.provider_error, None);
     Ok(())
 }
 

@@ -37,6 +37,23 @@ const MAX_SCAN_BYTES: usize = 8 * 1024;
 /// Newest transcript messages scanned for a provider error.
 const SCANNED_MESSAGES: usize = 3;
 
+/// The stages Orca 1.4.212 records when a start fails before the agent was
+/// ready (`failWorkerStart` from `worker-start` and remote attach). Other
+/// failed stages, such as `process_exited` or `terminal_missing`, come after
+/// the agent may have run.
+const START_FAILURE_STAGES: [&str; 10] = [
+    "worktree_create",
+    "surface_create",
+    "mode_settle",
+    "terminal_create",
+    "setup_start",
+    "setup_wait",
+    "agent_readiness",
+    "dispatch_input",
+    "turn_observation",
+    "remote_attach",
+];
+
 /// Whether the agent behind a launch began work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StartOutcome {
@@ -47,14 +64,16 @@ pub enum StartOutcome {
     /// finished turn, the transcript holds an agent message, or the agent
     /// reported an outcome.
     TurnObserved,
-    /// No turn was seen. Orca recorded the launch as failed before the agent
-    /// was ready, or it accepted the input and the start window closed with
+    /// No turn was seen. Orca recorded the launch as failed at a start stage,
+    /// before the agent was ready, or it accepted the input and the start
+    /// window closed while the worker's output, read successfully, held
     /// nothing from the agent (the shape of a prompt that swallowed the
     /// launch). This is missing evidence, not proof the agent is gone: read
     /// [`WorkerSignals::liveness`] before acting.
     NeverObserved,
-    /// Not enough to say: still starting, stopped before it showed a turn, or
-    /// a stage Kitchen does not recognize.
+    /// Not enough to say: still starting, stopped or exited before it showed
+    /// a turn, output Orca refused to read, or a stage Kitchen does not
+    /// recognize.
     Unknown,
 }
 
@@ -182,16 +201,19 @@ pub struct WorkerSignals {
     pub transcript: Option<TranscriptProgress>,
     /// Who holds the terminal.
     pub terminal: TerminalOwner,
-    /// A provider failure seen in the worker's start error, terminal, or
-    /// newest agent messages. A heuristic over text: pair it with
-    /// [`Self::prompt`] and [`Self::start`].
+    /// A provider failure seen in the start error Orca recorded (with an API
+    /// error frame) or in provider-shaped lines of the terminal and newest
+    /// agent messages. A heuristic over text: pair it with [`Self::prompt`]
+    /// and [`Self::start`].
     pub provider_error: Option<ProviderErrorClass>,
 }
 
 impl WorkerSignals {
-    /// Whether a message to the worker would be accepted: the Dispatch is
-    /// active and no person holds the terminal. This is the adapter's own
-    /// rule, so a `false` here means the adapter would send nothing.
+    /// Whether a message to the worker is known to be accepted: the Dispatch
+    /// is active and no person holds the terminal. `false` is conservative:
+    /// for a person's terminal or another Run the adapter sends nothing, for
+    /// an ended Dispatch Orca refuses the message, and for an unknown state
+    /// (such as a `pending` Dispatch) it may still be accepted.
     #[must_use]
     pub fn accepts_messages(&self) -> bool {
         self.dispatch == DispatchActivity::Active && self.terminal != TerminalOwner::Person
@@ -316,7 +338,33 @@ fn value_text(value: &Value) -> String {
     }
 }
 
-/// Phrases that name a provider's own failure. Matched on lowercased text.
+/// How a provider line starts once decoration is stripped, lowercased: the
+/// shapes Claude Code and Codex print for a failed request or account. Agent
+/// prose, tool output, and diffs rarely start a line this way, so only these
+/// lines are read as the provider's own output.
+const PROVIDER_LINES: &[&str] = &[
+    "api error",
+    "stream error",
+    "unexpected status",
+    "error: unexpected status",
+    "error: stream error",
+    "{\"type\":\"error\"",
+    "invalid api key",
+    "not logged in",
+    "please run /login",
+    "oauth token has expired",
+    "credit balance is too low",
+    "claude usage limit reached",
+    "you've hit your usage limit",
+    "rate limit reached for",
+    "429 too many requests",
+];
+
+/// Characters terminal UIs put before a line: bullets, frames, and markers.
+/// `+` and `-` are not among them, so a diff line is never a provider line.
+const LINE_DECORATION: &[char] = &['>', '•', '●', '■', '⎿', '│', '⏺', '✗', '✘', '⚠', '❌'];
+
+/// Phrases that name a provider's own failure, read in provider lines only.
 const QUOTA: &[&str] = &[
     "insufficient_quota",
     "exceeded your current quota",
@@ -326,6 +374,9 @@ const QUOTA: &[&str] = &[
     "usage limit",
     "billing hard limit",
 ];
+/// Quota wording a throttle message shares (`Rate limit reached for ...`), so
+/// it is read after the throttle phrases.
+const QUOTA_AFTER_THROTTLE: &[&str] = &["limit reached", "limit will reset"];
 const AUTH: &[&str] = &[
     "authentication_error",
     "invalid api key",
@@ -335,15 +386,13 @@ const AUTH: &[&str] = &[
     "token has expired",
     "oauth token",
     "login expired",
+    "unauthorized",
+    "forbidden",
+    "401",
+    "403",
 ];
-const RATE_LIMIT: &[&str] = &["rate_limit_error", "rate limit", "too many requests"];
-/// Weaker phrases that count only beside a provider error frame, because
-/// ordinary tool output prints them too.
-const AUTH_WEAK: &[&str] = &["unauthorized", "forbidden"];
-const AUTH_STATUS: &[&str] = &["401", "403"];
-const RATE_LIMIT_STATUS: &[&str] = &["429"];
-const QUOTA_WEAK: &[&str] = &["limit reached", "limit will reset"];
-/// Markers that the text reports a provider or API failure.
+const RATE_LIMIT: &[&str] = &["rate_limit_error", "rate limit", "too many requests", "429"];
+/// Markers that a recorded start error quotes a provider or API failure.
 const FRAMES: &[&str] = &[
     "api error",
     "api_error",
@@ -354,51 +403,96 @@ const FRAMES: &[&str] = &[
     "request failed",
     "\"type\":\"error\"",
     "overloaded_error",
+    "authentication_error",
+    "rate_limit_error",
+    "insufficient_quota",
+    "invalid x-api-key",
+    "please run /login",
 ];
 
-fn any(text: &str, phrases: &[&str]) -> bool {
-    phrases.iter().any(|phrase| text.contains(phrase))
-}
-
-/// Whether `text` holds `status` as a number of its own, not inside a longer one.
-fn has_status(text: &str, status: &str) -> bool {
-    text.match_indices(status).any(|(at, _)| {
+/// Whether `text` holds `term` as a whole word: not inside a longer word or
+/// number, so `401` is not in `14010` and `not logged in` is not in
+/// `not logged into`.
+fn has_term(text: &str, term: &str) -> bool {
+    text.match_indices(term).any(|(at, _)| {
         let before = text.get(..at).and_then(|head| head.chars().next_back());
         let after = text
-            .get(at + status.len()..)
+            .get(at + term.len()..)
             .and_then(|rest| rest.chars().next());
-        !before.is_some_and(|c| c.is_ascii_alphanumeric())
-            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+        let joins = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        !before.is_some_and(|c| joins(c) && term.starts_with(|t: char| joins(t)))
+            && !after.is_some_and(|c| joins(c) && term.ends_with(|t: char| joins(t)))
     })
 }
 
-/// Classify a provider failure in `text`, or `None` when it reports none.
+fn any(text: &str, terms: &[&str]) -> bool {
+    terms.iter().any(|term| has_term(text, term))
+}
+
+/// The class of a failure in `text`, which is known to be the provider's.
 ///
-/// Only the class leaves this function. Specific provider phrases decide on
-/// their own; status codes and generic words such as `unauthorized` count only
-/// beside an API error frame, since tool output prints them for other
-/// reasons. A quota phrase wins over a throttle, because providers report an
+/// A quota phrase wins over a throttle, because providers report an
 /// exhausted quota with the throttle status.
+fn classify_provider_line(text: &str) -> ProviderErrorClass {
+    if any(text, QUOTA) {
+        ProviderErrorClass::Quota
+    } else if any(text, AUTH) {
+        ProviderErrorClass::Auth
+    } else if any(text, RATE_LIMIT) {
+        ProviderErrorClass::RateLimit
+    } else if any(text, QUOTA_AFTER_THROTTLE) {
+        ProviderErrorClass::Quota
+    } else {
+        ProviderErrorClass::Other
+    }
+}
+
+/// `line` lowercased, without leading whitespace and decoration, when it has
+/// the shape of a provider's output.
+fn provider_line(line: &str) -> Option<String> {
+    let lower = line
+        .trim_start_matches(|c: char| c.is_whitespace() || LINE_DECORATION.contains(&c))
+        .to_lowercase();
+    PROVIDER_LINES
+        .iter()
+        .any(|shape| {
+            lower.starts_with(shape)
+                && !lower
+                    .get(shape.len()..)
+                    .and_then(|rest| rest.chars().next())
+                    .is_some_and(|c| {
+                        c.is_ascii_alphanumeric()
+                            && shape.ends_with(|t: char| t.is_ascii_alphanumeric())
+                    })
+        })
+        .then_some(lower)
+}
+
+/// Classify a provider failure in output the agent's terminal or transcript
+/// shows, or `None` when it reports none.
+///
+/// Only lines shaped like a provider's own output count (see
+/// [`PROVIDER_LINES`]); the agent's prose, tool output, and diffs mention
+/// rate limits, logins, and tokens for other reasons. The newest such line
+/// decides, and only the class leaves this function.
 pub(crate) fn classify_provider_error(text: &str) -> Option<ProviderErrorClass> {
-    let lower = tail(text, MAX_SCAN_BYTES).to_ascii_lowercase();
-    let framed = any(&lower, FRAMES);
-    if any(&lower, QUOTA) {
-        return Some(ProviderErrorClass::Quota);
+    tail(text, MAX_SCAN_BYTES)
+        .lines()
+        .rev()
+        .find_map(provider_line)
+        .map(|line| classify_provider_line(&line))
+}
+
+/// Classify the start error Orca recorded. Orca wrote it, so a provider
+/// failure it quotes need not start a line, but it must carry an API error
+/// frame: Orca's own start failures are not the provider's.
+fn classify_recorded_error(text: &str) -> Option<ProviderErrorClass> {
+    let lower = tail(text, MAX_SCAN_BYTES).to_lowercase();
+    if any(&lower, FRAMES) {
+        Some(classify_provider_line(&lower))
+    } else {
+        classify_provider_error(text)
     }
-    if any(&lower, AUTH)
-        || (framed && (any(&lower, AUTH_WEAK) || AUTH_STATUS.iter().any(|s| has_status(&lower, s))))
-    {
-        return Some(ProviderErrorClass::Auth);
-    }
-    if any(&lower, RATE_LIMIT)
-        || (framed && RATE_LIMIT_STATUS.iter().any(|s| has_status(&lower, s)))
-    {
-        return Some(ProviderErrorClass::RateLimit);
-    }
-    if any(&lower, QUOTA_WEAK) && framed {
-        return Some(ProviderErrorClass::Quota);
-    }
-    framed.then_some(ProviderErrorClass::Other)
 }
 
 /// What the agent is doing, from Orca's activity and its wait probe.
@@ -423,24 +517,52 @@ fn turn_shown(activity: Option<&str>) -> bool {
     matches!(activity, Some("working" | "blocked" | "waiting" | "done"))
 }
 
+/// What the worker's output shows of the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentMessages {
+    /// A proven transcript holds a message from the agent or its tools.
+    Seen,
+    /// Orca returned the output and it shows no agent message: a transcript
+    /// without one, or only the terminal because Orca has no transcript for
+    /// the agent (as when the launch input went to a shell).
+    NoneSeen,
+    /// Orca refused the read, so the output was not seen at all. Silence
+    /// there is not evidence.
+    Unread,
+}
+
+impl AgentMessages {
+    fn of(read: Option<&WorkerRead>) -> Self {
+        match read.and_then(WorkerRead::progress) {
+            Some(progress) if progress.agent_spoke => Self::Seen,
+            Some(_) => Self::NoneSeen,
+            None if read.is_some() => Self::NoneSeen,
+            None => Self::Unread,
+        }
+    }
+}
+
 /// Whether the agent began work.
 ///
 /// A turn seen anywhere is `TurnObserved`. Without one, `NeverObserved` needs
-/// positive evidence: Orca recorded a start-stage failure, or the input was
-/// accepted and the window closed. Kitchen's own stop leaves it unknown.
+/// positive evidence: Orca recorded a failure at one of its start stages, or
+/// the input was accepted, the window closed, and the worker's output, read
+/// successfully, showed nothing from the agent. A process exit, Kitchen's own
+/// stop, and a refused read leave it unknown.
 pub(crate) fn start_outcome(
     stage: Option<&ProjectionStage>,
-    agent_spoke: bool,
+    messages: AgentMessages,
     window: &StartWindow,
 ) -> StartOutcome {
+    let spoke = messages == AgentMessages::Seen;
     let Some(stage) = stage else {
-        return if agent_spoke {
+        return if spoke {
             StartOutcome::TurnObserved
         } else {
             StartOutcome::Unknown
         };
     };
-    if agent_spoke || turn_shown(stage.activity.as_deref()) {
+    if spoke || turn_shown(stage.activity.as_deref()) {
         return StartOutcome::TurnObserved;
     }
     match (
@@ -454,10 +576,17 @@ pub(crate) fn start_outcome(
         }
         // Orca recorded the launch as failed at a start stage, before the
         // agent was ready.
-        (Some("failed"), Some("failed"), Some(detail)) if detail != "process_stopped" => {
+        (Some("failed"), Some("failed"), Some(detail))
+            if START_FAILURE_STAGES.contains(&detail) =>
+        {
             StartOutcome::NeverObserved
         }
-        (_, _, Some("input_accepted")) if window.closed() => StartOutcome::NeverObserved,
+        (_, _, Some("input_accepted"))
+            if window.closed() && messages == AgentMessages::NoneSeen =>
+        {
+            StartOutcome::NeverObserved
+        }
+        (_, _, Some("input_accepted")) if window.closed() => StartOutcome::Unknown,
         (_, _, Some("input_accepted")) => StartOutcome::Accepted,
         _ => StartOutcome::Unknown,
     }
@@ -506,8 +635,9 @@ pub(crate) fn terminal_owner(resource: Option<&TerminalResource>) -> TerminalOwn
     }
 }
 
-/// A provider failure in the start error, the terminal preview, or the
-/// newest output, in that order.
+/// A provider failure in the start error Orca recorded, the terminal
+/// preview, or the newest output, in that order. Only provider-shaped lines
+/// of the preview and output count.
 ///
 /// Each source is classified on its own, so a long output cannot push Orca's
 /// recorded start error out of the scanned window.
@@ -519,10 +649,15 @@ fn provider_error(shown: &WorkerShow, read: Option<&WorkerRead>) -> Option<Provi
         .and_then(|terminal| terminal.preview.clone());
     // Lines can split one error across entries, so classify the whole output.
     let output = read.map(|read| read.provider_text().join("\n"));
-    [last_error, preview, output]
-        .into_iter()
-        .flatten()
-        .find_map(|text| classify_provider_error(&text))
+    last_error
+        .as_deref()
+        .and_then(classify_recorded_error)
+        .or_else(|| {
+            [preview, output]
+                .into_iter()
+                .flatten()
+                .find_map(|text| classify_provider_error(&text))
+        })
 }
 
 impl<R: OrcaRunner> OrcaBackend<R> {
@@ -551,7 +686,6 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         let read = self.read_output(dispatch)?;
         let transcript = read.as_ref().and_then(WorkerRead::progress);
         let stage = shown.projection.stage.as_ref();
-        let agent_spoke = transcript.is_some_and(|progress| progress.agent_spoke);
         let waiting = shown
             .observation
             .as_ref()
@@ -561,7 +695,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             worker: worker.clone(),
             dispatch: dispatch_activity(&shown, self.config().run.as_str()),
             liveness: liveness(&shown.projection.liveness.verdict),
-            start: start_outcome(stage, agent_spoke, window),
+            start: start_outcome(stage, AgentMessages::of(read.as_ref()), window),
             prompt: prompt_of(stage.and_then(|stage| stage.activity.as_deref()), waiting),
             transcript,
             terminal: terminal_owner(shown.terminal_resource.as_ref()),
@@ -699,6 +833,15 @@ mod tests {
             "Compiling kitchen v0.1.0 (14290 files)",
             "error[E0432]: unresolved import",
             "the limit reached its default of 10",
+            // Agent prose and ordinary tool output about the same subjects.
+            "The API rate limit is 100 per minute, so I batch the requests.",
+            "You are not logged into any GitHub hosts. Run gh auth login to authenticate.",
+            "Next I am handling the oauth token refresh in the client.",
+            "I checked: the usage limit and credit balance fields are optional.",
+            "Too many requests hit the cache, so I added a limiter.",
+            "The API errors below come from the test fixture.",
+            // A diff that adds error handling.
+            "+    if body.contains(\"API Error: 401\") {\n-    // rate limit reached",
         ] {
             assert_eq!(classify_provider_error(text), None, "{text}");
         }
@@ -707,6 +850,46 @@ mod tests {
             classify_provider_error("API error: request of 14290 tokens failed"),
             Some(ProviderErrorClass::Other)
         );
+        // A provider line among agent text is still read, behind decoration,
+        // and the newest one decides.
+        assert_eq!(
+            classify_provider_error(
+                "I will retry.\n  ⎿  API Error: 401 {\"type\":\"error\"}\nWaiting."
+            ),
+            Some(ProviderErrorClass::Auth)
+        );
+        assert_eq!(
+            classify_provider_error("API Error: 401 Unauthorized\n■ stream error: 429"),
+            Some(ProviderErrorClass::RateLimit)
+        );
+        // `not logged in` is a phrase of its own, not a prefix of another.
+        assert_eq!(
+            classify_provider_error("Not logged in · Please run /login"),
+            Some(ProviderErrorClass::Auth)
+        );
+        assert_eq!(classify_provider_error("Not logged into the VPN"), None);
+    }
+
+    #[test]
+    fn a_recorded_start_error_counts_only_with_an_api_frame() {
+        // Orca quotes the provider inside its own sentence.
+        assert_eq!(
+            classify_recorded_error("Agent did not become ready: API Error: 429 rate_limit_error"),
+            Some(ProviderErrorClass::RateLimit)
+        );
+        assert_eq!(
+            classify_recorded_error("agent exited: invalid x-api-key"),
+            Some(ProviderErrorClass::Auth)
+        );
+        // Orca's own start failures are not the provider's.
+        for text in [
+            "Agent did not become ready within 60000ms",
+            "Setup failed: git fetch returned 403 from the mirror",
+            "Worktree creation failed: rate limit on the local disk queue",
+            "",
+        ] {
+            assert_eq!(classify_recorded_error(text), None, "{text}");
+        }
     }
 
     #[test]
@@ -725,77 +908,131 @@ mod tests {
 
     #[test]
     fn a_first_turn_is_seen_or_missing_evidence_stays_missing() {
+        use AgentMessages::{NoneSeen, Seen, Unread};
         let accepted =
             |activity: &str| stage("ready", "dispatched", Some("input_accepted"), activity);
+        let failed_at = |detail: &str| stage("failed", "failed", Some(detail), "unknown");
         let cases = [
             // Within the window, nothing from the agent yet.
-            (accepted("unknown"), false, 59_999, StartOutcome::Accepted),
+            (
+                accepted("unknown"),
+                NoneSeen,
+                59_999,
+                StartOutcome::Accepted,
+            ),
+            (accepted("unknown"), Unread, 59_999, StartOutcome::Accepted),
             // The window closes at its deadline, not after it.
             (
                 accepted("unknown"),
-                false,
+                NoneSeen,
                 60_000,
                 StartOutcome::NeverObserved,
             ),
             // An idle prompt is not a turn.
-            (accepted("idle"), false, 90_000, StartOutcome::NeverObserved),
+            (
+                accepted("idle"),
+                NoneSeen,
+                90_000,
+                StartOutcome::NeverObserved,
+            ),
+            // A closed window proves nothing when Orca refused the read.
+            (accepted("unknown"), Unread, 90_000, StartOutcome::Unknown),
+            (accepted("idle"), Unread, 90_000, StartOutcome::Unknown),
             // Any agent status that shows a turn wins over a closed window.
             (
                 accepted("working"),
-                false,
+                NoneSeen,
                 90_000,
                 StartOutcome::TurnObserved,
             ),
             (
                 accepted("blocked"),
-                false,
+                NoneSeen,
                 90_000,
                 StartOutcome::TurnObserved,
             ),
             (
                 accepted("waiting"),
-                false,
+                Unread,
                 90_000,
                 StartOutcome::TurnObserved,
             ),
-            (accepted("done"), false, 90_000, StartOutcome::TurnObserved),
+            (
+                accepted("done"),
+                NoneSeen,
+                90_000,
+                StartOutcome::TurnObserved,
+            ),
             // So does an agent message in the transcript.
             (
                 accepted("unknown"),
-                true,
+                Seen,
                 90_000,
                 StartOutcome::TurnObserved,
             ),
-            // Orca recorded a start-stage failure.
+            // Orca recorded a failure at a start stage.
             (
-                stage("failed", "failed", Some("agent_readiness"), "unknown"),
-                false,
+                failed_at("agent_readiness"),
+                Unread,
                 1,
                 StartOutcome::NeverObserved,
             ),
-            // An agent's own report means it ran.
             (
-                stage("failed", "failed", Some("settled"), "unknown"),
-                false,
+                failed_at("worktree_create"),
+                Unread,
                 1,
-                StartOutcome::TurnObserved,
+                StartOutcome::NeverObserved,
             ),
             (
+                failed_at("turn_observation"),
+                NoneSeen,
+                1,
+                StartOutcome::NeverObserved,
+            ),
+            // A failure after the start, such as the process exiting after an
+            // hour of work, is not a launch that never took.
+            (
+                failed_at("process_exited"),
+                Unread,
+                3_600_000,
+                StartOutcome::Unknown,
+            ),
+            (
+                failed_at("terminal_missing"),
+                NoneSeen,
+                90_000,
+                StartOutcome::Unknown,
+            ),
+            (
+                failed_at("stop_outcome_unknown"),
+                Unread,
+                90_000,
+                StartOutcome::Unknown,
+            ),
+            (
+                failed_at("process_exited"),
+                Seen,
+                90_000,
+                StartOutcome::TurnObserved,
+            ),
+            // An agent's own report means it ran.
+            (failed_at("settled"), Unread, 1, StartOutcome::TurnObserved),
+            (
                 stage("succeeded", "completed", Some("settled"), "unknown"),
-                false,
+                Unread,
                 1,
                 StartOutcome::TurnObserved,
             ),
             // Kitchen's own stop says nothing about whether a turn happened.
             (
                 stage("stopped", "failed", Some("process_stopped"), "unknown"),
-                false,
+                NoneSeen,
                 90_000,
                 StartOutcome::Unknown,
             ),
             (
-                stage("failed", "failed", Some("process_stopped"), "unknown"),
-                false,
+                failed_at("process_stopped"),
+                NoneSeen,
                 90_000,
                 StartOutcome::Unknown,
             ),
@@ -803,37 +1040,43 @@ mod tests {
             // not know, stay unknown.
             (
                 stage("failed", "dispatched", Some("agent_readiness"), "unknown"),
-                false,
+                NoneSeen,
+                1,
+                StartOutcome::Unknown,
+            ),
+            (
+                failed_at("something_new"),
+                NoneSeen,
                 1,
                 StartOutcome::Unknown,
             ),
             (
                 stage("starting", "dispatched", None, "unknown"),
-                false,
+                NoneSeen,
                 90_000,
                 StartOutcome::Unknown,
             ),
             (
                 stage("ready", "dispatched", Some("something_new"), "unknown"),
-                false,
+                NoneSeen,
                 90_000,
                 StartOutcome::Unknown,
             ),
         ];
-        for (index, (stage, spoke, now, expected)) in cases.iter().enumerate() {
+        for (index, (stage, messages, now, expected)) in cases.iter().enumerate() {
             assert_eq!(
-                start_outcome(Some(stage), *spoke, &window(*now)),
+                start_outcome(Some(stage), *messages, &window(*now)),
                 *expected,
                 "case {index}"
             );
         }
         // An older host reports no stage: only the transcript can show a turn.
         assert_eq!(
-            start_outcome(None, false, &window(90_000)),
+            start_outcome(None, NoneSeen, &window(90_000)),
             StartOutcome::Unknown
         );
         assert_eq!(
-            start_outcome(None, true, &window(90_000)),
+            start_outcome(None, Seen, &window(90_000)),
             StartOutcome::TurnObserved
         );
         // A launch judged before it was recorded has no elapsed time.

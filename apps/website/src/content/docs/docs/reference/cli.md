@@ -46,13 +46,25 @@ kitchn house setup --registry <dir> [options]
 
 | Option | Description |
 | --- | --- |
-| `--repository <owner/name>` | Repository identity. Read from the git remote when omitted. |
+| `--repository <owner/name>` | Repository identity. Read from the checkout's git remote when omitted; naming it skips the remote check, and the house allowlist still applies. |
 | `--house <id>` | House to use. Needed only when more than one house claims the repository; the choice is remembered in the registry. |
 | `--workflows <list>` | Comma-separated workflows, or `none`. Prompted when omitted. |
-| `--repository-path <dir>` | Adopt another directory, including one without Git yet. |
+| `--repository-path <dir>` | Checkout whose git remotes identify the repository (default: the current directory). Needs a GitHub remote. |
 | `--preview` | Report the proposed setup without writing. |
 | `--evidence <file>` | Scoped, read-only observations from an integration. |
 | `--json` | Print the doctor report plus `preview`, `binding` and `written`. |
+
+## `kitchn house import`
+
+Copy a legacy `.kitchen.json` into the registry. The preview lists the house,
+repository, workflows, reviewers and checks it would store, and prints a digest.
+Approving needs that digest; if the file changed since the preview, nothing is
+stored. The file is never modified or deleted.
+
+```sh
+kitchn house import --registry <dir> [--repository-path <dir>] [--json]
+kitchn house import --registry <dir> [--repository-path <dir>] --yes --digest <sha256>
+```
 
 ## `kitchn house doctor`
 

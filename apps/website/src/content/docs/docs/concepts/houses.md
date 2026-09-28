@@ -41,7 +41,7 @@ binding lives in your registry, keyed by the repository's identity:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "house": "acme",
   "repository": "acme/app",
   "workflows": ["pickup", "gate"],
@@ -57,9 +57,13 @@ never less.
 
 ## How a repository finds its house
 
-kitchn reads the repository's `owner/name` from its git remote and matches it
-against every house's allowlist. Every worktree and subdirectory of the same
-repository resolves the same way.
+kitchn reads the repository's `owner/name` from one git remote and matches it
+against every house's allowlist. That remote is the push destination of the
+branch's tracked upstream, or `origin` when the branch tracks none. A fork
+checkout whose branch tracks `upstream` is therefore the upstream repository.
+Every worktree and subdirectory of the same repository resolves the same way.
+If another remote belongs to a different house, kitchn stops and names the
+remotes instead of choosing.
 
 - One house claims it: that house is used.
 - No house claims it: kitchn stops and says so.
@@ -72,7 +76,9 @@ or repository is reported as a conflict, not migrated silently.
 ## Older `.kitchen.json` files
 
 Earlier versions wrote `.kitchen.json` into the repository. An explicit,
-previewed import moves it into your registry. Doctor reports any leftover file
+previewed import moves it into your registry: the preview shows everything that
+would be stored, and approving it with the printed digest stores exactly that,
+never a file that changed in between. Doctor reports any leftover file
 and suggests deleting it; kitchn never deletes files in your repository itself.
 
 ## Workflows

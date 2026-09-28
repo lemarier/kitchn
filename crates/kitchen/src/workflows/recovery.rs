@@ -98,10 +98,12 @@ pub struct RecoverySignals {
 impl RecoverySignals {
     /// Positive proof that the first turn never started: the transcript was
     /// read and the agent never spoke, the backend saw no turn, and the agent
-    /// sits idle at its prompt. Anything less keeps waiting.
+    /// sits idle at its prompt in a terminal known to be the agent's. Anything
+    /// less keeps waiting.
     #[must_use]
     pub fn proves_never_started(&self) -> bool {
-        self.start == StartEvidence::NoTurn
+        self.terminal == TerminalHolder::Agent
+            && self.start == StartEvidence::NoTurn
             && self.prompt == PromptState::Idle
             && self
                 .transcript
@@ -109,10 +111,15 @@ impl RecoverySignals {
     }
 
     /// When the agent last made progress, if it now sits idle at its prompt
-    /// with a readable transcript. `None` means stall cannot be established.
+    /// with a readable transcript. `None` means stall cannot be established,
+    /// including when nobody identified the terminal's holder: a terminal
+    /// not known to be the agent's is never stopped as stalled.
     #[must_use]
     pub fn idle_since(&self) -> Option<Timestamp> {
-        if self.prompt != PromptState::Idle || self.provider.is_some() {
+        if self.prompt != PromptState::Idle
+            || self.provider.is_some()
+            || self.terminal == TerminalHolder::Unknown
+        {
             return None;
         }
         self.transcript?.last_activity

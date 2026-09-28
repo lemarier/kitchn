@@ -921,6 +921,11 @@ fn an_uncertain_stop_blocks_until_reconciled_and_then_frees_the_attempt() -> Tes
 /// A coordinator launched a worker and handed the scope over; a second
 /// coordinator adopted the task and holds the returned fence.
 fn adopted_with_live_worker(world: &World) -> TestResult<(TaskId, Fence, ResourceRef)> {
+    adopted_with_budget(world, 3)
+}
+
+/// [`adopted_with_live_worker`] for a task allowed `attempts` attempts.
+fn adopted_with_budget(world: &World, attempts: u32) -> TestResult<(TaskId, Fence, ResourceRef)> {
     let store = &world.fixture.store;
     let old = common::scheduled("coordinator-a")?;
     let CoordinatorStart::Fresh(lease) = start_coordinator(
@@ -937,7 +942,7 @@ fn adopted_with_live_worker(world: &World) -> TestResult<(TaskId, Fence, Resourc
     let claimant = old.under(consumer()?, lease.fence());
     let ClaimOutcome::Claimed(task_lease) = claim_issue(
         store,
-        &template()?,
+        &template_with(attempts, workflows_support::provenance('a')?)?,
         &issue(1)?,
         &claimant,
         ttl(300)?,
@@ -1203,19 +1208,171 @@ fn a_refused_stop_of_an_adopted_worker_still_reserves_its_branch() -> TestResult
     let world = World::new()?;
     let (task, fence, worker) = adopted_with_live_worker(&world)?;
     world.clock.advance(130);
-    // Supervision starts an attempt to account for the adopted worker, and
-    // the backend refuses to stop it. That attempt has no launch of its own.
+    // Supervision continues the adopted worker's attempt to stop it, and the
+    // backend refuses. No attempt is started for the stop.
     world.backend.inject(ExecuteFault::Reject);
     assert_eq!(
         stalled_step(&world, &task, fence, &worker)?,
         Supervision::Escalate(Escalation::StopRefused)
     );
+    assert_eq!(attempt_count(&world, &task)?, 1);
     let effects = world.backend.effects_performed();
-    // The worker may still run, so no other writer launches beside it.
+    // The worker may still run, so no other writer launches beside it: the
+    // continued attempt replays its own accepted launch of that worker.
     assert_eq!(
         launch(&world, &task, fence, 1)?,
-        LaunchOutcome::SuperviseFirst { worker }
+        LaunchOutcome::Accepted {
+            attempt: kitchen::contracts::AttemptNumber::new(1).ok_or("attempt")?,
+            worker
+        }
     );
     assert_eq!(world.backend.effects_performed(), effects);
+    assert_eq!(attempt_count(&world, &task)?, 1);
+    Ok(())
+}
+
+fn attempt_count(world: &World, task: &TaskId) -> TestResult<usize> {
+    Ok(world.fixture.store.task(task)?.attempts().len())
+}
+
+#[test]
+fn an_adopted_worker_on_its_last_attempt_settles_with_its_own_outcome() -> TestResult {
+    let world = World::new()?;
+    let (task, fence, worker) = adopted_with_budget(&world, 1)?;
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    let good = completion("lemarier/issue-1", EvidenceVerdict::Pass)?;
+    let outcome = supervise(
+        &world.ctx(),
+        &task,
+        fence,
+        &supervision()?,
+        &SupervisionInput {
+            completion: Some(&good),
+            ..SupervisionInput::default()
+        },
+    )?;
+    // The adopted worker's attempt records its success; no second attempt.
+    assert_eq!(outcome, Supervision::Settled(Settlement::Succeeded));
+    assert_eq!(attempt_count(&world, &task)?, 1);
+    Ok(())
+}
+
+#[test]
+fn an_adopted_idle_worker_on_its_last_attempt_is_stopped_before_the_task_settles() -> TestResult {
+    use kitchen::contracts::WorkerBackend;
+    let world = World::new()?;
+    let (task, fence, worker) = adopted_with_budget(&world, 1)?;
+    world.backend.set_worker_state(&worker, WorkerState::Ready);
+    world.clock.advance(500);
+    let idle = kitchen::workflows::recovery::RecoverySignals {
+        prompt: kitchen::workflows::recovery::PromptState::Idle,
+        ..workflows_support::signals(&worker, Some(common::at(1)))
+    };
+    let outcome = supervise(
+        &world.ctx(),
+        &task,
+        fence,
+        &supervision()?,
+        &SupervisionInput {
+            signals: Some(&idle),
+            ..SupervisionInput::default()
+        },
+    )?;
+    assert_eq!(
+        outcome,
+        Supervision::IdleStopped {
+            disposition: Disposition::Settled(Settlement::Exhausted)
+        }
+    );
+    // The worker was stopped before the task settled, never left running.
+    assert_eq!(
+        world.backend.observe_worker(&worker)?,
+        WorkerState::Settled(WorkerOutcome::Cancelled)
+    );
+    assert_eq!(attempt_count(&world, &task)?, 1);
+    Ok(())
+}
+
+#[test]
+fn an_adopted_failure_keeps_the_exact_retry_budget() -> TestResult {
+    let world = World::new()?;
+    let (task, fence, worker) = adopted_with_budget(&world, 3)?;
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Failed));
+    // The adopted worker failed in attempt 1: two attempts are left, as
+    // they would be without the hand-over.
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Retry { remaining: 2 }
+    );
+    assert_eq!(attempt_count(&world, &task)?, 1);
+    let replacement = launched(&world, &task, fence, 1)?;
+    assert_ne!(replacement, worker);
+    assert_eq!(attempt_count(&world, &task)?, 2);
+    Ok(())
+}
+
+#[test]
+fn messages_reach_an_adopted_worker_without_starting_an_attempt() -> TestResult {
+    use kitchen::workflows::coordination::{
+        FollowUpRoute, Revalidation, retry_validation, send_follow_up,
+    };
+    let world = World::new()?;
+    let (task, fence, worker) = adopted_with_budget(&world, 1)?;
+    world.backend.set_worker_state(&worker, WorkerState::Ready);
+    let request = kitchen::workflows::recovery::FollowUp {
+        id: ExternalRef::new("review-1")?,
+        body: Text::new("Rename the driver module.")?,
+    };
+    assert!(matches!(
+        send_follow_up(&world.ctx(), &task, fence, &request)?,
+        FollowUpRoute::Delivered { .. }
+    ));
+    assert_eq!(
+        retry_validation(&world.ctx(), &task, fence)?,
+        Revalidation::Sent
+    );
+    assert_eq!(attempt_count(&world, &task)?, 1);
+    Ok(())
+}
+
+#[test]
+fn a_parked_adopted_worker_resumes_when_the_provider_works() -> TestResult {
+    use kitchen::workflows::recovery::{ProviderCheck, ProviderInterruption, RecoverySignals};
+    let world = World::new()?;
+    let (task, fence, worker) = adopted_with_budget(&world, 1)?;
+    world.backend.set_worker_state(&worker, WorkerState::Ready);
+    let refused = RecoverySignals {
+        provider: Some(ProviderInterruption::Quota),
+        ..workflows_support::signals(&worker, Some(common::at(1)))
+    };
+    let tick = |provider| {
+        supervise(
+            &world.ctx(),
+            &task,
+            fence,
+            &supervision()?,
+            &SupervisionInput {
+                signals: Some(&refused),
+                provider,
+                ..SupervisionInput::default()
+            },
+        )
+        .map_err(Into::into)
+    };
+    let parked: TestResult<Supervision> = tick(ProviderCheck::NotChecked);
+    assert_eq!(
+        parked?,
+        Supervision::Parked {
+            interruption: ProviderInterruption::Quota,
+            report: true
+        }
+    );
+    let resumed: TestResult<Supervision> = tick(ProviderCheck::Working);
+    assert_eq!(resumed?, Supervision::Resumed);
+    assert_eq!(attempt_count(&world, &task)?, 1);
     Ok(())
 }

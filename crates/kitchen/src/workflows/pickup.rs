@@ -682,7 +682,7 @@ fn is_workspace_path(value: &str) -> bool {
 /// `value` as one double-quoted line with JSON escapes: quotes, backslashes,
 /// control characters, and invisible formatting characters are escaped, so
 /// the quoted text cannot end its line or its string.
-fn quote(value: &str) -> String {
+pub(crate) fn quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len().saturating_add(2));
     quoted.push('"');
     for character in value.chars() {

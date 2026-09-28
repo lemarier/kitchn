@@ -18,8 +18,11 @@
 //! a poll of the same revision, or a restart between receipt and claim finds
 //! the same task instead of creating another. Admissions are ordered only by
 //! the store's own receipt order, never by the event's provider-supplied time,
-//! which is kept for audit: every revision the store has not received before
-//! is new work, whenever the source says it occurred. Finishing an interrupted
+//! which is kept for audit. Neither order says which revision is newer, so
+//! before creating work the intake asks the forge, through a
+//! [`RevisionSource`], whether the revision is still the item's current one;
+//! a late event for a superseded head is reported [`Admission::Superseded`]
+//! and writes nothing. Finishing an interrupted
 //! admission is reported stale once the store has received another revision
 //! of the same item since. Both the event receiver and the fallback schedule
 //! act under one consumer lease, so only one of them consumes the workflow
@@ -46,4 +49,6 @@ mod intake;
 
 pub use delivery::{ForgeEvent, ForgeEventKind, MAX_EVENT_BYTES, PolledWork};
 pub use error::EventError;
-pub use intake::{ADMISSION_SCHEMA, Admission, EventIntake, EventRoute, WorkOrder};
+pub use intake::{
+    ADMISSION_SCHEMA, Admission, EventIntake, EventRoute, RevisionSource, RevisionState, WorkOrder,
+};

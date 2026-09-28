@@ -71,9 +71,35 @@ pub enum Admission {
     /// another revision of the same item since, so finishing it starts
     /// nothing. Names the newer work's task.
     Stale(TaskId),
+    /// The forge reports that this revision is no longer the item's current
+    /// one, such as a late event for an older pull-request head. Nothing was
+    /// written; work starts only for the current revision.
+    Superseded,
     /// The route does not start work for this event kind. Nothing was read or
     /// written.
     Ignored,
+}
+
+/// Whether a revision is still an item's current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionState {
+    /// The forge reports this revision as the item's current one.
+    Current,
+    /// The item has moved to another revision, or no longer has one, such as
+    /// a closed pull request.
+    Superseded,
+}
+
+/// Reads an item's current revision from the forge. Event and poll order is
+/// not revision order, so intake asks before it creates revision-specific
+/// work.
+pub trait RevisionSource {
+    /// Whether `subject` is still `item`'s current revision.
+    ///
+    /// # Errors
+    /// Returns an error when the forge cannot establish the current revision;
+    /// intake then writes nothing, and a redelivery or the next poll retries.
+    fn revision_state(&self, item: &WorkItem, subject: &MarkerSubject) -> Result<RevisionState>;
 }
 
 /// How work was admitted, for audit.
@@ -99,17 +125,30 @@ struct AdmissionRecord {
 }
 
 /// The intake for one event-started workflow in one house.
-#[derive(Debug)]
 pub struct EventIntake<'a> {
     store: &'a HouseStore,
     house: &'a HouseConfig,
     source: &'a BackendDescriptor,
+    revisions: &'a (dyn RevisionSource + Sync),
     route: EventRoute,
     schema: MarkerSchema,
 }
 
+impl std::fmt::Debug for EventIntake<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventIntake")
+            .field("store", &self.store)
+            .field("house", &self.house)
+            .field("source", &self.source)
+            .field("route", &self.route)
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> EventIntake<'a> {
-    /// Activate `route` for `house` with events delivered by `source`.
+    /// Activate `route` for `house` with events delivered by `source`, and
+    /// current revisions read from `revisions`.
     ///
     /// # Errors
     /// Returns [`ContractError::UnsupportedCapabilities`] when `source` does
@@ -121,6 +160,7 @@ impl<'a> EventIntake<'a> {
         store: &'a HouseStore,
         house: &'a HouseConfig,
         source: &'a BackendDescriptor,
+        revisions: &'a (dyn RevisionSource + Sync),
         route: EventRoute,
     ) -> Result<Self> {
         for found in [&house.house, &source.house] {
@@ -141,6 +181,7 @@ impl<'a> EventIntake<'a> {
             store,
             house,
             source,
+            revisions,
             route,
             schema,
         })
@@ -285,9 +326,9 @@ impl<'a> EventIntake<'a> {
         }
     }
 
-    /// Record the work key first, then create its task. A restart between the
-    /// two leaves the key, and the next admission of the same work creates
-    /// the task.
+    /// Confirm the revision is current, record the work key, then create its
+    /// task. A restart between the last two leaves the key, and the next
+    /// admission of the same work creates the task.
     #[expect(
         clippy::too_many_arguments,
         reason = "one private step shared by both admission paths"
@@ -303,6 +344,13 @@ impl<'a> EventIntake<'a> {
         now: Timestamp,
     ) -> Result<Admission> {
         self.check_consumer_live(claimant, now)?;
+        // Neither receipt order nor a source time says which revision is
+        // newer, so a late event for an older head would otherwise start
+        // work on it. The read happens before any write.
+        match self.revisions.revision_state(item, subject)? {
+            RevisionState::Current => {}
+            RevisionState::Superseded => return Ok(Admission::Superseded),
+        }
         let key = MarkerKey {
             workflow: self.route.workflow.clone(),
             item: item.clone(),

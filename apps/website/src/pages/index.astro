@@ -408,7 +408,6 @@ const menu = [
               <ul class="stations wrap">
                 {row.map((role, i) => (
                   <li class="station" style={`--i:${i}`}>
-                    <span class="clip" aria-hidden="true" />
                     <button type="button" class="station-card" data-open={`contract-${role.slug}`} aria-haspopup="dialog">
                       <RoleAvatar slug={role.slug} />
                       <span class="station-name">{role.kitchenName}</span>
@@ -1703,11 +1702,11 @@ const menu = [
     background: linear-gradient(180deg, #e9eef0 0%, #b9c3c9 40%, #7f8c94 75%, #5d6870 100%);
     box-shadow: 0 6px 10px -4px rgb(0 0 0 / 55%);
     position: relative;
-    z-index: 1;
+    z-index: 2;
   }
   .stations {
     list-style: none;
-    margin-top: -4px;
+    margin-top: -8px;
     padding: 0 0 2rem;
     display: grid;
     grid-template-columns: repeat(8, minmax(0, 1fr));
@@ -1715,33 +1714,19 @@ const menu = [
     align-items: start;
   }
   .station {
-    --tilt: calc((mod(var(--i), 3) - 1) * 1.2deg);
     position: relative;
-    transform: rotate(var(--tilt));
-    transform-origin: 50% 0;
-    transition: transform 250ms ease;
+    transition: transform 200ms ease;
   }
   .station:hover,
   .station:focus-within {
-    transform: none;
-  }
-  .clip {
-    position: absolute;
-    top: -6px;
-    left: 50%;
-    width: 2.5rem;
-    height: 0.9rem;
-    margin-left: -1.25rem;
-    background: #b9c3c9;
-    border-radius: 0 0 4px 4px;
-    z-index: 2;
+    transform: translateY(4px);
   }
   .station-card {
     display: grid;
     justify-items: center;
     width: 100%;
     gap: 0.45rem;
-    padding: 1.4rem 0.7rem 1.3rem;
+    padding: 1.8rem 0.7rem 1.3rem;
     text-align: center;
     font: inherit;
     color: var(--print);

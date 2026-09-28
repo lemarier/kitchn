@@ -14,4 +14,5 @@ const planned = readdirSync(dir)
   );
 
 for (const p of planned) console.warn(`src/data/${p.file}:${p.line}: planned output`);
-if (planned.length > 0) console.warn(`${planned.length} planned entries still show intended output.`);
+if (planned.length > 0)
+  console.warn(`${planned.length} planned entries still show intended output.`);

@@ -3562,6 +3562,33 @@ fn an_unresolved_release_task_is_never_retired() -> TestResult {
 }
 
 #[test]
+fn a_settled_dishwasher_task_without_a_release_effect_is_never_retired() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    // Role and prefix match a release task, but nothing records a release.
+    let name = format!("{TASK_PREFIX}lookalike");
+    let lookalike = TaskId::new(&name)?;
+    let mut lookalike_spec = spec(&name)?;
+    lookalike_spec.role = kitchen::contracts::Role::Dishwasher;
+    lookalike_spec.resources.insert(owned.worktree.clone());
+    let store = harness.store();
+    store.create_task(lookalike_spec, &scheduled("pickup")?, harness.clock.now())?;
+    let fence = store
+        .claim(
+            &lookalike,
+            &scheduled("pickup")?,
+            ttl(600)?,
+            harness.clock.now(),
+        )?
+        .fence();
+    store.settle_cancelled(&lookalike, fence, harness.clock.now())?;
+    harness.clock.advance(RETENTION.as_secs() * 10);
+    assert!(harness.retire()?.tasks.is_empty());
+    assert!(harness.store().task(&lookalike).is_ok());
+    Ok(())
+}
+
+#[test]
 fn retirement_refuses_a_retention_shorter_than_the_approval_age() -> TestResult {
     let mut harness = Harness::new()?;
     released(&mut harness, "task-1")?;

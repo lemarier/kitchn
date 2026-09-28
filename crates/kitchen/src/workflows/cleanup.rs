@@ -1153,7 +1153,7 @@ pub fn retire(
         .tasks()?
         .into_iter()
         .filter(|task| {
-            is_release_task(task)
+            has_release_evidence(task)
                 && matches!(task.state(), TaskState::Settled { at, .. }
                     if now.saturating_since(*at) > retention)
                 && task.effects().iter().all(|effect| {
@@ -1572,6 +1572,24 @@ fn release_state(task: &TaskRecord) -> Option<&EffectState> {
 
 fn is_release_task(task: &TaskRecord) -> bool {
     task.spec().role == Role::Dishwasher && task.spec().id.as_str().starts_with(TASK_PREFIX)
+}
+
+/// Whether the task's own record shows a release: a dishwasher task for one
+/// resource whose effects are all the release of that resource, and at least
+/// one. Role and identifier prefix only name a candidate; retiring deletes the
+/// audit, so a task without this evidence is never retired.
+fn has_release_evidence(task: &TaskRecord) -> bool {
+    let mut resources = task.spec().resources.iter();
+    let (Some(resource), None) = (resources.next(), resources.next()) else {
+        return false;
+    };
+    is_release_task(task)
+        && !task.effects().is_empty()
+        && task.effects().iter().all(|effect| {
+            matches!(effect.request().effect(),
+                Effect::Worker(Operation::ReleaseResource { resource: released })
+                    if released == resource)
+        })
 }
 
 /// The release task for one observation. `at` is the approval's time for a

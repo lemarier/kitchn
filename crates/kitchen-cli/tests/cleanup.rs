@@ -388,6 +388,112 @@ fn ignored_files_that_keep_a_worktree_are_listed_in_the_preview() -> TestResult 
     Ok(())
 }
 
+/// An inventory of one settled task's worker and its worktree at `path`.
+fn worktree_inventory(
+    root: &Path,
+    (worker, worktree, key): &(String, String, String),
+    path: &Path,
+) -> TestResult<PathBuf> {
+    let inventory = root.join("inventory.json");
+    fs::write(
+        &inventory,
+        serde_json::to_vec(&serde_json::json!({
+            "backend": "orca",
+            "resources": [
+                {"kind": "worker", "handle": worker, "owner": key, "liveness": "exited", "worker": "settled-succeeded"},
+                {"kind": "worktree", "handle": worktree, "owner": key, "liveness": "exited", "path": path},
+            ],
+        }))?,
+    )?;
+    Ok(inventory)
+}
+
+#[test]
+fn an_unfinished_operation_keeps_a_worktree_and_the_preview_names_it() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let store = initialize(&root)?;
+    let task = settled_task(&store)?;
+    let path = pushed_worktree(&root)?;
+    // Clean and fully pushed, but a bisect was started and never reset.
+    git(&path, &["bisect", "start"])?;
+    let inventory = worktree_inventory(&root, &task, &path)?;
+    let store_dir = root.join("house");
+    let mut args = preview_args(text(&store_dir)?, text(&inventory)?);
+    let output = kitchen(&args)?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("1 to release, 1 retained."), "{stdout}");
+    assert!(stdout.contains("retain: operation-in-progress"), "{stdout}");
+    assert!(stdout.contains("\n  bisect in progress, kept"), "{stdout}");
+
+    args.push("--json");
+    let output = kitchen(&args)?;
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        json["entries"][1]["worktree"]["state"]["operation"],
+        "bisect"
+    );
+    assert_eq!(
+        json["entries"][1]["decision"]["reasons"][0],
+        "operation-in-progress"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_worktree_pushed_only_to_a_mirror_is_kept_unless_the_mirror_is_named() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let store = initialize(&root)?;
+    let task = settled_task(&store)?;
+    let path = pushed_worktree(&root)?;
+    let mirror = root.join("origin-mirror.git");
+    fs::create_dir_all(&mirror)?;
+    git(&mirror, &["init", "--bare", "--quiet"])?;
+    git(&path, &["remote", "add", "origin-mirror", text(&mirror)?])?;
+    fs::write(path.join("backup-only.txt"), "backed up\n")?;
+    git(&path, &["add", "."])?;
+    git(&path, &["commit", "--quiet", "-m", "backup only"])?;
+    git(&path, &["push", "--quiet", "origin-mirror", "task-1"])?;
+    let inventory = worktree_inventory(&root, &task, &path)?;
+    let store_dir = root.join("house");
+    let preview = |remotes: &[&str]| -> TestResult<String> {
+        let mut args = preview_args(text(&store_dir)?, text(&inventory)?);
+        for remote in remotes {
+            args.extend(["--remote", remote]);
+        }
+        let output = kitchen(&args)?;
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        Ok(String::from_utf8(output.stdout)?)
+    };
+    // The forge remote defaults to `origin`, which lacks the commit.
+    let by_default = preview(&[])?;
+    assert!(
+        by_default.contains("1 to release, 1 retained."),
+        "{by_default}"
+    );
+    assert!(
+        by_default.contains("retain: unpreserved-commits"),
+        "{by_default}"
+    );
+    // Naming the mirror as a forge remote, alone or with `origin`, vouches for it.
+    for remotes in [&["origin-mirror"][..], &["origin", "origin-mirror"]] {
+        let named = preview(remotes)?;
+        assert!(
+            named.contains("2 to release, 0 retained."),
+            "{remotes:?}: {named}"
+        );
+    }
+    // A name that is not a plain remote name is invalid input.
+    let mut args = preview_args(text(&store_dir)?, text(&inventory)?);
+    args.extend(["--remote", "origin*"]);
+    let output = kitchen(&args)?;
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty());
+    Ok(())
+}
+
 #[test]
 fn invalid_snapshots_are_rejected_as_input_errors() -> TestResult {
     let temp = tempfile::tempdir()?;

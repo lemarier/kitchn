@@ -35,18 +35,19 @@ use kitchen::{
     workflows::cleanup::{
         ApplyOptions, ApplyReport, ApprovalOutcome, ApprovalResult, BuildOutcome, BuildReport,
         CACHEDIR_SIGNATURE, CleanupError, ConsentSource, Decision, EXTERNAL_CACHE_SUGGESTIONS,
-        Exclusion, GitLimits, GitReadError, InspectionTrigger, Inspector, NoConsent, Ownership,
-        Precheck, Preview, ReleaseOutcome, Step, apply, approve, inspect, inspect_worktree,
-        reclaim_build_output,
+        Exclusion, GitLimits, GitOperation, GitReadError, InspectionTrigger, Inspector, NoConsent,
+        Ownership, Precheck, Preview, ReleaseOutcome, RemoteName, Step, apply, approve, inspect,
+        inspect_worktree, reclaim_build_output,
     },
 };
 
 // ---------------------------------------------------------------------------
 // Git fixtures
 
-/// Run Git for a fixture, isolated from the user's configuration.
-fn git(dir: &Path, args: &[&str]) -> TestResult<String> {
-    let output = Command::new("git")
+/// A Git command for a fixture, isolated from the user's configuration.
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(dir)
         .args([
@@ -64,8 +65,13 @@ fn git(dir: &Path, args: &[&str]) -> TestResult<String> {
         .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()?;
+        .env_remove("GIT_INDEX_FILE");
+    command
+}
+
+/// Run Git for a fixture; a failure is an error.
+fn git(dir: &Path, args: &[&str]) -> TestResult<String> {
+    let output = git_command(dir, args).output()?;
     if !output.status.success() {
         return Err(format!(
             "git {args:?} failed: {}",
@@ -74,6 +80,13 @@ fn git(dir: &Path, args: &[&str]) -> TestResult<String> {
         .into());
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Run Git where stopping is the point: a merge, cherry-pick, revert, `am`, or
+/// rebase that halts leaves an unfinished operation and a nonzero exit.
+fn git_stops(dir: &Path, args: &[&str]) -> TestResult {
+    git_command(dir, args).output()?;
+    Ok(())
 }
 
 /// A bare origin, a main checkout with one pushed commit, and linked worktrees.
@@ -116,6 +129,11 @@ impl Repo {
         git(&path, &["push", "--quiet", "origin", name])?;
         Ok(path)
     }
+}
+
+/// The forge remote every fixture repository pushes to.
+fn origin() -> TestResult<Vec<RemoteName>> {
+    Ok(vec![RemoteName::new("origin")?])
 }
 
 fn path_str(path: &Path) -> TestResult<&str> {
@@ -309,6 +327,7 @@ struct Harness {
     paths: BTreeMap<ResourceRef, PathBuf>,
     merged: BTreeMap<ResourceRef, CommitId>,
     limits: GitLimits,
+    remotes: Vec<RemoteName>,
     clock: ManualClock,
     repo: Repo,
 }
@@ -327,6 +346,7 @@ impl Harness {
             paths: BTreeMap::new(),
             merged: BTreeMap::new(),
             limits: GitLimits::default(),
+            remotes: origin()?,
             clock: ManualClock::starting_at(1_000),
             repo: Repo::new()?,
         })
@@ -343,6 +363,7 @@ impl Harness {
             worktrees: &self.paths,
             merged_heads: &self.merged,
             git: &self.limits,
+            remotes: &self.remotes,
         }
     }
 
@@ -688,7 +709,7 @@ fn ignored_local_files_keep_the_worktree_and_are_listed() -> TestResult {
     fs::create_dir_all(path.join(".claude"))?;
     fs::write(path.join(".claude").join("notes.md"), "plan\n")?;
     // `git status` reports neither, so the worktree looks clean.
-    let state = inspect_worktree(&path, &GitLimits::default())?;
+    let state = inspect_worktree(&path, &GitLimits::default(), &origin()?)?;
     assert_eq!((state.tracked_changes, state.untracked_files), (0, 0));
 
     let preview = harness.inspect()?;
@@ -766,7 +787,7 @@ fn files_ignored_by_a_global_excludes_file_keep_the_worktree() -> TestResult {
         &["config", "core.excludesFile", path_str(&global)?],
     )?;
     fs::write(path.join("secret.txt"), "keep me\n")?;
-    let state = inspect_worktree(&path, &GitLimits::default())?;
+    let state = inspect_worktree(&path, &GitLimits::default(), &origin()?)?;
     assert_eq!((state.tracked_changes, state.untracked_files), (0, 0));
     let preview = harness.inspect()?;
     assert_eq!(
@@ -809,7 +830,7 @@ fn edits_hidden_by_index_flags_keep_the_worktree() -> TestResult {
         let path = harness.path(&owned.worktree)?.to_path_buf();
         git(&path, &["update-index", flag, "README.md"])?;
         fs::write(path.join("README.md"), "edited where status cannot see\n")?;
-        let state = inspect_worktree(&path, &GitLimits::default())?;
+        let state = inspect_worktree(&path, &GitLimits::default(), &origin()?)?;
         assert_eq!(state.tracked_changes, 0, "status reports the edit: {flag}");
         assert_eq!(state.hidden_tracked, 1);
     }
@@ -839,7 +860,7 @@ fn too_many_ignored_paths_make_the_worktree_unreadable() -> TestResult {
         fs::write(path.join("logs").join(format!("run-{index}.log")), "x")?;
     }
     assert_eq!(
-        inspect_worktree(&path, &GitLimits::default()),
+        inspect_worktree(&path, &GitLimits::default(), &origin()?),
         Err(GitReadError::OutputTooLarge)
     );
     Ok(())
@@ -914,6 +935,298 @@ fn main_checkouts_locked_unreadable_and_unlocated_worktrees_are_retained() -> Te
         reasons(&preview, &unlocated.worktree)?,
         [Exclusion::WorktreeUnlocated]
     );
+    Ok(())
+}
+
+/// A commit on the branch `side-<back_to>` (branches are shared by a
+/// repository's worktrees), started from the pushed `main`, that changes
+/// `README.md`; leaves `back_to` checked out.
+fn side_commit(path: &Path, back_to: &str) -> TestResult {
+    let side = format!("side-{back_to}");
+    git(path, &["switch", "--quiet", "-c", &side, "origin/main"])?;
+    fs::write(path.join("README.md"), "side\n")?;
+    git(path, &["commit", "--quiet", "-am", "side"])?;
+    git(path, &["switch", "--quiet", back_to])?;
+    Ok(())
+}
+
+/// Two pushed commits that change `README.md`, so a later merge, cherry-pick,
+/// revert, or `am` of a change to it conflicts.
+fn readme_history(path: &Path, branch: &str) -> TestResult {
+    for text in ["one\n", "two\n"] {
+        fs::write(path.join("README.md"), text)?;
+        git(path, &["commit", "--quiet", "-am", text.trim()])?;
+    }
+    git(path, &["push", "--quiet", "origin", branch])?;
+    Ok(())
+}
+
+/// Resolve a conflicted `README.md` to the current side, so the index matches
+/// `HEAD` and `git status` reports nothing while the operation stays open.
+fn resolve_to_ours(path: &Path) -> TestResult {
+    git(path, &["checkout", "--ours", "README.md"])?;
+    git(path, &["add", "README.md"])?;
+    Ok(())
+}
+
+/// What leaves an operation unfinished in a worktree: given its path and the
+/// branch name.
+type Stop = dyn Fn(&Path, &str) -> TestResult;
+
+/// A worktree that is clean and fully pushed, with `stop` run in it.
+fn stopped_worktree(
+    harness: &mut Harness,
+    name: &str,
+    stop: &Stop,
+) -> TestResult<(ResourceRef, PathBuf)> {
+    let owned = harness.owner(name, true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    side_commit(&path, name)?;
+    readme_history(&path, name)?;
+    stop(&path, name)?;
+    Ok((owned.worktree, path))
+}
+
+#[test]
+fn a_worktree_with_an_unfinished_operation_is_kept_and_the_operation_named() -> TestResult {
+    let mut harness = Harness::new()?;
+    let stops: [(&str, GitOperation, &Stop); 5] = [
+        ("task-1", GitOperation::Merge, &|path, name| {
+            let side = format!("side-{name}");
+            git_stops(path, &["merge", "--no-commit", "--no-ff", &side])?;
+            resolve_to_ours(path)
+        }),
+        ("task-2", GitOperation::CherryPick, &|path, name| {
+            git_stops(path, &["cherry-pick", &format!("side-{name}")])?;
+            resolve_to_ours(path)
+        }),
+        ("task-3", GitOperation::Revert, &|path, _| {
+            git_stops(path, &["revert", "HEAD~1"])?;
+            resolve_to_ours(path)
+        }),
+        ("task-4", GitOperation::ApplyMailbox, &|path, name| {
+            let side = format!("side-{name}");
+            let patch = git(path, &["format-patch", "-1", &side, "--stdout"])?;
+            let file = path
+                .parent()
+                .ok_or("no parent")?
+                .join(format!("{name}.patch"));
+            fs::write(&file, patch)?;
+            git_stops(path, &["am", path_str(&file)?])
+        }),
+        ("task-5", GitOperation::Bisect, &|path, _| {
+            git(path, &["bisect", "start"])?;
+            Ok(())
+        }),
+    ];
+    let mut worktrees = Vec::new();
+    for (name, kind, stop) in stops {
+        let (worktree, path) = stopped_worktree(&mut harness, name, stop)?;
+        // Nothing else says anything is wrong: clean, and everything pushed.
+        let state = inspect_worktree(&path, &GitLimits::default(), &origin()?)?;
+        assert_eq!(
+            (
+                state.tracked_changes,
+                state.untracked_files,
+                state.unpushed_commits
+            ),
+            (0, 0, false),
+            "{kind}: the fixture must be clean and pushed"
+        );
+        assert_eq!(state.operation, Some(kind), "{kind}");
+        worktrees.push((worktree, kind));
+    }
+    let preview = harness.inspect()?;
+    for (worktree, kind) in &worktrees {
+        assert_eq!(
+            reasons(&preview, worktree)?,
+            [Exclusion::OperationInProgress],
+            "{kind}"
+        );
+        // The report names the operation, in the entry and its digest input.
+        let json = serde_json::to_value(preview.entry(worktree).ok_or("entry")?)?;
+        assert_eq!(json["worktree"]["state"]["operation"], kind.as_str());
+    }
+    // A person's approval of everything eligible never reaches them.
+    let before = harness.backend.fake.effects_performed();
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    let report = harness.apply()?;
+    for (worktree, _) in &worktrees {
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|result| &result.resource != worktree),
+            "an unfinished operation is never planned"
+        );
+    }
+    // Only the five workers were released.
+    assert_eq!(harness.backend.fake.effects_performed(), before + 5);
+    Ok(())
+}
+
+#[test]
+fn an_unfinished_operation_keeps_the_worktree_but_not_its_regenerable_build_output() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    build_dir(&path, 4096)?;
+    git(&path, &["bisect", "start"])?;
+    let preview = harness.inspect()?;
+    assert_eq!(
+        reasons(&preview, &owned.worktree)?,
+        [Exclusion::OperationInProgress]
+    );
+    // Build output is not work and the operation's state lives in the Git
+    // directory, so removing `target/` loses nothing.
+    let entry = preview.entry(&owned.worktree).ok_or("entry")?;
+    assert!(entry.build_output_eligible());
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    let report = harness.reclaim()?;
+    assert_eq!(
+        report.results.iter().map(|r| r.outcome).collect::<Vec<_>>(),
+        [BuildOutcome::Removed]
+    );
+    assert!(!path.join("target").exists());
+    assert!(
+        inspect_worktree(&path, &GitLimits::default(), &origin()?)?
+            .operation
+            .is_some(),
+        "the bisect is untouched"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_rebase_stopped_on_a_clean_tree_keeps_a_worktree_that_head_alone_calls_pushed() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    // Unpushed work on the branch, then an interactive rebase that stops at a
+    // `break` before replaying anything: HEAD sits on the pushed base.
+    commit_locally(&path, "local.txt")?;
+    let editor = harness.repo.dir.path().join("break-first.sh");
+    fs::write(
+        &editor,
+        "#!/bin/sh\n{ echo break; cat \"$1\"; } > \"$1.new\" && mv \"$1.new\" \"$1\"\n",
+    )?;
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755))?;
+    let sequence_editor = format!("sequence.editor={}", path_str(&editor)?);
+    git_stops(
+        &path,
+        &["-c", &sequence_editor, "rebase", "-i", "origin/main"],
+    )?;
+
+    let state = inspect_worktree(&path, &GitLimits::default(), &origin()?)?;
+    // What the previous check saw: a clean tree on a pushed commit.
+    assert_eq!(
+        (
+            state.tracked_changes,
+            state.untracked_files,
+            state.unpushed_commits
+        ),
+        (0, 0, false)
+    );
+    // What it missed: the branch tip holds a commit no remote has, and the
+    // rebase todo that would replay it exists only in this worktree.
+    let tip = git(
+        &path,
+        &["rev-list", "--count", "task-1", "--not", "--remotes=origin"],
+    )?;
+    assert_eq!(tip.trim(), "1");
+    assert_eq!(state.operation, Some(GitOperation::Rebase));
+    assert_eq!(
+        reasons(&harness.inspect()?, &owned.worktree)?,
+        [Exclusion::OperationInProgress]
+    );
+
+    // Approving what the preview offers (the worker only) leaves it alone.
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    let report = harness.apply()?;
+    assert_eq!(outcome(&report, &owned.worker)?, ReleaseOutcome::Released);
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|result| result.resource != owned.worktree)
+    );
+    let git_dir = harness
+        .repo
+        .main()
+        .join(".git")
+        .join("worktrees")
+        .join("task-1");
+    assert!(git_dir.join("rebase-merge").is_dir());
+
+    // Once the person finishes or abandons it, the worktree is judged on its
+    // commits again: the unpushed one keeps it.
+    git(&path, &["rebase", "--abort"])?;
+    assert_eq!(
+        reasons(&harness.inspect()?, &owned.worktree)?,
+        [Exclusion::UnpreservedCommits]
+    );
+    Ok(())
+}
+
+/// A second, local bare repository added as remote `name`.
+fn add_mirror(harness: &Harness, path: &Path, name: &str) -> TestResult {
+    let mirror = harness.repo.dir.path().join(format!("{name}.git"));
+    fs::create_dir_all(&mirror)?;
+    git(&mirror, &["init", "--bare", "--quiet"])?;
+    git(path, &["remote", "add", name, path_str(&mirror)?])?;
+    Ok(())
+}
+
+#[test]
+fn a_commit_counts_as_pushed_only_on_a_configured_remote() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    // Backed up to a local mirror, never pushed to the forge remote. The
+    // mirror's name starts with the forge remote's, which must not matter.
+    add_mirror(&harness, &path, "origin-mirror")?;
+    commit_locally(&path, "backup-only.txt")?;
+    git(&path, &["push", "--quiet", "origin-mirror", "task-1"])?;
+
+    assert_eq!(
+        reasons(&harness.inspect()?, &owned.worktree)?,
+        [Exclusion::UnpreservedCommits]
+    );
+    // Naming the mirror as a forge remote makes it count.
+    harness.remotes = vec![
+        RemoteName::new("origin")?,
+        RemoteName::new("origin-mirror")?,
+    ];
+    assert_eq!(reasons(&harness.inspect()?, &owned.worktree)?, []);
+    // Pushing to the forge remote satisfies the default.
+    harness.remotes = origin()?;
+    git(&path, &["push", "--quiet", "origin", "task-1"])?;
+    assert_eq!(reasons(&harness.inspect()?, &owned.worktree)?, []);
+    Ok(())
+}
+
+#[test]
+fn without_a_matching_remote_nothing_is_pushed() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    // HEAD is on `origin`, but no configured remote says so.
+    for remotes in [vec![], vec![RemoteName::new("upstream")?]] {
+        harness.remotes = remotes;
+        assert_eq!(
+            reasons(&harness.inspect()?, &owned.worktree)?,
+            [Exclusion::UnpreservedCommits]
+        );
+        assert!(inspect_worktree(&path, &GitLimits::default(), &harness.remotes)?.unpushed_commits);
+    }
+    // A merged pull request's head still preserves it.
+    harness.merged.insert(owned.worktree.clone(), head(&path)?);
+    assert_eq!(reasons(&harness.inspect()?, &owned.worktree)?, []);
     Ok(())
 }
 
@@ -2041,7 +2354,7 @@ fn a_hung_git_call_is_killed_at_its_deadline() -> TestResult {
     };
     let started = std::time::Instant::now();
     assert_eq!(
-        inspect_worktree(dir.path(), &limits),
+        inspect_worktree(dir.path(), &limits, &origin()?),
         Err(GitReadError::Timeout)
     );
     assert!(started.elapsed() < Duration::from_secs(10));
@@ -2060,10 +2373,10 @@ fn oversized_git_output_is_refused() -> TestResult {
         ..GitLimits::default()
     };
     assert_eq!(
-        inspect_worktree(&path, &limits),
+        inspect_worktree(&path, &limits, &origin()?),
         Err(GitReadError::OutputTooLarge)
     );
-    let state = inspect_worktree(&path, &GitLimits::default())?;
+    let state = inspect_worktree(&path, &GitLimits::default(), &origin()?)?;
     assert_eq!(state.untracked_files, 64);
     assert!(state.linked && !state.locked && !state.unpushed_commits);
     Ok(())
@@ -2076,7 +2389,7 @@ fn a_repository_without_remotes_has_unpushed_commits() -> TestResult {
     fs::write(dir.path().join("a.txt"), "a")?;
     git(dir.path(), &["add", "."])?;
     git(dir.path(), &["commit", "--quiet", "-m", "a"])?;
-    let state = inspect_worktree(dir.path(), &GitLimits::default())?;
+    let state = inspect_worktree(dir.path(), &GitLimits::default(), &origin()?)?;
     assert!(state.unpushed_commits && !state.linked);
     assert_eq!(state.head, head(dir.path())?);
     Ok(())
@@ -2086,7 +2399,7 @@ fn a_repository_without_remotes_has_unpushed_commits() -> TestResult {
 fn a_directory_that_is_not_a_repository_is_unreadable() -> TestResult {
     let dir = tempfile::tempdir()?;
     assert_eq!(
-        inspect_worktree(dir.path(), &GitLimits::default()),
+        inspect_worktree(dir.path(), &GitLimits::default(), &origin()?),
         Err(GitReadError::Failed)
     );
     Ok(())

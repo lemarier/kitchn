@@ -8,16 +8,19 @@
 
 use std::{
     ffi::OsStr,
+    fmt,
     io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{ChildStdout, Command, ExitStatus, Stdio},
+    str::FromStr,
     sync::mpsc::{self, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
+use super::CleanupError;
 use crate::contracts::CommitId;
 
 /// Environment variables that would redirect Git away from the given path or
@@ -96,6 +99,109 @@ pub enum GitReadError {
     NotCheckoutRoot,
 }
 
+/// Longest remote name accepted.
+const MAX_REMOTE_NAME_BYTES: usize = 64;
+
+/// The name of a Git remote whose remote-tracking refs prove a commit is
+/// pushed: the house's forge remote, not a local mirror or a person's backup.
+/// Validated on construction, so it is safe as part of a ref pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteName(String);
+
+impl RemoteName {
+    /// Accept `name` if it is 1 to 64 ASCII letters, digits, `-`, `_`, or `.`
+    /// and does not start with `-` or `.` or contain `..`.
+    ///
+    /// # Errors
+    /// Returns [`CleanupError::InvalidRemote`] for anything else, including
+    /// pattern characters and path separators.
+    pub fn new(name: &str) -> Result<Self, CleanupError> {
+        let valid = !name.is_empty()
+            && name.len() <= MAX_REMOTE_NAME_BYTES
+            && !name.starts_with(['-', '.'])
+            && !name.contains("..")
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if valid {
+            Ok(Self(name.to_owned()))
+        } else {
+            Err(CleanupError::InvalidRemote)
+        }
+    }
+
+    /// The name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for RemoteName {
+    type Err = CleanupError;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::new(name)
+    }
+}
+
+impl fmt::Display for RemoteName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// An operation Git left unfinished in a worktree. Its progress lives only in
+/// the worktree's Git directory and is lost when the worktree is removed, and
+/// `HEAD` during it may say nothing about the commits the operation holds, so
+/// the worktree is kept and the operation reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GitOperation {
+    /// A rebase stopped for a conflict, an `edit` or `break`, or a failed `exec`.
+    Rebase,
+    /// `git am` stopped on a patch that did not apply.
+    ApplyMailbox,
+    /// A merge stopped before its commit.
+    Merge,
+    /// A single cherry-pick stopped.
+    CherryPick,
+    /// A single revert stopped.
+    Revert,
+    /// A cherry-pick or revert of several commits stopped part way.
+    Sequence,
+    /// A bisect that was started and not reset.
+    Bisect,
+}
+
+impl GitOperation {
+    /// The stable kebab-case name, as serialized.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rebase => "rebase",
+            Self::ApplyMailbox => "apply-mailbox",
+            Self::Merge => "merge",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
+            Self::Sequence => "sequence",
+            Self::Bisect => "bisect",
+        }
+    }
+}
+
+impl fmt::Display for GitOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for GitOperation {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// What Git reports about one worktree.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,16 +222,26 @@ pub struct WorktreeState {
     /// Tracked files marked assume-unchanged or skip-worktree, whose edits
     /// `git status` does not report.
     pub hidden_tracked: u32,
-    /// Whether `HEAD` has commits that no remote-tracking ref contains.
+    /// The operation Git left unfinished in this worktree, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<GitOperation>,
+    /// Whether `HEAD` has commits that no remote-tracking ref of a configured
+    /// remote contains.
     pub unpushed_commits: bool,
 }
 
-/// Inspect the worktree whose top level is `path`.
+/// Inspect the worktree whose top level is `path`. A commit counts as pushed
+/// only when a remote-tracking ref of one of `remotes` contains it; with no
+/// remotes, nothing is pushed.
 ///
 /// # Errors
 /// Returns a [`GitReadError`] when any bounded call fails; callers must treat
 /// that as "retain", never as clean.
-pub fn inspect_worktree(path: &Path, limits: &GitLimits) -> Result<WorktreeState, GitReadError> {
+pub fn inspect_worktree(
+    path: &Path,
+    limits: &GitLimits,
+    remotes: &[RemoteName],
+) -> Result<WorktreeState, GitReadError> {
     if !path.is_absolute() || !path.is_dir() {
         return Err(GitReadError::InvalidPath);
     }
@@ -153,12 +269,8 @@ pub fn inspect_worktree(path: &Path, limits: &GitLimits) -> Result<WorktreeState
     let git_dir = canonical(Path::new(git_dir))?;
     let linked = git_dir != canonical(Path::new(common_dir))?;
     // A lock marker that cannot be read counts as a failure, not as unlocked.
-    let locked = linked
-        && match git_dir.join("locked").symlink_metadata() {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(_) => return Err(GitReadError::Failed),
-        };
+    let locked = linked && state_file_exists(&git_dir, "locked")?;
+    let operation = in_progress_operation(&git_dir)?;
 
     let head = run(
         path,
@@ -182,11 +294,17 @@ pub fn inspect_worktree(path: &Path, limits: &GitLimits) -> Result<WorktreeState
     let ignored = list_ignored(path, limits)?;
     let hidden_tracked = count_hidden_tracked(path, limits)?;
 
-    let unpushed = run(
-        path,
-        ["rev-list", "--max-count=1", "HEAD", "--not", "--remotes"],
-        limits,
-    )?;
+    // `--remotes=<name>` matches `refs/remotes/<name>/*` and no other remote
+    // whose name merely starts with it. With no remotes the `--not` list is
+    // empty, so `HEAD` itself is listed: nothing counts as pushed.
+    let mut unpushed_args = vec![
+        "rev-list".to_owned(),
+        "--max-count=1".to_owned(),
+        "HEAD".to_owned(),
+        "--not".to_owned(),
+    ];
+    unpushed_args.extend(remotes.iter().map(|remote| format!("--remotes={remote}")));
+    let unpushed = run(path, unpushed_args, limits)?;
     Ok(WorktreeState {
         head,
         linked,
@@ -195,8 +313,58 @@ pub fn inspect_worktree(path: &Path, limits: &GitLimits) -> Result<WorktreeState
         untracked_files,
         ignored,
         hidden_tracked,
+        operation,
         unpushed_commits: !unpushed.trim().is_empty(),
     })
+}
+
+/// Whether `name` exists in the Git directory, without following symlinks. A
+/// path that cannot be examined is an error, never "absent".
+fn state_file_exists(git_dir: &Path, name: &str) -> Result<bool, GitReadError> {
+    match git_dir.join(name).symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(GitReadError::Failed),
+    }
+}
+
+/// The operation Git left unfinished in the worktree whose Git directory is
+/// `git_dir`, judged from the state files Git keeps there (the same ones its
+/// shell prompt reads). These files are per worktree, so another worktree's
+/// operation does not show here. When several are present, the first in this
+/// order is reported.
+///
+/// An unfinished operation says nothing through `git status`, and during it
+/// `HEAD` can sit on a pushed base while the branch's own commits wait in the
+/// operation's to-do list, so the pushed check on `HEAD` alone cannot vouch for
+/// them. The branch itself survives the worktree's removal; the operation's
+/// progress does not.
+fn in_progress_operation(git_dir: &Path) -> Result<Option<GitOperation>, GitReadError> {
+    if state_file_exists(git_dir, "rebase-merge")? {
+        return Ok(Some(GitOperation::Rebase));
+    }
+    if state_file_exists(git_dir, "rebase-apply")? {
+        // `rebasing` marks an old-style rebase; `applying` or nothing, `am`.
+        return Ok(Some(
+            if state_file_exists(git_dir, "rebase-apply/rebasing")? {
+                GitOperation::Rebase
+            } else {
+                GitOperation::ApplyMailbox
+            },
+        ));
+    }
+    for (name, operation) in [
+        ("MERGE_HEAD", GitOperation::Merge),
+        ("CHERRY_PICK_HEAD", GitOperation::CherryPick),
+        ("REVERT_HEAD", GitOperation::Revert),
+        ("sequencer", GitOperation::Sequence),
+        ("BISECT_LOG", GitOperation::Bisect),
+    ] {
+        if state_file_exists(git_dir, name)? {
+            return Ok(Some(operation));
+        }
+    }
+    Ok(None)
 }
 
 /// Count tracked and untracked entries in `git status --porcelain=v1 -z`
@@ -306,7 +474,11 @@ pub(super) fn ignored_untracked(
     // `check-ignore` reads a leading `:` as pathspec magic, so a directory
     // named `:(top)target` would be checked as `target`. `./` prevents that.
     let relative = format!("./{name}/");
-    let (ignored, _) = run_raw(dir, ["check-ignore", "--quiet", "--", &relative], limits)?;
+    let (ignored, _) = run_raw(
+        dir,
+        ["check-ignore", "--quiet", "--", relative.as_str()],
+        limits,
+    )?;
     match ignored.code() {
         Some(0) => {}
         Some(1) => return Ok(false),
@@ -316,7 +488,13 @@ pub(super) fn ignored_untracked(
     let entry = format!("{name}/");
     let tracked = run(
         dir,
-        ["--literal-pathspecs", "ls-files", "-z", "--", &entry],
+        [
+            "--literal-pathspecs",
+            "ls-files",
+            "-z",
+            "--",
+            entry.as_str(),
+        ],
         limits,
     )?;
     if !tracked.is_empty() {
@@ -333,16 +511,16 @@ pub(super) fn ignored_untracked(
             "--directory",
             "--no-empty-directory",
             "--",
-            &entry,
+            entry.as_str(),
         ],
         limits,
     )?;
     Ok(unignored.is_empty())
 }
 /// Run one read-only `git` call in `dir` that must succeed.
-fn run<const N: usize>(
+fn run<S: AsRef<OsStr>>(
     dir: &Path,
-    args: [&str; N],
+    args: impl IntoIterator<Item = S>,
     limits: &GitLimits,
 ) -> Result<String, GitReadError> {
     let (status, output) = run_raw(dir, args, limits)?;
@@ -354,9 +532,9 @@ fn run<const N: usize>(
 
 /// Run one read-only `git` call in `dir` within the limits and return its
 /// exit status with its output.
-fn run_raw<const N: usize>(
+fn run_raw<S: AsRef<OsStr>>(
     dir: &Path,
-    args: [&str; N],
+    args: impl IntoIterator<Item = S>,
     limits: &GitLimits,
 ) -> Result<(ExitStatus, String), GitReadError> {
     let max = limits.max_output_bytes;
@@ -375,9 +553,9 @@ fn run_raw<const N: usize>(
 
 /// Run one read-only `git` call in `dir` under its deadline, handing its
 /// standard output to `read` on a separate thread.
-fn run_with<const N: usize, T: Send + 'static>(
+fn run_with<S: AsRef<OsStr>, T: Send + 'static>(
     dir: &Path,
-    args: [&str; N],
+    args: impl IntoIterator<Item = S>,
     limits: &GitLimits,
     read: impl FnOnce(ChildStdout) -> io::Result<T> + Send + 'static,
 ) -> Result<(ExitStatus, T), GitReadError> {
@@ -393,7 +571,7 @@ fn run_with<const N: usize, T: Send + 'static>(
         ])
         .arg("-C")
         .arg(dir)
-        .args(args.iter().map(OsStr::new))
+        .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
@@ -448,6 +626,107 @@ fn run_with<const N: usize, T: Send + 'static>(
 mod tests {
     use super::*;
 
+    /// A Git directory holding exactly `names`, each an empty file except
+    /// those ending in `/`, which are directories.
+    fn git_dir_with(names: &[&str]) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        for name in names {
+            if name.ends_with('/') {
+                std::fs::create_dir_all(dir.path().join(name))?;
+            } else {
+                if let Some(parent) = Path::new(name).parent() {
+                    std::fs::create_dir_all(dir.path().join(parent))?;
+                }
+                std::fs::write(dir.path().join(name), b"")?;
+            }
+        }
+        Ok(dir)
+    }
+
+    #[test]
+    fn each_state_file_names_its_operation() -> Result<(), Box<dyn std::error::Error>> {
+        let kind = |names: &[&str]| -> Result<_, Box<dyn std::error::Error>> {
+            Ok(in_progress_operation(git_dir_with(names)?.path())?)
+        };
+        assert_eq!(kind(&[])?, None);
+        // Files Git keeps for every worktree do not count.
+        assert_eq!(kind(&["HEAD", "index", "locked", "logs/"])?, None);
+        assert_eq!(kind(&["rebase-merge/"])?, Some(GitOperation::Rebase));
+        assert_eq!(
+            kind(&["rebase-apply/rebasing"])?,
+            Some(GitOperation::Rebase)
+        );
+        assert_eq!(
+            kind(&["rebase-apply/applying"])?,
+            Some(GitOperation::ApplyMailbox)
+        );
+        // A bare `rebase-apply` is `am` or a rebase; either way it is kept.
+        assert_eq!(kind(&["rebase-apply/"])?, Some(GitOperation::ApplyMailbox));
+        assert_eq!(kind(&["MERGE_HEAD"])?, Some(GitOperation::Merge));
+        assert_eq!(kind(&["CHERRY_PICK_HEAD"])?, Some(GitOperation::CherryPick));
+        assert_eq!(kind(&["REVERT_HEAD"])?, Some(GitOperation::Revert));
+        assert_eq!(kind(&["sequencer/"])?, Some(GitOperation::Sequence));
+        assert_eq!(kind(&["BISECT_LOG"])?, Some(GitOperation::Bisect));
+        // A rebase that stops on a conflict also leaves `REBASE_HEAD` and
+        // possibly `MERGE_HEAD`; the rebase is what is reported.
+        assert_eq!(
+            kind(&["rebase-merge/", "MERGE_HEAD", "BISECT_LOG"])?,
+            Some(GitOperation::Rebase)
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_file_that_cannot_be_read_is_a_failure_not_a_clean_worktree()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A regular file where the Git directory should be: every lookup
+        // beneath it fails with something other than "not found".
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"")?;
+        assert_eq!(in_progress_operation(&file), Err(GitReadError::Failed));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_names_are_plain_and_bounded() {
+        for name in [
+            "origin",
+            "upstream",
+            "fork-2",
+            "my_remote",
+            "a.b",
+            &"x".repeat(64),
+        ] {
+            assert_eq!(
+                RemoteName::new(name).map(|n| n.to_string()),
+                Ok(name.to_owned())
+            );
+        }
+        assert_eq!("origin".parse(), RemoteName::new("origin"));
+        for name in [
+            "",
+            "-origin",
+            ".hidden",
+            "a..b",
+            "a/b",
+            "or*",
+            "or?gin",
+            "or[i]gin",
+            "with space",
+            "new\nline",
+            "café",
+            &"x".repeat(65),
+        ] {
+            assert_eq!(
+                RemoteName::new(name),
+                Err(CleanupError::InvalidRemote),
+                "{name:?}"
+            );
+        }
+    }
+
     #[test]
     fn status_counts_tracked_untracked_and_renames() {
         assert_eq!(count_status(""), Ok((0, 0)));
@@ -493,11 +772,11 @@ mod tests {
             ..GitLimits::default()
         };
         assert_eq!(
-            inspect_worktree(Path::new("relative"), &limits),
+            inspect_worktree(Path::new("relative"), &limits, &[]),
             Err(GitReadError::InvalidPath)
         );
         assert_eq!(
-            inspect_worktree(Path::new("/nonexistent/worktree"), &limits),
+            inspect_worktree(Path::new("/nonexistent/worktree"), &limits, &[]),
             Err(GitReadError::InvalidPath)
         );
     }
@@ -509,7 +788,7 @@ mod tests {
             ..GitLimits::default()
         };
         assert_eq!(
-            inspect_worktree(&std::env::temp_dir(), &limits),
+            inspect_worktree(&std::env::temp_dir(), &limits, &[]),
             Err(GitReadError::Spawn)
         );
     }

@@ -13,13 +13,24 @@
 //! - the backend reports it exited, and every worker of the owning task is
 //!   settled; a person's takeover of any of them retains everything the task
 //!   owns;
-//! - a worktree is a linked, unlocked worktree with no tracked or untracked
-//!   changes, no tracked file whose edits Git is told to hide
-//!   (assume-unchanged, skip-worktree), and no ignored file except proven
-//!   build output, because deleting a worktree deletes its local
-//!   configuration, notes, and ignored nested repositories too; its `HEAD` is
-//!   contained in a remote-tracking ref or equals the head of the pull
-//!   request that merged it (for squash merges).
+//! - a worktree is a linked, unlocked worktree with no rebase, merge,
+//!   cherry-pick, revert, `am`, or bisect unfinished (its progress lives only
+//!   in the worktree), no tracked or untracked changes, no tracked file whose
+//!   edits Git is told to hide (assume-unchanged, skip-worktree), and no
+//!   ignored file except proven build output, because deleting a worktree
+//!   deletes its local configuration, notes, and ignored nested repositories
+//!   too; its `HEAD` is contained in a remote-tracking ref of a configured
+//!   forge remote (a local mirror or a person's backup remote does not count)
+//!   or equals the head of the pull request that merged it (for squash
+//!   merges).
+//!
+//! The pushed check reads remote-tracking refs as the last fetch left them;
+//! Kitchen never fetches, so a branch deleted on the forge since then still
+//! looks pushed. The check covers `HEAD` only, and that is enough outside an
+//! unfinished operation: an attached `HEAD` is its branch's tip, and a branch
+//! outlives its worktree, because the dishwasher never removes one. During an
+//! unfinished operation `HEAD` can sit on a pushed base while the branch tip
+//! holds unpushed commits, which is why the operation retains the worktree.
 //!
 //! Anything else is retained with every reason that applies. Unknown and
 //! legacy resources are retained. Branches and schedules are never removed.
@@ -71,7 +82,10 @@ pub use build::{
     BuildDirectory, CACHEDIR_SIGNATURE, DiskUsage, MAX_MEASURED_ENTRIES, MAX_TOP_LEVEL_ENTRIES,
     disk_usage,
 };
-pub use git::{GitLimits, GitReadError, MAX_IGNORED_PATHS, WorktreeState, inspect_worktree};
+pub use git::{
+    GitLimits, GitOperation, GitReadError, MAX_IGNORED_PATHS, RemoteName, WorktreeState,
+    inspect_worktree,
+};
 
 use crate::{
     BackendId, EffectName, Error, ErrorClass, HouseId, Result, TaskId, WorkflowId,
@@ -120,6 +134,10 @@ pub enum CleanupError {
     /// Only a person present can approve a previewed cleanup step.
     #[error("a cleanup approval must be recorded by an interactive claimant")]
     ApprovalNeedsPerson,
+    /// A remote name is empty, too long, or holds characters that are not
+    /// plain letters, digits, `-`, `_`, or `.`.
+    #[error("a remote name must be 1 to 64 letters, digits, '-', '_' or '.'")]
+    InvalidRemote,
 }
 
 impl CleanupError {
@@ -127,7 +145,7 @@ impl CleanupError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
-            Self::GrantMismatch => ErrorClass::InvalidInput,
+            Self::GrantMismatch | Self::InvalidRemote => ErrorClass::InvalidInput,
             Self::ApprovalNeedsPerson => ErrorClass::Refused,
             Self::Backend(_) | Self::DuplicateResource | Self::Encoding => ErrorClass::Execution,
         }
@@ -174,6 +192,10 @@ pub struct Inspector<'a> {
     pub merged_heads: &'a BTreeMap<ResourceRef, CommitId>,
     /// Bounds for each Git call.
     pub git: &'a GitLimits,
+    /// The forge remotes: a commit counts as pushed only when a
+    /// remote-tracking ref of one of them contains it. Empty means nothing is
+    /// pushed, so every unmerged commit keeps its worktree.
+    pub remotes: &'a [RemoteName],
 }
 
 /// A reason a resource is retained.
@@ -217,6 +239,8 @@ pub enum Exclusion {
     MainCheckout,
     /// The worktree is locked.
     WorktreeLocked,
+    /// A rebase, merge, cherry-pick, revert, `am`, or bisect is unfinished.
+    OperationInProgress,
     /// Tracked files have changes.
     TrackedChanges,
     /// Untracked files exist.
@@ -252,6 +276,7 @@ impl Exclusion {
             Self::WorktreeUnreadable => "worktree-unreadable",
             Self::MainCheckout => "main-checkout",
             Self::WorktreeLocked => "worktree-locked",
+            Self::OperationInProgress => "operation-in-progress",
             Self::TrackedChanges => "tracked-changes",
             Self::UntrackedFiles => "untracked-files",
             Self::IgnoredFiles => "ignored-files",
@@ -1661,6 +1686,7 @@ fn own_reasons(
             let checks = [
                 (!state.linked, Exclusion::MainCheckout),
                 (state.locked, Exclusion::WorktreeLocked),
+                (state.operation.is_some(), Exclusion::OperationInProgress),
                 (state.tracked_changes > 0, Exclusion::TrackedChanges),
                 (state.untracked_files > 0, Exclusion::UntrackedFiles),
                 (!ignored_files.is_empty(), Exclusion::IgnoredFiles),
@@ -1753,7 +1779,7 @@ fn worktree_evidence(
     let Some(path) = inspector.worktrees.locate(resource) else {
         return (WorktreeEvidence::Unlocated, Vec::new());
     };
-    match inspect_worktree(&path, inspector.git) {
+    match inspect_worktree(&path, inspector.git, inspector.remotes) {
         Ok(state) => {
             // A checkout Git cannot list precisely proves no build output, so
             // every ignored path then counts as work.
@@ -1831,6 +1857,7 @@ const fn blocks_build_output(reason: Exclusion) -> bool {
         | Exclusion::MainCheckout
         | Exclusion::WorktreeLocked => true,
         Exclusion::OwnerActive
+        | Exclusion::OperationInProgress
         | Exclusion::TrackedChanges
         | Exclusion::UntrackedFiles
         | Exclusion::IgnoredFiles

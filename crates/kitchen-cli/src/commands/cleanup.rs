@@ -24,7 +24,8 @@ use kitchen::{
     state::{HouseStore, StoreOptions},
     workflows::cleanup::{
         ApprovalOutcome, ApprovalResult, Decision, DiskUsage, GitLimits, InspectionTrigger,
-        Inspector, OwnerState, Ownership, Preview, Step, WorktreeEvidence, approve, inspect,
+        Inspector, OwnerState, Ownership, Preview, RemoteName, Step, WorktreeEvidence, approve,
+        inspect,
     },
 };
 use serde::Deserialize;
@@ -47,6 +48,11 @@ struct Source {
     /// Git reads each listed worktree path.
     #[arg(long)]
     inventory: PathBuf,
+    /// A forge remote whose remote-tracking refs prove a commit is pushed.
+    /// Repeat for several. A commit no such ref contains is unpushed, so a
+    /// worktree holding it is kept.
+    #[arg(long = "remote", default_value = "origin")]
+    remotes: Vec<RemoteName>,
     #[arg(long)]
     json: bool,
 }
@@ -99,13 +105,9 @@ pub fn run(args: CleanupArgs) -> Result<(String, bool), kitchen::Error> {
     match args.command {
         CleanupCommand::Preview { source, trigger } => {
             let json = source.json;
-            let (backend, store) = open(source)?;
+            let opened = open(source)?;
             let git = GitLimits::default();
-            let preview = inspect(
-                &inspector(&store, &backend, &git),
-                trigger.into(),
-                SystemClock.now(),
-            )?;
+            let preview = inspect(&inspector(&opened, &git), trigger.into(), SystemClock.now())?;
             let output = if json {
                 String::from_utf8(encode(&preview)?).map_err(|_| HouseError::InvalidInput)?
             } else {
@@ -119,10 +121,10 @@ pub fn run(args: CleanupArgs) -> Result<(String, bool), kitchen::Error> {
             digests,
         } => {
             let json = source.json;
-            let (backend, store) = open(source)?;
+            let opened = open(source)?;
             let git = GitLimits::default();
             let results = approve(
-                &inspector(&store, &backend, &git),
+                &inspector(&opened, &git),
                 &Claimant::interactive(holder),
                 &digests,
                 &SystemClock,
@@ -140,24 +142,33 @@ pub fn run(args: CleanupArgs) -> Result<(String, bool), kitchen::Error> {
     }
 }
 
-fn open(source: Source) -> Result<(SnapshotBackend, HouseStore), kitchen::Error> {
+/// What a subcommand reads: the snapshot backend, the house store, and the
+/// forge remotes that prove a commit is pushed.
+struct Opened {
+    backend: SnapshotBackend,
+    store: HouseStore,
+    remotes: Vec<RemoteName>,
+}
+
+fn open(source: Source) -> Result<Opened, kitchen::Error> {
     let snapshot: Snapshot = decode(&source.inventory)?;
     let backend = SnapshotBackend::new(source.house.clone(), snapshot)?;
     let store = HouseStore::open(source.store, source.house, StoreOptions::default())?;
-    Ok((backend, store))
+    Ok(Opened {
+        backend,
+        store,
+        remotes: source.remotes,
+    })
 }
 
-fn inspector<'a>(
-    store: &'a HouseStore,
-    backend: &'a SnapshotBackend,
-    git: &'a GitLimits,
-) -> Inspector<'a> {
+fn inspector<'a>(opened: &'a Opened, git: &'a GitLimits) -> Inspector<'a> {
     Inspector {
-        store,
-        backend,
-        worktrees: &backend.paths,
-        merged_heads: &backend.merged,
+        store: &opened.store,
+        backend: &opened.backend,
+        worktrees: &opened.backend.paths,
+        merged_heads: &opened.backend.merged,
         git,
+        remotes: &opened.remotes,
     }
 }
 
@@ -251,6 +262,9 @@ fn render(preview: &Preview) -> String {
             ..
         }) = &entry.worktree
         {
+            if let Some(operation) = state.operation {
+                let _ = write!(text, "\n  {operation} in progress, kept");
+            }
             if !ignored_files.is_empty() {
                 let _ = write!(text, "\n  ignored, kept: {}", ignored_files.join(", "));
             }

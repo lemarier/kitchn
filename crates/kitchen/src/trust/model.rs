@@ -1,9 +1,10 @@
 //! Evidence inputs and immutable audit records.
+use crate::contracts::Settlement;
 use crate::{
     HolderId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, Evidence, EvidenceSubject, ExternalRef, Grant, Provenance, Repository, Role,
-        Text, Timestamp,
+        AttemptNumber, Evidence, EvidenceSubject, EvidenceVerdict, ExternalRef, Grant, Provenance,
+        Repository, Role, TaskSpec, Text, Timestamp,
     },
     state::{AttemptState, EffectRecord, HouseStore, TaskState},
     trust::TrustError,
@@ -214,8 +215,27 @@ impl Observation {
         self.mode == EvidenceMode::Live
             && matches!(self.attribution.agent, Measurement::Observed { .. })
             && matches!(self.attribution.model, Measurement::Observed { .. })
-            && matches!(self.attribution.tokens, Measurement::Observed { .. })
-            && matches!(self.state, TaskState::Settled { .. })
+            && matches!(self.attribution.tokens, Measurement::Observed { value, .. } if value > 0)
+            && matches!(
+                self.state,
+                TaskState::Settled {
+                    settlement: Settlement::Succeeded,
+                    ..
+                }
+            )
+            && matches!(&self.pull_request, Measurement::Observed { value: pr, .. }
+                if matches!(pr.first_pass, Measurement::Observed { value: true, .. })
+                    && matches!(&pr.findings, Measurement::Observed { value, .. } if value.is_empty())
+                    && matches!(&pr.reverts, Measurement::Observed { value, .. } if value.is_empty())
+                    && matches!(&pr.regressions, Measurement::Observed { value, .. } if value.is_empty()))
+            && matches!(&self.pull_request, Measurement::Observed { value: pr, .. }
+                if matches!(&pr.checks, Measurement::Observed { value, .. }
+                    if !value.is_empty() && value.iter().all(|check| check.verdict == EvidenceVerdict::Pass)))
+            && !matches!(&self.bench, Measurement::Observed { value, .. } if value.iter().any(|result| !result.passed))
+            && !matches!(
+                &self.appropriate_escalation,
+                Measurement::Observed { value: false, .. }
+            )
     }
 
     pub(crate) fn validate(&self) -> Result<(), TrustError> {
@@ -284,25 +304,87 @@ pub struct AutonomyGrant {
     pub decision: ExternalRef,
     /// Evidence stream and revision explicitly considered by the approver.
     pub evidence: Vec<(ExternalRef, NonZeroU32)>,
+    /// Original unapproved proposal, retained after an approval transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<AutonomyProposal>,
     /// Approval time.
     pub at: Timestamp,
 }
 
-/// Append-only grant audit trail; revocation can arrive before issuance.
+/// A requested standing grant that has no approval authority yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutonomyProposal {
+    /// Stable identity used by the later approval decision.
+    pub id: ExternalRef,
+    /// Owning house.
+    pub house: HouseId,
+    /// Station, project, and work category.
+    pub scope: StationScope,
+    /// Proposed exact core grant.
+    pub claim: Grant,
+    /// Evidence explicitly presented for review.
+    pub evidence: Vec<(ExternalRef, NonZeroU32)>,
+    /// Proposal source.
+    pub source: ExternalRef,
+    /// Proposal time.
+    pub at: Timestamp,
+}
+
+/// Write-once adapter attribution for a prospective task. Core authority is
+/// delegated after this binding and is checked separately at execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskBinding {
+    /// Prospective task specification before earned authority is delegated.
+    pub spec: TaskSpec,
+    /// Station and work category declared by the house adapter.
+    pub scope: StationScope,
+    /// Exact selected model.
+    pub model: Text,
+    /// Auditable source for the adapter decision.
+    pub source: ExternalRef,
+}
+
+impl TaskBinding {
+    pub(crate) fn matches(&self, spec: &TaskSpec) -> bool {
+        self.spec.id == spec.id
+            && self.spec.role == spec.role
+            && self.spec.repository == spec.repository
+            && self.spec.retry == spec.retry
+            && self.spec.provenance == spec.provenance
+            && self.spec.resources == spec.resources
+            && self.spec.requires == spec.requires
+    }
+}
+
+/// Grant decision state. Revocation replaces the current entry while retaining
+/// the original proposal or approval and the revocation decision together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum GrantAudit {
+    /// Proposal without authority.
+    Proposed(AutonomyProposal),
     /// Explicit issuance.
     Issued(AutonomyGrant),
-    /// Permanent tombstone for this identity.
+    /// Revoked approval; the original decision remains auditable in place.
     Revoked {
-        /// Grant identity.
-        id: ExternalRef,
-        /// House making the decision.
-        house: HouseId,
+        /// Original approved grant.
+        grant: AutonomyGrant,
         /// Decision author.
         by: HolderId,
         /// Auditable reason.
+        decision: ExternalRef,
+        /// Decision time.
+        at: Timestamp,
+    },
+    /// Revoked proposal, which was never active authority.
+    RevokedProposal {
+        /// Original proposal retained for audit.
+        proposal: AutonomyProposal,
+        /// Decision author.
+        by: HolderId,
+        /// Revocation source.
         decision: ExternalRef,
         /// Decision time.
         at: Timestamp,

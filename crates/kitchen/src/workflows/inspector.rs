@@ -267,6 +267,13 @@ impl Ledger {
                 .position(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
             let inspection = &doc.inspections[index];
+            if let Some(old) = inspection.samples.iter().find(|s| s.number == number) {
+                return if old.tokens == tokens {
+                    Ok(SampleReservation::Existing(old.clone()))
+                } else {
+                    Err(TrustError::Conflict)
+                };
+            }
             if inspection.cancelled {
                 return Err(TrustError::Refused);
             }
@@ -276,15 +283,11 @@ impl Ledger {
             if now >= inspection.plan.deadline {
                 return Err(TrustError::Exhausted);
             }
-            if doc.latest(&inspection.plan.observation)?.revision != inspection.revision {
+            let current = doc.latest(&inspection.plan.observation)?;
+            if current.revision != inspection.revision
+                || !matches!(&current.pull_request, Measurement::Observed { value, .. } if value.subject == inspection.subject)
+            {
                 return Err(TrustError::Refused);
-            }
-            if let Some(old) = inspection.samples.iter().find(|s| s.number == number) {
-                return if old.tokens == tokens {
-                    Ok(SampleReservation::Existing(old.clone()))
-                } else {
-                    Err(TrustError::Conflict)
-                };
             }
             if inspection.samples.iter().any(|s| s.result.is_none()) {
                 return Err(TrustError::Incomplete);
@@ -330,10 +333,6 @@ impl Ledger {
                 .iter()
                 .position(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
-            let inspection = &doc.inspections[index];
-            if doc.latest(&inspection.plan.observation)?.revision != inspection.revision {
-                return Err(TrustError::Refused);
-            }
             let sample = doc.inspections[index]
                 .samples
                 .iter_mut()

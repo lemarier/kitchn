@@ -10,8 +10,8 @@ use kitchen::{
         Text,
     },
     trust::{
-        Attribution, AutonomyGrant, EvidenceMode, GrantAudit, Ledger, Measurement, Observation,
-        PullRequestEvidence, StationScope, TrustError,
+        Attribution, AutonomyGrant, AutonomyProposal, EvidenceMode, Ledger, Measurement,
+        Observation, PullRequestEvidence, StationScope, TrustError,
     },
     workflows::inspector::{FollowUpRoute, InspectionPlan, SampleReservation, SampleResult},
 };
@@ -70,6 +70,16 @@ fn observation(f: &Fixture) -> TestResult<Observation> {
 fn ledger(f: &Fixture) -> TestResult<Ledger> {
     Ok(Ledger::initialize(f.dir.path().join("trust"), house()?)?)
 }
+fn bind_evidence(l: &Ledger, f: &Fixture) -> TestResult {
+    let task = f.store.task(&task_id("task")?)?;
+    l.bind_task(
+        task.spec(),
+        scope()?,
+        Text::new("fixture-model-v1")?,
+        source("fixture:task-binding")?,
+    )?;
+    Ok(())
+}
 fn reopen(f: &Fixture) -> TestResult<Ledger> {
     Ok(Ledger::open(f.dir.path().join("trust"), house()?)?)
 }
@@ -94,6 +104,24 @@ fn with_pr(mut o: Observation) -> TestResult<Observation> {
     })?;
     Ok(o)
 }
+fn eligible(mut o: Observation) -> TestResult<Observation> {
+    o = with_pr(o)?;
+    o.mode = EvidenceMode::Live;
+    if let Measurement::Observed { value, .. } = &mut o.pull_request {
+        value.first_pass = measured(true)?;
+        value.findings = measured(Vec::new())?;
+        value.reverts = measured(Vec::new())?;
+        value.regressions = measured(Vec::new())?;
+        value.checks = measured(vec![kitchen::contracts::Evidence {
+            kind: kitchen::contracts::EvidenceKind::Check,
+            verdict: kitchen::contracts::EvidenceVerdict::Pass,
+            subject: value.subject.clone(),
+            source: source("fixture:passing-check")?,
+            observed_at: at(4),
+        }])?;
+    }
+    Ok(o)
+}
 fn grant() -> TestResult<AutonomyGrant> {
     Ok(AutonomyGrant {
         id: source("fixture:grant")?,
@@ -108,17 +136,17 @@ fn grant() -> TestResult<AutonomyGrant> {
         approved_by: holder("owner")?,
         decision: source("fixture:decision")?,
         evidence: vec![(source("fixture:task")?, NonZeroU32::MIN)],
+        proposal: None,
         at: at(5),
     })
 }
-fn revoke() -> TestResult<GrantAudit> {
-    Ok(GrantAudit::Revoked {
-        id: source("fixture:grant")?,
-        house: house()?,
-        by: holder("owner")?,
-        decision: source("fixture:revoke")?,
-        at: at(6),
-    })
+fn revoke(l: &Ledger) -> TestResult<bool> {
+    Ok(l.revoke(
+        &grant()?.id,
+        holder("owner")?,
+        source("fixture:revoke")?,
+        at(6),
+    )?)
 }
 fn plan() -> TestResult<InspectionPlan> {
     Ok(InspectionPlan {
@@ -179,15 +207,18 @@ fn duplicate_reordered_corrections_preserve_history_and_sample_sizes() -> TestRe
     corrected.revision = NonZeroU32::new(2).ok_or("revision")?;
     corrected.correction = Some(source("fixture:attribution-investigation")?);
     corrected.attribution.agent = measured(holder("actual-worker")?)?;
-    assert!(l.record(corrected.clone())?);
+    assert!(l.record(&f.store, corrected.clone())?);
     assert!(matches!(l.latest(&first.id), Err(TrustError::Incomplete)));
-    assert!(l.record(first.clone())?);
-    assert!(!l.record(first.clone())?);
+    assert!(l.record(&f.store, first.clone())?);
+    assert!(!l.record(&f.store, first.clone())?);
     assert_eq!(reopen(&f)?.latest(&first.id)?, corrected);
     assert_eq!(l.history()?.len(), 2);
     let mut conflict = first.clone();
     conflict.attribution.tokens = measured(0)?;
-    assert!(matches!(l.record(conflict), Err(TrustError::Conflict)));
+    assert!(matches!(
+        l.record(&f.store, conflict),
+        Err(TrustError::Conflict)
+    ));
     assert_eq!(l.history()?.len(), 2);
     assert_eq!(l.latest(&first.id)?.attribution.tokens, measured(120)?);
     Ok(())
@@ -199,17 +230,17 @@ fn incomplete_bench_and_cross_house_inputs_never_pass() -> TestResult {
     let l = ledger(&f)?;
     let mut o = with_pr(observation(&f)?)?;
     o.bench = Measurement::Untested;
-    l.record(o.clone())?;
+    l.record(&f.store, o.clone())?;
     assert_eq!(l.latest(&o.id)?.bench, Measurement::Untested);
     let mut other = o.clone();
     other.house = other_house()?;
     other.id = source("fixture:other")?;
-    assert!(l.record(other).is_err());
+    assert!(l.record(&f.store, other).is_err());
     assert!(Ledger::open(f.dir.path().join("trust"), other_house()?).is_err());
     if let Measurement::Observed { value, .. } = &mut o.pull_request {
         value.house = other_house()?;
     }
-    assert!(l.record(o).is_err());
+    assert!(l.record(&f.store, o).is_err());
     Ok(())
 }
 
@@ -222,7 +253,7 @@ fn unknown_attribution_and_usage_do_not_derive_trust() -> TestResult {
     o.mode = EvidenceMode::Live;
     o.attribution.tokens = Measurement::Unavailable;
     assert!(!o.trust_eligible());
-    l.record(o.clone())?;
+    l.record(&f.store, o.clone())?;
     assert!(matches!(
         l.grant(grant()?, &grants()?),
         Err(TrustError::Refused)
@@ -242,58 +273,373 @@ fn unknown_attribution_and_usage_do_not_derive_trust() -> TestResult {
 }
 
 #[test]
-fn explicit_grant_uses_core_authority_and_revocation_survives_restart() -> TestResult {
+fn trust_requires_success_positive_usage_and_positive_pr_evidence() -> TestResult {
+    use kitchen::{contracts::Settlement, state::TaskState};
     let f = Fixture::new()?;
-    let l = ledger(&f)?;
-    let mut o = observation(&f)?;
-    o.mode = EvidenceMode::Live;
-    l.record(o)?;
-    assert!(l.grant(grant()?, &grants()?)?);
-    assert!(!l.grant(grant()?, &grants()?)?);
-    let task = f.store.task(&task_id("task")?)?;
-    assert_eq!(
-        l.authorize(&grant()?.id, &scope()?, &task, &grants()?)?,
-        common::credential()?
-    );
-    let withdrawn = kitchen::contracts::HouseGrants::new(house()?, []);
-    assert!(
-        l.authorize(&grant()?.id, &scope()?, &task, &withdrawn)
-            .is_err()
-    );
-    let mut other_scope = scope()?;
-    other_scope.work_type = Text::new("release")?;
-    assert!(
-        l.authorize(&grant()?.id, &other_scope, &task, &grants()?)
-            .is_err()
-    );
-    assert!(l.revoke(revoke()?)?);
-    assert!(!l.revoke(revoke()?)?);
-    assert!(
-        reopen(&f)?
-            .authorize(&grant()?.id, &scope()?, &task, &grants()?)
-            .is_err()
-    );
-    assert_eq!(l.grant_history()?.len(), 2);
+    let mut o = eligible(observation(&f)?)?;
+    assert!(o.trust_eligible());
+    o.attribution.tokens = measured(0)?;
+    assert!(!o.trust_eligible());
+    o.attribution.tokens = measured(120)?;
+    for settlement in [
+        Settlement::Failed,
+        Settlement::Cancelled,
+        Settlement::Exhausted,
+    ] {
+        let mut bad = o.clone();
+        if let TaskState::Settled {
+            settlement: value, ..
+        } = &mut bad.state
+        {
+            *value = settlement;
+        }
+        assert!(!bad.trust_eligible());
+    }
+    if let Measurement::Observed { value, .. } = &mut o.pull_request {
+        value.first_pass = measured(false)?;
+    }
+    assert!(!o.trust_eligible());
+    if let Measurement::Observed { value, .. } = &mut o.pull_request {
+        value.first_pass = measured(true)?;
+        if let Measurement::Observed { value: checks, .. } = &mut value.checks {
+            checks[0].verdict = kitchen::contracts::EvidenceVerdict::Fail;
+        }
+    }
+    assert!(!o.trust_eligible());
+    if let Measurement::Observed { value, .. } = &mut o.pull_request
+        && let Measurement::Observed { value: checks, .. } = &mut value.checks
+    {
+        checks[0].verdict = kitchen::contracts::EvidenceVerdict::Pass;
+    }
+    o.bench = measured(vec![kitchen::trust::BenchResult {
+        subject: subject()?,
+        passed: false,
+        procedure: Text::new("bench fixture")?,
+    }])?;
+    assert!(!o.trust_eligible());
+    o.bench = Measurement::Missing;
+    o.pull_request = Measurement::Missing;
+    assert!(!o.trust_eligible());
     Ok(())
 }
 
 #[test]
-fn revoked_before_issued_and_privileged_grants_are_refused() -> TestResult {
+fn fabricated_core_outcome_and_scope_correction_are_refused() -> TestResult {
     let f = Fixture::new()?;
     let l = ledger(&f)?;
-    let mut o = observation(&f)?;
-    o.mode = EvidenceMode::Live;
-    l.record(o)?;
-    l.revoke(revoke()?)?;
+    let mut o = eligible(observation(&f)?)?;
+    let original = o.clone();
+    o.task = task_id("absent")?;
+    assert!(l.record(&f.store, o).is_err());
+    let mut o = original.clone();
+    o.effects.clear();
+    o.state = kitchen::state::TaskState::Settled {
+        settlement: kitchen::contracts::Settlement::Failed,
+        at: at(10),
+    };
+    assert!(l.record(&f.store, o).is_err());
+    l.record(&f.store, original.clone())?;
+    let mut corrected = original;
+    corrected.revision = NonZeroU32::new(2).ok_or("revision")?;
+    corrected.correction = Some(source("fixture:scope-correction")?);
+    corrected.attribution.scope.station = Text::new("other-station")?;
+    assert!(l.record(&f.store, corrected).is_err());
+    Ok(())
+}
+
+#[test]
+fn nonterminal_task_cannot_be_recorded_as_completed_evidence() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let mut task = spec("running")?;
+    task.repository = Some(scope()?.project);
+    f.store.create_task(task, &creator()?, at(0))?;
+    let mut o = Observation::collect(
+        &f.store,
+        &task_id("running")?,
+        source("fixture:running")?,
+        attribution()?,
+        EvidenceMode::Live,
+        at(1),
+    )?;
+    assert!(matches!(
+        l.record(&f.store, o.clone()),
+        Err(TrustError::Refused)
+    ));
+    o.state = kitchen::state::TaskState::Settled {
+        settlement: kitchen::contracts::Settlement::Succeeded,
+        at: at(2),
+    };
+    assert!(matches!(l.record(&f.store, o), Err(TrustError::Refused)));
+    Ok(())
+}
+
+#[test]
+fn task_binding_is_write_once_and_rejects_role_confusion() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let mut task = spec("bound-task")?;
+    task.repository = Some(scope()?.project);
+    let model = Text::new("fixture-model-v1")?;
+    let origin = source("fixture:binding")?;
+    assert!(l.bind_task(&task, scope()?, model.clone(), origin.clone())?);
+    assert!(!l.bind_task(&task, scope()?, model.clone(), origin)?);
+    let mut changed = task.clone();
+    changed.provenance.house_guidance = commit('c')?;
+    assert!(matches!(
+        l.bind_task(
+            &changed,
+            scope()?,
+            model.clone(),
+            source("fixture:binding")?
+        ),
+        Err(TrustError::Conflict)
+    ));
+    let mut wrong_role = scope()?;
+    wrong_role.station = Text::new("inspector")?;
+    assert!(matches!(
+        l.bind_task(&task, wrong_role, model, source("fixture:other")?),
+        Err(TrustError::Refused)
+    ));
+    Ok(())
+}
+
+#[test]
+fn revocation_succeeds_at_history_capacity_and_stays_revoked() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    l.grant(grant()?, &grants()?)?;
+    let path = f.dir.path().join("trust/ledger.json");
+    let mut document: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let audits = document["grants"].as_array_mut().ok_or("grants")?;
+    let original = audits.first().cloned().ok_or("grant")?;
+    for index in 1..4094 {
+        let mut additional = original.clone();
+        additional["Issued"]["id"] = serde_json::json!(format!("fixture:grant-{index}"));
+        audits.push(additional);
+    }
+    fs::write(&path, serde_json::to_vec(&document)?)?;
+    assert!(revoke(&l)?);
+    assert!(!revoke(&reopen(&f)?)?);
     assert!(matches!(
         l.grant(grant()?, &grants()?),
         Err(TrustError::Conflict)
     ));
+    assert_eq!(l.grant_history()?.len(), 4094);
+    Ok(())
+}
+
+#[test]
+fn waiting_writer_yields_to_pending_revocation() -> TestResult {
+    use std::{fs::OpenOptions, thread, time::Duration};
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    l.grant(grant()?, &grants()?)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.dir.path().join("trust/ledger.lock"))?;
+    lock.lock()?;
+    let revoker = l.clone();
+    let grant_id = grant()?.id;
+    let actor = holder("owner")?;
+    let decision = source("fixture:revoke")?;
+    let revocation = thread::spawn(move || revoker.revoke(&grant_id, actor, decision, at(6)));
+    let pending = f.dir.path().join("trust/revoke.pending");
+    for _ in 0..100 {
+        if pending.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(pending.exists());
+    let reader = l.clone();
+    let read = thread::spawn(move || reader.grant_history());
+    drop(lock);
+    assert!(revocation.join().map_err(|_| "revoker panicked")??);
+    let history = read.join().map_err(|_| "reader panicked")??;
+    assert!(matches!(
+        history.as_slice(),
+        [kitchen::trust::GrantAudit::Revoked { .. }]
+    ));
+    Ok(())
+}
+
+#[test]
+fn proposal_within_limits_needs_explicit_approval_and_can_be_revoked() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    let g = grant()?;
+    let policy = kitchen::contracts::HouseGrants::with_limits(house()?, [g.claim.clone()], [])?;
+    assert!(matches!(
+        l.grant(g.clone(), &policy),
+        Err(TrustError::Refused)
+    ));
+    let proposal = AutonomyProposal {
+        id: g.id.clone(),
+        house: g.house.clone(),
+        scope: g.scope.clone(),
+        claim: g.claim.clone(),
+        evidence: g.evidence.clone(),
+        source: source("fixture:proposal")?,
+        at: at(5),
+    };
+    assert!(l.propose(proposal.clone(), &policy)?);
+    assert!(!l.propose(proposal, &policy)?);
+    assert!(matches!(
+        l.grant_history()?.as_slice(),
+        [kitchen::trust::GrantAudit::Proposed(_)]
+    ));
+    assert!(l.approve(
+        &g.id,
+        holder("owner")?,
+        source("fixture:approval")?,
+        at(6),
+        &policy
+    )?);
+    assert!(matches!(
+        l.grant_history()?.as_slice(),
+        [kitchen::trust::GrantAudit::Issued(AutonomyGrant {
+            proposal: Some(_),
+            ..
+        })]
+    ));
+    assert!(revoke(&l)?);
+    assert!(matches!(
+        reopen(&f)?.grant_history()?.as_slice(),
+        [kitchen::trust::GrantAudit::Revoked { .. }]
+    ));
+    Ok(())
+}
+
+#[test]
+fn explicit_grant_uses_core_authority_and_revocation_survives_restart() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    let g = grant()?;
+    let policy = kitchen::contracts::HouseGrants::with_limits(house()?, [g.claim.clone()], [])?;
+    let proposal = AutonomyProposal {
+        id: g.id.clone(),
+        house: g.house.clone(),
+        scope: g.scope.clone(),
+        claim: g.claim.clone(),
+        evidence: g.evidence.clone(),
+        source: source("fixture:proposal")?,
+        at: at(5),
+    };
+    l.propose(proposal, &policy)?;
+    let mut acting = spec("acting")?;
+    acting.repository = Some(scope()?.project);
+    acting.authority = kitchen::contracts::TaskAuthority::delegate(&policy, [])?;
+    l.bind_task(
+        &acting,
+        scope()?,
+        Text::new("fixture-model-v1")?,
+        source("fixture:acting-binding")?,
+    )?;
+    assert!(
+        !l.standing_for_task(&f.store, &acting, &policy)?
+            .covers(&g.claim)
+    );
+    l.approve(
+        &g.id,
+        holder("owner")?,
+        source("fixture:approval")?,
+        at(6),
+        &policy,
+    )?;
+    let projected = l.standing_for_task(&f.store, &acting, &policy)?;
+    assert!(projected.covers(&g.claim));
+    let foreign_policy = kitchen::contracts::HouseGrants::new(other_house()?, []);
+    assert!(matches!(
+        l.standing_for_task(&f.store, &acting, &foreign_policy),
+        Err(TrustError::Refused)
+    ));
+    acting.authority = kitchen::contracts::TaskAuthority::delegate(&projected, [g.claim.clone()])?;
+    f.store.create_task(acting.clone(), &creator()?, at(7))?;
+    assert_eq!(
+        acting.authority.authorize(
+            &l.standing_for_task(&f.store, &acting, &policy)?,
+            g.claim.permission,
+            &g.claim.scope,
+            &g.claim.destination
+        )?,
+        g.claim.credential
+    );
+    let mut other_scope = scope()?;
+    other_scope.work_type = Text::new("release")?;
+    let mut other = spec("other-acting")?;
+    other.repository = Some(scope()?.project);
+    other.authority = kitchen::contracts::TaskAuthority::delegate(&policy, [])?;
+    l.bind_task(
+        &other,
+        other_scope,
+        Text::new("fixture-model-v1")?,
+        source("fixture:other-binding")?,
+    )?;
+    assert!(
+        !l.standing_for_task(&f.store, &other, &policy)?
+            .covers(&g.claim)
+    );
+    let mut altered = acting.clone();
+    altered.provenance.house_guidance = commit('c')?;
+    assert!(matches!(
+        l.standing_for_task(&f.store, &altered, &policy),
+        Err(TrustError::Refused)
+    ));
+    assert!(revoke(&l)?);
+    assert!(!revoke(&l)?);
+    let after = reopen(&f)?.standing_for_task(&f.store, &acting, &policy)?;
+    assert!(!after.covers(&g.claim));
+    assert!(
+        acting
+            .authority
+            .authorize(
+                &after,
+                g.claim.permission,
+                &g.claim.scope,
+                &g.claim.destination
+            )
+            .is_err()
+    );
+    assert_eq!(l.grant_history()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn unknown_revocation_and_privileged_grants_are_refused() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let o = eligible(observation(&f)?)?;
+    l.record(&f.store, o)?;
+    bind_evidence(&l, &f)?;
+    assert!(matches!(
+        l.revoke(
+            &grant()?.id,
+            holder("owner")?,
+            source("fixture:revoke")?,
+            at(6)
+        ),
+        Err(TrustError::Incomplete)
+    ));
     for permission in [
+        Permission::ReleaseResource,
+        Permission::PushBranch,
+        Permission::OpenPullRequest,
         Permission::Merge,
+        Permission::ManageSchedule,
         Permission::Publish,
         Permission::OperateEquipment,
         Permission::ActivateSchedule,
+        Permission::TrialSchedule,
     ] {
         let mut g = grant()?;
         g.claim.permission = permission;
@@ -310,21 +656,19 @@ fn revoked_before_issued_and_privileged_grants_are_refused() -> TestResult {
 fn corrected_grant_evidence_requires_new_explicit_approval() -> TestResult {
     let f = Fixture::new()?;
     let l = ledger(&f)?;
-    let mut o = observation(&f)?;
-    o.mode = EvidenceMode::Live;
-    l.record(o.clone())?;
+    let mut o = eligible(observation(&f)?)?;
+    l.record(&f.store, o.clone())?;
+    bind_evidence(&l, &f)?;
     l.grant(grant()?, &grants()?)?;
     o.revision = NonZeroU32::new(2).ok_or("revision")?;
     o.correction = Some(source("fixture:correction")?);
-    l.record(o)?;
+    l.record(&f.store, o)?;
+    let g = grant()?;
+    let policy = kitchen::contracts::HouseGrants::with_limits(house()?, [g.claim.clone()], [])?;
+    let task = f.store.task(&task_id("task")?)?;
     assert!(
-        l.authorize(
-            &grant()?.id,
-            &scope()?,
-            &f.store.task(&task_id("task")?)?,
-            &grants()?
-        )
-        .is_err()
+        !l.standing_for_task(&f.store, task.spec(), &policy)?
+            .covers(&g.claim)
     );
     assert_eq!(l.grant_history()?.len(), 1);
     Ok(())
@@ -334,7 +678,7 @@ fn corrected_grant_evidence_requires_new_explicit_approval() -> TestResult {
 fn inspection_reserves_before_execution_and_restarts_without_budget_reset() -> TestResult {
     let f = Fixture::new()?;
     let l = ledger(&f)?;
-    l.record(with_pr(observation(&f)?)?)?;
+    l.record(&f.store, with_pr(observation(&f)?)?)?;
     l.start_inspection(plan()?, at(5))?;
     let sample = l.reserve_sample(&plan()?.id, 1, 60, at(6))?;
     let SampleReservation::Reserved(sample) = sample else {
@@ -375,7 +719,7 @@ fn inspection_independence_missing_evidence_and_deadline_fail_closed() -> TestRe
     let l = ledger(&f)?;
     let mut o = with_pr(observation(&f)?)?;
     o.attribution.agent = Measurement::Unavailable;
-    l.record(o.clone())?;
+    l.record(&f.store, o.clone())?;
     assert!(matches!(
         l.start_inspection(plan()?, at(5)),
         Err(TrustError::Refused)
@@ -383,7 +727,7 @@ fn inspection_independence_missing_evidence_and_deadline_fail_closed() -> TestRe
     o.revision = NonZeroU32::new(2).ok_or("revision")?;
     o.correction = Some(source("fixture:known-agent")?);
     o.attribution.agent = measured(holder("independent-reviewer")?)?;
-    l.record(o)?;
+    l.record(&f.store, o)?;
     assert!(matches!(
         l.start_inspection(plan()?, at(5)),
         Err(TrustError::Refused)
@@ -412,7 +756,7 @@ fn inspection_independence_missing_evidence_and_deadline_fail_closed() -> TestRe
 fn confirmed_inspector_findings_route_once_with_exact_revision() -> TestResult {
     let f = Fixture::new()?;
     let l = ledger(&f)?;
-    l.record(with_pr(observation(&f)?)?)?;
+    l.record(&f.store, with_pr(observation(&f)?)?)?;
     l.start_inspection(plan()?, at(5))?;
     l.reserve_sample(&plan()?.id, 1, 20, at(6))?;
     let result = SampleResult::Confirmed {
@@ -446,7 +790,7 @@ fn confirmed_inspector_findings_route_once_with_exact_revision() -> TestResult {
 fn storage_corruption_and_partial_initialization_never_reset_history() -> TestResult {
     let f = Fixture::new()?;
     let l = ledger(&f)?;
-    l.record(observation(&f)?)?;
+    l.record(&f.store, observation(&f)?)?;
     let path = f.dir.path().join("trust/ledger.json");
     fs::write(&path, b"{bad")?;
     assert!(reopen(&f).is_err());
@@ -464,7 +808,7 @@ fn storage_rejects_symlinks_public_permissions_and_repository_paths() -> TestRes
     use std::os::unix::{fs::PermissionsExt, fs::symlink};
     let f = Fixture::new()?;
     let l = ledger(&f)?;
-    l.record(observation(&f)?)?;
+    l.record(&f.store, observation(&f)?)?;
     let link = f.dir.path().join("link");
     symlink(f.dir.path().join("trust"), &link)?;
     assert!(Ledger::open(link, house()?).is_err());
@@ -513,7 +857,7 @@ fn sourced_pr_and_bench_fixtures_preserve_measurements_and_reject_stale_findings
     // Exercise the adapter serialization boundary with a sanitized fixture.
     let bytes = serde_json::to_vec(&o)?;
     let decoded: Observation = serde_json::from_slice(&bytes)?;
-    l.record(decoded.clone())?;
+    l.record(&f.store, decoded.clone())?;
     assert_eq!(l.latest(&o.id)?, decoded);
     let mut correction = decoded;
     correction.revision = NonZeroU32::new(2).ok_or("revision")?;
@@ -521,7 +865,10 @@ fn sourced_pr_and_bench_fixtures_preserve_measurements_and_reject_stale_findings
     if let Measurement::Observed { value, .. } = &mut correction.pull_request {
         value.subject.head = commit('d')?;
     }
-    assert!(matches!(l.record(correction), Err(TrustError::Invalid)));
+    assert!(matches!(
+        l.record(&f.store, correction),
+        Err(TrustError::Invalid)
+    ));
     let invalid = String::from_utf8(bytes)?.replace("\"samples\":1", "\"samples\":0");
     assert!(serde_json::from_str::<Observation>(&invalid).is_err());
     Ok(())
@@ -540,11 +887,12 @@ fn concurrent_duplicate_delivery_has_one_writer_and_no_lost_history() -> TestRes
     let mut handles = Vec::new();
     for _ in 0..2 {
         let l = l.clone();
+        let store = f.store.clone();
         let o = o.clone();
         let barrier = barrier.clone();
         handles.push(thread::spawn(move || {
             barrier.wait();
-            l.record(o)
+            l.record(&store, o)
         }));
     }
     let mut inserted = 0;
@@ -564,7 +912,7 @@ fn lock_contention_is_bounded_and_interrupted_temp_write_preserves_snapshot() ->
     let f = Fixture::new()?;
     let l = ledger(&f)?;
     let o = observation(&f)?;
-    l.record(o.clone())?;
+    l.record(&f.store, o.clone())?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -583,7 +931,7 @@ fn lock_contention_is_bounded_and_interrupted_temp_write_preserves_snapshot() ->
     let mut next = o.clone();
     next.revision = NonZeroU32::new(2).ok_or("revision")?;
     next.correction = Some(source("fixture:refresh")?);
-    l.record(next.clone())?;
+    l.record(&f.store, next.clone())?;
     assert_eq!(reopen(&f)?.latest(&o.id)?, next);
     assert!(!temp.exists());
     Ok(())
@@ -596,9 +944,9 @@ fn invalid_history_budget_and_inspector_inputs_do_not_commit() -> TestResult {
     let o = observation(&f)?;
     let mut bad = o.clone();
     bad.revision = NonZeroU32::new(2).ok_or("revision")?;
-    assert!(matches!(l.record(bad), Err(TrustError::Invalid)));
+    assert!(matches!(l.record(&f.store, bad), Err(TrustError::Invalid)));
     assert!(l.history()?.is_empty());
-    l.record(o.clone())?;
+    l.record(&f.store, o.clone())?;
     assert!(matches!(
         l.start_inspection(plan()?, at(5)),
         Err(TrustError::Incomplete)
@@ -606,7 +954,7 @@ fn invalid_history_budget_and_inspector_inputs_do_not_commit() -> TestResult {
     let mut o = with_pr(o)?;
     o.revision = NonZeroU32::new(2).ok_or("revision")?;
     o.correction = Some(source("fixture:pr-attached")?);
-    l.record(o)?;
+    l.record(&f.store, o)?;
     for (samples, tokens, deadline) in [
         (0, 10, 60),
         (33, 10, 60),
@@ -710,9 +1058,9 @@ fn unknown_authority_fields_and_dangling_persisted_evidence_are_rejected() -> Te
     assert!(serde_json::from_value::<AutonomyGrant>(encoded).is_err());
     let f = Fixture::new()?;
     let l = ledger(&f)?;
-    let mut o = observation(&f)?;
-    o.mode = EvidenceMode::Live;
-    l.record(o)?;
+    let o = eligible(observation(&f)?)?;
+    l.record(&f.store, o)?;
+    bind_evidence(&l, &f)?;
     l.grant(grant()?, &grants()?)?;
     let path = f.dir.path().join("trust/ledger.json");
     let mut document: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
@@ -727,8 +1075,10 @@ fn moved_observation_stops_inspection_and_duplicate_findings_do_not_route_twice(
     let f = Fixture::new()?;
     let l = ledger(&f)?;
     let mut o = with_pr(observation(&f)?)?;
-    l.record(o.clone())?;
-    l.start_inspection(plan()?, at(5))?;
+    l.record(&f.store, o.clone())?;
+    let mut inspection_plan = plan()?;
+    inspection_plan.max_samples = 4;
+    l.start_inspection(inspection_plan, at(5))?;
     l.reserve_sample(&plan()?.id, 1, 10, at(6))?;
     let result = SampleResult::Confirmed {
         finding: kitchen::trust::Finding {
@@ -743,12 +1093,29 @@ fn moved_observation_stops_inspection_and_duplicate_findings_do_not_route_twice(
     assert!(l.finish_sample(&plan()?.id, 2, result).is_err());
     assert_eq!(l.inspection(&plan()?.id)?.follow_ups().count(), 1);
     o.revision = NonZeroU32::new(2).ok_or("revision")?;
+    o.correction = Some(source("fixture:attribution-correction")?);
+    l.record(&f.store, o.clone())?;
+    assert!(l.finish_sample(&plan()?.id, 2, SampleResult::Unavailable)?);
+    assert!(matches!(
+        l.reserve_sample(&plan()?.id, 2, 10, at(8))?,
+        SampleReservation::Existing(_)
+    ));
+    assert!(l.reserve_sample(&plan()?.id, 3, 10, at(8)).is_err());
+    let mut next_inspection = plan()?;
+    next_inspection.id = source("fixture:inspection-after-correction")?;
+    l.start_inspection(next_inspection.clone(), at(8))?;
+    l.reserve_sample(&next_inspection.id, 1, 10, at(9))?;
+    o.revision = NonZeroU32::new(3).ok_or("revision")?;
     o.correction = Some(source("fixture:new-head")?);
-    l.record(o)?;
+    if let Measurement::Observed { value, .. } = &mut o.pull_request {
+        value.subject.head = commit('c')?;
+    }
+    l.record(&f.store, o)?;
+    assert!(l.finish_sample(&next_inspection.id, 1, SampleResult::Unavailable)?);
     assert!(
-        l.finish_sample(&plan()?.id, 2, SampleResult::Unavailable)
+        l.reserve_sample(&next_inspection.id, 2, 10, at(10))
             .is_err()
     );
-    assert!(l.reserve_sample(&plan()?.id, 2, 10, at(8)).is_err());
+    assert!(l.reserve_sample(&plan()?.id, 4, 10, at(9)).is_err());
     Ok(())
 }

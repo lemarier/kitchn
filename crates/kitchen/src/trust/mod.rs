@@ -17,5 +17,5 @@ mod store;
 pub use error::TrustError;
 pub use model::*;
 pub use store::EARNED_AUTONOMY_PERMISSIONS;
-pub use store::Ledger;
+pub use store::{Capacity, Ledger};
 pub(crate) use store::{Document, store_error};

@@ -246,6 +246,13 @@ impl<S: Snapshot> SnapshotStore<S> {
         Ok(view(&state))
     }
 
+    /// Like [`Self::read`], also passing the stored snapshot's size in bytes.
+    pub(crate) fn read_sized<T>(&self, view: impl FnOnce(&S, u64) -> T) -> Result<T, S::Error> {
+        let _lock = self.lock(false, false)?;
+        let (state, bytes) = self.load()?.ok_or(StateError::StateMissing)?;
+        Ok(view(&state, u64::try_from(bytes.len()).unwrap_or(u64::MAX)))
+    }
+
     fn read_marker(&self) -> Result<StoreMarker, S::Error> {
         let path = self.dir.join(self.layout.marker);
         let bytes = match fs::read(&path) {

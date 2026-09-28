@@ -3125,3 +3125,95 @@ fn a_clock_running_backwards_cannot_reserve() -> TestResult {
     assert_corrupt(try_open(&f)?, "reservation before its predecessor");
     Ok(())
 }
+
+#[test]
+fn capacity_reports_entries_and_bytes_before_writes_stop() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let empty = l.capacity()?;
+    assert_eq!((empty.entries, empty.max_entries), (0, 4096));
+    assert_eq!(empty.bytes, fs::metadata(ledger_path(&f))?.len());
+    assert_eq!(empty.max_bytes, ORDINARY_LIMIT);
+    assert!(!empty.near_limit());
+
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    issue(&l, &grants()?)?;
+    let used = l.capacity()?;
+    assert_eq!(used.entries, 3);
+    assert_eq!(used.bytes, fs::metadata(ledger_path(&f))?.len());
+
+    // Grow to the last free entry: the warning is on and one write remains.
+    tamper(&f, |d| {
+        let audits = d["grants"].as_array_mut().ok_or("grants")?;
+        let original = audits.first().cloned().ok_or("grant")?;
+        for index in 1..4093 {
+            let mut additional = original.clone();
+            let id = serde_json::json!(format!("fixture:grant-{index}"));
+            additional["proposal"]["id"] = id.clone();
+            additional["id"] = id;
+            audits.push(additional);
+        }
+        Ok(())
+    })?;
+    let almost = l.capacity()?;
+    assert_eq!(almost.entries, 4095);
+    assert!(almost.near_limit());
+    assert!(try_bind_extra(&l)??);
+    assert_eq!(l.capacity()?.entries, 4096);
+    let mut another = spec("another")?;
+    another.repository = Some(scope()?.project);
+    assert!(matches!(
+        l.bind_task(
+            &another,
+            scope()?,
+            Text::new("fixture-model-v1")?,
+            source("fixture:another-binding")?
+        ),
+        Err(TrustError::Exhausted)
+    ));
+    // Revocation still succeeds at the entry limit.
+    assert!(revoke(&l)?);
+    assert_eq!(l.capacity()?.entries, 4096);
+    Ok(())
+}
+
+#[test]
+fn capacity_warns_at_eighty_percent_of_either_limit() {
+    use kitchen::trust::Capacity;
+    let at = |entries, bytes| Capacity {
+        entries,
+        max_entries: 4096,
+        bytes,
+        max_bytes: 1000,
+    };
+    assert_eq!(Capacity::WARNING_PERCENT, 80);
+    // 80 % of 4096 entries is 3276.8.
+    assert!(!at(3276, 0).near_limit());
+    assert!(at(3277, 0).near_limit());
+    assert!(!at(0, 799).near_limit());
+    assert!(at(0, 800).near_limit());
+    assert!(at(4096, 1000).near_limit());
+    let unbounded = Capacity {
+        entries: usize::MAX,
+        max_entries: usize::MAX,
+        bytes: u64::MAX,
+        max_bytes: u64::MAX,
+    };
+    assert!(unbounded.near_limit());
+}
+
+#[test]
+fn capacity_of_a_corrupt_ledger_is_an_error() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, observation(&f)?)?;
+    tamper(&f, |d| append_clone(d, "observations"))?;
+    assert_corrupt(l.capacity(), "duplicate observation");
+    fs::remove_file(ledger_path(&f))?;
+    assert!(matches!(
+        l.capacity(),
+        Err(TrustError::Storage(StateError::StateMissing))
+    ));
+    Ok(())
+}

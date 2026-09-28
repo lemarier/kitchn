@@ -238,7 +238,7 @@ pub const ROGER_ASK: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 pub const ROGER_REQUESTER: &str = "kitchen-roger";
 
 /// A Roger stand-in that acknowledges every Ask as [`ROGER_ASK`]. It never
-/// answers; answers are sanitized fixtures from [`roger_answer`].
+/// answers; [`roger_client`] reads sanitized [`roger_answer`] fixtures.
 pub struct AckRoger(BackendDescriptor);
 
 impl AckRoger {
@@ -292,6 +292,52 @@ pub fn roger_scope(
         kitchen::integrations::github::PostingBudget::new(3)?,
         [Permission::AskHuman],
     )?)
+}
+
+/// Roger as the house's Roger client reads it: every `get` returns `reply`
+/// and records the Ask id it was asked for.
+pub struct RogerReply {
+    reply: Result<Vec<u8>, kitchen::integrations::github::IntegrationError>,
+    asked: RogerReads,
+}
+
+/// Ask ids a [`RogerReply`] was read for, in order.
+pub type RogerReads = std::rc::Rc<std::cell::RefCell<Vec<kitchen::contracts::ExternalRef>>>;
+
+impl kitchen::integrations::roger::RogerReadTransport for RogerReply {
+    fn get(
+        &self,
+        _: &kitchen::integrations::github::CredentialRef,
+        ask: &kitchen::contracts::ExternalRef,
+        _: Duration,
+        _: usize,
+    ) -> Result<Vec<u8>, kitchen::integrations::github::IntegrationError> {
+        self.asked.borrow_mut().push(ask.clone());
+        self.reply.clone()
+    }
+}
+
+/// The house's Roger client for `repository`, reading `reply` from Roger,
+/// and the Ask ids it reads.
+pub fn roger_client(
+    repository: &kitchen::contracts::Repository,
+    reply: Result<Vec<u8>, kitchen::integrations::github::IntegrationError>,
+) -> TestResult<(
+    kitchen::integrations::roger::RogerClient<RogerReply>,
+    RogerReads,
+)> {
+    let asked = RogerReads::default();
+    Ok((
+        kitchen::integrations::roger::RogerClient::new(
+            roger_scope(repository)?,
+            RogerReply {
+                reply,
+                asked: asked.clone(),
+            },
+            kitchen::integrations::github::ReadLimits::default(),
+        ),
+        asked,
+    ))
 }
 
 /// A running task that may ask a person about `repository`, with its

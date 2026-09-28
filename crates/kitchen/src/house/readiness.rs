@@ -14,10 +14,9 @@ use crate::{
     },
     integrations::{
         github::{
-            CheckConclusion, CheckRun, CheckStatus, CommitStatus, HouseScope, RequiredChecks,
-            StatusState,
+            CheckConclusion, CheckRun, CheckStatus, CommitStatus, RequiredChecks, StatusState,
         },
-        roger::{DecisionStatus, validate_answer},
+        roger::{DecisionStatus, RogerClient, RogerReadTransport},
     },
     state::{EffectState, HouseStore},
 };
@@ -800,25 +799,27 @@ pub fn below_readiness_ask(
 /// Verify an owner's approval of a below-readiness merge from the house
 /// store. The task must hold a Roger approval Ask for exactly this house,
 /// pull request, head, base, work type, levels, and reason, and Roger must
-/// have acknowledged it. `answer` is the Roger reply read for that Ask; it
-/// counts only as an explicit, passkey-confirmed approval of the persisted
-/// binding under the house's Roger scope. The decider is whoever holds that
-/// house's Roger approval; nothing the caller states identifies them.
+/// have acknowledged it. The answer is read here from `roger` for the
+/// persisted Ask id, never supplied by the caller, and counts only as an
+/// explicit, passkey-confirmed approval of the persisted binding under the
+/// house's Roger scope. The decider is whoever holds that house's Roger
+/// approval; nothing the caller states identifies them.
 ///
 /// # Errors
 /// Returns the [`below_readiness_ask`] refusals,
 /// [`HouseError::DecisionRecord`] when the task cannot be read from this
 /// house's store, and [`HouseError::ReadinessNotApproved`] when no matching
-/// Ask was persisted and acknowledged or the answer does not approve it.
-pub fn accept_below_readiness(
+/// Ask was persisted and acknowledged, Roger cannot be read, or its answer
+/// does not approve the Ask.
+pub fn accept_below_readiness<T: RogerReadTransport>(
     house: &HouseConfig,
     readiness: &RepositoryReadiness,
     request: &BelowReadinessRequest,
     store: &HouseStore,
     task: &TaskId,
-    scope: &HouseScope,
-    answer: &[u8],
+    roger: &RogerClient<T>,
 ) -> Result<BelowReadinessDecision, HouseError> {
+    let scope = roger.scope();
     let (assessed, required) = shortfall(house, readiness, request)?;
     if store.house() != &house.house {
         return Err(HouseError::HouseSelection);
@@ -855,7 +856,7 @@ pub fn accept_below_readiness(
                 .then(|| (binding, receipt.reference()))
         })
         .ok_or(HouseError::ReadinessNotApproved)?;
-    match validate_answer(scope, binding, ask, answer) {
+    match roger.poll(binding, ask) {
         Ok(DecisionStatus::Approved) => Ok(BelowReadinessDecision {
             house: house.house.clone(),
             task: task.clone(),

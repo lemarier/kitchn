@@ -6,8 +6,8 @@ use kitchen::{
     ErrorClass,
     adoption::HouseRegistry,
     contracts::{
-        AskKind, CommitId, DecisionOwner, EvidenceSubject, Grant, GrantScope, IssueNumber,
-        Permission, Repository, RogerAsk, Text,
+        AskKind, CommitId, DecisionOwner, EvidenceSubject, ExternalRef, Grant, GrantScope,
+        IssueNumber, Permission, Repository, RogerAsk, Text,
     },
     house::{
         AccessStatus, Assessed, BelowReadinessDecision, BelowReadinessRequest, CheckHistory,
@@ -17,8 +17,8 @@ use kitchen::{
         required_check_apps, required_check_names,
     },
     integrations::github::{
-        CheckApp, CheckConclusion, CheckRun, CheckStatus, CommitStatus, RequiredCheck,
-        RequiredChecks, StatusState,
+        CheckApp, CheckConclusion, CheckRun, CheckStatus, CommitStatus, IntegrationError,
+        RequiredCheck, RequiredChecks, StatusState,
     },
     state::EffectState,
 };
@@ -728,13 +728,25 @@ fn asked(house: &HouseConfig, reason: &str) -> TestResult<Asked> {
 }
 
 impl Asked {
+    /// Accept `request` while Roger reports `reply` for the persisted Ask.
     fn accept(
         &self,
         house: &HouseConfig,
         request: &BelowReadinessRequest,
-        answer: &[u8],
+        reply: &[u8],
     ) -> Result<BelowReadinessDecision, HouseError> {
-        let scope = common::roger_scope(&request.subject.repository)
+        self.accept_reading(house, request, Ok(reply.to_vec()))
+            .map(|(decision, _)| decision)
+    }
+    /// Accept `request` while Roger returns `reply`; also returns the Ask
+    /// ids the Roger client read.
+    fn accept_reading(
+        &self,
+        house: &HouseConfig,
+        request: &BelowReadinessRequest,
+        reply: Result<Vec<u8>, IntegrationError>,
+    ) -> Result<(BelowReadinessDecision, common::RogerReads), HouseError> {
+        let (roger, reads) = common::roger_client(&request.subject.repository, reply)
             .map_err(|_| HouseError::InvalidInput)?;
         accept_below_readiness(
             house,
@@ -742,9 +754,9 @@ impl Asked {
             request,
             &self.fixture.store,
             &self.task,
-            &scope,
-            answer,
+            &roger,
         )
+        .map(|decision| (decision, reads))
     }
 }
 
@@ -813,7 +825,16 @@ fn persisted_owner_approval_clears_one_pull_request_and_records_the_reason() -> 
     let reason = "Bench runs weekly by hand";
     let asked = asked(&house, reason)?;
     let request = request(&house, "firmware", reason)?;
-    let decision = asked.accept(&house, &request, &common::roger_answer(&asked.ask, true)?)?;
+    let (decision, reads) = asked.accept_reading(
+        &house,
+        &request,
+        Ok(common::roger_answer(&asked.ask, true)?),
+    )?;
+    // The approval was read from Roger for the persisted Ask id.
+    assert_eq!(
+        reads.borrow().as_slice(),
+        [ExternalRef::new(common::ROGER_ASK)?]
+    );
     assert_eq!(decision.reason().as_str(), reason);
     assert_eq!(decision.ask().as_str(), common::ROGER_ASK);
     assert_eq!(decision.task(), &asked.task);
@@ -905,18 +926,10 @@ fn forged_or_unapproved_decisions_are_refused() -> TestResult {
         &subject.head,
         &subject.base,
     )?;
-    let scope = common::roger_scope(&subject.repository)?;
+    let (roger, reads) = common::roger_client(&subject.repository, Ok(approved))?;
     let readiness = checked_only(&house)?;
     assert!(matches!(
-        accept_below_readiness(
-            &house,
-            &readiness,
-            &request,
-            &fixture.store,
-            &bare,
-            &scope,
-            &approved
-        ),
+        accept_below_readiness(&house, &readiness, &request, &fixture.store, &bare, &roger),
         Err(HouseError::ReadinessNotApproved)
     ));
     let missing = accept_below_readiness(
@@ -925,13 +938,43 @@ fn forged_or_unapproved_decisions_are_refused() -> TestResult {
         &request,
         &fixture.store,
         &kitchen::TaskId::new("gate-9")?,
-        &scope,
-        &approved,
+        &roger,
     );
+    // Neither reached Roger.
+    assert!(reads.borrow().is_empty());
     assert!(matches!(missing, Err(HouseError::DecisionRecord)));
     assert_eq!(
         missing.err().map(|error| error.class()),
         Some(ErrorClass::Execution)
     );
+    Ok(())
+}
+
+#[test]
+fn approval_is_read_from_roger_not_supplied_by_the_caller() -> TestResult {
+    let (house, _) = merge_house()?;
+    let reason = "Bench runs weekly by hand";
+    let asked = asked(&house, reason)?;
+    let request = request(&house, "firmware", reason)?;
+    // The caller holds an approval that matches the persisted Ask exactly,
+    // but Roger still reports the Ask open: there is no way to pass the
+    // fabricated bytes in, and Roger's own reply is not an approval.
+    let fabricated = common::roger_answer(&asked.ask, true)?;
+    let mut open: serde_json::Value = serde_json::from_slice(&fabricated)?;
+    open["state"] = "open".into();
+    open["answer"] = serde_json::Value::Null;
+    let refused = asked.accept_reading(&house, &request, Ok(serde_json::to_vec(&open)?));
+    assert!(matches!(refused, Err(HouseError::ReadinessNotApproved)));
+    // Roger unreachable or over its time limit is not an approval.
+    for failure in [IntegrationError::Unavailable, IntegrationError::Timeout] {
+        assert!(matches!(
+            asked.accept_reading(&house, &request, Err(failure)),
+            Err(HouseError::ReadinessNotApproved)
+        ));
+    }
+    // Once Roger itself reports the passkey approval, it is accepted.
+    let (decision, reads) = asked.accept_reading(&house, &request, Ok(fabricated))?;
+    assert_eq!(decision.ask().as_str(), common::ROGER_ASK);
+    assert_eq!(reads.borrow().len(), 1);
     Ok(())
 }

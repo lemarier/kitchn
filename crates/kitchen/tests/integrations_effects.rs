@@ -4,8 +4,10 @@ use common::{Fixture, ManualClock, TestResult, at, creator, house, plan, schedul
 use kitchen::{
     BackendId, CredentialId, Error, HouseId, TaskId,
     contracts::*,
+    house::MergeSubject,
     integrations::{github::*, roger::*},
     state::{EffectRecord, EffectState, HouseStore, StateError, run_effect},
+    workflows::gate::MergeGrant,
 };
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, time::Duration};
@@ -30,6 +32,8 @@ struct Remote {
     calls: Vec<(String, Value)>,
     fault: Option<Fault>,
     read_failure: bool,
+    /// GitHub reads served, including failed ones.
+    reads: std::cell::Cell<usize>,
     asks: BTreeMap<String, Value>,
     hide_lookup: bool,
 }
@@ -65,6 +69,7 @@ impl GitHubReadTransport for Provider {
         _: usize,
     ) -> Result<Vec<u8>, IntegrationError> {
         let remote = self.remote.borrow();
+        remote.reads.set(remote.reads.get() + 1);
         if remote.read_failure {
             return Err(IntegrationError::Unavailable);
         }
@@ -1276,6 +1281,60 @@ fn merge(head: &str, base: Option<&str>) -> TestResult<GitHubAction> {
     })
 }
 
+/// A persisted merge effect built without [`GitHubExecutor::effect`].
+fn unchecked_merge(scope: &HouseScope, base: Option<&str>) -> TestResult<GitHubEffect> {
+    Ok(GitHubEffect {
+        requester: scope.requester().clone(),
+        mutation: mutation(merge(HEAD, base)?)?,
+        posting_budget: scope.budget(),
+    })
+}
+
+/// Pull request 1 at [`HEAD`] and [`BASE`].
+fn merge_subject() -> TestResult<MergeSubject> {
+    Ok(MergeSubject {
+        repository: Repository::new("sample/project")?,
+        number: IssueNumber::new(1)?,
+        head: commit(HEAD)?,
+        base: commit(BASE)?,
+    })
+}
+
+/// Authority of a house with a standing merge grant for `sample/project`
+/// on `github`, the given readiness policy, and no readiness assessment.
+fn merge_authority(
+    policy: &[(&str, kitchen::house::ReadinessLevel)],
+) -> TestResult<kitchen::house::IssuedAuthority> {
+    let mut config: kitchen::house::HouseConfig =
+        serde_json::from_str(include_str!("fixtures/house/origin89.json"))?;
+    let repository = Repository::new("sample/project")?;
+    let merge = Grant::repository(
+        Permission::Merge,
+        repository.clone(),
+        BackendId::new("github")?,
+        CredentialId::new("sample-credential")?,
+    );
+    config.house = house()?;
+    config.repositories = [repository.clone()].into();
+    config.posting_destinations = [repository].into();
+    config.grants = [merge.clone()].into();
+    config.policy_limits = [merge].into();
+    for (work_type, level) in policy {
+        config.merge_readiness.insert(Text::new(work_type)?, *level);
+    }
+    Ok(config.issue_authority(&[], &[])?)
+}
+
+/// The readiness-checked grant to merge [`merge_subject`], from a house
+/// without a readiness policy.
+fn granted() -> TestResult<MergeGrant> {
+    Ok(MergeGrant::resolve(
+        &merge_authority(&[])?,
+        &merge_subject()?,
+        &BackendId::new("github")?,
+    )?)
+}
+
 fn open_pull_request(head: &str, base_ref: &str) -> Value {
     json!({"number":1,"merged":false,"head":{"sha":head},"base":{"ref":base_ref}})
 }
@@ -1321,7 +1380,8 @@ fn squash_merge_is_exact_head_and_reconciles_lost_response() -> TestResult {
         scope.clone(),
         provider(&fixture, &task, remote.clone())?,
         ReadLimits::default(),
-    );
+    )
+    .with_merge_grant(granted()?);
     let effect = backend.effect(mutation(merge(HEAD, Some(BASE))?)?)?;
     assert_eq!(effect.required_permission(), Permission::Merge);
     let first = run_effect(
@@ -1337,7 +1397,8 @@ fn squash_merge_is_exact_head_and_reconciles_lost_response() -> TestResult {
         scope,
         provider(&fixture, &task, remote.clone())?,
         ReadLimits::default(),
-    );
+    )
+    .with_merge_grant(granted()?);
     let reconciled = kitchen::state::reconcile(
         &fixture.reopen()?,
         &restarted,
@@ -1366,7 +1427,8 @@ fn squash_merge_rejects_retargeted_base_branch_before_submission() -> TestResult
         scope,
         provider(&fixture, &task, remote.clone())?,
         ReadLimits::default(),
-    );
+    )
+    .with_merge_grant(granted()?);
     let effect = backend.effect(mutation(merge(HEAD, Some(BASE))?)?)?;
     let record = run_effect(
         &fixture.store,
@@ -1394,7 +1456,8 @@ fn squash_merge_rejects_pull_request_head_that_moved_after_evidence() -> TestRes
         scope,
         provider(&fixture, &task, remote.clone())?,
         ReadLimits::default(),
-    );
+    )
+    .with_merge_grant(granted()?);
     let effect = backend.effect(mutation(merge(HEAD, Some(BASE))?)?)?;
     let record = run_effect(
         &fixture.store,
@@ -1421,7 +1484,8 @@ fn merge_is_admitted_only_at_the_tasks_evidence_subject() -> TestResult {
         scope,
         provider(&fixture, &task, remote.clone())?,
         ReadLimits::default(),
-    );
+    )
+    .with_merge_grant(granted()?);
     let clock = ManualClock::starting_at(1);
     let attempt = |name: &str,
                    action: GitHubAction,
@@ -1456,8 +1520,12 @@ fn merge_is_admitted_only_at_the_tasks_evidence_subject() -> TestResult {
     refused("moved-head", merge(HEAD, Some(BASE))?, evidence)?;
     let evidence = record_subject(&fixture, &task, fence, HEAD, Some(MOVED))?;
     refused("moved-base", merge(HEAD, Some(BASE))?, evidence)?;
-    let evidence = record_subject(&fixture, &task, fence, HEAD, Some(BASE))?;
-    refused("base-omitted", merge(HEAD, None)?, evidence)?;
+    // A merge grant always names a base commit, so a baseless merge is
+    // refused before a plan exists.
+    assert_eq!(
+        backend.effect(mutation(merge(HEAD, None)?)?),
+        Err(IntegrationError::PermissionDenied)
+    );
     let evidence = record_subject(&fixture, &task, fence, HEAD, None)?;
     refused("base-unseen", merge(HEAD, Some(BASE))?, evidence)?;
     // A refused merge leaves no persisted intent and GitHub saw no request.
@@ -1472,7 +1540,7 @@ fn merge_is_admitted_only_at_the_tasks_evidence_subject() -> TestResult {
 }
 
 #[test]
-fn merge_of_a_subject_without_a_base_names_no_base_commit() -> TestResult {
+fn merge_of_a_subject_without_a_base_is_not_granted() -> TestResult {
     let fixture = Fixture::new()?;
     let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::Merge], "github")?;
     let revision = record_subject(&fixture, &task, fence, HEAD, None)?;
@@ -1482,20 +1550,110 @@ fn merge_of_a_subject_without_a_base_names_no_base_commit() -> TestResult {
     }));
     let backend = GitHubExecutor::new(
         BackendId::new("github")?,
-        scope,
+        scope.clone(),
         provider(&fixture, &task, remote.clone())?,
         ReadLimits::default(),
+    )
+    .with_merge_grant(granted()?);
+    assert_eq!(
+        backend.effect(mutation(merge(HEAD, None)?)?),
+        Err(IntegrationError::PermissionDenied)
     );
-    let effect = backend.effect(mutation(merge(HEAD, None)?)?)?;
-    let merged = run_effect(
+    // Persisted without the executor's admission, it is still refused.
+    let record = run_effect(
         &fixture.store,
         &backend,
         &grants,
-        plan_at(&task, fence, "merge", effect, revision)?,
+        plan_at(
+            &task,
+            fence,
+            "merge",
+            unchecked_merge(&scope, None)?,
+            revision,
+        )?,
         &ManualClock::starting_at(1),
     )?;
+    assert!(matches!(record.state(), EffectState::NotApplied { .. }));
+    assert_eq!(remote.borrow().reads.get(), 0);
+    assert!(remote.borrow().calls.is_empty());
+    Ok(())
+}
+
+#[test]
+fn merge_below_readiness_is_refused_on_the_generic_executor_path() -> TestResult {
+    use kitchen::house::{HouseError, ReadinessLevel};
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) = setup(&fixture, 3, &[Permission::Merge], "github")?;
+    let revision = record_subject(&fixture, &task, fence, HEAD, Some(BASE))?;
+    let remote = Rc::new(RefCell::new(Remote {
+        pull_request: Some(open_pull_request(HEAD, "main")),
+        ..Remote::default()
+    }));
+    // The house holds a standing merge grant, but firmware work is below
+    // policy and no owner approved this pull request: no grant resolves.
+    let below = merge_authority(&[("firmware", ReadinessLevel::Covered)])?;
+    assert!(matches!(
+        MergeGrant::resolve(&below, &merge_subject()?, &BackendId::new("github")?),
+        Err(HouseError::BelowReadiness { .. })
+    ));
+    let clock = ManualClock::starting_at(1);
+    let attempt = |name: &str, backend: &GitHubExecutor<Provider>| {
+        run_effect(
+            &fixture.store,
+            backend,
+            &grants,
+            plan_at(
+                &task,
+                fence,
+                name,
+                unchecked_merge(&scope, Some(BASE))?,
+                revision,
+            )?,
+            &clock,
+        )
+        .map_err(Into::<Box<dyn std::error::Error>>::into)
+    };
+    let executor = |grant: MergeGrant| -> TestResult<GitHubExecutor<Provider>> {
+        Ok(GitHubExecutor::new(
+            BackendId::new("github")?,
+            scope.clone(),
+            provider(&fixture, &task, remote.clone())?,
+            ReadLimits::default(),
+        )
+        .with_merge_grant(grant))
+    };
+    // Without a grant, or with one for another head, neither admission nor
+    // execution of an independently persisted merge reaches GitHub.
+    let mut moved = merge_subject()?;
+    moved.head = commit(MOVED)?;
+    let other = MergeGrant::resolve(&merge_authority(&[])?, &moved, &BackendId::new("github")?)?;
+    for (name, grant) in [("ungranted", MergeGrant::none()), ("other-head", other)] {
+        let backend = executor(grant)?;
+        assert_eq!(
+            backend.effect(mutation(merge(HEAD, Some(BASE))?)?),
+            Err(IntegrationError::PermissionDenied)
+        );
+        let record = attempt(name, &backend)?;
+        assert!(
+            matches!(
+                record.state(),
+                EffectState::NotApplied {
+                    reason: NotAppliedReason::Rejected,
+                    ..
+                }
+            ),
+            "{name}: {:?}",
+            record.state()
+        );
+    }
+    assert_eq!(remote.borrow().reads.get(), 0);
+    assert!(remote.borrow().calls.is_empty());
+    // The same house at the required level merges through the same path.
+    let backend = executor(granted()?)?;
+    let merged = attempt("granted", &backend)?;
     assert!(matches!(merged.state(), EffectState::Applied { .. }));
     assert_eq!(remote.borrow().calls.len(), 1);
+    assert_eq!(remote.borrow().calls[0].1["sha"], HEAD);
     Ok(())
 }
 
@@ -1519,7 +1677,8 @@ fn merge_reconciliation_clears_a_moved_head_but_not_an_unchanged_one() -> TestRe
         scope,
         provider(&fixture, &task, remote.clone())?,
         ReadLimits::default(),
-    );
+    )
+    .with_merge_grant(granted()?);
     let clock = ManualClock::starting_at(1);
     let lost = run_effect(
         &fixture.store,

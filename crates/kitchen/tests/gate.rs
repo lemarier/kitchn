@@ -3350,14 +3350,15 @@ fn owner_approval_persisted_in_the_house_store_lets_a_below_level_merge_through(
     )?;
     let ask = kitchen::house::below_readiness_ask(&config, &checked, &request, &task, revision)?;
     common::persist_ask(&fixture, &task, fence, &grants, ask.clone())?;
+    let (roger, _) =
+        common::roger_client(&subject.repository, Ok(common::roger_answer(&ask, true)?))?;
     let decision = kitchen::house::accept_below_readiness(
         &config,
         &checked,
         &request,
         &fixture.store,
         &task,
-        &common::roger_scope(&subject.repository)?,
-        &common::roger_answer(&ask, true)?,
+        &roger,
     )?;
     let issued = config.issue_authority(
         std::slice::from_ref(&checked),

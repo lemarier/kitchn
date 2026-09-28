@@ -3,7 +3,7 @@
 use super::{CredentialRef, HouseScope, IntegrationError, IssueNumber, evidence::*};
 use crate::{
     HouseId,
-    contracts::{CommitId, Repository},
+    contracts::{CommitId, Repository, Timestamp},
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -199,7 +199,13 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
                 if let Some(source) = event.source.and_then(|v| v.issue)
                     && source.pull_request.is_some()
                 {
-                    self.scope.authorize_read(house, &source.repository_url)?;
+                    if self
+                        .scope
+                        .authorize_read(house, &source.repository_url)
+                        .is_err()
+                    {
+                        continue;
+                    }
                     refs.insert((source.repository_url, source.number.get()));
                     if refs.len() > 100 {
                         return Err(IntegrationError::LimitExceeded);
@@ -291,7 +297,38 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
     }
     /// Read all issue pages (pull requests are excluded).
     pub fn issues(&self, house: &HouseId, repo: &Repository) -> Observation<Vec<Issue>> {
-        match self.pages::<Issue>(house, repo, "issues?state=all", None, true) {
+        self.issues_filtered(house, repo, None, None)
+    }
+    /// Read issue inventory with optional state and updated-since filters.
+    pub fn issues_filtered(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        state: Option<IssueState>,
+        since: Option<Timestamp>,
+    ) -> Observation<Vec<Issue>> {
+        let mut endpoint = format!(
+            "issues?state={}",
+            match state {
+                Some(IssueState::Open) => "open",
+                Some(IssueState::Closed) => "closed",
+                Some(IssueState::Unknown) =>
+                    return Observation::Unavailable(IntegrationError::InvalidInput),
+                None => "all",
+            }
+        );
+        if let Some(since) = since {
+            let nanos = i128::from(since.as_unix_millis()) * 1_000_000;
+            let Ok(date) = time::OffsetDateTime::from_unix_timestamp_nanos(nanos) else {
+                return Observation::Unavailable(IntegrationError::InvalidInput);
+            };
+            let Ok(value) = date.format(&time::format_description::well_known::Rfc3339) else {
+                return Observation::Unavailable(IntegrationError::InvalidInput);
+            };
+            endpoint.push_str("&since=");
+            endpoint.push_str(&value);
+        }
+        match self.pages::<Issue>(house, repo, &endpoint, None, true) {
             Observation::Known(issues) if issues.iter().any(|issue| &issue.repository != repo) => {
                 Observation::Unknown
             }
@@ -451,9 +488,19 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
     ) -> Observation<RequiredChecks> {
         if branch.is_empty()
             || branch.len() > 255
-            || !branch
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-._/".contains(&b))
+            || branch.starts_with('/')
+            || branch.ends_with('/')
+            || branch.split('/').any(|part| {
+                part.is_empty()
+                    || part == "."
+                    || part == ".."
+                    || part.contains("..")
+                    || part.starts_with('.')
+                    || part.ends_with('.')
+                    || !part
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+            })
         {
             return Observation::Unavailable(IntegrationError::InvalidInput);
         }

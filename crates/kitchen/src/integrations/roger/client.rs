@@ -130,24 +130,11 @@ impl RogerCli {
             },
         )
     }
-    /// Configure bounded Roger calls. No network request occurs here.
-    ///
-    /// # Errors
-    /// Requires an absolute binary path and a valid Ask id.
-    pub fn new(
-        executable: PathBuf,
-        credential: CredentialFile,
-        probe: ExternalRef,
-    ) -> Result<Self, IntegrationError> {
-        let _ = (executable, credential, probe);
-        // No implicit deployment may receive a house credential.
-        Err(IntegrationError::InvalidInput)
-    }
     /// Configure a house-selected HTTPS deployment.
     ///
     /// # Errors
     /// Refuses malformed endpoints and unsupported CLI installations.
-    pub fn new_with_url(
+    pub fn new(
         executable: PathBuf,
         credential: CredentialFile,
         probe: ExternalRef,

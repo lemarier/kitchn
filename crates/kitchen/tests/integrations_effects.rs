@@ -946,7 +946,9 @@ fn squash_merge_is_exact_head_and_reconciles_lost_response() -> TestResult {
     let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::Merge], "github")?;
     let head = CommitId::new("1111111111111111111111111111111111111111")?;
     let remote = Rc::new(RefCell::new(Remote {
-        pull_request: Some(json!({"number":1,"merged":false,"head":{"sha":head.as_str()}})),
+        pull_request: Some(
+            json!({"number":1,"merged":false,"head":{"sha":head.as_str()},"base":{"ref":"main"}}),
+        ),
         fault: Some(Fault::LoseAfterApply),
         ..Remote::default()
     }));
@@ -959,6 +961,7 @@ fn squash_merge_is_exact_head_and_reconciles_lost_response() -> TestResult {
     let effect = backend.effect(mutation(GitHubAction::MergePullRequest {
         number: IssueNumber::new(1)?,
         expected_head: head.clone(),
+        expected_base: "main".into(),
         method: MergeMethod::Squash,
     })?)?;
     assert_eq!(effect.required_permission(), Permission::Merge);
@@ -990,13 +993,48 @@ fn squash_merge_is_exact_head_and_reconciles_lost_response() -> TestResult {
 }
 
 #[test]
+fn squash_merge_rejects_moved_base_before_submission() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::Merge], "github")?;
+    let head = CommitId::new("1111111111111111111111111111111111111111")?;
+    let remote = Rc::new(RefCell::new(Remote {
+        pull_request: Some(
+            json!({"number":1,"merged":false,"head":{"sha":head.as_str()},"base":{"ref":"release"}}),
+        ),
+        ..Remote::default()
+    }));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let effect = backend.effect(mutation(GitHubAction::MergePullRequest {
+        number: IssueNumber::new(1)?,
+        expected_head: head,
+        expected_base: "main".into(),
+        method: MergeMethod::Squash,
+    })?)?;
+    let record = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "merge-base", effect)?,
+        &ManualClock::starting_at(1),
+    )?;
+    assert!(matches!(record.state(), EffectState::NotApplied { .. }));
+    assert!(remote.borrow().calls.is_empty());
+    Ok(())
+}
+
+#[test]
 fn squash_merge_rejects_moved_head_before_submission() -> TestResult {
     let fixture = Fixture::new()?;
     let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::Merge], "github")?;
     let expected = CommitId::new("1111111111111111111111111111111111111111")?;
     let remote = Rc::new(RefCell::new(Remote {
         pull_request: Some(
-            json!({"number":1,"merged":false,"head":{"sha":"2222222222222222222222222222222222222222"}}),
+            json!({"number":1,"merged":false,"head":{"sha":"2222222222222222222222222222222222222222"},"base":{"ref":"main"}}),
         ),
         ..Remote::default()
     }));
@@ -1009,6 +1047,7 @@ fn squash_merge_rejects_moved_head_before_submission() -> TestResult {
     let effect = backend.effect(mutation(GitHubAction::MergePullRequest {
         number: IssueNumber::new(1)?,
         expected_head: expected,
+        expected_base: "main".into(),
         method: MergeMethod::Squash,
     })?)?;
     let record = run_effect(

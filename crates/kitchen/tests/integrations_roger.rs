@@ -279,11 +279,7 @@ esac
     let credential = CredentialFile::new(scope.credential().clone(), token_path)?;
     let probe = ExternalRef::new("01ARZ3NDEKTSV4RRFFQ69G5FAV")?;
     assert!(matches!(
-        RogerCli::new(executable.clone(), credential.clone(), probe.clone()),
-        Err(IntegrationError::InvalidInput)
-    ));
-    assert!(matches!(
-        RogerCli::new_with_url(
+        RogerCli::new(
             executable.clone(),
             credential.clone(),
             probe.clone(),
@@ -291,7 +287,31 @@ esac
         ),
         Err(IntegrationError::InvalidInput)
     ));
-    let cli = RogerCli::new_with_url(
+    for url in [
+        "https://user@roger.example.test",
+        "https://roger.example.test/path",
+        "https://roger.example.test?query",
+        "https://roger.example.test:0",
+        "https://roger.example.test:65536",
+        "https://roger.example.test:no",
+        "https://-bad.test",
+        "https://bad-.test",
+        "https://",
+    ] {
+        assert!(
+            matches!(
+                RogerCli::new(
+                    executable.clone(),
+                    credential.clone(),
+                    probe.clone(),
+                    url.into()
+                ),
+                Err(IntegrationError::InvalidInput)
+            ),
+            "{url}"
+        );
+    }
+    let cli = RogerCli::new(
         executable,
         credential,
         probe.clone(),
@@ -329,7 +349,7 @@ esac
     std::fs::set_permissions(&wrong_binary, std::fs::Permissions::from_mode(0o700))?;
     let wrong_credential =
         CredentialFile::new(scope.credential().clone(), directory.path().join("token"))?;
-    let wrong = RogerCli::new_with_url(
+    let wrong = RogerCli::new(
         wrong_binary,
         wrong_credential,
         ExternalRef::new("01ARZ3NDEKTSV4RRFFQ69G5FAV")?,

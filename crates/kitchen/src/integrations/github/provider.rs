@@ -93,9 +93,6 @@ impl GitHubMutationTransport for GhCli {
                 IntegrationError::Timeout => EffectFailure::Uncertain(UncertainReason::Timeout),
                 _ => EffectFailure::Uncertain(UncertainReason::Transport),
             })?;
-        if output.code == Some(4) {
-            return Err(EffectFailure::NotApplied(NotAppliedReason::Rejected));
-        }
         let status = output
             .stdout
             .split(|byte| *byte == b'\n')
@@ -104,11 +101,24 @@ impl GitHubMutationTransport for GhCli {
             .and_then(|line| line.strip_prefix("HTTP/"))
             .and_then(|line| line.split_whitespace().nth(1))
             .and_then(|code| code.parse::<u16>().ok());
+        let retry_after = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .take_while(|line| !line.is_empty() && *line != b"\r")
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                    .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+            })
+            .map(Duration::from_secs);
         match (status, output.code) {
-            (Some(400 | 401 | 403 | 404 | 422), _) => {
-                Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
-            }
+            (Some(429), _) => Err(EffectFailure::NotApplied(NotAppliedReason::RateLimited {
+                retry_after,
+            })),
+            (Some(400..=499), _) => Err(EffectFailure::NotApplied(NotAppliedReason::Rejected)),
             (Some(200..=299), Some(0)) => Ok(output.stdout),
+            (None, Some(4)) => Err(EffectFailure::NotApplied(NotAppliedReason::Rejected)),
             _ => Err(EffectFailure::Uncertain(UncertainReason::Transport)),
         }
     }
@@ -282,6 +292,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             GitHubAction::MergePullRequest {
                 number,
                 expected_head,
+                expected_base,
                 ..
             } => {
                 let pr = self.read(format!("{root}/pulls/{}", number.get()))?;
@@ -292,7 +303,10 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                     .pointer("/head/sha")
                     .and_then(Value::as_str)
                     .ok_or(IntegrationError::Unknown)?;
-                if head != expected_head.as_str() {
+                if head != expected_head.as_str()
+                    || pr.pointer("/base/ref").and_then(Value::as_str)
+                        != Some(expected_base.as_str())
+                {
                     return Ok(Inspection::Conflict);
                 }
                 match pr.get("merged").and_then(Value::as_bool) {
@@ -785,6 +799,24 @@ mod mutation_tests {
                 EffectFailure::NotApplied(NotAppliedReason::Rejected),
             ),
             (
+                "HTTP/2 405 Method Not Allowed",
+                EffectFailure::NotApplied(NotAppliedReason::Rejected),
+            ),
+            (
+                "HTTP/2 409 Conflict",
+                EffectFailure::NotApplied(NotAppliedReason::Rejected),
+            ),
+            (
+                "HTTP/2 410 Gone",
+                EffectFailure::NotApplied(NotAppliedReason::Rejected),
+            ),
+            (
+                "HTTP/2 429 Too Many Requests\r\nRetry-After: 12",
+                EffectFailure::NotApplied(NotAppliedReason::RateLimited {
+                    retry_after: Some(Duration::from_secs(12)),
+                }),
+            ),
+            (
                 "HTTP/2 404 Not Found",
                 EffectFailure::NotApplied(NotAppliedReason::Rejected),
             ),
@@ -798,7 +830,7 @@ mod mutation_tests {
             ),
         ] {
             let script = format!(
-                "for arg in \"$@\"; do [ \"$arg\" != fixture-secret ] || exit 9; done\ncase \" $* \" in *' user '*) printf '%s' '{{\"login\":\"sample-bot\"}}';; *) printf '%s\\r\\n\\r\\n' '{response}'; exit 1;; esac"
+                "for arg in \"$@\"; do case \"$arg\" in *fixture-secret*) exit 9;; esac; done\ncase \" $* \" in *' user '*) printf '%s' '{{\"login\":\"sample-bot\"}}';; *) printf '%s\\r\\n\\r\\n' '{response}'; exit 1;; esac"
             );
             let (_directory, cli, credential) = fake_cli(&script)?;
             assert_eq!(
@@ -817,7 +849,7 @@ mod mutation_tests {
             "case \" $* \" in *' user '*) printf '%s' '{\"login\":\"sample-bot\"}';; *) while :; do :; done;; esac",
         )?;
         assert_eq!(
-            cli.submit(&credential, &request, Duration::from_millis(500), 4096),
+            cli.submit(&credential, &request, Duration::from_secs(3), 4096),
             Err(EffectFailure::Uncertain(UncertainReason::Timeout))
         );
         Ok(())

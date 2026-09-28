@@ -56,7 +56,7 @@ fn scope() -> Result<HouseScope> {
     )?)
 }
 fn issue(number: u64) -> Value {
-    json!({"repository_url":"https://api.github.com/repos/sample/project","id":number,"number":number,"title":"sanitized issue","state":"open","assignees":[],"labels":[]})
+    json!({"repository_url":"https://api.github.com/repos/sample/project","id":number,"number":number,"title":"sanitized issue","state":"open","assignees":[],"labels":[],"updated_at":"2026-01-02T00:00:00Z","closed_at":null})
 }
 #[test]
 fn scope_rejects_foreign_house_repository_requester_and_budget() -> Result {
@@ -298,7 +298,7 @@ for arg in "$@"; do [ "$arg" != sanitized-fixture-token ] || exit 2; done
 if [ "$4" = user ]; then
   printf '%s' '{"login":"sample-bot"}'
 else
-  printf '%s' '{"repository_url":"https://api.github.com/repos/sample/project","id":1,"number":1,"title":"sample","state":"open","assignees":[],"labels":[]}'
+  printf '%s' '{"repository_url":"https://api.github.com/repos/sample/project","id":1,"number":1,"title":"sample","state":"open","assignees":[],"labels":[],"updated_at":"2026-01-02T00:00:00Z","closed_at":null}'
 fi
 "#,
     )?;
@@ -397,8 +397,8 @@ fn exact_head_checks_reviews_dependencies_and_unknown_mergeability() -> Result {
         Some("Unable to review this pull request because the quota has been reached.")
     );
     assert_eq!(
-        reviews[0].submitted_at.as_deref(),
-        Some("2026-09-28T15:00:00Z")
+        reviews[0].submitted_at.map(|date| date.as_unix_millis()),
+        Some(1790607600000)
     );
     let Observation::Known(deps) = client.dependencies(&house, &repo, number) else {
         return Err("expected dependencies".into());
@@ -719,5 +719,71 @@ fn closing_pr_links_are_found_without_timeline_cross_reference() -> Result {
     assert!(
         matches!(client.linked_pull_requests(&house, &repo, IssueNumber::new(1)?), Observation::Known(v) if v.len() == 1 && !v[0].pull_request.merged)
     );
+    Ok(())
+}
+
+#[test]
+fn required_checks_rejects_path_segments_without_io() -> Result {
+    let client = GitHubClient::new(scope()?, Fake::default(), ReadLimits::default());
+    for branch in [
+        "",
+        "..",
+        "main/../other",
+        "/main",
+        "main/",
+        "main//next",
+        "main/.hidden",
+    ] {
+        assert_eq!(
+            client.required_checks(
+                &HouseId::new("sample")?,
+                &Repository::new("sample/project")?,
+                branch
+            ),
+            Observation::Unavailable(IntegrationError::InvalidInput)
+        );
+    }
+    assert!(client.transport().requests.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn foreign_timeline_cross_reference_does_not_block_linked_prs() -> Result {
+    let timeline = json!([{"event":"cross-referenced","source":{"issue":{"number":4,"repository_url":"https://api.github.com/repos/foreign/project","pull_request":{}}}}]);
+    let closing = json!({"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}});
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![Ok(timeline), Ok(closing)])?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        client.linked_pull_requests(
+            &HouseId::new("sample")?,
+            &Repository::new("sample/project")?,
+            IssueNumber::new(1)?
+        ),
+        Observation::Known(vec![])
+    );
+    assert_eq!(client.transport().requests.borrow().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn inventory_filters_and_timestamps_are_typed() -> Result {
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![Ok(json!([issue(1)]))])?,
+        ReadLimits::default(),
+    );
+    let found = client.issues_filtered(
+        &HouseId::new("sample")?,
+        &Repository::new("sample/project")?,
+        Some(IssueState::Open),
+        Some(kitchen::contracts::Timestamp::from_unix_millis(0)),
+    );
+    assert!(
+        matches!(found, Observation::Known(v) if v[0].updated_at.as_unix_millis() > 0 && v[0].closed_at.is_none())
+    );
+    assert!(client.transport().requests.borrow()[0].contains("state=open&since=1970-01-01T"));
     Ok(())
 }

@@ -20,6 +20,12 @@
 //! are refused without renaming, recoloring, or deleting them. Budgets count
 //! distinct admitted effects conservatively, including unresolved or no-op
 //! effects, rather than promising a wall-clock posting rate limit.
+//! Provider 4xx refusals are definitely not applied; rate-limit responses carry
+//! a typed retry delay when one is supplied. Transport and 5xx outcomes require
+//! reconciliation. Merge requires the approved head and base branch.
+//! `CloseIssue` is disabled until its distinct grant lands; its PATCH field
+//! `duplicate_issue_id` and GraphQL `duplicateOf` read-back still require live
+//! API verification before activation.
 
 mod mutation;
 pub(crate) mod process;

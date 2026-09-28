@@ -1,6 +1,29 @@
 //! Typed provider responses. Missing or unrecognized facts remain unknown.
 
-use crate::contracts::{CommitId, IssueNumber, Repository, Text};
+use crate::contracts::{CommitId, IssueNumber, Repository, Text, Timestamp};
+use serde::{Deserializer, de::Error as _};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+fn timestamp<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    let date = OffsetDateTime::parse(&value, &Rfc3339).map_err(D::Error::custom)?;
+    let millis = date.unix_timestamp_nanos() / 1_000_000;
+    let millis = u64::try_from(millis).map_err(D::Error::custom)?;
+    Ok(Timestamp::from_unix_millis(millis))
+}
+fn optional_timestamp<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Timestamp>, D::Error> {
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| {
+            let date = OffsetDateTime::parse(&value, &Rfc3339).map_err(D::Error::custom)?;
+            let millis =
+                u64::try_from(date.unix_timestamp_nanos() / 1_000_000).map_err(D::Error::custom)?;
+            Ok(Timestamp::from_unix_millis(millis))
+        })
+        .transpose()
+}
+
 use serde::Deserialize;
 
 /// Whether a complete observation was obtained.
@@ -63,6 +86,12 @@ pub struct Issue {
     pub assignees: Vec<User>,
     /// Applied labels.
     pub labels: Vec<Label>,
+    /// Last update timestamp.
+    #[serde(deserialize_with = "timestamp")]
+    pub updated_at: Timestamp,
+    /// Closure timestamp, if any.
+    #[serde(default, deserialize_with = "optional_timestamp")]
+    pub closed_at: Option<Timestamp>,
 }
 /// Issue detail for triage, including untrusted body text as data.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -76,11 +105,14 @@ pub struct IssueDetail {
     /// Untrusted issue body.
     pub body: Option<String>,
     /// Creation timestamp.
-    pub created_at: String,
+    #[serde(deserialize_with = "timestamp")]
+    pub created_at: Timestamp,
     /// Last update timestamp.
-    pub updated_at: String,
+    #[serde(deserialize_with = "timestamp")]
+    pub updated_at: Timestamp,
     /// Closure timestamp, if any.
-    pub closed_at: Option<String>,
+    #[serde(default, deserialize_with = "optional_timestamp")]
+    pub closed_at: Option<Timestamp>,
 }
 /// One issue comment, returned through complete pagination.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -92,9 +124,11 @@ pub struct IssueComment {
     /// Untrusted comment body.
     pub body: String,
     /// Creation timestamp.
-    pub created_at: String,
+    #[serde(deserialize_with = "timestamp")]
+    pub created_at: Timestamp,
     /// Last update timestamp.
-    pub updated_at: String,
+    #[serde(deserialize_with = "timestamp")]
+    pub updated_at: Timestamp,
 }
 /// One issue timeline event; unknown kinds remain visible to callers.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -384,7 +418,8 @@ pub struct CommitDetail {
 /// Provider response data.
 pub struct CommitPerson {
     /// Provider response field.
-    pub date: String,
+    #[serde(deserialize_with = "timestamp")]
+    pub date: Timestamp,
 }
 /// Required status contexts from branch protection.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -544,7 +579,8 @@ pub struct Review {
     /// Review text is untrusted provider data; callers classify it without executing it.
     pub body: Option<String>,
     /// Provider submission timestamp, absent for pending reviews.
-    pub submitted_at: Option<String>,
+    #[serde(default, deserialize_with = "optional_timestamp")]
+    pub submitted_at: Option<Timestamp>,
 }
 
 /// A review outcome.

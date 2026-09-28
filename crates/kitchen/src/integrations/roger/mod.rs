@@ -17,6 +17,9 @@
 //! Credentials and operations remain house scoped; unknown legacy decision
 //! prefixes require explicit migration into the closed [`DecisionOwner`] set.
 
+//! A house selects an HTTPS Roger URL explicitly; requester-scoped `get` and
+//! native `--idem` replay semantics need Roger deployment evidence.
+
 mod binding;
 pub use crate::contracts::{AskKind, AskRisk, DecisionBinding, DecisionOwner, RogerAsk};
 pub use binding::{DecisionStatus, validate_answer};

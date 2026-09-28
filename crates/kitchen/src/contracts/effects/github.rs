@@ -133,6 +133,8 @@ pub enum GitHubAction {
         number: IssueNumber,
         /// Exact head approved for merging.
         expected_head: CommitId,
+        /// Base branch approved for the merge.
+        expected_base: String,
         /// Fixed merge method.
         method: MergeMethod,
     },
@@ -213,6 +215,11 @@ impl GitHubMutation {
                 ..
             } if number == of => Err(invalid()),
             GitHubAction::CloseIssue { .. } => Ok(()),
+            GitHubAction::MergePullRequest { expected_base, .. }
+                if !valid_branch(expected_base) =>
+            {
+                Err(invalid())
+            }
             GitHubAction::MergePullRequest { .. } => Ok(()),
             GitHubAction::PostComment { body, .. } if body.as_str().len() > 60 * 1024 => {
                 Err(invalid())
@@ -312,4 +319,22 @@ impl GitHubEffect {
 /// Replace this fail-closed placeholder with Permission::CloseIssue on rebase of #27.
 const fn close_issue_permission_placeholder() -> Permission {
     Permission::EditIssueRelationships
+}
+
+fn valid_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && branch.len() <= 255
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && branch.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.starts_with('.')
+                && !part.ends_with('.')
+                && !part.contains("..")
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+        })
 }

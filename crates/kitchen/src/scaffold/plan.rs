@@ -2,15 +2,16 @@
 //! the additions-only apply step.
 
 use std::{
+    collections::BTreeSet,
     fmt, fs, io,
     path::{Path, PathBuf},
 };
 
 use crate::{
-    adoption::{self, FileMode, FileStatus, InstallReport, NewFile, SafeInstaller},
+    adoption::{self, FileMode, FileStatus, InstallReport, NewFile, RelativePath, SafeInstaller},
     house::HouseError,
     scaffold::{
-        ManagedMarker, ManagedState, RenderedFile, RenderedTemplate, ScaffoldError,
+        Activation, ManagedMarker, ManagedState, RenderedFile, RenderedTemplate, ScaffoldError,
         ScaffoldOperation, TemplateProvenance, inspect_managed,
     },
 };
@@ -78,6 +79,13 @@ pub enum PlanAction {
     Unchanged,
     /// Something exists that the plan must not overwrite.
     Conflict(Conflict),
+    /// Nothing exists, but a declared requirement is not being added, so
+    /// creating this file could activate it against content the template
+    /// did not supply. Rerun after reconciling the requirements.
+    Withheld {
+        /// Required output paths that conflict or are themselves withheld.
+        requires: Vec<RelativePath>,
+    },
 }
 
 /// One rendered file and its classification.
@@ -87,6 +95,14 @@ pub struct PlannedFile {
     pub file: RenderedFile,
     /// What applying would do.
     pub action: PlanAction,
+}
+
+impl PlannedFile {
+    /// What this file can activate once present; `None` for ordinary content.
+    #[must_use]
+    pub fn activation(&self) -> Option<Activation> {
+        Activation::of(&self.file.path, &self.file.contents)
+    }
 }
 
 /// A validated, in-memory plan. Building it writes nothing.
@@ -147,6 +163,7 @@ impl FilePlan {
             };
             files.push(PlannedFile { file, action });
         }
+        withhold_unmet(&mut files);
         Ok(Self {
             provenance: rendered.provenance,
             target: target.to_path_buf(),
@@ -193,7 +210,7 @@ impl FilePlan {
             .iter()
             .filter_map(|planned| match &planned.action {
                 PlanAction::Conflict(conflict) => Some((&planned.file, conflict)),
-                PlanAction::Add | PlanAction::Unchanged => None,
+                PlanAction::Add | PlanAction::Unchanged | PlanAction::Withheld { .. } => None,
             })
     }
 
@@ -237,6 +254,43 @@ impl FilePlan {
             &self.target,
             &new_files(self.additions()),
         )?)
+    }
+}
+
+/// Withhold additions whose requirements are not added or already present,
+/// repeating until stable so withholding propagates along requirement chains.
+fn withhold_unmet(files: &mut [PlannedFile]) {
+    loop {
+        let blocked: BTreeSet<RelativePath> = files
+            .iter()
+            .filter(|planned| {
+                matches!(
+                    planned.action,
+                    PlanAction::Conflict(_) | PlanAction::Withheld { .. }
+                )
+            })
+            .map(|planned| planned.file.path.clone())
+            .collect();
+        let mut changed = false;
+        for planned in files.iter_mut() {
+            if planned.action != PlanAction::Add {
+                continue;
+            }
+            let requires: Vec<RelativePath> = planned
+                .file
+                .requires
+                .iter()
+                .filter(|path| blocked.contains(*path))
+                .cloned()
+                .collect();
+            if !requires.is_empty() {
+                planned.action = PlanAction::Withheld { requires };
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
     }
 }
 
@@ -289,7 +343,8 @@ impl fmt::Display for FilePlan {
                 PlanKind::Adoption => "existing directory",
             }
         )?;
-        let (mut added, mut unchanged, mut conflicts) = (0_usize, 0_usize, 0_usize);
+        let (mut added, mut unchanged, mut conflicts, mut withheld, mut activating) =
+            (0_usize, 0_usize, 0_usize, 0_usize, 0_usize);
         for planned in &self.files {
             let path = planned.file.path.as_str();
             let mode = match planned.file.mode {
@@ -299,7 +354,12 @@ impl fmt::Display for FilePlan {
             match &planned.action {
                 PlanAction::Add => {
                     added += 1;
-                    writeln!(formatter, "  add        {path}{mode}")?;
+                    write!(formatter, "  add        {path}{mode}")?;
+                    if let Some(activation) = planned.activation() {
+                        activating += 1;
+                        write!(formatter, "  [{activation}: {}]", activation.boundary())?;
+                    }
+                    writeln!(formatter)?;
                 }
                 PlanAction::Unchanged => {
                     unchanged += 1;
@@ -309,11 +369,34 @@ impl fmt::Display for FilePlan {
                     conflicts += 1;
                     writeln!(formatter, "  conflict   {path}: {conflict}; left untouched")?;
                 }
+                PlanAction::Withheld { requires } => {
+                    withheld += 1;
+                    let requires: Vec<&str> = requires.iter().map(RelativePath::as_str).collect();
+                    writeln!(
+                        formatter,
+                        "  withheld   {path}: requires {}, which is not added; left uncreated",
+                        requires.join(", ")
+                    )?;
+                }
             }
+        }
+        if added > 0 {
+            let matched = match activating {
+                0 => "No additions match known automation paths. Kitchen activates nothing."
+                    .to_owned(),
+                1 => "1 addition matches known automation paths and can activate automation once pushed or opened. Kitchen activates none of them.".to_owned(),
+                many => format!(
+                    "{many} additions match known automation paths and can activate automation once pushed or opened. Kitchen activates none of them."
+                ),
+            };
+            writeln!(
+                formatter,
+                "{matched} Matching is best-effort: other files may still be run by tools."
+            )?;
         }
         write!(
             formatter,
-            "{added} to add, {unchanged} unchanged, {conflicts} conflicts. Nothing is written until the plan is applied; existing files are never overwritten or deleted."
+            "{added} to add, {unchanged} unchanged, {withheld} withheld, {conflicts} conflicts. Nothing is written until the plan is applied; existing files are never overwritten or deleted."
         )
     }
 }

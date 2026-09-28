@@ -43,6 +43,7 @@ path = "apps/{{ vars.app_name }}/src-tauri/Cargo.toml"
 source = "github/workflows/ci.yml"
 path = ".github/workflows/ci.yml"
 render = false
+requires = ["justfile.tera"]
 
 [[files]]
 source = "scripts/bindings.sh"

@@ -47,12 +47,14 @@
 //! # }
 //! ```
 
+mod activation;
 mod error;
 mod manifest;
 mod plan;
 mod provenance;
 mod template;
 
+pub use activation::{Activation, MAX_WORKFLOW_YAML_DEPTH};
 pub use error::{
     MissingVariable, ScaffoldError, ScaffoldLimit, ScaffoldOperation, TemplateProblem,
 };

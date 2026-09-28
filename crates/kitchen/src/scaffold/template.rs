@@ -168,6 +168,16 @@ impl Template {
                 limit: ScaffoldLimit::SourceBytes,
             });
         }
+        for entry in &manifest.files {
+            let mut seen = BTreeSet::new();
+            if entry.requires.iter().any(|required| {
+                *required == entry.source || !listed.contains(required) || !seen.insert(required)
+            }) {
+                return Err(template_problem(TemplateProblem::InvalidRequirement(
+                    entry.source.clone(),
+                )));
+            }
+        }
         let mut engine = tera::Tera::new();
         engine.autoescape_on(Vec::<&'static str>::new());
         for entry in &manifest.files {
@@ -307,9 +317,25 @@ impl Template {
                 contents,
                 mode: entry.mode,
                 managed: entry.provenance.is_some(),
+                requires: Vec::new(),
             });
         }
         check_outputs(&files)?;
+        // Requirements name sources; plans compare output paths.
+        let outputs: BTreeMap<&RelativePath, RelativePath> = self
+            .manifest
+            .files
+            .iter()
+            .zip(&files)
+            .map(|(entry, file)| (&entry.source, file.path.clone()))
+            .collect();
+        for (entry, file) in self.manifest.files.iter().zip(files.iter_mut()) {
+            file.requires = entry
+                .requires
+                .iter()
+                .filter_map(|source| outputs.get(source).cloned())
+                .collect();
+        }
         Ok(RenderedTemplate { provenance, files })
     }
 
@@ -568,6 +594,9 @@ pub struct RenderedFile {
     pub mode: FileMode,
     /// Whether the file carries a provenance marker.
     pub managed: bool,
+    /// Output paths that must be added or already present for this file to
+    /// be added.
+    pub requires: Vec<RelativePath>,
 }
 
 /// A template rendered in memory, ready to plan against a target.

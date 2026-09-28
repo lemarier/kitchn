@@ -243,6 +243,11 @@ pub struct FileEntry {
     /// Provenance marker style; `None` leaves the file unmarked.
     #[serde(default)]
     pub provenance: Option<MarkerStyle>,
+    /// Other listed sources this output depends on, such as the justfile a
+    /// workflow runs. If any of their outputs is not added, this output is
+    /// withheld instead of added.
+    #[serde(default)]
+    pub requires: Vec<RelativePath>,
 }
 
 const fn render_by_default() -> bool {

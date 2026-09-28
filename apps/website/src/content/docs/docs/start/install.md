@@ -5,6 +5,8 @@ description: Install the kitchn CLI.
 
 ## Install script (macOS and Linux)
 
+Available with the first release ([#18](https://github.com/lemarier/kitchen/issues/18)).
+
 ```sh
 curl -fsSL https://getkitchn.com/install.sh | sh
 ```
@@ -14,13 +16,15 @@ GitHub release and verifies its SHA-256 checksum before installing it.
 
 ## Cargo
 
+Available once the `kitchn` crate is published with the first release.
+
 ```sh
 cargo install kitchn --locked
 ```
 
 ## From source
 
-kitchn needs the Rust toolchain pinned in the repository's
+This works today. kitchn needs the Rust toolchain pinned in the repository's
 `rust-toolchain.toml`; rustup installs it automatically.
 
 ```sh

@@ -370,7 +370,9 @@ const menu = [
           }
         </div>
         <p class="setup-note">
-          Then <a href="/docs/start/quickstart/">set up your first house</a>. It takes about two minutes.
+          Both arrive with the first release (<a href="https://github.com/lemarier/kitchen/issues/18">#18</a>).
+          Until then, <a href="/docs/start/install/#from-source">build from source</a>, then
+          <a href="/docs/start/quickstart/">set up your first house</a>.
         </p>
       </section>
 
@@ -885,7 +887,11 @@ const menu = [
       <section class="final wrap" aria-labelledby="final-title">
         <p class="final-kicker">Always dreamed of running a kitchen?</p>
         <h2 id="final-title">Now you're the chef-owner.</h2>
-        <p class="section-lede">Install the CLI, register your house and adopt a repository. About two minutes.</p>
+        <p class="section-lede">
+          Install the CLI, register your house and adopt a repository. About two minutes. The script
+          and crate arrive with the first release; until then,
+          <a href="/docs/start/install/#from-source">build from source</a>.
+        </p>
         <div class="installer" data-installer data-second>
           <div class="installer-tabs" role="tablist" aria-label="Install method">
             {
@@ -2765,8 +2771,9 @@ const menu = [
     .layer,
     .steps,
     .guest-list,
-    .review-row,
-
+    .review-row {
+      grid-template-columns: minmax(0, 1fr);
+    }
     .step + .step {
       padding-left: 0;
       border-left: 0;

@@ -2575,11 +2575,22 @@ fn only_the_plans_inspector_with_a_live_claim_can_act() -> TestResult {
         ttl(600)?,
         at(2),
     )?;
-    // A task of another role cannot run the inspection.
+    // A live claim by the same inspector on a task of another role cannot
+    // run the inspection.
+    let mut worker = spec("worker")?;
+    worker.role = Role::Commis;
+    worker.repository = Some(scope()?.project);
+    f.store.create_task(worker, &creator()?, at(0))?;
+    let worker_claim = f.store.claim(
+        &task_id("worker")?,
+        &scheduled("independent-reviewer")?,
+        ttl(600)?,
+        at(2),
+    )?;
     let mut worker_plan = plan()?;
-    worker_plan.task = task_id("task")?;
+    worker_plan.task = task_id("worker")?;
     assert!(matches!(
-        l.start_inspection(&f.store, worker_plan, own.fence(), &clock(5)),
+        l.start_inspection(&f.store, worker_plan, worker_claim.fence(), &clock(5)),
         Err(TrustError::Refused)
     ));
     l.start_inspection(&f.store, plan()?, own.fence(), &clock(5))?;

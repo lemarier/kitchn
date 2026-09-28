@@ -17,16 +17,16 @@ use kitchen::{
     },
     state::StateError,
     workflows::{
-        pickup::{ClaimOutcome, TaskTemplate, claim_issue, issue_task_id},
+        coordination::{LaunchOutcome, launch_worker},
+        pickup::{Base, ClaimOutcome, TaskTemplate, WorkerBrief, claim_issue, issue_task_id},
         push::{
             PullRequests, PushBoundary, PushIntent, PushOutcome, PushPermit, PushRefusal,
             RefUpdater, RemoteBranches, UpdateFailure,
         },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
-        stack::BranchLayer,
     },
 };
-use workflows_support::{World, branch, issue, template, under_consumer};
+use workflows_support::{World, branch, brief, issue, template, under_consumer};
 
 fn number(value: u64) -> TestResult<IssueNumber> {
     Ok(IssueNumber::new(value)?)
@@ -55,25 +55,42 @@ fn house_grants_of(grants: &[Grant]) -> TestResult<HouseGrants> {
     Ok(HouseGrants::new(common::house()?, grants.to_vec()))
 }
 
-/// A claimed pickup task whose authority includes `PushBranch` when `grants`
-/// delegates it.
+/// A claimed pickup task whose worker was launched on `lemarier/issue-5`,
+/// and whose authority includes `PushBranch` when `grants` delegates it.
 struct Pushing {
     world: World,
     task: TaskId,
     fence: Fence,
     github: BackendId,
-    branch: BranchName,
 }
 
 fn pushing_with(grants: &HouseGrants, requested: Vec<Grant>) -> TestResult<Pushing> {
+    pushing_on(grants, requested, Base::DefaultBranch)
+}
+
+/// Launch `setup`'s worker with `brief`, which must be accepted.
+fn launch(setup: &Pushing, brief: &WorkerBrief) -> TestResult {
+    match launch_worker(
+        &setup.world.ctx(),
+        &setup.task,
+        setup.fence,
+        kitchen::contracts::Workspace::Isolated,
+        brief,
+    )? {
+        LaunchOutcome::Accepted { .. } => Ok(()),
+        other => Err(format!("launch not accepted: {other:?}").into()),
+    }
+}
+
+fn pushing_on(grants: &HouseGrants, requested: Vec<Grant>, base: Base) -> TestResult<Pushing> {
     let mut world = World::new()?;
     world.grants = grants.clone();
-    let mut base: TaskTemplate = template()?;
-    base.authority = TaskAuthority::delegate(grants, requested)?;
+    let mut spec: TaskTemplate = template()?;
+    spec.authority = TaskAuthority::delegate(grants, requested)?;
     let (claimant, _) = under_consumer(&world, "coordinator")?;
     let ClaimOutcome::Claimed(lease) = claim_issue(
         &world.fixture.store,
-        &base,
+        &spec,
         &issue(5)?,
         &claimant,
         ttl(300)?,
@@ -82,13 +99,14 @@ fn pushing_with(grants: &HouseGrants, requested: Vec<Grant>) -> TestResult<Pushi
     else {
         return Err("claim failed".into());
     };
-    Ok(Pushing {
+    let setup = Pushing {
         task: issue_task_id(&issue(5)?)?,
         fence: lease.fence(),
         github: github()?,
-        branch: branch("lemarier/issue-5")?,
         world,
-    })
+    };
+    launch(&setup, &WorkerBrief { base, ..brief(5)? })?;
+    Ok(setup)
 }
 
 fn pushing() -> TestResult<Pushing> {
@@ -100,6 +118,8 @@ fn pushing() -> TestResult<Pushing> {
 struct Reads {
     pull_request: Observed<Option<PullRequestView>>,
     remote: Observed<Option<CommitId>>,
+    default_branch: Observed<BranchName>,
+    bound: Observed<bool>,
     pull_request_reads: Cell<u32>,
     remote_reads: Cell<u32>,
     heads_asked: RefCell<Vec<String>>,
@@ -113,6 +133,8 @@ impl Reads {
         Self {
             pull_request,
             remote,
+            default_branch: BranchName::new("main").map_or(Observed::Unknown, Observed::Known),
+            bound: Observed::Known(true),
             pull_request_reads: Cell::new(0),
             remote_reads: Cell::new(0),
             heads_asked: RefCell::new(Vec::new()),
@@ -130,9 +152,17 @@ impl PullRequests for Reads {
             .set(self.pull_request_reads.get() + 1);
         self.pull_request.clone()
     }
+
+    fn default_branch(&self) -> Observed<BranchName> {
+        self.default_branch.clone()
+    }
 }
 
 impl RemoteBranches for Reads {
+    fn reads_from(&self, _: &Repository) -> Observed<bool> {
+        self.bound
+    }
+
     fn head(&self, branch: &BranchName) -> Observed<Option<CommitId>> {
         self.remote_reads.set(self.remote_reads.get() + 1);
         self.heads_asked
@@ -160,6 +190,10 @@ impl Recorder {
 }
 
 impl RefUpdater for Recorder {
+    fn pushes_to(&self, _: &Repository) -> Observed<bool> {
+        Observed::Known(true)
+    }
+
     fn update(
         &self,
         permit: &PushPermit,
@@ -184,8 +218,6 @@ fn boundary<'a>(
         store: &setup.world.fixture.store,
         grants: &setup.world.grants,
         destination: &setup.github,
-        branch: &setup.branch,
-        layer: &BranchLayer::Independent,
         stack_tool: None,
         clock: &setup.world.clock,
         pull_requests: reads,
@@ -200,6 +232,7 @@ fn view(pr: u64, state: PullRequestState, head_branch: &str) -> TestResult<PullR
         state,
         head: commit('d')?,
         head_branch: head_branch.to_owned(),
+        base_branch: "main".to_owned(),
         mergeability: Mergeability::Clean,
     })
 }
@@ -254,6 +287,7 @@ fn a_checked_push_updates_only_the_head_it_read() -> TestResult {
     assert_eq!(*reads.heads_asked.borrow(), vec!["lemarier/issue-5"]);
 
     // A first push reads no pull request, and must find no branch.
+    let setup = pushing()?;
     let reads = Reads::new(Observed::Unknown, Observed::Known(None));
     let updater = Recorder::answering(Ok(()));
     let outcome = boundary(&setup, &reads, &updater).push(
@@ -372,17 +406,18 @@ fn every_refusal_stops_the_push_before_any_update() -> TestResult {
 
 #[test]
 fn a_push_that_already_landed_is_not_sent_again() -> TestResult {
-    let setup = pushing()?;
     let landed = commit('e')?;
     let updater = Recorder::answering(Ok(()));
     let reads = Reads::new(open(5)?, Observed::Known(Some(landed.clone())));
     // Its answer was lost, and the head is already the commit.
     for intent in [update_intent(Some(commit('d')?))?, first_intent()?] {
+        let setup = pushing()?;
         let outcome =
             boundary(&setup, &reads, &updater).push(&setup.task, setup.fence, &intent, &landed)?;
         assert_eq!(outcome, PushOutcome::AlreadyCurrent);
     }
     assert!(updater.calls.borrow().is_empty());
+    let setup = pushing()?;
 
     // A merged pull request still refuses.
     let merged = Reads::new(
@@ -553,35 +588,36 @@ fn only_the_live_claim_holder_may_push() -> TestResult {
 fn a_stacked_layer_is_never_pushed_on_the_plain_path_when_a_stack_tool_is_configured() -> TestResult
 {
     use kitchen::house::StackTool;
-    let setup = pushing()?;
     let head = commit('d')?;
-    let parent = branch("lemarier/issue-4")?;
-    let dependent = BranchLayer::Dependent { parent };
-    let push = |layer: &BranchLayer,
+    let push = |setup: &Pushing,
+                reads: &Reads,
                 tool: Option<StackTool>,
                 intent: &PushIntent|
      -> TestResult<(PushOutcome, u32, usize)> {
-        let reads = Reads::new(open(5)?, Observed::Known(Some(head.clone())));
         let updater = Recorder::answering(Ok(()));
         let outcome = PushBoundary {
-            layer,
             stack_tool: tool,
-            ..boundary(&setup, &reads, &updater)
+            ..boundary(setup, reads, &updater)
         }
         .push(&setup.task, setup.fence, intent, &commit('e')?)?;
         let updates = updater.calls.borrow().len();
         Ok((outcome, reads.total(), updates))
     };
-    // A dependent layer under a configured tool: refused before any read,
-    // for an update and for a first push alike.
     let update = update_intent(Some(head.clone()))?;
-    let create = PushIntent {
-        pull_request: None,
-        expected_remote: None,
+    let create = first_intent()?;
+    let stack_base = Base::Stack {
+        pull_request: number(4)?,
+        branch: branch("lemarier/issue-4")?,
+        depth: 1,
     };
+    let list = push_grant_list()?;
+    // Launched as a layer: the record makes it dependent, whatever the
+    // writer says, and it is refused before any read.
+    let stacked = pushing_on(&house_grants_of(&list)?, list.clone(), stack_base)?;
     for intent in [&update, &create] {
+        let reads = Reads::new(open(5)?, Observed::Known(Some(head.clone())));
         assert_eq!(
-            push(&dependent, Some(StackTool::GhStack), intent)?,
+            push(&stacked, &reads, Some(StackTool::GhStack), intent)?,
             (
                 PushOutcome::Refused(PushRefusal::StackToolRequired(StackTool::GhStack)),
                 0,
@@ -589,12 +625,38 @@ fn a_stacked_layer_is_never_pushed_on_the_plain_path_when_a_stack_tool_is_config
             )
         );
     }
+    // Launched on the default branch, but its pull request is based on
+    // another branch: dependent by the observed base.
+    let setup = pushing()?;
+    let on_layer = || -> TestResult<Reads> {
+        let mut view = view(5, PullRequestState::Open, "lemarier/issue-5")?;
+        view.base_branch = "lemarier/issue-4".to_owned();
+        Ok(Reads::new(
+            Observed::Known(Some(view)),
+            Observed::Known(Some(head.clone())),
+        ))
+    };
+    let (outcome, _, updates) = push(&setup, &on_layer()?, Some(StackTool::GhStack), &update)?;
+    assert_eq!(
+        outcome,
+        PushOutcome::Refused(PushRefusal::StackToolRequired(StackTool::GhStack))
+    );
+    assert_eq!(updates, 0);
+    // An unreadable default branch refuses under a stack tool.
+    let mut unknown = Reads::new(open(5)?, Observed::Known(Some(head.clone())));
+    unknown.default_branch = Observed::Unknown;
+    let (outcome, _, updates) = push(&setup, &unknown, Some(StackTool::GhStack), &update)?;
+    assert_eq!(outcome, PushOutcome::Refused(PushRefusal::Unknown));
+    assert_eq!(updates, 0);
     // An independent branch, or a house without a stack tool, pushes.
-    for (layer, tool) in [
-        (&BranchLayer::Independent, Some(StackTool::GhStack)),
-        (&dependent, None),
+    for (reads, tool) in [
+        (
+            Reads::new(open(5)?, Observed::Known(Some(head.clone()))),
+            Some(StackTool::GhStack),
+        ),
+        (on_layer()?, None),
     ] {
-        let (outcome, _, updates) = push(layer, tool, &update)?;
+        let (outcome, _, updates) = push(&setup, &reads, tool, &update)?;
         assert_eq!(
             outcome,
             PushOutcome::Pushed {
@@ -603,6 +665,14 @@ fn a_stacked_layer_is_never_pushed_on_the_plain_path_when_a_stack_tool_is_config
         );
         assert_eq!(updates, 1);
     }
+    let reads = Reads::new(open(5)?, Observed::Known(Some(head.clone())));
+    let (outcome, _, _) = push(&stacked, &reads, None, &update)?;
+    assert_eq!(
+        outcome,
+        PushOutcome::Pushed {
+            replaced: Some(head.clone())
+        }
+    );
     Ok(())
 }
 
@@ -771,10 +841,12 @@ mod git_remote {
         other: PathBuf,
     }
 
+    /// The bare remote is the task's repository, `origin89hq/firmware`,
+    /// under the temporary directory, which is the remote's URL base.
     fn fresh_repos() -> TestResult<Repos> {
         let dir = tempfile::tempdir()?;
-        let remote = dir.path().join("remote.git");
-        fs::create_dir(&remote)?;
+        let remote = dir.path().join("origin89hq").join("firmware.git");
+        fs::create_dir_all(&remote)?;
         git(&remote, &["init", "--bare"])?;
         let worker = dir.path().join("worker");
         let other = dir.path().join("other");
@@ -822,13 +894,18 @@ mod git_remote {
         Ok(moved)
     }
 
+    fn url_base(repos: &Repos) -> TestResult<String> {
+        Ok(format!("{}/", text(repos.dir.path())?))
+    }
+
     fn remote_for(repos: &Repos) -> TestResult<GitRemote> {
         Ok(GitRemote::new(
             PathBuf::from(GIT),
             repos.worker.clone(),
             "origin",
             Duration::from_secs(30),
-        )?)
+        )?
+        .with_url_bases(&[&url_base(repos)?])?)
     }
 
     /// Reads the remote head, then lets something happen before answering:
@@ -841,6 +918,10 @@ mod git_remote {
     }
 
     impl RemoteBranches for ChangesAfterRead<'_> {
+        fn reads_from(&self, repository: &Repository) -> Observed<bool> {
+            self.remote.reads_from(repository)
+        }
+
         fn head(&self, branch: &BranchName) -> Observed<Option<CommitId>> {
             let head = self.remote.head(branch);
             if !self.done.replace(true)
@@ -990,6 +1071,112 @@ mod git_remote {
             assert_eq!(outcome, PushOutcome::Refused(refusal));
             assert_eq!(remote_head(&repos, BRANCH)?, None);
         }
+        // A stale intent that claims a first push cannot recreate it either:
+        // the boundary recorded that it published the branch.
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &next,
+        )?;
+        assert_eq!(outcome, PushOutcome::Refused(PushRefusal::BranchDeleted));
+        assert_eq!(remote_head(&repos, BRANCH)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn git_pushes_only_to_the_granted_repository() -> TestResult {
+        let repos = fresh_repos()?;
+        let setup = pushing()?;
+        let elsewhere = repos.dir.path().join("elsewhere").join("firmware.git");
+        fs::create_dir_all(&elsewhere)?;
+        git(&elsewhere, &["init", "--bare"])?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        let granted = text(&repos.remote)?.to_owned();
+        let other = text(&elsewhere)?.to_owned();
+        let redirects: [(&str, [&str; 4]); 3] = [
+            // The checkout's origin points at another repository.
+            ("set-url", ["remote", "set-url", "origin", &other]),
+            // The URL is right, but a rewrite sends fetches elsewhere.
+            (
+                "insteadOf",
+                ["config", &format!("url.{other}.insteadOf"), &granted, ""],
+            ),
+            // Or only pushes.
+            (
+                "pushInsteadOf",
+                [
+                    "config",
+                    &format!("url.{other}.pushInsteadOf"),
+                    &granted,
+                    "",
+                ],
+            ),
+        ];
+        for (name, args) in &redirects {
+            let args: Vec<&str> = args.iter().copied().filter(|arg| !arg.is_empty()).collect();
+            git(&repos.worker, &args)?;
+            let remote = remote_for(&repos)?;
+            let outcome = push_with(
+                &setup,
+                Observed::Unknown,
+                &remote,
+                &remote,
+                &first_intent()?,
+                &mine,
+            )?;
+            assert_eq!(
+                outcome,
+                PushOutcome::Refused(PushRefusal::RemoteMismatch),
+                "{name}"
+            );
+            // Nothing reached either repository.
+            assert_eq!(remote_head(&repos, BRANCH)?, None, "{name}");
+            let landed = git(&elsewhere, &["for-each-ref", "--format=%(refname)"])?;
+            assert!(landed.is_empty(), "{name} pushed elsewhere");
+            // Undo the redirect for the next case.
+            git(&repos.worker, &["remote", "set-url", "origin", &granted])?;
+            let _ = git(
+                &repos.worker,
+                &["config", "--remove-section", &format!("url.{other}")],
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn git_never_runs_the_checkouts_hooks() -> TestResult {
+        let repos = fresh_repos()?;
+        let setup = pushing()?;
+        let marker = repos.dir.path().join("hook-ran");
+        let hooks = repos.dir.path().join("hooks");
+        fs::create_dir_all(&hooks)?;
+        for dir in [hooks.clone(), repos.worker.join(".git").join("hooks")] {
+            let hook = dir.join("pre-push");
+            fs::write(
+                &hook,
+                format!("#!/bin/sh\ntouch '{}'\nexit 0\n", text(&marker)?),
+            )?;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+        }
+        git(&repos.worker, &["config", "core.hooksPath", text(&hooks)?])?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        let remote = remote_for(&repos)?;
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert_eq!(outcome, PushOutcome::Pushed { replaced: None });
+        assert!(
+            !marker.exists(),
+            "a worker-controlled hook ran under Kitchen"
+        );
         Ok(())
     }
 
@@ -1079,15 +1266,8 @@ mod git_remote {
         let repos = fresh_repos()?;
         let setup = pushing()?;
         let mine = commit_in(&repos.worker, "mine")?;
-        git(
-            &repos.worker,
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                text(&repos.dir.path().join("missing.git"))?,
-            ],
-        )?;
+        // The remote is the granted repository, but it cannot be reached.
+        fs::remove_dir_all(&repos.remote)?;
         let remote = remote_for(&repos)?;
         assert_eq!(remote.head(&branch(BRANCH)?), Observed::Unknown);
         let outcome = push_with(
@@ -1108,6 +1288,10 @@ mod git_remote {
     fn permit_for(setup: &Pushing) -> TestResult<PushPermit> {
         struct Capture(RefCell<Option<PushPermit>>);
         impl RefUpdater for Capture {
+            fn pushes_to(&self, _: &Repository) -> Observed<bool> {
+                Observed::Known(true)
+            }
+
             fn update(
                 &self,
                 permit: &PushPermit,
@@ -1166,6 +1350,25 @@ mod git_remote {
                 ErrorClass::InvalidInput
             );
         }
+        let remote = || good(GIT, "/tmp", "origin", Duration::from_secs(1));
+        assert!(remote()?.with_url_bases(&["https://git.example/"]).is_ok());
+        let long = "a".repeat(513);
+        for bases in [
+            &[][..],
+            &[""],
+            &["https://git.example/ x/"],
+            &["a\nb"],
+            &[long.as_str()],
+        ] {
+            let error = remote()?
+                .with_url_bases(bases)
+                .err()
+                .ok_or("invalid URL base accepted")?;
+            assert_eq!(
+                kitchen::Error::from(error).class(),
+                ErrorClass::InvalidInput
+            );
+        }
         Ok(())
     }
 
@@ -1217,5 +1420,228 @@ fn a_task_with_a_pending_cancellation_does_not_push() -> TestResult {
         kitchen::Error::State(StateError::CancelRequested)
     ));
     assert_eq!((reads.total(), updater.calls.borrow().len()), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn a_push_is_bound_to_the_tasks_recorded_branch() -> TestResult {
+    use kitchen::contracts::{WorkerBackend, WorkerState};
+    use kitchen::workflows::coordination::{Supervision, SupervisionInput, supervise};
+    use kitchen::workflows::recovery::{PromptState, RecoverySignals, TerminalHolder};
+    let setup = pushing()?;
+    let head = commit('d')?;
+    let intent = update_intent(Some(head.clone()))?;
+    let push = |setup: &Pushing| -> TestResult<(PushOutcome, Vec<String>, usize)> {
+        let reads = Reads::new(open(5)?, Observed::Known(Some(head.clone())));
+        let updater = Recorder::answering(Ok(()));
+        let outcome = boundary(setup, &reads, &updater).push(
+            &setup.task,
+            setup.fence,
+            &intent,
+            &commit('e')?,
+        )?;
+        let asked = reads.heads_asked.borrow().clone();
+        let updates = updater.calls.borrow().len();
+        Ok((outcome, asked, updates))
+    };
+    // A person takes the worker's terminal over, and it goes idle.
+    let record = setup.world.fixture.store.task(&setup.task)?;
+    let worker = kitchen::workflows::coordination::current_worker(&record)
+        .ok_or("no worker")?
+        .worker;
+    setup
+        .world
+        .backend
+        .set_worker_state(&worker, WorkerState::UserTakeover);
+    let last = setup.world.now();
+    setup.world.clock.advance(241);
+    let idle = RecoverySignals {
+        prompt: PromptState::Idle,
+        terminal: TerminalHolder::Person,
+        ..workflows_support::signals(&worker, Some(last))
+    };
+    let replaced = supervise(
+        &setup.world.ctx(),
+        &setup.task,
+        setup.fence,
+        &workflows_support::supervision()?,
+        &SupervisionInput {
+            signals: Some(&idle),
+            ..SupervisionInput::default()
+        },
+    )?;
+    assert!(matches!(replaced, Supervision::Replace { .. }));
+    // The person's branch is never pushed, before anything is read.
+    let (outcome, asked, updates) = push(&setup)?;
+    assert_eq!(outcome, PushOutcome::Refused(PushRefusal::BranchHeld));
+    assert!(asked.is_empty());
+    assert_eq!(updates, 0);
+    // The replacement works on a new branch, and pushes go there only.
+    launch(
+        &setup,
+        &WorkerBrief {
+            branch: branch("lemarier/issue-5-replacement")?,
+            ..brief(5)?
+        },
+    )?;
+    let mut renamed = view(5, PullRequestState::Open, "lemarier/issue-5-replacement")?;
+    renamed.number = number(5)?;
+    let reads = Reads::new(
+        Observed::Known(Some(renamed)),
+        Observed::Known(Some(head.clone())),
+    );
+    let updater = Recorder::answering(Ok(()));
+    let outcome = boundary(&setup, &reads, &updater).push(
+        &setup.task,
+        setup.fence,
+        &intent,
+        &commit('e')?,
+    )?;
+    assert_eq!(
+        outcome,
+        PushOutcome::Pushed {
+            replaced: Some(head.clone())
+        }
+    );
+    assert_eq!(
+        *reads.heads_asked.borrow(),
+        vec!["lemarier/issue-5-replacement"]
+    );
+    assert_eq!(
+        updater.calls.borrow().first().map(|call| call.1.clone()),
+        Some("lemarier/issue-5-replacement".to_owned())
+    );
+    assert_eq!(
+        setup.world.backend.observe_worker(&worker)?,
+        WorkerState::UserTakeover
+    );
+    Ok(())
+}
+
+#[test]
+fn a_task_without_a_launched_branch_pushes_nothing() -> TestResult {
+    let mut world = World::new()?;
+    let list = push_grant_list()?;
+    world.grants = house_grants_of(&list)?;
+    let mut spec: TaskTemplate = template()?;
+    spec.authority = TaskAuthority::delegate(&world.grants, list)?;
+    let (claimant, _) = under_consumer(&world, "coordinator")?;
+    let ClaimOutcome::Claimed(lease) = claim_issue(
+        &world.fixture.store,
+        &spec,
+        &issue(5)?,
+        &claimant,
+        ttl(300)?,
+        world.now(),
+    )?
+    else {
+        return Err("claim failed".into());
+    };
+    let setup = Pushing {
+        task: issue_task_id(&issue(5)?)?,
+        fence: lease.fence(),
+        github: github()?,
+        world,
+    };
+    let reads = Reads::new(open(5)?, Observed::Known(None));
+    let updater = Recorder::answering(Ok(()));
+    let outcome = boundary(&setup, &reads, &updater).push(
+        &setup.task,
+        setup.fence,
+        &first_intent()?,
+        &commit('e')?,
+    )?;
+    assert_eq!(outcome, PushOutcome::Refused(PushRefusal::NoBranch));
+    assert_eq!((reads.total(), updater.calls.borrow().len()), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn a_checked_pull_request_and_a_published_branch_bind_later_pushes() -> TestResult {
+    let setup = pushing()?;
+    let (first, second) = (commit('d')?, commit('e')?);
+    // The first push creates the branch.
+    let reads = Reads::new(Observed::Unknown, Observed::Known(None));
+    let updater = Recorder::answering(Ok(()));
+    assert_eq!(
+        boundary(&setup, &reads, &updater).push(
+            &setup.task,
+            setup.fence,
+            &first_intent()?,
+            &first
+        )?,
+        PushOutcome::Pushed { replaced: None }
+    );
+    // An update names the pull request, which is checked and recorded.
+    let reads = Reads::new(open(5)?, Observed::Known(Some(first.clone())));
+    assert_eq!(
+        boundary(&setup, &reads, &updater).push(
+            &setup.task,
+            setup.fence,
+            &update_intent(Some(first.clone()))?,
+            &second,
+        )?,
+        PushOutcome::Pushed {
+            replaced: Some(first.clone())
+        }
+    );
+    // The pull request merged and the forge kept the branch. An intent that
+    // omits the pull request cannot skip the merged check.
+    let merged = Reads::new(
+        Observed::Known(Some(view(5, PullRequestState::Merged, "lemarier/issue-5")?)),
+        Observed::Known(Some(second.clone())),
+    );
+    let omitted = PushIntent {
+        pull_request: None,
+        expected_remote: Some(second.clone()),
+    };
+    assert_eq!(
+        boundary(&setup, &merged, &updater).push(
+            &setup.task,
+            setup.fence,
+            &omitted,
+            &commit('f')?
+        )?,
+        PushOutcome::Refused(PushRefusal::PullRequestRequired)
+    );
+    assert_eq!(merged.total(), 0);
+    // A stale first-push intent cannot recreate the branch once it is gone.
+    let first_again = PushIntent {
+        pull_request: Some(number(5)?),
+        expected_remote: None,
+    };
+    let gone_open = Reads::new(open(5)?, Observed::Known(None));
+    assert_eq!(
+        boundary(&setup, &gone_open, &updater).push(
+            &setup.task,
+            setup.fence,
+            &first_again,
+            &commit('f')?
+        )?,
+        PushOutcome::Refused(PushRefusal::BranchDeleted)
+    );
+    assert_eq!(updater.calls.borrow().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_remote_that_is_not_the_granted_repository_is_refused_before_any_read() -> TestResult {
+    let setup = pushing()?;
+    for (bound, refusal) in [
+        (Observed::Known(false), PushRefusal::RemoteMismatch),
+        (Observed::Unknown, PushRefusal::Unknown),
+    ] {
+        let mut reads = Reads::new(open(5)?, Observed::Known(None));
+        reads.bound = bound;
+        let updater = Recorder::answering(Ok(()));
+        let outcome = boundary(&setup, &reads, &updater).push(
+            &setup.task,
+            setup.fence,
+            &first_intent()?,
+            &commit('e')?,
+        )?;
+        assert_eq!(outcome, PushOutcome::Refused(refusal));
+        assert_eq!((reads.total(), updater.calls.borrow().len()), (0, 0));
+    }
     Ok(())
 }

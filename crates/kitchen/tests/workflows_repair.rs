@@ -58,6 +58,7 @@ fn view(
         state,
         head: commit('d')?,
         head_branch: format!("lemarier/issue-{pr}"),
+        base_branch: "main".to_owned(),
         mergeability,
     })
 }
@@ -491,3 +492,4 @@ fn the_branch_writer_comes_from_the_backend_observation() -> TestResult {
     }
     Ok(())
 }
+

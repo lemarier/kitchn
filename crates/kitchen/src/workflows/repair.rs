@@ -72,6 +72,9 @@ pub struct PullRequestView {
     pub head: CommitId,
     /// Head branch name, verbatim.
     pub head_branch: String,
+    /// Base branch name, verbatim: a base other than the repository's
+    /// default branch makes the head a dependent layer.
+    pub base_branch: String,
     /// Mergeability.
     pub mergeability: Mergeability,
 }
@@ -97,6 +100,7 @@ impl PullRequestView {
             state,
             head: pull_request.head.sha.clone(),
             head_branch: pull_request.head.name.clone(),
+            base_branch: pull_request.base.name.clone(),
             mergeability,
         }
     }

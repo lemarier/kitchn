@@ -1,8 +1,9 @@
 //! The push boundary: every branch update a worker makes for a task goes
-//! through [`PushBoundary::push`], which authorizes the task, reads the pull
-//! request and the remote branch head of the one branch the task owns,
-//! refuses stale state, and updates the remote ref only if it still holds the
-//! head that was checked.
+//! through [`PushBoundary::push`], which authorizes the task, binds the push
+//! to the one branch the task's durable record names, checks that the Git
+//! remote is the granted repository, reads the pull request and the remote
+//! branch head, refuses stale state, and updates the remote ref only if it
+//! still holds the head that was checked.
 //!
 //! The decision and the update cannot be separated. The only value that lets
 //! a [`RefUpdater`] act is the [`PushPermit`] the boundary builds from
@@ -10,6 +11,13 @@
 //! permit: a branch that changes between the check and the update makes the
 //! update fail instead of overwriting the change. [`GitRemote`] is the Git
 //! implementation of both remote traits.
+//!
+//! Nothing about the branch comes from the writer: the branch is the task's
+//! latest launched branch ([`crate::workflows::coordination::task_branch`]),
+//! a branch a person holds is refused, the layer comes from the launch
+//! record and the pull request's observed base, and once a push checked the
+//! pull request or published the branch, later intents cannot drop the pull
+//! request or recreate the branch as a first push.
 //!
 //! The boundary covers pushes made through it. A worker whose own Git
 //! credentials can still push directly is a limit of credential isolation
@@ -31,29 +39,30 @@ use crate::{
         Repository,
     },
     house::StackTool,
-    integrations::github::{GitHubClient, GitHubReadTransport},
-    state::{HouseStore, StateError, TaskState},
+    integrations::github::{GitHubClient, GitHubReadTransport, Observation},
+    state::{HouseStore, StateError, TaskRecord, TaskState},
     workflows::{
-        coordination::CoordinationError,
+        coordination::{BranchFact, CoordinationError, held_branches, task_branch},
         repair::{Observed, PullRequestState, PullRequestView, observe_pull_request},
-        stack::{BranchLayer, BranchOperation, StackRefusal, check_plain},
     },
 };
 
 type Result<T> = std::result::Result<T, crate::Error>;
 
-/// What a writer is about to push to the branch its boundary is bound to.
+/// What a writer is about to push to the branch its task owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushIntent {
-    /// The pull request the branch belongs to, once opened.
+    /// The pull request the branch belongs to, once opened. Once a push
+    /// checked it, every later intent must name it.
     pub pull_request: Option<IssueNumber>,
     /// The remote head the writer last saw; `None` before the first push.
+    /// Once the branch was published through a boundary, `None` is refused.
     pub expected_remote: Option<CommitId>,
 }
 
 /// State read immediately before the push.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PushObservation {
+pub(crate) struct PushObservation {
     /// The pull request, when the intent names one.
     pull_request: Observed<Option<PullRequestView>>,
     /// The remote branch head; `None` when the branch does not exist.
@@ -68,7 +77,8 @@ pub enum PushRefusal {
     Merged,
     /// The pull request closed.
     Closed,
-    /// The branch was deleted.
+    /// The branch was deleted, or a first push would recreate a branch this
+    /// task already published.
     BranchDeleted,
     /// Someone else moved the branch.
     RemoteMoved {
@@ -83,9 +93,20 @@ pub enum PushRefusal {
     PullRequestMissing,
     /// The observation is about another pull request.
     WrongPullRequest,
+    /// An earlier push checked the branch's pull request, and this intent
+    /// names none.
+    PullRequestRequired,
     /// The branch is a dependent layer and the house configures a stack
     /// tool: push it through [`crate::workflows::stack::StackBoundary`].
     StackToolRequired(StackTool),
+    /// The task has launched no worker on a branch: nothing to push.
+    NoBranch,
+    /// A person took over the terminal of the worker on this branch. The
+    /// branch is theirs; the task's replacement works on another one.
+    BranchHeld,
+    /// The Git remote is not the repository the task's grant names, or it is
+    /// redirected elsewhere.
+    RemoteMismatch,
     /// State could not be read.
     Unknown,
 }
@@ -112,20 +133,21 @@ impl PushPermit {
 
 /// What the check decided.
 #[derive(Debug, PartialEq, Eq)]
-enum Decision {
+pub(crate) enum Decision {
     /// Update the remote ref under this permit.
     Update(PushPermit),
     /// The remote already holds the commit.
     Current,
 }
 
-/// Check PR and branch state immediately before a push. Every push needs a
+/// Check PR and branch state immediately before a push of `commit`, or of
+/// whatever a stack tool pushes when `commit` is `None`. Every push needs a
 /// fresh check; a stale permit proves nothing.
-fn decide(
-    branch: &BranchName,
+pub(crate) fn decide(
+    bound: &Binding,
     intent: &PushIntent,
     observed: &PushObservation,
-    commit: &CommitId,
+    commit: Option<&CommitId>,
 ) -> std::result::Result<Decision, PushRefusal> {
     if let Some(number) = intent.pull_request {
         let Observed::Known(pull_request) = &observed.pull_request else {
@@ -142,7 +164,7 @@ fn decide(
             PullRequestState::Merged => return Err(PushRefusal::Merged),
             PullRequestState::Closed => return Err(PushRefusal::Closed),
         }
-        if pull_request.head_branch != branch.as_str() {
+        if pull_request.head_branch != bound.branch.as_str() {
             return Err(PushRefusal::WrongBranch);
         }
     }
@@ -151,7 +173,10 @@ fn decide(
     };
     match (&intent.expected_remote, remote) {
         // An earlier push of this commit landed and its answer was lost.
-        (_, Some(found)) if found == commit => Ok(Decision::Current),
+        (_, Some(found)) if Some(found) == commit => Ok(Decision::Current),
+        // A branch this task published and that is gone now was merged or
+        // deleted: never recreate it.
+        (None, None) if bound.published => Err(PushRefusal::BranchDeleted),
         (None, None) => Ok(Decision::Update(PushPermit { replaces: None })),
         (None, Some(_)) => Err(PushRefusal::BranchExists),
         (Some(_), None) => Err(PushRefusal::BranchDeleted),
@@ -169,10 +194,17 @@ pub trait PullRequests {
     /// The pull request `number`, `Known(None)` when it does not exist, and
     /// `Unknown` when it could not be read.
     fn pull_request(&self, number: IssueNumber) -> Observed<Option<PullRequestView>>;
+
+    /// The repository's default branch: a pull request based on anything
+    /// else is a dependent layer.
+    fn default_branch(&self) -> Observed<BranchName>;
 }
 
 /// Reads remote branch heads.
 pub trait RemoteBranches {
+    /// Whether reads go to `repository` and nowhere else. `Unknown` refuses.
+    fn reads_from(&self, repository: &Repository) -> Observed<bool>;
+
     /// The head of `branch`, `Known(None)` when the branch does not exist,
     /// and `Unknown` when the remote could not be read.
     fn head(&self, branch: &BranchName) -> Observed<Option<CommitId>>;
@@ -190,6 +222,10 @@ pub enum UpdateFailure {
 
 /// Updates a remote branch with compare-and-swap semantics.
 pub trait RefUpdater {
+    /// Whether updates go to `repository` and nowhere else. `Unknown`
+    /// refuses.
+    fn pushes_to(&self, repository: &Repository) -> Observed<bool>;
+
     /// Point `branch` at `commit` only if it still holds
     /// [`PushPermit::replaces`] (or does not exist, for `None`). A branch
     /// that changed since the check must make this fail with
@@ -227,6 +263,125 @@ pub enum PushOutcome {
     Uncertain,
 }
 
+/// The task's branch as its durable record describes it, after the task's
+/// claim and grants were checked.
+pub(crate) struct Binding {
+    /// The repository the grants name.
+    pub(crate) repository: Repository,
+    /// The task's branch.
+    pub(crate) branch: BranchName,
+    /// It was launched as a stack layer.
+    pub(crate) stacked: bool,
+    /// A push already published it.
+    pub(crate) published: bool,
+    /// A push already checked its pull request.
+    pub(crate) pull_request_bound: bool,
+}
+
+/// Check the live claim at `fence`, a pending cancellation, and every
+/// permission in `permissions` for the task's repository, then bind the
+/// task's branch from its record. Nothing is read or sent before this.
+pub(crate) fn bind(
+    store: &HouseStore,
+    grants: &HouseGrants,
+    destination: &BackendId,
+    clock: &dyn Clock,
+    task: &TaskId,
+    fence: Fence,
+    permissions: &[Permission],
+) -> Result<(TaskRecord, std::result::Result<Binding, PushRefusal>)> {
+    let record = store.task(task)?;
+    match record.state() {
+        TaskState::Claimed { lease } if lease.fence() == fence && lease.is_live(clock.now()) => {}
+        TaskState::Claimed { .. } | TaskState::Open | TaskState::Settled { .. } => {
+            return Err(StateError::StaleFence { presented: fence }.into());
+        }
+    }
+    // Like every other effect, nothing starts once cancellation is pending.
+    if record.cancel_request().is_some() {
+        return Err(StateError::CancelRequested.into());
+    }
+    let repository = record
+        .spec()
+        .repository
+        .clone()
+        .ok_or(CoordinationError::MissingRepository)?;
+    for permission in permissions {
+        record.spec().authority.authorize(
+            grants,
+            *permission,
+            &GrantScope::Repository(repository.clone()),
+            destination,
+        )?;
+    }
+    let Some(branch) = task_branch(&record) else {
+        return Ok((record, Err(PushRefusal::NoBranch)));
+    };
+    if held_branches(&record).contains(&branch) {
+        return Ok((record, Err(PushRefusal::BranchHeld)));
+    }
+    let binding = Binding {
+        stacked: BranchFact::Stacked.holds(&record, &branch),
+        published: BranchFact::Published.holds(&record, &branch),
+        pull_request_bound: BranchFact::PullRequestBound.holds(&record, &branch),
+        repository,
+        branch,
+    };
+    Ok((record, Ok(binding)))
+}
+
+/// The pull request an intent names, read, and, when `layer` is asked for,
+/// whether the branch is a dependent layer by its observed base.
+pub(crate) fn observe(
+    binding: &Binding,
+    intent: &PushIntent,
+    pull_requests: &dyn PullRequests,
+    remote: &dyn RemoteBranches,
+    layer: bool,
+) -> std::result::Result<(PushObservation, Observed<bool>), PushRefusal> {
+    if binding.pull_request_bound && intent.pull_request.is_none() {
+        return Err(PushRefusal::PullRequestRequired);
+    }
+    let pull_request = match intent.pull_request {
+        Some(number) => pull_requests.pull_request(number),
+        None => Observed::Known(None),
+    };
+    let dependent = match &pull_request {
+        Observed::Known(_) if !layer => Observed::Known(false),
+        Observed::Known(Some(view)) => match pull_requests.default_branch() {
+            Observed::Known(default) => Observed::Known(view.base_branch != default.as_str()),
+            Observed::Unknown => Observed::Unknown,
+        },
+        Observed::Known(None) => Observed::Known(false),
+        Observed::Unknown => Observed::Unknown,
+    };
+    let observed = PushObservation {
+        pull_request,
+        remote_head: remote.head(&binding.branch),
+    };
+    Ok((observed, dependent))
+}
+
+/// Record what a landed push established: the branch is published and, when
+/// the intent named a checked pull request, later pushes must name it.
+pub(crate) fn record_landed(
+    store: &HouseStore,
+    clock: &dyn Clock,
+    task: &TaskId,
+    fence: Fence,
+    binding: &Binding,
+    intent: &PushIntent,
+) -> Result<()> {
+    let now = clock.now();
+    if !binding.published {
+        BranchFact::Published.record(store, task, fence, &binding.branch, now)?;
+    }
+    if intent.pull_request.is_some() && !binding.pull_request_bound {
+        BranchFact::PullRequestBound.record(store, task, fence, &binding.branch, now)?;
+    }
+    Ok(())
+}
+
 /// What a push acts through.
 #[derive(Clone, Copy)]
 pub struct PushBoundary<'a> {
@@ -236,11 +391,6 @@ pub struct PushBoundary<'a> {
     pub grants: &'a HouseGrants,
     /// The backend namespace the task's push grant names.
     pub destination: &'a BackendId,
-    /// The branch the task owns, from its durable record and never from the
-    /// pushing worker: the only branch this boundary reads and updates.
-    pub branch: &'a BranchName,
-    /// Where that branch sits, from the task's durable record.
-    pub layer: &'a BranchLayer,
     /// The house's configured stack tool, if any.
     pub stack_tool: Option<StackTool>,
     /// Time source.
@@ -254,14 +404,20 @@ pub struct PushBoundary<'a> {
 }
 
 impl PushBoundary<'_> {
-    /// Push `commit` to the bound branch for `task`.
+    /// Push `commit` to the task's branch.
     ///
     /// Nothing is read or sent until the task's live claim at `fence` and its
     /// delegated [`Permission::PushBranch`] for its repository are checked
-    /// against the house's current grants. A dependent layer is refused when
-    /// the house configures a stack tool. The pull request and the remote
-    /// head are then read, the push is checked against them, and the update
-    /// is a compare-and-swap on the head that was read.
+    /// against the house's current grants. The branch is the task's latest
+    /// launched branch; a branch a person holds is refused. A branch launched
+    /// as a stack layer is refused when the house configures a stack tool.
+    /// The remote must be the granted repository. The pull request and the
+    /// remote head are then read, a pull request based on another branch
+    /// than the default is refused under a stack tool, the push is checked
+    /// against both, and the update is a compare-and-swap on the head that
+    /// was read. A landed push is recorded, so a later first-push intent
+    /// cannot recreate the branch and a later intent must name the checked
+    /// pull request.
     ///
     /// # Errors
     /// Returns [`StateError::StaleFence`] when `fence` no longer holds a live
@@ -277,58 +433,77 @@ impl PushBoundary<'_> {
         intent: &PushIntent,
         commit: &CommitId,
     ) -> Result<PushOutcome> {
-        let record = self.store.task(task)?;
-        match record.state() {
-            TaskState::Claimed { lease }
-                if lease.fence() == fence && lease.is_live(self.clock.now()) => {}
-            TaskState::Claimed { .. } | TaskState::Open | TaskState::Settled { .. } => {
-                return Err(StateError::StaleFence { presented: fence }.into());
-            }
-        }
-        // Like every other effect, nothing starts once cancellation is pending.
-        if record.cancel_request().is_some() {
-            return Err(StateError::CancelRequested.into());
-        }
-        let repository = record
-            .spec()
-            .repository
-            .clone()
-            .ok_or(CoordinationError::MissingRepository)?;
-        record.spec().authority.authorize(
+        let (_, binding) = bind(
+            self.store,
             self.grants,
-            Permission::PushBranch,
-            &GrantScope::Repository(repository),
             self.destination,
+            self.clock,
+            task,
+            fence,
+            &[Permission::PushBranch],
         )?;
-
-        let operation = match intent.expected_remote {
-            None => BranchOperation::Create,
-            Some(_) => BranchOperation::Push,
+        let binding = match binding {
+            Ok(binding) => binding,
+            Err(refusal) => return Ok(PushOutcome::Refused(refusal)),
         };
-        if let Err(StackRefusal::StackToolRequired { tool, .. }) =
-            check_plain(self.stack_tool, self.layer, operation)
+        // A branch launched as a layer is a dependent layer: only the stack
+        // tool pushes it, before anything is read.
+        if binding.stacked
+            && let Some(tool) = self.stack_tool
         {
             return Ok(PushOutcome::Refused(PushRefusal::StackToolRequired(tool)));
         }
-        let observed = PushObservation {
-            pull_request: match intent.pull_request {
-                Some(number) => self.pull_requests.pull_request(number),
-                None => Observed::Known(None),
-            },
-            remote_head: self.remote.head(self.branch),
-        };
-        let permit = match decide(self.branch, intent, &observed, commit) {
-            Ok(Decision::Update(permit)) => permit,
-            Ok(Decision::Current) => return Ok(PushOutcome::AlreadyCurrent),
+        match (
+            self.remote.reads_from(&binding.repository),
+            self.updater.pushes_to(&binding.repository),
+        ) {
+            (Observed::Known(true), Observed::Known(true)) => {}
+            (Observed::Known(false), _) | (_, Observed::Known(false)) => {
+                return Ok(PushOutcome::Refused(PushRefusal::RemoteMismatch));
+            }
+            (Observed::Unknown, _) | (_, Observed::Unknown) => {
+                return Ok(PushOutcome::Refused(PushRefusal::Unknown));
+            }
+        }
+        let (observed, dependent) = match observe(
+            &binding,
+            intent,
+            self.pull_requests,
+            self.remote,
+            self.stack_tool.is_some(),
+        ) {
+            Ok(observed) => observed,
             Err(refusal) => return Ok(PushOutcome::Refused(refusal)),
         };
-        Ok(match self.updater.update(&permit, self.branch, commit) {
-            Ok(()) => PushOutcome::Pushed {
-                replaced: permit.replaces,
+        if let Some(tool) = self.stack_tool {
+            match dependent {
+                Observed::Known(false) => {}
+                Observed::Known(true) => {
+                    return Ok(PushOutcome::Refused(PushRefusal::StackToolRequired(tool)));
+                }
+                Observed::Unknown => return Ok(PushOutcome::Refused(PushRefusal::Unknown)),
+            }
+        }
+        let permit = match decide(&binding, intent, &observed, Some(commit)) {
+            Ok(Decision::Update(permit)) => permit,
+            Ok(Decision::Current) => {
+                record_landed(self.store, self.clock, task, fence, &binding, intent)?;
+                return Ok(PushOutcome::AlreadyCurrent);
+            }
+            Err(refusal) => return Ok(PushOutcome::Refused(refusal)),
+        };
+        Ok(
+            match self.updater.update(&permit, &binding.branch, commit) {
+                Ok(()) => {
+                    record_landed(self.store, self.clock, task, fence, &binding, intent)?;
+                    PushOutcome::Pushed {
+                        replaced: permit.replaces,
+                    }
+                }
+                Err(UpdateFailure::Rejected) => PushOutcome::Stale,
+                Err(UpdateFailure::Uncertain) => PushOutcome::Uncertain,
             },
-            Err(UpdateFailure::Rejected) => PushOutcome::Stale,
-            Err(UpdateFailure::Uncertain) => PushOutcome::Uncertain,
-        })
+        )
     }
 }
 
@@ -351,6 +526,15 @@ impl<T: GitHubReadTransport> PullRequests for GitHubPullRequests<'_, T> {
             Observed::Unknown => Observed::Unknown,
         }
     }
+
+    fn default_branch(&self) -> Observed<BranchName> {
+        match self.client.repository(self.house, self.repository) {
+            Observation::Known(info) => {
+                BranchName::new(&info.default_branch).map_or(Observed::Unknown, Observed::Known)
+            }
+            Observation::Unavailable(_) | Observation::Unknown => Observed::Unknown,
+        }
+    }
 }
 
 /// Longest Git output read, in bytes.
@@ -365,13 +549,32 @@ const GIT_POLL: Duration = Duration::from_millis(10);
 /// only if the ref still holds the expected value. It uses the credentials
 /// the checkout's Git already has and never prompts. Every call has a
 /// deadline; an expired call reports unknown or uncertain, never success.
+///
+/// The checkout belongs to the worker, so its Git configuration is not
+/// trusted. Before any read or push, the remote's fetch and push URLs, with
+/// `insteadOf` and `pushInsteadOf` rewrites applied, must both be the
+/// granted repository under one of the accepted URL bases (GitHub's HTTPS
+/// and SSH forms by default). Every call disables hooks and pins the SSH
+/// command and the remote's pack programs. Credential helpers configured in
+/// the checkout still run; a Kitchen-owned clone removes that limit.
 #[derive(Debug, Clone)]
 pub struct GitRemote {
     git: PathBuf,
     worktree: PathBuf,
     remote: String,
     deadline: Duration,
+    url_bases: Vec<String>,
 }
+
+/// The URL prefixes of GitHub repositories, followed by `owner/name`.
+const GITHUB_URL_BASES: [&str; 3] = [
+    "https://github.com/",
+    "git@github.com:",
+    "ssh://git@github.com/",
+];
+
+/// Longest accepted URL base, in bytes.
+const MAX_URL_BASE_BYTES: usize = 512;
 
 impl GitRemote {
     /// Longest remote name accepted, in bytes.
@@ -405,17 +608,98 @@ impl GitRemote {
             worktree,
             remote: remote.to_owned(),
             deadline,
+            url_bases: GITHUB_URL_BASES
+                .iter()
+                .map(|base| (*base).to_owned())
+                .collect(),
         })
     }
 
+    /// Accept repositories under these URL bases instead of GitHub's, such
+    /// as another forge's `https://host/` or a directory of bare
+    /// repositories. The remote's URL must be a base followed by
+    /// `owner/name`, optionally with `.git`.
+    ///
+    /// # Errors
+    /// Returns [`CoordinationError::InvalidGitRemote`] for no bases, or a
+    /// base that is empty, longer than 512 bytes, or has whitespace or
+    /// control characters.
+    pub fn with_url_bases(
+        mut self,
+        bases: &[&str],
+    ) -> std::result::Result<Self, CoordinationError> {
+        let valid = |base: &&str| {
+            !base.is_empty()
+                && base.len() <= MAX_URL_BASE_BYTES
+                && !base
+                    .chars()
+                    .any(|character| character.is_whitespace() || character.is_control())
+        };
+        if bases.is_empty() || !bases.iter().all(valid) {
+            return Err(CoordinationError::InvalidGitRemote);
+        }
+        self.url_bases = bases.iter().map(|base| (*base).to_owned()).collect();
+        Ok(self)
+    }
+
     fn run(&self, args: &[&str]) -> Option<(Option<i32>, Vec<u8>)> {
+        let receive = format!("remote.{}.receivepack=git-receive-pack", self.remote);
+        let upload = format!("remote.{}.uploadpack=git-upload-pack", self.remote);
+        // The worker can edit the checkout's configuration: its hooks, SSH
+        // command, and pack programs must not run under Kitchen.
+        let mut full = vec![
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.sshCommand=ssh",
+            "-c",
+            &receive,
+            "-c",
+            &upload,
+        ];
+        full.extend_from_slice(args);
         run_bounded(
             &self.git,
             &self.worktree,
-            args,
-            &[("GIT_TERMINAL_PROMPT", "0")],
+            &full,
+            &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_SSH_COMMAND", "ssh")],
             self.deadline,
         )
+    }
+
+    /// Whether `url` names `repository` under an accepted base.
+    fn names(&self, url: &str, repository: &Repository) -> bool {
+        let path = repository.as_str();
+        self.url_bases.iter().any(|base| {
+            url.strip_prefix(base.as_str()).is_some_and(|rest| {
+                let rest = rest.strip_suffix(".git").unwrap_or(rest);
+                rest.eq_ignore_ascii_case(path)
+            })
+        })
+    }
+
+    /// The remote's single URL after rewrites, for fetching or pushing.
+    fn url(&self, push: bool) -> Option<String> {
+        let mut args = vec!["remote", "get-url"];
+        if push {
+            args.push("--push");
+        }
+        args.push(&self.remote);
+        let (Some(0), stdout) = self.run(&args)? else {
+            return None;
+        };
+        let text = String::from_utf8(stdout).ok()?;
+        let mut lines = text.lines();
+        match (lines.next(), lines.next()) {
+            (Some(url), None) => Some(url.to_owned()),
+            _ => None,
+        }
+    }
+
+    fn bound_to(&self, repository: &Repository, push: bool) -> Observed<bool> {
+        self.url(push).map_or(Observed::Unknown, |url| {
+            Observed::Known(self.names(&url, repository))
+        })
     }
 }
 
@@ -473,6 +757,10 @@ fn read_bounded(file: &mut File) -> Option<Vec<u8>> {
 }
 
 impl RemoteBranches for GitRemote {
+    fn reads_from(&self, repository: &Repository) -> Observed<bool> {
+        self.bound_to(repository, false)
+    }
+
     fn head(&self, branch: &BranchName) -> Observed<Option<CommitId>> {
         let reference = format!("refs/heads/{branch}");
         let Some((Some(0), stdout)) = self.run(&["ls-remote", &self.remote, &reference]) else {
@@ -498,6 +786,10 @@ impl RemoteBranches for GitRemote {
 }
 
 impl RefUpdater for GitRemote {
+    fn pushes_to(&self, repository: &Repository) -> Observed<bool> {
+        self.bound_to(repository, true)
+    }
+
     fn update(
         &self,
         permit: &PushPermit,

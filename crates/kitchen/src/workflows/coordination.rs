@@ -52,7 +52,7 @@ use crate::{
         reconcile, run_effect,
     },
     workflows::{
-        pickup::{WorkerBrief, quote, stable_hash},
+        pickup::{Base, WorkerBrief, quote, stable_hash},
         recovery::{
             EnvironmentFault, FollowUp, ProviderCheck, ProviderInterruption, QueuedFollowUp,
             RecoverySignals, TerminalHolder, ValidationFailure, ValidationReport,
@@ -239,6 +239,53 @@ fn held_key(worker: &ResourceRef) -> Result<ExternalRef> {
     ))?)
 }
 
+/// A durable fact Kitchen records about one of a task's branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchFact {
+    /// The branch was launched as a layer on another branch.
+    Stacked,
+    /// A push through a boundary put the branch on the remote.
+    Published,
+    /// A push checked the branch's pull request; later pushes must name it.
+    PullRequestBound,
+}
+
+impl BranchFact {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stacked => "stacked",
+            Self::Published => "published",
+            Self::PullRequestBound => "pull-request",
+        }
+    }
+
+    fn key(self, branch: &BranchName) -> Result<ExternalRef> {
+        Ok(ExternalRef::new(&format!(
+            "branch-{}-{:016x}",
+            self.as_str(),
+            stable_hash(branch.as_str().as_bytes())
+        ))?)
+    }
+
+    /// Whether the task's record holds this fact about `branch`.
+    pub(crate) fn holds(self, record: &TaskRecord, branch: &BranchName) -> bool {
+        self.key(branch).is_ok_and(|key| record.has_consumed(&key))
+    }
+
+    /// Record this fact about `branch` for the task, under its live claim.
+    pub(crate) fn record(
+        self,
+        store: &HouseStore,
+        task: &TaskId,
+        fence: Fence,
+        branch: &BranchName,
+        now: Timestamp,
+    ) -> Result<()> {
+        store.consume_message(task, fence, &self.key(branch)?, now)?;
+        Ok(())
+    }
+}
+
 /// Whether supervision recorded that a person holds `worker`'s terminal.
 fn person_held(record: &TaskRecord, worker: &ResourceRef) -> bool {
     held_key(worker).is_ok_and(|key| record.has_consumed(&key))
@@ -363,6 +410,11 @@ pub fn launch_worker(
         }
         Err(error) => return Err(error),
     };
+    if matches!(brief.base, Base::Stack { .. }) {
+        // The push boundary reads the layer from this record, never from
+        // the writer.
+        BranchFact::Stacked.record(ctx.store, task, fence, &brief.branch, ctx.clock.now())?;
+    }
     let record = ctx.store.task(task)?;
     let role = record.spec().role;
     let revision = record.evidence().revision();

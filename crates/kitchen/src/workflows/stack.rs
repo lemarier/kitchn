@@ -2,12 +2,16 @@
 //!
 //! When a house configures a stack tool ([`StackTool`]), a dependent branch
 //! is created, rebased, retargeted, and pushed only through that tool. The
-//! plain paths (a Git push through [`crate::workflows::push`], a plain
-//! rebase, a pull-request base edit) call [`check_plain`] and are refused;
-//! the tool runs through [`StackBoundary`], which authorizes the task, binds
-//! the command to the task's branch, and never rewrites layers another
-//! writer is working on. [`GhStack`] runs `gh stack` with non-interactive
-//! flags and an explicit remote.
+//! push boundary ([`crate::workflows::push`]) refuses a branch launched as a
+//! layer or whose pull request is based on another branch than the default;
+//! other plain paths (a plain rebase, a pull-request base edit) call
+//! [`check_plain`] and are refused. The tool runs through [`StackBoundary`], which authorizes the task, binds
+//! the command to the branch its durable record names, applies the push
+//! boundary's pull-request and remote-head checks before anything reaches
+//! the remote, and never rewrites layers another writer is working on, as
+//! derived from the tool's own view of the stack and the house's tasks.
+//! [`GhStack`] runs `gh stack` with non-interactive flags and an explicit
+//! remote.
 //!
 //! [`plan_retarget`] turns a merged base pull request into the steps its
 //! dependents need, addressed to each branch's own writer.
@@ -21,12 +25,18 @@ use serde::Deserialize;
 
 use crate::{
     BackendId, TaskId,
-    contracts::{
-        BranchName, Clock, CommitId, Fence, GrantScope, HouseGrants, IssueNumber, Permission,
-    },
+    contracts::{BranchName, Clock, CommitId, Fence, HouseGrants, IssueNumber, Permission},
     house::{StackTool, StackToolStatus},
-    state::{HouseStore, StateError, TaskState},
-    workflows::{coordination::CoordinationError, push::run_bounded},
+    state::{HouseStore, TaskState},
+    workflows::{
+        coordination::{CoordinationError, held_branches, task_branch},
+        pickup::is_shell_safe,
+        push::{
+            Decision, PullRequests, PushIntent, PushRefusal, RemoteBranches, bind, decide, observe,
+            record_landed, run_bounded,
+        },
+        repair::Observed,
+    },
 };
 
 type Result<T> = std::result::Result<T, crate::Error>;
@@ -82,6 +92,14 @@ pub enum StackRefusal {
     /// The command names no layer, too many, or one twice.
     #[error("the stack layers are empty, too many, repeated, or not linear")]
     InvalidLayers,
+    /// A branch name has characters that are unsafe in an instruction a
+    /// writer runs in a shell.
+    #[error("a branch name is unsafe in a shell instruction")]
+    UnsafeBranchName,
+    /// The push boundary's checks refused the task's branch, its pull
+    /// request, or its remote head.
+    #[error("the push boundary refused the stack command")]
+    Push(PushRefusal),
 }
 
 /// Check a plain branch operation. With a configured stack tool, a
@@ -141,6 +159,26 @@ impl StackCommand {
         match self {
             Self::RebaseUpstack | Self::Push | Self::Submit { .. } => true,
             Self::Adopt { .. } | Self::Add { .. } | Self::View => false,
+        }
+    }
+
+    /// The permissions the command exercises: every command acts on the
+    /// task's branch, and a submission also opens pull requests and, when
+    /// `ready`, asks for their review.
+    #[must_use]
+    pub const fn permissions(&self) -> &'static [Permission] {
+        match self {
+            Self::Submit { ready: false } => &[Permission::PushBranch, Permission::OpenPullRequest],
+            Self::Submit { ready: true } => &[
+                Permission::PushBranch,
+                Permission::OpenPullRequest,
+                Permission::RequestReview,
+            ],
+            Self::Adopt { .. }
+            | Self::Add { .. }
+            | Self::RebaseUpstack
+            | Self::Push
+            | Self::View => &[Permission::PushBranch],
         }
     }
 }
@@ -369,6 +407,49 @@ pub enum Upstack {
     Unknown,
 }
 
+/// Derive who works above `branch` from the stack tool's `view` and the
+/// house's tasks: a layer whose task is still open, or whose worker a person
+/// holds, is busy; a layer no task of this house owns is unknown, since a
+/// person may be working on it.
+///
+/// # Errors
+/// Returns store read failures.
+pub fn upstack(store: &HouseStore, view: &StackView, branch: &BranchName) -> Result<Upstack> {
+    let Some(position) = view.branches.iter().position(|layer| &layer.name == branch) else {
+        return Ok(Upstack::Unknown);
+    };
+    let above: Vec<&StackLayerView> = view
+        .branches
+        .iter()
+        .skip(position.saturating_add(1))
+        .filter(|layer| !layer.is_merged)
+        .collect();
+    if above.is_empty() {
+        return Ok(Upstack::Top);
+    }
+    let tasks = store.tasks()?;
+    let mut state = Upstack::Idle;
+    for layer in above {
+        let owner = tasks
+            .iter()
+            .find(|record| task_branch(record).as_ref() == Some(&layer.name));
+        let layer_state = match owner {
+            None => Upstack::Unknown,
+            Some(record) if held_branches(record).contains(&layer.name) => Upstack::Busy,
+            Some(record) => match record.state() {
+                TaskState::Settled { .. } => Upstack::Idle,
+                TaskState::Open | TaskState::Claimed { .. } => Upstack::Busy,
+            },
+        };
+        state = match (state, layer_state) {
+            (Upstack::Busy, _) | (_, Upstack::Busy) => Upstack::Busy,
+            (Upstack::Unknown, _) | (_, Upstack::Unknown) => Upstack::Unknown,
+            (Upstack::Idle | Upstack::Top, Upstack::Idle | Upstack::Top) => Upstack::Idle,
+        };
+    }
+    Ok(state)
+}
+
 /// What a stack-tool command acts through, bound to one task's branch.
 #[derive(Clone, Copy)]
 pub struct StackBoundary<'a> {
@@ -378,14 +459,14 @@ pub struct StackBoundary<'a> {
     pub grants: &'a HouseGrants,
     /// The backend namespace the task's push grant names.
     pub destination: &'a BackendId,
-    /// The branch the task owns, from its durable record.
-    pub branch: &'a BranchName,
-    /// Writers on the layers above it.
-    pub upstack: Upstack,
     /// Time source.
     pub clock: &'a dyn Clock,
     /// The stack tool.
     pub runner: &'a dyn StackRunner,
+    /// Pull request reads.
+    pub pull_requests: &'a dyn PullRequests,
+    /// Remote head reads, through the remote the tool pushes to.
+    pub remote: &'a dyn RemoteBranches,
 }
 
 /// What a stack-tool command through the boundary did.
@@ -399,79 +480,124 @@ pub enum StackOutcome {
 
 impl StackBoundary<'_> {
     /// Run `command` for `task`. Nothing runs until the task's live claim at
-    /// `fence` and its delegated [`Permission::PushBranch`] for its
-    /// repository are checked against the house's current grants. The command
-    /// must name only the task's branch, and a command that rewrites or
-    /// pushes upper layers needs them free of other writers.
+    /// `fence` and every permission the command exercises
+    /// ([`StackCommand::permissions`]) for its repository are checked
+    /// against the house's current grants. The task's branch comes from its
+    /// durable record, and a branch a person holds is refused. The command
+    /// must name only that branch. Before a command that fetches, rewrites,
+    /// or pushes, the remote must be the granted repository, and the pull
+    /// request and remote head are checked exactly as the push boundary
+    /// checks them against `intent`: a merged or closed pull request, a
+    /// deleted or moved branch, or an unreadable state refuses. Such a
+    /// command also needs every layer above free of other writers, derived
+    /// through [`upstack`] from the tool's view of the stack.
     ///
     /// # Errors
-    /// Returns [`StateError::StaleFence`] without a live claim at `fence`,
-    /// [`StateError::CancelRequested`] while cancellation is pending, and
-    /// contract errors when the task lacks the grant or the house revoked it.
-    pub fn run(&self, task: &TaskId, fence: Fence, command: &StackCommand) -> Result<StackOutcome> {
-        let record = self.store.task(task)?;
-        match record.state() {
-            TaskState::Claimed { lease }
-                if lease.fence() == fence && lease.is_live(self.clock.now()) => {}
-            TaskState::Claimed { .. } | TaskState::Open | TaskState::Settled { .. } => {
-                return Err(StateError::StaleFence { presented: fence }.into());
-            }
-        }
-        if record.cancel_request().is_some() {
-            return Err(StateError::CancelRequested.into());
-        }
-        let repository = record
-            .spec()
-            .repository
-            .clone()
-            .ok_or(CoordinationError::MissingRepository)?;
-        record.spec().authority.authorize(
+    /// Returns [`crate::state::StateError::StaleFence`] without a live claim
+    /// at `fence`, [`crate::state::StateError::CancelRequested`] while
+    /// cancellation is pending, contract errors when the task lacks a grant
+    /// or the house revoked it, and store read failures.
+    pub fn run(
+        &self,
+        task: &TaskId,
+        fence: Fence,
+        command: &StackCommand,
+        intent: &PushIntent,
+    ) -> Result<StackOutcome> {
+        let (_, binding) = bind(
+            self.store,
             self.grants,
-            Permission::PushBranch,
-            &GrantScope::Repository(repository),
             self.destination,
+            self.clock,
+            task,
+            fence,
+            command.permissions(),
         )?;
-        if let Err(refusal) = self.check(command) {
+        let binding = match binding {
+            Ok(binding) => binding,
+            Err(refusal) => return Ok(StackOutcome::Refused(StackRefusal::Push(refusal))),
+        };
+        if let Err(refusal) = check_layers(command, &binding.branch) {
             return Ok(StackOutcome::Refused(refusal));
         }
-        Ok(StackOutcome::Ran(self.runner.run(command)))
+        if !command.touches_upstack() {
+            return Ok(StackOutcome::Ran(self.runner.run(command)));
+        }
+        match self.remote.reads_from(&binding.repository) {
+            Observed::Known(true) => {}
+            Observed::Known(false) => {
+                return Ok(refused(PushRefusal::RemoteMismatch));
+            }
+            Observed::Unknown => return Ok(refused(PushRefusal::Unknown)),
+        }
+        let observed = match observe(&binding, intent, self.pull_requests, self.remote, false) {
+            Ok((observed, _)) => observed,
+            Err(refusal) => return Ok(refused(refusal)),
+        };
+        match decide(&binding, intent, &observed, None) {
+            Ok(Decision::Update(_) | Decision::Current) => {}
+            Err(refusal) => return Ok(refused(refusal)),
+        }
+        let above = match self.runner.run(&StackCommand::View) {
+            StackResult::Viewed(view) => upstack(self.store, &view, &binding.branch)?,
+            StackResult::Done
+            | StackResult::Conflict
+            | StackResult::RebaseInProgress
+            | StackResult::Locked
+            | StackResult::NotInStack
+            | StackResult::Rejected
+            | StackResult::Uncertain => Upstack::Unknown,
+        };
+        match above {
+            Upstack::Top | Upstack::Idle => {}
+            Upstack::Busy | Upstack::Unknown => {
+                return Ok(StackOutcome::Refused(StackRefusal::UpstackBusy));
+            }
+        }
+        let result = self.runner.run(command);
+        if result == StackResult::Done
+            && matches!(command, StackCommand::Push | StackCommand::Submit { .. })
+        {
+            record_landed(self.store, self.clock, task, fence, &binding, intent)?;
+        }
+        Ok(StackOutcome::Ran(result))
     }
+}
 
-    fn check(&self, command: &StackCommand) -> std::result::Result<(), StackRefusal> {
-        match command {
-            StackCommand::Adopt { trunk, branches } => {
-                let mut seen: Vec<&BranchName> = Vec::with_capacity(branches.len());
-                for branch in branches {
-                    if branch == trunk || seen.contains(&branch) {
-                        return Err(StackRefusal::InvalidLayers);
-                    }
-                    seen.push(branch);
-                }
-                if branches.is_empty() || branches.len() > MAX_STACK_LAYERS {
+const fn refused(refusal: PushRefusal) -> StackOutcome {
+    StackOutcome::Refused(StackRefusal::Push(refusal))
+}
+
+/// The command may name only the task's own branch.
+fn check_layers(
+    command: &StackCommand,
+    branch: &BranchName,
+) -> std::result::Result<(), StackRefusal> {
+    match command {
+        StackCommand::Adopt { trunk, branches } => {
+            let mut seen: Vec<&BranchName> = Vec::with_capacity(branches.len());
+            for layer in branches {
+                if layer == trunk || seen.contains(&layer) {
                     return Err(StackRefusal::InvalidLayers);
                 }
-                // Adopting records the chain; it rewrites nothing, but the
-                // task must own one of its layers.
-                if !branches.contains(self.branch) {
-                    return Err(StackRefusal::ForeignBranch);
-                }
+                seen.push(layer);
             }
-            StackCommand::Add { branch } if branch != self.branch => {
+            if branches.is_empty() || branches.len() > MAX_STACK_LAYERS {
+                return Err(StackRefusal::InvalidLayers);
+            }
+            // Adopting records the chain; it rewrites nothing, but the task
+            // must own one of its layers.
+            if !branches.contains(branch) {
                 return Err(StackRefusal::ForeignBranch);
             }
-            StackCommand::Add { .. }
-            | StackCommand::RebaseUpstack
-            | StackCommand::Push
-            | StackCommand::Submit { .. }
-            | StackCommand::View => {}
+            Ok(())
         }
-        match self.upstack {
-            Upstack::Top | Upstack::Idle => Ok(()),
-            Upstack::Busy | Upstack::Unknown if command.touches_upstack() => {
-                Err(StackRefusal::UpstackBusy)
-            }
-            Upstack::Busy | Upstack::Unknown => Ok(()),
-        }
+        StackCommand::Add { branch: added } if added != branch => Err(StackRefusal::ForeignBranch),
+        StackCommand::Add { .. }
+        | StackCommand::RebaseUpstack
+        | StackCommand::Push
+        | StackCommand::Submit { .. }
+        | StackCommand::View => Ok(()),
     }
 }
 
@@ -537,8 +663,32 @@ pub enum RetargetStep {
 }
 
 impl RetargetStep {
+    /// The command for the branch's writer, for a
+    /// [`RetargetStep::RebaseOnto`] step, as separate arguments to run
+    /// without a shell.
+    #[must_use]
+    pub fn args(&self) -> Option<Vec<String>> {
+        match self {
+            Self::RebaseOnto {
+                branch,
+                onto,
+                upstream,
+            } => Some(vec![
+                "git".to_owned(),
+                "rebase".to_owned(),
+                "--onto".to_owned(),
+                onto.to_string(),
+                upstream.to_string(),
+                branch.to_string(),
+            ]),
+            Self::Retarget { .. } | Self::StackTool { .. } => None,
+        }
+    }
+
     /// The instruction text for the branch's writer, for a
-    /// [`RetargetStep::RebaseOnto`] step.
+    /// [`RetargetStep::RebaseOnto`] step. `None` unless every name is safe
+    /// to read as one shell word ([`is_shell_safe`]); [`plan_retarget`]
+    /// refuses other names before any step exists.
     #[must_use]
     pub fn instruction(&self) -> Option<String> {
         match self {
@@ -546,8 +696,10 @@ impl RetargetStep {
                 branch,
                 onto,
                 upstream,
-            } => Some(format!("git rebase --onto {onto} {upstream} {branch}")),
-            Self::Retarget { .. } | Self::StackTool { .. } => None,
+            } if is_shell_safe(branch) && is_shell_safe(onto) => {
+                Some(format!("git rebase --onto {onto} {upstream} {branch}"))
+            }
+            Self::RebaseOnto { .. } | Self::Retarget { .. } | Self::StackTool { .. } => None,
         }
     }
 }
@@ -574,7 +726,9 @@ pub struct RetargetPlan {
 ///
 /// # Errors
 /// Returns [`StackRefusal::InvalidLayers`] when the chain branches (two
-/// dependents on one base) or is longer than [`MAX_STACK_LAYERS`].
+/// dependents on one base) or is longer than [`MAX_STACK_LAYERS`], and
+/// [`StackRefusal::UnsafeBranchName`] when a branch in the plan, read from
+/// pull-request data, is not [`is_shell_safe`].
 pub fn plan_retarget(
     tool: Option<StackTool>,
     merged: &MergedBase,
@@ -594,6 +748,16 @@ pub fn plan_retarget(
         }
         chain.push(next);
         base = &next.branch;
+    }
+    let names = [&merged.branch, &merged.into].into_iter().chain(
+        chain
+            .iter()
+            .flat_map(|dependent| [&dependent.branch, &dependent.base]),
+    );
+    for name in names {
+        if !is_shell_safe(name) {
+            return Err(StackRefusal::UnsafeBranchName);
+        }
     }
     let steps = match (tool, chain.first()) {
         (_, None) => Vec::new(),

@@ -54,6 +54,20 @@ pub struct IssueSources {
     pub linked_prs: Vec<LinkedPullRequest>,
 }
 
+impl IssueSources {
+    /// Newest observed comment identity for a durable issue marker key.
+    pub fn last_comment(&self) -> Result<Option<ExternalRef>, WorkflowError> {
+        self.comments
+            .iter()
+            .map(|comment| comment.id)
+            .max()
+            .map(|id| {
+                ExternalRef::new(&id.to_string()).map_err(|_| WorkflowError::IncompleteEvidence)
+            })
+            .transpose()
+    }
+}
+
 fn known<T>(observation: Observation<T>) -> Result<T, WorkflowError> {
     match observation {
         Observation::Known(value) => Ok(value),

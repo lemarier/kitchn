@@ -99,6 +99,28 @@ fn triage_collects_complete_forge_sources_and_rejects_partial_reads()
     let collected = triage::collect_issue(&client, &house, &repo, issue(10))?;
     assert_eq!(collected.detail.body.as_deref(), Some("request"));
     assert!(collected.linked_prs.is_empty());
+    assert_eq!(collected.last_comment()?, None);
+    let mut with_comments = collected.clone();
+    for id in [17, 11] {
+        with_comments
+            .comments
+            .push(kitchen::integrations::github::IssueComment {
+                id,
+                user: kitchen::integrations::github::User {
+                    login: "owner".into(),
+                },
+                body: "question".into(),
+                created_at: "2026-01-02T00:00:00Z".into(),
+                updated_at: "2026-01-02T00:00:00Z".into(),
+            });
+    }
+    assert_eq!(
+        with_comments
+            .last_comment()?
+            .as_ref()
+            .map(ExternalRef::as_str),
+        Some("17")
+    );
     let mut stale = pages.clone();
     stale[7]["updated_at"] = json!("2026-01-03T00:00:00Z");
     let client = github_client(stale)?;

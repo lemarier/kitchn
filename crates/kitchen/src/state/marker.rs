@@ -514,10 +514,12 @@ impl Markers {
         key: &MarkerKey,
         expected: &MarkerFact,
     ) -> Result<(), MarkerRefusal> {
-        let Some(index) = self.0.iter().position(|marker| &marker.key == key) else {
-            return Err(MarkerRefusal::Missing);
-        };
-        let Some(marker) = self.0.get(index) else {
+        let Some((index, marker)) = self
+            .0
+            .iter()
+            .enumerate()
+            .find(|(_, marker)| &marker.key == key)
+        else {
             return Err(MarkerRefusal::Missing);
         };
         if &marker.fact != expected {

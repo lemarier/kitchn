@@ -32,7 +32,7 @@ mod git;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
+    fmt::{self, Write as _},
     num::NonZeroU32,
     path::PathBuf,
     time::Duration,
@@ -144,8 +144,7 @@ pub struct Inspector<'a> {
 }
 
 /// A reason a resource is retained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Exclusion {
     /// The resource belongs to another backend namespace.
     ForeignBackend,
@@ -187,6 +186,47 @@ pub enum Exclusion {
     UntrackedFiles,
     /// `HEAD` has commits that are neither pushed nor the merged head.
     UnpreservedCommits,
+}
+
+impl Exclusion {
+    /// The stable kebab-case name, as serialized.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ForeignBackend => "foreign-backend",
+            Self::NotReclaimable => "not-reclaimable",
+            Self::UnknownOwner => "unknown-owner",
+            Self::AmbiguousOwner => "ambiguous-owner",
+            Self::BackendOwnerMismatch => "backend-owner-mismatch",
+            Self::OwnerActive => "owner-active",
+            Self::UnresolvedEffects => "unresolved-effects",
+            Self::SharedWithTask => "shared-with-task",
+            Self::InUse => "in-use",
+            Self::LivenessUnverifiable => "liveness-unverifiable",
+            Self::UserTakeover => "user-takeover",
+            Self::WorkerNotSettled => "worker-not-settled",
+            Self::SiblingInUse => "sibling-in-use",
+            Self::WorktreeUnlocated => "worktree-unlocated",
+            Self::WorktreeUnreadable => "worktree-unreadable",
+            Self::MainCheckout => "main-checkout",
+            Self::WorktreeLocked => "worktree-locked",
+            Self::TrackedChanges => "tracked-changes",
+            Self::UntrackedFiles => "untracked-files",
+            Self::UnpreservedCommits => "unpreserved-commits",
+        }
+    }
+}
+
+impl fmt::Display for Exclusion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Exclusion {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 /// What the dishwasher would do with a resource.

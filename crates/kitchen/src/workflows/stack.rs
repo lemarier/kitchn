@@ -14,7 +14,10 @@
 //! branch must still be an open pull request on the same base chain whose
 //! remote and pull-request heads are the head the checkout holds
 //! ([`LowerLayerFault`]); a lower layer someone else moved, merged, closed,
-//! or retargeted refuses the command with that layer named. The boundary
+//! or retargeted refuses the command with that layer named. Every unmerged
+//! layer above it must hold no remote commit the checkout has not
+//! integrated, and one with a pull request must still be open with its
+//! branch on the remote ([`UpperLayerFault`]). The boundary
 //! then pushes the layers itself in one atomic update leased to the heads it
 //! checked, so a layer moved after the check fails the whole push, and uses
 //! the tool only to link pull requests that already exist, named by number.
@@ -122,6 +125,15 @@ pub enum StackRefusal {
         /// What is wrong with it.
         fault: LowerLayerFault,
     },
+    /// A layer above the task's branch is not in a state the push may
+    /// replace.
+    #[error("upper stack layer {branch} is not in a state this push may replace")]
+    UpperLayer {
+        /// The upper layer.
+        branch: BranchName,
+        /// What is wrong with it.
+        fault: UpperLayerFault,
+    },
     /// A submission reached a layer at or above the task's branch that has
     /// no pull request. The stack tool opens one only by pushing the branch
     /// itself, outside the boundary's leased push, so nothing is pushed.
@@ -151,6 +163,27 @@ pub enum LowerLayerFault {
     HeadMoved,
     /// The pull request, the remote head, or the checkout's head could not be
     /// read.
+    Unknown,
+}
+
+/// Why a layer above the task's branch refuses a stack push or submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UpperLayerFault {
+    /// Its pull request merged or closed, though the stack tool still holds
+    /// the layer as unmerged.
+    NotOpen(PullRequestState),
+    /// Its pull request's head branch is not the layer.
+    WrongBranch,
+    /// It has a pull request but its remote branch is gone, such as after
+    /// the forge deleted a merged branch: the push would recreate it.
+    BranchDeleted,
+    /// Its remote head is neither in the checkout's branch history nor in
+    /// that branch's reflog: the push would drop commits the checkout never
+    /// integrated.
+    NotIntegrated,
+    /// Its pull request, remote head, or checkout head could not be read,
+    /// or the checkout lacks the layer.
     Unknown,
 }
 
@@ -312,7 +345,19 @@ pub trait LocalBranches {
     /// The head of the local `branch`, `Known(None)` when it does not exist,
     /// and `Unknown` when it could not be read.
     fn local_head(&self, branch: &BranchName) -> Observed<Option<CommitId>>;
+
+    /// Whether the local `branch` integrated `commit`: `commit` is in the
+    /// branch's current history, or is an entry of its reflog, as a rebase
+    /// leaves the replaced head. Git's `--force-if-includes` also accepts a
+    /// commit reachable only from an older reflog entry; this refuses it.
+    /// `Known(false)` when the checkout lacks `commit`.
+    fn includes(&self, branch: &BranchName, commit: &CommitId) -> Observed<bool>;
 }
+
+/// Most reflog entries [`LocalBranches::includes`] reads for one branch. A
+/// replaced head older than that is not found, so the push is refused unless
+/// the head is still in the branch's history.
+const MAX_REFLOG_ENTRIES: &str = "256";
 
 impl LocalBranches for GitRemote {
     fn local_head(&self, branch: &BranchName) -> Observed<Option<CommitId>> {
@@ -324,6 +369,41 @@ impl LocalBranches for GitRemote {
                 .map_or(Observed::Unknown, |id| Observed::Known(Some(id))),
             // `--verify --quiet` exits 1 without output for a missing ref.
             Some((Some(1), stdout)) if stdout.is_empty() => Observed::Known(None),
+            Some(_) | None => Observed::Unknown,
+        }
+    }
+
+    fn includes(&self, branch: &BranchName, commit: &CommitId) -> Observed<bool> {
+        let reference = format!("refs/heads/{branch}");
+        let reflog = self.run(&[
+            "log",
+            "--walk-reflogs",
+            "--max-count",
+            MAX_REFLOG_ENTRIES,
+            "--format=%H",
+            &reference,
+            "--",
+        ]);
+        match reflog {
+            Some((Some(0), stdout)) => {
+                if stdout
+                    .split(|byte| *byte == b'\n')
+                    .any(|line| line == commit.as_str().as_bytes())
+                {
+                    return Observed::Known(true);
+                }
+            }
+            Some(_) | None => return Observed::Unknown,
+        }
+        // `cat-file -e` exits 1 without output for a missing object.
+        match self.run(&["cat-file", "-e", commit.as_str()]) {
+            Some((Some(0), _)) => {}
+            Some((Some(1), _)) => return Observed::Known(false),
+            Some(_) | None => return Observed::Unknown,
+        }
+        match self.run(&["merge-base", "--is-ancestor", commit.as_str(), &reference]) {
+            Some((Some(0), _)) => Observed::Known(true),
+            Some((Some(1), _)) => Observed::Known(false),
             Some(_) | None => Observed::Unknown,
         }
     }
@@ -691,7 +771,10 @@ impl StackBoundary<'_> {
     /// command also needs every layer above free of other writers, derived
     /// through [`upstack`] from the tool's view of the stack. A push or
     /// submission also needs every unmerged layer below to be as the checkout
-    /// holds it ([`LowerLayerFault`]).
+    /// holds it ([`LowerLayerFault`]), and every unmerged layer above to
+    /// hold no remote commit the checkout has not integrated and, with a pull
+    /// request, to be open with its branch on the remote
+    /// ([`UpperLayerFault`]).
     ///
     /// The tool never pushes a push or submission's layers. The boundary
     /// pushes every unmerged layer in one atomic update
@@ -873,7 +956,7 @@ impl StackBoundary<'_> {
     /// Every unmerged layer's update, bottom to top: lower layers held at
     /// their checked heads ([`Self::check_lower`]), the task's branch moved
     /// from `replaces` to `local`, and each layer above moved from its
-    /// remote head to the checkout's.
+    /// remote head to the checkout's ([`Self::check_upper`]).
     fn plan_push(
         &self,
         view: &StackView,
@@ -900,15 +983,60 @@ impl StackBoundary<'_> {
         let mut updates = self.check_lower(lower, &view.trunk)?;
         updates.push(LayerUpdate::new(binding.branch.clone(), replaces, local));
         for layer in rest.iter().skip(1).filter(|layer| !layer.is_merged) {
-            let (Observed::Known(Some(head)), Observed::Known(remote)) = (
-                self.local.local_head(&layer.name),
-                self.remote.head(&layer.name),
-            ) else {
-                return Err(StackRefusal::Push(PushRefusal::Unknown));
-            };
-            updates.push(LayerUpdate::new(layer.name.clone(), remote, head));
+            let update = self
+                .check_upper(layer)
+                .map_err(|fault| StackRefusal::UpperLayer {
+                    branch: layer.name.clone(),
+                    fault,
+                })?;
+            updates.push(update);
         }
         Ok(LayersPermit::new(binding.repository.clone(), updates))
+    }
+
+    /// Check a layer above the task's branch and return its update, from
+    /// its remote head to the checkout's. The lease alone only guards
+    /// against a change during the push; this check refuses a remote head the
+    /// checkout never integrated, and, for a layer with a pull request, a
+    /// merged or closed pull request or a deleted branch.
+    fn check_upper(
+        &self,
+        layer: &StackLayerView,
+    ) -> std::result::Result<LayerUpdate, UpperLayerFault> {
+        let (Observed::Known(Some(local)), Observed::Known(remote)) = (
+            self.local.local_head(&layer.name),
+            self.remote.head(&layer.name),
+        ) else {
+            return Err(UpperLayerFault::Unknown);
+        };
+        if let Some(pr) = layer.pr {
+            let Observed::Known(Some(pull_request)) = self.pull_requests.pull_request(pr.number)
+            else {
+                return Err(UpperLayerFault::Unknown);
+            };
+            if pull_request.number != pr.number || pull_request.head_branch != layer.name.as_str() {
+                return Err(UpperLayerFault::WrongBranch);
+            }
+            match pull_request.state {
+                PullRequestState::Open => {}
+                state @ (PullRequestState::Merged | PullRequestState::Closed) => {
+                    return Err(UpperLayerFault::NotOpen(state));
+                }
+            }
+            if remote.is_none() {
+                return Err(UpperLayerFault::BranchDeleted);
+            }
+        }
+        if let Some(remote) = &remote
+            && remote != &local
+        {
+            match self.local.includes(&layer.name, remote) {
+                Observed::Known(true) => {}
+                Observed::Known(false) => return Err(UpperLayerFault::NotIntegrated),
+                Observed::Unknown => return Err(UpperLayerFault::Unknown),
+            }
+        }
+        Ok(LayerUpdate::new(layer.name.clone(), remote, local))
     }
 
     fn check_layer(

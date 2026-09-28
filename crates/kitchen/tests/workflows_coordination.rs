@@ -19,9 +19,8 @@ use kitchen::{
     workflows::{
         coordination::{
             Completion, CoordinatorStart, Escalation, HumanDecision, LaunchOutcome,
-            QuestionEscalation, QuestionRoute, Response, RogerChannel, Supervision,
-            TerminalControl, WorkerQuestion, handle_question, launch_worker,
-            relinquish_coordinator, start_coordinator, supervise,
+            QuestionEscalation, QuestionRoute, Response, RogerChannel, Supervision, WorkerQuestion,
+            handle_question, launch_worker, relinquish_coordinator, start_coordinator, supervise,
         },
         pickup::{ClaimOutcome, claim_issue, issue_task_id},
     },
@@ -64,14 +63,7 @@ fn launched(world: &World, task: &TaskId, fence: Fence, number: u64) -> TestResu
 }
 
 fn step(world: &World, task: &TaskId, fence: Fence) -> TestResult<Supervision> {
-    Ok(supervise(
-        &world.ctx(),
-        task,
-        fence,
-        &supervision()?,
-        TerminalControl::Agent,
-        None,
-    )?)
+    Ok(supervise(&world.ctx(), task, fence, &supervision()?, None)?)
 }
 
 fn report(verdict: EvidenceVerdict) -> TestResult<Evidence> {
@@ -118,16 +110,8 @@ fn a_worker_settles_only_with_readable_passing_evidence_on_its_exact_branch() ->
         Supervision::Escalate(Escalation::MissingEvidence)
     );
     let policy = supervision()?;
-    let run = |completion: &Completion| {
-        supervise(
-            &world.ctx(),
-            &task,
-            fence,
-            &policy,
-            TerminalControl::Agent,
-            Some(completion),
-        )
-    };
+    let run =
+        |completion: &Completion| supervise(&world.ctx(), &task, fence, &policy, Some(completion));
     let prefixed = completion("orca/lemarier/issue-1", EvidenceVerdict::Pass)?;
     assert_eq!(
         run(&prefixed)?,
@@ -164,7 +148,7 @@ fn an_uncertain_launch_is_reconciled_and_never_repeated() -> TestResult {
     let capabilities = CapabilitySet::supporting(
         Capability::ALL
             .into_iter()
-            .filter(|capability| *capability != Capability::EffectIdempotentRequests),
+            .filter(|capability| !capability.as_str().starts_with("effect.idempotent")),
     );
     let world = World::with_capabilities(capabilities)?;
     let (task, fence) = claim(&world, "coordinator", 1, 3)?;
@@ -258,21 +242,16 @@ fn a_person_owns_a_taken_over_terminal() -> TestResult {
     let worker = launched(&world, &task, fence, 1)?;
     world.clock.advance(200);
     let calls = world.backend.execute_calls();
-    let outcome = supervise(
-        &world.ctx(),
-        &task,
-        fence,
-        &supervision()?,
-        TerminalControl::UserTakeover,
-        None,
-    )?;
-    assert_eq!(outcome, Supervision::PersonOwnsTerminal);
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::UserTakeover);
+    assert_eq!(step(&world, &task, fence)?, Supervision::PersonOwnsTerminal);
     // Past the readiness deadline, but nothing is stopped or sent.
     assert_eq!(world.backend.execute_calls(), calls);
     use kitchen::contracts::WorkerBackend;
     assert_eq!(
         world.backend.observe_worker(&worker)?,
-        WorkerState::Starting
+        WorkerState::UserTakeover
     );
     Ok(())
 }
@@ -309,7 +288,6 @@ fn decision(task: &TaskId) -> TestResult<HumanDecision> {
     Ok(HumanDecision {
         action: Permission::OpenPullRequest,
         target: ExternalRef::new(&format!("task:{task}"))?,
-        subject: commit('d')?,
         limits: Text::new("Open one draft pull request.")?,
         kind: AskKind::Approval,
         risk: AskRisk::Routine,
@@ -367,6 +345,26 @@ fn human_decisions_go_through_roger_only_when_installed() -> TestResult {
         requester: &requester,
         budget: PostingBudget::new(3)?,
     };
+    // Without an evidence subject there is no exact head to decide on.
+    assert_eq!(
+        handle_question(
+            &world.ctx(),
+            &task,
+            fence,
+            &supervision()?,
+            &asked,
+            &human,
+            Some(&channel)
+        )?,
+        QuestionRoute::Escalate(QuestionEscalation::NoSubject)
+    );
+    assert_eq!(roger.execute_calls(), 0);
+    let evidence = report(EvidenceVerdict::Pass)?;
+    let subject = evidence.subject.clone();
+    world
+        .fixture
+        .store
+        .record_evidence(&task, fence, evidence, world.now())?;
     let policy = kitchen::workflows::coordination::SupervisionPolicy {
         question_deadline: std::time::Duration::from_secs(100),
         ..supervision()?
@@ -392,6 +390,7 @@ fn human_decisions_go_through_roger_only_when_installed() -> TestResult {
         effect.request().effect(),
         kitchen::contracts::Effect::Roger(ask) if ask.ask.binding.task == task
             && ask.ask.binding.house == house
+            && ask.ask.binding.subject.as_ref() == Some(&subject)
     )));
 
     // Past the deadline an unanswered decision is escalated, not re-asked.
@@ -729,6 +728,12 @@ fn a_refused_human_ask_stays_escalated_and_is_not_retried_silently() -> TestResu
         CapabilitySet::supporting([Capability::AskHuman]),
     );
     roger.inject(ExecuteFault::Reject);
+    world.fixture.store.record_evidence(
+        &task,
+        fence,
+        report(EvidenceVerdict::Pass)?,
+        world.now(),
+    )?;
     let requester = ExternalRef::new("kitchen-origin89-pickup")?;
     let channel = RogerChannel {
         executor: &roger,
@@ -843,7 +848,7 @@ fn an_uncertain_stop_blocks_until_reconciled_and_then_frees_the_attempt() -> Tes
     let capabilities = CapabilitySet::supporting(
         Capability::ALL
             .into_iter()
-            .filter(|capability| *capability != Capability::EffectIdempotentRequests),
+            .filter(|capability| !capability.as_str().starts_with("effect.idempotent")),
     );
     let world = World::with_capabilities(capabilities)?;
     let (task, fence) = claim(&world, "coordinator", 1, 3)?;
@@ -1081,14 +1086,23 @@ fn a_launch_is_accepted_when_the_backend_reports_the_exact_branch_or_none() -> T
         launch_on(&world, "lemarier/issue-1", false, &task, fence)?,
         LaunchOutcome::Accepted { .. }
     ));
-    // Until the contract carries the requested branch, a backend that
-    // reports none is not refused; settlement still checks the branch.
+    // The launch request names the exact branch, so the backend creates it
+    // rather than learning it from prose in the brief.
     let world = World::new()?;
     let (task, fence) = claim(&world, "coordinator", 1, 3)?;
     assert!(matches!(
         launch(&world, &task, fence, 1)?,
         LaunchOutcome::Accepted { .. }
     ));
+    let record = world.fixture.store.task(&task)?;
+    let requested = branch("lemarier/issue-1")?;
+    assert!(record.effects().iter().any(|effect| matches!(
+        effect.request().effect(),
+        kitchen::contracts::Effect::Worker(kitchen::contracts::Operation::LaunchWorker {
+            branch: Some(named),
+            ..
+        }) if named == &requested
+    )));
     Ok(())
 }
 

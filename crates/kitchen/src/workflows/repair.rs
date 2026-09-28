@@ -13,13 +13,14 @@ use std::collections::BTreeSet;
 use crate::{
     HouseId, TaskId,
     contracts::{
-        CommitId, IssueNumber, Provenance, Repository, ResourceRef, RetryPolicy, Role, Settlement,
-        TaskAuthority, TaskSpec,
+        BackendUnavailable, BranchName, CapabilityRequirements, CommitId, IssueNumber, Provenance,
+        Repository, ResourceRef, RetryPolicy, Role, Settlement, TaskAuthority, TaskSpec,
+        WorkerState,
     },
     integrations::github::{
         GitHubClient, GitHubReadTransport, IssueState, MergeState, Observation, PullRequest,
     },
-    workflows::pickup::{BranchName, FollowUpBudget, derived_task_id},
+    workflows::pickup::{FollowUpBudget, derived_task_id},
 };
 
 type Result<T> = std::result::Result<T, crate::Error>;
@@ -127,6 +128,27 @@ pub enum Writer {
     Person,
     /// Could not be established.
     Unknown,
+}
+
+impl Writer {
+    /// The writer implied by the backend's observation of `task`'s worker on
+    /// the branch. A takeover is the person's; a worker that has not settled
+    /// is the task's; a missing, unknown, or unreadable worker is never
+    /// taken as absent.
+    #[must_use]
+    pub fn observed(
+        task: &TaskId,
+        state: std::result::Result<WorkerState, BackendUnavailable>,
+    ) -> Self {
+        match state {
+            Ok(WorkerState::UserTakeover) => Self::Person,
+            Ok(WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply) => {
+                Self::Task(task.clone())
+            }
+            Ok(WorkerState::Settled(_)) => Self::None,
+            Ok(WorkerState::Missing | WorkerState::Unknown) | Err(_) => Self::Unknown,
+        }
+    }
 }
 
 /// The local checkout that holds the branch.
@@ -392,6 +414,6 @@ pub fn repair_spec(
         retry,
         provenance,
         resources: BTreeSet::from([worktree]),
-        requires: crate::contracts::CapabilityRequirements::new(),
+        requires: CapabilityRequirements::new(),
     }
 }

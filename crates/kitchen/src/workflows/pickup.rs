@@ -13,8 +13,9 @@ use std::{collections::BTreeMap, fmt, fmt::Write as _};
 use crate::{
     HouseId, TaskId,
     contracts::{
-        Claimant, IssueNumber, LeaseTtl, Permission, Provenance, Repository, RetryPolicy, Role,
-        Settlement, TaskAuthority, TaskSpec, Text, Timestamp, Trigger,
+        BranchName, CapabilityRequirements, Claimant, IssueNumber, LeaseTtl, Permission,
+        Provenance, Repository, RetryPolicy, Role, Settlement, TaskAuthority, TaskSpec, Text,
+        Timestamp, Trigger,
     },
     state::{HouseStore, Lease, OwnershipEvent, StateError, TaskRecord, TaskState},
     workflows::coordination::CoordinationError,
@@ -71,74 +72,35 @@ pub fn issue_task_id(issue: &IssueRef) -> Result<TaskId> {
     derived_task_id("issue", &issue.repository, issue.number)
 }
 
-/// An exact Git branch name, requested verbatim from the backend.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BranchName(String);
+/// Longest branch name Kitchen asks a worker to create, in bytes.
+pub const MAX_WORK_BRANCH_BYTES: usize = 200;
 
-impl BranchName {
-    /// Longest accepted branch name in bytes.
-    pub const MAX_BYTES: usize = 200;
-
-    /// Validate a branch name with Git's `check-ref-format` rules, restricted
-    /// to ASCII letters, digits, and `._/+-`. A worker passes the name to Git
-    /// and its shell, so shell metacharacters that Git would accept are
-    /// refused here, before any effect. Nothing is normalized or prefixed.
-    ///
-    /// # Errors
-    /// Returns [`CoordinationError::InvalidBranchName`] without echoing input.
-    pub fn new(value: &str) -> std::result::Result<Self, CoordinationError> {
-        let invalid = Err(CoordinationError::InvalidBranchName);
-        if value.is_empty()
-            || value.len() > Self::MAX_BYTES
-            || value == "@"
-            || value.contains("..")
-            || value.contains("@{")
-            || value.contains("//")
-            || value.starts_with('/')
-            || value.ends_with('/')
-            || value.ends_with('.')
-            || value.starts_with('-')
-        {
-            return invalid;
-        }
-        if !value.bytes().all(|byte| {
+/// Whether `branch` is safe to hand to a worker's Git and shell: at most
+/// [`MAX_WORK_BRANCH_BYTES`] of ASCII letters, digits, and `._/+-`, with no
+/// empty path component. [`BranchName`] accepts every printable name Git
+/// accepts, including shell metacharacters; a brief refuses those.
+#[must_use]
+pub fn is_shell_safe(branch: &BranchName) -> bool {
+    let value = branch.as_str();
+    value.len() <= MAX_WORK_BRANCH_BYTES
+        && !value.contains("//")
+        && !value.ends_with('/')
+        && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'+' | b'-')
-        }) {
-            return invalid;
-        }
-        if value
-            .split('/')
-            .any(|segment| segment.starts_with('.') || segment.ends_with(".lock"))
-        {
-            return invalid;
-        }
-        Ok(Self(value.to_owned()))
-    }
-
-    /// The exact name.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Check that the backend created exactly this branch. A prefixed,
-    /// suffixed, or otherwise rewritten name is a mismatch, not a success.
-    ///
-    /// # Errors
-    /// Returns [`CoordinationError::BranchMismatch`].
-    pub fn verify_observed(&self, observed: &str) -> std::result::Result<(), CoordinationError> {
-        if observed == self.0 {
-            Ok(())
-        } else {
-            Err(CoordinationError::BranchMismatch)
-        }
-    }
+        })
 }
 
-impl fmt::Display for BranchName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
+/// Validate the exact name of a branch a worker creates: Git's reference
+/// rules ([`BranchName`]) and [`is_shell_safe`]. Nothing is normalized or
+/// prefixed.
+///
+/// # Errors
+/// Returns [`CoordinationError::InvalidBranchName`] without echoing input.
+pub fn work_branch(value: &str) -> std::result::Result<BranchName, CoordinationError> {
+    BranchName::new(value)
+        .ok()
+        .filter(is_shell_safe)
+        .ok_or(CoordinationError::InvalidBranchName)
 }
 
 /// Readiness derived from house labels.
@@ -541,11 +503,12 @@ pub struct TaskTemplate {
     pub retry: RetryPolicy,
     /// Instruction revisions pinned for new tasks.
     pub provenance: Provenance,
-    /// Capabilities every executor of the task's effects must support. The
-    /// store applies these to forge and Roger executors too; worker-only
-    /// needs belong in
-    /// [`crate::workflows::coordination::REQUIRED_WORKER_CAPABILITIES`].
-    pub requires: crate::contracts::CapabilityRequirements,
+    /// Capabilities each executor family must support for the task's
+    /// effects, such as
+    /// [`crate::workflows::coordination::REQUIRED_WORKER_CAPABILITIES`] from
+    /// the worker backend. The store applies each family's set only to
+    /// executors of that family.
+    pub requires: CapabilityRequirements,
 }
 
 impl TaskTemplate {
@@ -747,8 +710,9 @@ impl WorkerBrief {
     /// belong to another house or other pinned revisions than the task, or
     /// there are no acceptance criteria, and
     /// [`CoordinationError::InvalidBriefArgument`] when the entry point or
-    /// report path is not a plain single-line path. Returns a text error when
-    /// the brief is too large.
+    /// report path is not a plain single-line path, and
+    /// [`CoordinationError::InvalidBranchName`] when a branch is not
+    /// [`is_shell_safe`]. Returns a text error when the brief is too large.
     pub fn render(&self, spec: &TaskSpec) -> Result<Text> {
         if self.instructions.house != *spec.authority.house()
             || self.instructions.provenance != spec.provenance
@@ -761,6 +725,13 @@ impl WorkerBrief {
             || !is_workspace_path(self.report_path.as_str())
         {
             return Err(CoordinationError::InvalidBriefArgument.into());
+        }
+        let base_safe = match &self.base {
+            Base::DefaultBranch => true,
+            Base::Stack { branch, .. } => is_shell_safe(branch),
+        };
+        if !is_shell_safe(&self.branch) || !base_safe {
+            return Err(CoordinationError::InvalidBranchName.into());
         }
         let mut permissions: Vec<Permission> = spec
             .authority

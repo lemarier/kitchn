@@ -3,7 +3,7 @@
 use clap::{Args, Subcommand};
 use kitchen::{
     contracts::{IssueNumber, Repository},
-    workflows::pickup::{BranchName, IssueRef, issue_task_id},
+    workflows::pickup::{IssueRef, issue_task_id, work_branch},
 };
 
 /// Offline pickup diagnostics.
@@ -40,6 +40,6 @@ pub fn run(args: PickupArgs) -> kitchen::Result<String> {
             };
             Ok(issue_task_id(&issue)?.to_string())
         }
-        PickupCommand::CheckBranch { name } => Ok(BranchName::new(&name)?.to_string()),
+        PickupCommand::CheckBranch { name } => Ok(work_branch(&name)?.to_string()),
     }
 }

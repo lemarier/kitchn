@@ -453,3 +453,41 @@ fn a_repair_writer_works_only_in_the_worktree_it_was_given() -> TestResult {
     assert!(matches!(outcome, LaunchOutcome::Accepted { .. }));
     Ok(())
 }
+
+#[test]
+fn the_branch_writer_comes_from_the_backend_observation() -> TestResult {
+    use kitchen::contracts::{BackendUnavailable, WorkerOutcome, WorkerState};
+    let owner = task("issue-7")?;
+    // A takeover is the person's, and repair hands the branch over.
+    let writer = Writer::observed(&owner, Ok(WorkerState::UserTakeover));
+    assert_eq!(writer, Writer::Person);
+    let mut candidate = conflicting(7)?;
+    candidate.writer = writer;
+    assert_eq!(
+        assess(&repair_policy(), &candidate),
+        RepairDecision::HandOver(HandOver::PersonOwnsTerminal)
+    );
+    for running in [
+        WorkerState::Starting,
+        WorkerState::Ready,
+        WorkerState::AwaitingReply,
+    ] {
+        assert_eq!(
+            Writer::observed(&owner, Ok(running)),
+            Writer::Task(owner.clone())
+        );
+    }
+    assert_eq!(
+        Writer::observed(&owner, Ok(WorkerState::Settled(WorkerOutcome::Succeeded))),
+        Writer::None
+    );
+    // Absence of evidence is never an absent writer.
+    for unknown in [
+        Ok(WorkerState::Missing),
+        Ok(WorkerState::Unknown),
+        Err(BackendUnavailable::Timeout),
+    ] {
+        assert_eq!(Writer::observed(&owner, unknown), Writer::Unknown);
+    }
+    Ok(())
+}

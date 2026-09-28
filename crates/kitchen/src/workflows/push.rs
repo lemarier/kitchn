@@ -27,13 +27,13 @@ use std::{
 use crate::{
     BackendId, HouseId, TaskId,
     contracts::{
-        Clock, CommitId, Fence, GrantScope, HouseGrants, IssueNumber, Permission, Repository,
+        BranchName, Clock, CommitId, Fence, GrantScope, HouseGrants, IssueNumber, Permission,
+        Repository,
     },
     integrations::github::{GitHubClient, GitHubReadTransport},
     state::{HouseStore, StateError, TaskState},
     workflows::{
         coordination::CoordinationError,
-        pickup::BranchName,
         repair::{Observed, PullRequestState, PullRequestView, observe_pull_request},
     },
 };
@@ -137,7 +137,7 @@ fn decide(
             PullRequestState::Merged => return Err(PushRefusal::Merged),
             PullRequestState::Closed => return Err(PushRefusal::Closed),
         }
-        if branch.verify_observed(&pull_request.head_branch).is_err() {
+        if pull_request.head_branch != branch.as_str() {
             return Err(PushRefusal::WrongBranch);
         }
     }

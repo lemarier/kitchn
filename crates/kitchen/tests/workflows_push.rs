@@ -12,12 +12,12 @@ use common::{TestResult, commit, ttl};
 use kitchen::{
     BackendId, ErrorClass, TaskId,
     contracts::{
-        CommitId, ContractError, Fence, Grant, HouseGrants, IssueNumber, Permission, Repository,
-        TaskAuthority,
+        BranchName, CommitId, ContractError, Fence, Grant, HouseGrants, IssueNumber, Permission,
+        Repository, TaskAuthority,
     },
     state::StateError,
     workflows::{
-        pickup::{BranchName, ClaimOutcome, TaskTemplate, claim_issue, issue_task_id},
+        pickup::{ClaimOutcome, TaskTemplate, claim_issue, issue_task_id},
         push::{
             PullRequests, PushBoundary, PushIntent, PushOutcome, PushPermit, PushRefusal,
             RefUpdater, RemoteBranches, UpdateFailure,

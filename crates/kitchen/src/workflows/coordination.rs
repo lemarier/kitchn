@@ -12,12 +12,10 @@
 //! launches only after every earlier attempt's worker is shown stopped, so an
 //! adopted worker is supervised rather than duplicated.
 //!
-//! Two inputs are interim seams until #4's follow-up contract lands:
-//! [`TerminalControl`] (user takeover) is supplied by the caller rather than
-//! observed through [`WorkerBackend`], and [`Operation::LaunchWorker`] cannot
-//! carry the requested branch yet. Until it can, [`launch_worker`] renders the
-//! typed [`BranchName`] into the brief and checks the branch a backend
-//! reports in its launch receipt; a different branch stops the worker.
+//! A launch names the exact branch in [`Operation::LaunchWorker`], and the
+//! branch a backend reports in its launch receipt is checked again: a
+//! different branch stops the worker. A terminal a person took over
+//! ([`WorkerState::UserTakeover`]) is never dispatched into.
 
 use std::time::Duration;
 
@@ -25,7 +23,7 @@ use crate::{
     ConsumerId, EffectName, ErrorClass, TaskId,
     contracts::{
         AskKind, AskRisk, AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor,
-        Capability, Claimant, Clock, CommitId, Consent, ContractError, DecisionBinding,
+        BranchName, Capability, Claimant, Clock, Consent, ContractError, DecisionBinding,
         DecisionOwner, Disposition, Effect, EffectExecutor, Evidence, EvidenceKind,
         EvidenceRevision, EvidenceVerdict, ExternalRef, FailureClass, Fence, HouseGrants, LeaseTtl,
         NotAppliedReason, Operation, Permission, PostingBudget, ResourceKind, ResourceRef,
@@ -37,7 +35,7 @@ use crate::{
         HouseStore, Lease, OwnershipEvent, StateError, TaskRecord, TaskState, reconcile,
         run_effect,
     },
-    workflows::pickup::{BranchName, WorkerBrief, stable_hash},
+    workflows::pickup::{WorkerBrief, stable_hash},
 };
 
 type Result<T> = std::result::Result<T, crate::Error>;
@@ -109,9 +107,10 @@ impl ConsentSource for Standing {
 
 /// Worker backend capabilities supervision needs: isolated launch, positive
 /// readiness, messaging, status, and cancellation of a stalled launch. They
-/// are checked when a coordinator starts rather than recorded as task
-/// requirements, because the store applies task requirements to every
-/// executor, including forge and Roger executors.
+/// are checked when a coordinator starts, and a task records them as its
+/// [`crate::contracts::ExecutorKind::Worker`] requirements
+/// ([`crate::contracts::CapabilityRequirements`]), which the store applies to
+/// worker backends only, never to forge or Roger executors.
 pub const REQUIRED_WORKER_CAPABILITIES: [Capability; 5] = [
     Capability::WorkerLaunchIsolated,
     Capability::WorkerLaunchReadiness,
@@ -156,17 +155,6 @@ impl Context<'_> {
         };
         run_effect(self.store, executor, self.grants, plan, self.clock)
     }
-}
-
-/// Who controls a worker's terminal. Interim seam: until the backend
-/// contract reports a takeover, the caller supplies it from the backend's
-/// own record. A terminal a person took over belongs to them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminalControl {
-    /// The agent runs the terminal.
-    Agent,
-    /// A person took the terminal over.
-    UserTakeover,
 }
 
 /// The result of a launch request.
@@ -317,14 +305,11 @@ pub fn launch_worker(
     let record = ctx.store.task(task)?;
     let role = record.spec().role;
     let revision = record.evidence().revision();
-    // Interim seam: once `Operation::LaunchWorker` carries the requested
-    // branch (#4 follow-up), set it here from `brief.branch` so the backend
-    // creates exactly that branch. The receipt check below stays.
     let effect = Effect::Worker(Operation::LaunchWorker {
         role,
         workspace,
         brief: text,
-        branch: None,
+        branch: Some(brief.branch.clone()),
     });
     let record = match ctx.run(
         ctx.backend,
@@ -352,12 +337,12 @@ pub fn launch_worker(
                 // Accepted without a worker handle: nothing to supervise.
                 return Ok(LaunchOutcome::Uncertain);
             };
+            // Defense in depth: the backend must create exactly the
+            // requested branch, and a receipt naming another one stops the
+            // worker before it works.
             let wrong_branch = receipt.created().iter().any(|resource| {
                 resource.kind == ResourceKind::Branch
-                    && brief
-                        .branch
-                        .verify_observed(resource.handle.as_str())
-                        .is_err()
+                    && resource.handle.as_str() != brief.branch.as_str()
             });
             if wrong_branch {
                 return stop_misplaced(ctx, task, fence, attempt, worker);
@@ -619,7 +604,6 @@ pub fn supervise(
     task: &TaskId,
     fence: Fence,
     policy: &SupervisionPolicy,
-    control: TerminalControl,
     completion: Option<&Completion>,
 ) -> Result<Supervision> {
     let now = ctx.clock.now();
@@ -645,10 +629,6 @@ pub fn supervise(
     let Some(view) = current_worker(&record).filter(|_| !attempt_done) else {
         return Ok(Supervision::AwaitingLaunch);
     };
-    match control {
-        TerminalControl::Agent => {}
-        TerminalControl::UserTakeover => return Ok(Supervision::PersonOwnsTerminal),
-    }
     let Ok(state) = ctx.backend.observe_worker(&view.worker) else {
         return Ok(Supervision::Unobservable);
     };
@@ -668,11 +648,7 @@ pub fn supervise(
             let Some(completion) = completion else {
                 return Ok(Supervision::Escalate(Escalation::MissingEvidence));
             };
-            if completion
-                .requested
-                .verify_observed(&completion.observed_branch)
-                .is_err()
-            {
+            if completion.observed_branch != completion.requested.as_str() {
                 return Ok(Supervision::Escalate(Escalation::BranchMismatch));
             }
             if completion.report.kind != EvidenceKind::WorkerReport
@@ -739,8 +715,6 @@ pub struct HumanDecision {
     pub action: Permission,
     /// The exact target, such as `pr:owner/name#12` or `task:<id>`.
     pub target: ExternalRef,
-    /// The exact commit the person sees.
-    pub subject: CommitId,
     /// Human-visible constraints.
     pub limits: Text,
     /// Approval or question.
@@ -784,6 +758,9 @@ pub enum QuestionEscalation {
     Unanswered,
     /// The worker is gone or was never launched.
     NoWorker,
+    /// A human decision is needed but the task has no evidence subject yet,
+    /// so there is no exact head for the person to decide on.
+    NoSubject,
     /// The reply or ask definitely failed.
     NotApplied,
 }
@@ -901,6 +878,11 @@ pub fn handle_question(
                 .repository
                 .clone()
                 .ok_or(CoordinationError::MissingRepository)?;
+            // The person decides on the exact head and base the task's
+            // evidence is about; the binding must match it exactly.
+            let Some(subject) = record.evidence().subject().cloned() else {
+                return Ok(QuestionRoute::Escalate(QuestionEscalation::NoSubject));
+            };
             let effect = Effect::Roger(RogerEffect {
                 requester: roger.requester.clone(),
                 ask: RogerAsk {
@@ -912,10 +894,7 @@ pub fn handle_question(
                         action: decision.action,
                         target: decision.target.clone(),
                         revision,
-                        subject: Some(crate::contracts::EvidenceSubject {
-                            head: decision.subject.clone(),
-                            base: None,
-                        }),
+                        subject: Some(subject),
                         limits: decision.limits.clone(),
                     },
                     kind: decision.kind,

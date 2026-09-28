@@ -13,8 +13,9 @@ use kitchen::{
     workflows::{
         coordination::CoordinationError,
         pickup::{
-            Base, Blocker, Blockers, BranchName, ClaimOutcome, Exclusion, IssueRef, LinkedWork,
-            MAX_STACK_DEPTH, Overlap, Precheck, Readiness, claim_issue, issue_task_id, select,
+            Base, Blocker, Blockers, ClaimOutcome, Exclusion, IssueRef, LinkedWork,
+            MAX_STACK_DEPTH, MAX_WORK_BRANCH_BYTES, Overlap, Precheck, Readiness, claim_issue,
+            is_shell_safe, issue_task_id, select, work_branch,
         },
     },
 };
@@ -470,7 +471,7 @@ fn an_existing_task_keeps_its_pinned_instructions() -> TestResult {
 #[test]
 fn overlapping_settled_work_stacks_up_to_the_depth_limit() -> TestResult {
     let world = World::new()?;
-    let lower = BranchName::new("lemarier/driver")?;
+    let lower = work_branch("lemarier/driver")?;
     let mut shallow = ready(1)?;
     shallow.overlap = Overlap::SettledPullRequest {
         pull_request: IssueNumber::new(30)?,
@@ -534,19 +535,20 @@ fn task_ids_are_stable_and_distinguish_similar_repositories() -> TestResult {
 
 #[test]
 fn branch_names_are_exact_and_validated() -> TestResult {
-    let name = BranchName::new("lemarier/pickup-coordination")?;
+    let name = work_branch("lemarier/pickup-coordination")?;
     assert_eq!(name.as_str(), "lemarier/pickup-coordination");
-    assert_eq!(name.verify_observed("lemarier/pickup-coordination"), Ok(()));
-    for observed in [
-        "orca/lemarier/pickup-coordination",
-        "lemarier/pickup-coordination-2",
-        "Lemarier/pickup-coordination",
-    ] {
-        assert_eq!(
-            name.verify_observed(observed),
-            Err(CoordinationError::BranchMismatch)
-        );
-    }
+    // A Git-valid name a shell would interpret is refused before any brief.
+    let git_valid = kitchen::contracts::BranchName::new("a$b")?;
+    assert!(!is_shell_safe(&git_valid));
+    let mut unsafe_brief = brief(1)?;
+    unsafe_brief.branch = git_valid;
+    let spec = template()?.spec_for(&issue(1)?)?;
+    assert!(matches!(
+        unsafe_brief.render(&spec),
+        Err(kitchen::Error::Coordination(
+            CoordinationError::InvalidBranchName
+        ))
+    ));
     for invalid in [
         "",
         "@",
@@ -589,15 +591,15 @@ fn branch_names_are_exact_and_validated() -> TestResult {
         "a,b",
     ] {
         assert_eq!(
-            BranchName::new(invalid),
+            work_branch(invalid),
             Err(CoordinationError::InvalidBranchName)
         );
     }
     for valid in ["lemarier/issue-8", "release/1.2+build_3", "a.b/c-d"] {
-        assert_eq!(BranchName::new(valid)?.as_str(), valid);
+        assert_eq!(work_branch(valid)?.as_str(), valid);
     }
-    assert!(BranchName::new(&"a".repeat(BranchName::MAX_BYTES)).is_ok());
-    assert!(BranchName::new(&"a".repeat(BranchName::MAX_BYTES + 1)).is_err());
+    assert!(work_branch(&"a".repeat(MAX_WORK_BRANCH_BYTES)).is_ok());
+    assert!(work_branch(&"a".repeat(MAX_WORK_BRANCH_BYTES + 1)).is_err());
     Ok(())
 }
 

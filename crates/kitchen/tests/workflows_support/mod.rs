@@ -18,8 +18,8 @@ use kitchen::{
     workflows::{
         coordination::{ConsentSource, Context, Standing, SupervisionPolicy},
         pickup::{
-            Base, Blockers, BranchName, Candidate, FollowUpBudget, IssueRef, LinkedWork, Overlap,
-            PickupPolicy, PinnedInstructions, Readiness, TaskTemplate, WorkerBrief,
+            Base, Blockers, Candidate, FollowUpBudget, IssueRef, LinkedWork, Overlap, PickupPolicy,
+            PinnedInstructions, Readiness, TaskTemplate, WorkerBrief,
         },
     },
 };
@@ -106,7 +106,12 @@ pub fn template_with(attempts: u32, pins: Provenance) -> TestResult<TaskTemplate
         authority: TaskAuthority::delegate(&grants, requested)?,
         retry: RetryPolicy::new(attempts, Duration::from_secs(24 * 3600))?,
         provenance: pins,
-        requires: kitchen::contracts::CapabilityRequirements::new(),
+        // Worker needs apply to the worker backend only; Roger asks in the
+        // same task are not refused for lacking them.
+        requires: kitchen::contracts::CapabilityRequirements::new().with(
+            kitchen::contracts::ExecutorKind::Worker,
+            kitchen::workflows::coordination::REQUIRED_WORKER_CAPABILITIES,
+        ),
     })
 }
 
@@ -126,8 +131,8 @@ pub fn supervision() -> TestResult<SupervisionPolicy> {
     })
 }
 
-pub fn branch(value: &str) -> TestResult<BranchName> {
-    Ok(BranchName::new(value)?)
+pub fn branch(value: &str) -> TestResult<kitchen::contracts::BranchName> {
+    Ok(kitchen::workflows::pickup::work_branch(value)?)
 }
 
 pub fn brief(number: u64) -> TestResult<WorkerBrief> {

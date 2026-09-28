@@ -135,6 +135,12 @@ pub enum GitHubAction {
         expected_head: CommitId,
         /// Base branch approved for the merge; a retargeted PR is refused.
         expected_base: BranchName,
+        /// Base commit of the evidence subject the merge was approved at, or
+        /// `None` when that subject has no base. Admission requires it to
+        /// equal the task's current subject base; the provider does not
+        /// re-read it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_base_commit: Option<CommitId>,
         /// Fixed merge method.
         method: MergeMethod,
     },
@@ -285,10 +291,30 @@ impl GitHubEffect {
     }
     /// Validate the mutation on every submission, including same-key retries.
     ///
+    /// A merge must name exactly the task's current evidence subject: its
+    /// `expected_head` is the subject's head, and its `expected_base_commit`
+    /// is the subject's base (or `None` when the subject has none). A task
+    /// without recorded evidence cannot merge.
+    ///
     /// # Errors
-    /// Refuses malformed action payloads.
-    pub fn check(&self, _context: &EffectContext<'_>) -> Result<(), ContractError> {
+    /// Refuses malformed action payloads and returns
+    /// [`ContractError::DecisionBindingMismatch`] for a merge whose head or
+    /// base commit differs from the current evidence subject.
+    pub fn check(&self, context: &EffectContext<'_>) -> Result<(), ContractError> {
         self.mutation.validate()?;
+        if let GitHubAction::MergePullRequest {
+            expected_head,
+            expected_base_commit,
+            ..
+        } = &self.mutation.action
+        {
+            let approved = context.subject.is_some_and(|subject| {
+                &subject.head == expected_head && &subject.base == expected_base_commit
+            });
+            if !approved {
+                return Err(ContractError::DecisionBindingMismatch);
+            }
+        }
         Ok(())
     }
     /// Validate input and atomically reserve one logical posting slot.

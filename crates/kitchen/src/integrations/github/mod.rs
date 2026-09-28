@@ -22,9 +22,13 @@
 //! effects, rather than promising a wall-clock posting rate limit.
 //! Provider 4xx refusals are definitely not applied; rate-limit responses carry
 //! a typed retry delay when one is supplied. Transport and 5xx outcomes require
-//! reconciliation. Merge requires the approved head and base branch; a
-//! retargeted or moved pull request is refused before submission, and a merge
-//! at the approved head by another actor or method reads back as applied.
+//! reconciliation. A merge must name the task's current evidence subject: core
+//! refuses it at admission unless `expected_head` and `expected_base_commit`
+//! equal the recorded head and base, so callers record evidence before
+//! merging. The provider then requires the approved head and base branch; a
+//! retargeted or moved pull request is refused before submission, but the base
+//! commit is not re-read. A merge at the approved head by another actor or
+//! method reads back as applied.
 //! `SetLabel` refuses a label the repository does not define. `CloseIssue`
 //! requires the distinct [`Permission::CloseIssue`](crate::contracts::Permission)
 //! grant; its PATCH field `duplicate_issue_id` and GraphQL `duplicateOf`

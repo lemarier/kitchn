@@ -73,7 +73,9 @@ pub enum ContractError {
         /// The task's scope.
         task: GrantScope,
     },
-    /// A decision request names another house, task, or evidence revision.
+    /// A decision request names another house, task, evidence revision, or
+    /// evidence subject, or a merge names a head or base other than the
+    /// task's current subject.
     #[error("decision binding does not match this task")]
     DecisionBindingMismatch,
     /// The task used its budget of effects for one executor family.

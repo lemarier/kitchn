@@ -33,6 +33,14 @@ struct Remote {
     asks: BTreeMap<String, Value>,
     hide_lookup: bool,
 }
+/// One query-string value of a relative endpoint.
+fn query<'a>(endpoint: &'a str, name: &str) -> Option<&'a str> {
+    endpoint
+        .split_once('?')?
+        .1
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+}
 struct Provider {
     remote: Rc<RefCell<Remote>>,
     store: HouseStore,
@@ -87,7 +95,31 @@ impl GitHubReadTransport for Provider {
                     .unwrap_or_default()
             )
         } else if path.contains("/issues?") {
-            json!(remote.issues)
+            // Like GitHub: filter by creator, order by creation, then page.
+            let mut issues: Vec<_> = remote
+                .issues
+                .iter()
+                .filter(|issue| {
+                    query(path, "creator")
+                        .is_none_or(|login| issue["user"]["login"].as_str() == Some(login))
+                })
+                .collect();
+            if query(path, "direction") == Some("desc") {
+                issues.reverse();
+            }
+            let number = |name: &str, default: usize| {
+                query(path, name)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(default)
+            };
+            let per_page = number("per_page", 30);
+            json!(
+                issues
+                    .into_iter()
+                    .skip(number("page", 1).saturating_sub(1) * per_page)
+                    .take(per_page)
+                    .collect::<Vec<_>>()
+            )
         } else {
             return Err(IntegrationError::Unknown);
         };
@@ -711,6 +743,124 @@ fn issue_creation_labels_and_relationships_use_typed_requests() -> TestResult {
     assert_eq!(remote.calls[3].1["sub_issue_id"], 102);
     assert_eq!(remote.calls[4].1["issue_id"], 102);
     assert_eq!(remote.issues.len(), 1);
+    Ok(())
+}
+
+/// Issues numbered from 10, each authored by `login`, with distinct titles.
+fn authored_issues(login: &str, count: u64) -> Vec<Value> {
+    (0..count)
+        .map(|n| {
+            json!({
+                "id": 1_000 + n,
+                "number": 10 + n,
+                "title": format!("unrelated {n}"),
+                "body": "unrelated",
+                "user": {"login": login},
+                "html_url": format!("https://github.com/sample/project/issues/{}", 10 + n),
+            })
+        })
+        .collect()
+}
+fn create_issue_effect(
+    fixture: &Fixture,
+    remote: &Rc<RefCell<Remote>>,
+) -> TestResult<(
+    GitHubExecutor<Provider>,
+    HouseGrants,
+    TaskId,
+    Fence,
+    GitHubEffect,
+)> {
+    let (scope, grants, task, fence) = setup(fixture, 3, &[Permission::CreateIssue], "github")?;
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let effect = backend.effect(mutation(GitHubAction::CreateIssue {
+        title: Text::new("sanitized issue")?,
+        body: Text::new("sanitized body")?,
+    })?)?;
+    Ok((backend, grants, task, fence, effect))
+}
+#[test]
+fn create_issue_marker_scan_stays_complete_in_a_large_repository() -> TestResult {
+    let fixture = Fixture::new()?;
+    // Twice the default page budget of other people's issues.
+    let remote = Rc::new(RefCell::new(Remote {
+        issues: authored_issues("someone-else", 2_100),
+        fault: Some(Fault::LoseAfterApply),
+        ..Remote::default()
+    }));
+    let (backend, grants, task, fence, effect) = create_issue_effect(&fixture, &remote)?;
+    let first = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "issue", effect.clone())?,
+        &ManualClock::starting_at(1),
+    )?;
+    // The pre-submit scan completed, so the issue was submitted and only its response lost.
+    assert!(matches!(first.state(), EffectState::Uncertain { .. }));
+    let reconciled = kitchen::state::reconcile(
+        &fixture.reopen()?,
+        &backend,
+        &task,
+        fence,
+        &ManualClock::starting_at(2),
+    )?;
+    assert_eq!(reconciled.resolved.len(), 1);
+    let second = run_effect(
+        &fixture.reopen()?,
+        &backend,
+        &grants,
+        plan(&task, fence, "issue", effect)?,
+        &ManualClock::starting_at(2),
+    )?;
+    let EffectState::Applied { receipt, .. } = second.state() else {
+        return Err("expected the reconciled issue".into());
+    };
+    assert_eq!(
+        receipt.reference().as_str(),
+        "https://github.com/sample/project/issues/3"
+    );
+    let remote = remote.borrow();
+    assert_eq!(remote.calls.len(), 1);
+    assert_eq!(
+        remote
+            .issues
+            .iter()
+            .filter(|issue| issue["user"]["login"] == "sample-bot")
+            .count(),
+        1
+    );
+    Ok(())
+}
+#[test]
+fn create_issue_fails_closed_when_the_requesters_own_issues_exceed_the_scan_budget() -> TestResult {
+    let fixture = Fixture::new()?;
+    let remote = Rc::new(RefCell::new(Remote {
+        issues: authored_issues("sample-bot", 2_100),
+        ..Remote::default()
+    }));
+    let (backend, grants, task, fence, effect) = create_issue_effect(&fixture, &remote)?;
+    let record = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "issue", effect)?,
+        &ManualClock::starting_at(1),
+    )?;
+    // An incomplete scan is not proof of absence: nothing may be submitted.
+    assert!(matches!(
+        record.state(),
+        EffectState::NotApplied {
+            reason: NotAppliedReason::Rejected,
+            ..
+        }
+    ));
+    assert!(remote.borrow().calls.is_empty());
     Ok(())
 }
 

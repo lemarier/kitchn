@@ -338,7 +338,12 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             }
             GitHubAction::CreateIssue { title, body } => {
                 let expected = marked(body.as_str(), key);
-                let entries = self.pages(&format!("{root}/issues?state=all"))?;
+                // Markers are only trusted from the requester, so list just its issues:
+                // the scan stays complete without paging through the whole repository.
+                let entries = self.pages(&format!(
+                    "{root}/issues?state=all&creator={}&sort=created&direction=desc",
+                    encode_segment(self.scope.requester().as_str())
+                ))?;
                 let matches: Vec<_> = entries
                     .into_iter()
                     .filter(|v| {

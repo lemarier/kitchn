@@ -38,6 +38,8 @@ pub enum ValueKind {
     EffectKind,
     /// A Git branch name.
     BranchName,
+    /// A verification target, operating system, or device class.
+    VerificationTarget,
 }
 
 impl fmt::Display for ValueKind {
@@ -55,6 +57,7 @@ impl fmt::Display for ValueKind {
             Self::Receipt => "receipt",
             Self::EffectKind => "effect kind",
             Self::BranchName => "branch name",
+            Self::VerificationTarget => "verification target",
         })
     }
 }

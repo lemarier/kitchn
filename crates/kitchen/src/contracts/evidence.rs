@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::{CommitId, ExternalRef, Timestamp};
+use crate::contracts::{CommitId, ExternalRef, Timestamp, VerificationTarget};
 
 /// A per-task counter that increases whenever the evidence subject changes,
 /// for example when a pull-request head or its base moves. Decisions record the revision
@@ -38,7 +38,7 @@ impl fmt::Display for EvidenceRevision {
 
 /// What an evidence item attests. Workflow owners add the kinds their
 /// policies evaluate, such as reviews or approvals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum EvidenceKind {
@@ -46,6 +46,9 @@ pub enum EvidenceKind {
     Check,
     /// A worker's own completion report.
     WorkerReport,
+    /// A run of the changed software in the named verification environment.
+    /// Distinct from checks: CI, unit, and simulated results never use it.
+    Verification(VerificationTarget),
 }
 
 /// The exact revision evidence is about: a head commit and, for a change

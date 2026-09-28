@@ -1067,6 +1067,7 @@ fn unknown_revocation_and_privileged_proposals_are_refused() -> TestResult {
         Permission::TrialSchedule,
         Permission::Publish,
         Permission::OperateEquipment,
+        Permission::UseVerificationEnvironment,
     ];
     for permission in Permission::ALL {
         let mut p = proposal()?;

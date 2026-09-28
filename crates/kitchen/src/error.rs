@@ -62,6 +62,9 @@ pub enum Error {
     /// An event was refused or malformed.
     #[error(transparent)]
     Event(#[from] crate::events::EventError),
+    /// A verification environment declaration, policy, or access check failed.
+    #[error(transparent)]
+    Verification(#[from] crate::contracts::VerificationError),
 }
 
 impl Error {
@@ -81,6 +84,7 @@ impl Error {
             Self::Workflow(error) => error.class(),
             Self::Selection(error) => error.class(),
             Self::Event(error) => error.class(),
+            Self::Verification(error) => error.class(),
         }
     }
 }

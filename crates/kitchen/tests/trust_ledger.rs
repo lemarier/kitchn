@@ -6,13 +6,15 @@ use common::{
 };
 use kitchen::{
     contracts::{
-        AttemptNumber, AttemptOutcome, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
-        ExternalRef, Grant, Permission, Repository, Role, TaskSpec, Text,
+        AttemptNumber, AttemptOutcome, ContractError, Evidence, EvidenceKind, EvidenceSubject,
+        EvidenceVerdict, ExternalRef, Grant, HouseGrants, Permission, Repository, Role,
+        TaskAuthority, TaskSpec, Text,
     },
     state::{Corruption, HouseStore, StateError, StoreOptions},
     trust::{
-        Attribution, AutonomyGrant, AutonomyProposal, EvidenceMode, Ledger, Measurement,
-        Observation, PullRequestEvidence, StationScope, TrustError,
+        Attribution, AutonomyGrant, AutonomyProposal, BenchResult, EvidenceMode, Finding,
+        GrantAudit, Ledger, Measurement, Observation, PullRequestEvidence, StationScope,
+        TrustError,
     },
     workflows::inspector::{FollowUpRoute, InspectionPlan, SampleReservation, SampleResult},
 };
@@ -204,6 +206,148 @@ fn revoke(l: &Ledger) -> TestResult<bool> {
         at(6),
     )?)
 }
+fn ledger_path(f: &Fixture) -> std::path::PathBuf {
+    f.dir.path().join("trust/ledger.json")
+}
+fn pr_mut(o: &mut Observation) -> TestResult<&mut PullRequestEvidence> {
+    match &mut o.pull_request {
+        Measurement::Observed { value, .. } => Ok(value),
+        _ => Err("observed pull request expected".into()),
+    }
+}
+/// A prospective task bound to the fixture station with `model`, for
+/// `standing_for_task` before the task exists. `edit` changes its spec.
+fn bound_acting(
+    l: &Ledger,
+    policy: &HouseGrants,
+    name: &str,
+    model: &str,
+    edit: impl FnOnce(&mut TaskSpec),
+) -> TestResult<TaskSpec> {
+    let mut acting = spec(name)?;
+    acting.repository = Some(scope()?.project);
+    acting.authority = TaskAuthority::delegate(policy, [])?;
+    edit(&mut acting);
+    l.bind_task(
+        &acting,
+        scope()?,
+        Text::new(model)?,
+        source(&format!("fixture:{name}-binding"))?,
+    )?;
+    Ok(acting)
+}
+/// An ordinary (non-priority) write: bind one more prospective task.
+fn try_bind_extra(l: &Ledger) -> TestResult<Result<bool, TrustError>> {
+    let mut extra = spec("extra")?;
+    extra.repository = Some(scope()?.project);
+    Ok(l.bind_task(
+        &extra,
+        scope()?,
+        Text::new("fixture-model-v1")?,
+        source("fixture:extra-binding")?,
+    ))
+}
+fn try_approve(l: &Ledger, current: &HouseGrants) -> TestResult<Result<bool, TrustError>> {
+    Ok(l.approve(
+        &grant()?.id,
+        holder("owner")?,
+        source("fixture:decision")?,
+        at(6),
+        current,
+    ))
+}
+/// Ways a measurement can fail to be a positive result without being a
+/// negative one.
+fn absent<T>() -> [Measurement<T>; 3] {
+    [
+        Measurement::Missing,
+        Measurement::Untested,
+        Measurement::Unavailable,
+    ]
+}
+/// [`absent`] plus a measurement that observed `negative`.
+fn unproven<T>(negative: T) -> TestResult<[Measurement<T>; 4]> {
+    let [missing, untested, unavailable] = absent();
+    Ok([missing, untested, unavailable, measured(negative)?])
+}
+/// `edit` must make a copy of `base` ineligible for trust.
+fn assert_blocks(
+    base: &Observation,
+    label: &str,
+    edit: impl FnOnce(&mut Observation) -> TestResult,
+) -> TestResult {
+    let mut o = base.clone();
+    edit(&mut o)?;
+    assert!(!o.trust_eligible(), "{label} must block trust");
+    Ok(())
+}
+fn confirmed(name: &str) -> TestResult<Finding> {
+    Ok(Finding {
+        source: source(name)?,
+        subject: subject()?,
+        consequence: Text::new("Confirmed consequence.")?,
+    })
+}
+fn findings_of(pr: &mut PullRequestEvidence) -> &mut Measurement<Vec<Finding>> {
+    &mut pr.findings
+}
+fn reverts_of(pr: &mut PullRequestEvidence) -> &mut Measurement<Vec<Finding>> {
+    &mut pr.reverts
+}
+fn regressions_of(pr: &mut PullRequestEvidence) -> &mut Measurement<Vec<Finding>> {
+    &mut pr.regressions
+}
+/// The largest snapshot an ordinary write may produce, and the extra bytes only
+/// revocations may use.
+const ORDINARY_LIMIT: u64 = 8 * 1024 * 1024;
+const REVOCATION_RESERVE: u64 = 4096 * 1024;
+const MAX_TEXT: usize = 64 * 1024;
+
+/// A valid observation of another task that carries `bytes` of bench text.
+fn bulky(template: &Observation, index: usize, bytes: usize) -> TestResult<serde_json::Value> {
+    let mut o = template.clone();
+    o.id = source(&format!("fixture:bulk-{index}"))?;
+    o.task = task_id(&format!("bulk-{index}"))?;
+    pr_mut(&mut o)?.task = o.task.clone();
+    o.bench = measured(vec![BenchResult {
+        subject: subject()?,
+        passed: true,
+        procedure: Text::new(&"b".repeat(bytes))?,
+    }])?;
+    Ok(serde_json::to_value(o)?)
+}
+/// Grow the persisted ledger to exactly `target` bytes by appending valid
+/// observations with bulk bench text. Every entry passes the ledger's own
+/// validation when it next loads the file.
+fn fill_ledger(l: &Ledger, f: &Fixture, target: u64) -> TestResult {
+    let template = l.history()?.into_iter().next().ok_or("an observation")?;
+    let path = ledger_path(f);
+    let mut document: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let mut size = u64::try_from(serde_json::to_vec(&document)?.len())?;
+    let entries = document["observations"]
+        .as_array_mut()
+        .ok_or("observations")?;
+    for index in 0.. {
+        let missing = target
+            .checked_sub(size)
+            .ok_or("ledger already over target")?;
+        // Bytes an entry adds with one byte of text, plus its separator.
+        let fixed = u64::try_from(serde_json::to_vec(&bulky(&template, index, 1)?)?.len())? + 1;
+        let room = (missing + 1)
+            .checked_sub(fixed)
+            .ok_or("target too close to pad")?;
+        let last = room <= u64::try_from(MAX_TEXT)?;
+        let text = if last { usize::try_from(room)? } else { 60_000 };
+        entries.push(bulky(&template, index, text)?);
+        size += fixed - 1 + u64::try_from(text)?;
+        if last {
+            break;
+        }
+    }
+    fs::write(&path, serde_json::to_vec(&document)?)?;
+    assert_eq!(fs::metadata(&path)?.len(), target);
+    Ok(())
+}
 fn plan() -> TestResult<InspectionPlan> {
     Ok(InspectionPlan {
         id: source("fixture:inspection")?,
@@ -240,7 +384,7 @@ fn derives_task_attempt_effect_evidence_without_inventing_acceptance() -> TestRe
     assert!(!o.trust_eligible());
     let mut wrong = attribution()?;
     wrong.scope.project = Repository::new("other/project")?;
-    assert!(
+    assert!(matches!(
         Observation::collect(
             &f.store,
             &task_id("task")?,
@@ -248,9 +392,9 @@ fn derives_task_attempt_effect_evidence_without_inventing_acceptance() -> TestRe
             wrong,
             EvidenceMode::Live,
             at(5)
-        )
-        .is_err()
-    );
+        ),
+        Err(kitchen::Error::Trust(TrustError::Refused))
+    ));
     Ok(())
 }
 
@@ -281,7 +425,7 @@ fn duplicate_reordered_corrections_preserve_history_and_sample_sizes() -> TestRe
 }
 
 #[test]
-fn incomplete_bench_and_cross_house_inputs_never_pass() -> TestResult {
+fn untested_bench_is_preserved_and_cross_house_inputs_are_refused() -> TestResult {
     let f = Fixture::new()?;
     let l = ledger(&f)?;
     let mut o = with_pr(observation(&f)?)?;
@@ -291,12 +435,19 @@ fn incomplete_bench_and_cross_house_inputs_never_pass() -> TestResult {
     let mut other = o.clone();
     other.house = other_house()?;
     other.id = source("fixture:other")?;
-    assert!(l.record(&f.store, other).is_err());
-    assert!(Ledger::open(f.dir.path().join("trust"), other_house()?).is_err());
+    assert!(matches!(
+        l.record(&f.store, other),
+        Err(TrustError::Refused)
+    ));
+    assert!(matches!(
+        Ledger::open(f.dir.path().join("trust"), other_house()?),
+        Err(TrustError::Authority(ContractError::CrossHouse { .. }))
+    ));
     if let Measurement::Observed { value, .. } = &mut o.pull_request {
         value.house = other_house()?;
     }
-    assert!(l.record(&f.store, o).is_err());
+    assert!(matches!(l.record(&f.store, o), Err(TrustError::Refused)));
+    assert_eq!(l.history()?.len(), 1);
     Ok(())
 }
 
@@ -330,53 +481,148 @@ fn unknown_attribution_and_usage_do_not_derive_trust() -> TestResult {
 }
 
 #[test]
-fn trust_requires_success_positive_usage_and_positive_pr_evidence() -> TestResult {
+fn trust_requires_every_positive_measurement() -> TestResult {
     use kitchen::{contracts::Settlement, state::TaskState};
+    type FindingsField = fn(&mut PullRequestEvidence) -> &mut Measurement<Vec<Finding>>;
     let f = Fixture::new()?;
-    let mut o = eligible(observation(&f)?)?;
-    assert!(o.trust_eligible());
-    o.attribution.tokens = measured(0)?;
-    assert!(!o.trust_eligible());
-    o.attribution.tokens = measured(120)?;
+    let ok = eligible(observation(&f)?)?;
+    assert!(ok.trust_eligible());
+
+    assert_blocks(&ok, "simulated evidence", |o| {
+        o.mode = EvidenceMode::Simulated;
+        Ok(())
+    })?;
+    for agent in absent() {
+        assert_blocks(&ok, "unknown agent", |o| {
+            o.attribution.agent = agent;
+            Ok(())
+        })?;
+    }
+    for model in absent() {
+        assert_blocks(&ok, "unknown model", |o| {
+            o.attribution.model = model;
+            Ok(())
+        })?;
+    }
+    for tokens in unproven(0)? {
+        assert_blocks(&ok, "unknown or zero token use", |o| {
+            o.attribution.tokens = tokens;
+            Ok(())
+        })?;
+    }
     for settlement in [
         Settlement::Failed,
         Settlement::Cancelled,
         Settlement::Exhausted,
     ] {
-        let mut bad = o.clone();
-        if let TaskState::Settled {
-            settlement: value, ..
-        } = &mut bad.state
-        {
-            *value = settlement;
+        assert_blocks(&ok, "settlement other than success", |o| {
+            if let TaskState::Settled {
+                settlement: value, ..
+            } = &mut o.state
+            {
+                *value = settlement;
+            }
+            Ok(())
+        })?;
+    }
+    for pull_request in absent() {
+        assert_blocks(&ok, "no pull request evidence", |o| {
+            o.pull_request = pull_request;
+            Ok(())
+        })?;
+    }
+    for first_pass in unproven(false)? {
+        assert_blocks(&ok, "first-pass acceptance", |o| {
+            pr_mut(o)?.first_pass = first_pass;
+            Ok(())
+        })?;
+    }
+    let lists: [(&str, FindingsField); 3] = [
+        ("findings", findings_of),
+        ("reverts", reverts_of),
+        ("regressions", regressions_of),
+    ];
+    for (label, field) in lists {
+        for measurement in unproven(vec![confirmed("fixture:finding")?])? {
+            assert_blocks(&ok, label, |o| {
+                *field(pr_mut(o)?) = measurement;
+                Ok(())
+            })?;
         }
-        assert!(!bad.trust_eligible());
     }
-    if let Measurement::Observed { value, .. } = &mut o.pull_request {
-        value.first_pass = measured(false)?;
+    for checks in unproven(Vec::<Evidence>::new())? {
+        assert_blocks(&ok, "required checks", |o| {
+            pr_mut(o)?.checks = checks;
+            Ok(())
+        })?;
     }
-    assert!(!o.trust_eligible());
-    if let Measurement::Observed { value, .. } = &mut o.pull_request {
-        value.first_pass = measured(true)?;
-        if let Measurement::Observed { value: checks, .. } = &mut value.checks {
-            checks[0].verdict = kitchen::contracts::EvidenceVerdict::Fail;
-        }
+    for verdict in [EvidenceVerdict::Fail, EvidenceVerdict::Unavailable] {
+        assert_blocks(&ok, "a check that is not a pass", |o| {
+            if let Measurement::Observed { value: checks, .. } = &mut pr_mut(o)?.checks {
+                let mut extra = checks[0].clone();
+                extra.verdict = verdict;
+                extra.source = source("fixture:second-check")?;
+                checks.push(extra);
+            }
+            Ok(())
+        })?;
     }
-    assert!(!o.trust_eligible());
-    if let Measurement::Observed { value, .. } = &mut o.pull_request
-        && let Measurement::Observed { value: checks, .. } = &mut value.checks
-    {
-        checks[0].verdict = kitchen::contracts::EvidenceVerdict::Pass;
+    assert_blocks(&ok, "a failing bench result", |o| {
+        o.bench = measured(vec![
+            BenchResult {
+                subject: subject()?,
+                passed: true,
+                procedure: Text::new("bench fixture")?,
+            },
+            BenchResult {
+                subject: subject()?,
+                passed: false,
+                procedure: Text::new("power interruption test")?,
+            },
+        ])?;
+        Ok(())
+    })?;
+    assert_blocks(&ok, "an inappropriate escalation", |o| {
+        o.appropriate_escalation = measured(false)?;
+        Ok(())
+    })?;
+    let other_head = EvidenceSubject {
+        head: commit('c')?,
+        base: subject()?.base,
+    };
+    for (label, item) in [
+        (
+            "a failed core check",
+            core_check(EvidenceVerdict::Fail, subject()?)?,
+        ),
+        (
+            "an unavailable core check",
+            core_check(EvidenceVerdict::Unavailable, subject()?)?,
+        ),
+        (
+            "core evidence for another head",
+            core_check(EvidenceVerdict::Pass, other_head)?,
+        ),
+    ] {
+        assert_blocks(&ok, label, |o| {
+            o.evidence.push(item);
+            Ok(())
+        })?;
     }
-    o.bench = measured(vec![kitchen::trust::BenchResult {
+
+    // Recorded positive results and an unrecorded bench keep the record eligible.
+    let mut positive = ok.clone();
+    positive.bench = measured(vec![BenchResult {
         subject: subject()?,
-        passed: false,
+        passed: true,
         procedure: Text::new("bench fixture")?,
     }])?;
-    assert!(!o.trust_eligible());
-    o.bench = Measurement::Missing;
-    o.pull_request = Measurement::Missing;
-    assert!(!o.trust_eligible());
+    positive.appropriate_escalation = measured(true)?;
+    positive
+        .evidence
+        .push(core_check(EvidenceVerdict::Pass, subject()?)?);
+    assert!(positive.trust_eligible());
+    assert_eq!(ok.bench, Measurement::Missing);
     Ok(())
 }
 
@@ -387,20 +633,24 @@ fn fabricated_core_outcome_and_scope_correction_are_refused() -> TestResult {
     let mut o = eligible(observation(&f)?)?;
     let original = o.clone();
     o.task = task_id("absent")?;
-    assert!(l.record(&f.store, o).is_err());
+    assert!(matches!(l.record(&f.store, o), Err(TrustError::Refused)));
     let mut o = original.clone();
     o.effects.clear();
     o.state = kitchen::state::TaskState::Settled {
         settlement: kitchen::contracts::Settlement::Failed,
         at: at(10),
     };
-    assert!(l.record(&f.store, o).is_err());
+    assert!(matches!(l.record(&f.store, o), Err(TrustError::Refused)));
     l.record(&f.store, original.clone())?;
     let mut corrected = original;
     corrected.revision = NonZeroU32::new(2).ok_or("revision")?;
     corrected.correction = Some(source("fixture:scope-correction")?);
     corrected.attribution.scope.station = Text::new("other-station")?;
-    assert!(l.record(&f.store, corrected).is_err());
+    assert!(matches!(
+        l.record(&f.store, corrected),
+        Err(TrustError::Refused)
+    ));
+    assert_eq!(l.history()?.len(), 1);
     Ok(())
 }
 
@@ -617,8 +867,8 @@ fn revocation_succeeds_at_history_capacity_and_stays_revoked() -> TestResult {
 }
 
 #[test]
-fn waiting_writer_yields_to_pending_revocation() -> TestResult {
-    use std::{fs::OpenOptions, thread, time::Duration};
+fn readers_yield_to_a_pending_revocation() -> TestResult {
+    use std::{fs::OpenOptions, sync::mpsc, thread, time::Duration};
     let f = Fixture::new()?;
     let l = ledger(&f)?;
     l.record(&f.store, eligible(observation(&f)?)?)?;
@@ -628,7 +878,10 @@ fn waiting_writer_yields_to_pending_revocation() -> TestResult {
         .read(true)
         .write(true)
         .open(f.dir.path().join("trust/ledger.lock"))?;
-    lock.lock()?;
+    // An in-flight reader holds the shared lock, so the revocation cannot start.
+    // A new reader would normally join it and finish; the pending revocation
+    // must hold that reader back.
+    lock.lock_shared()?;
     let revoker = l.clone();
     let grant_id = grant()?.id;
     let actor = holder("owner")?;
@@ -642,8 +895,19 @@ fn waiting_writer_yields_to_pending_revocation() -> TestResult {
         thread::sleep(Duration::from_millis(5));
     }
     assert!(pending.exists());
+    let (ready, started) = mpsc::channel();
     let reader = l.clone();
-    let read = thread::spawn(move || reader.grant_history());
+    let read = thread::spawn(move || {
+        // A send fails only if the test already ended.
+        let _ = ready.send(());
+        reader.grant_history()
+    });
+    started.recv_timeout(Duration::from_secs(1))?;
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        !read.is_finished(),
+        "a reader must not slip past a pending revocation"
+    );
     drop(lock);
     assert!(revocation.join().map_err(|_| "revoker panicked")??);
     let history = read.join().map_err(|_| "reader panicked")??;
@@ -762,17 +1026,15 @@ fn explicit_grant_uses_core_authority_and_revocation_survives_restart() -> TestR
     assert!(!revoke(&l)?);
     let after = reopen(&f)?.standing_for_task(&f.store, &acting, &policy)?;
     assert!(!after.covers(&g.claim));
-    assert!(
-        acting
-            .authority
-            .authorize(
-                &after,
-                g.claim.permission,
-                &g.claim.scope,
-                &g.claim.destination
-            )
-            .is_err()
-    );
+    assert!(matches!(
+        acting.authority.authorize(
+            &after,
+            g.claim.permission,
+            &g.claim.scope,
+            &g.claim.destination
+        ),
+        Err(ContractError::AuthorityExpansion { .. })
+    ));
     assert_eq!(l.grant_history()?.len(), 1);
     Ok(())
 }
@@ -979,7 +1241,10 @@ fn inspection_independence_missing_evidence_and_deadline_fail_closed() -> TestRe
         l.reserve_sample(&p.id, 1, 1, at(60)),
         Err(TrustError::Exhausted)
     ));
-    assert!(l.reserve_sample(&p.id, 0, 1, at(6)).is_err());
+    assert!(matches!(
+        l.reserve_sample(&p.id, 0, 1, at(6)),
+        Err(TrustError::Invalid)
+    ));
     assert!(matches!(
         l.reserve_sample(&p.id, 1, 1, at(4)),
         Err(TrustError::Invalid)
@@ -1011,13 +1276,16 @@ fn confirmed_inspector_findings_route_once_with_exact_revision() -> TestResult {
     if let SampleResult::Confirmed { finding, .. } = &mut stale {
         finding.subject.head = commit('c')?;
     }
-    assert!(l.finish_sample(&plan()?.id, 1, stale).is_err());
+    assert!(matches!(
+        l.finish_sample(&plan()?.id, 1, stale),
+        Err(TrustError::Refused)
+    ));
     assert!(l.finish_sample(&plan()?.id, 1, result.clone())?);
     assert!(!l.finish_sample(&plan()?.id, 1, result)?);
-    assert!(
-        l.finish_sample(&plan()?.id, 1, SampleResult::Unavailable)
-            .is_err()
-    );
+    assert!(matches!(
+        l.finish_sample(&plan()?.id, 1, SampleResult::Unavailable),
+        Err(TrustError::Conflict)
+    ));
     let inspection = reopen(&f)?.inspection(&plan()?.id)?;
     let routes: Vec<_> = inspection.follow_ups().collect();
     assert_eq!(routes.len(), 1);
@@ -1194,7 +1462,10 @@ fn sourced_pr_and_bench_fixtures_preserve_measurements_and_reject_stale_findings
         Err(TrustError::Invalid)
     ));
     let invalid = String::from_utf8(bytes)?.replace("\"samples\":1", "\"samples\":0");
-    assert!(serde_json::from_str::<Observation>(&invalid).is_err());
+    assert!(
+        serde_json::from_str::<Observation>(&invalid).is_err_and(|error| error.is_data()),
+        "a zero sample count is a data error"
+    );
     Ok(())
 }
 
@@ -1309,20 +1580,35 @@ fn invalid_history_budget_and_inspector_inputs_do_not_commit() -> TestResult {
         p.max_samples = samples;
         p.max_tokens = tokens;
         p.deadline = at(deadline);
-        assert!(l.start_inspection(p, at(5)).is_err());
+        assert!(
+            matches!(l.start_inspection(p, at(5)), Err(TrustError::Invalid)),
+            "bounds {samples}/{tokens}/{deadline} must be invalid"
+        );
     }
-    assert!(l.inspection(&plan()?.id).is_err());
+    assert!(matches!(
+        l.inspection(&plan()?.id),
+        Err(TrustError::Incomplete)
+    ));
     let mut fractional = plan()?;
     fractional.deadline = kitchen::contracts::Timestamp::from_unix_millis(3_605_001);
-    assert!(l.start_inspection(fractional, at(5)).is_err());
+    assert!(matches!(
+        l.start_inspection(fractional, at(5)),
+        Err(TrustError::Invalid)
+    ));
     let mut p = plan()?;
     p.house = other_house()?;
-    assert!(l.start_inspection(p, at(5)).is_err());
+    assert!(matches!(
+        l.start_inspection(p, at(5)),
+        Err(TrustError::Refused)
+    ));
     l.start_inspection(plan()?, at(5))?;
     l.reserve_sample(&plan()?.id, 1, 1, at(6))?;
     l.cancel_inspection(&plan()?.id)?;
     l.finish_sample(&plan()?.id, 1, SampleResult::Unavailable)?;
-    assert!(l.reserve_sample(&plan()?.id, 2, 1, at(7)).is_err());
+    assert!(matches!(
+        l.reserve_sample(&plan()?.id, 2, 1, at(7)),
+        Err(TrustError::Refused)
+    ));
     Ok(())
 }
 
@@ -1397,7 +1683,10 @@ fn unknown_authority_fields_and_dangling_persisted_evidence_are_rejected() -> Te
         .as_object_mut()
         .ok_or("grant object")?
         .insert("expired".into(), serde_json::json!(true));
-    assert!(serde_json::from_value::<AutonomyGrant>(encoded).is_err());
+    let unknown = serde_json::from_value::<AutonomyGrant>(encoded)
+        .err()
+        .ok_or("an unknown field must be rejected")?;
+    assert!(unknown.to_string().contains("expired"));
     let f = Fixture::new()?;
     let l = ledger(&f)?;
     let o = eligible(observation(&f)?)?;
@@ -1408,7 +1697,10 @@ fn unknown_authority_fields_and_dangling_persisted_evidence_are_rejected() -> Te
     let mut document: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
     document["observations"] = serde_json::json!([]);
     fs::write(&path, serde_json::to_vec(&document)?)?;
-    assert!(reopen(&f).is_err());
+    assert!(matches!(
+        Ledger::open(f.dir.path().join("trust"), house()?),
+        Err(TrustError::Corrupt)
+    ));
     Ok(())
 }
 
@@ -1432,7 +1724,10 @@ fn moved_observation_stops_inspection_and_duplicate_findings_do_not_route_twice(
     };
     l.finish_sample(&plan()?.id, 1, result.clone())?;
     l.reserve_sample(&plan()?.id, 2, 10, at(7))?;
-    assert!(l.finish_sample(&plan()?.id, 2, result).is_err());
+    assert!(matches!(
+        l.finish_sample(&plan()?.id, 2, result),
+        Err(TrustError::Refused)
+    ));
     assert_eq!(l.inspection(&plan()?.id)?.follow_ups().count(), 1);
     o.revision = NonZeroU32::new(2).ok_or("revision")?;
     o.correction = Some(source("fixture:attribution-correction")?);
@@ -1442,7 +1737,10 @@ fn moved_observation_stops_inspection_and_duplicate_findings_do_not_route_twice(
         l.reserve_sample(&plan()?.id, 2, 10, at(8))?,
         SampleReservation::Existing(_)
     ));
-    assert!(l.reserve_sample(&plan()?.id, 3, 10, at(8)).is_err());
+    assert!(matches!(
+        l.reserve_sample(&plan()?.id, 3, 10, at(8)),
+        Err(TrustError::Refused)
+    ));
     let mut next_inspection = plan()?;
     next_inspection.id = source("fixture:inspection-after-correction")?;
     l.start_inspection(next_inspection.clone(), at(8))?;
@@ -1454,10 +1752,255 @@ fn moved_observation_stops_inspection_and_duplicate_findings_do_not_route_twice(
     }
     l.record(&f.store, o)?;
     assert!(l.finish_sample(&next_inspection.id, 1, SampleResult::Unavailable)?);
+    assert!(matches!(
+        l.reserve_sample(&next_inspection.id, 2, 10, at(10)),
+        Err(TrustError::Refused)
+    ));
+    assert!(matches!(
+        l.reserve_sample(&plan()?.id, 4, 10, at(9)),
+        Err(TrustError::Refused)
+    ));
+    Ok(())
+}
+
+#[test]
+fn record_refuses_a_model_or_scope_that_differs_from_the_task_binding() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let o = eligible(observation(&f)?)?;
+    bind_evidence(&l, &f)?;
+    let mut wrong_model = o.clone();
+    wrong_model.attribution.model = measured(Text::new("other-model-v2")?)?;
+    let mut wrong_station = o.clone();
+    wrong_station.attribution.scope.station = Text::new("python")?;
+    let mut wrong_work_type = o.clone();
+    wrong_work_type.attribution.scope.work_type = Text::new("review")?;
+    for (label, bad) in [
+        ("model", wrong_model),
+        ("station", wrong_station),
+        ("work type", wrong_work_type),
+    ] {
+        assert!(
+            matches!(l.record(&f.store, bad), Err(TrustError::Refused)),
+            "a different {label} must be refused"
+        );
+    }
+    assert!(l.history()?.is_empty());
+    assert!(l.record(&f.store, o)?);
+    Ok(())
+}
+
+#[test]
+fn earned_standing_requires_the_evidence_tasks_role_pins_and_bound_model() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    let claim = grant()?.claim;
+    let policy = HouseGrants::with_limits(house()?, [claim.clone()], [])?;
+    issue(&l, &policy)?;
+    let earned = |acting: &TaskSpec| -> TestResult<bool> {
+        Ok(l.standing_for_task(&f.store, acting, &policy)?
+            .covers(&claim))
+    };
+
+    let same = bound_acting(&l, &policy, "same", "fixture-model-v1", |_| {})?;
     assert!(
-        l.reserve_sample(&next_inspection.id, 2, 10, at(10))
-            .is_err()
+        earned(&same)?,
+        "the evidence task's own pins earn the grant"
     );
-    assert!(l.reserve_sample(&plan()?.id, 4, 10, at(9)).is_err());
+
+    let pin = commit('c')?;
+    let repinned = [
+        bound_acting(&l, &policy, "kitchen-pin", "fixture-model-v1", |s| {
+            s.provenance.kitchen = pin.clone();
+        })?,
+        bound_acting(&l, &policy, "guidance-pin", "fixture-model-v1", |s| {
+            s.provenance.house_guidance = pin.clone();
+        })?,
+        bound_acting(&l, &policy, "repository-pin", "fixture-model-v1", |s| {
+            s.provenance.repository_instructions = Some(pin.clone());
+        })?,
+    ];
+    for acting in &repinned {
+        assert!(!earned(acting)?, "{} must not inherit standing", acting.id);
+    }
+    let remodelled = bound_acting(&l, &policy, "remodelled", "fixture-model-v2", |_| {})?;
+    assert!(!earned(&remodelled)?);
+    let other_role = bound_acting(&l, &policy, "other-role", "fixture-model-v1", |s| {
+        s.role = Role::Commis;
+    })?;
+    assert!(!earned(&other_role)?);
+    Ok(())
+}
+
+#[test]
+fn proposals_refuse_evidence_from_a_task_without_a_binding() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    assert!(matches!(
+        l.propose(proposal()?, &grants()?),
+        Err(TrustError::Refused)
+    ));
+    assert!(l.grant_history()?.is_empty());
+    bind_evidence(&l, &f)?;
+    issue(&l, &grants()?)?;
+    // A stored grant whose evidence task has lost its binding is corrupt.
+    let path = ledger_path(&f);
+    let mut document: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    document["bindings"] = serde_json::json!([]);
+    fs::write(&path, serde_json::to_vec(&document)?)?;
+    assert!(matches!(
+        Ledger::open(f.dir.path().join("trust"), house()?),
+        Err(TrustError::Corrupt)
+    ));
+    Ok(())
+}
+
+#[test]
+fn approval_is_refused_for_withdrawn_limits_changed_credentials_and_stale_evidence() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let o = eligible(observation(&f)?)?;
+    l.record(&f.store, o.clone())?;
+    bind_evidence(&l, &f)?;
+    let claim = grant()?.claim;
+    let policy = HouseGrants::with_limits(house()?, [claim.clone()], [])?;
+    l.propose(proposal()?, &policy)?;
+
+    let withdrawn = HouseGrants::new(house()?, []);
+    assert!(matches!(
+        try_approve(&l, &withdrawn)?,
+        Err(TrustError::Authority(
+            ContractError::AuthorityExpansion { .. }
+        ))
+    ));
+    let other_credential = Grant::repository(
+        claim.permission,
+        scope()?.project,
+        common::backend_id()?,
+        kitchen::CredentialId::new("other-credential")?,
+    );
+    let rekeyed = HouseGrants::with_limits(house()?, [other_credential], [])?;
+    assert!(matches!(
+        try_approve(&l, &rekeyed)?,
+        Err(TrustError::Refused)
+    ));
+    let mut corrected = o;
+    corrected.revision = NonZeroU32::new(2).ok_or("revision")?;
+    corrected.correction = Some(source("fixture:correction")?);
+    l.record(&f.store, corrected)?;
+    assert!(matches!(
+        try_approve(&l, &policy)?,
+        Err(TrustError::Refused)
+    ));
+    assert!(matches!(
+        l.grant_history()?.as_slice(),
+        [GrantAudit::Proposed(_)]
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_revoked_proposal_never_becomes_authority() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    let claim = grant()?.claim;
+    let policy = HouseGrants::with_limits(house()?, [claim.clone()], [])?;
+    l.propose(proposal()?, &policy)?;
+    assert!(revoke(&l)?);
+    assert!(!revoke(&reopen(&f)?)?);
+    assert!(matches!(
+        reopen(&f)?.grant_history()?.as_slice(),
+        [GrantAudit::RevokedProposal { .. }]
+    ));
+    assert!(matches!(
+        try_approve(&l, &policy)?,
+        Err(TrustError::Conflict)
+    ));
+    let acting = bound_acting(&l, &policy, "acting", "fixture-model-v1", |_| {})?;
+    assert!(
+        !l.standing_for_task(&f.store, &acting, &policy)?
+            .covers(&claim)
+    );
+    Ok(())
+}
+
+#[test]
+fn revocation_uses_the_byte_reserve_when_ordinary_writes_are_full() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    issue(&l, &grants()?)?;
+    // Eight bytes under the ordinary bound: less room than any revocation needs.
+    fill_ledger(&l, &f, ORDINARY_LIMIT - 8)?;
+    let path = ledger_path(&f);
+    let full = fs::read(&path)?;
+    assert!(matches!(
+        try_bind_extra(&l)?,
+        Err(TrustError::Storage(StateError::StateTooLarge {
+            limit_bytes: ORDINARY_LIMIT
+        }))
+    ));
+    assert_eq!(
+        fs::read(&path)?,
+        full,
+        "a refused write leaves the file alone"
+    );
+
+    assert!(revoke(&l)?);
+    let revoked = fs::metadata(&path)?.len();
+    assert!(
+        revoked > ORDINARY_LIMIT && revoked <= ORDINARY_LIMIT + REVOCATION_RESERVE,
+        "revoked ledger is {revoked} bytes"
+    );
+    assert!(matches!(
+        reopen(&f)?.grant_history()?.as_slice(),
+        [GrantAudit::Revoked { .. }]
+    ));
+    // The reserve stays closed to ordinary writers.
+    assert!(matches!(
+        try_bind_extra(&l)?,
+        Err(TrustError::Storage(StateError::StateTooLarge {
+            limit_bytes: ORDINARY_LIMIT
+        }))
+    ));
+    Ok(())
+}
+
+#[test]
+fn revocation_growth_stays_inside_the_per_grant_reserve() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    let policy = grants()?;
+    issue(&l, &policy)?;
+    let mut pending = proposal()?;
+    pending.id = source("fixture:second-proposal")?;
+    l.propose(pending.clone(), &policy)?;
+    // The most a revocation can add: a 256-byte decision whose every byte the
+    // JSON encoding escapes, a 64-byte holder, and the widest timestamp.
+    let decision = source(&"\"".repeat(256))?;
+    let holder_max = holder(&"h".repeat(64))?;
+    let path = ledger_path(&f);
+    for id in [grant()?.id, pending.id] {
+        let before = fs::metadata(&path)?.len();
+        assert!(l.revoke(
+            &id,
+            holder_max.clone(),
+            decision.clone(),
+            kitchen::contracts::Timestamp::from_unix_millis(u64::MAX),
+        )?);
+        let growth = fs::metadata(&path)?.len() - before;
+        // 1 KiB is each entry's share of the ledger's revocation reserve
+        // (`MAX_HISTORY` entries share `REVOCATION_RESERVE`).
+        assert!(growth <= 1024, "a revocation added {growth} bytes");
+        assert!(growth > 512 + 64, "the worst-case fields were not written");
+    }
     Ok(())
 }

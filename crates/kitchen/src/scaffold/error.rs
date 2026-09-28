@@ -123,8 +123,8 @@ pub enum ScaffoldError {
         "variable names are 1 to 64 bytes: a lowercase ASCII letter followed by lowercase letters, digits, or '_'"
     )]
     InvalidVariableName,
-    /// A variable value contains a control character.
-    #[error("value of template variable {name} contains a control character")]
+    /// A variable value violates its declared kind or contains a control character.
+    #[error("value of template variable {name} violates its kind or contains a control character")]
     InvalidVariableValue {
         /// The variable.
         name: VariableName,
@@ -222,6 +222,8 @@ pub enum TemplateProblem {
     UnsupportedSchema(u32),
     /// The template has no files.
     Empty,
+    /// A marker would displace a shebang/front matter, or mark an executable.
+    MarkerPlacement(RelativePath),
 }
 
 impl fmt::Display for TemplateProblem {
@@ -255,6 +257,11 @@ impl fmt::Display for TemplateProblem {
                 write!(formatter, "manifest schema {version} is not supported")
             }
             Self::Empty => formatter.write_str("template lists no files"),
+            Self::MarkerPlacement(path) => write!(
+                formatter,
+                "{} cannot carry a first-line provenance marker",
+                path.as_str()
+            ),
         }
     }
 }

@@ -94,7 +94,7 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
                 false,
             ));
         }
-        Err(error) => return Err(error),
+        Err(error) => return installation_error(error),
     }
     let healthy = plan.conflicts().next().is_none();
     Ok((
@@ -136,7 +136,7 @@ fn confirm() -> Result<bool, HouseError> {
     Ok(false)
 }
 
-/// Resolve the user's root once, including symlinked ancestors such as /var.
+/// Refuse a redirected final component; resolve ancestors such as /var once.
 /// Missing suffixes are retained; the installer checks all paths below this root.
 fn canonical_target(path: PathBuf) -> Result<PathBuf, HouseError> {
     let absolute = if path.is_absolute() {
@@ -149,6 +149,13 @@ fn canonical_target(path: PathBuf) -> Result<PathBuf, HouseError> {
         .any(|part| matches!(part, Component::ParentDir))
     {
         return Err(HouseError::InvalidInput);
+    }
+    let absolute: PathBuf = absolute.components().collect();
+    match std::fs::symlink_metadata(&absolute) {
+        Ok(metadata) if !metadata.is_dir() => return Err(HouseError::RedirectedPath),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let mut ancestor = absolute.as_path();
     let mut missing = Vec::new();
@@ -175,5 +182,43 @@ fn canonical_target(path: PathBuf) -> Result<PathBuf, HouseError> {
             }
             Err(error) => return Err(error.into()),
         }
+    }
+}
+
+fn installation_error(error: kitchen::Error) -> Result<(String, bool), kitchen::Error> {
+    if let kitchen::Error::House(HouseError::PartialInstallation { remaining }) = error {
+        let paths = remaining
+            .iter()
+            .map(|path| format!("  {}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok((
+            format!(
+                "Partial installation remains; inspect these paths before retrying:\n{paths}\nExisting files were not overwritten. Preserve any local changes while recovering."
+            ),
+            false,
+        ));
+    }
+    Err(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_installation_reports_every_remaining_path() -> Result<(), kitchen::Error> {
+        let error = HouseError::PartialInstallation {
+            remaining: vec![
+                PathBuf::from("/consumer/one"),
+                PathBuf::from("/consumer/two"),
+            ],
+        };
+        let (message, healthy) = installation_error(error.into())?;
+        assert!(!healthy);
+        assert!(message.contains("/consumer/one"));
+        assert!(message.contains("/consumer/two"));
+        assert!(message.contains("inspect"));
+        Ok(())
     }
 }

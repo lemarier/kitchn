@@ -186,7 +186,7 @@ fn mismatched_existing_house_is_refused() -> Result {
 }
 #[cfg(unix)]
 #[test]
-fn symlinked_root_is_resolved_but_links_below_root_are_refused() -> Result {
+fn symlinked_ancestor_is_resolved_but_links_below_root_are_refused() -> Result {
     use std::os::unix::fs::symlink;
     let f = Fixture::new()?;
     symlink(&f.root, f.root.join("alias"))?;
@@ -250,5 +250,41 @@ fn destination_created_after_preview_blocks_confirmed_apply() -> Result {
     );
     assert!(!f.root.join("consumer/AGENTS.md").exists());
     assert!(!f.root.join("consumer/.kitchen.json").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn redirected_and_invalid_target_roots_are_refused() -> Result {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new()?;
+    fs::create_dir(f.root.join("destination"))?;
+    symlink(f.root.join("destination"), f.root.join("link"))?;
+    symlink(f.root.join("absent"), f.root.join("dangling"))?;
+    fs::write(f.root.join("file"), "local")?;
+    for (verb, target, code) in [
+        ("init", "link", 1),
+        ("init", "link/.", 1),
+        ("init", "dangling", 1),
+        ("init", "destination/../consumer", 2),
+        ("init", "file", 1),
+        ("init", "file/child", 1),
+        ("adopt", "absent", 2),
+    ] {
+        let output = f
+            .command(verb, &f.root.join(target))
+            .args([
+                "--house",
+                "crabnebula",
+                "--repository",
+                "crabnebula/tauri-fixture",
+                "--yes",
+            ])
+            .output()?;
+        assert_eq!(output.status.code(), Some(code), "{target}: {output:?}");
+    }
+    assert_eq!(fs::read_dir(f.root.join("destination"))?.count(), 0);
+    assert_eq!(fs::read_to_string(f.root.join("file"))?, "local");
+    assert!(!f.root.join("absent").exists());
     Ok(())
 }

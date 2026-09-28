@@ -12,24 +12,30 @@ description = "Rust workspace with pinned toolchain, just checks, CI, security p
 description = "Human-readable project name"
 
 [variables.summary]
+kind = "quoted-text"
 description = "One-sentence project description"
 
 [variables.crate_name]
+kind = "rust-identifier"
 description = "Name of the first library crate under crates/"
 
 [variables.copyright_holder]
+kind = "quoted-text"
 description = "Copyright holder for the licenses and crate metadata"
 
 [variables.copyright_year]
+kind = "year"
 description = "Year in the MIT copyright notice"
 
 [variables.security_contact]
 description = "Private address for vulnerability reports"
 
 [variables.repository_url]
+kind = "https-url"
 description = "Repository URL recorded in Cargo metadata"
 
 [variables.rust_version]
+kind = "version"
 description = "Pinned Rust toolchain and MSRV"
 default = "1.98.1"
 

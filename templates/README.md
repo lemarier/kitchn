@@ -32,9 +32,9 @@ even with `--yes`; reconcile them manually. Only missing files are installed.
 Unchanged reruns do nothing. An interrupted create-only install can be rerun;
 inspect any reported partial-installation failure before proceeding.
 
-The CLI resolves the user-supplied root, including symlinked ancestors, once.
-Links and redirected paths below that resolved root are still refused by the
-installer. Parent (`..`) components are rejected; supply the intended root
+The CLI rejects a symlink or file as the target itself, including a dangling
+link. It resolves symlinked ancestors (such as macOS `/var`) once. Links and
+redirected paths below that resolved root are still refused by the installer. Parent (`..`) components are rejected; supply the intended root
 explicitly.
 
 ## House guidance and bootstrap assets
@@ -70,3 +70,30 @@ and must not silently change an active task's pin.
 Kitchen ships only `example/`. Copy it into your house guidance, set the house
 identity, declare all files, and bump the template revision when content changes.
 Keep product policy separate from Kitchen's development standards.
+
+## Values in structured output
+
+Variables default to `kind = "text"`: single-line text, never evaluated as another
+template. Houses must select an appropriate constraint before interpolating a
+value into TOML, Rust, JSON, or a shell command. Constraints reject unsupported
+values; they do not escape or silently rewrite them.
+
+- `quoted-text`: no double quote, backslash, or backtick; suitable inside the
+  fixtures' double-quoted strings and Rust doc comments.
+- `rust-identifier`: 1–64 lowercase ASCII letters, digits, or underscores,
+  starting with a letter; Rust keywords and hyphens are rejected.
+- `version`: exactly three decimal u32 components, with no leading zeroes;
+  suitable for the fixture's `cargo +<version>` shell token.
+- `year`: exactly four ASCII digits.
+- `https-url`: an `https://` prefix and a nonempty remainder, using only ASCII
+  letters, digits, `/`, `:`, `.`, `_`, and `-`.
+
+All kinds also reject control characters and values over 1 KiB. Defaults receive
+the same validation as supplied values. Use context-specific escaping in a
+house template if it needs richer text; do not put unrestricted text directly
+into structured syntax or commands. For example, the Origin89 fixture rejects
+`summary='A "quoted" tool'` rather than producing invalid TOML.
+
+Provenance cannot be enabled for executables or content beginning with `#!` or
+`---`. Those formats need their first line; leave them unmarked. The check runs
+after rendering, so variables cannot introduce a displaced shebang or front matter.

@@ -841,7 +841,9 @@ fn missing_template_is_an_execution_error() -> TestResult {
 }
 
 /// Kitchen's files that differ from the Origin89 template, and why. A rendered
-/// file not listed here must match this repository byte for byte.
+/// file not listed here must match this repository byte for byte. The five
+/// build-file exceptions are executed by generated_origin89_fixture_passes_offline_checks;
+/// this list alone is not build evidence.
 const DOCUMENTED_DIFFERENCES: &[(&str, &str)] = &[
     (
         "README.md",
@@ -930,5 +932,209 @@ fn changed_or_removed_unchanged_files_refuse_additions() -> TestResult {
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn structured_fixture_variables_refuse_code_and_syntax_injection() -> TestResult {
+    for (name, value) in [
+        ("summary", "A \"quoted\" tool"),
+        ("crate_name", "my-crate"),
+        ("crate_name", "type"),
+        ("rust_version", "1.98.1; touch /tmp/kitchen-injected"),
+        ("repository_url", "https://example.com/\"injected"),
+        ("copyright_year", "2026; command"),
+    ] {
+        let mut values = kitchen_vars()?;
+        values.insert(name.parse()?, value.to_owned());
+        assert!(
+            matches!(
+                origin89_template()?.render(&HouseId::new("origin89")?, &guidance('a')?, &values),
+                Err(ScaffoldError::InvalidVariableValue { .. })
+            ),
+            "{name} must be rejected"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn markers_refuse_first_line_sensitive_content() -> TestResult {
+    for (body, mode) in [
+        ("#!/bin/sh\necho hello\n", "regular"),
+        ("---\nname: skill\n---\n", "regular"),
+        ("echo hello\n", "executable"),
+    ] {
+        let manifest = Manifest::parse(&minimal_with(&format!(
+            "[[files]]\nsource = \"file\"\nmode = \"{mode}\"\nprovenance = \"hash-comment\"\n"
+        )))?;
+        let template = Template::from_parts(
+            manifest,
+            BTreeMap::from([(RelativePath::new("file")?, body.to_owned())]),
+        )?;
+        assert!(
+            matches!(
+                template.render(&HouseId::new("home")?, &guidance('a')?, &BTreeMap::new()),
+                Err(ScaffoldError::Template {
+                    problem: TemplateProblem::MarkerPlacement(_)
+                })
+            ),
+            "{body}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn real_apply_io_failure_rolls_back_and_retry_recovers() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new()?;
+    let root = real(&temp)?;
+    let target = root.join("consumer");
+    fs::create_dir_all(target.join("crates"))?;
+    fs::write(target.join("local.txt"), "preserve me")?;
+    let template = Template::from_parts(
+        Manifest::parse(&minimal_with(
+            "[[files]]\nsource = \"first\"\n[[files]]\nsource = \"crates/second\"\n",
+        ))?,
+        BTreeMap::from([
+            (RelativePath::new("first")?, "first".into()),
+            (RelativePath::new("crates/second")?, "second".into()),
+        ]),
+    )?;
+    let plan = FilePlan::new(
+        template.render(&HouseId::new("home")?, &guidance('a')?, &BTreeMap::new())?,
+        &target,
+    )?;
+    fs::set_permissions(target.join("crates"), fs::Permissions::from_mode(0o555))?;
+    let result = plan.apply();
+    fs::set_permissions(target.join("crates"), fs::Permissions::from_mode(0o755))?;
+    assert!(
+        matches!(
+            result,
+            Err(Error::House(HouseError::Io(
+                std::io::ErrorKind::PermissionDenied
+            )))
+        ),
+        "{result:?}; test requires an unprivileged user"
+    );
+    assert!(!target.join("first").exists());
+    assert!(!target.join("crates/second").exists());
+    assert_eq!(fs::read_to_string(target.join("local.txt"))?, "preserve me");
+    let report = plan.apply()?;
+    assert_eq!(report.files.len(), 2);
+    assert_eq!(fs::read_to_string(target.join("first"))?, "first");
+    assert_eq!(fs::read_to_string(target.join("crates/second"))?, "second");
+    Ok(())
+}
+
+#[test]
+fn text_variables_are_not_evaluated_as_templates() -> TestResult {
+    let rendered = example_template()?.render(
+        &HouseId::new("example")?,
+        &guidance('a')?,
+        &vars(&[("project_name", "{{ throw(message='must not run') }}")])?,
+    )?;
+    let readme = rendered
+        .files
+        .iter()
+        .find(|file| file.path.as_str() == "README.md")
+        .ok_or("README missing")?;
+    assert!(
+        readme
+            .contents
+            .contains("{{ throw(message='must not run') }}")
+    );
+    Ok(())
+}
+
+#[test]
+fn generated_origin89_fixture_passes_offline_checks() -> TestResult {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    for tool in ["just", "cargo"] {
+        match Command::new(tool).arg("--version").output() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                writeln!(
+                    std::io::stderr(),
+                    "SKIP generated Origin89 offline just check: {tool} unavailable"
+                )?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+            Ok(output) if !output.status.success() => {
+                return Err(format!("{tool} --version failed").into());
+            }
+            Ok(_) => {}
+        }
+    }
+    let temp = TempDir::new()?;
+    let root = real(&temp)?;
+    let consumer = root.join("consumer");
+    FilePlan::new(render_origin89('a')?, &consumer)?.apply()?;
+    let log_path = root.join("check.log");
+    let log = fs::File::create(&log_path)?;
+    let mut child = Command::new("just")
+        .arg("check")
+        .current_dir(&consumer)
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env("CARGO_NET_OFFLINE", "true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log))
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline || fs::metadata(&log_path)?.len() > 2 * 1024 * 1024 {
+            child.kill()?;
+            child.wait()?;
+            return Err("generated fixture check exceeded 180 seconds or 2 MiB output".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let output = fs::read_to_string(log_path)?;
+    assert!(
+        status.success(),
+        "generated Origin89 just check failed:\n{output}"
+    );
+    writeln!(
+        std::io::stderr(),
+        "PASS generated Origin89 offline just check: fmt, clippy, tests, build, docs, MSRV, actionlint (current checkout)"
+    )?;
+    Ok(())
+}
+
+#[test]
+fn variable_constraints_validate_defaults_and_reject_unknown_kinds() -> TestResult {
+    let manifest = minimal_with(
+        "[variables.version]\ndescription = \"Version\"\nkind = \"version\"\ndefault = \"1.2.3; command\"\n[[files]]\nsource = \"file\"\n",
+    );
+    let template = Template::from_parts(
+        Manifest::parse(&manifest)?,
+        BTreeMap::from([(RelativePath::new("file")?, "{{ vars.version }}".into())]),
+    )?;
+    assert!(matches!(
+        template.render(&HouseId::new("home")?, &guidance('a')?, &BTreeMap::new()),
+        Err(ScaffoldError::InvalidVariableValue { .. })
+    ));
+    let rendered = template.render(
+        &HouseId::new("home")?,
+        &guidance('a')?,
+        &vars(&[("version", "1.2.3")])?,
+    )?;
+    assert_eq!(
+        rendered.files.first().ok_or("file missing")?.contents,
+        "1.2.3"
+    );
+    assert!(
+        Manifest::parse(&manifest.replace("kind = \"version\"", "kind = \"unknown\"")).is_err()
+    );
     Ok(())
 }

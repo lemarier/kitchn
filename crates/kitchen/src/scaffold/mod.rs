@@ -56,7 +56,7 @@ mod template;
 pub use error::{ScaffoldError, ScaffoldLimit, ScaffoldOperation, TemplateProblem};
 pub use manifest::{
     FileEntry, MAX_VARIABLES, Manifest, MarkerStyle, TEMPLATE_SCHEMA, TemplateName,
-    TemplateRevision, VariableName, VariableSpec,
+    TemplateRevision, VariableKind, VariableName, VariableSpec,
 };
 pub use plan::{Conflict, FilePlan, PlanAction, PlanKind, PlannedFile};
 pub use provenance::{

@@ -210,7 +210,17 @@ impl Template {
                 })?
             };
             let contents = match entry.provenance {
-                Some(style) => mark(style, &provenance, &body),
+                Some(style) => {
+                    if entry.mode == FileMode::Executable
+                        || body.starts_with("#!")
+                        || body.starts_with("---")
+                    {
+                        return Err(template_problem(TemplateProblem::MarkerPlacement(
+                            entry.source.clone(),
+                        )));
+                    }
+                    mark(style, &provenance, &body)
+                }
                 None => body,
             };
             if contents.len() > MAX_RENDERED_BYTES {
@@ -279,7 +289,7 @@ impl Template {
                     limit: ScaffoldLimit::VariableBytes,
                 });
             }
-            if value.chars().any(char::is_control) {
+            if value.chars().any(char::is_control) || !spec.kind.accepts(value) {
                 return Err(ScaffoldError::InvalidVariableValue { name: name.clone() });
             }
             resolved.insert(name.as_str(), value.as_str());

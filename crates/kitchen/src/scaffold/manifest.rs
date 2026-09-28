@@ -141,9 +141,69 @@ impl fmt::Display for VariableName {
 pub struct VariableSpec {
     /// What the value means, for prompts and previews.
     pub description: String,
+    /// Validation for the output context; free text by default.
+    #[serde(default)]
+    pub kind: VariableKind,
     /// The value used when none is supplied; without one the variable is required.
     #[serde(default)]
     pub default: Option<String>,
+}
+
+/// Constraints for values embedded in structured output. These validate, not escape.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum VariableKind {
+    /// Single-line text; houses must escape it for structured output.
+    #[default]
+    Text,
+    /// Single-line literal inside double quotes or a Rust doc comment.
+    QuotedText,
+    /// Lowercase Rust crate identifier, excluding keywords and hyphens.
+    RustIdentifier,
+    /// Three dot-separated unsigned version numbers, suitable for a shell token.
+    Version,
+    /// Four decimal digits.
+    Year,
+    /// HTTPS URL using ASCII letters, digits, slash, colon, dot, underscore and hyphen.
+    HttpsUrl,
+}
+
+impl VariableKind {
+    pub(super) fn accepts(self, value: &str) -> bool {
+        match self {
+            Self::Text => true,
+            Self::QuotedText => !value.contains(['"', '\\', '`']),
+            Self::RustIdentifier => {
+                let keywords = "as break const continue crate else enum extern false fn for if impl in let loop match mod move mut pub ref return self static struct super trait true type unsafe use where while async await dyn gen abstract become box do final macro override priv typeof unsized virtual yield try union";
+                value.len() <= 64
+                    && value.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    && !keywords.split_whitespace().any(|word| word == value)
+            }
+            Self::Version => {
+                let parts: Vec<_> = value.split('.').collect();
+                parts.len() == 3
+                    && parts.iter().all(|part| {
+                        !part.is_empty()
+                            && part.bytes().all(|b| b.is_ascii_digit())
+                            && (part.len() == 1 || !part.starts_with('0'))
+                            && part.parse::<u32>().is_ok()
+                    })
+            }
+            Self::Year => value.len() == 4 && value.bytes().all(|b| b.is_ascii_digit()),
+            Self::HttpsUrl => {
+                value
+                    .strip_prefix("https://")
+                    .is_some_and(|rest| !rest.is_empty())
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"/:._-".contains(&b))
+            }
+        }
+    }
 }
 
 /// How a rendered file records its provenance.
@@ -251,5 +311,45 @@ impl Manifest {
             }
         }
         Ok(manifest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VariableKind;
+
+    #[test]
+    fn structured_kinds_accept_only_their_documented_grammar() {
+        use VariableKind::{HttpsUrl, QuotedText, RustIdentifier, Text, Version, Year};
+        for (kind, valid, invalid) in [
+            (QuotedText, "A useful tool.", "A \"quoted\" tool"),
+            (QuotedText, "", "back\\slash"),
+            (QuotedText, "é", "```"),
+            (RustIdentifier, "my_crate2", "my-crate"),
+            (RustIdentifier, "x", "type"),
+            (RustIdentifier, "x", "gen"),
+            (RustIdentifier, "crate_name", ""),
+            (RustIdentifier, "crate_name", "r#type"),
+            (Version, "1.98.1", "1.98.1; command"),
+            (Version, "0.0.0", "01.2.3"),
+            (Version, "1.2.3", "1.2"),
+            (Version, "1.2.3", "4294967296.2.3"),
+            (Year, "2026", "26"),
+            (Year, "0000", "202x"),
+            (
+                HttpsUrl,
+                "https://example.com/a-b_c",
+                "https://example.com/\"",
+            ),
+            (HttpsUrl, "https://example.com", "http://example.com"),
+            (HttpsUrl, "https://example.com", "https://"),
+        ] {
+            assert!(kind.accepts(valid), "{kind:?}: {valid}");
+            assert!(!kind.accepts(invalid), "{kind:?}: {invalid}");
+        }
+        assert!(!RustIdentifier.accepts("r#type"));
+        assert!(!RustIdentifier.accepts(&"a".repeat(65)));
+        assert!(RustIdentifier.accepts(&"a".repeat(64)));
+        assert!(Text.accepts("{{ literal }}"));
     }
 }

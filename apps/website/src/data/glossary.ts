@@ -43,7 +43,7 @@ export const glossary: Term[] = [
     term: "Orchestrator",
     kitchen: "backend",
     meaning:
-      "The tool that actually launches and supervises agents, such as Orca. kitchn sits on top of it.",
+      "The tool that launches and supervises agents, such as Orca. kitchn sits on top of it.",
     landing: true,
   },
   {

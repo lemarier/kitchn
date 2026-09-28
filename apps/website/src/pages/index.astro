@@ -153,7 +153,7 @@ const lookedAt = [
       { name: "Copilot review", icon: siGithubcopilot },
     ],
     good: "A second opinion on a pull request.",
-    missing: "A review isn't a gate tied to the exact head and your approvals.",
+    missing: "It doesn't hold the merge until the exact head passes your checks and approvals.",
   },
   {
     what: "Governance layers",
@@ -167,7 +167,7 @@ const lookedAt = [
 const guests = [
   {
     title: "You run more agents than you can watch",
-    body: "Six worktrees, three models, and you're still the one reading every diff. Hand the first read to an expediter that works from evidence.",
+    body: "An expediter takes the first pass on every pull request and sends back what fails, with the evidence.",
   },
   {
     title: "You work for more than one house",
@@ -379,14 +379,13 @@ const menu = [
         <div class="factory-split">
           <p class="factory-lede">
             Six agents, one of you. You take every order, read every diff, decide what's good enough,
-            merge at midnight and clean up worktrees in the morning. More agents only make the line
-            longer.
+            merge at midnight and clean up worktrees in the morning.
           </p>
           <div class="factory-quote">
             <p class="factory-big">You're not running a software factory.</p>
             <p>
               Factories count units shipped. A good kitchen serves a full room every night and still
-              sends back any plate that isn't right. That's the bar: quality at scale, with a brigade
+              sends back any plate that isn't right. Your agents should work to that standard, as a brigade
               where everyone knows their station.
             </p>
           </div>
@@ -398,7 +397,7 @@ const menu = [
           <h2 id="brigade-title">Meet the brigade</h2>
           <p class="section-lede">
             Eight stations, each with one job. Every station owes evidence and has a line it can't cross.
-            Stations open when there's work; installing kitchn starts nothing and grants no authority.
+            Stations open only when there's work for them.
           </p>
         </div>
         {
@@ -495,8 +494,7 @@ const menu = [
           </div>
           <div class="board-foot">
             <p>
-              One issue, start to finish. Each station has one owner, runs on the orchestrator and model
-              you chose for it, and shows evidence before the order moves on.
+              Each station runs on the orchestrator and model you chose for it.
             </p>
             <button class="refire" type="button" data-refire>Fire it again</button>
           </div>

@@ -1504,8 +1504,7 @@ impl StoreState {
         backend.capabilities.require(
             task.spec
                 .requires
-                .iter()
-                .copied()
+                .for_executor(plan.effect.executor())
                 .chain([plan.effect.required_capability()]),
         )?;
         let trigger = task.owned_lease(plan.fence, now, true)?.trigger;

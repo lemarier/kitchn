@@ -853,11 +853,13 @@ fn workflow_capability_requirements_are_checked_at_execution() -> TestResult {
     let fixture = Fixture::new()?;
     let task = task_id("task-1")?;
     let mut workflow = spec("task-1")?;
-    workflow.requires = [
-        Capability::WorkerLaunchReadiness,
-        Capability::ScheduleRunTimeout,
-    ]
-    .into();
+    workflow.requires = kitchen::contracts::CapabilityRequirements::new().with(
+        kitchen::contracts::ExecutorKind::Worker,
+        [
+            Capability::WorkerLaunchReadiness,
+            Capability::ScheduleRunTimeout,
+        ],
+    );
     fixture.store.create_task(workflow, &creator()?, at(0))?;
     let fence = fixture
         .store
@@ -903,7 +905,11 @@ fn workflow_capability_requirements_are_checked_at_execution() -> TestResult {
     assert!(matches!(launched.state(), EffectState::Applied { .. }));
     let stored = fixture.store.task(&task)?;
     assert_eq!(
-        stored.spec().requires.iter().copied().collect::<Vec<_>>(),
+        stored
+            .spec()
+            .requires
+            .for_executor(kitchen::contracts::ExecutorKind::Worker)
+            .collect::<Vec<_>>(),
         [
             Capability::ScheduleRunTimeout,
             Capability::WorkerLaunchReadiness

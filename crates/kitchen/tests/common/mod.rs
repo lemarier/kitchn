@@ -110,7 +110,7 @@ pub fn spec_with(id: &str, retry: RetryPolicy, permissions: &[Permission]) -> Te
             repository_instructions: None,
         },
         resources: std::collections::BTreeSet::new(),
-        requires: std::collections::BTreeSet::new(),
+        requires: kitchen::contracts::CapabilityRequirements::new(),
     })
 }
 

@@ -86,8 +86,8 @@ pub use evidence::{Evidence, EvidenceKind, EvidenceRevision, EvidenceSubject, Ev
 pub use resource::{ResourceKind, ResourceRef};
 pub use role::Role;
 pub use task::{
-    AttemptNumber, AttemptOutcome, AttemptStart, Disposition, EffectSeq, FailureClass, Fence,
-    Provenance, RetryPolicy, Settlement, TaskSpec,
+    AttemptNumber, AttemptOutcome, AttemptStart, CapabilityRequirements, Disposition, EffectSeq,
+    FailureClass, Fence, Provenance, RetryPolicy, Settlement, TaskSpec,
 };
 pub use trigger::{Authorization, Claimant, Consent, ConsumerFence, Trigger};
 pub use value::{

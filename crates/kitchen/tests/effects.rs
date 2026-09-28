@@ -1028,3 +1028,76 @@ fn recovery_follows_the_per_kind_declaration() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn capability_requirements_apply_only_to_their_executor() -> TestResult {
+    let fixture = Fixture::new()?;
+    let grants = grants_everywhere()?;
+    let mut work = spec("task-1")?;
+    work.repository = Some(km43()?);
+    work.authority = TaskAuthority::delegate(&grants, grants_everywhere_list()?)?;
+    work.requires = kitchen::contracts::CapabilityRequirements::new()
+        .with(ExecutorKind::Worker, [Capability::WorkerLaunchReadiness]);
+    let task = task_id("task-1")?;
+    fixture.store.create_task(work, &creator()?, at(0))?;
+    let fence = fixture
+        .store
+        .claim(&task, &scheduled("coordinator-a")?, ttl(600)?, at(0))?
+        .fence();
+    fixture.store.start_attempt(&task, fence, at(0))?;
+    let clock = ManualClock::starting_at(1);
+
+    // A forge executor does not need worker capabilities.
+    let forge = executor(ExecutorKind::GitHub, Capability::ForgeMutation)?;
+    let labelled = run_effect(
+        &fixture.store,
+        &forge,
+        &grants,
+        plan(&task, fence, "label", label(km43()?, "agent-ready")?)?,
+        &clock,
+    )?;
+    assert!(matches!(labelled.state(), EffectState::Applied { .. }));
+
+    // A worker backend without the required worker capability is refused.
+    let workers = executor(ExecutorKind::Worker, Capability::WorkerLaunchIsolated)?;
+    assert!(matches!(
+        run_effect(&fixture.store, &workers, &grants, plan(&task, fence, "launch", launch()?)?, &clock),
+        Err(Error::Contract(ContractError::UnsupportedCapabilities { ref missing, .. }))
+            if missing == &[Capability::WorkerLaunchReadiness]
+    ));
+    Ok(())
+}
+
+#[test]
+fn persisted_capability_requirements_reject_a_repeated_executor() -> TestResult {
+    let requirements = kitchen::contracts::CapabilityRequirements::new()
+        .with(ExecutorKind::Worker, [Capability::WorkerLaunchReadiness])
+        .with(ExecutorKind::GitHub, [Capability::ForgeMutation]);
+    let json = serde_json::to_string(&requirements)?;
+    assert_eq!(
+        json,
+        r#"{"worker":["worker.launch_readiness"],"github":["forge.mutation"]}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<kitchen::contracts::CapabilityRequirements>(&json)?,
+        requirements
+    );
+    let repeated = r#"{"worker":["worker.launch_readiness"],"worker":[]}"#;
+    assert!(serde_json::from_str::<kitchen::contracts::CapabilityRequirements>(repeated).is_err());
+    let unknown = r#"{"mainframe":["worker.launch_readiness"]}"#;
+    assert!(serde_json::from_str::<kitchen::contracts::CapabilityRequirements>(unknown).is_err());
+
+    // A stored task with a repeated executor is rejected on load, bytes kept.
+    let fixture = Fixture::new()?;
+    let mut work = spec("task-1")?;
+    work.requires = requirements;
+    fixture.store.create_task(work, &creator()?, at(0))?;
+    let path = fixture.state_path();
+    let text = std::fs::read_to_string(&path)?;
+    let corrupt = text.replacen("\"github\": [", "\"worker\": [", 1);
+    assert_ne!(corrupt, text);
+    std::fs::write(&path, &corrupt)?;
+    assert!(fixture.reopen().is_err());
+    assert_eq!(std::fs::read_to_string(&path)?, corrupt);
+    Ok(())
+}

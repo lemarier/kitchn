@@ -18,7 +18,9 @@
 //! that message only when the gate task owns the worker (it launched it, or
 //! the worker was given to it); otherwise nothing is written. With no live
 //! worker, the gate launches one on exactly that branch. A worker a person
-//! took over, or whose state is unknown, receives nothing.
+//! took over, or whose state is unknown, receives nothing. Before persisting a
+//! fix delivery, the owning task must hold [`Permission::PushBranch`] for the
+//! repository on the forge backend; worker permissions alone do not suffice.
 
 use std::{
     fmt,
@@ -29,9 +31,10 @@ use crate::{
     BackendId, EffectName, HouseId, IdentifierError, TaskId, WorkflowId,
     contracts::{
         BackendDescriptor, BackendUnavailable, BranchName, Claimant, CommitId, ContractError,
-        Effect, EvidenceSubject, ExternalRef, Fence, GitHubAction, GitHubEffect, HouseGrants,
-        IdempotencyKey, IssueNumber, Operation, PostingBudget, Repository, ResourceKind,
-        ResourceRef, Role, Timestamp, ValueKind, WorkerBackend, WorkerState, Workspace,
+        Effect, EvidenceSubject, ExternalRef, Fence, GitHubAction, GitHubEffect, GrantScope,
+        HouseGrants, IdempotencyKey, IssueNumber, Operation, Permission, PostingBudget, Repository,
+        ResourceKind, ResourceRef, Role, Timestamp, ValueKind, WorkerBackend, WorkerState,
+        Workspace,
     },
     state::{
         EffectPlan, EffectRecord, EffectStart, EffectState, HouseStore, MarkerFact, MarkerKey,
@@ -500,11 +503,23 @@ impl GateMarkerStore for HouseGateStore<'_> {
                 gate_state(existing.state()),
             ));
         }
-        let effect = self.effect(&tasks, record, decision)?;
         let owner = tasks
             .iter()
             .find(|task| task.spec().id == self.task)
             .ok_or_else(|| StateError::TaskNotFound(self.task.clone()))?;
+        // A fix request asks a worker to edit, commit, and push the branch.
+        // The owning task must hold push authority for the repository on the
+        // forge under the house's current grants, separately from the worker
+        // permissions that deliver the request.
+        if matches!(record.verdict, Verdict::FixRequest { .. }) {
+            owner.spec().authority.authorize(
+                self.grants,
+                Permission::PushBranch,
+                &GrantScope::Repository(record.repository.clone()),
+                &self.backend.backend,
+            )?;
+        }
+        let effect = self.effect(&tasks, record, decision)?;
         let subject = EvidenceSubject {
             head: record.head.clone(),
             base: Some(record.base.clone()),

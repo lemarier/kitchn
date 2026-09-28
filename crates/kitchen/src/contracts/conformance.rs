@@ -49,7 +49,7 @@ pub enum Check {
     LaunchObservable,
     /// The inventory lists the launched worker as live, within its bound.
     InventoryListsLaunch,
-    /// A cancelled worker is no longer reported as running.
+    /// A cancelled worker is reported settled; a missing record is not evidence.
     CancelObserved,
 }
 
@@ -633,10 +633,12 @@ impl<'a> Runner<'a> {
             Ok(WorkerState::Ready | WorkerState::AwaitingReply | WorkerState::Starting) => {
                 fail(check, "cancelled worker still reported as running")
             }
-            Ok(WorkerState::Settled(_) | WorkerState::Missing) => {
+            Ok(WorkerState::Settled(_)) => {
                 self.record(check, CheckResult::Passed);
                 Ok(())
             }
+            // No record is not proof that the worker stopped.
+            Ok(WorkerState::Missing) => fail(check, "cancelled worker is missing, not settled"),
             Ok(WorkerState::Unknown) => fail(check, "cancelled worker state is unknown"),
             Err(_) => fail(check, "declared status was unavailable"),
         }

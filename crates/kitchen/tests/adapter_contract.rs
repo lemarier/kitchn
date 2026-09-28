@@ -1182,3 +1182,45 @@ fn abrupt_exit_after_intent_leaves_a_reconcilable_effect() -> TestResult {
     assert_eq!(backend.execute_calls(), 0);
     Ok(())
 }
+
+/// Loses its worker record after an uncertain cancel, while the worker may run on.
+struct ForgetfulCancelBackend(FakeBackend);
+
+impl EffectExecutor for ForgetfulCancelBackend {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.0.descriptor()
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        match request.effect() {
+            kitchen::contracts::Effect::Worker(Operation::CancelWorker { worker }) => {
+                self.0.set_worker_state(worker, WorkerState::Missing);
+                Err(EffectFailure::Uncertain(UncertainReason::Timeout))
+            }
+            _ => self.0.execute(request),
+        }
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.0.lookup(request)
+    }
+}
+
+impl WorkerBackend for ForgetfulCancelBackend {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.0.observe_worker(worker)
+    }
+    fn inventory(
+        &self,
+    ) -> Result<Vec<kitchen::contracts::ResourceObservation>, BackendUnavailable> {
+        self.0.inventory()
+    }
+}
+
+#[test]
+fn a_missing_worker_is_not_evidence_of_cancellation() -> TestResult {
+    let backend = ForgetfulCancelBackend(FakeBackend::fully_capable(backend_id()?, house()?));
+    let failure = conformance::run_worker(&backend, &conformance_fixture()?)
+        .err()
+        .ok_or("a missing worker passed as cancelled")?;
+    assert_eq!(failure.check, Check::CancelObserved);
+    Ok(())
+}

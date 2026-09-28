@@ -1,4 +1,4 @@
-//! `kitchen cleanup preview` through the real binary. Simulated evidence: the
+//! `kitchen cleanup preview` and `approve` through the real binary. Simulated evidence: the
 //! store and worktrees are disposable, and ownership comes from the fake
 //! backend; nothing here reads a live orchestrator.
 
@@ -15,8 +15,8 @@ use kitchen::{
     contracts::{
         AttemptOutcome, AttemptStart, CapabilityRequirements, Claimant, Clock, CommitId,
         EvidenceRevision, Grant, HouseGrants, LeaseTtl, Operation, Permission, Provenance,
-        ResourceKind, RetryPolicy, Role, TaskAuthority, TaskSpec, Text, Timestamp, Workspace,
-        fake::FakeBackend,
+        ResourceKind, RetryPolicy, Role, TaskAuthority, TaskSpec, Text, Timestamp, Trigger,
+        Workspace, fake::FakeBackend,
     },
     state::{EffectPlan, EffectState, HouseStore, StoreOptions, run_effect},
 };
@@ -194,13 +194,30 @@ fn preview_args<'a>(store: &'a str, inventory: &'a str) -> Vec<&'a str> {
         "origin89",
         "--inventory",
         inventory,
-        "--holder",
-        "david",
     ]
 }
 
+fn approve_args<'a>(store: &'a str, inventory: &'a str, digests: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "cleanup",
+        "approve",
+        "--store",
+        store,
+        "--house",
+        "origin89",
+        "--inventory",
+        inventory,
+        "--holder",
+        "david",
+    ];
+    for digest in digests {
+        args.extend(["--digest", digest]);
+    }
+    args
+}
+
 #[test]
-fn a_preview_explains_releases_and_exclusions_and_records_markers() -> TestResult {
+fn a_preview_explains_releases_and_exclusions_and_writes_nothing() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let store = initialize(&root)?;
@@ -242,9 +259,9 @@ fn a_preview_explains_releases_and_exclusions_and_records_markers() -> TestResul
     );
     assert!(stdout.contains("\n  build output target ("), "{stdout}");
     assert!(stdout.contains(") remove"), "{stdout}");
-    // One marker per eligible step: two releases and the build output.
-    let markers = store.markers(&WorkflowId::new("dishwasher")?)?;
-    assert_eq!(markers.len(), 3);
+    assert!(stdout.contains("approve with --digest sha256:"), "{stdout}");
+    // Previewing approves nothing and records nothing.
+    assert!(store.markers(&WorkflowId::new("dishwasher")?)?.is_empty());
 
     args.push("--json");
     let output = kitchen(&args)?;
@@ -256,8 +273,7 @@ fn a_preview_explains_releases_and_exclusions_and_records_markers() -> TestResul
         json["entries"][2]["decision"]["reasons"][0],
         "unknown-owner"
     );
-    // Unchanged evidence does not record more markers.
-    assert_eq!(store.markers(&WorkflowId::new("dishwasher")?)?.len(), 3);
+    assert!(store.markers(&WorkflowId::new("dishwasher")?)?.is_empty());
 
     // Disk pressure adds commands for caches Kitchen does not own.
     let mut pressured = preview_args(text(&store_dir)?, text(&inventory)?);
@@ -268,6 +284,107 @@ fn a_preview_explains_releases_and_exclusions_and_records_markers() -> TestResul
         stdout.contains("Not run (outside Kitchen): cargo cache --autoclean"),
         "{stdout}"
     );
+
+    // A person approves the two releases and the build output by digest.
+    let digest = |value: &serde_json::Value| -> TestResult<String> {
+        Ok(value.as_str().ok_or("digest")?.to_owned())
+    };
+    let digests = [
+        digest(&json["entries"][0]["observation"])?,
+        digest(&json["entries"][1]["observation"])?,
+        digest(&json["entries"][1]["buildOutput"]["observation"])?,
+    ];
+    let refs: Vec<&str> = digests.iter().map(String::as_str).collect();
+    let output = kitchen(&approve_args(text(&store_dir)?, text(&inventory)?, &refs))?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("Recorded 3 of 3 approvals. Nothing was released."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("approved build output of worktree"),
+        "{stdout}"
+    );
+    let markers = store.markers(&WorkflowId::new("dishwasher")?)?;
+    assert_eq!(markers.len(), 3);
+    for marker in &markers {
+        assert_eq!(marker.recorded_by().trigger, Trigger::Interactive);
+        assert_eq!(marker.recorded_by().holder.as_str(), "david");
+    }
+    // Approving the same evidence again renews it without another marker.
+    let output = kitchen(&approve_args(text(&store_dir)?, text(&inventory)?, &refs))?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(store.markers(&WorkflowId::new("dishwasher")?)?.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn an_approval_for_evidence_that_no_longer_matches_is_refused() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let store = initialize(&root)?;
+    let (worker, _, key) = settled_task(&store)?;
+    let inventory = root.join("inventory.json");
+    fs::write(
+        &inventory,
+        serde_json::to_vec(&serde_json::json!({
+            "backend": "orca",
+            "resources": [
+                {"kind": "worker", "handle": worker, "owner": key, "liveness": "exited", "worker": "settled-succeeded"},
+            ],
+        }))?,
+    )?;
+    let store_dir = root.join("house");
+    let stale = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let output = kitchen(&approve_args(
+        text(&store_dir)?,
+        text(&inventory)?,
+        &[stale],
+    ))?;
+    // The approval is reported, the exit is a failure, and nothing is recorded.
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("Recorded 0 of 1 approvals"), "{stdout}");
+    assert!(stdout.contains("not approved: sha256:0000"), "{stdout}");
+    assert!(store.markers(&WorkflowId::new("dishwasher")?)?.is_empty());
+    // At least one digest is required.
+    let output = kitchen(&approve_args(text(&store_dir)?, text(&inventory)?, &[]))?;
+    assert_eq!(output.status.code(), Some(2));
+    Ok(())
+}
+
+#[test]
+fn ignored_files_that_keep_a_worktree_are_listed_in_the_preview() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let store = initialize(&root)?;
+    let (worker, worktree, key) = settled_task(&store)?;
+    let path = pushed_worktree(&root)?;
+    // Ignored by the repository's exclude file, so `git status` stays clean.
+    fs::write(
+        root.join("main").join(".git").join("info").join("exclude"),
+        ".env\n",
+    )?;
+    fs::write(path.join(".env"), "TOKEN=secret\n")?;
+    let inventory = root.join("inventory.json");
+    fs::write(
+        &inventory,
+        serde_json::to_vec(&serde_json::json!({
+            "backend": "orca",
+            "resources": [
+                {"kind": "worker", "handle": worker, "owner": key, "liveness": "exited", "worker": "settled-succeeded"},
+                {"kind": "worktree", "handle": worktree, "owner": key, "liveness": "exited", "path": path},
+            ],
+        }))?,
+    )?;
+    let store_dir = root.join("house");
+    let output = kitchen(&preview_args(text(&store_dir)?, text(&inventory)?))?;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("1 to release, 1 retained."), "{stdout}");
+    assert!(stdout.contains("retain: ignored-files"), "{stdout}");
+    assert!(stdout.contains("ignored, kept: .env"), "{stdout}");
     Ok(())
 }
 

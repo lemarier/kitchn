@@ -1,11 +1,14 @@
-//! `kitchen cleanup`: preview dishwasher decisions from a captured inventory.
+//! `kitchen cleanup`: preview dishwasher decisions from a captured inventory
+//! and record a person's approval of what the preview showed.
 //!
-//! The preview reads the house store, an inventory snapshot exported from the
-//! backend, and the listed worktrees through bounded read-only Git calls. It
-//! records one preview marker per eligible resource and releases nothing:
-//! this command has no path to a backend effect.
+//! Both subcommands read the house store, an inventory snapshot exported from
+//! the backend, and the listed worktrees through bounded read-only Git calls.
+//! `preview` writes nothing. `approve` records one approval marker per named
+//! digest, as an interactive claimant, so a scheduled run cannot approve for
+//! itself. Neither releases anything: this command has no path to a backend
+//! effect.
 
-use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
 use kitchen::{
@@ -20,8 +23,8 @@ use kitchen::{
     house::HouseError,
     state::{HouseStore, StoreOptions},
     workflows::cleanup::{
-        Decision, DiskUsage, GitLimits, InspectionTrigger, Inspector, OwnerState, Ownership,
-        Preview, preview,
+        ApprovalOutcome, ApprovalResult, Decision, DiskUsage, GitLimits, InspectionTrigger,
+        Inspector, OwnerState, Ownership, Preview, Step, WorktreeEvidence, approve, inspect,
     },
 };
 use serde::Deserialize;
@@ -32,30 +35,45 @@ pub struct CleanupArgs {
     command: CleanupCommand,
 }
 
+/// Where the inventory comes from and which house it belongs to.
+#[derive(Args)]
+struct Source {
+    /// The house's initialized state store.
+    #[arg(long)]
+    store: PathBuf,
+    #[arg(long)]
+    house: HouseId,
+    /// Inventory snapshot exported from the backend (JSON). Trusted input:
+    /// Git reads each listed worktree path.
+    #[arg(long)]
+    inventory: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Subcommand)]
 enum CleanupCommand {
     /// Explain what the dishwasher would release and why everything else is kept.
-    /// Records the preview in the house store; releases nothing.
+    /// Writes nothing; each step it would take shows the digest to approve.
     Preview {
-        /// The house's initialized state store.
-        #[arg(long)]
-        store: PathBuf,
-        #[arg(long)]
-        house: HouseId,
-        /// Inventory snapshot exported from the backend (JSON). Trusted input:
-        /// Git reads each listed worktree path.
-        #[arg(long)]
-        inventory: PathBuf,
-        /// Who is recording the preview.
-        #[arg(long)]
-        holder: HolderId,
+        #[command(flatten)]
+        source: Source,
         #[arg(long, value_enum, default_value_t = TriggerArg::Manual)]
         trigger: TriggerArg,
-        /// Seconds after which an unchanged preview is recorded again.
-        #[arg(long, default_value_t = 86_400)]
-        max_age_secs: u64,
+    },
+    /// Record your approval of previewed steps, by the digests the preview
+    /// showed. A scheduled run acts only on steps a person approved this way,
+    /// and only while the evidence still matches. Releases nothing.
+    Approve {
+        #[command(flatten)]
+        source: Source,
+        /// The person approving.
         #[arg(long)]
-        json: bool,
+        holder: HolderId,
+        /// An evidence digest from the preview, such as `sha256:…`. Repeat for
+        /// each step.
+        #[arg(long = "digest", required = true)]
+        digests: Vec<ExternalRef>,
     },
 }
 
@@ -78,31 +96,13 @@ impl From<TriggerArg> for InspectionTrigger {
 
 pub fn run(args: CleanupArgs) -> Result<(String, bool), kitchen::Error> {
     match args.command {
-        CleanupCommand::Preview {
-            store,
-            house,
-            inventory,
-            holder,
-            trigger,
-            max_age_secs,
-            json,
-        } => {
-            let snapshot: Snapshot = decode(&inventory)?;
-            let backend = SnapshotBackend::new(house.clone(), snapshot)?;
-            let store = HouseStore::open(store, house, StoreOptions::default())?;
+        CleanupCommand::Preview { source, trigger } => {
+            let json = source.json;
+            let (backend, store) = open(source)?;
             let git = GitLimits::default();
-            let inspector = Inspector {
-                store: &store,
-                backend: &backend,
-                worktrees: &backend.paths,
-                merged_heads: &backend.merged,
-                git: &git,
-            };
-            let preview = preview(
-                &inspector,
+            let preview = inspect(
+                &inspector(&store, &backend, &git),
                 trigger.into(),
-                &Claimant::interactive(holder),
-                Duration::from_secs(max_age_secs),
                 SystemClock.now(),
             )?;
             let output = if json {
@@ -112,6 +112,90 @@ pub fn run(args: CleanupArgs) -> Result<(String, bool), kitchen::Error> {
             };
             Ok((output, true))
         }
+        CleanupCommand::Approve {
+            source,
+            holder,
+            digests,
+        } => {
+            let json = source.json;
+            let (backend, store) = open(source)?;
+            let git = GitLimits::default();
+            let results = approve(
+                &inspector(&store, &backend, &git),
+                &Claimant::interactive(holder),
+                &digests,
+                &SystemClock,
+            )?;
+            let all_current = results
+                .iter()
+                .all(|result| matches!(result.outcome, ApprovalOutcome::Approved { .. }));
+            let output = if json {
+                String::from_utf8(encode(&results)?).map_err(|_| HouseError::InvalidInput)?
+            } else {
+                render_approvals(&results)
+            };
+            Ok((output, all_current))
+        }
+    }
+}
+
+fn open(source: Source) -> Result<(SnapshotBackend, HouseStore), kitchen::Error> {
+    let snapshot: Snapshot = decode(&source.inventory)?;
+    let backend = SnapshotBackend::new(source.house.clone(), snapshot)?;
+    let store = HouseStore::open(source.store, source.house, StoreOptions::default())?;
+    Ok((backend, store))
+}
+
+fn inspector<'a>(
+    store: &'a HouseStore,
+    backend: &'a SnapshotBackend,
+    git: &'a GitLimits,
+) -> Inspector<'a> {
+    Inspector {
+        store,
+        backend,
+        worktrees: &backend.paths,
+        merged_heads: &backend.merged,
+        git,
+    }
+}
+
+fn render_approvals(results: &[ApprovalResult]) -> String {
+    let approved = results
+        .iter()
+        .filter(|result| matches!(result.outcome, ApprovalOutcome::Approved { .. }))
+        .count();
+    let mut text = format!(
+        "Recorded {approved} of {} approvals. Nothing was released.",
+        results.len()
+    );
+    for result in results {
+        match &result.outcome {
+            ApprovalOutcome::Approved { resource, step } => {
+                let _ = write!(
+                    text,
+                    "\napproved {} {} {}",
+                    step_name(*step),
+                    kind_name(resource.kind),
+                    resource.handle,
+                );
+            }
+            ApprovalOutcome::NotCurrent => {
+                let _ = write!(
+                    text,
+                    "\nnot approved: {} matches no eligible step now; preview again",
+                    result.observation
+                );
+            }
+        }
+    }
+    text
+}
+
+const fn step_name(step: Step) -> &'static str {
+    match step {
+        Step::Release => "release",
+        Step::BuildOutput => "build output of",
     }
 }
 
@@ -157,6 +241,26 @@ fn render(preview: &Preview) -> String {
         if let Some(usage) = entry.usage {
             let _ = write!(text, " ({})", size(usage));
         }
+        if entry.eligible() {
+            let _ = write!(text, "\n  approve with --digest {}", entry.observation);
+        }
+        if let Some(WorktreeEvidence::Read {
+            state,
+            ignored_files,
+            ..
+        }) = &entry.worktree
+        {
+            if !ignored_files.is_empty() {
+                let _ = write!(text, "\n  ignored, kept: {}", ignored_files.join(", "));
+            }
+            if state.hidden_tracked > 0 {
+                let _ = write!(
+                    text,
+                    "\n  {} tracked files hide edits (assume-unchanged or skip-worktree)",
+                    state.hidden_tracked
+                );
+            }
+        }
         if let Some(build) = &entry.build_output {
             let names: Vec<&str> = build
                 .directories
@@ -180,6 +284,9 @@ fn render(preview: &Preview) -> String {
                 names.join(", "),
                 size(build.usage()),
             );
+            if build.decision == Decision::Release {
+                let _ = write!(text, "\n  approve with --digest {}", build.observation);
+            }
         }
     }
     for suggestion in &preview.suggestions {

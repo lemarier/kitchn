@@ -8,6 +8,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     fs,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -27,12 +28,16 @@ use kitchen::{
         WorkerBackend, WorkerOutcome, WorkerState,
         fake::{ExecuteFault, FakeBackend},
     },
-    state::{EffectState, HouseStore, run_effect},
+    state::{
+        EffectState, HouseStore, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, WorkItem,
+        run_effect,
+    },
     workflows::cleanup::{
-        ApplyOptions, ApplyReport, BuildOutcome, BuildReport, CACHEDIR_SIGNATURE, CleanupError,
-        ConsentSource, Decision, EXTERNAL_CACHE_SUGGESTIONS, Exclusion, GitLimits, GitReadError,
-        InspectionTrigger, Inspector, NoConsent, Ownership, Precheck, Preview, ReleaseOutcome,
-        apply, inspect, inspect_worktree, preview, reclaim_build_output,
+        ApplyOptions, ApplyReport, ApprovalOutcome, ApprovalResult, BuildOutcome, BuildReport,
+        CACHEDIR_SIGNATURE, CleanupError, ConsentSource, Decision, EXTERNAL_CACHE_SUGGESTIONS,
+        Exclusion, GitLimits, GitReadError, InspectionTrigger, Inspector, NoConsent, Ownership,
+        Precheck, Preview, ReleaseOutcome, Step, apply, approve, inspect, inspect_worktree,
+        reclaim_build_output,
     },
 };
 
@@ -171,7 +176,7 @@ struct Inventory {
     fake: FakeBackend,
     extra: RefCell<Vec<ResourceObservation>>,
     calls: Cell<usize>,
-    /// After this many inventory calls, apply `change` once.
+    /// The inventory call count after which `change` applies once.
     change_after: Cell<Option<usize>>,
     change: RefCell<Option<Box<Change>>>,
     outage: Cell<bool>,
@@ -197,8 +202,9 @@ impl Inventory {
         });
     }
 
+    /// Apply `change` once, after `calls` more inventory calls have been made.
     fn change_after(&self, calls: usize, change: impl Fn(&mut Vec<ResourceObservation>) + 'static) {
-        self.change_after.set(Some(calls));
+        self.change_after.set(Some(self.calls.get() + calls));
         *self.change.borrow_mut() = Some(Box::new(change));
     }
 }
@@ -377,21 +383,41 @@ impl Harness {
         )?)
     }
 
-    fn preview(&self) -> TestResult<Preview> {
-        Ok(preview(
+    /// A person reviews the preview and approves every step it would take.
+    fn approve_all(&self) -> TestResult<Vec<ApprovalResult>> {
+        let preview = self.inspect()?;
+        let mut digests = Vec::new();
+        for entry in &preview.entries {
+            if entry.eligible() {
+                digests.push(entry.observation.clone());
+            }
+            if let Some(build) = entry
+                .build_output
+                .as_ref()
+                .filter(|_| entry.build_output_eligible())
+            {
+                digests.push(build.observation.clone());
+            }
+        }
+        Ok(approve(
             &self.inspector(),
-            InspectionTrigger::Schedule,
-            &scheduled("dishwasher")?,
-            PREVIEW_AGE,
-            self.clock.now(),
+            &interactive("david")?,
+            &digests,
+            &self.clock,
         )?)
+    }
+
+    /// The dishwasher's approval markers.
+    fn markers(&self) -> TestResult<Vec<kitchen::state::WorkflowMarker>> {
+        Ok(self
+            .store()
+            .markers(&kitchen::WorkflowId::new("dishwasher")?)?)
     }
 
     fn reclaim(&self) -> TestResult<BuildReport> {
         Ok(reclaim_build_output(
             &self.inspector(),
             InspectionTrigger::DiskPressure,
-            &scheduled("dishwasher")?,
             PREVIEW_AGE,
             &self.clock,
         )?)
@@ -435,7 +461,7 @@ fn options() -> TestResult<ApplyOptions> {
             repository_instructions: None,
         },
         lease: ttl(300)?,
-        max_preview_age: PREVIEW_AGE,
+        max_approval_age: PREVIEW_AGE,
         max_releases: 16,
     })
 }
@@ -951,17 +977,17 @@ fn the_first_run_is_preview_only_and_repeating_is_harmless() -> TestResult {
     let owned = harness.owner("task-1", true)?;
     let before = harness.backend.fake.effects_performed();
 
+    // Nobody has approved anything, so nothing runs and nothing is written.
     let first = harness.apply()?;
-    assert_eq!(
-        outcome(&first, &owned.worker)?,
-        ReleaseOutcome::NotPreviewed
-    );
+    assert_eq!(outcome(&first, &owned.worker)?, ReleaseOutcome::NotApproved);
     assert_eq!(
         outcome(&first, &owned.worktree)?,
-        ReleaseOutcome::NotPreviewed
+        ReleaseOutcome::NotApproved
     );
     assert_eq!(harness.backend.fake.effects_performed(), before);
+    assert!(harness.markers()?.is_empty());
 
+    harness.approve_all()?;
     harness.clock.advance(60);
     let second = harness.apply()?;
     assert_eq!(outcome(&second, &owned.worker)?, ReleaseOutcome::Released);
@@ -991,33 +1017,214 @@ fn the_first_run_is_preview_only_and_repeating_is_harmless() -> TestResult {
 }
 
 #[test]
-fn a_recorded_preview_lets_the_next_apply_act() -> TestResult {
+fn a_scheduled_run_cannot_approve_its_own_preview() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
-    harness.preview()?;
-    // Previewing again with unchanged evidence records nothing new.
-    let markers = harness
-        .store()
-        .markers(&kitchen::WorkflowId::new("dishwasher")?)?;
-    harness.preview()?;
+    let before = harness.backend.fake.effects_performed();
+    // The same standing claimant inspects and applies, tick after tick.
+    for _ in 0..3 {
+        let report = harness.apply()?;
+        assert_eq!(
+            outcome(&report, &owned.worker)?,
+            ReleaseOutcome::NotApproved
+        );
+        assert_eq!(
+            outcome(&report, &owned.worktree)?,
+            ReleaseOutcome::NotApproved
+        );
+        harness.clock.advance(60);
+    }
+    assert_eq!(harness.backend.fake.effects_performed(), before);
+    assert!(harness.markers()?.is_empty(), "apply records no approval");
+    // Build output under disk pressure is gated the same way.
+    build_dir(harness.path(&owned.worktree)?, 1024)?;
+    let reclaimed = harness.reclaim()?;
     assert_eq!(
-        harness
-            .store()
-            .markers(&kitchen::WorkflowId::new("dishwasher")?)?,
-        markers
+        reclaimed
+            .results
+            .iter()
+            .map(|r| r.outcome)
+            .collect::<Vec<_>>(),
+        [BuildOutcome::NotApproved]
     );
-    harness.clock.advance(1);
-    let report = harness.apply()?;
-    assert_eq!(outcome(&report, &owned.worktree)?, ReleaseOutcome::Released);
+    assert!(harness.path(&owned.worktree)?.join("target").is_dir());
     Ok(())
 }
 
 #[test]
-fn changed_evidence_after_the_preview_is_not_released() -> TestResult {
+fn only_a_person_can_record_an_approval() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let digest = harness
+        .inspect()?
+        .entry(&owned.worktree)
+        .ok_or("worktree")?
+        .observation
+        .clone();
+    let error = approve(
+        &harness.inspector(),
+        &scheduled("dishwasher")?,
+        std::slice::from_ref(&digest),
+        &harness.clock,
+    )
+    .err()
+    .ok_or("a scheduled claimant approved")?;
+    assert!(matches!(
+        error,
+        Error::Cleanup(CleanupError::ApprovalNeedsPerson)
+    ));
+    assert_eq!(error.class(), ErrorClass::Refused);
+    assert!(harness.markers()?.is_empty());
+    let report = harness.apply()?;
+    assert_eq!(
+        outcome(&report, &owned.worktree)?,
+        ReleaseOutcome::NotApproved
+    );
+    Ok(())
+}
+
+#[test]
+fn a_marker_a_person_did_not_record_approves_nothing() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let worker = harness.inspect()?;
+    let worker_digest = worker
+        .entry(&owned.worker)
+        .ok_or("worker")?
+        .observation
+        .clone();
+    let worktree_digest = worker
+        .entry(&owned.worktree)
+        .ok_or("worktree")?
+        .observation
+        .clone();
+    let key = |resource: &ResourceRef, digest: &ExternalRef| -> TestResult<MarkerKey> {
+        Ok(MarkerKey {
+            workflow: kitchen::WorkflowId::new("dishwasher")?,
+            item: WorkItem::Resource {
+                resource: resource.clone(),
+            },
+            subject: MarkerSubject::Observation(digest.clone()),
+        })
+    };
+    let schema = MarkerSchema::new("cleanup.approval", NonZeroU32::MIN)?;
+    let approval = |step: &str| {
+        MarkerFact::workflow(
+            schema.clone(),
+            &serde_json::json!({
+                "step": step,
+                "owner": "task-1",
+                "approvedAt": harness.clock.now().as_unix_millis(),
+            }),
+        )
+    };
+    // A well-formed approval recorded by a scheduled claimant, as if the
+    // automation had written it for itself.
+    harness.store().record_marker(
+        key(&owned.worker, &worker_digest)?,
+        approval("release")?,
+        &scheduled("dishwasher")?,
+        harness.clock.now(),
+    )?;
+    // A person's marker, but for a different step than the key's evidence.
+    harness.store().record_marker(
+        key(&owned.worktree, &worktree_digest)?,
+        approval("build-output")?,
+        &interactive("david")?,
+        harness.clock.now(),
+    )?;
+    let before = harness.backend.fake.effects_performed();
+    harness.clock.advance(60);
+    let report = harness.apply()?;
+    assert_eq!(
+        outcome(&report, &owned.worker)?,
+        ReleaseOutcome::NotApproved
+    );
+    assert_eq!(
+        outcome(&report, &owned.worktree)?,
+        ReleaseOutcome::NotApproved
+    );
+    assert_eq!(harness.backend.fake.effects_performed(), before);
+    Ok(())
+}
+
+#[test]
+fn an_approval_names_exact_current_evidence() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let dirty = harness.owner("task-2", true)?;
+    fs::write(harness.path(&dirty.worktree)?.join("wip.txt"), "wip\n")?;
+    let preview = harness.inspect()?;
+    let release = preview
+        .entry(&owned.worktree)
+        .ok_or("worktree")?
+        .observation
+        .clone();
+    let retained = preview
+        .entry(&dirty.worktree)
+        .ok_or("dirty")?
+        .observation
+        .clone();
+    let unknown = ExternalRef::new("sha256:0000")?;
+    let results = approve(
+        &harness.inspector(),
+        &interactive("david")?,
+        &[release.clone(), retained, unknown.clone()],
+        &harness.clock,
+    )?;
+    assert_eq!(
+        results
+            .iter()
+            .map(|r| r.outcome.clone())
+            .collect::<Vec<_>>(),
+        [
+            ApprovalOutcome::Approved {
+                resource: owned.worktree.clone(),
+                step: Step::Release
+            },
+            ApprovalOutcome::NotCurrent,
+            ApprovalOutcome::NotCurrent,
+        ]
+    );
+    // Only the approved step is recorded, by the person who approved it.
+    let markers = harness.markers()?;
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].recorded_by(), &interactive("david")?);
+
+    // Approving again renews the one marker rather than adding another.
+    harness.clock.advance(10);
+    approve(
+        &harness.inspector(),
+        &interactive("david")?,
+        &[release],
+        &harness.clock,
+    )?;
+    let markers = harness.markers()?;
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].history().len(), 1);
+
+    // Evidence that changes after the approval needs a new one.
+    fs::write(harness.path(&owned.worktree)?.join("resumed.txt"), "wip\n")?;
+    let report = harness.apply()?;
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|result| result.resource != owned.worktree)
+    );
+    assert_eq!(
+        reasons(&report.preview, &owned.worktree)?,
+        [Exclusion::UntrackedFiles]
+    );
+    Ok(())
+}
+
+#[test]
+fn changed_evidence_after_the_approval_is_not_released() -> TestResult {
     let mut harness = Harness::new()?;
     let dirty = harness.owner("task-1", true)?;
     let moved = harness.owner("task-2", true)?;
-    harness.preview()?;
+    harness.approve_all()?;
     let before = harness.backend.fake.effects_performed();
     // Someone resumes work in one worktree and pushes a new commit in another.
     fs::write(harness.path(&dirty.worktree)?.join("resumed.txt"), "wip\n")?;
@@ -1036,10 +1243,10 @@ fn changed_evidence_after_the_preview_is_not_released() -> TestResult {
             .iter()
             .all(|result| result.resource != dirty.worktree)
     );
-    // New evidence needs its own preview first.
+    // New evidence needs its own approval first.
     assert_eq!(
         outcome(&report, &moved.worktree)?,
-        ReleaseOutcome::NotPreviewed
+        ReleaseOutcome::NotApproved
     );
     // Only the two untouched workers were released.
     assert_eq!(harness.backend.fake.effects_performed(), before + 2);
@@ -1047,18 +1254,25 @@ fn changed_evidence_after_the_preview_is_not_released() -> TestResult {
 }
 
 #[test]
-fn a_stale_preview_is_refreshed_not_applied() -> TestResult {
+fn an_expired_approval_is_not_applied_until_a_person_renews_it() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
-    harness.preview()?;
+    harness.approve_all()?;
     harness.clock.advance(PREVIEW_AGE.as_secs() + 1);
     let before = harness.backend.fake.effects_performed();
     let stale = harness.apply()?;
     assert_eq!(
         outcome(&stale, &owned.worktree)?,
-        ReleaseOutcome::StalePreview
+        ReleaseOutcome::ApprovalExpired
     );
     assert_eq!(harness.backend.fake.effects_performed(), before);
+    // Applying again does not renew it.
+    let again = harness.apply()?;
+    assert_eq!(
+        outcome(&again, &owned.worktree)?,
+        ReleaseOutcome::ApprovalExpired
+    );
+    harness.approve_all()?;
     harness.clock.advance(1);
     let fresh = harness.apply()?;
     assert_eq!(outcome(&fresh, &owned.worktree)?, ReleaseOutcome::Released);
@@ -1066,15 +1280,98 @@ fn a_stale_preview_is_refreshed_not_applied() -> TestResult {
 }
 
 #[test]
+fn an_ignored_file_keeps_its_worktree_even_with_an_approval() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    exclude(&harness.repo, ".env\n")?;
+    fs::write(path.join(".env"), "TOKEN=secret\n")?;
+    let approved = harness.approve_all()?;
+    // Only the worker is offered; the worktree is retained and never approved.
+    assert_eq!(approved.len(), 1);
+    harness.clock.advance(60);
+    let report = harness.apply()?;
+    assert_eq!(outcome(&report, &owned.worker)?, ReleaseOutcome::Released);
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|result| result.resource != owned.worktree)
+    );
+    assert!(path.join(".env").is_file());
+    assert!(
+        harness
+            .backend
+            .extra
+            .borrow()
+            .iter()
+            .any(|observation| observation.resource == owned.worktree)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_full_marker_table_stops_new_approvals_but_not_recovery() -> TestResult {
+    let mut harness = Harness::new()?;
+    let first = harness.owner("task-1", true)?;
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    harness
+        .backend
+        .fake
+        .inject(ExecuteFault::TimeoutWithoutApplying);
+    let interrupted = harness.apply()?;
+    assert_eq!(
+        outcome(&interrupted, &first.worker)?,
+        ReleaseOutcome::Uncertain
+    );
+    // Unrelated workflows fill the house's shared marker table.
+    let path = harness.fixture.state_path();
+    let mut state: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let template = state["markers"][0].clone();
+    if let Some(list) = state["markers"].as_array_mut() {
+        for number in 0..(kitchen::state::MAX_MARKERS - list.len()) {
+            let mut marker = template.clone();
+            marker["key"]["item"]["resource"]["handle"] = format!("filler-{number}").into();
+            list.push(marker);
+        }
+    }
+    fs::write(&path, serde_json::to_vec(&state)?)?;
+    // Another resource becomes eligible while the earlier release is unresolved.
+    let second = harness.owner("task-2", true)?;
+    harness.clock.advance(60);
+
+    // Approving it fails closed with the capacity error and records nothing.
+    let error = harness
+        .approve_all()
+        .err()
+        .ok_or("approved into a full table")?;
+    assert!(error.to_string().contains("limit reached"), "{error}");
+    // Apply still reconciles the interrupted release and reports the new
+    // resource as not approved instead of failing.
+    let report = harness.apply()?;
+    assert_eq!(outcome(&report, &first.worker)?, ReleaseOutcome::Released);
+    assert_eq!(
+        outcome(&report, &second.worker)?,
+        ReleaseOutcome::NotApproved
+    );
+    assert!(harness.markers()?.iter().all(|marker| !matches!(
+        marker.key().item,
+        WorkItem::Resource { ref resource } if resource == &second.worker
+    )));
+    Ok(())
+}
+
+#[test]
 fn an_owner_change_just_before_the_effect_refuses_the_release() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
-    harness.preview()?;
+    harness.approve_all()?;
     harness.clock.advance(60);
-    // After apply's first inventory read (the preview made one before it),
-    // the backend reassigns the worktree while the worker is being released.
+    // After apply's first inventory read, the backend reassigns the worktree
+    // while the worker is being released.
     let worktree = owned.worktree.clone();
-    harness.backend.change_after(2, move |extra| {
+    harness.backend.change_after(1, move |extra| {
         for observation in extra.iter_mut() {
             if observation.resource == worktree {
                 observation.owner = ExternalRef::new("reassigned").ok();
@@ -1113,7 +1410,7 @@ fn an_owner_change_just_before_the_effect_refuses_the_release() -> TestResult {
 fn release_needs_the_separate_grant() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
-    harness.preview()?;
+    harness.approve_all()?;
     harness.clock.advance(60);
     let before = harness.backend.fake.effects_performed();
     // The house grants worker lifecycle permissions but not release.
@@ -1159,7 +1456,7 @@ fn release_needs_the_separate_grant() -> TestResult {
 fn an_interrupted_release_is_reconciled_not_repeated() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
-    harness.preview()?;
+    harness.approve_all()?;
     harness.clock.advance(60);
     let before = harness.backend.fake.effects_performed();
     // The first release is applied but its response is lost.
@@ -1225,7 +1522,7 @@ impl ConsentSource for Approve {
 fn interactive_release_needs_consent_for_each_resource() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
-    harness.preview()?;
+    harness.approve_all()?;
     harness.clock.advance(60);
     let before = harness.backend.fake.effects_performed();
     let session = interactive("session")?;
@@ -1317,7 +1614,7 @@ fn a_directory_that_is_not_a_repository_is_unreadable() -> TestResult {
 fn an_unresolved_release_blocks_any_new_release_of_that_resource() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
-    harness.preview()?;
+    harness.approve_all()?;
     harness.clock.advance(60);
     // The worker's release times out and its outcome cannot be looked up.
     harness
@@ -1329,13 +1626,15 @@ fn an_unresolved_release_blocks_any_new_release_of_that_resource() -> TestResult
     assert_eq!(outcome(&first, &owned.worker)?, ReleaseOutcome::Uncertain);
     let calls = harness.backend.fake.execute_calls();
 
-    // The preview expires and is refreshed, which plans a new release task.
+    // The approval expires and a person renews it, which plans a new release
+    // task.
     harness.clock.advance(PREVIEW_AGE.as_secs() + 1);
-    let refreshed = harness.apply()?;
+    let expired = harness.apply()?;
     assert_eq!(
-        outcome(&refreshed, &owned.worker)?,
-        ReleaseOutcome::StalePreview
+        outcome(&expired, &owned.worker)?,
+        ReleaseOutcome::ApprovalExpired
     );
+    harness.approve_all()?;
     harness.clock.advance(60);
     let blocked = harness.apply()?;
     let result = blocked
@@ -1378,7 +1677,7 @@ fn an_unresolved_release_blocks_any_new_release_of_that_resource() -> TestResult
 fn a_release_proven_absent_is_retried_within_its_task() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
-    harness.preview()?;
+    harness.approve_all()?;
     harness.clock.advance(60);
     harness
         .backend
@@ -1425,14 +1724,27 @@ fn build_output_of_settled_workers_is_reclaimed_without_touching_work() -> TestR
     assert!(build.usage().bytes >= 64 * 1024);
     assert_eq!(preview.precheck(), Precheck::Actionable);
 
-    // The first run under disk pressure only previews.
+    // The first run under disk pressure only previews: nobody approved it.
     let first = harness.reclaim()?;
     assert_eq!(
         first.results.iter().map(|r| r.outcome).collect::<Vec<_>>(),
-        [BuildOutcome::NotPreviewed]
+        [BuildOutcome::NotApproved]
     );
     assert!(target.is_dir());
 
+    // A person approves the build output; the worktree itself stays retained
+    // and is never offered for release.
+    let steps: Vec<Step> = harness
+        .approve_all()?
+        .into_iter()
+        .filter_map(|result| match result.outcome {
+            ApprovalOutcome::Approved { resource, step } if resource == owned.worktree => {
+                Some(step)
+            }
+            ApprovalOutcome::Approved { .. } | ApprovalOutcome::NotCurrent => None,
+        })
+        .collect();
+    assert_eq!(steps, [Step::BuildOutput]);
     harness.clock.advance(60);
     let second = harness.reclaim()?;
     let result = second.results.first().ok_or("no result")?;
@@ -1494,7 +1806,7 @@ fn build_output_is_kept_while_its_owner_is_in_use_taken_over_or_unknown() -> Tes
         [Exclusion::UserTakeover, Exclusion::SiblingInUse]
     );
     assert_eq!(build_reasons(&orphan)?, [Exclusion::UnknownOwner]);
-    harness.preview()?;
+    harness.approve_all()?;
     harness.clock.advance(60);
     assert!(harness.reclaim()?.results.is_empty());
     assert!(orphan_path.join("target").is_dir());
@@ -1542,7 +1854,7 @@ fn only_ignored_untracked_tagged_directories_are_build_output() -> TestResult {
         std::os::unix::fs::symlink(&elsewhere, path.join("target"))?;
         assert!(!entry_has_build(&harness)?);
         harness.paths.insert(owned.worktree.clone(), path.clone());
-        harness.preview()?;
+        harness.approve_all()?;
         harness.clock.advance(60);
         assert!(harness.reclaim()?.results.is_empty());
         assert!(elsewhere.join("CACHEDIR.TAG").is_file());
@@ -1584,12 +1896,12 @@ fn build_output_whose_owner_changes_before_removal_is_kept() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
     let target = build_dir(harness.path(&owned.worktree)?, 1024)?;
-    harness.preview()?;
+    harness.approve_all()?;
     harness.clock.advance(60);
     // Between reclaim's inspection and its revalidation, the backend
     // reports the worktree under another owner.
     let worktree = owned.worktree.clone();
-    harness.backend.change_after(2, move |extra| {
+    harness.backend.change_after(1, move |extra| {
         for observation in extra.iter_mut() {
             if observation.resource == worktree {
                 observation.owner = ExternalRef::new("reassigned").ok();

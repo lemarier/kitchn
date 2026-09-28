@@ -23,20 +23,27 @@
 //! Anything else is retained with every reason that applies. Unknown and
 //! legacy resources are retained. Branches and schedules are never removed.
 //!
-//! [`preview`] records one workflow marker per eligible resource, keyed by the
-//! resource and a digest of the evidence it was judged on. [`apply`] acts only
-//! on resources whose unchanged evidence was previewed by an *earlier* call,
-//! so the first run against an existing backlog is preview-only. Each release
-//! runs as its own dishwasher task given exactly that resource, through the
-//! durable effect path ([`crate::state::run_effect`]) and the explicit
-//! release grant, and is revalidated immediately before the effect. An
-//! interrupted release is reconciled by the next run before anything else.
+//! [`inspect`] only reads; it records nothing and approves nothing. Acting
+//! needs an approval that the automation which inspected cannot give itself:
+//! [`approve`] records, for one previewed step, a marker keyed by the resource
+//! and the digest of the evidence it was judged on, and refuses any claimant
+//! that is not [`Trigger::Interactive`], a person present. [`apply`] and
+//! [`reclaim_build_output`] act only where such a person-recorded approval
+//! names the unchanged digest and is not older than the allowed age, so the
+//! first run against an existing backlog is preview-only and a scheduled run
+//! never approves its own preview. Neither run writes a marker, so a full
+//! marker table cannot stop them, and recovery never depends on one.
+//!
+//! Each release runs as its own dishwasher task given exactly that resource,
+//! through the durable effect path ([`crate::state::run_effect`]) and the
+//! explicit release grant, and is revalidated immediately before the effect.
+//! An interrupted release is reconciled by the next run before anything else.
 //!
 //! Build output is the one thing reclaimed without a grant: a `CACHEDIR.TAG`
 //! directory that Git ignores and tracks nothing in, at the top of a
 //! Kitchen-owned worktree whose workers have all settled. It is regenerable
-//! and not work, so [`reclaim_build_output`] needs only an earlier preview of
-//! the same evidence; the worktree itself stays until it passes every check
+//! and not work, so [`reclaim_build_output`] needs only the approval of the
+//! same evidence; the worktree itself stays until it passes every check
 //! above. Caches outside Kitchen-owned resources are never touched: under
 //! disk pressure the preview lists commands a person may run instead.
 //! Every step reports the space it measured before acting.
@@ -47,6 +54,7 @@ mod git;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{self, Write as _},
+    io,
     num::NonZeroU32,
     path::PathBuf,
     time::Duration,
@@ -73,15 +81,14 @@ use crate::{
     },
     state::{
         EffectPlan, EffectRecord, EffectState, HouseStore, MarkerFact, MarkerKey, MarkerSchema,
-        MarkerSubject, StateError, TaskRecord, TaskState, WorkItem, WorkflowMarker, reconcile,
-        run_effect,
+        MarkerSubject, StateError, TaskRecord, TaskState, WorkItem, reconcile, run_effect,
     },
 };
 
 /// The workflow id the dishwasher records markers under.
 pub const WORKFLOW: &str = "dishwasher";
-/// The marker schema of a recorded preview.
-pub const PREVIEW_SCHEMA: &str = "cleanup.preview";
+/// The marker schema of a person's approval of one previewed step.
+pub const APPROVAL_SCHEMA: &str = "cleanup.approval";
 /// Prefix of the tasks the dishwasher creates for releases.
 pub const TASK_PREFIX: &str = "dishwasher-";
 /// Attempts a release task may use, including ones spent on recovery.
@@ -106,6 +113,9 @@ pub enum CleanupError {
     /// Evidence could not be encoded for its digest or marker.
     #[error("cleanup evidence could not be encoded")]
     Encoding,
+    /// Only a person present can approve a previewed cleanup step.
+    #[error("a cleanup approval must be recorded by an interactive claimant")]
+    ApprovalNeedsPerson,
 }
 
 impl CleanupError {
@@ -114,6 +124,7 @@ impl CleanupError {
     pub const fn class(&self) -> ErrorClass {
         match self {
             Self::GrantMismatch => ErrorClass::InvalidInput,
+            Self::ApprovalNeedsPerson => ErrorClass::Refused,
             Self::Backend(_) | Self::DuplicateResource | Self::Encoding => ErrorClass::Execution,
         }
     }
@@ -530,14 +541,14 @@ pub enum Step {
     BuildOutput,
 }
 
-/// The payload recorded in a preview marker.
+/// The payload of an approval marker. Who approved is the marker's own
+/// recorder; a marker not recorded by an interactive claimant approves nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PreviewFact {
+struct ApprovalFact {
     step: Step,
     owner: TaskId,
-    trigger: InspectionTrigger,
-    previewed_at: Timestamp,
+    approved_at: Timestamp,
 }
 
 /// Inspect every inventoried resource without recording anything.
@@ -566,43 +577,6 @@ pub fn inspect(
     })
 }
 
-/// Inspect and record a preview marker for each eligible resource. A marker
-/// for the same evidence is kept, or refreshed once older than `max_age`.
-///
-/// # Errors
-/// As [`inspect`], plus marker and consumer lease errors from the store.
-pub fn preview(
-    inspector: &Inspector<'_>,
-    trigger: InspectionTrigger,
-    recorder: &Claimant,
-    max_age: Duration,
-    now: Timestamp,
-) -> Result<Preview> {
-    let preview = inspect(inspector, trigger, now)?;
-    for entry in &preview.entries {
-        for (step, observation) in previewed_steps(entry) {
-            let key = marker_key(&entry.resource, observation)?;
-            let current = inspector.store.marker(&key)?;
-            let fresh = current
-                .as_ref()
-                .is_some_and(|marker| now.saturating_since(marker.recorded_at()) <= max_age);
-            if !fresh {
-                record_preview(
-                    inspector.store,
-                    entry,
-                    step,
-                    observation,
-                    current.as_ref(),
-                    trigger,
-                    recorder,
-                    now,
-                )?;
-            }
-        }
-    }
-    Ok(preview)
-}
-
 /// The eligible steps of `entry` and the evidence digest of each.
 fn previewed_steps(entry: &PreviewEntry) -> impl Iterator<Item = (Step, &ExternalRef)> {
     let release = entry
@@ -627,8 +601,8 @@ pub struct ApplyOptions {
     pub provenance: Provenance,
     /// Lease on each release task.
     pub lease: LeaseTtl,
-    /// Oldest preview that still authorizes a release.
-    pub max_preview_age: Duration,
+    /// Oldest approval that still authorizes a release.
+    pub max_approval_age: Duration,
     /// Most releases attempted in one call; the rest are deferred.
     pub max_releases: usize,
 }
@@ -661,13 +635,12 @@ impl ConsentSource for NoConsent {
 pub enum ReleaseOutcome {
     /// The backend released it in this call.
     Released,
-    /// Eligible, but no earlier preview covers this exact evidence; this
-    /// call recorded one.
-    NotPreviewed,
-    /// The preview for this evidence is older than allowed; this call
-    /// refreshed it.
-    StalePreview,
-    /// The evidence changed between the preview and the effect.
+    /// Eligible, but no person has approved this exact evidence.
+    NotApproved,
+    /// The approval of this evidence is older than allowed; a person must
+    /// approve it again.
+    ApprovalExpired,
+    /// The evidence changed between the approval and the effect.
     Changed,
     /// Another run holds the release task, or an earlier release of this
     /// resource that another run holds.
@@ -715,10 +688,10 @@ pub struct ApplyReport {
 }
 
 /// Reconcile interrupted releases, then release each eligible resource whose
-/// exact evidence an earlier call previewed.
+/// exact evidence a person approved with [`approve`]. Writes no marker.
 ///
 /// # Errors
-/// As [`preview`]; [`CleanupError::GrantMismatch`] for a grant that is not
+/// As [`inspect`]; [`CleanupError::GrantMismatch`] for a grant that is not
 /// release on this backend; [`ContractError::AuthorityExpansion`] when a
 /// scheduled claimant's house does not hold the release grant as a standing
 /// grant; and store errors, which leave interrupted work for the next run.
@@ -763,21 +736,18 @@ pub fn apply(
     // Decide what each eligible resource needs before acting on anything.
     let mut planned = Vec::with_capacity(eligible.len());
     for entry in eligible {
-        let now = clock.now();
         let plan = match approval(
             inspector.store,
-            entry,
+            &entry.resource,
             Step::Release,
             &entry.observation,
-            options.max_preview_age,
-            preview.trigger,
-            claimant,
-            now,
+            options.max_approval_age,
+            clock.now(),
         )? {
-            Approval::NotPreviewed => Plan::Report(ReleaseOutcome::NotPreviewed),
-            Approval::Stale => Plan::Report(ReleaseOutcome::StalePreview),
-            Approval::Approved(previewed_at) => {
-                Plan::Drive(release_task_id(&entry.observation, previewed_at)?)
+            Approval::Missing => Plan::Report(ReleaseOutcome::NotApproved),
+            Approval::Expired => Plan::Report(ReleaseOutcome::ApprovalExpired),
+            Approval::Approved(approved_at) => {
+                Plan::Drive(release_task_id(&entry.observation, approved_at)?)
             }
         };
         planned.push((entry, plan));
@@ -822,10 +792,11 @@ pub fn apply(
         let (task, outcome) = match plan {
             Plan::Report(outcome) => (None, outcome),
             Plan::Drive(task) => {
+                // Blocked and deferred resources get no release task.
                 if let Some(outcome) = blocked.get(&entry.resource) {
-                    (Some(task), *outcome)
+                    (None, *outcome)
                 } else if attempted >= options.max_releases {
-                    (Some(task), ReleaseOutcome::Deferred)
+                    (None, ReleaseOutcome::Deferred)
                 } else {
                     attempted = attempted.saturating_add(1);
                     let outcome = run.drive(task.clone(), &entry.resource, Some(entry))?;
@@ -855,15 +826,16 @@ pub fn apply(
 pub enum BuildOutcome {
     /// Removed in this call.
     Removed,
-    /// No earlier preview covers this evidence; this call recorded one.
-    NotPreviewed,
-    /// The preview is older than allowed; this call refreshed it.
-    StalePreview,
-    /// The evidence changed since the preview; nothing was removed.
+    /// No person has approved this evidence.
+    NotApproved,
+    /// The approval is older than allowed; a person must approve it again.
+    ApprovalExpired,
+    /// The evidence changed since the approval; nothing was removed.
     Changed,
-    /// Removal failed or was refused by the final checks; a later run
-    /// finishes a partial removal.
-    RemoveFailed,
+    /// The final checks refused the directory; nothing was removed.
+    Refused,
+    /// Removal failed part way; a later run finishes it.
+    Failed,
 }
 
 /// One build output directory's result.
@@ -879,6 +851,9 @@ pub struct BuildResult {
     /// Space measured just before removal, for a removed directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freed: Option<DiskUsage>,
+    /// For a failed removal: the I/O error kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// The result of [`reclaim_build_output`].
@@ -909,18 +884,18 @@ impl BuildReport {
 }
 
 /// Remove regenerable build output from Kitchen-owned worktrees whose
-/// workers have all settled, where an earlier call previewed the same
-/// evidence. Needs no grant: nothing leaves the worktree's own ignored build
-/// directories, and nothing goes through the backend. Each worktree is
-/// revalidated immediately before its directories are removed.
+/// workers have all settled, where a person approved the same evidence with
+/// [`approve`]. Needs no grant: nothing leaves the worktree's own ignored
+/// build directories, and nothing goes through the backend. Each worktree is
+/// revalidated immediately before its directories are removed. Writes no
+/// marker.
 ///
 /// # Errors
-/// As [`preview`].
+/// As [`inspect`].
 pub fn reclaim_build_output(
     inspector: &Inspector<'_>,
     trigger: InspectionTrigger,
-    recorder: &Claimant,
-    max_preview_age: Duration,
+    max_approval_age: Duration,
     clock: &dyn Clock,
 ) -> Result<BuildReport> {
     let preview = inspect(inspector, trigger, clock.now())?;
@@ -939,24 +914,23 @@ pub fn reclaim_build_output(
                 directory: directory.name.clone(),
                 outcome,
                 freed: None,
+                error: None,
             })
         };
         match approval(
             inspector.store,
-            entry,
+            &entry.resource,
             Step::BuildOutput,
             &build.observation,
-            max_preview_age,
-            preview.trigger,
-            recorder,
+            max_approval_age,
             clock.now(),
         )? {
-            Approval::NotPreviewed => {
-                results.extend(report(BuildOutcome::NotPreviewed));
+            Approval::Missing => {
+                results.extend(report(BuildOutcome::NotApproved));
                 continue;
             }
-            Approval::Stale => {
-                results.extend(report(BuildOutcome::StalePreview));
+            Approval::Expired => {
+                results.extend(report(BuildOutcome::ApprovalExpired));
                 continue;
             }
             Approval::Approved(_) => {}
@@ -981,15 +955,19 @@ pub fn reclaim_build_output(
         };
         for directory in &build.directories {
             let usage = disk_usage(&path.join(&directory.name));
-            let (outcome, freed) = match build::remove(&path, &directory.name) {
-                Ok(()) => (BuildOutcome::Removed, Some(usage)),
-                Err(_) => (BuildOutcome::RemoveFailed, None),
+            let (outcome, freed, error) = match build::remove(&path, &directory.name) {
+                Ok(()) => (BuildOutcome::Removed, Some(usage), None),
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                    (BuildOutcome::Refused, None, None)
+                }
+                Err(error) => (BuildOutcome::Failed, None, Some(error.kind().to_string())),
             };
             results.push(BuildResult {
                 resource: entry.resource.clone(),
                 directory: directory.name.clone(),
                 outcome,
                 freed,
+                error,
             });
         }
     }
@@ -1203,21 +1181,138 @@ fn is_release_task(task: &TaskRecord) -> bool {
     task.spec().role == Role::Dishwasher && task.spec().id.as_str().starts_with(TASK_PREFIX)
 }
 
-/// The release task for one previewed observation. The preview's time is
-/// part of the identity, so a refreshed preview starts a new task while an
+/// The release task for one approved observation. The approval's time is
+/// part of the identity, so a renewed approval starts a new task while an
 /// interrupted run resumes the same one.
-fn release_task_id(observation: &ExternalRef, previewed_at: Timestamp) -> Result<TaskId> {
+fn release_task_id(observation: &ExternalRef, approved_at: Timestamp) -> Result<TaskId> {
     let mut digest = Sha256::new();
     digest.update(b"kitchen-dishwasher-release-v1\0");
     digest.update(observation.as_str().as_bytes());
-    digest.update(previewed_at.as_unix_millis().to_be_bytes());
+    digest.update(approved_at.as_unix_millis().to_be_bytes());
     let hex = hex(digest.finalize().as_slice());
     let short = hex.get(..48).ok_or(CleanupError::Encoding)?;
     Ok(TaskId::new(&format!("{TASK_PREFIX}{short}"))?)
 }
 
+/// What the store holds for one step's evidence.
+enum Approval {
+    /// No approval by a person names this evidence.
+    Missing,
+    /// A person approved it, but longer ago than allowed.
+    Expired,
+    /// A person approved it at this time.
+    Approved(Timestamp),
+}
+
+/// Whether a person approved `observation` for `step` of `resource`. Reads
+/// only. A marker under the key counts only when an interactive claimant
+/// recorded a `cleanup.approval` fact for this step: anything else, however it
+/// got there, approves nothing.
+fn approval(
+    store: &HouseStore,
+    resource: &ResourceRef,
+    step: Step,
+    observation: &ExternalRef,
+    max_age: Duration,
+    now: Timestamp,
+) -> Result<Approval> {
+    let key = marker_key(resource, observation)?;
+    let Some(marker) = store.marker(&key)? else {
+        return Ok(Approval::Missing);
+    };
+    if marker.recorded_by().trigger != Trigger::Interactive {
+        return Ok(Approval::Missing);
+    }
+    let approves = marker
+        .fact()
+        .decode::<ApprovalFact>(&schema()?)
+        .is_ok_and(|fact| fact.step == step);
+    if !approves {
+        return Ok(Approval::Missing);
+    }
+    if now.saturating_since(marker.recorded_at()) > max_age {
+        return Ok(Approval::Expired);
+    }
+    Ok(Approval::Approved(marker.recorded_at()))
+}
+
+/// What [`approve`] did with one digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum ApprovalOutcome {
+    /// Recorded: this step of this resource may now run until the approval
+    /// expires, while its evidence stays the same.
+    Approved {
+        /// The resource.
+        resource: ResourceRef,
+        /// The step.
+        step: Step,
+    },
+    /// No current eligible step has this digest: the evidence changed, the
+    /// step is retained, or the digest is not from this house's inspection.
+    NotCurrent,
+}
+
+/// One digest's result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalResult {
+    /// The evidence digest the person named.
+    pub observation: ExternalRef,
+    /// What happened.
+    pub outcome: ApprovalOutcome,
+}
+
+/// Record a person's approval of the previewed steps named by `digests`, the
+/// `observation` values of a [`Preview`]. Inspects again first, so only a
+/// step that is eligible now, on this exact evidence, is approved; nothing is
+/// recorded for a digest that no longer matches. Approving again renews the
+/// approval's time.
+///
+/// # Errors
+/// [`CleanupError::ApprovalNeedsPerson`] unless `approver` is
+/// [`Trigger::Interactive`], because an approval by the automation that
+/// inspected is no approval; as [`inspect`]; and marker store errors, such as
+/// the shared marker table being full. Nothing is recorded for the digests
+/// after a failure.
+pub fn approve(
+    inspector: &Inspector<'_>,
+    approver: &Claimant,
+    digests: &[ExternalRef],
+    clock: &dyn Clock,
+) -> Result<Vec<ApprovalResult>> {
+    if approver.trigger != Trigger::Interactive {
+        return Err(CleanupError::ApprovalNeedsPerson.into());
+    }
+    let now = clock.now();
+    let preview = inspect(inspector, InspectionTrigger::Manual, now)?;
+    let mut results = Vec::with_capacity(digests.len());
+    for digest in digests {
+        let target = preview.entries.iter().find_map(|entry| {
+            previewed_steps(entry)
+                .find(|(_, observation)| *observation == digest)
+                .map(|(step, _)| (entry, step))
+        });
+        let outcome = match target {
+            Some((entry, step)) => {
+                record_approval(inspector.store, entry, step, digest, approver, now)?;
+                ApprovalOutcome::Approved {
+                    resource: entry.resource.clone(),
+                    step,
+                }
+            }
+            None => ApprovalOutcome::NotCurrent,
+        };
+        results.push(ApprovalResult {
+            observation: digest.clone(),
+            outcome,
+        });
+    }
+    Ok(results)
+}
+
 fn schema() -> Result<MarkerSchema> {
-    Ok(MarkerSchema::new(PREVIEW_SCHEMA, NonZeroU32::MIN)?)
+    Ok(MarkerSchema::new(APPROVAL_SCHEMA, NonZeroU32::MIN)?)
 }
 
 fn marker_key(resource: &ResourceRef, observation: &ExternalRef) -> Result<MarkerKey> {
@@ -1230,79 +1325,13 @@ fn marker_key(resource: &ResourceRef, observation: &ExternalRef) -> Result<Marke
     })
 }
 
-/// Whether an earlier call previewed `observation` for `step`.
-enum Approval {
-    /// No preview; this call recorded one.
-    NotPreviewed,
-    /// Too old; this call refreshed it.
-    Stale,
-    /// Previewed at this time.
-    Approved(Timestamp),
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument names one part of the preview being checked"
-)]
-fn approval(
+/// Record or renew the approval marker for one step of `entry`.
+fn record_approval(
     store: &HouseStore,
     entry: &PreviewEntry,
     step: Step,
     observation: &ExternalRef,
-    max_age: Duration,
-    trigger: InspectionTrigger,
-    claimant: &Claimant,
-    now: Timestamp,
-) -> Result<Approval> {
-    let key = marker_key(&entry.resource, observation)?;
-    let Some(marker) = store.marker(&key)? else {
-        record_preview(
-            store,
-            entry,
-            step,
-            observation,
-            None,
-            trigger,
-            claimant,
-            now,
-        )?;
-        return Ok(Approval::NotPreviewed);
-    };
-    // Only the dishwasher's own preview of this step authorizes acting.
-    let fact: PreviewFact = marker.fact().decode(&schema()?)?;
-    if fact.step != step {
-        return Err(Error::State(StateError::MarkerConflict));
-    }
-    if now.saturating_since(marker.recorded_at()) > max_age {
-        record_preview(
-            store,
-            entry,
-            step,
-            observation,
-            Some(&marker),
-            trigger,
-            claimant,
-            now,
-        )?;
-        return Ok(Approval::Stale);
-    }
-    Ok(Approval::Approved(marker.recorded_at()))
-}
-
-/// Record or refresh the preview marker for one step of `entry`. A
-/// concurrent recorder of the same evidence is not an error.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument names one part of the recorded preview"
-)]
-fn record_preview(
-    store: &HouseStore,
-    entry: &PreviewEntry,
-    step: Step,
-    observation: &ExternalRef,
-    current: Option<&WorkflowMarker>,
-    trigger: InspectionTrigger,
-    recorder: &Claimant,
+    approver: &Claimant,
     now: Timestamp,
 ) -> Result<()> {
     let Some(owner) = entry.owner_task() else {
@@ -1310,23 +1339,18 @@ fn record_preview(
     };
     let fact = MarkerFact::workflow(
         schema()?,
-        &PreviewFact {
+        &ApprovalFact {
             step,
             owner: owner.clone(),
-            trigger,
-            previewed_at: now,
+            approved_at: now,
         },
     )?;
     let key = marker_key(&entry.resource, observation)?;
-    let recorded = match current {
-        None => store.record_marker(key, fact, recorder, now).map(drop),
-        Some(marker) => store
-            .supersede_marker(&key, marker.fact(), fact, recorder, now)
+    match store.marker(&key)? {
+        None => store.record_marker(key, fact, approver, now).map(drop),
+        Some(current) => store
+            .supersede_marker(&key, current.fact(), fact, approver, now)
             .map(drop),
-    };
-    match recorded {
-        Ok(()) | Err(Error::State(StateError::MarkerConflict)) => Ok(()),
-        Err(error) => Err(error),
     }
 }
 

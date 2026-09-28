@@ -34,7 +34,7 @@ enum Command {
     Init(commands::scaffold::ScaffoldArgs),
     /// Preview house template additions or revisions in an existing repository.
     Adopt(commands::scaffold::ScaffoldArgs),
-    /// Preview dishwasher cleanup decisions; releases nothing.
+    /// Preview dishwasher cleanup decisions and record a person's approval; releases nothing.
     Cleanup(commands::cleanup::CleanupArgs),
 }
 

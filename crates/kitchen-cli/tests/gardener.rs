@@ -10,9 +10,10 @@ use std::{
 };
 
 use kitchen::{
-    CredentialId, HouseId,
-    contracts::{ExternalRef, Repository, Text},
+    CredentialId, HolderId, HouseId,
+    contracts::{Claimant, ExternalRef, IssueNumber, Repository, Text, Timestamp},
     scheduling::PrecheckOutcome,
+    state::{HouseStore, StoreOptions},
     workflows::gardener,
 };
 
@@ -38,10 +39,22 @@ fn fake_gh(root: &Path, changed: &str, open: &str) -> TestResult<PathBuf> {
     Ok(path)
 }
 
+/// The house store under `root`, initialized on first use.
+fn house_store(root: &Path) -> TestResult<HouseStore> {
+    let dir = root.join("house");
+    let house = HouseId::new("sample")?;
+    Ok(if dir.exists() {
+        HouseStore::open(dir, house, StoreOptions::default())?
+    } else {
+        HouseStore::initialize(dir, house, StoreOptions::default())?
+    })
+}
+
 /// The argument vector the schedule records, built by the library.
 fn scheduled_argv(root: &Path, gh: PathBuf) -> TestResult<Vec<String>> {
     let token = root.join("token");
     std::fs::write(&token, "sanitized-fixture-token")?;
+    house_store(root)?;
     let args = gardener::PrecheckArgs {
         kitchen: env!("CARGO_BIN_EXE_kitchen").into(),
         house: HouseId::new("sample")?,
@@ -50,6 +63,7 @@ fn scheduled_argv(root: &Path, gh: PathBuf) -> TestResult<Vec<String>> {
         credential: CredentialId::new("read")?,
         credential_file: token,
         gh,
+        store: root.join("house"),
         labels: gardener::AgentLabels {
             ready: "agent-ready".into(),
             working: "agent-working".into(),
@@ -97,6 +111,50 @@ fn scheduled_precheck_reports_idle_and_actionable_by_exit_status() -> TestResult
 }
 
 #[test]
+fn a_handled_stale_issue_keeps_later_daily_runs_idle() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let stale = issue(3, "open", "2000-01-01T00:00:00Z", &[]);
+    let gh = fake_gh(root.path(), "[]", &format!("[{stale}]"))?;
+    let argv = scheduled_argv(root.path(), gh)?;
+    assert_eq!(outcome(&run(&argv)?), PrecheckOutcome::Actionable);
+
+    // The pass reports the stale issue and records it as handled at its
+    // current revision; the following days have nothing to do.
+    let store = house_store(root.path())?;
+    let markers = gardener::StaleMarkers::new(&store)?;
+    let project = Repository::new("sample/project")?;
+    let updated = Timestamp::from_unix_millis(946_684_800_000); // 2000-01-01
+    markers.record(
+        &project,
+        IssueNumber::new(3)?,
+        updated,
+        &Claimant::scheduled(HolderId::new("gardener-tick")?),
+        Timestamp::from_unix_millis(946_684_900_000),
+    )?;
+    for day in 0..3 {
+        let output = run(&argv)?;
+        assert_eq!(outcome(&output), PrecheckOutcome::Idle, "day {day}");
+        assert_eq!(String::from_utf8(output.stdout)?, "idle\n");
+    }
+
+    // Another stale issue that was never handled wakes the schedule.
+    let other = issue(5, "open", "2000-01-01T00:00:00Z", &[]);
+    let gh = fake_gh(root.path(), "[]", &format!("[{stale},{other}]"))?;
+    assert_eq!(
+        outcome(&run(&scheduled_argv(root.path(), gh)?)?),
+        PrecheckOutcome::Actionable
+    );
+    // So does the handled issue once it changes, even while still stale.
+    let touched = issue(3, "open", "2000-02-01T00:00:00Z", &[]);
+    let gh = fake_gh(root.path(), "[]", &format!("[{touched}]"))?;
+    assert_eq!(
+        outcome(&run(&scheduled_argv(root.path(), gh)?)?),
+        PrecheckOutcome::Actionable
+    );
+    Ok(())
+}
+
+#[test]
 fn precheck_failures_never_exit_as_idle() -> TestResult {
     let root = tempfile::tempdir()?;
     // The forge read fails: an execution error, not a quiet day.
@@ -132,5 +190,22 @@ fn precheck_failures_never_exit_as_idle() -> TestResult {
     *argv.get_mut(credential + 1).ok_or("missing value")? = "token".into();
     let relative = run(&argv)?;
     assert_eq!(relative.status.code(), Some(2));
+
+    // A relative store path is invalid input; a missing store is a read
+    // failure, never an idle day.
+    let fresh = issue(1, "open", "2999-01-01T00:00:00Z", &[]);
+    let gh = fake_gh(root.path(), "[]", &format!("[{fresh}]"))?;
+    let mut argv = scheduled_argv(root.path(), gh)?;
+    let store = argv
+        .iter()
+        .position(|arg| arg == "--store")
+        .ok_or("missing store")?;
+    *argv.get_mut(store + 1).ok_or("missing value")? = "house".into();
+    assert_eq!(run(&argv)?.status.code(), Some(2));
+    *argv.get_mut(store + 1).ok_or("missing value")? =
+        root.path().join("absent").display().to_string();
+    let missing = run(&argv)?;
+    assert_eq!(missing.status.code(), Some(3));
+    assert!(missing.stdout.is_empty());
     Ok(())
 }

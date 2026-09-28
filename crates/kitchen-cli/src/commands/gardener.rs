@@ -12,6 +12,7 @@ use kitchen::{
         CredentialFile, CredentialRef, GhCli, GitHubClient, HouseScope, ReadLimits,
     },
     scheduling::PrecheckOutcome,
+    state::{HouseStore, StoreOptions},
     workflows::{Precheck, WorkflowError, gardener, precheck_outcome},
 };
 
@@ -25,7 +26,7 @@ pub struct GardenerArgs {
 enum GardenerCommand {
     /// Scheduled precheck: exit 0 when the repository needs a hygiene pass,
     /// 1 when it does not, 2 for invalid arguments, and 3 when the inventory
-    /// cannot be read. Only reads GitHub.
+    /// or the house store cannot be read. Only reads GitHub and the store.
     Precheck(PrecheckArgs),
 }
 
@@ -46,6 +47,9 @@ struct PrecheckArgs {
     /// Absolute path of the GitHub CLI.
     #[arg(long)]
     gh: PathBuf,
+    /// Absolute path of the house's initialized state store.
+    #[arg(long)]
+    store: PathBuf,
     #[arg(long)]
     ready_label: String,
     #[arg(long)]
@@ -92,16 +96,23 @@ fn precheck(args: PrecheckArgs) -> Result<Precheck, Failure> {
         std::iter::empty::<Permission>(),
     )
     .map_err(invalid)?;
+    if !args.store.is_absolute() {
+        return Err(Failure::Invalid);
+    }
     let credential = CredentialFile::new(reference, args.credential_file).map_err(invalid)?;
     let gh = GhCli::new(args.gh, credential).map_err(invalid)?;
     let client = GitHubClient::new(scope, gh, ReadLimits::default());
     let window = window.window(SystemClock.now()).map_err(Failure::Read)?;
+    let store = HouseStore::open(&args.store, args.house.clone(), StoreOptions::default())
+        .map_err(|_| Failure::Read(WorkflowError::PrecheckFailed))?;
+    let handled = gardener::StaleMarkers::new(&store).map_err(Failure::Read)?;
     gardener::precheck(gardener::signal(
         &client,
         &args.house,
         &args.repository,
         &labels,
         window,
+        &handled,
     ))
     .map_err(Failure::Read)
 }

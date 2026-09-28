@@ -589,15 +589,10 @@ pub fn precheck(evidence: &Evidence, history: &History) -> Result<Precheck, Work
     if !evidence.needs_spec || evidence.human_only || evidence.claim == ClaimState::ClaimedByOther {
         return Ok(Precheck::Idle);
     }
-    let unresolved = evidence
-        .existing_decisions
-        .iter()
-        .any(|decision| decision.state != DecisionState::Answered);
-    let pending_resolution = evidence.needs_spec
-        && evidence.factual_resolution.is_some()
-        && (!history.resolution_posted
-            || !evidence.ready_label_present && !unresolved && !evidence.open_dependencies
-            || evidence.needs_spec && evidence.ready_label_present);
+    // The same predicates the plan uses, so the precheck is actionable only
+    // when the plan would post the resolution or change a label.
+    let pending_resolution = evidence.factual_resolution.is_some()
+        && (!history.resolution_posted || label_change(evidence).is_some());
     if evidence.changed_since_last_pass || pending_resolution {
         Ok(Precheck::Actionable)
     } else {
@@ -621,10 +616,6 @@ pub fn plan(evidence: &Evidence, history: &History) -> Result<Vec<Change>, Workf
     if evidence.existing_decisions.len() > MAX_ASKS_PER_TASK as usize {
         return Err(WorkflowError::IncompleteEvidence);
     }
-    let unresolved = evidence
-        .existing_decisions
-        .iter()
-        .any(|decision| decision.state != DecisionState::Answered);
     let mut changes = Vec::new();
     if let Some(operation) = judgment_request(evidence, history)? {
         changes.push(Change::Judgment(operation));
@@ -652,24 +643,40 @@ pub fn plan(evidence: &Evidence, history: &History) -> Result<Vec<Change>, Workf
     {
         changes.push(Change::Ask { ordinal: asked });
     }
-    if evidence.factual_resolution.is_some()
-        && !unresolved
-        && !evidence.open_dependencies
-        && evidence.pending_product_questions == 0
-    {
-        if !evidence.ready_label_present {
-            changes.push(Change::Mutation(GitHubAction::SetLabel {
-                issue: evidence.issue,
-                label: evidence.ready_label.clone(),
-                present: true,
-            }));
-        } else if evidence.needs_spec {
-            changes.push(Change::Mutation(GitHubAction::SetLabel {
-                issue: evidence.issue,
-                label: evidence.needs_spec_label.clone(),
-                present: false,
-            }));
-        }
+    if let Some(change) = label_change(evidence) {
+        changes.push(Change::Mutation(change));
     }
     Ok(changes)
+}
+
+/// The readiness label change a resolved issue needs: add the ready label,
+/// then remove needs-spec. None while a decision is unresolved, a dependency
+/// is open, or a product question is pending.
+fn label_change(evidence: &Evidence) -> Option<GitHubAction> {
+    let unresolved = evidence
+        .existing_decisions
+        .iter()
+        .any(|decision| decision.state != DecisionState::Answered);
+    if evidence.factual_resolution.is_none()
+        || unresolved
+        || evidence.open_dependencies
+        || evidence.pending_product_questions > 0
+    {
+        return None;
+    }
+    if !evidence.ready_label_present {
+        Some(GitHubAction::SetLabel {
+            issue: evidence.issue,
+            label: evidence.ready_label.clone(),
+            present: true,
+        })
+    } else if evidence.needs_spec {
+        Some(GitHubAction::SetLabel {
+            issue: evidence.issue,
+            label: evidence.needs_spec_label.clone(),
+            present: false,
+        })
+    } else {
+        None
+    }
 }

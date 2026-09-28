@@ -421,6 +421,51 @@ fn triage_asks_once_per_revision_within_the_task_budget() {
 }
 
 #[test]
+fn a_posted_resolution_is_idle_while_the_plan_cannot_change_a_label() -> common::TestResult {
+    let mut markers = Recorded::default();
+    markers.posted.push((
+        ExternalRef::new("spec-10")?,
+        triage::ResolutionKind::Evidence,
+    ));
+    let mut input = triage_input();
+    input.changed_since_last_pass = false;
+    input.ready_label_present = true;
+
+    // Each blocker stops the needs-spec removal, so neither the plan nor the
+    // precheck has work, on this pass or any later one.
+    let blocked: [fn(&mut triage::Evidence); 3] = [
+        |input| input.open_dependencies = true,
+        |input| input.pending_product_questions = 1,
+        |input| {
+            input.existing_decisions.push(triage::Decision {
+                issue: input.issue,
+                owner: DecisionOwner::Spec,
+                revision: input.revision.clone(),
+                state: triage::DecisionState::Open,
+            });
+        },
+    ];
+    for block in blocked {
+        let mut case = input.clone();
+        block(&mut case);
+        assert!(plan_after(&markers, &case)?.is_empty());
+        assert_eq!(precheck_after(&markers, &case), Ok(Precheck::Idle));
+    }
+
+    // Unblocked, both agree the needs-spec label comes off.
+    assert_eq!(precheck_after(&markers, &input), Ok(Precheck::Actionable));
+    assert_eq!(
+        plan_after(&markers, &input)?,
+        vec![triage::Change::Mutation(GitHubAction::SetLabel {
+            issue: issue(10),
+            label: "needs-spec".into(),
+            present: false,
+        })]
+    );
+    Ok(())
+}
+
+#[test]
 fn unresolved_issue_requests_one_bounded_gardener_worker() -> common::TestResult {
     use kitchen::contracts::{Capability, Operation, Role, Workspace};
     let mut input = triage_input();
@@ -921,6 +966,7 @@ fn precheck_args() -> common::TestResult<gardener::PrecheckArgs> {
         credential: CredentialId::new("read")?,
         credential_file: "/etc/kitchen/sample/read.token".into(),
         gh: "/usr/local/bin/gh".into(),
+        store: "/var/lib/kitchen/sample".into(),
         labels: agent_labels(),
         window: gardener::PrecheckWindow::new(48, 30)?,
     })
@@ -972,6 +1018,8 @@ fn gardener_installs_a_disabled_daily_schedule_with_its_own_precheck() -> common
             "/etc/kitchen/sample/read.token",
             "--gh",
             "/usr/local/bin/gh",
+            "--store",
+            "/var/lib/kitchen/sample",
             "--ready-label",
             "agent-ready",
             "--working-label",
@@ -996,6 +1044,10 @@ fn gardener_installs_a_disabled_daily_schedule_with_its_own_precheck() -> common
         },
         gardener::PrecheckArgs {
             credential_file: "read.token".into(),
+            ..precheck_args()?
+        },
+        gardener::PrecheckArgs {
+            store: "house".into(),
             ..precheck_args()?
         },
         gardener::PrecheckArgs {
@@ -1183,9 +1235,18 @@ fn gardener_precheck_reads_changed_and_open_inventory() -> common::TestResult {
     let stale_before = Timestamp::from_unix_millis(1_767_225_600_000);
     let window = gardener::Window::new(since, stale_before)?;
     let fresh = forge_issue(1, "open", "2026-01-05T00:00:00Z", &[]);
+    let fixture = common::Fixture::new()?;
+    let handled = gardener::StaleMarkers::new(&fixture.store)?;
     let signal = |pages: Vec<serde_json::Value>| -> common::TestResult<_> {
         let client = github_client(pages)?;
-        let result = gardener::signal(&client, &house, &project(), &agent_labels(), window);
+        let result = gardener::signal(
+            &client,
+            &house,
+            &project(),
+            &agent_labels(),
+            window,
+            &handled,
+        );
         Ok((result, client))
     };
 
@@ -1221,6 +1282,87 @@ fn gardener_precheck_reads_changed_and_open_inventory() -> common::TestResult {
     );
     assert_eq!(
         gardener::Window::new(stale_before, since),
+        Err(WorkflowError::IncompleteEvidence)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_stale_issue_handled_at_its_revision_leaves_the_precheck_idle() -> common::TestResult {
+    use kitchen::state::{MarkerFact, MarkerKey, MarkerRecording, MarkerSchema, MarkerSubject};
+    use serde_json::json;
+    let house = HouseId::new("sample")?;
+    let since = Timestamp::from_unix_millis(1_768_003_200_000);
+    let stale_before = Timestamp::from_unix_millis(1_767_225_600_000);
+    let window = gardener::Window::new(since, stale_before)?;
+    // 2025-12-01 in Unix milliseconds.
+    let updated = Timestamp::from_unix_millis(1_764_547_200_000);
+    let old = forge_issue(3, "open", "2025-12-01T00:00:00Z", &[]);
+    let fixture = common::Fixture::new()?;
+    let markers = gardener::StaleMarkers::new(&fixture.store)?;
+    let precheck = |markers: &gardener::StaleMarkers<'_>, open: serde_json::Value| {
+        let client = github_client(vec![json!([]), open])?;
+        common::TestResult::Ok(gardener::precheck(gardener::signal(
+            &client,
+            &house,
+            &project(),
+            &agent_labels(),
+            window,
+            markers,
+        )))
+    };
+    assert_eq!(
+        precheck(&markers, json!([old.clone()]))?,
+        Ok(Precheck::Actionable)
+    );
+
+    let tick = common::scheduled("gardener-tick")?;
+    let record = |at: Timestamp| markers.record(&project(), issue(3), at, &tick, common::at(9));
+    assert!(matches!(record(updated), Ok(MarkerRecording::Recorded(_))));
+    assert!(matches!(
+        record(updated),
+        Ok(MarkerRecording::AlreadyRecorded(_))
+    ));
+    // Repeated daily runs over the same inventory stay idle, including
+    // after a restart.
+    let reopened = fixture.reopen()?;
+    let restarted = gardener::StaleMarkers::new(&reopened)?;
+    for _ in 0..3 {
+        assert_eq!(
+            precheck(&restarted, json!([old.clone()]))?,
+            Ok(Precheck::Idle)
+        );
+    }
+    // A marker at an older revision does not cover a later update.
+    let touched = forge_issue(3, "open", "2025-12-02T00:00:00Z", &[]);
+    assert_eq!(
+        precheck(&restarted, json!([touched]))?,
+        Ok(Precheck::Actionable)
+    );
+
+    // A foreign fact at the handled key proves nothing: the precheck fails.
+    let other = common::Fixture::new()?;
+    other.store.record_marker(
+        MarkerKey {
+            workflow: kitchen::WorkflowId::new(gardener::WORKFLOW)?,
+            item: kitchen::state::WorkItem::Issue {
+                repository: project(),
+                number: std::num::NonZeroU64::new(3).ok_or("issue")?,
+            },
+            subject: MarkerSubject::Issue(IssueRevision {
+                updated_at: updated,
+                last_comment: None,
+            }),
+        },
+        MarkerFact::workflow(
+            MarkerSchema::new("gardener.other", std::num::NonZeroU32::MIN)?,
+            &"payload",
+        )?,
+        &tick,
+        common::at(1),
+    )?;
+    assert_eq!(
+        precheck(&gardener::StaleMarkers::new(&other.store)?, json!([old]))?,
         Err(WorkflowError::IncompleteEvidence)
     );
     Ok(())

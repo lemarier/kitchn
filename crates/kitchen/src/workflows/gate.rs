@@ -799,6 +799,70 @@ pub struct RecordedDecision {
     /// Whether this call added the record; false means a duplicate tick.
     pub new_record: bool,
 }
+/// One scheduled pass; at most three PRs may be evaluated and merged.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GateRun {
+    evaluated: u8,
+    merges: u8,
+}
+impl GateRun {
+    /// Start a bounded pass.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            evaluated: 0,
+            merges: 0,
+        }
+    }
+    /// Number of PRs already evaluated.
+    #[must_use]
+    pub const fn evaluated(self) -> u8 {
+        self.evaluated
+    }
+    /// Evaluate and record the next PR, or return `None` at the three-PR cap.
+    ///
+    /// # Errors
+    /// Propagates marker-store failure and leaves this pass's counter unchanged.
+    pub fn evaluate_next<S: GateMarkerStore>(
+        &mut self,
+        store: &mut S,
+        evidence: &GateEvidence,
+        grants: GateGrants,
+        mode: GateMode,
+        now_unix_secs: u64,
+    ) -> Result<Option<RecordedDecision>, S::Error> {
+        if self.evaluated >= 3 {
+            return Ok(None);
+        }
+        let decision = evaluate_and_record(store, evidence, grants, mode, now_unix_secs)?;
+        self.evaluated += 1;
+        Ok(Some(decision))
+    }
+    /// Prepare the next merge after a fresh forge reread. The caller increments
+    /// the merge count only after a confirmed merged readback.
+    ///
+    /// # Errors
+    /// Refuses a fourth merge or stale provider state.
+    pub fn next_merge<T: crate::integrations::github::GitHubReadTransport>(
+        &self,
+        recorded: &RecordedDecision,
+        client: &crate::integrations::github::GitHubClient<T>,
+    ) -> Result<MergeRequest, crate::integrations::github::IntegrationError> {
+        merge_request_from_forge(recorded, client, self.merges)
+    }
+    /// Count a positively confirmed merge; an uncertain request must be
+    /// reconciled before this call or another merge.
+    ///
+    /// # Errors
+    /// Refuses a count beyond the three-merge ceiling.
+    pub fn confirm_merge(&mut self) -> Result<(), RequestRefusal> {
+        if self.merges >= 3 {
+            return Err(RequestRefusal::MergeLimit);
+        }
+        self.merges += 1;
+        Ok(())
+    }
+}
 /// Evaluate and record one exact subject before any external effect.
 ///
 /// # Errors

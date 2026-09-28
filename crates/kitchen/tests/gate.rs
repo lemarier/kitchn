@@ -747,3 +747,23 @@ fn comment_after_change_request_does_not_clear_it() -> TestResult {
     );
     Ok(())
 }
+#[test]
+fn run_caps_evaluations_and_confirmed_merges() -> TestResult {
+    let mut store = FakeMarkers::default();
+    let e = ready()?;
+    let mut run = GateRun::new();
+    for i in 0..3 {
+        let result = run.evaluate_next(&mut store, &e, grants(), GateMode::ReportOnly, i)?;
+        assert!(result.is_some());
+    }
+    assert_eq!(run.evaluated(), 3);
+    assert!(
+        run.evaluate_next(&mut store, &e, grants(), GateMode::ReportOnly, 4)?
+            .is_none()
+    );
+    for _ in 0..3 {
+        run.confirm_merge()?;
+    }
+    assert_eq!(run.confirm_merge(), Err(RequestRefusal::MergeLimit));
+    Ok(())
+}

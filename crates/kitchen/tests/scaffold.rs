@@ -11,13 +11,16 @@ use std::{
 
 use kitchen::{
     Error, ErrorClass, HouseId,
-    adoption::{FileMode, FileStatus, NewFile, RelativePath, install_new_files},
+    adoption::{
+        FileMode, FileStatus, MAX_INSTALL_BYTES, MAX_INSTALL_FILES, NewFile, RelativePath,
+        install_new_files,
+    },
     contracts::CommitId,
     house::HouseError,
     scaffold::{
-        Conflict, FilePlan, MAX_RENDERED_BYTES, ManagedState, Manifest, PlanAction, PlanKind,
-        RenderedTemplate, ScaffoldError, ScaffoldLimit, Template, TemplateProblem, VariableName,
-        inspect_managed,
+        Conflict, FilePlan, MAX_RENDERED_BYTES, MAX_TEMPLATE_OUTPUT_BYTES, ManagedState, Manifest,
+        PlanAction, PlanKind, RenderedFile, RenderedTemplate, ScaffoldError, ScaffoldLimit,
+        Template, TemplateProblem, VariableName, inspect_managed,
     },
 };
 use tempfile::TempDir;
@@ -703,6 +706,90 @@ fn template_and_output_sizes_are_bounded() -> TestResult {
         contents(&rendered, "a").map(str::len),
         Some(MAX_RENDERED_BYTES)
     );
+    Ok(())
+}
+
+/// An in-memory template of verbatim, unmarked files with the given contents.
+fn verbatim_template(contents: &[String]) -> TestResult<Result<Template, ScaffoldError>> {
+    let mut manifest = MINIMAL.to_owned();
+    let mut sources = BTreeMap::new();
+    for (index, text) in contents.iter().enumerate() {
+        manifest.push_str(&format!(
+            "[[files]]\nsource = \"f{index}\"\nrender = false\n"
+        ));
+        sources.insert(RelativePath::new(&format!("f{index}"))?, text.clone());
+    }
+    Ok(Template::from_parts(Manifest::parse(&manifest)?, sources))
+}
+
+/// A binding-sized file, as `plan_repository` appends to every plan.
+fn binding(bytes: usize) -> TestResult<RenderedFile> {
+    Ok(RenderedFile {
+        path: RelativePath::new(".kitchen.json")?,
+        contents: "x".repeat(bytes),
+        mode: FileMode::Regular,
+        managed: false,
+    })
+}
+
+#[test]
+fn template_file_count_leaves_an_installer_slot_for_the_binding() -> TestResult {
+    let dir = TempDir::new()?;
+    let target = real(&dir)?.join("absent");
+    let largest = vec!["x".to_owned(); MAX_INSTALL_FILES - 1];
+    let mut rendered = verbatim_template(&largest)??.render(
+        &HouseId::new("home")?,
+        &guidance('a')?,
+        &vars(&[])?,
+    )?;
+    rendered.files.push(binding(2)?);
+    let plan = FilePlan::new(rendered, &target)?;
+    assert_eq!(plan.additions().count(), MAX_INSTALL_FILES);
+    let one_more = vec!["x".to_owned(); MAX_INSTALL_FILES];
+    assert_eq!(
+        verbatim_template(&one_more)?.err(),
+        Some(ScaffoldError::Limit {
+            limit: ScaffoldLimit::TemplateFiles
+        })
+    );
+    assert!(!target.exists());
+    Ok(())
+}
+
+#[test]
+fn total_rendered_bytes_leave_installer_room_for_the_binding() -> TestResult {
+    let dir = TempDir::new()?;
+    let target = real(&dir)?.join("absent");
+    let mut contents =
+        vec!["x".repeat(MAX_RENDERED_BYTES); MAX_TEMPLATE_OUTPUT_BYTES / MAX_RENDERED_BYTES];
+    contents.push("x".repeat(MAX_TEMPLATE_OUTPUT_BYTES % MAX_RENDERED_BYTES));
+    let mut rendered = verbatim_template(&contents)??.render(
+        &HouseId::new("home")?,
+        &guidance('a')?,
+        &vars(&[])?,
+    )?;
+    let total: usize = rendered.files.iter().map(|file| file.contents.len()).sum();
+    assert_eq!(total, MAX_TEMPLATE_OUTPUT_BYTES);
+    rendered
+        .files
+        .push(binding(MAX_INSTALL_BYTES - MAX_TEMPLATE_OUTPUT_BYTES)?);
+    assert!(
+        FilePlan::new(rendered, &target)?
+            .conflicts()
+            .next()
+            .is_none()
+    );
+
+    contents.push("x".to_owned());
+    assert_eq!(
+        verbatim_template(&contents)??
+            .render(&HouseId::new("home")?, &guidance('a')?, &vars(&[])?)
+            .err(),
+        Some(ScaffoldError::Limit {
+            limit: ScaffoldLimit::TotalRenderedBytes
+        })
+    );
+    assert!(!target.exists());
     Ok(())
 }
 

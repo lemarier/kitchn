@@ -19,6 +19,8 @@ pub enum ScaffoldLimit {
     SourceBytes,
     /// The size of one rendered file.
     RenderedBytes,
+    /// The combined size of all rendered files and the repository binding.
+    TotalRenderedBytes,
     /// The number of declared or supplied variables.
     Variables,
     /// The size of one variable value.
@@ -34,6 +36,7 @@ impl fmt::Display for ScaffoldLimit {
             Self::TemplateFiles => "template file count",
             Self::SourceBytes => "template source size",
             Self::RenderedBytes => "rendered file size",
+            Self::TotalRenderedBytes => "total rendered size",
             Self::Variables => "variable count",
             Self::VariableBytes => "variable value size",
             Self::TemplateDepth => "template directory depth",

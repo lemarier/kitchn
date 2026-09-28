@@ -6,15 +6,16 @@
 //!   such as `id:<repo-id>`.
 //! - `KITCHEN_ORCA_WORKTREE`: path of an Orca worktree where the throwaway
 //!   coordinator terminal is opened.
-//! - `KITCHEN_ORCA_BRANCH_PREFIX`: must be `kitchen`, and must be what Orca's
-//!   Git branch-prefix setting is on this host. The shared suite launches on
-//!   the exact branch `kitchen/<tag>`, and Orca's CLI can only create a
-//!   branch as the host's prefix plus a name, so on a host with another
-//!   prefix (or none) the adapter refuses that launch. Setting this without
-//!   changing Orca's setting makes the launch fail its branch check and stop
-//!   the worker; the test then fails.
 //! - `KITCHEN_ORCA_BASE_BRANCH` (optional): base ref for the worktree.
 //! - `KITCHEN_ORCA_AGENT` (optional): `claude` (default) or `codex`.
+//!
+//! Orca's CLI can only create a branch as the host's branch prefix plus a
+//! name, and the prefix is not a fixed value: it comes from Orca's setting,
+//! Git config, or the `gh` login. Nothing here is configured for it. The test
+//! first creates a throwaway worktree with a known name, reads back the
+//! branch Orca gave it, derives the prefix from that, and removes the
+//! worktree. The shared suite then launches on `<prefix>/kitchen-smoke-<tag>`,
+//! and the launch's branch is read back again through Orca's worktree record.
 //!
 //! It creates its own coordinator terminal and Run, runs the shared contract
 //! suite (which launches and stops one worker), then stops and releases that
@@ -53,7 +54,6 @@ struct LiveSettings {
     repo: ExternalRef,
     worktree: String,
     base_branch: Option<ExternalRef>,
-    branch_prefix: BranchName,
     agent: AgentFamily,
 }
 
@@ -69,12 +69,6 @@ fn settings() -> TestResult<Option<LiveSettings>> {
             .ok()
             .map(|base| ExternalRef::new(&base))
             .transpose()?,
-        branch_prefix: match required("KITCHEN_ORCA_BRANCH_PREFIX")?.as_str() {
-            "kitchen" => BranchName::new("kitchen")?,
-            _ => {
-                return Err("KITCHEN_ORCA_BRANCH_PREFIX must be kitchen: the shared suite launches on kitchen/<tag>".into());
-            }
-        },
         agent: match env::var("KITCHEN_ORCA_AGENT").ok().as_deref() {
             None | Some("claude") => AgentFamily::Claude,
             Some("codex") => AgentFamily::Codex,
@@ -119,6 +113,136 @@ fn find(value: &Value, key: &str, prefix: &str) -> Option<String> {
             .or_else(|| map.values().find_map(|nested| find(nested, key, prefix))),
         Value::Array(items) => items.iter().find_map(|nested| find(nested, key, prefix)),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+    }
+}
+
+/// The prefix Orca put in front of `name` in the branch it reports: none when
+/// the branch is `name`.
+fn prefix_of(branch: &str, name: &str) -> TestResult<Option<BranchName>> {
+    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    if branch == name {
+        return Ok(None);
+    }
+    let prefix = branch
+        .strip_suffix(name)
+        .and_then(|rest| rest.strip_suffix('/'))
+        .ok_or_else(|| {
+            format!("Orca gave the probe branch {branch}, which does not end in /{name}")
+        })?;
+    Ok(Some(BranchName::new(prefix)?))
+}
+
+/// The branch `name` becomes under `prefix`.
+fn smoke_branch(prefix: Option<&BranchName>, name: &str) -> TestResult<BranchName> {
+    Ok(match prefix {
+        Some(prefix) => BranchName::new(&format!("{}/{name}", prefix.as_str()))?,
+        None => BranchName::new(name)?,
+    })
+}
+
+/// The branch prefix this Orca host applies, read from the host itself.
+///
+/// Orca's CLI does not expose the setting, and the prefix depends on it, on
+/// Git config, and on the `gh` login, so the test creates a throwaway
+/// worktree with a known name, reads the branch Orca gave it, and removes it.
+/// The worktree is removed on every path after it exists.
+fn host_branch_prefix(
+    runner: &SystemRunner,
+    settings: &LiveSettings,
+    stamp: u64,
+) -> TestResult<Option<BranchName>> {
+    let name = format!("kitchen-smoke-{stamp}-prefix");
+    let mut args = vec![
+        "worktree".to_owned(),
+        "create".to_owned(),
+        format!("--repo={}", settings.repo),
+        format!("--name={name}"),
+        "--no-parent".to_owned(),
+        "--setup=skip".to_owned(),
+        "--json".to_owned(),
+    ];
+    if let Some(base) = &settings.base_branch {
+        args.push(format!("--base-branch={base}"));
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let created = orca(runner, &args)?;
+    let id = created
+        .pointer("/worktree/id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!("worktree create returned no id; a worktree named {name} may remain")
+        })?;
+    println!("LIVE created prefix probe worktree {name}");
+    let branch = created
+        .pointer("/worktree/branch")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "worktree create returned no branch".into())
+        .and_then(|branch| prefix_of(branch, &name));
+    let removed = orca(
+        runner,
+        &[
+            "worktree",
+            "rm",
+            &format!("--worktree=id:{id}"),
+            "--force",
+            "--json",
+        ],
+    );
+    println!("LIVE removed prefix probe worktree: {}", removed.is_ok());
+    let prefix = branch?;
+    removed?;
+    Ok(prefix)
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    #[test]
+    fn the_prefix_is_what_orca_put_before_the_name() -> TestResult {
+        for (reported, expected) in [
+            ("refs/heads/lemarier/probe-1", Some("lemarier")),
+            ("lemarier/probe-1", Some("lemarier")),
+            ("refs/heads/team/lemarier/probe-1", Some("team/lemarier")),
+            ("refs/heads/probe-1", None),
+            ("probe-1", None),
+        ] {
+            assert_eq!(
+                prefix_of(reported, "probe-1")?
+                    .as_ref()
+                    .map(BranchName::as_str),
+                expected,
+                "{reported}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_branch_that_does_not_end_in_the_name_is_not_a_prefix() {
+        for reported in [
+            "refs/heads/lemarier/other",
+            "refs/heads/lemarier-probe-1",
+            "refs/heads/lemarier/x-probe-1",
+            "",
+        ] {
+            assert!(prefix_of(reported, "probe-1").is_err(), "{reported}");
+        }
+    }
+
+    #[test]
+    fn the_smoke_branch_is_the_prefix_and_the_name() -> TestResult {
+        let prefix = BranchName::new("lemarier")?;
+        assert_eq!(
+            smoke_branch(Some(&prefix), "kitchen-smoke-7")?.as_str(),
+            "lemarier/kitchen-smoke-7"
+        );
+        assert_eq!(
+            smoke_branch(None, "kitchen-smoke-7")?.as_str(),
+            "kitchen-smoke-7"
+        );
+        Ok(())
     }
 }
 
@@ -177,6 +301,10 @@ fn exercise(
     created_run: &mut Option<String>,
     terminals: &mut Vec<String>,
 ) -> TestResult {
+    let prefix = host_branch_prefix(runner, settings, stamp)?;
+    println!("LIVE host branch prefix: {prefix:?}");
+    let branch = smoke_branch(prefix.as_ref(), &format!("kitchen-smoke-{stamp}"))?;
+    println!("LIVE requested branch: {branch}");
     let run = orca(
         runner,
         &[
@@ -202,7 +330,7 @@ fn exercise(
         coordinator: ExternalRef::new(handle)?,
         repo: settings.repo.clone(),
         base_branch: settings.base_branch.clone(),
-        branch_prefix: Some(settings.branch_prefix.clone()),
+        branch_prefix: prefix,
         agent: settings.agent,
         call_timeout: DEFAULT_CALL_TIMEOUT,
         launch_timeout: DEFAULT_LAUNCH_TIMEOUT,
@@ -227,7 +355,7 @@ fn exercise(
              messages. You will be stopped within a minute.",
         )?,
     };
-    let report = conformance::run_worker(&backend, &fixture);
+    let report = conformance::run_worker_on_branch(&backend, &fixture, &branch);
     match &report {
         Ok(report) => {
             for (check, result) in &report.results {
@@ -238,7 +366,7 @@ fn exercise(
     }
     let adapter = report
         .is_ok()
-        .then(|| adapter_checks(&backend, &fixture))
+        .then(|| adapter_checks(runner, &backend, &fixture, &branch))
         .map(|checked| checked.and_then(|()| adoption(runner, settings, &backend, terminals)));
     if let Some(Err(error)) = &adapter {
         println!("LIVE adapter check failed: {error}");
@@ -285,8 +413,10 @@ fn smoke_request(
 /// reads as cancelled; a second worker receives a message, is stopped, and
 /// its release is idempotent.
 fn adapter_checks(
+    runner: &SystemRunner,
     backend: &OrcaBackend<&SystemRunner>,
     fixture: &ConformanceFixture,
+    requested: &BranchName,
 ) -> TestResult {
     let namespace = backend.descriptor().backend.clone();
     let probe_key =
@@ -300,14 +430,37 @@ fn adapter_checks(
         .find(|resource| resource.kind == ResourceKind::Worker)
         .cloned()
         .ok_or("probe receipt names no worker")?;
-    let branch = probe
+    verify_branch(&probe, requested.as_str())?;
+    println!("LIVE probe launch receipt names exactly {requested}");
+    // A second reading, through Orca's own record of the worktree.
+    let worktree = probe
         .created()
         .iter()
-        .find(|resource| resource.kind == ResourceKind::Branch)
-        .map(|branch| branch.handle.as_str().to_owned())
-        .ok_or("the launch receipt names no branch")?;
-    println!("LIVE probe branch as created by Orca: {branch}");
-    verify_branch(&probe, &branch)?;
+        .find(|resource| resource.kind == ResourceKind::Worktree)
+        .map(|worktree| worktree.handle.as_str().to_owned())
+        .ok_or("the launch receipt names no worktree")?;
+    let shown = orca(
+        runner,
+        &[
+            "worktree",
+            "show",
+            &format!("--worktree=id:{worktree}"),
+            "--json",
+        ],
+    )?;
+    let recorded = shown
+        .pointer("/worktree/branch")
+        .and_then(Value::as_str)
+        .map(|branch| {
+            branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch)
+                .to_owned()
+        });
+    println!("LIVE probe worktree branch per `worktree show`: {recorded:?}");
+    if recorded.as_deref() != Some(requested.as_str()) {
+        return Err(format!("`worktree show` reports {recorded:?}, not {requested}").into());
+    }
     let observed = backend.observe_worker(&probe_worker)?;
     println!("LIVE probe after cancel: {observed:?}");
     if observed != WorkerState::Settled(WorkerOutcome::Cancelled) {

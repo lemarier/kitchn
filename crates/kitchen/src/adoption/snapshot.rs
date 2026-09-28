@@ -102,7 +102,7 @@ pub(crate) fn snapshot_path(root: &Path, house: &HouseConfig) -> PathBuf {
 
 /// Install the selected pins. Existing snapshots must be byte-identical; no
 /// overwrite, refresh, role activation, or authority grant is performed.
-pub fn install_snapshot(
+pub(crate) fn install_snapshot(
     root: &Path,
     house: &HouseConfig,
     bundle: &InstructionBundle,
@@ -178,12 +178,16 @@ pub fn resolve_instructions(
         }
     }
     for asset in &manifest.roles {
-        if read_bounded(&snapshot.join(asset.path.as_path()))? != asset.contents.as_bytes() {
+        if read_bounded(&snapshot.join(asset.path.as_path()))
+            .map_err(|_| HouseError::UnverifiedSnapshot)?
+            != asset.contents.as_bytes()
+        {
             return Err(HouseError::UnverifiedSnapshot);
         }
     }
     for asset in &manifest.bundle.assets {
-        if read_bounded(&snapshot.join("house").join(asset.path.as_path()))?
+        if read_bounded(&snapshot.join("house").join(asset.path.as_path()))
+            .map_err(|_| HouseError::UnverifiedSnapshot)?
             != asset.contents.as_bytes()
         {
             return Err(HouseError::UnverifiedSnapshot);

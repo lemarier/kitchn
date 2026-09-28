@@ -16,5 +16,6 @@
     "tauri-check",
     "specta-types"
   ],
-  "grants": []
+  "grants": [],
+  "policyLimits": []
 }

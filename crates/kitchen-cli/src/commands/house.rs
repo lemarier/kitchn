@@ -83,7 +83,7 @@ enum HouseCommand {
 pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
     match args.command {
         HouseCommand::Init { registry, config } => {
-            let registry = HouseRegistry::new(registry)?;
+            let registry = HouseRegistry::new(canonical_root(registry)?)?;
             let config: HouseConfig = decode(&config)?;
             registry.initialize(&config)?;
             Ok((
@@ -100,7 +100,7 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             house,
             bundle,
         } => {
-            let registry = HouseRegistry::new(registry)?;
+            let registry = HouseRegistry::new(canonical_root(registry)?)?;
             let bundle: InstructionBundle = decode(&bundle)?;
             let resolved = registry.sync(&house, &bundle)?;
             Ok((json_text(&resolved)?, true))
@@ -110,7 +110,7 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             house,
             bundle,
         } => {
-            let registry = HouseRegistry::new(registry)?;
+            let registry = HouseRegistry::new(canonical_root(registry)?)?;
             let bundle: InstructionBundle = decode(&bundle)?;
             let current = registry.load(&house)?;
             let resolved = registry.update(&current, &bundle)?;
@@ -122,7 +122,7 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             evidence,
             json,
         } => {
-            let registry = HouseRegistry::new(registry)?;
+            let registry = HouseRegistry::new(canonical_root(registry)?)?;
             let root = canonical_root(repository_path)?;
             let config = read_repository(&root)?;
             diagnose(&registry, &config, evidence, json)
@@ -137,7 +137,7 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             evidence,
             json,
         } => {
-            let registry = HouseRegistry::new(registry)?;
+            let registry = HouseRegistry::new(canonical_root(registry)?)?;
             let root = canonical_root(repository_path)?;
             let houses = registry.houses()?;
             if houses.is_empty() {

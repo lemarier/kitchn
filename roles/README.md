@@ -21,7 +21,11 @@ Setup asks for the house and workflows. Choose `none` for interactive-only work.
 It writes only `.kitchen.json` and finishes with a doctor report and next steps.
 The binding contains the house and repository identities, selected workflows,
 and additional reviewer/check requirements. It cannot contain credentials,
-grants, private context, or house-policy overrides. Existing reviewer/check
+grants, private context, or house-policy overrides. External house policy keeps
+`policyLimits` separate from standing `grants`; interactive permission is never
+promoted into a scheduled grant. Repository effects use repository-scoped grants
+with explicit backend and credential identifiers, and posting grants must name
+an allowed posting destination. Existing reviewer/check
 additions survive setup reruns. A changed house or repository is a conflict,
 not an implicit migration.
 

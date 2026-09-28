@@ -75,7 +75,9 @@ fn two_houses_resolve_without_guidance_or_authority_leakage() -> TestResult {
         );
         assert!(
             !house.authority()?.covers(&kitchen::contracts::Grant::house(
-                kitchen::contracts::Permission::Merge
+                kitchen::contracts::Permission::Merge,
+                kitchen::BackendId::new("test-backend")?,
+                kitchen::CredentialId::new("test-credential")?,
             ))
         );
     }
@@ -365,5 +367,35 @@ fn explicit_workflow_change_preserves_strengthening_and_detects_stale_setup() ->
         registry.configure_repository(&consumer, &original, &next),
         Err(HouseError::Conflict)
     ));
+    Ok(())
+}
+
+#[test]
+fn interactive_policy_limits_never_become_standing_grants() -> TestResult {
+    use kitchen::contracts::{Grant, GrantScope, Permission};
+    let mut house = config("crabnebula")?;
+    let destination = kitchen::BackendId::new("forge")?;
+    let credential = kitchen::CredentialId::new("crabnebula-forge")?;
+    let grant = Grant::repository(
+        Permission::PostComment,
+        repo(&house)?.repository,
+        destination.clone(),
+        credential.clone(),
+    );
+    house.policy_limits.insert(grant.clone());
+    let authority = house.authority()?;
+    assert!(!authority.covers(&grant));
+    assert_eq!(
+        authority.permitted(Permission::PostComment, &grant.scope, &destination)?,
+        credential
+    );
+    house
+        .grants
+        .insert(Grant::house(Permission::Merge, destination, credential));
+    assert!(matches!(
+        house.authority(),
+        Err(HouseError::PolicyRelaxation)
+    ));
+    assert!(matches!(grant.scope, GrantScope::Repository(_)));
     Ok(())
 }

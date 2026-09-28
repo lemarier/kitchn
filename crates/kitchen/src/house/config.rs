@@ -28,6 +28,8 @@ pub struct HouseConfig {
     pub required_reviewers: BTreeSet<String>,
     /// Required checks; repository additions cannot remove these.
     pub required_checks: BTreeSet<String>,
+    /// Maximum permitted actions, including actions requiring per-action interactive consent.
+    pub policy_limits: BTreeSet<Grant>,
     /// Standing scheduled grants, separate from interactive consent.
     pub grants: BTreeSet<Grant>,
 }
@@ -40,17 +42,47 @@ impl HouseConfig {
             || self.repositories.len() > 256
             || !self.posting_destinations.is_subset(&self.repositories)
             || self.grants.len() > 256
+            || self.policy_limits.len() > 256
         {
             return Err(HouseError::InvalidInput);
         }
         validate_names(&self.required_reviewers)?;
         validate_names(&self.required_checks)?;
-        for grant in &self.grants {
+        for grant in self.grants.iter().chain(&self.policy_limits) {
+            use crate::contracts::{GrantScope, Permission};
+            let repository_effect = matches!(
+                grant.permission,
+                Permission::LaunchWorker
+                    | Permission::PostComment
+                    | Permission::EditLabels
+                    | Permission::PushBranch
+                    | Permission::OpenPullRequest
+                    | Permission::RequestReview
+                    | Permission::Merge
+                    | Permission::Publish
+            );
+            if repository_effect {
+                let GrantScope::Repository(repository) = &grant.scope else {
+                    return Err(HouseError::PolicyRelaxation);
+                };
+                if grant.permission != Permission::LaunchWorker
+                    && !self.posting_destinations.contains(repository)
+                {
+                    return Err(HouseError::PolicyRelaxation);
+                }
+            }
             if let crate::contracts::GrantScope::Repository(repo) = &grant.scope
                 && !self.repositories.contains(repo)
             {
                 return Err(HouseError::PolicyRelaxation);
             }
+        }
+        if self
+            .grants
+            .iter()
+            .any(|grant| !self.policy_limits.iter().any(|limit| limit.covers(grant)))
+        {
+            return Err(HouseError::PolicyRelaxation);
         }
         Ok(())
     }
@@ -58,10 +90,12 @@ impl HouseConfig {
     /// Translate explicit configured grants to the core authority contract.
     pub fn authority(&self) -> Result<HouseGrants, HouseError> {
         self.validate()?;
-        Ok(HouseGrants::new(
+        HouseGrants::with_limits(
             self.house.clone(),
+            self.policy_limits.iter().cloned(),
             self.grants.iter().cloned(),
-        ))
+        )
+        .map_err(|_| HouseError::PolicyRelaxation)
     }
 }
 

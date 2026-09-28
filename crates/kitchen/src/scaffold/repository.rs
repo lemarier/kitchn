@@ -1,5 +1,8 @@
 //! Compose house selection, repository binding and template files in one plan.
-use super::{FilePlan, RenderedFile, Template, TemplateName, VariableName};
+use super::{
+    FilePlan, MAX_BINDING_BYTES, RenderedFile, ScaffoldError, ScaffoldLimit, Template,
+    TemplateName, VariableName,
+};
 use crate::{
     HouseId,
     adoption::{
@@ -70,9 +73,17 @@ pub fn plan_repository(
     }) {
         return Err(HouseError::InvalidInput.into());
     }
+    let binding = String::from_utf8(encode(&config)?).map_err(|_| HouseError::InvalidInput)?;
+    // Rendering keeps template output within the installer batch minus this reserve.
+    if binding.len() > MAX_BINDING_BYTES {
+        return Err(ScaffoldError::Limit {
+            limit: ScaffoldLimit::TotalRenderedBytes,
+        }
+        .into());
+    }
     rendered.files.push(RenderedFile {
         path: RelativePath::new(REPOSITORY_CONFIG)?,
-        contents: String::from_utf8(encode(&config)?).map_err(|_| HouseError::InvalidInput)?,
+        contents: binding,
         mode: FileMode::Regular,
         managed: false,
     });

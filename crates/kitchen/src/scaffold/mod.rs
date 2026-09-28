@@ -63,9 +63,9 @@ pub use provenance::{
     ContentDigest, ManagedMarker, ManagedState, TemplateProvenance, inspect_managed,
 };
 pub use template::{
-    MAX_MANIFEST_BYTES, MAX_OUTPUT_PATH_BYTES, MAX_RENDERED_BYTES, MAX_SOURCE_BYTES,
-    MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_FILES, MAX_VARIABLE_BYTES, RenderedFile, RenderedTemplate,
-    Template,
+    MAX_BINDING_BYTES, MAX_MANIFEST_BYTES, MAX_OUTPUT_PATH_BYTES, MAX_RENDERED_BYTES,
+    MAX_SOURCE_BYTES, MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_FILES, MAX_TEMPLATE_OUTPUT_BYTES,
+    MAX_VARIABLE_BYTES, RenderedFile, RenderedTemplate, Template,
 };
 
 mod repository;

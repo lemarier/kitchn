@@ -76,7 +76,10 @@ and must not silently change an active task's pin.
 Kitchen ships only `example/`. Copy it into your house guidance as
 `templates/<name>/`, with `template.toml` and its `files/` tree as bundle assets,
 set the house identity and a manifest `name` matching the directory, declare all
-files, and bump the template revision when content changes.
+files, and bump the template revision when content changes. A template renders
+at most 255 files and 8 MiB minus 64 KiB in total, leaving one installer slot and
+64 KiB for `.kitchen.json`; an instruction bundle holds at most 200 assets across
+all of its guidance and templates.
 Keep product policy separate from Kitchen's development standards.
 
 ## Values in structured output

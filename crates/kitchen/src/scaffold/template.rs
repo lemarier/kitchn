@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::{
     HouseId,
-    adoption::{FileMode, InstructionAsset, RelativePath},
+    adoption::{FileMode, InstructionAsset, MAX_INSTALL_BYTES, MAX_INSTALL_FILES, RelativePath},
     contracts::CommitId,
     scaffold::{
         Manifest, ScaffoldError, ScaffoldLimit, ScaffoldOperation, TemplateName, TemplateProblem,
@@ -20,12 +20,18 @@ use crate::{
 
 /// Maximum size of `template.toml` in bytes.
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
-/// Maximum number of files under a template's `files/` directory.
-pub const MAX_TEMPLATE_FILES: usize = 256;
+/// Maximum number of files under a template's `files/` directory: one fewer
+/// than the installer's batch, reserving a slot for the repository binding.
+pub const MAX_TEMPLATE_FILES: usize = MAX_INSTALL_FILES - 1;
 /// Maximum size of one source file in bytes.
 pub const MAX_SOURCE_BYTES: u64 = 256 * 1024;
 /// Maximum size of one rendered file in bytes, including its marker.
 pub const MAX_RENDERED_BYTES: usize = 256 * 1024;
+/// Installer bytes reserved for the repository binding in every plan.
+pub const MAX_BINDING_BYTES: usize = 64 * 1024;
+/// Maximum combined size of a template's rendered files in bytes, leaving
+/// [`MAX_BINDING_BYTES`] of the installer's batch for the repository binding.
+pub const MAX_TEMPLATE_OUTPUT_BYTES: usize = MAX_INSTALL_BYTES - MAX_BINDING_BYTES;
 /// Maximum size of one variable value in bytes.
 pub const MAX_VARIABLE_BYTES: usize = 1024;
 /// Maximum rendered output path length, matching the installer's path bound.
@@ -237,6 +243,7 @@ impl Template {
         context.insert("vars", &self.resolve_variables(variables)?);
 
         let mut files = Vec::with_capacity(self.manifest.files.len());
+        let mut total = 0_usize;
         for entry in &self.manifest.files {
             let render_error = |error: tera::Error| ScaffoldError::Render {
                 path: entry.source.clone(),
@@ -289,6 +296,12 @@ impl Template {
                     limit: ScaffoldLimit::RenderedBytes,
                 });
             }
+            total = total
+                .checked_add(contents.len())
+                .filter(|total| *total <= MAX_TEMPLATE_OUTPUT_BYTES)
+                .ok_or(ScaffoldError::Limit {
+                    limit: ScaffoldLimit::TotalRenderedBytes,
+                })?;
             files.push(RenderedFile {
                 path,
                 contents,

@@ -1,19 +1,24 @@
 //! Repository plans that resolve templates from a house's verified instruction
 //! snapshot, using a disposable external registry and consumer directory.
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::PathBuf,
+};
 
 use kitchen::{
     Error, HouseId,
     adoption::{
-        HouseRegistry, InstructionAsset, InstructionBundle, RelativePath, role_cards_digest,
+        HouseRegistry, InstructionAsset, InstructionBundle, MAX_INSTALL_BYTES, MAX_INSTALL_FILES,
+        RelativePath, encode, role_cards_digest,
     },
     contracts::{CommitId, Repository},
-    house::{HouseConfig, HouseError},
+    house::{HouseConfig, HouseError, RepositoryConfig, Workflow},
     scaffold::{
-        FilePlan, MAX_MANIFEST_BYTES, MAX_TEMPLATE_DEPTH, ManagedState, PlanAction, ScaffoldError,
-        ScaffoldLimit, Template, TemplateName, TemplateProblem, VariableName, inspect_managed,
-        plan_repository,
+        FilePlan, MAX_BINDING_BYTES, MAX_MANIFEST_BYTES, MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_FILES,
+        MAX_TEMPLATE_OUTPUT_BYTES, ManagedState, PlanAction, ScaffoldError, ScaffoldLimit,
+        Template, TemplateName, TemplateProblem, VariableName, inspect_managed, plan_repository,
     },
 };
 use tempfile::TempDir;
@@ -279,5 +284,36 @@ fn guidance_templates_keep_the_directory_bounds() -> TestResult {
     unrelated.extend(template_assets("web", "other")?);
     let template = Template::from_guidance(&unrelated, &name)?;
     assert_eq!(template.manifest().files.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn the_largest_valid_binding_fits_its_installer_reserve() -> TestResult {
+    let house: HouseConfig = serde_json::from_str(include_str!("fixtures/house/crabnebula.json"))?;
+    // Quotes double when encoded, so these are the longest encodable names.
+    let names = |kind: &str| -> BTreeSet<String> {
+        (0..64)
+            .map(|index| {
+                let prefix = format!("{kind}{index}");
+                format!("{prefix}{}", "\"".repeat(128 - prefix.len()))
+            })
+            .collect()
+    };
+    let config = RepositoryConfig {
+        schema: 1,
+        house: house.house.clone(),
+        repository: REPOSITORY.parse()?,
+        workflows: Workflow::ALL.into(),
+        additional_reviewers: names("r"),
+        additional_checks: names("c"),
+    };
+    config.validate(&house)?;
+    let encoded = encode(&config)?.len();
+    assert!(encoded <= MAX_BINDING_BYTES, "{encoded}");
+    assert_eq!(
+        MAX_TEMPLATE_OUTPUT_BYTES + MAX_BINDING_BYTES,
+        MAX_INSTALL_BYTES
+    );
+    assert_eq!(MAX_TEMPLATE_FILES + 1, MAX_INSTALL_FILES);
     Ok(())
 }

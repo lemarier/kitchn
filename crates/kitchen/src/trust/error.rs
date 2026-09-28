@@ -4,6 +4,9 @@ use crate::ErrorClass;
 /// Evidence, autonomy, inspection, or runtime storage failure.
 #[derive(Debug, thiserror::Error)]
 pub enum TrustError {
+    /// The shared core authority model refused the action.
+    #[error(transparent)]
+    Authority(#[from] crate::contracts::ContractError),
     /// Malformed or inconsistent input.
     #[error("invalid trust input")]
     Invalid,
@@ -37,6 +40,7 @@ impl TrustError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
+            Self::Authority(error) => error.class(),
             Self::Invalid => ErrorClass::InvalidInput,
             Self::Refused | Self::Exhausted | Self::UnsafePath => ErrorClass::Refused,
             Self::Conflict | Self::Incomplete => ErrorClass::Conflict,

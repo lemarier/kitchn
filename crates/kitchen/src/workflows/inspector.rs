@@ -179,9 +179,13 @@ impl Inspection {
             {
                 return Err(TrustError::Invalid);
             }
-            if let Some(SampleResult::Confirmed { finding, .. }) = &sample.result
-                && (finding.subject != self.subject || self.samples[..index].iter().any(|old| matches!(&old.result, Some(SampleResult::Confirmed { finding: prior, .. }) if prior.source == finding.source))) {
-                return Err(TrustError::Refused);
+            if let Some(SampleResult::Confirmed { finding, .. }) = &sample.result {
+                let duplicate_source = self.samples[..index].iter().any(|old| {
+                    matches!(&old.result, Some(SampleResult::Confirmed { finding: prior, .. }) if prior.source == finding.source)
+                });
+                if finding.subject != self.subject || duplicate_source {
+                    return Err(TrustError::Refused);
+                }
             }
         }
         if spent > self.plan.max_tokens {
@@ -263,10 +267,13 @@ impl Ledger {
                 .position(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
             let inspection = &doc.inspections[index];
-            if inspection.cancelled
-                || now < inspection.started_at
-                || now >= inspection.plan.deadline
-            {
+            if inspection.cancelled {
+                return Err(TrustError::Refused);
+            }
+            if now < inspection.started_at {
+                return Err(TrustError::Invalid);
+            }
+            if now >= inspection.plan.deadline {
                 return Err(TrustError::Exhausted);
             }
             if doc.latest(&inspection.plan.observation)?.revision != inspection.revision {

@@ -221,7 +221,7 @@ impl Observation {
     pub(crate) fn validate(&self) -> Result<(), TrustError> {
         if (self.revision.get() == 1) != self.correction.is_none()
             || self.attempts.len() > MAX_ITEMS
-            || self.effects.len() > 256
+            || self.effects.len() > crate::state::MAX_EFFECTS_PER_TASK
             || self.evidence.len() > MAX_ITEMS
         {
             return Err(TrustError::Invalid);

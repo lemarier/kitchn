@@ -279,7 +279,7 @@ impl Ledger {
         task: &TaskRecord,
         current: &HouseGrants,
     ) -> crate::Result<CredentialId> {
-        let claim = self.read(|doc| {
+        self.read(|doc| {
             if current.house() != &self.house
                 || task.spec().authority.house() != &self.house
                 || task.spec().repository.as_ref() != Some(&scope.project)
@@ -320,18 +320,19 @@ impl Ledger {
             {
                 return Err(TrustError::Refused);
             }
-            Ok(grant.claim.clone())
-        })?;
-        let credential = task.spec().authority.authorize(
-            current,
-            claim.permission,
-            &claim.scope,
-            &claim.destination,
-        )?;
-        if credential != claim.credential {
-            return Err(TrustError::Refused.into());
-        }
-        Ok(credential)
+            let claim = &grant.claim;
+            let credential = task.spec().authority.authorize(
+                current,
+                claim.permission,
+                &claim.scope,
+                &claim.destination,
+            )?;
+            if credential != claim.credential {
+                return Err(TrustError::Refused);
+            }
+            Ok(credential)
+        })
+        .map_err(Into::into)
     }
 
     pub(crate) fn transact<T>(

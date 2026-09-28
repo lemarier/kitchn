@@ -396,8 +396,15 @@ fn inspection_independence_missing_evidence_and_deadline_fail_closed() -> TestRe
         Err(TrustError::Exhausted)
     ));
     assert!(l.reserve_sample(&p.id, 0, 1, at(6)).is_err());
+    assert!(matches!(
+        l.reserve_sample(&p.id, 1, 1, at(4)),
+        Err(TrustError::Invalid)
+    ));
     l.cancel_inspection(&p.id)?;
-    assert!(l.reserve_sample(&p.id, 1, 1, at(6)).is_err());
+    assert!(matches!(
+        l.reserve_sample(&p.id, 1, 1, at(6)),
+        Err(TrustError::Refused)
+    ));
     Ok(())
 }
 

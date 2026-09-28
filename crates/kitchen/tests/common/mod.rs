@@ -111,6 +111,7 @@ pub fn spec_with(id: &str, retry: RetryPolicy, permissions: &[Permission]) -> Te
         },
         resources: std::collections::BTreeSet::new(),
         requires: kitchen::contracts::CapabilityRequirements::new(),
+        agent: None,
     })
 }
 
@@ -136,6 +137,7 @@ pub fn launch() -> TestResult<Operation> {
         workspace: Workspace::Isolated,
         brief: Text::new("Implement the task described in the issue.")?,
         branch: None,
+        agent: None,
     })
 }
 

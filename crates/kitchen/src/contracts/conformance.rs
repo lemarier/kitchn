@@ -348,6 +348,7 @@ impl<'a> Runner<'a> {
             workspace: Workspace::Isolated,
             brief: self.fixture.brief.clone(),
             branch: Some(self.branch()?),
+            agent: None,
         }))
     }
 

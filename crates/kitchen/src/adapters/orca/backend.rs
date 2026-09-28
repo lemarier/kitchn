@@ -2,7 +2,7 @@
 //!
 //! | Kitchen | Orca |
 //! | --- | --- |
-//! | `LaunchWorker` | `task-create --task-title <launch marker>`, then `worker-start --task` |
+//! | `LaunchWorker` | `task-create --task-title <launch marker>`, then `worker-start --task --agent [--model [--effort]]` |
 //! | `MessageWorker` | `send --to dispatch:<id>` |
 //! | `CancelWorker` | `worker-stop --dispatch` |
 //! | `ReleaseResource` (workers only) | `worker-release --dispatch` |
@@ -48,6 +48,7 @@ use crate::{
         WorkerState, Workspace,
     },
     scheduling::AgentFamily,
+    selection::{AgentSelection, EffortSupport, SelectionSupport},
 };
 
 /// Default deadline for one non-launch Orca call.
@@ -90,6 +91,14 @@ const SETTLED_WORKER_STATES: [&str; 4] = ["stopped", "failed", "succeeded", "aba
 /// the launch is left held with the worker reported as running.
 const WRONG_BRANCH_STOP_ATTEMPTS: usize = 3;
 
+/// What `worker-start` can launch: both agent families, any opaque model id
+/// through `--model`, and `--effort` only together with `--model`.
+pub const WORKER_SELECTION: SelectionSupport = SelectionSupport {
+    families: &[AgentFamily::Claude, AgentFamily::Codex],
+    model: true,
+    effort: EffortSupport::WithModel,
+};
+
 /// Where and as whom one backend instance acts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrcaConfig {
@@ -117,7 +126,7 @@ pub struct OrcaConfig {
     /// single name when there is no prefix); any other branch is refused
     /// before anything is created.
     pub branch_prefix: Option<BranchName>,
-    /// The agent family workers start with.
+    /// The agent family a launch without an agent selection starts with.
     pub agent: AgentFamily,
     /// Deadline for each non-launch call.
     pub call_timeout: Duration,
@@ -765,6 +774,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         task: &str,
         workspace: &Workspace,
         name: Option<&str>,
+        agent: Option<&AgentSelection>,
     ) -> Result<Receipt, EffectFailure> {
         self.check_workspace(workspace)?;
         let timeout_ms = u64::try_from(self.config.launch_timeout.as_millis()).unwrap_or(u64::MAX);
@@ -772,8 +782,19 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .value("task", task)
             .value("run", self.config.run.as_str())
             .value("from", self.config.coordinator.as_str())
-            .value("agent", self.config.agent.as_str())
+            .value(
+                "agent",
+                agent
+                    .map_or(self.config.agent, |agent| agent.agent)
+                    .as_str(),
+            )
             .value("timeout-ms", &timeout_ms.to_string());
+        if let Some(model) = agent.and_then(|agent| agent.model.as_ref()) {
+            args = args.value("model", model.as_str());
+        }
+        if let Some(effort) = agent.and_then(|agent| agent.effort.as_ref()) {
+            args = args.value("effort", effort.as_str());
+        }
         args = match workspace {
             Workspace::Isolated => {
                 let args = args
@@ -836,10 +857,19 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         workspace: &Workspace,
         brief: &Text,
         branch: Option<&BranchName>,
+        agent: Option<&AgentSelection>,
     ) -> Result<Receipt, EffectFailure> {
-        // A workspace or branch no launch can honor is refused before
-        // anything exists: no reservation, no Task.
+        // A workspace, branch, or agent selection no launch can honor is
+        // refused before anything exists: no reservation, no Task. A
+        // selection Orca cannot provide is never replaced by another.
         self.check_workspace(workspace)?;
+        if let Some(agent) = agent
+            && let Some(gap) = WORKER_SELECTION.gaps(agent).first()
+        {
+            return Err(EffectFailure::NotApplied(NotAppliedReason::Unsupported(
+                gap.capability(),
+            )));
+        }
         let name = match (workspace, branch) {
             (Workspace::Isolated, Some(branch)) => Some(
                 branch::worktree_name(self.config.branch_prefix.as_ref(), branch)
@@ -853,7 +883,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 key_digest(&self.config.house, key.as_str())
             ))
             .map_err(|error| call_failure(&error))?;
-        let receipt = self.launch_reserved(key, workspace, brief, name)?;
+        let receipt = self.launch_reserved(key, workspace, brief, name, agent)?;
         reservation.settle();
         let Some(branch) = branch else {
             return Ok(receipt);
@@ -888,6 +918,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         workspace: &Workspace,
         brief: &Text,
         name: Option<String>,
+        agent: Option<&AgentSelection>,
     ) -> Result<Receipt, EffectFailure> {
         let task = match self
             .task_launch(key)
@@ -898,7 +929,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             TaskLaunch::Undispatched(task) => task,
             TaskLaunch::None => self.create_task(key, brief)?,
         };
-        self.start(key, &task, workspace, name.as_deref())
+        self.start(key, &task, workspace, name.as_deref(), agent)
     }
 
     /// Reserve `stem` under this instance's runtime directory.
@@ -1240,7 +1271,14 @@ impl<R: OrcaRunner> EffectExecutor for OrcaBackend<R> {
                 workspace,
                 brief,
                 branch,
-            } => self.launch(request.key(), workspace, brief, branch.as_ref()),
+                agent,
+            } => self.launch(
+                request.key(),
+                workspace,
+                brief,
+                branch.as_ref(),
+                agent.as_ref(),
+            ),
             Operation::MessageWorker { worker, body } => self.message(worker, body),
             Operation::ReplyToWorker {
                 worker,

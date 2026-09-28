@@ -482,6 +482,7 @@ fn adapter_checks(
             workspace: Workspace::Isolated,
             brief: fixture.brief.clone(),
             branch: None,
+            agent: None,
         },
     )?;
     let launched_at = SystemClock.now();
@@ -605,6 +606,7 @@ fn exit_checks(
             workspace: Workspace::Isolated,
             brief: fixture.brief.clone(),
             branch: Some(branch.clone()),
+            agent: None,
         },
     )?;
     let launched_at = SystemClock.now();

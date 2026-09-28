@@ -198,6 +198,9 @@ pub enum StateError {
     /// The target resource was not reported by an applied effect of this task.
     #[error("the task does not own the target resource")]
     ResourceNotOwned,
+    /// A worker launch named another agent selection than the task's own.
+    #[error("the launch does not use the agent selection recorded for its task")]
+    AgentSelectionMismatch,
     /// Effects with unknown outcomes must be reconciled first.
     #[error("{count} effect(s) have unresolved outcomes; reconcile before continuing")]
     UnresolvedEffects {
@@ -346,6 +349,7 @@ impl StateError {
             | Self::NoRunningAttempt
             | Self::CancelRequested
             | Self::ResourceNotOwned
+            | Self::AgentSelectionMismatch
             | Self::UnresolvedEffects { .. }
             | Self::EffectNotFound(_)
             | Self::EffectNameConflict(_)

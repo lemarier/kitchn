@@ -1502,6 +1502,12 @@ impl StoreState {
                 .chain([plan.effect.required_capability()]),
         )?;
         let trigger = task.owned_lease(plan.fence, now, true)?.trigger;
+        // Every launch uses the selection fixed when the task was created.
+        if let Effect::Worker(Operation::LaunchWorker { agent, .. }) = &plan.effect
+            && agent.as_ref() != task.spec.agent.as_ref().map(|resolved| &resolved.selection)
+        {
+            return fail(StateError::AgentSelectionMismatch);
+        }
         if let Some(target) = plan.effect.target()
             && (target.backend != backend.backend || !task.owns_resource(target))
         {

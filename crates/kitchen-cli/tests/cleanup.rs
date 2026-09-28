@@ -120,6 +120,7 @@ fn settled_task(store: &HouseStore) -> TestResult<(String, String, String)> {
             },
             resources: BTreeSet::new(),
             requires: CapabilityRequirements::new(),
+            agent: None,
         },
         &pickup,
         now,
@@ -144,6 +145,7 @@ fn settled_task(store: &HouseStore) -> TestResult<(String, String, String)> {
                 workspace: Workspace::Isolated,
                 brief: Text::new("Implement it.")?,
                 branch: None,
+                agent: None,
             }
             .into(),
             consent: None,

@@ -1352,6 +1352,7 @@ impl Run<'_> {
                     Capability::ResourceRelease,
                 ],
             ),
+            agent: None,
         })
     }
 }

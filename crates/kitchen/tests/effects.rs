@@ -643,6 +643,7 @@ fn targeted_operations_need_a_resource_the_task_owns() -> TestResult {
             workspace: kitchen::contracts::Workspace::Existing(worker.clone()),
             brief: Text::new("reuse")?,
             branch: None,
+            agent: None,
         },
     ];
     for (index, operation) in targeted.into_iter().enumerate() {

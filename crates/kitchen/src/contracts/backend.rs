@@ -16,6 +16,7 @@ use crate::{
         AttemptNumber, BackendDescriptor, BranchName, Capability, ContractError, Effect,
         ExternalRef, Permission, ResourceRef, Role, Text, ValueKind,
     },
+    selection::AgentSelection,
 };
 
 /// Where a worker runs.
@@ -49,6 +50,12 @@ pub enum Operation {
         /// rather than let it run on another branch.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         branch: Option<BranchName>,
+        /// The agent, model, and effort to launch: the task's resolved
+        /// selection, which the state store enforces. `None` only for a task
+        /// without one; the backend then launches its default agent. An
+        /// executor that cannot provide the selection refuses the launch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentSelection>,
     },
     /// Deliver a message to a worker.
     MessageWorker {

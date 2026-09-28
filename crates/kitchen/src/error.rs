@@ -56,6 +56,9 @@ pub enum Error {
     /// A triage or hygiene decision failed.
     #[error(transparent)]
     Workflow(#[from] crate::workflows::WorkflowError),
+    /// An agent policy or selection was rejected.
+    #[error(transparent)]
+    Selection(#[from] crate::selection::SelectionError),
 }
 
 impl Error {
@@ -73,6 +76,7 @@ impl Error {
             Self::Cleanup(error) => error.class(),
             Self::Trust(error) => error.class(),
             Self::Workflow(error) => error.class(),
+            Self::Selection(error) => error.class(),
         }
     }
 }

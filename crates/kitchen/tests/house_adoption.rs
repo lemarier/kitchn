@@ -325,6 +325,7 @@ fn doctor_unknown_is_not_success_and_scoped_evidence_can_complete_it() -> TestRe
         capabilities: CapabilitySet::supporting(Capability::ALL),
         labels: Some(labels),
         access: AccessStatus::Available,
+        agent_models: None,
     };
     assert!(doctor(&registry, &repository, Some(&evidence))?.healthy());
     evidence.house = config("crabnebula")?.house;
@@ -573,6 +574,7 @@ fn label_metadata_drift_is_informational_in_preview_and_doctor() -> TestResult {
         capabilities: CapabilitySet::supporting(Capability::ALL),
         labels: Some(labels.clone()),
         access: AccessStatus::Available,
+        agent_models: None,
     };
     let report = doctor(&registry, &repository, Some(&evidence))?;
     assert!(report.healthy());

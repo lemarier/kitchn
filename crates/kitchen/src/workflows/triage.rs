@@ -505,6 +505,9 @@ pub fn judgment_request(
         workspace: Workspace::Isolated,
         brief: Text::new(&brief).map_err(|_| WorkflowError::IncompleteEvidence)?,
         branch: None,
+        // The caller sets the task's recorded selection before submitting:
+        // the store refuses a launch that differs from it.
+        agent: None,
     }))
 }
 

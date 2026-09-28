@@ -15,6 +15,7 @@ use crate::{
         Capability, CommitId, ContractError, ExecutorKind, GrantScope, Repository, ResourceRef,
         Role, TaskAuthority, ValueKind,
     },
+    selection::ResolvedSelection,
 };
 
 /// A monotonically increasing ownership token. Every claim or takeover gets a
@@ -187,6 +188,12 @@ pub struct TaskSpec {
     /// own family, in addition to the capability the effect itself needs;
     /// other families' requirements do not apply to it.
     pub requires: CapabilityRequirements,
+    /// The agent selection resolved from house policy when the task was
+    /// created. Every worker launch of the task must use exactly this
+    /// selection, so retries keep it and a later policy change leaves it.
+    /// `None` when no policy applies; launches then use the backend default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<ResolvedSelection>,
 }
 
 /// Capability requirements per executor family. Persisted as a map keyed by

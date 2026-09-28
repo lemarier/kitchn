@@ -7,7 +7,9 @@
 use super::{HouseConfig, HouseError, RepositoryConfig, validate_names};
 use crate::{
     HolderId, HouseId,
-    contracts::{CommitId, ExternalRef, Repository, Text, Timestamp},
+    contracts::{
+        CommitId, ExternalRef, GrantScope, HouseGrants, Permission, Repository, Text, Timestamp,
+    },
     integrations::github::{
         CheckConclusion, CheckRun, CheckStatus, CommitStatus, RequiredChecks, StatusState,
     },
@@ -554,8 +556,8 @@ pub(super) fn validate_work_type(work_type: &Text) -> Result<(), HouseError> {
 
 /// An owner's decision to allow a merge grant below the required level.
 /// It is bound to the exact scope and levels it was made for. Who may decide
-/// is house policy: the caller must verify that `decided_by` holds owner
-/// authority for the house before passing the decision to [`merge_readiness`].
+/// is house policy: `decided_by` must be listed in [`HouseConfig::owners`],
+/// or the decision is refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BelowReadinessDecision {
@@ -627,14 +629,123 @@ pub fn merge_readiness(
     let Some(decision) = decision else {
         return Err(HouseError::BelowReadiness { required, assessed });
     };
-    if decision.house != house.house
-        || decision.repository != readiness.repository
-        || &decision.work_type != work_type
+    verify_decision(
+        house,
+        &readiness.repository,
+        work_type,
+        assessed,
+        required,
+        decision,
+    )?;
+    Ok(ReadinessClearance::AcceptedBelow(decision.clone()))
+}
+
+fn decision_in_scope(
+    house: &HouseConfig,
+    repository: &Repository,
+    work_type: &Text,
+    decision: &BelowReadinessDecision,
+) -> bool {
+    decision.house == house.house
+        && &decision.repository == repository
+        && &decision.work_type == work_type
+}
+
+/// A decision counts only for the exact house, repository, work type, and
+/// levels it was made for, with a reason, by a holder the house lists as owner.
+fn verify_decision(
+    house: &HouseConfig,
+    repository: &Repository,
+    work_type: &Text,
+    assessed: ReadinessLevel,
+    required: ReadinessLevel,
+    decision: &BelowReadinessDecision,
+) -> Result<(), HouseError> {
+    if !decision_in_scope(house, repository, work_type, decision)
         || decision.assessed != assessed
         || decision.required != required
         || decision.reason.as_str().trim().is_empty()
     {
         return Err(HouseError::ReadinessDecision);
     }
-    Ok(ReadinessClearance::AcceptedBelow(decision.clone()))
+    if !house.owners.contains(&decision.decided_by) {
+        return Err(HouseError::ReadinessDeciderNotOwner);
+    }
+    Ok(())
+}
+
+/// House authority issued with the readiness evidence behind any merge grant.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct IssuedAuthority {
+    /// Standing grants, including merge grants that passed the readiness gate.
+    pub authority: HouseGrants,
+    /// Owner decisions that let a merge grant proceed below the required
+    /// level; record each with the grant.
+    pub accepted_below: Vec<BelowReadinessDecision>,
+}
+
+impl HouseConfig {
+    /// Issue house authority, gating every configured [`Permission::Merge`]
+    /// grant on readiness. For each repository with a merge grant and each
+    /// work type in `merge_readiness`, the repository's assessed level must
+    /// meet the requirement, or `decisions` must hold an owner decision bound
+    /// to that house, repository, work type, and both levels. A repository
+    /// without an assessment counts as unready.
+    ///
+    /// # Errors
+    /// Returns [`HouseError::BelowReadiness`] naming the required and
+    /// assessed level, [`HouseError::ReadinessDecision`] or
+    /// [`HouseError::ReadinessDeciderNotOwner`] for an unusable decision, and
+    /// the validation errors of [`HouseConfig::authority`].
+    pub fn issue_authority(
+        &self,
+        readiness: &[RepositoryReadiness],
+        decisions: &[BelowReadinessDecision],
+    ) -> Result<IssuedAuthority, HouseError> {
+        let authority = self.build_authority()?;
+        let mut accepted_below = Vec::new();
+        let merge_repositories: BTreeSet<&Repository> = self
+            .grants
+            .iter()
+            .filter(|grant| grant.permission == Permission::Merge)
+            .filter_map(|grant| match &grant.scope {
+                GrantScope::Repository(repository) => Some(repository),
+                GrantScope::House => None,
+            })
+            .collect();
+        for repository in merge_repositories {
+            for (work_type, &required) in &self.merge_readiness {
+                let assessed = readiness
+                    .iter()
+                    .filter(|r| r.house == self.house && &r.repository == repository)
+                    .map(|r| r.level_for(work_type))
+                    .min()
+                    .unwrap_or(ReadinessLevel::Unready);
+                if assessed >= required {
+                    continue;
+                }
+                let mut refusal = HouseError::BelowReadiness { required, assessed };
+                let mut accepted = None;
+                for decision in decisions
+                    .iter()
+                    .filter(|d| decision_in_scope(self, repository, work_type, d))
+                {
+                    match verify_decision(self, repository, work_type, assessed, required, decision)
+                    {
+                        Ok(()) => {
+                            accepted = Some(decision.clone());
+                            break;
+                        }
+                        Err(error) => refusal = error,
+                    }
+                }
+                accepted_below.push(accepted.ok_or(refusal)?);
+            }
+        }
+        Ok(IssuedAuthority {
+            authority,
+            accepted_below,
+        })
+    }
 }

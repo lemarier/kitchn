@@ -27,6 +27,7 @@ fn house() -> TestResult<HouseConfig> {
     house
         .merge_readiness
         .insert(work("firmware")?, ReadinessLevel::Covered);
+    house.owners.insert(HolderId::new("owner")?);
     Ok(house)
 }
 
@@ -589,5 +590,152 @@ fn doctor_reports_readiness_and_flags_policy_below_the_required_level() -> TestR
             .iter()
             .any(|finding| finding.code == DoctorCode::Readiness)
     );
+    Ok(())
+}
+
+/// The house with a repository-scoped merge grant inside its policy limits.
+fn merge_house() -> TestResult<(HouseConfig, Grant)> {
+    let mut house = house()?;
+    let repository = house.repositories.first().ok_or("empty fixture")?.clone();
+    let grant = Grant {
+        permission: Permission::Merge,
+        scope: GrantScope::Repository(repository),
+        destination: kitchen::BackendId::new("github")?,
+        credential: kitchen::CredentialId::new("forge")?,
+    };
+    house.policy_limits.insert(grant.clone());
+    house.grants.insert(grant.clone());
+    Ok((house, grant))
+}
+
+fn checked_only(house: &HouseConfig) -> TestResult<kitchen::house::RepositoryReadiness> {
+    let mut evidence = complete()?;
+    evidence.check_history = None;
+    Ok(assess(house, &repo(house)?, Some(&evidence))?)
+}
+
+#[test]
+fn plain_authority_refuses_a_configured_merge_grant() -> TestResult {
+    let (house, _) = merge_house()?;
+    assert!(matches!(
+        house.authority(),
+        Err(HouseError::MergeNeedsReadiness)
+    ));
+    Ok(())
+}
+
+#[test]
+fn merge_grant_at_the_required_level_is_issued() -> TestResult {
+    let (house, grant) = merge_house()?;
+    let covered = assess(&house, &repo(&house)?, Some(&complete()?))?;
+    let issued = house.issue_authority(&[covered], &[])?;
+    assert!(issued.authority.covers(&grant));
+    assert!(issued.accepted_below.is_empty());
+    Ok(())
+}
+
+#[test]
+fn merge_grant_below_policy_is_refused_naming_both_levels() -> TestResult {
+    let (house, _) = merge_house()?;
+    let below = checked_only(&house)?;
+    assert!(matches!(
+        house.issue_authority(&[below], &[]),
+        Err(HouseError::BelowReadiness {
+            required: ReadinessLevel::Covered,
+            assessed: ReadinessLevel::Checked,
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn merge_grant_with_unobserved_readiness_fails_closed() -> TestResult {
+    let (house, _) = merge_house()?;
+    assert!(matches!(
+        house.issue_authority(&[], &[]),
+        Err(HouseError::BelowReadiness {
+            required: ReadinessLevel::Covered,
+            assessed: ReadinessLevel::Unready,
+        })
+    ));
+    let unobserved = assess(&house, &repo(&house)?, None)?;
+    assert!(matches!(
+        house.issue_authority(&[unobserved], &[]),
+        Err(HouseError::BelowReadiness {
+            assessed: ReadinessLevel::Unready,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn owner_decision_lets_a_below_level_merge_grant_proceed_and_records_the_reason() -> TestResult {
+    let (house, grant) = merge_house()?;
+    let below = checked_only(&house)?;
+    let accepted = decision(&house, ReadinessLevel::Checked, "Bench runs weekly by hand")?;
+    let issued = house.issue_authority(&[below], std::slice::from_ref(&accepted))?;
+    assert!(issued.authority.covers(&grant));
+    assert_eq!(issued.accepted_below, [accepted]);
+    assert_eq!(
+        issued.accepted_below[0].reason.as_str(),
+        "Bench runs weekly by hand"
+    );
+    Ok(())
+}
+
+#[test]
+fn merge_grant_refuses_a_decision_from_a_non_owner() -> TestResult {
+    let (house, _) = merge_house()?;
+    let below = checked_only(&house)?;
+    let mut outsider = decision(&house, ReadinessLevel::Checked, "Trust me")?;
+    outsider.decided_by = HolderId::new("worker")?;
+    assert!(matches!(
+        house.issue_authority(std::slice::from_ref(&below), &[outsider.clone()]),
+        Err(HouseError::ReadinessDeciderNotOwner)
+    ));
+    // The standalone check applies the same owner rule.
+    assert!(matches!(
+        merge_readiness(&house, &below, &work("firmware")?, Some(&outsider)),
+        Err(HouseError::ReadinessDeciderNotOwner)
+    ));
+    // A house that lists no owner accepts no below-level decision.
+    let mut ownerless = house.clone();
+    ownerless.owners.clear();
+    let owned = decision(&house, ReadinessLevel::Checked, "Bench runs weekly by hand")?;
+    assert!(matches!(
+        ownerless.issue_authority(&[below], &[owned]),
+        Err(HouseError::ReadinessDeciderNotOwner)
+    ));
+    Ok(())
+}
+
+#[test]
+fn merge_grant_refuses_decisions_bound_to_another_scope_or_level() -> TestResult {
+    let (house, _) = merge_house()?;
+    let below = checked_only(&house)?;
+    let base = decision(&house, ReadinessLevel::Checked, "Bench runs weekly by hand")?;
+    let mut other_work = base.clone();
+    other_work.work_type = work("docs")?;
+    let mut other_house = base.clone();
+    other_house.house = kitchen::HouseId::new("crabnebula")?;
+    let mut other_repo = base.clone();
+    other_repo.repository = Repository::new("origin89hq/other")?;
+    // Out-of-scope decisions are ignored, leaving the plain below-level refusal.
+    for stray in [other_work, other_house, other_repo] {
+        assert!(matches!(
+            house.issue_authority(std::slice::from_ref(&below), &[stray]),
+            Err(HouseError::BelowReadiness { .. })
+        ));
+    }
+    // In scope but for a different assessed level or without a reason.
+    let stale = decision(&house, ReadinessLevel::Reliable, "Older assessment")?;
+    let blank = decision(&house, ReadinessLevel::Checked, "  ")?;
+    for unusable in [stale, blank] {
+        assert!(matches!(
+            house.issue_authority(std::slice::from_ref(&below), &[unusable]),
+            Err(HouseError::ReadinessDecision)
+        ));
+    }
     Ok(())
 }

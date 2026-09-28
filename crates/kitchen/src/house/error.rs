@@ -80,6 +80,12 @@ pub enum HouseError {
         "readiness decision does not match this house, repository, work type, or assessed level"
     )]
     ReadinessDecision,
+    /// The readiness decision was not made by a holder listed as house owner.
+    #[error("readiness decision was not made by a house owner")]
+    ReadinessDeciderNotOwner,
+    /// A configured merge grant cannot become authority without a readiness check.
+    #[error("merge grants are issued through the readiness check, not plain authority")]
+    MergeNeedsReadiness,
     /// Bounded filesystem I/O failed.
     #[error("house storage operation failed ({0:?})")]
     Io(std::io::ErrorKind),
@@ -100,7 +106,9 @@ impl HouseError {
             | Self::AmbiguousHouse { .. }
             | Self::RemotesDisagree { .. }
             | Self::BelowReadiness { .. }
-            | Self::ReadinessDecision => ErrorClass::Refused,
+            | Self::ReadinessDecision
+            | Self::ReadinessDeciderNotOwner
+            | Self::MergeNeedsReadiness => ErrorClass::Refused,
             Self::Conflict | Self::Conflicts(_) | Self::LegacyChanged | Self::Busy => {
                 ErrorClass::Conflict
             }

@@ -9,7 +9,7 @@ mod workflows_support;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     time::Duration,
 };
 
@@ -31,9 +31,10 @@ use kitchen::{
         },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
         stack::{
-            BranchLayer, BranchOperation, Dependent, GhStack, MAX_STACK_LAYERS, MergedBase,
-            RetargetStep, StackBoundary, StackCommand, StackLayerView, StackOutcome, StackRefusal,
-            StackResult, StackRunner, StackView, Upstack, check_plain, plan_retarget, upstack,
+            BranchLayer, BranchOperation, Dependent, GhStack, LocalBranches, LowerLayerFault,
+            MAX_STACK_LAYERS, MergedBase, RetargetStep, StackBoundary, StackCommand,
+            StackLayerView, StackOutcome, StackPullRequest, StackRefusal, StackResult, StackRunner,
+            StackView, Upstack, check_plain, plan_retarget, upstack,
         },
     },
 };
@@ -187,6 +188,12 @@ impl RefUpdater for Remote {
     }
 }
 
+impl LocalBranches for Remote {
+    fn local_head(&self, _: &BranchName) -> Observed<Option<CommitId>> {
+        self.head.clone()
+    }
+}
+
 fn pr_view(state: PullRequestState) -> TestResult<PullRequestView> {
     Ok(PullRequestView {
         number: number(5)?,
@@ -319,6 +326,7 @@ fn boundary<'a>(
         pull_requests: remote,
         remote,
         updater: remote,
+        local: remote,
     }
 }
 
@@ -788,6 +796,379 @@ fn a_stack_push_is_recorded_so_a_first_push_cannot_recreate_the_branch() -> Test
     Ok(())
 }
 
+// Lower layers.
+
+/// A layer's pull request `number` on `branch`, based on `base`, open at
+/// `head`.
+fn layer_pr(number_: u64, name: &str, base: &str, head: char) -> TestResult<PullRequestView> {
+    Ok(PullRequestView {
+        number: number(number_)?,
+        state: PullRequestState::Open,
+        head: commit(head)?,
+        head_branch: name.to_owned(),
+        base_branch: base.to_owned(),
+        mergeability: Mergeability::Clean,
+    })
+}
+
+/// Per-branch pull requests, remote heads, and checkout heads for the stack
+/// `main <- issue-3 <- issue-4 <- issue-5`, the task's branch on top, with
+/// every lower layer as the checkout holds it.
+struct Layers {
+    pull_requests: BTreeMap<u64, Observed<Option<PullRequestView>>>,
+    remote: BTreeMap<&'static str, Observed<Option<CommitId>>>,
+    local: BTreeMap<&'static str, Observed<Option<CommitId>>>,
+}
+
+impl Layers {
+    fn consistent() -> TestResult<Self> {
+        let known = |view: PullRequestView| Observed::Known(Some(view));
+        let head = |fill: char| -> TestResult<Observed<Option<CommitId>>> {
+            Ok(Observed::Known(Some(commit(fill)?)))
+        };
+        let heads = BTreeMap::from([
+            ("lemarier/issue-3", head('a')?),
+            ("lemarier/issue-4", head('b')?),
+            ("lemarier/issue-5", head('d')?),
+        ]);
+        Ok(Self {
+            pull_requests: BTreeMap::from([
+                (3, known(layer_pr(3, "lemarier/issue-3", "main", 'a')?)),
+                (
+                    4,
+                    known(layer_pr(4, "lemarier/issue-4", "lemarier/issue-3", 'b')?),
+                ),
+                (5, known(pr_view(PullRequestState::Open)?)),
+            ]),
+            remote: heads.clone(),
+            local: heads,
+        })
+    }
+
+    /// Change pull request `number` in place.
+    fn edit(mut self, number: u64, change: impl FnOnce(&mut PullRequestView)) -> Self {
+        if let Some(Observed::Known(Some(view))) = self.pull_requests.get_mut(&number) {
+            change(view);
+        }
+        self
+    }
+}
+
+impl PullRequests for Layers {
+    fn pull_request(&self, number: IssueNumber) -> Observed<Option<PullRequestView>> {
+        self.pull_requests
+            .get(&number.get())
+            .cloned()
+            .unwrap_or(Observed::Known(None))
+    }
+
+    fn default_branch(&self) -> Observed<BranchName> {
+        BranchName::new("main").map_or(Observed::Unknown, Observed::Known)
+    }
+}
+
+impl RemoteBranches for Layers {
+    fn reads_from(&self, _: &Repository) -> Observed<bool> {
+        Observed::Known(true)
+    }
+
+    fn head(&self, branch: &BranchName) -> Observed<Option<CommitId>> {
+        self.remote
+            .get(branch.as_str())
+            .cloned()
+            .unwrap_or(Observed::Known(None))
+    }
+}
+
+impl RefUpdater for Layers {
+    fn pushes_to(&self, _: &Repository) -> Observed<bool> {
+        Observed::Known(true)
+    }
+
+    fn redirect(&self, _: &Repository) -> Observed<Option<GitConfigKey>> {
+        Observed::Known(None)
+    }
+
+    fn update(&self, _: &PushPermit, _: &BranchName, _: &CommitId) -> Result<(), UpdateFailure> {
+        Err(UpdateFailure::Rejected)
+    }
+}
+
+impl LocalBranches for Layers {
+    fn local_head(&self, branch: &BranchName) -> Observed<Option<CommitId>> {
+        self.local
+            .get(branch.as_str())
+            .cloned()
+            .unwrap_or(Observed::Known(None))
+    }
+}
+
+/// A stack on `main`, bottom to top: each layer's name, whether the tool
+/// holds it as merged, and its pull request.
+fn stack_with_prs(layers: &[(&str, bool, Option<u64>)]) -> TestResult<StackView> {
+    Ok(StackView {
+        trunk: branch("main")?,
+        branches: layers
+            .iter()
+            .map(|(name, merged, pr)| {
+                Ok(StackLayerView {
+                    name: branch(name)?,
+                    is_merged: *merged,
+                    needs_rebase: false,
+                    pr: pr
+                        .map(|pr| {
+                            Ok::<_, Box<dyn std::error::Error>>(StackPullRequest {
+                                number: number(pr)?,
+                            })
+                        })
+                        .transpose()?,
+                })
+            })
+            .collect::<TestResult<_>>()?,
+    })
+}
+
+fn three_layers() -> TestResult<StackView> {
+    stack_with_prs(&[
+        ("lemarier/issue-3", false, Some(3)),
+        ("lemarier/issue-4", false, Some(4)),
+        ("lemarier/issue-5", false, Some(5)),
+    ])
+}
+
+/// Run `command` for the task on `issue-5` against `layers` and `view`, and
+/// the commands the tool ran.
+fn run_layers(
+    setup: &Stacking,
+    view: StackView,
+    layers: &Layers,
+    command: &StackCommand,
+) -> TestResult<(StackOutcome, Vec<StackCommand>)> {
+    let runner = Recording::answering(StackResult::Done)?.with_view(StackResult::Viewed(view));
+    let outcome = StackBoundary {
+        store: &setup.world.fixture.store,
+        grants: &setup.world.grants,
+        destination: &setup.github,
+        clock: &setup.world.clock,
+        runner: &runner,
+        pull_requests: layers,
+        remote: layers,
+        updater: layers,
+        local: layers,
+    }
+    .run(&setup.task, setup.fence, command, &intent()?)?;
+    Ok((outcome, runner.ran()))
+}
+
+#[test]
+fn a_stack_push_runs_when_every_lower_layer_is_as_the_checkout_holds_it() -> TestResult {
+    let setup = stacking()?;
+    for command in [StackCommand::Push, StackCommand::Submit { ready: false }] {
+        let (outcome, ran) = run_layers(&setup, three_layers()?, &Layers::consistent()?, &command)?;
+        assert_eq!(outcome, StackOutcome::Ran(StackResult::Done), "{command:?}");
+        assert_eq!(ran, vec![command]);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_moved_lower_layer_refuses_a_stack_push_with_the_layer_named() -> TestResult {
+    let setup = stacking()?;
+    let issue_3 = branch("lemarier/issue-3")?;
+    let issue_4 = branch("lemarier/issue-4")?;
+    let moved = |layers: Layers, name: &'static str, fill: char| -> TestResult<Layers> {
+        let mut layers = layers;
+        layers
+            .remote
+            .insert(name, Observed::Known(Some(commit(fill)?)));
+        Ok(layers)
+    };
+    let cases: Vec<(&str, Layers, BranchName, LowerLayerFault)> = vec![
+        (
+            "rewritten on the remote",
+            moved(Layers::consistent()?, "lemarier/issue-4", 'f')?,
+            issue_4.clone(),
+            LowerLayerFault::HeadMoved,
+        ),
+        (
+            "deleted on the remote",
+            {
+                let mut layers = Layers::consistent()?;
+                layers
+                    .remote
+                    .insert("lemarier/issue-3", Observed::Known(None));
+                layers
+            },
+            issue_3.clone(),
+            LowerLayerFault::HeadMoved,
+        ),
+        (
+            "pull request head moved",
+            Layers::consistent()?.edit(4, |view| {
+                if let Ok(head) = commit('e') {
+                    view.head = head;
+                }
+            }),
+            issue_4.clone(),
+            LowerLayerFault::HeadMoved,
+        ),
+        (
+            "merged by someone else",
+            Layers::consistent()?.edit(3, |view| view.state = PullRequestState::Merged),
+            issue_3.clone(),
+            LowerLayerFault::NotOpen(PullRequestState::Merged),
+        ),
+        (
+            "closed",
+            Layers::consistent()?.edit(4, |view| view.state = PullRequestState::Closed),
+            issue_4.clone(),
+            LowerLayerFault::NotOpen(PullRequestState::Closed),
+        ),
+        (
+            "retargeted",
+            Layers::consistent()?.edit(4, |view| view.base_branch = "main".to_owned()),
+            issue_4.clone(),
+            LowerLayerFault::BaseChanged,
+        ),
+        (
+            "another branch's pull request",
+            Layers::consistent()?.edit(3, |view| view.head_branch = "lemarier/other".to_owned()),
+            issue_3.clone(),
+            LowerLayerFault::WrongBranch,
+        ),
+        (
+            "pull request gone",
+            {
+                let mut layers = Layers::consistent()?;
+                layers.pull_requests.remove(&3);
+                layers
+            },
+            issue_3.clone(),
+            LowerLayerFault::NoPullRequest,
+        ),
+        (
+            "pull request unreadable",
+            {
+                let mut layers = Layers::consistent()?;
+                layers.pull_requests.insert(4, Observed::Unknown);
+                layers
+            },
+            issue_4.clone(),
+            LowerLayerFault::Unknown,
+        ),
+        (
+            "remote unreadable",
+            {
+                let mut layers = Layers::consistent()?;
+                layers.remote.insert("lemarier/issue-3", Observed::Unknown);
+                layers
+            },
+            issue_3.clone(),
+            LowerLayerFault::Unknown,
+        ),
+        (
+            "not in the checkout",
+            {
+                let mut layers = Layers::consistent()?;
+                layers
+                    .local
+                    .insert("lemarier/issue-4", Observed::Known(None));
+                layers
+            },
+            issue_4.clone(),
+            LowerLayerFault::Unknown,
+        ),
+    ];
+    for command in [StackCommand::Push, StackCommand::Submit { ready: true }] {
+        for (name, layers, layer, fault) in &cases {
+            let (outcome, ran) = run_layers(&setup, three_layers()?, layers, &command)?;
+            assert_eq!(
+                outcome,
+                StackOutcome::Refused(StackRefusal::LowerLayer {
+                    branch: layer.clone(),
+                    fault: fault.clone(),
+                }),
+                "{name} {command:?}"
+            );
+            assert!(ran.is_empty(), "{name}: the tool ran");
+        }
+    }
+    // A lower layer without a pull request cannot be checked.
+    let (outcome, _) = run_layers(
+        &setup,
+        stack_with_prs(&[
+            ("lemarier/issue-3", false, None),
+            ("lemarier/issue-4", false, Some(4)),
+            ("lemarier/issue-5", false, Some(5)),
+        ])?,
+        &Layers::consistent()?,
+        &StackCommand::Push,
+    )?;
+    assert_eq!(
+        outcome,
+        StackOutcome::Refused(StackRefusal::LowerLayer {
+            branch: issue_3,
+            fault: LowerLayerFault::NoPullRequest,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn a_merged_lower_layer_is_skipped_and_its_dependent_may_still_name_it() -> TestResult {
+    let setup = stacking()?;
+    // The tool knows issue-3 merged; its branch is gone. issue-4 is still
+    // based on it until the submission retargets it, or already on main.
+    let view = stack_with_prs(&[
+        ("lemarier/issue-3", true, Some(3)),
+        ("lemarier/issue-4", false, Some(4)),
+        ("lemarier/issue-5", false, Some(5)),
+    ])?;
+    for base in ["lemarier/issue-3", "main"] {
+        let mut layers = Layers::consistent()?.edit(4, |view| view.base_branch = base.to_owned());
+        layers.pull_requests.remove(&3);
+        layers.remote.remove("lemarier/issue-3");
+        let (outcome, _) = run_layers(
+            &setup,
+            view.clone(),
+            &layers,
+            &StackCommand::Submit { ready: false },
+        )?;
+        assert_eq!(outcome, StackOutcome::Ran(StackResult::Done), "{base}");
+    }
+    // A base outside the chain is still refused.
+    let layers = Layers::consistent()?.edit(4, |view| view.base_branch = "lemarier/x".to_owned());
+    let (outcome, _) = run_layers(&setup, view, &layers, &StackCommand::Push)?;
+    assert_eq!(
+        outcome,
+        StackOutcome::Refused(StackRefusal::LowerLayer {
+            branch: branch("lemarier/issue-4")?,
+            fault: LowerLayerFault::BaseChanged,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rebase_upstack_is_not_blocked_by_a_moved_lower_layer() -> TestResult {
+    // Rebasing onto a lower layer that moved is how the writer repairs the
+    // stack; only commands that push the layers check them.
+    let setup = stacking()?;
+    let mut layers = Layers::consistent()?;
+    layers
+        .remote
+        .insert("lemarier/issue-4", Observed::Known(Some(commit('f')?)));
+    let (outcome, ran) = run_layers(
+        &setup,
+        three_layers()?,
+        &layers,
+        &StackCommand::RebaseUpstack,
+    )?;
+    assert_eq!(outcome, StackOutcome::Ran(StackResult::Done));
+    assert_eq!(ran, vec![StackCommand::RebaseUpstack]);
+    Ok(())
+}
+
 #[test]
 fn a_submission_needs_the_grants_it_exercises() -> TestResult {
     // Only `push-branch`: pushing runs, opening pull requests does not.
@@ -1215,6 +1596,7 @@ mod gh_process {
                     pull_requests: &Remote::open()?,
                     remote: &remote,
                     updater: &remote,
+                    local: &remote,
                 }
                 .run(&setup.task, setup.fence, &command, &intent()?)?;
                 assert_eq!(
@@ -1272,6 +1654,7 @@ mod gh_process {
                 pull_requests: &Remote::open()?,
                 remote: &remote,
                 updater: &remote,
+                local: &remote,
             }
             .run(&setup.task, setup.fence, &command, &intent()?)?;
             assert_eq!(
@@ -1283,6 +1666,98 @@ mod gh_process {
             );
         }
         assert!(!root.join("log").exists(), "gh stack ran");
+        Ok(())
+    }
+
+    /// A real checkout and remote: a lower layer rewritten on the remote
+    /// after the checkout last saw it refuses the stack push before
+    /// `gh stack push` runs; the same stack pushes while it is unchanged.
+    #[test]
+    fn a_lower_layer_rewritten_on_the_remote_is_refused_before_gh_stack_pushes() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (bare, worker) = granted_clone(&root)?;
+        let mut heads = Vec::new();
+        for (name, message) in [
+            ("main", "base"),
+            ("lemarier/issue-4", "lower"),
+            ("lemarier/issue-5", "top"),
+        ] {
+            if name != "main" {
+                git(&worker, &["checkout", "-b", name])?;
+            }
+            git(&worker, &["commit", "--allow-empty", "-m", message])?;
+            git(&worker, &["push", "origin", name])?;
+            heads.push(CommitId::new(&git(&worker, &["rev-parse", "HEAD"])?)?);
+        }
+        let [base, lower, top] = heads.as_slice() else {
+            return Err("three heads".into());
+        };
+        let view = r#"{"trunk":"main","branches":[{"name":"lemarier/issue-4","pr":{"number":4}},{"name":"lemarier/issue-5","pr":{"number":5}}]}"#;
+        let (gh, _kitchen) = adapter(fake_gh(&root, view, 0)?, &worker)?;
+        let remote = gh
+            .git_remote(GIT.into(), Duration::from_secs(30))?
+            .with_url_bases(&[&format!("{}/", text(&root)?)])?;
+        assert_eq!(
+            remote.local_head(&branch("lemarier/issue-4")?),
+            Observed::Known(Some(lower.clone()))
+        );
+        assert_eq!(
+            remote.local_head(&branch("lemarier/none")?),
+            Observed::Known(None)
+        );
+        let mut top_pr = pr_view(PullRequestState::Open)?;
+        top_pr.head = top.clone();
+        let mut lower_pr = layer_pr(4, "lemarier/issue-4", "main", 'a')?;
+        lower_pr.head = lower.clone();
+        let pull_requests = Layers {
+            pull_requests: BTreeMap::from([
+                (4, Observed::Known(Some(lower_pr))),
+                (5, Observed::Known(Some(top_pr))),
+            ]),
+            remote: BTreeMap::new(),
+            local: BTreeMap::new(),
+        };
+        let setup = stacking()?;
+        let push = |intent: &PushIntent| -> TestResult<StackOutcome> {
+            Ok(StackBoundary {
+                store: &setup.world.fixture.store,
+                grants: &setup.world.grants,
+                destination: &setup.github,
+                clock: &setup.world.clock,
+                runner: &gh,
+                pull_requests: &pull_requests,
+                remote: &remote,
+                updater: &remote,
+                local: &remote,
+            }
+            .run(&setup.task, setup.fence, &StackCommand::Push, intent)?)
+        };
+        let intent = PushIntent {
+            pull_request: Some(number(5)?),
+            expected_remote: Some(top.clone()),
+        };
+        let pushes = || -> TestResult<usize> {
+            Ok(fs::read_to_string(root.join("log"))?
+                .lines()
+                .filter(|line| line.starts_with("stack push"))
+                .count())
+        };
+        assert_eq!(push(&intent)?, StackOutcome::Ran(StackResult::Done));
+        assert_eq!(pushes()?, 1);
+        // Someone else rewrites the lower layer on the remote.
+        git(
+            &bare,
+            &["update-ref", "refs/heads/lemarier/issue-4", base.as_str()],
+        )?;
+        assert_eq!(
+            push(&intent)?,
+            StackOutcome::Refused(StackRefusal::LowerLayer {
+                branch: branch("lemarier/issue-4")?,
+                fault: LowerLayerFault::HeadMoved,
+            })
+        );
+        assert_eq!(pushes()?, 1, "gh stack pushed over the moved layer");
         Ok(())
     }
 
@@ -1335,6 +1810,7 @@ mod gh_process {
             pull_requests: &Remote::open()?,
             remote: &remote,
             updater: &remote,
+            local: &remote,
         }
         .run(&setup.task, setup.fence, &StackCommand::Push, &intent()?)?;
         assert_eq!(

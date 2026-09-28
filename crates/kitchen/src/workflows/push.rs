@@ -698,7 +698,7 @@ impl GitRemote {
         Ok(self)
     }
 
-    fn run(&self, args: &[&str]) -> Option<(Option<i32>, Vec<u8>)> {
+    pub(crate) fn run(&self, args: &[&str]) -> Option<(Option<i32>, Vec<u8>)> {
         let env = git_environment(&self.config, &self.remote);
         let env: Vec<(&str, &str)> = env
             .iter()

@@ -10,6 +10,11 @@
 //! boundary's pull-request and remote-head checks before anything reaches
 //! the remote, and never rewrites layers another writer is working on, as
 //! derived from the tool's own view of the stack and the house's tasks.
+//! Before a stack push or submission, every unmerged layer below the task's
+//! branch must still be an open pull request on the same base chain whose
+//! remote and pull-request heads are the head the checkout holds
+//! ([`LowerLayerFault`]); a lower layer someone else moved, merged, closed,
+//! or retargeted refuses the command with that layer named.
 //! [`GhStack`] runs `gh stack` with non-interactive flags and an explicit
 //! remote.
 //!
@@ -38,7 +43,7 @@ use crate::{
             RefUpdater, RemoteBranches, bind, decide, git_environment, observe, record_landed,
             run_bounded,
         },
-        repair::Observed,
+        repair::{Observed, PullRequestState},
     },
 };
 
@@ -103,6 +108,37 @@ pub enum StackRefusal {
     /// request, or its remote head.
     #[error("the push boundary refused the stack command")]
     Push(PushRefusal),
+    /// A layer below the task's branch is not in the state the push builds
+    /// on.
+    #[error("lower stack layer {branch} is not in the state this push builds on")]
+    LowerLayer {
+        /// The lower layer.
+        branch: BranchName,
+        /// What is wrong with it.
+        fault: LowerLayerFault,
+    },
+}
+
+/// Why a layer below the task's branch refuses a stack push or submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LowerLayerFault {
+    /// The layer has no pull request to check.
+    NoPullRequest,
+    /// Its pull request merged or closed, though the stack tool still holds
+    /// the layer as unmerged.
+    NotOpen(PullRequestState),
+    /// Its pull request's head branch is not the layer.
+    WrongBranch,
+    /// Its pull request is based on neither the layer below it nor a merged
+    /// layer between them (or the trunk, for the bottom layer).
+    BaseChanged,
+    /// Its remote head or pull-request head is not the head the checkout
+    /// holds, or its remote branch is gone.
+    HeadMoved,
+    /// The pull request, the remote head, or the checkout's head could not be
+    /// read.
+    Unknown,
 }
 
 /// Check a plain branch operation. With a configured stack tool, a
@@ -239,6 +275,28 @@ pub enum StackResult {
     Rejected,
     /// The command may or may not have changed branches or pull requests.
     Uncertain,
+}
+
+/// Reads branch heads in the checkout the stack tool runs in.
+pub trait LocalBranches {
+    /// The head of the local `branch`, `Known(None)` when it does not exist,
+    /// and `Unknown` when it could not be read.
+    fn local_head(&self, branch: &BranchName) -> Observed<Option<CommitId>>;
+}
+
+impl LocalBranches for GitRemote {
+    fn local_head(&self, branch: &BranchName) -> Observed<Option<CommitId>> {
+        let reference = format!("refs/heads/{branch}^{{commit}}");
+        match self.run(&["rev-parse", "--verify", "--quiet", &reference]) {
+            Some((Some(0), stdout)) => String::from_utf8(stdout)
+                .ok()
+                .and_then(|text| CommitId::new(text.trim()).ok())
+                .map_or(Observed::Unknown, |id| Observed::Known(Some(id))),
+            // `--verify --quiet` exits 1 without output for a missing ref.
+            Some((Some(1), stdout)) if stdout.is_empty() => Observed::Known(None),
+            Some(_) | None => Observed::Unknown,
+        }
+    }
 }
 
 /// Runs stack-tool commands in one checkout.
@@ -533,6 +591,8 @@ pub struct StackBoundary<'a> {
     /// [`RefUpdater::redirect`] and [`RefUpdater::pushes_to`] are used, to
     /// check the checkout's configuration and the effective push URL.
     pub updater: &'a dyn RefUpdater,
+    /// Branch heads in the checkout the tool pushes from.
+    pub local: &'a dyn LocalBranches,
 }
 
 /// What a stack-tool command through the boundary did.
@@ -556,7 +616,9 @@ impl StackBoundary<'_> {
     /// checks them against `intent`: a merged or closed pull request, a
     /// deleted or moved branch, or an unreadable state refuses. Such a
     /// command also needs every layer above free of other writers, derived
-    /// through [`upstack`] from the tool's view of the stack.
+    /// through [`upstack`] from the tool's view of the stack. A push or
+    /// submission also needs every unmerged layer below to be as the checkout
+    /// holds it ([`LowerLayerFault`]).
     ///
     /// # Errors
     /// Returns [`crate::state::StateError::StaleFence`] without a live claim
@@ -600,21 +662,30 @@ impl StackBoundary<'_> {
             Ok(Decision::Update(_) | Decision::Current) => {}
             Err(refusal) => return Ok(refused(refusal)),
         }
-        let above = match self.runner.run(&StackCommand::View) {
-            StackResult::Viewed(view) => upstack(self.store, &view, &binding.branch)?,
+        let view = match self.runner.run(&StackCommand::View) {
+            StackResult::Viewed(view) => view,
             StackResult::Done
             | StackResult::Conflict
             | StackResult::RebaseInProgress
             | StackResult::Locked
             | StackResult::NotInStack
             | StackResult::Rejected
-            | StackResult::Uncertain => Upstack::Unknown,
+            | StackResult::Uncertain => {
+                return Ok(StackOutcome::Refused(StackRefusal::UpstackBusy));
+            }
         };
-        match above {
+        match upstack(self.store, &view, &binding.branch)? {
             Upstack::Top | Upstack::Idle => {}
             Upstack::Busy | Upstack::Unknown => {
                 return Ok(StackOutcome::Refused(StackRefusal::UpstackBusy));
             }
+        }
+        // The tool pushes every layer from the checkout: a lower layer that
+        // moved on the remote would be overwritten or built on stale history.
+        if pushes_layers(command)
+            && let Err(refusal) = self.check_lower(&view, &binding.branch)
+        {
+            return Ok(StackOutcome::Refused(refusal));
         }
         // The tool takes the remote by name, so it resolves the URLs itself
         // and this check cannot bind them: check the checkout's
@@ -626,9 +697,7 @@ impl StackBoundary<'_> {
             return Ok(refused(refusal));
         }
         let result = self.runner.run(command);
-        if result == StackResult::Done
-            && matches!(command, StackCommand::Push | StackCommand::Submit { .. })
-        {
+        if result == StackResult::Done && pushes_layers(command) {
             record_landed(self.store, self.clock, task, fence, &binding, intent)?;
         }
         Ok(StackOutcome::Ran(result))
@@ -656,6 +725,91 @@ impl StackBoundary<'_> {
             }
             (Observed::Unknown, _) | (_, Observed::Unknown) => Some(PushRefusal::Unknown),
         }
+    }
+}
+
+impl StackBoundary<'_> {
+    /// Check every unmerged layer below `branch`, bottom to top: its pull
+    /// request is open, is the layer's, and is based on the layer below it,
+    /// a merged layer the tool will retarget it from, or the trunk; and its
+    /// remote and pull-request heads are the checkout's head of the layer.
+    fn check_lower(
+        &self,
+        view: &StackView,
+        branch: &BranchName,
+    ) -> std::result::Result<(), StackRefusal> {
+        let Some(position) = view.branches.iter().position(|layer| &layer.name == branch) else {
+            return Err(StackRefusal::InvalidLayers);
+        };
+        let mut bases: Vec<&BranchName> = vec![&view.trunk];
+        for layer in view.branches.iter().take(position) {
+            if layer.is_merged {
+                bases.push(&layer.name);
+                continue;
+            }
+            self.check_layer(layer, &bases)
+                .map_err(|fault| StackRefusal::LowerLayer {
+                    branch: layer.name.clone(),
+                    fault,
+                })?;
+            bases = vec![&layer.name];
+        }
+        Ok(())
+    }
+
+    fn check_layer(
+        &self,
+        layer: &StackLayerView,
+        bases: &[&BranchName],
+    ) -> std::result::Result<(), LowerLayerFault> {
+        let Some(pr) = layer.pr else {
+            return Err(LowerLayerFault::NoPullRequest);
+        };
+        let pull_request = match self.pull_requests.pull_request(pr.number) {
+            Observed::Known(Some(pull_request)) => pull_request,
+            Observed::Known(None) => return Err(LowerLayerFault::NoPullRequest),
+            Observed::Unknown => return Err(LowerLayerFault::Unknown),
+        };
+        if pull_request.number != pr.number || pull_request.head_branch != layer.name.as_str() {
+            return Err(LowerLayerFault::WrongBranch);
+        }
+        match pull_request.state {
+            PullRequestState::Open => {}
+            state @ (PullRequestState::Merged | PullRequestState::Closed) => {
+                return Err(LowerLayerFault::NotOpen(state));
+            }
+        }
+        if !bases
+            .iter()
+            .any(|base| pull_request.base_branch == base.as_str())
+        {
+            return Err(LowerLayerFault::BaseChanged);
+        }
+        let Observed::Known(local) = self.local.local_head(&layer.name) else {
+            return Err(LowerLayerFault::Unknown);
+        };
+        // A layer the checkout lacks cannot be compared.
+        let Some(local) = local else {
+            return Err(LowerLayerFault::Unknown);
+        };
+        match self.remote.head(&layer.name) {
+            Observed::Known(Some(remote)) if remote == local && pull_request.head == local => {
+                Ok(())
+            }
+            Observed::Known(_) => Err(LowerLayerFault::HeadMoved),
+            Observed::Unknown => Err(LowerLayerFault::Unknown),
+        }
+    }
+}
+
+/// Whether `command` pushes the stack's layers.
+const fn pushes_layers(command: &StackCommand) -> bool {
+    match command {
+        StackCommand::Push | StackCommand::Submit { .. } => true,
+        StackCommand::Adopt { .. }
+        | StackCommand::Add { .. }
+        | StackCommand::RebaseUpstack
+        | StackCommand::View => false,
     }
 }
 

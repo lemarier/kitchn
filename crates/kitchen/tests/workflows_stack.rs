@@ -495,6 +495,68 @@ fn a_settled_task_above_leaves_the_upper_layer_idle() -> TestResult {
 }
 
 #[test]
+fn an_active_task_on_a_layers_branch_keeps_the_layer_busy_behind_a_settled_one() -> TestResult {
+    use kitchen::contracts::{WorkerOutcome, WorkerState};
+    use kitchen::workflows::coordination::{SupervisionInput, supervise};
+    let setup = stacking()?;
+    // Issue 6 launched on its branch and failed. Issue 7, such as a repair,
+    // works on the same branch and sorts after it.
+    let (first, fence) = claim_and_launch(&setup.world, 6, &worker_template(&setup.world, 1)?)?;
+    let record = setup.world.fixture.store.task(&first)?;
+    let worker = kitchen::workflows::coordination::current_worker(&record)
+        .ok_or("no worker")?
+        .worker;
+    setup
+        .world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Failed));
+    supervise(
+        &setup.world.ctx(),
+        &first,
+        fence,
+        &workflows_support::supervision()?,
+        &SupervisionInput::default(),
+    )?;
+    let view = stack_view(&[("lemarier/issue-5", false), ("lemarier/issue-6", false)])?;
+    let own = branch("lemarier/issue-5")?;
+    let store = &setup.world.fixture.store;
+    assert_eq!(upstack(store, &view, &own)?, Upstack::Idle);
+
+    let mut second = brief(7)?;
+    second.branch = branch("lemarier/issue-6")?;
+    let ClaimOutcome::Claimed(lease) = claim_issue(
+        store,
+        &worker_template(&setup.world, 1)?,
+        &issue(7)?,
+        &common::scheduled("coordinator-7")?,
+        ttl(300)?,
+        setup.world.now(),
+    )?
+    else {
+        return Err("issue not claimed".into());
+    };
+    let launched = launch_worker(
+        &setup.world.ctx(),
+        &issue_task_id(&issue(7)?)?,
+        lease.fence(),
+        Workspace::Isolated,
+        &second,
+    )?;
+    assert!(
+        matches!(launched, LaunchOutcome::Accepted { .. }),
+        "{launched:?}"
+    );
+    assert_eq!(upstack(store, &view, &own)?, Upstack::Busy);
+    let runner = Recording::answering(StackResult::Done)?.with_view(StackResult::Viewed(view));
+    assert_eq!(
+        run(&setup, &runner, &StackCommand::RebaseUpstack)?,
+        StackOutcome::Refused(StackRefusal::UpstackBusy)
+    );
+    assert!(runner.ran().is_empty());
+    Ok(())
+}
+
+#[test]
 fn the_stack_path_runs_the_push_boundarys_checks_first() -> TestResult {
     let setup = stacking()?;
     let with = |change: &dyn Fn(&mut Remote)| -> TestResult<Remote> {
@@ -609,6 +671,68 @@ fn the_stack_path_refuses_a_push_url_that_is_not_the_granted_repository() -> Tes
         )?,
         StackOutcome::Ran(StackResult::Done)
     );
+    Ok(())
+}
+
+/// Answers the push-URL check as scripted, one answer per call, then keeps
+/// the last one.
+struct PushUrls<'a> {
+    remote: &'a Remote,
+    answers: RefCell<Vec<Observed<bool>>>,
+}
+
+impl PullRequests for PushUrls<'_> {
+    fn pull_request(&self, number: IssueNumber) -> Observed<Option<PullRequestView>> {
+        self.remote.pull_request(number)
+    }
+
+    fn default_branch(&self) -> Observed<BranchName> {
+        self.remote.default_branch()
+    }
+}
+
+impl RefUpdater for PushUrls<'_> {
+    fn pushes_to(&self, _: &Repository) -> Observed<bool> {
+        let mut answers = self.answers.borrow_mut();
+        if answers.len() > 1 {
+            answers.remove(0)
+        } else {
+            answers.first().copied().unwrap_or(Observed::Unknown)
+        }
+    }
+
+    fn update(&self, _: &PushPermit, _: &BranchName, _: &CommitId) -> Result<(), UpdateFailure> {
+        Err(UpdateFailure::Rejected)
+    }
+}
+
+#[test]
+fn the_push_urls_are_read_again_right_before_the_tool_runs() -> TestResult {
+    let setup = stacking()?;
+    let remote = Remote::open()?;
+    for command in [
+        StackCommand::Push,
+        StackCommand::Submit { ready: false },
+        StackCommand::RebaseUpstack,
+    ] {
+        // The URLs pass at the first check and change before the tool runs.
+        let updater = PushUrls {
+            remote: &remote,
+            answers: RefCell::new(vec![Observed::Known(true), Observed::Known(false)]),
+        };
+        let runner = Recording::answering(StackResult::Done)?;
+        let outcome = StackBoundary {
+            updater: &updater,
+            ..boundary(&setup, &runner, &remote)
+        }
+        .run(&setup.task, setup.fence, &command, &intent()?)?;
+        assert_eq!(
+            outcome,
+            StackOutcome::Refused(StackRefusal::Push(PushRefusal::RemoteMismatch)),
+            "{command:?}"
+        );
+        assert!(runner.ran().is_empty(), "{command:?} ran the tool");
+    }
     Ok(())
 }
 
@@ -1072,6 +1196,54 @@ mod gh_process {
             )
             .ok();
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_push_url_is_refused_before_gh_stack_runs() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (bare, worker) = granted_clone(&root)?;
+        let elsewhere = root.join("elsewhere").join("firmware.git");
+        fs::create_dir_all(&elsewhere)?;
+        git(&elsewhere, &["init", "--bare"])?;
+        let setup = stacking()?;
+        let gh = adapter(fake_gh(&root, "", 0)?, &worker)?;
+        let remote = gh
+            .git_remote(GIT.into(), Duration::from_secs(30))?
+            .with_url_bases(&[&format!("{}/", text(&root)?)])?;
+        // The first push URL is the granted repository, so a check of only
+        // the first passes.
+        for url in [text(&bare)?, text(&elsewhere)?] {
+            git(&worker, &["config", "--add", "remote.origin.pushurl", url])?;
+        }
+        assert_eq!(
+            remote.pushes_to(&workflows_support::repo()?),
+            Observed::Known(false)
+        );
+        for command in [
+            StackCommand::Push,
+            StackCommand::Submit { ready: true },
+            StackCommand::RebaseUpstack,
+        ] {
+            let outcome = StackBoundary {
+                store: &setup.world.fixture.store,
+                grants: &setup.world.grants,
+                destination: &setup.github,
+                clock: &setup.world.clock,
+                runner: &gh,
+                pull_requests: &Remote::open()?,
+                remote: &remote,
+                updater: &remote,
+            }
+            .run(&setup.task, setup.fence, &command, &intent()?)?;
+            assert_eq!(
+                outcome,
+                StackOutcome::Refused(StackRefusal::Push(PushRefusal::RemoteMismatch)),
+                "{command:?}"
+            );
+        }
+        assert!(!root.join("log").exists(), "gh stack ran");
         Ok(())
     }
 

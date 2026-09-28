@@ -1146,6 +1146,159 @@ mod git_remote {
         Ok(())
     }
 
+    /// A second `pushurl` names another repository: a push by remote name
+    /// would send the ref to both, so the check must read every push URL.
+    #[test]
+    fn git_refuses_a_second_push_url_that_names_another_repository() -> TestResult {
+        let repos = fresh_repos()?;
+        let setup = pushing()?;
+        let elsewhere = repos.dir.path().join("elsewhere").join("firmware.git");
+        fs::create_dir_all(&elsewhere)?;
+        git(&elsewhere, &["init", "--bare"])?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        let granted = text(&repos.remote)?.to_owned();
+        let other = text(&elsewhere)?.to_owned();
+        git(
+            &repos.worker,
+            &["config", "--add", "remote.origin.pushurl", &granted],
+        )?;
+        git(
+            &repos.worker,
+            &["config", "--add", "remote.origin.pushurl", &other],
+        )?;
+        let remote = remote_for(&repos)?;
+        assert_eq!(
+            remote.pushes_to(&Repository::new("origin89hq/firmware")?),
+            Observed::Known(false)
+        );
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert_eq!(outcome, PushOutcome::Refused(PushRefusal::RemoteMismatch));
+        assert_eq!(remote_head(&repos, BRANCH)?, None);
+        assert!(git(&elsewhere, &["for-each-ref"])?.is_empty());
+
+        // A second fetch URL is refused as well.
+        git(
+            &repos.worker,
+            &["config", "--unset-all", "remote.origin.pushurl"],
+        )?;
+        git(
+            &repos.worker,
+            &["config", "--add", "remote.origin.url", &other],
+        )?;
+        assert_eq!(
+            remote.reads_from(&Repository::new("origin89hq/firmware")?),
+            Observed::Known(false)
+        );
+        Ok(())
+    }
+
+    /// Updates the remote's config after the check passed and before the
+    /// update runs: the window issue #92 describes.
+    struct ChangesBeforeUpdate<'a> {
+        remote: &'a GitRemote,
+        change: &'a dyn Fn() -> TestResult,
+        failure: RefCell<Option<String>>,
+    }
+
+    impl RefUpdater for ChangesBeforeUpdate<'_> {
+        fn pushes_to(&self, repository: &Repository) -> Observed<bool> {
+            self.remote.pushes_to(repository)
+        }
+
+        fn update(
+            &self,
+            permit: &PushPermit,
+            branch: &BranchName,
+            commit: &CommitId,
+        ) -> Result<(), UpdateFailure> {
+            if let Err(error) = (self.change)() {
+                *self.failure.borrow_mut() = Some(error.to_string());
+            }
+            self.remote.update(permit, branch, commit)
+        }
+    }
+
+    #[test]
+    fn git_does_not_follow_a_config_change_between_the_check_and_the_push() -> TestResult {
+        for (name, args) in [
+            ("pushurl", ["remote", "set-url", "--push", "origin"]),
+            ("url", ["remote", "set-url", "origin", ""]),
+        ] {
+            let repos = fresh_repos()?;
+            let setup = pushing()?;
+            let elsewhere = repos.dir.path().join("elsewhere").join("firmware.git");
+            fs::create_dir_all(&elsewhere)?;
+            git(&elsewhere, &["init", "--bare"])?;
+            let mine = commit_in(&repos.worker, "mine")?;
+            let other = text(&elsewhere)?.to_owned();
+            let remote = remote_for(&repos)?;
+            let change = || -> TestResult {
+                let mut args: Vec<&str> = args.to_vec();
+                args.retain(|arg| !arg.is_empty());
+                args.push(&other);
+                git(&repos.worker, &args)?;
+                Ok(())
+            };
+            let racing = ChangesBeforeUpdate {
+                remote: &remote,
+                change: &change,
+                failure: RefCell::new(None),
+            };
+            let outcome = push_with(
+                &setup,
+                Observed::Unknown,
+                &remote,
+                &racing,
+                &first_intent()?,
+                &mine,
+            )?;
+            assert_eq!(racing.failure.borrow().as_deref(), None, "{name}");
+            assert_ne!(
+                outcome,
+                PushOutcome::Pushed { replaced: None },
+                "{name}: reported a push that went elsewhere"
+            );
+            assert!(
+                git(&elsewhere, &["for-each-ref"])?.is_empty(),
+                "{name}: the push followed the changed config"
+            );
+        }
+        Ok(())
+    }
+
+    /// The explicit-URL push works when the push URL is set apart from the
+    /// fetch URL and both name the granted repository.
+    #[test]
+    fn git_pushes_through_a_separate_push_url_that_names_the_granted_repository() -> TestResult {
+        let repos = fresh_repos()?;
+        let setup = pushing()?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        let granted = text(&repos.remote)?.to_owned();
+        git(
+            &repos.worker,
+            &["config", "--add", "remote.origin.pushurl", &granted],
+        )?;
+        let remote = remote_for(&repos)?;
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert_eq!(outcome, PushOutcome::Pushed { replaced: None });
+        assert_eq!(remote_head(&repos, BRANCH)?.as_deref(), Some(mine.as_str()));
+        Ok(())
+    }
+
     #[test]
     fn git_never_runs_the_checkouts_hooks() -> TestResult {
         let repos = fresh_repos()?;

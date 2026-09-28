@@ -971,6 +971,162 @@ fn nothing_is_sent_into_a_terminal_a_person_holds() -> TestResult {
     Ok(())
 }
 
+/// Supervision records a takeover, then the backend and the signals report
+/// an ordinary agent terminal again.
+fn takeover_recorded_then_agent_returns(
+    world: &World,
+    task: &TaskId,
+    fence: Fence,
+    worker: &ResourceRef,
+) -> TestResult {
+    world
+        .backend
+        .set_worker_state(worker, WorkerState::UserTakeover);
+    assert_eq!(
+        step(world, task, fence, &SupervisionInput::default())?,
+        Supervision::PersonOwnsTerminal
+    );
+    world.backend.set_worker_state(worker, WorkerState::Ready);
+    Ok(())
+}
+
+#[test]
+fn supervision_never_stops_a_terminal_a_recorded_hold_says_a_person_has() -> TestResult {
+    let world = World::new()?;
+    let (task, fence) = claim(&world, 3)?;
+    let worker = launched(&world, &task, fence)?;
+    let last = world.now();
+    takeover_recorded_then_agent_returns(&world, &task, fence, &worker)?;
+    world.clock.advance(241);
+    let calls = world.backend.execute_calls();
+    // Idle Agent signals past the bound would stop an ordinary worker.
+    let outcome = step(
+        &world,
+        &task,
+        fence,
+        &with_signals(&idle(&worker, Some(last))),
+    )?;
+    assert!(
+        matches!(outcome, Supervision::Replace { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        world.backend.execute_calls(),
+        calls,
+        "the person was stopped"
+    );
+    Ok(())
+}
+
+#[test]
+fn supervision_never_messages_a_terminal_a_recorded_hold_says_a_person_has() -> TestResult {
+    let world = World::new()?;
+    let (task, fence) = claim(&world, 3)?;
+    let worker = launched(&world, &task, fence)?;
+    takeover_recorded_then_agent_returns(&world, &task, fence, &worker)?;
+    let calls = world.backend.execute_calls();
+    let refused = RecoverySignals {
+        provider: Some(ProviderInterruption::Quota),
+        ..signals(&worker, Some(world.now()))
+    };
+    // A working provider would resume an ordinary parked worker by message.
+    let outcome = step(
+        &world,
+        &task,
+        fence,
+        &SupervisionInput {
+            signals: Some(&refused),
+            provider: ProviderCheck::Working,
+            ..SupervisionInput::default()
+        },
+    )?;
+    assert_eq!(outcome, Supervision::PersonOwnsTerminal);
+    assert_eq!(
+        world.backend.execute_calls(),
+        calls,
+        "the person was messaged"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_follow_up_id_is_sent_once_even_after_the_first_send_was_not_applied() -> TestResult {
+    let world = World::new()?;
+    let (task, fence) = claim(&world, 3)?;
+    let worker = launched(&world, &task, fence)?;
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    let request = follow_up("review-9", "Add a test for the timeout path.")?;
+    let FollowUpRoute::Queued { id } = send_follow_up(&world.ctx(), &task, fence, &request)? else {
+        return Err("expected the refused send to queue".into());
+    };
+    let calls = world.backend.execute_calls();
+    // The same id again, in the same attempt.
+    assert_eq!(
+        send_follow_up(&world.ctx(), &task, fence, &request)?,
+        FollowUpRoute::Queued { id: id.clone() }
+    );
+    // And in the next attempt.
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Failed));
+    assert!(matches!(
+        step(&world, &task, fence, &SupervisionInput::default())?,
+        Supervision::Retry { .. }
+    ));
+    launched(&world, &task, fence)?;
+    let calls_after_launch = world.backend.execute_calls();
+    assert_eq!(
+        send_follow_up(&world.ctx(), &task, fence, &request)?,
+        FollowUpRoute::Queued { id: id.clone() }
+    );
+    assert_eq!(world.backend.execute_calls(), calls_after_launch);
+    assert!(calls_after_launch >= calls);
+    let queued = outstanding_follow_ups(&world.fixture.store.task(&task)?);
+    let [only] = queued.as_slice() else {
+        return Err(format!("expected one queued follow-up, found {}", queued.len()).into());
+    };
+    assert_eq!(only.id, id);
+    Ok(())
+}
+
+#[test]
+fn a_delivered_follow_up_is_not_sent_again_in_a_later_attempt() -> TestResult {
+    let world = World::new()?;
+    let (task, fence) = claim(&world, 3)?;
+    let worker = launched(&world, &task, fence)?;
+    let request = follow_up("review-10", "Rename the driver constant.")?;
+    let FollowUpRoute::Delivered { id } = send_follow_up(&world.ctx(), &task, fence, &request)?
+    else {
+        return Err("expected delivery".into());
+    };
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Failed));
+    assert!(matches!(
+        step(&world, &task, fence, &SupervisionInput::default())?,
+        Supervision::Retry { .. }
+    ));
+    launched(&world, &task, fence)?;
+    let calls = world.backend.execute_calls();
+    assert_eq!(
+        send_follow_up(&world.ctx(), &task, fence, &request)?,
+        FollowUpRoute::Delivered { id: id.clone() }
+    );
+    assert_eq!(world.backend.execute_calls(), calls, "sent a second time");
+    let queued = outstanding_follow_ups(&world.fixture.store.task(&task)?);
+    assert_eq!(queued.len(), 1);
+    // A different id is a different request and is still sent.
+    let other = follow_up("review-11", "Add a test.")?;
+    assert!(matches!(
+        send_follow_up(&world.ctx(), &task, fence, &other)?,
+        FollowUpRoute::Delivered { .. }
+    ));
+    assert!(world.backend.execute_calls() > calls);
+    Ok(())
+}
+
 #[test]
 fn a_follow_up_body_is_quoted_as_data() -> TestResult {
     let world = World::new()?;

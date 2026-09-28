@@ -25,9 +25,11 @@ use serde::Deserialize;
 
 use crate::{
     BackendId, TaskId,
-    contracts::{BranchName, Clock, CommitId, Fence, HouseGrants, IssueNumber, Permission},
+    contracts::{
+        BranchName, Clock, CommitId, Fence, HouseGrants, IssueNumber, Permission, Repository,
+    },
     house::{StackTool, StackToolStatus},
-    state::{HouseStore, TaskState},
+    state::{HouseStore, TaskRecord, TaskState},
     workflows::{
         coordination::{CoordinationError, held_branches, task_branch},
         pickup::is_shell_safe,
@@ -457,16 +459,24 @@ pub fn upstack(store: &HouseStore, view: &StackView, branch: &BranchName) -> Res
     let tasks = store.tasks()?;
     let mut state = Upstack::Idle;
     for layer in above {
-        let owner = tasks
+        // A settled pickup task and a later repair task can both name the
+        // layer's branch: every one must be settled for the layer to be idle.
+        let owners: Vec<&TaskRecord> = tasks
             .iter()
-            .find(|record| task_branch(record).as_ref() == Some(&layer.name));
-        let layer_state = match owner {
-            None => Upstack::Unknown,
-            Some(record) if held_branches(record).contains(&layer.name) => Upstack::Busy,
-            Some(record) => match record.state() {
-                TaskState::Settled { .. } => Upstack::Idle,
-                TaskState::Open | TaskState::Claimed { .. } => Upstack::Busy,
-            },
+            .filter(|record| task_branch(record).as_ref() == Some(&layer.name))
+            .collect();
+        let layer_state = if owners.is_empty() {
+            Upstack::Unknown
+        } else if owners.iter().any(|record| {
+            held_branches(record).contains(&layer.name)
+                || match record.state() {
+                    TaskState::Settled { .. } => false,
+                    TaskState::Open | TaskState::Claimed { .. } => true,
+                }
+        }) {
+            Upstack::Busy
+        } else {
+            Upstack::Idle
         };
         state = match (state, layer_state) {
             (Upstack::Busy, _) | (_, Upstack::Busy) => Upstack::Busy,
@@ -553,19 +563,8 @@ impl StackBoundary<'_> {
         if !command.touches_upstack() {
             return Ok(StackOutcome::Ran(self.runner.run(command)));
         }
-        // The tool fetches from and pushes to the remote's own URLs, and a
-        // worker can set the push URL apart from the fetch URL.
-        match (
-            self.remote.reads_from(&binding.repository),
-            self.updater.pushes_to(&binding.repository),
-        ) {
-            (Observed::Known(true), Observed::Known(true)) => {}
-            (Observed::Known(false), _) | (_, Observed::Known(false)) => {
-                return Ok(refused(PushRefusal::RemoteMismatch));
-            }
-            (Observed::Unknown, _) | (_, Observed::Unknown) => {
-                return Ok(refused(PushRefusal::Unknown));
-            }
+        if let Some(refusal) = self.remote_refusal(&binding.repository) {
+            return Ok(refused(refusal));
         }
         let observed = match observe(&binding, intent, self.pull_requests, self.remote, false) {
             Ok((observed, _)) => observed,
@@ -591,6 +590,13 @@ impl StackBoundary<'_> {
                 return Ok(StackOutcome::Refused(StackRefusal::UpstackBusy));
             }
         }
+        // The tool takes the remote by name, so it resolves the URLs itself
+        // and this check cannot bind them: read them again as late as
+        // possible. What remains is the interval between this read and the
+        // tool's own (#92).
+        if let Some(refusal) = self.remote_refusal(&binding.repository) {
+            return Ok(refused(refusal));
+        }
         let result = self.runner.run(command);
         if result == StackResult::Done
             && matches!(command, StackCommand::Push | StackCommand::Submit { .. })
@@ -598,6 +604,25 @@ impl StackBoundary<'_> {
             record_landed(self.store, self.clock, task, fence, &binding, intent)?;
         }
         Ok(StackOutcome::Ran(result))
+    }
+}
+
+impl StackBoundary<'_> {
+    /// Why the remote is not the granted repository, if it is not. The tool
+    /// fetches from and pushes to the remote's own URLs, and a worker can set
+    /// the push URLs apart from the fetch URLs, so every one of each must
+    /// name it.
+    fn remote_refusal(&self, repository: &Repository) -> Option<PushRefusal> {
+        match (
+            self.remote.reads_from(repository),
+            self.updater.pushes_to(repository),
+        ) {
+            (Observed::Known(true), Observed::Known(true)) => None,
+            (Observed::Known(false), _) | (_, Observed::Known(false)) => {
+                Some(PushRefusal::RemoteMismatch)
+            }
+            (Observed::Unknown, _) | (_, Observed::Unknown) => Some(PushRefusal::Unknown),
+        }
     }
 }
 

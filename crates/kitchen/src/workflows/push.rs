@@ -120,6 +120,7 @@ pub enum PushRefusal {
 #[must_use]
 pub struct PushPermit {
     replaces: Option<CommitId>,
+    repository: Repository,
 }
 
 impl PushPermit {
@@ -128,6 +129,13 @@ impl PushPermit {
     #[must_use]
     pub const fn replaces(&self) -> Option<&CommitId> {
         self.replaces.as_ref()
+    }
+
+    /// The repository the check granted the push to. An updater sends to
+    /// this repository and nowhere else.
+    #[must_use]
+    pub const fn repository(&self) -> &Repository {
+        &self.repository
     }
 }
 
@@ -177,11 +185,15 @@ pub(crate) fn decide(
         // A branch this task published and that is gone now was merged or
         // deleted: never recreate it.
         (None, None) if bound.published => Err(PushRefusal::BranchDeleted),
-        (None, None) => Ok(Decision::Update(PushPermit { replaces: None })),
+        (None, None) => Ok(Decision::Update(PushPermit {
+            replaces: None,
+            repository: bound.repository.clone(),
+        })),
         (None, Some(_)) => Err(PushRefusal::BranchExists),
         (Some(_), None) => Err(PushRefusal::BranchDeleted),
         (Some(expected), Some(found)) if expected == found => Ok(Decision::Update(PushPermit {
             replaces: Some(found.clone()),
+            repository: bound.repository.clone(),
         })),
         (Some(_), Some(found)) => Err(PushRefusal::RemoteMoved {
             found: found.clone(),
@@ -551,13 +563,24 @@ const GIT_POLL: Duration = Duration::from_millis(10);
 /// deadline; an expired call reports unknown or uncertain, never success.
 ///
 /// The checkout belongs to the worker, so its Git configuration is not
-/// trusted. Before any read or push, the remote's fetch and push URLs, with
-/// `insteadOf` and `pushInsteadOf` rewrites applied, must both be the
-/// granted repository under one of the accepted URL bases (GitHub's HTTPS
-/// and SSH forms by default). Every call disables hooks and pins the SSH
+/// trusted. Before any read or push, every fetch URL and every push URL of
+/// the remote (`git remote get-url --all`), with `insteadOf` and
+/// `pushInsteadOf` rewrites applied, must be the granted repository under
+/// one of the accepted URL bases (GitHub's HTTPS and SSH forms by default);
+/// a remote with a second `pushurl` is refused, since a push by remote name
+/// would send the ref to both. Every call disables hooks and pins the SSH
 /// command, the remote's pack programs, and a push's tags, submodules, and
-/// mirroring. Credential helpers configured in
-/// the checkout still run; a Kitchen-owned clone removes that limit.
+/// mirroring. Credential helpers configured in the checkout still run; a
+/// Kitchen-owned clone removes that limit.
+///
+/// An update does not push by remote name. It resolves the push URLs again,
+/// requires each to name the permit's repository, and pushes to that URL
+/// explicitly, so a change to `remote.<name>.url` or `.pushurl` after the
+/// check cannot redirect it. Git still applies `url.<base>.insteadOf` and
+/// `pushInsteadOf` rewrites to an explicit URL, and a checkout's config
+/// cannot be overridden from the command line; a rewrite of exactly the
+/// verified URL added in the instants between that last resolution and the
+/// push is the residual window (#92).
 #[derive(Debug, Clone)]
 pub struct GitRemote {
     git: PathBuf,
@@ -677,9 +700,10 @@ impl GitRemote {
         })
     }
 
-    /// The remote's single URL after rewrites, for fetching or pushing.
-    fn url(&self, push: bool) -> Option<String> {
-        let mut args = vec!["remote", "get-url"];
+    /// Every URL of the remote after rewrites, for fetching or pushing.
+    /// `None` when Git failed, printed nothing, or printed non-UTF-8.
+    fn urls(&self, push: bool) -> Option<Vec<String>> {
+        let mut args = vec!["remote", "get-url", "--all"];
         if push {
             args.push("--push");
         }
@@ -688,16 +712,13 @@ impl GitRemote {
             return None;
         };
         let text = String::from_utf8(stdout).ok()?;
-        let mut lines = text.lines();
-        match (lines.next(), lines.next()) {
-            (Some(url), None) => Some(url.to_owned()),
-            _ => None,
-        }
+        let urls: Vec<String> = text.lines().map(str::to_owned).collect();
+        (!urls.is_empty()).then_some(urls)
     }
 
     fn bound_to(&self, repository: &Repository, push: bool) -> Observed<bool> {
-        self.url(push).map_or(Observed::Unknown, |url| {
-            Observed::Known(self.names(&url, repository))
+        self.urls(push).map_or(Observed::Unknown, |urls| {
+            Observed::Known(urls.iter().all(|url| self.names(url, repository)))
         })
     }
 }
@@ -833,6 +854,17 @@ impl RefUpdater for GitRemote {
         branch: &BranchName,
         commit: &CommitId,
     ) -> std::result::Result<(), UpdateFailure> {
+        // Resolve the destination once more and push to that URL, never to
+        // the remote's name, which the checkout's config can repoint.
+        let Some(urls) = self.urls(true) else {
+            return Err(UpdateFailure::Uncertain);
+        };
+        if !urls.iter().all(|url| self.names(url, permit.repository())) {
+            return Err(UpdateFailure::Rejected);
+        }
+        let Some(destination) = urls.first() else {
+            return Err(UpdateFailure::Uncertain);
+        };
         let reference = format!("refs/heads/{branch}");
         // An empty expected value means the ref must not exist.
         let lease = format!(
@@ -845,8 +877,9 @@ impl RefUpdater for GitRemote {
             "--porcelain",
             "--no-follow-tags",
             "--no-recurse-submodules",
+            "--receive-pack=git-receive-pack",
             &lease,
-            &self.remote,
+            destination,
             &refspec,
         ]) {
             Some((Some(0), _)) => Ok(()),

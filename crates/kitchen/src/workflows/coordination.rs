@@ -957,9 +957,12 @@ pub fn supervise(
         WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply
     );
     // A person's terminal is theirs, whichever source reports it.
-    let person = state == WorkerState::UserTakeover
+    let taken_over = state == WorkerState::UserTakeover
         || (live && signals.is_some_and(|signals| signals.terminal == TerminalHolder::Person));
-    if person {
+    // The recorded hold outlasts the backend's later answers, but only
+    // while the worker is live: a settled worker still finishes its attempt.
+    let person = taken_over || (live && person_held(&record, &view.worker));
+    if taken_over {
         // Durable, so the branch stays the person's after their terminal
         // ends or the attempt is replaced.
         ctx.store
@@ -1312,7 +1315,13 @@ pub fn outstanding_follow_ups(record: &TaskRecord) -> Vec<QueuedFollowUp> {
             }
             _ => None,
         })
-        .collect()
+        .fold(Vec::new(), |mut queued: Vec<QueuedFollowUp>, next| {
+            // Records from before an id was sent once may repeat it.
+            if !queued.iter().any(|earlier| earlier.id == next.id) {
+                queued.push(next);
+            }
+            queued
+        })
 }
 
 /// What happened to a follow-up.
@@ -1360,6 +1369,23 @@ pub fn send_follow_up(
         return Ok(FollowUpRoute::NoWorker);
     };
     let id = follow_up_id(follow_up)?;
+    // One send per id, across attempts and whatever it ended as: a delivered
+    // or queued request travels in the next brief until a completion
+    // addresses it, and an unresolved one is reconciled, not sent again.
+    if let Some(earlier) = record
+        .effects()
+        .iter()
+        .find(|effect| effect.name().as_str() == id.as_str())
+    {
+        return Ok(match earlier.state() {
+            EffectState::Applied { .. } => FollowUpRoute::Delivered { id },
+            EffectState::NotApplied { .. } => FollowUpRoute::Queued { id },
+            EffectState::Intended
+            | EffectState::Uncertain { .. }
+            | EffectState::Unresolvable { .. }
+            | EffectState::Waived { .. } => FollowUpRoute::Uncertain,
+        });
+    }
     // A person's terminal is theirs: nothing is dispatched into it.
     let taken_over = person_held(&record, &latest.worker)
         || matches!(

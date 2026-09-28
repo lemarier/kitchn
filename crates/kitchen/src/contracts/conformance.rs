@@ -7,6 +7,11 @@
 //! in a controlled environment where those effects are authorized. A passing
 //! run is evidence about the executor it ran against, and only for the paths
 //! it exercised.
+//!
+//! The worker launch requests a branch. [`run_worker`] uses
+//! `kitchen/<run_tag>`; a backend that can only create branches under a
+//! host-chosen prefix passes a branch it can obtain to
+//! [`run_worker_on_branch`].
 
 use std::fmt;
 
@@ -20,6 +25,7 @@ use crate::{
         Permission, PostingBudget, Receipt, Repository, ResourceKind, ResourceRef, RogerAsk,
         RogerEffect, Role, ScheduleEffect, Text, WorkerBackend, WorkerState, Workspace,
     },
+    scheduling::{AgentFamily, Recurrence, ScheduleSpec, Timezone, WorkflowName},
 };
 
 /// One contract check.
@@ -120,6 +126,9 @@ impl ConformanceReport {
 }
 
 /// Inputs for one conformance run.
+///
+/// The probe launch requests `kitchen/<run_tag>` unless the caller names the
+/// branch with [`run_worker_on_branch`].
 #[derive(Debug, Clone)]
 pub struct ConformanceFixture {
     /// The house the executor serves.
@@ -143,6 +152,8 @@ pub struct ConformanceFixture {
 struct Runner<'a> {
     executor: &'a dyn EffectExecutor,
     fixture: &'a ConformanceFixture,
+    /// The branch the caller chose for the probe launch, if any.
+    branch: Option<&'a BranchName>,
     report: ConformanceReport,
 }
 
@@ -160,7 +171,7 @@ pub fn run(
     fixture: &ConformanceFixture,
     probe: &Effect,
 ) -> Result<ConformanceReport, ConformanceFailure> {
-    let mut runner = Runner::new(executor, fixture);
+    let mut runner = Runner::new(executor, fixture, None);
     runner.executor_checks(probe)?;
     Ok(runner.report)
 }
@@ -169,13 +180,42 @@ pub fn run(
 /// worker checks: the receipt names a worker, which is observable, listed
 /// by the inventory, and stops when cancelled.
 ///
+/// The launch requests the branch `kitchen/<run_tag>`. A backend that cannot
+/// create that branch, such as one whose host adds its own prefix, uses
+/// [`run_worker_on_branch`].
+///
 /// # Errors
 /// Returns the first [`ConformanceFailure`].
 pub fn run_worker(
     backend: &dyn WorkerBackend,
     fixture: &ConformanceFixture,
 ) -> Result<ConformanceReport, ConformanceFailure> {
-    let mut runner = Runner::new(backend, fixture);
+    worker_checks(backend, fixture, None)
+}
+
+/// [`run_worker`] with the launch requesting `branch`, which the backend under
+/// test supplies because only it knows which branches its host can create.
+///
+/// The receipt must name exactly `branch`: another branch, or a second one, is
+/// a [`Check::LaunchReceipt`] failure, whatever `kitchen/<run_tag>` would have
+/// been.
+///
+/// # Errors
+/// Returns the first [`ConformanceFailure`].
+pub fn run_worker_on_branch(
+    backend: &dyn WorkerBackend,
+    fixture: &ConformanceFixture,
+    branch: &BranchName,
+) -> Result<ConformanceReport, ConformanceFailure> {
+    worker_checks(backend, fixture, Some(branch))
+}
+
+fn worker_checks(
+    backend: &dyn WorkerBackend,
+    fixture: &ConformanceFixture,
+    branch: Option<&BranchName>,
+) -> Result<ConformanceReport, ConformanceFailure> {
+    let mut runner = Runner::new(backend, fixture, branch);
     let launch = runner.launch()?;
     let Some(receipt) = runner.executor_checks(&launch)? else {
         for check in [
@@ -235,10 +275,15 @@ pub fn run_worker(
 }
 
 impl<'a> Runner<'a> {
-    fn new(executor: &'a dyn EffectExecutor, fixture: &'a ConformanceFixture) -> Self {
+    fn new(
+        executor: &'a dyn EffectExecutor,
+        fixture: &'a ConformanceFixture,
+        branch: Option<&'a BranchName>,
+    ) -> Self {
         Self {
             executor,
             fixture,
+            branch,
             report: ConformanceReport::default(),
         }
     }
@@ -287,10 +332,14 @@ impl<'a> Runner<'a> {
         self.request(&self.fixture.house, &backend, suffix, effect)
     }
 
-    /// The branch the probe launch requests, unique to this run.
+    /// The branch the probe launch requests: the caller's, or one unique to
+    /// this run.
     fn branch(&self) -> Result<BranchName, ConformanceFailure> {
-        BranchName::new(&format!("kitchen/{}", self.fixture.run_tag))
-            .or_else(|_| fail(Check::Fixture, "run tag is not a valid branch name"))
+        match self.branch {
+            Some(branch) => Ok(branch.clone()),
+            None => BranchName::new(&format!("kitchen/{}", self.fixture.run_tag))
+                .or_else(|_| fail(Check::Fixture, "run tag is not a valid branch name")),
+        }
     }
 
     fn launch(&self) -> Result<Effect, ConformanceFailure> {
@@ -387,7 +436,18 @@ impl<'a> Runner<'a> {
             ),
             (
                 "unsupported-schedule",
-                Effect::Schedule(ScheduleEffect::InstallDisabled { consumer }),
+                Effect::Schedule(ScheduleEffect::InstallDisabled {
+                    schedule: ScheduleSpec::new(
+                        WorkflowName::new("conformance")
+                            .or_else(|_| fail(Check::Fixture, "invalid sample workflow"))?,
+                        consumer,
+                        Recurrence::Hourly,
+                        Timezone::new("UTC")
+                            .or_else(|_| fail(Check::Fixture, "invalid sample time zone"))?,
+                        self.fixture.brief.clone(),
+                        AgentFamily::Claude,
+                    ),
+                }),
             ),
         ])
     }

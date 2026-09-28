@@ -88,6 +88,12 @@ closed_names! {
         Ask = "ask",
         /// The `install_disabled_schedule` effect.
         InstallDisabledSchedule = "install_disabled_schedule",
+        /// The `set_schedule_state` effect.
+        SetScheduleState = "set_schedule_state",
+        /// The `remove_schedule` effect.
+        RemoveSchedule = "remove_schedule",
+        /// The `trial_schedule` effect.
+        TrialSchedule = "trial_schedule",
     }
 }
 
@@ -111,6 +117,9 @@ impl EffectKind {
             Self::CloseIssue => Capability::LookupCloseIssue,
             Self::Ask => Capability::LookupAsk,
             Self::InstallDisabledSchedule => Capability::LookupInstallDisabledSchedule,
+            Self::SetScheduleState => Capability::LookupSetScheduleState,
+            Self::RemoveSchedule => Capability::LookupRemoveSchedule,
+            Self::TrialSchedule => Capability::LookupTrialSchedule,
         }
     }
 
@@ -133,6 +142,9 @@ impl EffectKind {
             Self::CloseIssue => Capability::IdempotentCloseIssue,
             Self::Ask => Capability::IdempotentAsk,
             Self::InstallDisabledSchedule => Capability::IdempotentInstallDisabledSchedule,
+            Self::SetScheduleState => Capability::IdempotentSetScheduleState,
+            Self::RemoveSchedule => Capability::IdempotentRemoveSchedule,
+            Self::TrialSchedule => Capability::IdempotentTrialSchedule,
         }
     }
 }
@@ -187,9 +199,12 @@ impl Effect {
                 GitHubAction::CloseIssue { .. } => EffectKind::CloseIssue,
             },
             Self::Roger(_) => EffectKind::Ask,
-            Self::Schedule(ScheduleEffect::InstallDisabled { .. }) => {
-                EffectKind::InstallDisabledSchedule
-            }
+            Self::Schedule(effect) => match effect {
+                ScheduleEffect::InstallDisabled { .. } => EffectKind::InstallDisabledSchedule,
+                ScheduleEffect::SetState { .. } => EffectKind::SetScheduleState,
+                ScheduleEffect::Remove { .. } => EffectKind::RemoveSchedule,
+                ScheduleEffect::Trial { .. } => EffectKind::TrialSchedule,
+            },
         }
     }
 

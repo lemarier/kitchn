@@ -188,6 +188,11 @@ impl FakeBackend {
                     Vec::new(),
                 )
             }
+            Effect::Schedule(
+                ScheduleEffect::SetState { schedule, .. }
+                | ScheduleEffect::Remove { schedule }
+                | ScheduleEffect::Trial { schedule },
+            ) => (Vec::new(), vec![schedule.clone()]),
         };
         let reference = self.handle(state, "request")?;
         let receipt = Receipt::new(reference, created, touched).map_err(|_| rejected)?;

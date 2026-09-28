@@ -1,10 +1,15 @@
-//! Schedule effects. Owned by #6, which extends this payload.
+//! Schedule effects. Owned by #6.
+//!
+//! The portable definitions live in [`crate::scheduling`]. Installing never
+//! activates: [`ScheduleEffect::InstallDisabled`] needs
+//! [`Permission::ManageSchedule`], and turning a schedule on needs the
+//! separate [`Permission::ActivateSchedule`].
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ConsumerId,
-    contracts::{Capability, ContractError, EffectContext, GrantScope, Permission},
+    contracts::{Capability, ContractError, EffectContext, GrantScope, Permission, ResourceRef},
+    scheduling::{ScheduleSpec, ScheduleState},
 };
 
 /// A schedule change.
@@ -12,13 +17,38 @@ use crate::{
 #[serde(tag = "type", rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum ScheduleEffect {
-    /// Install the schedule for one workflow consumer scope, disabled.
-    /// Activating it is a separate effect needing
-    /// [`Permission::ActivateSchedule`].
+    /// Install a schedule, disabled, for the workflow consumer scope its
+    /// spec names. Executors reuse the one already installed for that
+    /// consumer only when it is paused and matches the spec, instead of
+    /// creating a second. They refuse, changing nothing, when it is active
+    /// (turning a schedule on is [`Permission::ActivateSchedule`]), when it
+    /// differs, or when several exist.
     #[serde(rename_all = "camelCase")]
     InstallDisabled {
-        /// The workflow consumer scope the schedule runs.
-        consumer: ConsumerId,
+        /// What to install, including its workflow and consumer scope.
+        schedule: ScheduleSpec,
+    },
+    /// Pause or activate an installed schedule.
+    #[serde(rename_all = "camelCase")]
+    SetState {
+        /// The schedule.
+        schedule: ResourceRef,
+        /// The requested state.
+        state: ScheduleState,
+    },
+    /// Remove an installed schedule and its run history.
+    #[serde(rename_all = "camelCase")]
+    Remove {
+        /// The schedule.
+        schedule: ResourceRef,
+    },
+    /// Run a paused schedule once now without activating it. Executors
+    /// refuse an active schedule. Each trial starts a run, so a trial is
+    /// never resubmitted without reconciling first.
+    #[serde(rename_all = "camelCase")]
+    Trial {
+        /// The schedule.
+        schedule: ResourceRef,
     },
 }
 
@@ -27,15 +57,29 @@ impl ScheduleEffect {
     #[must_use]
     pub const fn required_capability(&self) -> Capability {
         match self {
-            Self::InstallDisabled { .. } => Capability::ScheduleManage,
+            Self::InstallDisabled { .. }
+            | Self::SetState { .. }
+            | Self::Remove { .. }
+            | Self::Trial { .. } => Capability::ScheduleManage,
         }
     }
 
-    /// The task permission this effect needs.
+    /// The task permission this effect needs. Activation is separate from
+    /// management, and a trial run is separate from both.
     #[must_use]
     pub const fn required_permission(&self) -> Permission {
         match self {
-            Self::InstallDisabled { .. } => Permission::ManageSchedule,
+            Self::InstallDisabled { .. }
+            | Self::Remove { .. }
+            | Self::SetState {
+                state: ScheduleState::Paused,
+                ..
+            } => Permission::ManageSchedule,
+            Self::SetState {
+                state: ScheduleState::Active,
+                ..
+            } => Permission::ActivateSchedule,
+            Self::Trial { .. } => Permission::TrialSchedule,
         }
     }
 
@@ -43,27 +87,39 @@ impl ScheduleEffect {
     #[must_use]
     pub const fn scope(&self) -> GrantScope {
         match self {
-            Self::InstallDisabled { .. } => GrantScope::House,
+            Self::InstallDisabled { .. }
+            | Self::SetState { .. }
+            | Self::Remove { .. }
+            | Self::Trial { .. } => GrantScope::House,
         }
     }
 
     /// Per-submission check; see [`crate::contracts::Effect::check`].
     ///
     /// # Errors
-    /// None yet.
+    /// None: resubmission safety is the executor's reconciliation against
+    /// its installed inventory.
     pub const fn check(&self, _context: &EffectContext<'_>) -> Result<(), ContractError> {
         match self {
-            Self::InstallDisabled { .. } => Ok(()),
+            Self::InstallDisabled { .. }
+            | Self::SetState { .. }
+            | Self::Remove { .. }
+            | Self::Trial { .. } => Ok(()),
         }
     }
 
     /// Admission hook; see [`crate::contracts::Effect::admit`].
     ///
     /// # Errors
-    /// None yet; #6 adds its checks here.
+    /// None: schedule payloads are validated when constructed, and
+    /// duplicate consumers are reconciled by the executor against its
+    /// installed inventory.
     pub const fn admit(&self, _context: &EffectContext<'_>) -> Result<(), ContractError> {
         match self {
-            Self::InstallDisabled { .. } => Ok(()),
+            Self::InstallDisabled { .. }
+            | Self::SetState { .. }
+            | Self::Remove { .. }
+            | Self::Trial { .. } => Ok(()),
         }
     }
 }

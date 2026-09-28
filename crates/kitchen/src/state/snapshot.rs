@@ -16,7 +16,6 @@ use std::{
     io::{Read, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -30,7 +29,6 @@ use crate::{
 };
 
 const MAX_LOCK_BACKOFF: Duration = Duration::from_millis(50);
-static PRIORITY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Bounds for store I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,8 +74,10 @@ pub(crate) struct StoreLayout {
     /// Refuse a store directory or managed file readable by other users.
     /// Enforced on Unix; other platforms have no mode bits to check.
     pub require_private: bool,
-    /// A file whose held lock makes ordinary lockers yield to a priority
-    /// writer. `None` disables priority writes.
+    /// A persistent file whose exclusive lock, held by a priority writer,
+    /// makes ordinary lockers yield to it. It is never removed, so a locker
+    /// always probes the file a priority writer locks. `None` disables
+    /// priority writes.
     pub priority_intent: Option<&'static str>,
     /// Bytes of [`StoreOptions::max_state_bytes`] only priority writes may use.
     pub priority_reserve_bytes: u64,
@@ -282,11 +282,15 @@ impl<S: Snapshot> SnapshotStore<S> {
             require_private(&self.dir)?;
         }
         for name in [
-            self.layout.marker,
-            self.layout.lock,
-            self.layout.snapshot,
-            self.layout.temporary,
-        ] {
+            Some(self.layout.marker),
+            Some(self.layout.lock),
+            Some(self.layout.snapshot),
+            Some(self.layout.temporary),
+            self.layout.priority_intent,
+        ]
+        .into_iter()
+        .flatten()
+        {
             let path = self.dir.join(name);
             refuse_redirected(&path)?;
             if self.layout.require_private && exists(&path)? {
@@ -341,8 +345,9 @@ impl<S: Snapshot> SnapshotStore<S> {
         Ok(())
     }
 
-    /// Whether a priority writer currently holds its intent. A stale intent
-    /// left by a crashed writer is unlocked and removed.
+    /// Whether a priority writer currently holds its intent. The probe takes
+    /// a shared lock and releases it at once; a crashed writer's lock is
+    /// released by the operating system, so nothing needs cleaning up.
     fn priority_pending(&self) -> Result<bool, StateError> {
         let Some(name) = self.layout.priority_intent else {
             return Ok(false);
@@ -355,14 +360,13 @@ impl<S: Snapshot> SnapshotStore<S> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(lock(error)),
         };
-        match file.try_lock() {
+        match file.try_lock_shared() {
             Err(TryLockError::WouldBlock) => Ok(true),
             Err(TryLockError::Error(error)) => Err(lock(error)),
-            Ok(()) => match fs::remove_file(path) {
-                Ok(()) => Ok(false),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(lock(error)),
-            },
+            Ok(()) => {
+                file.unlock().map_err(lock)?;
+                Ok(false)
+            }
         }
     }
 
@@ -444,87 +448,35 @@ impl<S: Snapshot> SnapshotStore<S> {
     }
 }
 
-/// A held intent file announcing a priority writer. Ordinary lockers see the
-/// locked file and wait; it is removed on drop.
+/// A priority writer's exclusive lock on the persistent intent file. Ordinary
+/// lockers see it held and wait; dropping the handle releases it.
 struct PriorityIntent {
-    intent: PathBuf,
-    temporary: PathBuf,
     _lock: File,
 }
 
 impl PriorityIntent {
-    /// Publish the intent by hard-linking a locked private file into place,
+    /// Lock the intent file, creating it like the lock file if needed and
     /// waiting for another priority writer within `timeout`.
     fn acquire(dir: &Path, name: &str, timeout: Duration) -> Result<Self, StateError> {
         let lock = |error| StateError::io(StorageOperation::Lock, error);
-        let temporary = dir.join(format!(
-            "{name}.{}-{}.tmp",
-            std::process::id(),
-            PRIORITY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let file = create_private_new_file(&temporary).map_err(lock)?;
-        let mut cleanup = RemoveOnDrop(Some(temporary.clone()));
-        file.lock().map_err(lock)?;
-        let intent = dir.join(name);
+        let path = dir.join(name);
+        refuse_redirected(&path)?;
+        let file = open_lock_file(&path).map_err(lock)?;
         let started = Instant::now();
         loop {
-            match fs::hard_link(&temporary, &intent) {
-                Ok(()) => {
-                    cleanup.0 = None;
-                    return Ok(Self {
-                        intent,
-                        temporary,
-                        _lock: file,
-                    });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    refuse_redirected(&intent)?;
-                    let held = match File::open(&intent) {
-                        Ok(other) => match other.try_lock() {
-                            Ok(()) => false,
-                            Err(TryLockError::WouldBlock) => true,
-                            Err(TryLockError::Error(error)) => return Err(lock(error)),
-                        },
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                        Err(error) => return Err(lock(error)),
-                    };
-                    let waited = started.elapsed();
-                    if waited >= timeout {
-                        return Err(StateError::LockTimeout {
-                            waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
-                        });
-                    }
-                    if held {
-                        thread::sleep(Duration::from_millis(5));
-                    } else {
-                        // Stale intent from a crashed writer.
-                        match fs::remove_file(&intent) {
-                            Ok(()) => {}
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(error) => return Err(lock(error)),
-                        }
-                    }
-                }
-                Err(error) => return Err(lock(error)),
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _lock: file }),
+                // Another priority writer, or an ordinary locker's brief probe.
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Error(error)) => return Err(lock(error)),
             }
-        }
-    }
-}
-
-impl Drop for PriorityIntent {
-    fn drop(&mut self) {
-        // Best effort: a leftover unlocked intent is removed by the next locker.
-        let _ = fs::remove_file(&self.intent);
-        let _ = fs::remove_file(&self.temporary);
-    }
-}
-
-struct RemoveOnDrop(Option<PathBuf>);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = fs::remove_file(path);
+            let waited = started.elapsed();
+            if waited >= timeout {
+                return Err(StateError::LockTimeout {
+                    waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+            thread::sleep(Duration::from_millis(5));
         }
     }
 }
@@ -588,27 +540,6 @@ fn create_private_file(path: &Path) -> std::io::Result<File> {
 #[cfg(not(unix))]
 fn create_private_file(path: &Path) -> std::io::Result<File> {
     File::create(path)
-}
-
-/// Create a new file readable only by the owner; fails if it exists.
-#[cfg(unix)]
-fn create_private_new_file(path: &Path) -> std::io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn create_private_new_file(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path)
 }
 
 #[cfg(unix)]
@@ -772,7 +703,9 @@ mod tests {
             Ok(())
         })?;
         assert_eq!(store.read(|toy| toy.items.clone())?, [1, 2, 3, 4]);
-        assert!(!path.join("toy.priority").exists());
+        // The intent stays in place, released, and private.
+        assert!(!store.priority_pending()?);
+        require_private(&path.join("toy.priority"))?;
         Ok(())
     }
 
@@ -792,18 +725,99 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_priority_intent_does_not_block_ordinary_writers() -> TestResult {
+    fn a_released_priority_intent_does_not_block_ordinary_writers() -> TestResult {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("store");
         let store = bounded(&path, &[1, 2])?;
-        // An unlocked intent left by a crashed priority writer.
-        create_private_new_file(&path.join("toy.priority"))?;
+        // The intent file a finished or crashed priority writer leaves behind.
+        drop(PriorityIntent::acquire(
+            &store.dir,
+            "toy.priority",
+            Duration::from_secs(1),
+        )?);
         store.transact(|toy| {
             toy.items.push(1);
             Ok(())
         })?;
-        assert!(!path.join("toy.priority").exists());
+        assert!(path.join("toy.priority").exists());
         assert_eq!(store.read(|toy| toy.items.clone())?, [1]);
+        Ok(())
+    }
+
+    /// Lockers never unlink or replace the intent, so an ordinary locker
+    /// always probes the file a later priority writer locks.
+    #[cfg(unix)]
+    #[test]
+    fn the_intent_file_is_never_replaced() -> TestResult {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[1, 2])?;
+        let intent = path.join("toy.priority");
+        store.transact_priority(|toy| {
+            toy.items.push(1);
+            Ok(())
+        })?;
+        let inode = fs::metadata(&intent)?.ino();
+        store.transact(|toy| {
+            toy.items.push(2);
+            Ok(())
+        })?;
+        store.read(|toy| toy.items.len())?;
+        store.transact_priority(|toy| {
+            toy.items.clear();
+            Ok(())
+        })?;
+        assert_eq!(fs::metadata(&intent)?.ino(), inode);
+        let held = PriorityIntent::acquire(&store.dir, "toy.priority", Duration::from_secs(1))?;
+        assert!(store.priority_pending()?);
+        // A probe that finds the intent held leaves it held.
+        assert!(store.priority_pending()?);
+        drop(held);
+        assert!(!store.priority_pending()?);
+        assert_eq!(fs::metadata(&intent)?.ino(), inode);
+        Ok(())
+    }
+
+    #[test]
+    fn a_held_priority_intent_makes_another_priority_writer_time_out() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        bounded(&path, &[])?;
+        let _held = PriorityIntent::acquire(&path, "toy.priority", Duration::from_secs(1))?;
+        assert!(matches!(
+            PriorityIntent::acquire(&path, "toy.priority", Duration::from_millis(30)),
+            Err(StateError::LockTimeout { .. })
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_redirected_or_public_intent_is_refused() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        let intent = path.join("toy.priority");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::write(&elsewhere, b"")?;
+        std::os::unix::fs::symlink(&elsewhere, &intent)?;
+        assert!(matches!(
+            store.read(|toy| toy.items.len()),
+            Err(crate::Error::State(StateError::RedirectedPath))
+        ));
+        assert!(matches!(
+            store.transact_priority(|_| Ok(())),
+            Err(crate::Error::State(StateError::RedirectedPath))
+        ));
+        fs::remove_file(&intent)?;
+        store.transact_priority(|_| Ok(()))?;
+        fs::set_permissions(&intent, fs::Permissions::from_mode(0o644))?;
+        assert!(matches!(
+            store.read(|toy| toy.items.len()),
+            Err(crate::Error::State(StateError::PublicPath))
+        ));
         Ok(())
     }
 

@@ -887,14 +887,25 @@ fn readers_yield_to_a_pending_revocation() -> TestResult {
     let actor = holder("owner")?;
     let decision = source("fixture:revoke")?;
     let revocation = thread::spawn(move || revoker.revoke(&grant_id, actor, decision, at(6)));
+    // The revocation holds an exclusive lock on its intent file while it waits.
     let pending = f.dir.path().join("trust/revoke.pending");
+    let held = || -> TestResult<bool> {
+        let Ok(intent) = fs::File::open(&pending) else {
+            return Ok(false);
+        };
+        match intent.try_lock_shared() {
+            Ok(()) => Ok(false),
+            Err(fs::TryLockError::WouldBlock) => Ok(true),
+            Err(fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    };
     for _ in 0..100 {
-        if pending.exists() {
+        if held()? {
             break;
         }
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(pending.exists());
+    assert!(held()?);
     let (ready, started) = mpsc::channel();
     let reader = l.clone();
     let read = thread::spawn(move || {

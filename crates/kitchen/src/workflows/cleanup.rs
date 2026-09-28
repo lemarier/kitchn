@@ -27,7 +27,17 @@
 //! durable effect path ([`crate::state::run_effect`]) and the explicit
 //! release grant, and is revalidated immediately before the effect. An
 //! interrupted release is reconciled by the next run before anything else.
+//!
+//! Build output is the one thing reclaimed without a grant: a `CACHEDIR.TAG`
+//! directory that Git ignores and tracks nothing in, at the top of a
+//! Kitchen-owned worktree whose workers have all settled. It is regenerable
+//! and not work, so [`reclaim_build_output`] needs only an earlier preview of
+//! the same evidence; the worktree itself stays until it passes every check
+//! above. Caches outside Kitchen-owned resources are never touched: under
+//! disk pressure the preview lists commands a person may run instead.
+//! Every step reports the space it measured before acting.
 
+mod build;
 mod git;
 
 use std::{
@@ -41,6 +51,10 @@ use std::{
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+pub use build::{
+    BuildDirectory, CACHEDIR_SIGNATURE, DiskUsage, MAX_MEASURED_ENTRIES, MAX_TOP_LEVEL_ENTRIES,
+    disk_usage,
+};
 pub use git::{GitLimits, GitReadError, WorktreeState, inspect_worktree};
 
 use crate::{
@@ -314,6 +328,66 @@ pub enum WorktreeEvidence {
     },
 }
 
+/// Build output found in a worktree and the decision about removing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildOutput {
+    /// Digest of the evidence the decision rests on; sizes are excluded.
+    pub observation: ExternalRef,
+    /// The directories, sorted by name.
+    pub directories: Vec<BuildDirectory>,
+    /// [`Decision::Release`] when they may be removed.
+    pub decision: Decision,
+}
+
+impl BuildOutput {
+    /// Total measured size.
+    #[must_use]
+    pub fn usage(&self) -> DiskUsage {
+        self.directories.iter().fold(
+            DiskUsage {
+                bytes: 0,
+                complete: true,
+            },
+            |total, directory| DiskUsage {
+                bytes: total.bytes.saturating_add(directory.usage.bytes),
+                complete: total.complete && directory.usage.complete,
+            },
+        )
+    }
+}
+
+/// A command a person may run to reclaim space Kitchen does not own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Suggestion {
+    /// What it reclaims.
+    pub reclaims: &'static str,
+    /// The command.
+    pub command: &'static str,
+    /// What to check first.
+    pub caution: &'static str,
+}
+
+/// Suggestions listed under disk pressure. Kitchen runs none of them.
+pub const EXTERNAL_CACHE_SUGGESTIONS: [Suggestion; 3] = [
+    Suggestion {
+        reclaims: "Cargo registry and Git dependency caches",
+        command: "cargo cache --autoclean",
+        caution: "needs cargo-cache; affects every project on this host",
+    },
+    Suggestion {
+        reclaims: "a shared compiler cache",
+        command: "sccache --show-stats",
+        caution: "clear its cache directory only while nothing is compiling",
+    },
+    Suggestion {
+        reclaims: "build output in checkouts Kitchen does not own",
+        command: "cargo clean",
+        caution: "run it only inside a checkout you own",
+    },
+];
+
 /// One inventoried resource with its evidence and decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -340,6 +414,13 @@ pub struct PreviewEntry {
     /// Git evidence, for worktrees.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeEvidence>,
+    /// Regenerable build output in this worktree, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_output: Option<BuildOutput>,
+    /// For a worktree eligible for release: its measured size, which the
+    /// release frees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<DiskUsage>,
     /// Time since the owning task settled: a signal for review only.
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -355,6 +436,14 @@ impl PreviewEntry {
     #[must_use]
     pub fn eligible(&self) -> bool {
         self.decision == Decision::Release
+    }
+
+    /// Whether this worktree's build output may be removed.
+    #[must_use]
+    pub fn build_output_eligible(&self) -> bool {
+        self.build_output
+            .as_ref()
+            .is_some_and(|build| build.decision == Decision::Release)
     }
 
     fn owner_task(&self) -> Option<&TaskId> {
@@ -389,13 +478,20 @@ pub struct Preview {
     pub observed_at: Timestamp,
     /// Every inventoried resource, in inventory order.
     pub entries: Vec<PreviewEntry>,
+    /// Commands for caches Kitchen does not own; listed under disk pressure.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<Suggestion>,
 }
 
 impl Preview {
-    /// [`Precheck::Idle`] when nothing is eligible.
+    /// [`Precheck::Idle`] when nothing is eligible, including build output.
     #[must_use]
     pub fn precheck(&self) -> Precheck {
-        if self.entries.iter().any(PreviewEntry::eligible) {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.eligible() || entry.build_output_eligible())
+        {
             Precheck::Actionable
         } else {
             Precheck::Idle
@@ -411,10 +507,21 @@ impl Preview {
     }
 }
 
+/// Which cleanup step a preview covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Step {
+    /// Release the resource through the backend.
+    Release,
+    /// Remove the worktree's build output.
+    BuildOutput,
+}
+
 /// The payload recorded in a preview marker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PreviewFact {
+    step: Step,
     owner: TaskId,
     trigger: InspectionTrigger,
     previewed_at: Timestamp,
@@ -439,6 +546,10 @@ pub fn inspect(
         trigger,
         observed_at: now,
         entries,
+        suggestions: match trigger {
+            InspectionTrigger::DiskPressure => EXTERNAL_CACHE_SUGGESTIONS.to_vec(),
+            InspectionTrigger::Schedule | InspectionTrigger::Manual => Vec::new(),
+        },
     })
 }
 
@@ -455,24 +566,41 @@ pub fn preview(
     now: Timestamp,
 ) -> Result<Preview> {
     let preview = inspect(inspector, trigger, now)?;
-    for entry in preview.entries.iter().filter(|entry| entry.eligible()) {
-        let key = marker_key(entry)?;
-        let current = inspector.store.marker(&key)?;
-        let fresh = current
-            .as_ref()
-            .is_some_and(|marker| now.saturating_since(marker.recorded_at()) <= max_age);
-        if !fresh {
-            record_preview(
-                inspector.store,
-                entry,
-                current.as_ref(),
-                trigger,
-                recorder,
-                now,
-            )?;
+    for entry in &preview.entries {
+        for (step, observation) in previewed_steps(entry) {
+            let key = marker_key(&entry.resource, observation)?;
+            let current = inspector.store.marker(&key)?;
+            let fresh = current
+                .as_ref()
+                .is_some_and(|marker| now.saturating_since(marker.recorded_at()) <= max_age);
+            if !fresh {
+                record_preview(
+                    inspector.store,
+                    entry,
+                    step,
+                    observation,
+                    current.as_ref(),
+                    trigger,
+                    recorder,
+                    now,
+                )?;
+            }
         }
     }
     Ok(preview)
+}
+
+/// The eligible steps of `entry` and the evidence digest of each.
+fn previewed_steps(entry: &PreviewEntry) -> impl Iterator<Item = (Step, &ExternalRef)> {
+    let release = entry
+        .eligible()
+        .then_some((Step::Release, &entry.observation));
+    let build = entry
+        .build_output
+        .as_ref()
+        .filter(|build| build.decision == Decision::Release)
+        .map(|build| (Step::BuildOutput, &build.observation));
+    release.into_iter().chain(build)
 }
 
 /// Bounds and authority for [`apply`].
@@ -555,6 +683,10 @@ pub struct ReleaseResult {
     pub task: Option<TaskId>,
     /// The outcome.
     pub outcome: ReleaseOutcome,
+    /// For a worktree released in this call: its size measured before the
+    /// release, which is what the release freed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freed: Option<DiskUsage>,
 }
 
 /// The result of [`apply`].
@@ -618,29 +750,21 @@ pub fn apply(
     // Decide what each eligible resource needs before acting on anything.
     let mut planned = Vec::with_capacity(eligible.len());
     for entry in eligible {
-        let key = marker_key(entry)?;
         let now = clock.now();
-        let plan = match inspector.store.marker(&key)? {
-            None => {
-                record_preview(inspector.store, entry, None, preview.trigger, claimant, now)?;
-                Plan::Report(ReleaseOutcome::NotPreviewed)
-            }
-            Some(marker) => {
-                // Only the dishwasher's own preview fact authorizes a release.
-                marker.fact().decode::<PreviewFact>(&schema()?)?;
-                if now.saturating_since(marker.recorded_at()) > options.max_preview_age {
-                    record_preview(
-                        inspector.store,
-                        entry,
-                        Some(&marker),
-                        preview.trigger,
-                        claimant,
-                        now,
-                    )?;
-                    Plan::Report(ReleaseOutcome::StalePreview)
-                } else {
-                    Plan::Drive(release_task_id(&entry.observation, marker.recorded_at())?)
-                }
+        let plan = match approval(
+            inspector.store,
+            entry,
+            Step::Release,
+            &entry.observation,
+            options.max_preview_age,
+            preview.trigger,
+            claimant,
+            now,
+        )? {
+            Approval::NotPreviewed => Plan::Report(ReleaseOutcome::NotPreviewed),
+            Approval::Stale => Plan::Report(ReleaseOutcome::StalePreview),
+            Approval::Approved(previewed_at) => {
+                Plan::Drive(release_task_id(&entry.observation, previewed_at)?)
             }
         };
         planned.push((entry, plan));
@@ -675,6 +799,7 @@ pub fn apply(
             resource: resource.clone(),
             task: Some(id.clone()),
             outcome,
+            freed: None,
         });
     }
 
@@ -695,10 +820,12 @@ pub fn apply(
                 }
             }
         };
+        let freed = entry.usage.filter(|_| outcome == ReleaseOutcome::Released);
         results.push(ReleaseResult {
             resource: entry.resource.clone(),
             task,
             outcome,
+            freed,
         });
     }
     Ok(ApplyReport {
@@ -706,6 +833,154 @@ pub fn apply(
         recovered,
         results,
     })
+}
+
+/// What happened to one build output directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum BuildOutcome {
+    /// Removed in this call.
+    Removed,
+    /// No earlier preview covers this evidence; this call recorded one.
+    NotPreviewed,
+    /// The preview is older than allowed; this call refreshed it.
+    StalePreview,
+    /// The evidence changed since the preview; nothing was removed.
+    Changed,
+    /// Removal failed or was refused by the final checks; a later run
+    /// finishes a partial removal.
+    RemoveFailed,
+}
+
+/// One build output directory's result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildResult {
+    /// The worktree.
+    pub resource: ResourceRef,
+    /// The directory's name at the top of the worktree.
+    pub directory: String,
+    /// The outcome.
+    pub outcome: BuildOutcome,
+    /// Space measured just before removal, for a removed directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freed: Option<DiskUsage>,
+}
+
+/// The result of [`reclaim_build_output`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildReport {
+    /// The inspection this call acted on.
+    pub preview: Preview,
+    /// One result per eligible directory.
+    pub results: Vec<BuildResult>,
+}
+
+impl BuildReport {
+    /// Total space measured before the removals that succeeded.
+    #[must_use]
+    pub fn freed(&self) -> DiskUsage {
+        self.results.iter().filter_map(|result| result.freed).fold(
+            DiskUsage {
+                bytes: 0,
+                complete: true,
+            },
+            |total, freed| DiskUsage {
+                bytes: total.bytes.saturating_add(freed.bytes),
+                complete: total.complete && freed.complete,
+            },
+        )
+    }
+}
+
+/// Remove regenerable build output from Kitchen-owned worktrees whose
+/// workers have all settled, where an earlier call previewed the same
+/// evidence. Needs no grant: nothing leaves the worktree's own ignored build
+/// directories, and nothing goes through the backend. Each worktree is
+/// revalidated immediately before its directories are removed.
+///
+/// # Errors
+/// As [`preview`].
+pub fn reclaim_build_output(
+    inspector: &Inspector<'_>,
+    trigger: InspectionTrigger,
+    recorder: &Claimant,
+    max_preview_age: Duration,
+    clock: &dyn Clock,
+) -> Result<BuildReport> {
+    let preview = inspect(inspector, trigger, clock.now())?;
+    let mut results = Vec::new();
+    for entry in preview
+        .entries
+        .iter()
+        .filter(|entry| entry.build_output_eligible())
+    {
+        let Some(build) = &entry.build_output else {
+            continue;
+        };
+        let report = |outcome: BuildOutcome| {
+            build.directories.iter().map(move |directory| BuildResult {
+                resource: entry.resource.clone(),
+                directory: directory.name.clone(),
+                outcome,
+                freed: None,
+            })
+        };
+        match approval(
+            inspector.store,
+            entry,
+            Step::BuildOutput,
+            &build.observation,
+            max_preview_age,
+            preview.trigger,
+            recorder,
+            clock.now(),
+        )? {
+            Approval::NotPreviewed => {
+                results.extend(report(BuildOutcome::NotPreviewed));
+                continue;
+            }
+            Approval::Stale => {
+                results.extend(report(BuildOutcome::StalePreview));
+                continue;
+            }
+            Approval::Approved(_) => {}
+        }
+        // Revalidate immediately before removing anything.
+        let owner = entry.owner_task();
+        let fresh = evaluate(inspector, clock.now(), |observation| {
+            observation.resource == &entry.resource
+                || owner.is_some_and(|task| observation.owner == Some(task))
+        })?;
+        let unchanged = fresh
+            .iter()
+            .find(|candidate| candidate.resource == entry.resource)
+            .and_then(|candidate| candidate.build_output.as_ref())
+            .is_some_and(|current| {
+                current.decision == Decision::Release && current.observation == build.observation
+            });
+        let path = inspector.worktrees.locate(&entry.resource);
+        let Some(path) = path.filter(|_| unchanged) else {
+            results.extend(report(BuildOutcome::Changed));
+            continue;
+        };
+        for directory in &build.directories {
+            let usage = disk_usage(&path.join(&directory.name));
+            let (outcome, freed) = match build::remove(&path, &directory.name) {
+                Ok(()) => (BuildOutcome::Removed, Some(usage)),
+                Err(_) => (BuildOutcome::RemoveFailed, None),
+            };
+            results.push(BuildResult {
+                resource: entry.resource.clone(),
+                directory: directory.name.clone(),
+                outcome,
+                freed,
+            });
+        }
+    }
+    Ok(BuildReport { preview, results })
 }
 
 /// What [`apply`] does with one eligible resource.
@@ -932,21 +1207,86 @@ fn schema() -> Result<MarkerSchema> {
     Ok(MarkerSchema::new(PREVIEW_SCHEMA, NonZeroU32::MIN)?)
 }
 
-fn marker_key(entry: &PreviewEntry) -> Result<MarkerKey> {
+fn marker_key(resource: &ResourceRef, observation: &ExternalRef) -> Result<MarkerKey> {
     Ok(MarkerKey {
         workflow: WorkflowId::new(WORKFLOW)?,
         item: WorkItem::Resource {
-            resource: entry.resource.clone(),
+            resource: resource.clone(),
         },
-        subject: MarkerSubject::Observation(entry.observation.clone()),
+        subject: MarkerSubject::Observation(observation.clone()),
     })
 }
 
-/// Record or refresh the preview marker for `entry`. A concurrent recorder
-/// of the same evidence is not an error.
+/// Whether an earlier call previewed `observation` for `step`.
+enum Approval {
+    /// No preview; this call recorded one.
+    NotPreviewed,
+    /// Too old; this call refreshed it.
+    Stale,
+    /// Previewed at this time.
+    Approved(Timestamp),
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument names one part of the preview being checked"
+)]
+fn approval(
+    store: &HouseStore,
+    entry: &PreviewEntry,
+    step: Step,
+    observation: &ExternalRef,
+    max_age: Duration,
+    trigger: InspectionTrigger,
+    claimant: &Claimant,
+    now: Timestamp,
+) -> Result<Approval> {
+    let key = marker_key(&entry.resource, observation)?;
+    let Some(marker) = store.marker(&key)? else {
+        record_preview(
+            store,
+            entry,
+            step,
+            observation,
+            None,
+            trigger,
+            claimant,
+            now,
+        )?;
+        return Ok(Approval::NotPreviewed);
+    };
+    // Only the dishwasher's own preview of this step authorizes acting.
+    let fact: PreviewFact = marker.fact().decode(&schema()?)?;
+    if fact.step != step {
+        return Err(Error::State(StateError::MarkerConflict));
+    }
+    if now.saturating_since(marker.recorded_at()) > max_age {
+        record_preview(
+            store,
+            entry,
+            step,
+            observation,
+            Some(&marker),
+            trigger,
+            claimant,
+            now,
+        )?;
+        return Ok(Approval::Stale);
+    }
+    Ok(Approval::Approved(marker.recorded_at()))
+}
+
+/// Record or refresh the preview marker for one step of `entry`. A
+/// concurrent recorder of the same evidence is not an error.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument names one part of the recorded preview"
+)]
 fn record_preview(
     store: &HouseStore,
     entry: &PreviewEntry,
+    step: Step,
+    observation: &ExternalRef,
     current: Option<&WorkflowMarker>,
     trigger: InspectionTrigger,
     recorder: &Claimant,
@@ -958,12 +1298,13 @@ fn record_preview(
     let fact = MarkerFact::workflow(
         schema()?,
         &PreviewFact {
+            step,
             owner: owner.clone(),
             trigger,
             previewed_at: now,
         },
     )?;
-    let key = marker_key(entry)?;
+    let key = marker_key(&entry.resource, observation)?;
     let recorded = match current {
         None => store.record_marker(key, fact, recorder, now).map(drop),
         Some(marker) => store
@@ -1104,7 +1445,18 @@ fn evaluate(
             }) => Some(now.saturating_since(*at)),
             Ownership::Task(_) | Ownership::Unknown | Ownership::Ambiguous { .. } => None,
         };
+        let build_output = match &worktree {
+            Some(WorktreeEvidence::Read { .. }) => {
+                build_output(inspector, observation, ownership, &decision)?
+            }
+            Some(WorktreeEvidence::Unlocated | WorktreeEvidence::Unreadable { .. }) | None => None,
+        };
+        let usage = (decision == Decision::Release && worktree.is_some())
+            .then(|| inspector.worktrees.locate(&observation.resource))
+            .flatten()
+            .map(|path| disk_usage(&path));
         let digest = digest(&DigestInput {
+            domain: Step::Release,
             resource: &observation.resource,
             liveness: liveness_name(observation.liveness),
             backend_owner: observation.owner.as_ref(),
@@ -1121,6 +1473,8 @@ fn evaluate(
             worker: *worker,
             ownership: ownership.clone(),
             worktree,
+            build_output,
+            usage,
             settled_for,
             decision,
         });
@@ -1307,6 +1661,7 @@ fn worktree_evidence(inspector: &Inspector<'_>, resource: &ResourceRef) -> Workt
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DigestInput<'a> {
+    domain: Step,
     resource: &'a ResourceRef,
     liveness: &'static str,
     backend_owner: Option<&'a ExternalRef>,
@@ -1316,7 +1671,100 @@ struct DigestInput<'a> {
     decision: &'a Decision,
 }
 
-fn digest(input: &DigestInput<'_>) -> Result<ExternalRef> {
+/// The evidence a build output decision rests on. Sizes are excluded so a
+/// measurement difference is not a change of evidence.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildDigestInput<'a> {
+    domain: Step,
+    resource: &'a ResourceRef,
+    backend_owner: Option<&'a ExternalRef>,
+    ownership: &'a Ownership,
+    directories: Vec<&'a str>,
+    decision: &'a Decision,
+}
+
+/// Exclusions that also keep build output. Uncommitted or unpushed work,
+/// and a task that is still open, do not: build output is not work.
+const fn blocks_build_output(reason: Exclusion) -> bool {
+    match reason {
+        Exclusion::ForeignBackend
+        | Exclusion::NotReclaimable
+        | Exclusion::UnknownOwner
+        | Exclusion::AmbiguousOwner
+        | Exclusion::BackendOwnerMismatch
+        | Exclusion::UnresolvedEffects
+        | Exclusion::SharedWithTask
+        | Exclusion::InUse
+        | Exclusion::LivenessUnverifiable
+        | Exclusion::UserTakeover
+        | Exclusion::WorkerNotSettled
+        | Exclusion::SiblingInUse
+        | Exclusion::WorktreeUnlocated
+        | Exclusion::WorktreeUnreadable
+        | Exclusion::MainCheckout
+        | Exclusion::WorktreeLocked => true,
+        Exclusion::OwnerActive
+        | Exclusion::TrackedChanges
+        | Exclusion::UntrackedFiles
+        | Exclusion::UnpreservedCommits => false,
+    }
+}
+
+/// Build output in a readable worktree, with its own decision.
+fn build_output(
+    inspector: &Inspector<'_>,
+    observation: &ResourceObservation,
+    ownership: &Ownership,
+    worktree_decision: &Decision,
+) -> Result<Option<BuildOutput>> {
+    let Some(path) = inspector.worktrees.locate(&observation.resource) else {
+        return Ok(None);
+    };
+    // A checkout Git cannot list precisely has no build output to offer.
+    let Ok(names) = build::find(&path, inspector.git) else {
+        return Ok(None);
+    };
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let reasons: Vec<Exclusion> = match worktree_decision {
+        Decision::Release => Vec::new(),
+        Decision::Retain { reasons } => reasons
+            .iter()
+            .copied()
+            .filter(|reason| blocks_build_output(*reason))
+            .collect(),
+    };
+    let decision = if reasons.is_empty() {
+        Decision::Release
+    } else {
+        Decision::Retain { reasons }
+    };
+    let digest_input = BuildDigestInput {
+        domain: Step::BuildOutput,
+        resource: &observation.resource,
+        backend_owner: observation.owner.as_ref(),
+        ownership,
+        directories: names.iter().map(String::as_str).collect(),
+        decision: &decision,
+    };
+    let observation = digest(&digest_input)?;
+    let directories = names
+        .into_iter()
+        .map(|name| {
+            let usage = disk_usage(&path.join(&name));
+            BuildDirectory { name, usage }
+        })
+        .collect();
+    Ok(Some(BuildOutput {
+        observation,
+        directories,
+        decision,
+    }))
+}
+
+fn digest(input: &impl Serialize) -> Result<ExternalRef> {
     let bytes = serde_json::to_vec(input).map_err(|_| CleanupError::Encoding)?;
     let mut digest = Sha256::new();
     digest.update(b"kitchen-dishwasher-observation-v1\0");

@@ -20,7 +20,8 @@ use kitchen::{
     house::HouseError,
     state::{HouseStore, StoreOptions},
     workflows::cleanup::{
-        Decision, GitLimits, InspectionTrigger, Inspector, OwnerState, Ownership, Preview, preview,
+        Decision, DiskUsage, GitLimits, InspectionTrigger, Inspector, OwnerState, Ownership,
+        Preview, preview,
     },
 };
 use serde::Deserialize;
@@ -153,8 +154,47 @@ fn render(preview: &Preview) -> String {
             kind_name(entry.resource.kind),
             entry.resource.handle,
         );
+        if let Some(usage) = entry.usage {
+            let _ = write!(text, " ({})", size(usage));
+        }
+        if let Some(build) = &entry.build_output {
+            let names: Vec<&str> = build
+                .directories
+                .iter()
+                .map(|directory| directory.name.as_str())
+                .collect();
+            let verdict = match &build.decision {
+                Decision::Release => "remove".to_owned(),
+                Decision::Retain { reasons } => format!(
+                    "keep: {}",
+                    reasons
+                        .iter()
+                        .map(|reason| reason.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            let _ = write!(
+                text,
+                "\n  build output {} ({}) {verdict}",
+                names.join(", "),
+                size(build.usage()),
+            );
+        }
+    }
+    for suggestion in &preview.suggestions {
+        let _ = write!(
+            text,
+            "\nNot run (outside Kitchen): {} reclaims {}; {}.",
+            suggestion.command, suggestion.reclaims, suggestion.caution
+        );
     }
     text
+}
+
+fn size(usage: DiskUsage) -> String {
+    let bound = if usage.complete { "" } else { "at least " };
+    format!("{bound}{} bytes", usage.bytes)
 }
 
 const fn trigger_name(trigger: InspectionTrigger) -> &'static str {

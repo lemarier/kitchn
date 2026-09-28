@@ -9,7 +9,7 @@ use std::{
     ffi::OsStr,
     io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::mpsc::{self, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
@@ -198,12 +198,48 @@ fn count_status(output: &str) -> Result<(u32, u32), GitReadError> {
     Ok((tracked, untracked))
 }
 
-/// Run one read-only `git` call in `dir` within the limits.
+/// Whether `name`, a top-level entry of the checkout at `dir`, is ignored
+/// by Git and contains no tracked files.
+///
+/// # Errors
+/// Returns a [`GitReadError`] when a call fails; callers must treat that as
+/// "not build output".
+pub(super) fn ignored_untracked(
+    dir: &Path,
+    name: &str,
+    limits: &GitLimits,
+) -> Result<bool, GitReadError> {
+    let entry = format!("{name}/");
+    let (ignored, _) = run_raw(dir, ["check-ignore", "--quiet", "--", &entry], limits)?;
+    match ignored.code() {
+        Some(0) => {}
+        Some(1) => return Ok(false),
+        _ => return Err(GitReadError::Failed),
+    }
+    let tracked = run(dir, ["ls-files", "-z", "--", &entry], limits)?;
+    Ok(tracked.is_empty())
+}
+
+/// Run one read-only `git` call in `dir` that must succeed.
 fn run<const N: usize>(
     dir: &Path,
     args: [&str; N],
     limits: &GitLimits,
 ) -> Result<String, GitReadError> {
+    let (status, output) = run_raw(dir, args, limits)?;
+    if !status.success() {
+        return Err(GitReadError::Failed);
+    }
+    Ok(output)
+}
+
+/// Run one read-only `git` call in `dir` within the limits and return its
+/// exit status with its output.
+fn run_raw<const N: usize>(
+    dir: &Path,
+    args: [&str; N],
+    limits: &GitLimits,
+) -> Result<(ExitStatus, String), GitReadError> {
     let mut command = Command::new(&limits.program);
     command
         .arg("--no-optional-locks")
@@ -271,10 +307,8 @@ fn run<const N: usize>(
     if output.len() > limits.max_output_bytes {
         return Err(GitReadError::OutputTooLarge);
     }
-    if !status.success() {
-        return Err(GitReadError::Failed);
-    }
-    String::from_utf8(output).map_err(|_| GitReadError::Malformed)
+    let output = String::from_utf8(output).map_err(|_| GitReadError::Malformed)?;
+    Ok((status, output))
 }
 
 #[cfg(test)]

@@ -29,9 +29,10 @@ use kitchen::{
     },
     state::{EffectState, HouseStore, run_effect},
     workflows::cleanup::{
-        ApplyOptions, ApplyReport, CleanupError, ConsentSource, Decision, Exclusion, GitLimits,
-        GitReadError, InspectionTrigger, Inspector, NoConsent, Ownership, Precheck, Preview,
-        ReleaseOutcome, apply, inspect, inspect_worktree, preview,
+        ApplyOptions, ApplyReport, BuildOutcome, BuildReport, CACHEDIR_SIGNATURE, CleanupError,
+        ConsentSource, Decision, EXTERNAL_CACHE_SUGGESTIONS, Exclusion, GitLimits, GitReadError,
+        InspectionTrigger, Inspector, NoConsent, Ownership, Precheck, Preview, ReleaseOutcome,
+        apply, inspect, inspect_worktree, preview, reclaim_build_output,
     },
 };
 
@@ -86,7 +87,8 @@ impl Repo {
         git(&main, &["init", "--quiet"])?;
         git(&main, &["remote", "add", "origin", path_str(&origin)?])?;
         fs::write(main.join("README.md"), "kitchen\n")?;
-        git(&main, &["add", "README.md"])?;
+        fs::write(main.join(".gitignore"), "target/\n")?;
+        git(&main, &["add", "README.md", ".gitignore"])?;
         git(&main, &["commit", "--quiet", "-m", "initial"])?;
         git(&main, &["push", "--quiet", "origin", "main"])?;
         Ok(Self { dir })
@@ -117,6 +119,18 @@ fn path_str(path: &Path) -> TestResult<&str> {
 
 fn head(path: &Path) -> TestResult<CommitId> {
     Ok(CommitId::new(git(path, &["rev-parse", "HEAD"])?.trim())?)
+}
+
+/// Create a tagged build directory holding `bytes` of output.
+fn build_dir(dir: &Path, bytes: usize) -> TestResult<PathBuf> {
+    let target = dir.join("target");
+    fs::create_dir_all(target.join("debug"))?;
+    fs::write(
+        target.join("CACHEDIR.TAG"),
+        [CACHEDIR_SIGNATURE, b"\n"].concat(),
+    )?;
+    fs::write(target.join("debug").join("output.rlib"), vec![7_u8; bytes])?;
+    Ok(target)
 }
 
 /// Commit locally without pushing.
@@ -352,6 +366,16 @@ impl Harness {
             &scheduled("dishwasher")?,
             PREVIEW_AGE,
             self.clock.now(),
+        )?)
+    }
+
+    fn reclaim(&self) -> TestResult<BuildReport> {
+        Ok(reclaim_build_output(
+            &self.inspector(),
+            InspectionTrigger::DiskPressure,
+            &scheduled("dishwasher")?,
+            PREVIEW_AGE,
+            &self.clock,
         )?)
     }
 
@@ -758,6 +782,14 @@ fn the_first_run_is_preview_only_and_repeating_is_harmless() -> TestResult {
     assert_eq!(outcome(&second, &owned.worker)?, ReleaseOutcome::Released);
     assert_eq!(outcome(&second, &owned.worktree)?, ReleaseOutcome::Released);
     assert_eq!(harness.backend.fake.effects_performed(), before + 2);
+    // The worktree's release reports the space measured before it.
+    let freed = second
+        .results
+        .iter()
+        .find(|result| result.resource == owned.worktree)
+        .and_then(|result| result.freed)
+        .ok_or("no freed space reported")?;
+    assert!(freed.complete && freed.bytes > 0);
     // Each release ran as a settled dishwasher task given that resource.
     for result in &second.results {
         let task = harness.store().task(result.task.as_ref().ok_or("task")?)?;
@@ -1181,5 +1213,195 @@ fn a_release_proven_absent_is_retried_within_its_task() -> TestResult {
     let task = harness.store().task(result.task.as_ref().ok_or("task")?)?;
     assert_eq!(task.effects().len(), 2, "one absent, one applied");
     assert_eq!(task.attempts().len(), 2);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Build output under disk pressure
+
+#[test]
+fn build_output_of_settled_workers_is_reclaimed_without_touching_work() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    // Unfinished work keeps the worktree but not its build output.
+    commit_locally(&path, "local.txt")?;
+    fs::write(path.join("notes.txt"), "draft\n")?;
+    let target = build_dir(&path, 64 * 1024)?;
+    let preview = harness.inspect()?;
+    let entry = preview.entry(&owned.worktree).ok_or("worktree")?;
+    assert_eq!(
+        reasons(&preview, &owned.worktree)?,
+        [Exclusion::UntrackedFiles, Exclusion::UnpreservedCommits]
+    );
+    let build = entry.build_output.as_ref().ok_or("no build output")?;
+    assert_eq!(build.decision, Decision::Release);
+    assert_eq!(build.directories.len(), 1);
+    assert!(build.usage().bytes >= 64 * 1024);
+    assert_eq!(preview.precheck(), Precheck::Actionable);
+
+    // The first run under disk pressure only previews.
+    let first = harness.reclaim()?;
+    assert_eq!(
+        first.results.iter().map(|r| r.outcome).collect::<Vec<_>>(),
+        [BuildOutcome::NotPreviewed]
+    );
+    assert!(target.is_dir());
+
+    harness.clock.advance(60);
+    let second = harness.reclaim()?;
+    let result = second.results.first().ok_or("no result")?;
+    assert_eq!(result.outcome, BuildOutcome::Removed);
+    assert_eq!(result.directory, "target");
+    assert!(second.freed().bytes >= 64 * 1024);
+    assert!(!target.exists());
+    // Work and the worktree are untouched, and nothing went to the backend.
+    assert!(path.join("notes.txt").is_file() && path.join("local.txt").is_file());
+    assert_eq!(harness.backend.fake.execute_calls(), 1, "only the launch");
+
+    harness.clock.advance(60);
+    assert!(harness.reclaim()?.results.is_empty());
+    Ok(())
+}
+
+#[test]
+fn build_output_is_kept_while_its_owner_is_in_use_taken_over_or_unknown() -> TestResult {
+    let mut harness = Harness::new()?;
+    let running = harness.owner("task-1", true)?;
+    let taken = harness.owner("task-2", true)?;
+    for owned in [&running, &taken] {
+        build_dir(harness.path(&owned.worktree)?, 1024)?;
+    }
+    harness
+        .backend
+        .fake
+        .set_worker_state(&running.worker, WorkerState::Ready);
+    harness
+        .backend
+        .fake
+        .set_worker_state(&taken.worker, WorkerState::UserTakeover);
+    let orphan = ResourceRef {
+        kind: ResourceKind::Worktree,
+        backend: backend_id()?,
+        handle: ExternalRef::new("orphan")?,
+    };
+    let orphan_path = harness.repo.pushed_worktree("orphan")?;
+    build_dir(&orphan_path, 1024)?;
+    harness.backend.add(orphan.clone(), None, Liveness::Exited);
+    harness.paths.insert(orphan.clone(), orphan_path.clone());
+
+    let preview = harness.inspect()?;
+    let build_reasons = |resource: &ResourceRef| -> TestResult<Vec<Exclusion>> {
+        let entry = preview.entry(resource).ok_or("missing")?;
+        match &entry
+            .build_output
+            .as_ref()
+            .ok_or("no build output")?
+            .decision
+        {
+            Decision::Release => Ok(Vec::new()),
+            Decision::Retain { reasons } => Ok(reasons.clone()),
+        }
+    };
+    assert_eq!(build_reasons(&running.worktree)?, [Exclusion::SiblingInUse]);
+    assert_eq!(
+        build_reasons(&taken.worktree)?,
+        [Exclusion::UserTakeover, Exclusion::SiblingInUse]
+    );
+    assert_eq!(build_reasons(&orphan)?, [Exclusion::UnknownOwner]);
+    harness.preview()?;
+    harness.clock.advance(60);
+    assert!(harness.reclaim()?.results.is_empty());
+    assert!(orphan_path.join("target").is_dir());
+    Ok(())
+}
+
+#[test]
+fn only_ignored_untracked_tagged_directories_are_build_output() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    // Ignored but untagged.
+    fs::create_dir_all(path.join("target"))?;
+    fs::write(path.join("target").join("file"), "x")?;
+    // Tagged but not ignored.
+    fs::create_dir_all(path.join("cache"))?;
+    fs::write(path.join("cache").join("CACHEDIR.TAG"), CACHEDIR_SIGNATURE)?;
+    git(&path, &["add", "cache"])?;
+    git(&path, &["commit", "--quiet", "-m", "tracked cache"])?;
+    git(&path, &["push", "--quiet", "origin", "task-1"])?;
+    let entry_has_build = |harness: &Harness| -> TestResult<bool> {
+        Ok(harness
+            .inspect()?
+            .entry(&owned.worktree)
+            .ok_or("worktree")?
+            .build_output
+            .is_some())
+    };
+    assert!(!entry_has_build(&harness)?);
+    // Tagged and ignored, but holding a force-added tracked file.
+    fs::write(path.join("target").join("CACHEDIR.TAG"), CACHEDIR_SIGNATURE)?;
+    git(&path, &["add", "--force", "target/file"])?;
+    git(&path, &["commit", "--quiet", "-m", "tracked output"])?;
+    git(&path, &["push", "--quiet", "origin", "task-1"])?;
+    assert!(!entry_has_build(&harness)?);
+    #[cfg(unix)]
+    {
+        // A symlink to a tagged directory elsewhere is never followed.
+        git(&path, &["rm", "--quiet", "-r", "--cached", "target"])?;
+        git(&path, &["commit", "--quiet", "-m", "untrack"])?;
+        git(&path, &["push", "--quiet", "origin", "task-1"])?;
+        fs::remove_dir_all(path.join("target"))?;
+        let outside = tempfile::tempdir()?;
+        let elsewhere = build_dir(outside.path(), 1024)?;
+        std::os::unix::fs::symlink(&elsewhere, path.join("target"))?;
+        assert!(!entry_has_build(&harness)?);
+        harness.paths.insert(owned.worktree.clone(), path.clone());
+        harness.preview()?;
+        harness.clock.advance(60);
+        assert!(harness.reclaim()?.results.is_empty());
+        assert!(elsewhere.join("CACHEDIR.TAG").is_file());
+    }
+    Ok(())
+}
+
+#[test]
+fn build_output_whose_owner_changes_before_removal_is_kept() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let target = build_dir(harness.path(&owned.worktree)?, 1024)?;
+    harness.preview()?;
+    harness.clock.advance(60);
+    // Between reclaim's inspection and its revalidation, the backend
+    // reports the worktree under another owner.
+    let worktree = owned.worktree.clone();
+    harness.backend.change_after(2, move |extra| {
+        for observation in extra.iter_mut() {
+            if observation.resource == worktree {
+                observation.owner = ExternalRef::new("reassigned").ok();
+            }
+        }
+    });
+    let report = harness.reclaim()?;
+    assert_eq!(
+        report.results.iter().map(|r| r.outcome).collect::<Vec<_>>(),
+        [BuildOutcome::Changed]
+    );
+    assert!(target.is_dir());
+    Ok(())
+}
+
+#[test]
+fn disk_pressure_suggests_commands_for_external_caches_and_runs_none() -> TestResult {
+    let harness = Harness::new()?;
+    let pressured = inspect(
+        &harness.inspector(),
+        InspectionTrigger::DiskPressure,
+        harness.clock.now(),
+    )?;
+    assert_eq!(pressured.suggestions, EXTERNAL_CACHE_SUGGESTIONS);
+    assert!(harness.inspect()?.suggestions.is_empty());
+    let json = serde_json::to_value(&pressured)?;
+    assert_eq!(json["suggestions"][0]["command"], "cargo cache --autoclean");
     Ok(())
 }

@@ -66,6 +66,7 @@ fn pushed_worktree(root: &Path) -> TestResult<PathBuf> {
     git(&main, &["init", "--quiet"])?;
     git(&main, &["remote", "add", "origin", text(&origin)?])?;
     fs::write(main.join("README.md"), "kitchen\n")?;
+    fs::write(main.join(".gitignore"), "target/\n")?;
     git(&main, &["add", "."])?;
     git(&main, &["commit", "--quiet", "-m", "initial"])?;
     git(
@@ -205,6 +206,11 @@ fn a_preview_explains_releases_and_exclusions_and_records_markers() -> TestResul
     let store = initialize(&root)?;
     let (worker, worktree, key) = settled_task(&store)?;
     let path = pushed_worktree(&root)?;
+    fs::create_dir_all(path.join("target"))?;
+    fs::write(
+        path.join("target/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )?;
     let inventory = root.join("inventory.json");
     fs::write(
         &inventory,
@@ -234,9 +240,11 @@ fn a_preview_explains_releases_and_exclusions_and_records_markers() -> TestResul
         stdout.contains("terminal legacy-console [owner unknown] retain: unknown-owner, in-use"),
         "{stdout}"
     );
-    // One marker per eligible resource, recorded by the person who ran it.
+    assert!(stdout.contains("\n  build output target ("), "{stdout}");
+    assert!(stdout.contains(") remove"), "{stdout}");
+    // One marker per eligible step: two releases and the build output.
     let markers = store.markers(&WorkflowId::new("dishwasher")?)?;
-    assert_eq!(markers.len(), 2);
+    assert_eq!(markers.len(), 3);
 
     args.push("--json");
     let output = kitchen(&args)?;
@@ -249,7 +257,17 @@ fn a_preview_explains_releases_and_exclusions_and_records_markers() -> TestResul
         "unknown-owner"
     );
     // Unchanged evidence does not record more markers.
-    assert_eq!(store.markers(&WorkflowId::new("dishwasher")?)?.len(), 2);
+    assert_eq!(store.markers(&WorkflowId::new("dishwasher")?)?.len(), 3);
+
+    // Disk pressure adds commands for caches Kitchen does not own.
+    let mut pressured = preview_args(text(&store_dir)?, text(&inventory)?);
+    pressured.extend(["--trigger", "disk-pressure"]);
+    let output = kitchen(&pressured)?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("Not run (outside Kitchen): cargo cache --autoclean"),
+        "{stdout}"
+    );
     Ok(())
 }
 

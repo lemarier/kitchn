@@ -20,6 +20,7 @@ use kitchen::{
         conformance::{self, Check, CheckResult, ConformanceFixture},
         fake::{ExecuteFault, FakeBackend},
     },
+    scheduling::{AgentFamily, Recurrence, ScheduleSpec, Timezone, WorkflowName},
     state::{EffectState, reconcile, run_effect},
 };
 
@@ -103,7 +104,14 @@ fn ask_about(
 
 fn install() -> TestResult<Effect> {
     Ok(ScheduleEffect::InstallDisabled {
-        consumer: ConsumerId::new("pickup-origin89")?,
+        schedule: ScheduleSpec::new(
+            WorkflowName::new("pickup")?,
+            ConsumerId::new("pickup-origin89")?,
+            Recurrence::Hourly,
+            Timezone::new("UTC")?,
+            Text::new("Run pickup.")?,
+            AgentFamily::Claude,
+        ),
     }
     .into())
 }

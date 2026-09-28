@@ -1,0 +1,164 @@
+//! Schedule observations and install reconciliation.
+
+use crate::{
+    ConsumerId,
+    contracts::{ResourceRef, Timestamp},
+};
+
+/// Most recent runs one observation reports.
+pub const MAX_SCHEDULE_RUNS: usize = 20;
+
+/// A schedule's state as a backend reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObservedScheduleState {
+    /// Installed and firing.
+    Active,
+    /// Installed and paused.
+    Paused,
+    /// The backend has no such schedule.
+    Missing,
+    /// The backend cannot tell.
+    Unknown,
+}
+
+/// What one scheduled run did, as the backend recorded it.
+///
+/// No variant says the agent started: a backend's "completed launch" is not
+/// readiness evidence. [`run_verdict`] combines this with Kitchen's own
+/// readiness evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RunOutcome {
+    /// Queued or still starting.
+    Pending,
+    /// The backend reports the launch step finished. The agent may still
+    /// never have started.
+    LaunchReported,
+    /// The precheck found nothing to do.
+    PrecheckIdle,
+    /// The precheck failed, timed out, or exited with an unexpected code.
+    /// This is an error to report, never idle.
+    PrecheckFailed,
+    /// Skipped for another reason, such as a missed window or an unavailable host.
+    Skipped,
+    /// The backend failed to launch the agent.
+    LaunchFailed,
+    /// The backend reported a status Kitchen does not recognize.
+    Unknown,
+}
+
+/// One scheduled run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScheduleRun {
+    /// What the run did.
+    pub outcome: RunOutcome,
+    /// When it was due, when the backend reports it.
+    pub scheduled_for: Option<Timestamp>,
+}
+
+/// How a scheduled run ended, once readiness evidence is taken into account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RunVerdict {
+    /// Still within its readiness deadline.
+    Pending,
+    /// Kitchen observed positive readiness evidence from the run's agent.
+    Started,
+    /// The agent never became ready: a launch failure, never a completed or
+    /// idle run.
+    LaunchFailed,
+    /// The precheck found nothing to do.
+    Idle,
+    /// The precheck failed and must be reported.
+    PrecheckFailed,
+    /// Skipped before any launch for another reason.
+    Skipped,
+    /// The backend's record cannot be interpreted.
+    Unknown,
+}
+
+/// Decide how a run ended.
+///
+/// `ready` is Kitchen's own positive evidence that the run's agent started,
+/// such as the run acquiring its workflow consumer lease. Without it, a run
+/// the backend reports as launched is pending until `deadline` after it was
+/// due, then a launch failure. A run with no due time cannot age out, so it
+/// stays pending until evidence or an explicit decision.
+#[must_use]
+pub fn run_verdict(
+    run: &ScheduleRun,
+    ready: bool,
+    now: Timestamp,
+    deadline: std::time::Duration,
+) -> RunVerdict {
+    let expired = run
+        .scheduled_for
+        .is_some_and(|due| now.saturating_since(due) > deadline);
+    match run.outcome {
+        RunOutcome::Pending | RunOutcome::LaunchReported if ready => RunVerdict::Started,
+        RunOutcome::Pending | RunOutcome::LaunchReported if expired => RunVerdict::LaunchFailed,
+        RunOutcome::Pending | RunOutcome::LaunchReported => RunVerdict::Pending,
+        RunOutcome::LaunchFailed => RunVerdict::LaunchFailed,
+        RunOutcome::PrecheckIdle => RunVerdict::Idle,
+        RunOutcome::PrecheckFailed => RunVerdict::PrecheckFailed,
+        RunOutcome::Skipped => RunVerdict::Skipped,
+        RunOutcome::Unknown => RunVerdict::Unknown,
+    }
+}
+
+/// A read-only view of one schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleObservation {
+    /// Its state.
+    pub state: ObservedScheduleState,
+    /// Up to [`MAX_SCHEDULE_RUNS`] runs, newest first.
+    pub recent_runs: Vec<ScheduleRun>,
+}
+
+/// A schedule a backend reports as installed for this house.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledSchedule {
+    /// The backend resource.
+    pub resource: ResourceRef,
+    /// The workflow consumer scope decoded from the backend's native name.
+    pub consumer: ConsumerId,
+    /// Its state.
+    pub state: ObservedScheduleState,
+}
+
+/// What an install must do after reconciling against the inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallPlan {
+    /// No schedule serves this consumer; creating one is safe.
+    Create,
+    /// Exactly one schedule serves this consumer; reuse it instead of creating another.
+    Installed(ResourceRef),
+    /// Several schedules serve this consumer. Creating would add another one;
+    /// the duplicates need an explicit decision.
+    Duplicates(Vec<ResourceRef>),
+}
+
+/// Decide whether installing a schedule for `consumer` may create one.
+///
+/// A schedule whose state is unknown still counts: when unsure, reuse or
+/// refuse rather than add a consumer.
+///
+/// `installed` must be a complete inventory of this house's schedules. An
+/// incomplete or failed listing must not reach this function, because a
+/// missing entry would allow a duplicate create.
+#[must_use]
+pub fn plan_install(consumer: &ConsumerId, installed: &[InstalledSchedule]) -> InstallPlan {
+    let mut matches: Vec<ResourceRef> = installed
+        .iter()
+        .filter(|schedule| {
+            &schedule.consumer == consumer && schedule.state != ObservedScheduleState::Missing
+        })
+        .map(|schedule| schedule.resource.clone())
+        .collect();
+    match matches.as_slice() {
+        [] => InstallPlan::Create,
+        [only] => InstallPlan::Installed(only.clone()),
+        [_, _, ..] => {
+            matches.sort();
+            InstallPlan::Duplicates(matches)
+        }
+    }
+}

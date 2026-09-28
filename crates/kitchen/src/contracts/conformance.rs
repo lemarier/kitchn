@@ -20,6 +20,7 @@ use crate::{
         Permission, PostingBudget, Receipt, Repository, ResourceKind, ResourceRef, RogerAsk,
         RogerEffect, Role, ScheduleEffect, Text, WorkerBackend, WorkerState, Workspace,
     },
+    scheduling::{AgentFamily, Recurrence, ScheduleSpec, Timezone, WorkflowName},
 };
 
 /// One contract check.
@@ -387,7 +388,18 @@ impl<'a> Runner<'a> {
             ),
             (
                 "unsupported-schedule",
-                Effect::Schedule(ScheduleEffect::InstallDisabled { consumer }),
+                Effect::Schedule(ScheduleEffect::InstallDisabled {
+                    schedule: ScheduleSpec::new(
+                        WorkflowName::new("conformance")
+                            .or_else(|_| fail(Check::Fixture, "invalid sample workflow"))?,
+                        consumer,
+                        Recurrence::Hourly,
+                        Timezone::new("UTC")
+                            .or_else(|_| fail(Check::Fixture, "invalid sample time zone"))?,
+                        self.fixture.brief.clone(),
+                        AgentFamily::Claude,
+                    ),
+                }),
             ),
         ])
     }

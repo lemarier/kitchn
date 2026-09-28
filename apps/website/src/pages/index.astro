@@ -1,17 +1,15 @@
 ---
 import {
-  siAmp,
   siClaude,
   siCoderabbit,
   siCrewai,
   siCursor,
   siGithubcopilot,
-  siGooglegemini,
   siLanggraph,
-  siOpencode,
 } from "simple-icons";
 import RoleAvatar from "../components/RoleAvatar.astro";
 import ToolChip from "../components/ToolChip.astro";
+import { orcaAgents } from "../data/agents";
 import { nightShift } from "../data/autopilot";
 import { glossary } from "../data/glossary";
 import { commands } from "../data/terminal";
@@ -96,17 +94,6 @@ const service: Line[] = [
     who: "Order up",
     text: "Merged. Worktree kept until cleanup can prove it's done.",
   },
-];
-
-// Logos from Simple Icons (CC0), where the project has one.
-const agents = [
-  { name: "Claude Code", icon: siClaude },
-  { name: "Codex" },
-  { name: "OpenCode", icon: siOpencode },
-  { name: "Gemini CLI", icon: siGooglegemini },
-  { name: "Cursor CLI", icon: siCursor },
-  { name: "Amp", icon: siAmp },
-  { name: "Any CLI agent" },
 ];
 
 const steps = [
@@ -387,8 +374,87 @@ const menu = [
         </p>
       </section>
 
+      <section class="factory wrap" aria-labelledby="factory-title">
+        <h2 id="factory-title">Right now, you're the whole kitchen.</h2>
+        <div class="factory-split">
+          <p class="factory-lede">
+            Six agents, one of you. You take every order, read every diff, decide what's good enough,
+            merge at midnight and clean up worktrees in the morning. More agents only make the line
+            longer.
+          </p>
+          <div class="factory-quote">
+            <p class="factory-big">You're not running a software factory.</p>
+            <p>
+              Factories count units shipped. A good kitchen serves a full room every night and still
+              sends back any plate that isn't right. That's the bar: quality at scale, with a brigade
+              where everyone knows their station.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="brigade" aria-labelledby="brigade-title">
+        <div class="wrap">
+          <h2 id="brigade-title">Meet the brigade</h2>
+          <p class="section-lede">
+            Eight stations, each with one job. Every station owes evidence and has a line it can't cross.
+            Stations open when there's work; installing kitchn starts nothing and grants no authority.
+          </p>
+        </div>
+        {
+          [roles].map((row) => (
+            <div class="line">
+              <div class="line-rail" aria-hidden="true" />
+              <ul class="stations wrap">
+                {row.map((role, i) => (
+                  <li class="station" style={`--i:${i}`}>
+                    <span class="clip" aria-hidden="true" />
+                    <button type="button" class="station-card" data-open={`contract-${role.slug}`} aria-haspopup="dialog">
+                      <RoleAvatar slug={role.slug} />
+                      <span class="station-name">{role.kitchenName}</span>
+                      <span class="station-job">{role.job}</span>
+                      <span class="station-more">Contract</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))
+        }
+        {
+          roles.map((role) => (
+            <dialog class="contract" id={`contract-${role.slug}`} aria-labelledby={`contract-${role.slug}-title`}>
+              <div class="contract-body">
+                <button type="button" class="contract-close" data-close aria-label="Close">
+                  Close
+                </button>
+                <RoleAvatar slug={role.slug} />
+                <p class="contract-kind">{role.function}</p>
+                <h3 id={`contract-${role.slug}-title`}>{role.kitchenName}</h3>
+                <p class="contract-job">{role.job}</p>
+                <dl>
+                  <dt>Does</dt>
+                  <dd>{role.responsibility}</dd>
+                  <dt>Owes</dt>
+                  <dd>{role.evidence}</dd>
+                  <dt>Never</dt>
+                  <dd>{role.boundary}</dd>
+                </dl>
+                <p class="contract-foot">
+                  Installing this station starts no worker or schedule and grants no authority.
+                </p>
+              </div>
+            </dialog>
+          ))
+        }
+      </section>
+
       <section class="pass wrap" aria-labelledby="pass-title">
-        <h2 id="pass-title" class="visually-hidden">One issue, start to finish</h2>
+        <h2 id="pass-title">Follow one order</h2>
+        <p class="section-lede">
+          Here's issue #58 going through the kitchen. Every station hands over evidence, and nothing
+          moves on without it.
+        </p>
         <div class="board" data-board>
           <ol class="lamps">
             {
@@ -438,29 +504,11 @@ const menu = [
         </div>
       </section>
 
-      <section class="talk wrap" aria-labelledby="talk-title">
-        <h2 id="talk-title">Kitchen talk</h2>
-        <p class="section-lede">The words you'll see on this page, in plain terms.</p>
-        <dl class="terms">
-          {
-            glossary
-              .filter((t) => t.landing)
-              .map((t) => (
-                <div>
-                  <dt>{t.term}</dt>
-                  <dd>{t.meaning}</dd>
-                </div>
-              ))
-          }
-        </dl>
-        <a class="talk-more" href="/docs/start/glossary/">Full glossary</a>
-      </section>
-
       <section class="explorer wrap" aria-labelledby="explorer-title">
-        <h2 id="explorer-title">What it does</h2>
+        <h2 id="explorer-title">Start next to it</h2>
         <p class="section-lede center">
-          Work with it in your agent session, let it run the line on its own, and set it up from the
-          terminal in a couple of minutes.
+          Every brigade starts supervised. Hand it work from your agent session and watch how each
+          station cooks; set up your house from the terminal in a couple of minutes.
         </p>
         <div class="term" data-term>
           <svg class="doodle" viewBox="0 0 96 72" aria-hidden="true">
@@ -472,21 +520,25 @@ const menu = [
             <path d="M42 65h12" />
             <path d="M8 72c0-7 12-7 12 0M76 72c0-7 12-7 12 0" />
           </svg>
-          <div class="term-list" role="tablist" aria-label="Commands" aria-orientation="vertical">
+          <div class="term-list">
+            <div class="term-segments" role="group" aria-label="Kind of command">
+              {
+                [...new Set(commands.map((c) => c.group))].map((group, i) => (
+                  <button type="button" class="term-seg" aria-pressed={i === 0 ? "true" : "false"} data-seg={group}>
+                    {group}
+                  </button>
+                ))
+              }
+            </div>
+            <div class="term-tabs" role="tablist" aria-label="Commands" aria-orientation="vertical">
             {
               commands.map((c, i) => (
-                <>
-                  {commands[i - 1]?.group !== c.group && (
-                    <span class="term-group" role="presentation">
-                      {c.group}
-                    </span>
-                  )}
-                  <button type="button" role="tab" id={`term-tab-${c.id}`} aria-controls="term-screen" aria-selected={i === 0 ? "true" : "false"} tabindex={i === 0 ? 0 : -1} data-term-tab={c.id}>
-                    {c.label}
-                  </button>
-                </>
+                <button type="button" role="tab" id={`term-tab-${c.id}`} aria-controls="term-screen" aria-selected={i === 0 ? "true" : "false"} tabindex={i === 0 ? 0 : -1} data-term-tab={c.id} data-group={c.group} hidden={c.group !== commands[0]?.group}>
+                  {c.label}
+                </button>
               ))
             }
+            </div>
           </div>
           <div class="term-screen" id="term-screen" role="tabpanel">
             <div class="term-bar">
@@ -511,9 +563,20 @@ const menu = [
         <div class="wrap">
           <h2 id="autopilot-title">Put it on autopilot</h2>
           <p class="section-lede">
-            Close the laptop. The brigade keeps cooking on the stations you've trusted, stays inside the
-            house budget, and leaves the calls that need you on the pass for the morning.
+            Once a station has earned it, close the laptop. The brigade keeps cooking on the stations
+            you've trusted, stays inside the house budget, and leaves the calls that need you on the
+            pass for the morning.
           </p>
+          <ol class="steps">
+            {
+              steps.map((step) => (
+                <li class="step">
+                  <h3>{step.title}</h3>
+                  <p>{step.body}</p>
+                </li>
+              ))
+            }
+          </ol>
           <div class="shift">
             <ol class="shift-log">
               {
@@ -546,8 +609,8 @@ const menu = [
           </div>
           <ul class="guardrails">
             <li>
-              <h3>Earned, not switched on</h3>
-              <p>A station runs alone only after its supervised record meets your bar for that project and kind of work.</p>
+              <h3>One house at a time</h3>
+              <p>Trust earned in one house is never authority in another, and keys never cross.</p>
             </li>
             <li>
               <h3>Bounded</h3>
@@ -669,86 +732,28 @@ const menu = [
           </div>
           <div class="layer">
             <span class="layer-name">Agents</span>
-            <span class="layer-body chips">
-              {agents.map((agent) => <ToolChip name={agent.name} icon={"icon" in agent ? agent.icon : undefined} />)}
+            <span class="layer-body">
+              {orcaAgents.length} coding agents through Orca today, from Claude Code and Codex to Gemini,
+              Cursor and Devin.
             </span>
           </div>
         </div>
-      </section>
-
-      <section class="factory wrap" aria-labelledby="factory-title">
-        <h2 id="factory-title">You're not running a software factory.</h2>
-        <p class="section-lede">
-          Factories count units shipped. A good kitchen serves a full room every night and still sends
-          back any plate that isn't right. Quality at scale starts the same way in both places: nobody gets
-          the whole line on day one.
-        </p>
-        <ol class="steps">
-          {
-            steps.map((step) => (
-              <li class="step">
-                <h3>{step.title}</h3>
-                <p>{step.body}</p>
-              </li>
-            ))
-          }
-        </ol>
-      </section>
-
-      <section class="brigade" aria-labelledby="brigade-title">
-        <div class="wrap">
-          <h2 id="brigade-title">Meet the brigade</h2>
-          <p class="section-lede">
-            Eight stations, each with one job. Every station owes evidence and has a line it can't cross.
-            Stations open when there's work; installing kitchn starts nothing and grants no authority.
+        <div class="agent-wall">
+          <p class="agent-count">
+            <span>{orcaAgents.length}</span>
+            coding agents, one brigade
+          </p>
+          <p class="agent-note">
+            Anything Orca can launch can take a station. Put Codex on the line and Claude Code at the
+            pass, or pick per project and kind of work.
+          </p>
+          <div class="chips agent-chips">
+            {orcaAgents.map((agent) => <ToolChip name={agent.name} icon={agent.icon} />)}
+          </div>
+          <p class="agent-source">
+            Source: <a href="https://www.onorca.dev/docs/agents/supported">Orca's supported agents</a>
           </p>
         </div>
-        {
-          [roles].map((row) => (
-            <div class="line">
-              <div class="line-rail" aria-hidden="true" />
-              <ul class="stations wrap">
-                {row.map((role, i) => (
-                  <li class="station" style={`--i:${i}`}>
-                    <span class="clip" aria-hidden="true" />
-                    <button type="button" class="station-card" data-open={`contract-${role.slug}`} aria-haspopup="dialog">
-                      <RoleAvatar slug={role.slug} />
-                      <span class="station-name">{role.kitchenName}</span>
-                      <span class="station-job">{role.job}</span>
-                      <span class="station-more">Contract</span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))
-        }
-        {
-          roles.map((role) => (
-            <dialog class="contract" id={`contract-${role.slug}`} aria-labelledby={`contract-${role.slug}-title`}>
-              <div class="contract-body">
-                <button type="button" class="contract-close" data-close aria-label="Close">
-                  Close
-                </button>
-                <RoleAvatar slug={role.slug} />
-                <p class="contract-kind">{role.function}</p>
-                <h3 id={`contract-${role.slug}-title`}>{role.kitchenName}</h3>
-                <p class="contract-job">{role.job}</p>
-                <dl>
-                  <dt>Does</dt>
-                  <dd>{role.responsibility}</dd>
-                  <dt>Owes</dt>
-                  <dd>{role.evidence}</dd>
-                  <dt>Never</dt>
-                  <dd>{role.boundary}</dd>
-                </dl>
-                <p class="contract-foot">
-                  Installing this station starts no worker or schedule and grants no authority.
-                </p>
-              </div>
-            </dialog>
-          ))
-        }
       </section>
 
       <section class="looked wrap" aria-labelledby="looked-title">
@@ -819,6 +824,24 @@ const menu = [
             }
           </div>
         </div>
+      </section>
+
+      <section class="talk wrap" aria-labelledby="talk-title">
+        <h2 id="talk-title">Kitchen talk</h2>
+        <p class="section-lede">The kitchen words kitchn uses, in plain terms.</p>
+        <dl class="terms">
+          {
+            glossary
+              .filter((t) => t.landing)
+              .map((t) => (
+                <div>
+                  <dt>{t.term}</dt>
+                  <dd>{t.meaning}</dd>
+                </div>
+              ))
+          }
+        </dl>
+        <a class="talk-more" href="/docs/start/glossary/">Full glossary</a>
       </section>
 
       <section class="final wrap" aria-labelledby="final-title">
@@ -967,12 +990,27 @@ const menu = [
             const step = event.key === "ArrowDown" ? 1 : event.key === "ArrowUp" ? -1 : 0;
             if (step === 0) return;
             event.preventDefault();
-            const next = (i + step + tabs.length) % tabs.length;
-            select(next);
-            tabs[next]?.focus();
+            const visible = tabs.filter((t) => !t.hidden);
+            const at = visible.indexOf(tab);
+            const target = visible[(at + step + visible.length) % visible.length];
+            if (!target) return;
+            select(tabs.indexOf(target));
+            target.focus();
           });
         });
         term.querySelector("[data-term-replay]")?.addEventListener("click", () => select(current));
+        const segments = [...term.querySelectorAll<HTMLButtonElement>("[data-seg]")];
+        for (const seg of segments) {
+          seg.addEventListener("click", () => {
+            for (const s of segments) s.setAttribute("aria-pressed", String(s === seg));
+            let first = -1;
+            tabs.forEach((tab, i) => {
+              tab.hidden = tab.dataset.group !== seg.dataset.seg;
+              if (!tab.hidden && first < 0) first = i;
+            });
+            if (first >= 0) select(first);
+          });
+        }
 
         term.classList.add("live");
         const watch = new IntersectionObserver(
@@ -1559,7 +1597,37 @@ const menu = [
     border-style: dashed;
   }
 
-  /* Not a factory. */
+  /* The problem. */
+  .factory h2 {
+    max-width: 14ch;
+  }
+  .factory-split {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 2rem clamp(2rem, 6vw, 5rem);
+    margin-top: clamp(2rem, 4vw, 3rem);
+    align-items: start;
+  }
+  .factory-lede {
+    margin: 0;
+    font-size: clamp(1.125rem, 1.8vw, 1.3rem);
+    color: var(--ink-soft);
+  }
+  .factory-quote {
+    padding-left: 1.5rem;
+    border-left: 3px solid var(--red);
+  }
+  .factory-big {
+    margin: 0;
+    font: 900 clamp(1.9rem, 3.5vw, 2.75rem)/1 var(--display);
+    text-transform: uppercase;
+    color: var(--red);
+  }
+  .factory-quote p + p {
+    margin: 1rem 0 0;
+    color: var(--ink-soft);
+  }
+
   .steps {
     list-style: none;
     margin: clamp(2.5rem, 5vw, 3.5rem) 0 0;
@@ -1589,6 +1657,38 @@ const menu = [
   }
   .step p {
     margin: 0.6rem 0 0;
+    color: var(--ink-soft);
+  }
+
+  /* Agent wall. */
+  .agent-wall {
+    margin-top: clamp(3rem, 6vw, 4.5rem);
+    text-align: center;
+  }
+  .agent-count {
+    margin: 0;
+    font: 900 clamp(2rem, 4vw, 3rem)/1 var(--display);
+    text-transform: uppercase;
+  }
+  .agent-count span {
+    display: block;
+    font-size: clamp(5rem, 14vw, 10rem);
+    line-height: 0.85;
+    color: var(--red);
+  }
+  .agent-note {
+    max-width: 36rem;
+    margin: 1.25rem auto 0;
+    color: var(--ink-soft);
+  }
+  .agent-chips {
+    justify-content: center;
+    max-width: 60rem;
+    margin: 2rem auto 0;
+  }
+  .agent-source {
+    margin: 1.25rem 0 0;
+    font-size: 0.8125rem;
     color: var(--ink-soft);
   }
 
@@ -1936,8 +2036,7 @@ const menu = [
   .term {
     position: relative;
     display: grid;
-    grid-template-columns: 15rem minmax(0, 1fr);
-    min-height: 27rem;
+    grid-template-columns: 17.5rem minmax(0, 1fr);
     margin-top: clamp(2.5rem, 5vw, 3.5rem);
     background: #0c1012;
     border: 1px solid var(--steel-edge);
@@ -1973,6 +2072,10 @@ const menu = [
     padding: 1.05rem 1rem;
     cursor: pointer;
   }
+  .term-tabs {
+    display: flex;
+    flex-direction: column;
+  }
   .term-list button:hover {
     color: var(--ink);
   }
@@ -1980,10 +2083,30 @@ const menu = [
     color: var(--lamp);
     background: #161d21;
   }
-  .term-group {
-    padding: 1rem 1rem 0.4rem;
-    font: 600 0.75rem/1 var(--body);
-    color: #74828b;
+  .term-segments {
+    display: flex;
+    gap: 0.25rem;
+    padding: 0.6rem;
+    border-bottom: 1px solid var(--steel-edge);
+  }
+  .term-seg {
+    flex: 1;
+    font: 600 0.8125rem/1 var(--body);
+    color: var(--ink-soft);
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 0.55rem 0.5rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .term-seg[aria-pressed="true"] {
+    color: var(--ink);
+    background: var(--steel-2);
+    border-color: var(--steel-edge);
+  }
+  .term-list button[role="tab"][hidden] {
+    display: none;
   }
   .term-screen {
     min-width: 0;
@@ -2310,6 +2433,7 @@ const menu = [
   }
 
   @media (max-width: 60rem) {
+    .factory-split,
     .shift,
     .guardrails {
       grid-template-columns: minmax(0, 1fr);
@@ -2327,17 +2451,16 @@ const menu = [
       grid-template-columns: minmax(0, 1fr);
     }
     .term-list {
-      flex-direction: row;
-      overflow-x: auto;
       border-right: 0;
       border-bottom: 1px solid var(--steel-edge);
     }
-    .term-list button {
+    .term-tabs {
+      flex-direction: row;
+      overflow-x: auto;
+    }
+    .term-tabs button {
       white-space: nowrap;
       border-bottom: 0;
-    }
-    .term-group {
-      display: none;
     }
   }
 

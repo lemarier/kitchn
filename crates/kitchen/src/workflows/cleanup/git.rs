@@ -290,8 +290,10 @@ fn count_hidden(stdout: impl Read) -> io::Result<u32> {
     }
 }
 
-/// Whether `name`, a top-level entry of the checkout at `dir`, is ignored
-/// by Git and contains no tracked files.
+/// Whether `name`, a top-level entry of the checkout at `dir`, is ignored by
+/// Git and holds only ignored content: no tracked file, and no untracked file
+/// that Git does not ignore. A rule such as `name/*` with `!name/keep` ignores
+/// the entry while leaving a file of someone's work inside it.
 ///
 /// # Errors
 /// Returns a [`GitReadError`] when a call fails; callers must treat that as
@@ -317,9 +319,26 @@ pub(super) fn ignored_untracked(
         ["--literal-pathspecs", "ls-files", "-z", "--", &entry],
         limits,
     )?;
-    Ok(tracked.is_empty())
+    if !tracked.is_empty() {
+        return Ok(false);
+    }
+    let unignored = run(
+        dir,
+        [
+            "--literal-pathspecs",
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+            "--",
+            &entry,
+        ],
+        limits,
+    )?;
+    Ok(unignored.is_empty())
 }
-
 /// Run one read-only `git` call in `dir` that must succeed.
 fn run<const N: usize>(
     dir: &Path,

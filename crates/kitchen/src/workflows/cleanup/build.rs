@@ -173,9 +173,12 @@ fn allocated(metadata: &fs::Metadata) -> u64 {
 }
 
 /// Remove the build output directory `name` of the checkout at `worktree`
-/// after re-checking that it is a real top-level cache directory. The cache
-/// tag goes last, so a removal that fails part way leaves a directory that
-/// still qualifies as build output and a later run can finish it.
+/// after re-checking that it is a real top-level directory with a valid
+/// cache tag. Whether Git ignores it and whether anything in it is tracked or
+/// unignored is the caller's to establish immediately before, from
+/// [`find`]. The cache tag goes last, so a removal that fails part way leaves
+/// a directory that still qualifies as build output and a later run can
+/// finish it.
 ///
 /// # Errors
 /// Returns [`io::ErrorKind::InvalidInput`] when the checks fail, and the

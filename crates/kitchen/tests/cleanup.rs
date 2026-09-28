@@ -1336,6 +1336,53 @@ fn an_expired_approval_is_not_applied_until_a_person_renews_it() -> TestResult {
 }
 
 #[test]
+fn ignored_or_hidden_files_that_appear_after_the_approval_stop_the_release() -> TestResult {
+    let mut harness = Harness::new()?;
+    let ignored = harness.owner("task-1", true)?;
+    let hidden = harness.owner("task-2", true)?;
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    exclude(&harness.repo, ".env\n")?;
+    fs::write(harness.path(&ignored.worktree)?.join(".env"), "TOKEN=1\n")?;
+    let path = harness.path(&hidden.worktree)?.to_path_buf();
+    git(&path, &["update-index", "--assume-unchanged", "README.md"])?;
+    fs::write(path.join("README.md"), "edited out of sight\n")?;
+    let before = harness.backend.fake.effects_performed();
+    let report = harness.apply()?;
+    for owned in [&ignored, &hidden] {
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|result| result.resource != owned.worktree),
+            "a changed worktree is not even planned"
+        );
+    }
+    assert_eq!(
+        reasons(&report.preview, &ignored.worktree)?,
+        [Exclusion::IgnoredFiles]
+    );
+    assert_eq!(
+        reasons(&report.preview, &hidden.worktree)?,
+        [Exclusion::HiddenTrackedFiles]
+    );
+    // Only the two workers were released.
+    assert_eq!(harness.backend.fake.effects_performed(), before + 2);
+    Ok(())
+}
+
+#[test]
+fn an_approval_is_valid_up_to_and_including_its_maximum_age() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    harness.approve_all()?;
+    harness.clock.advance(PREVIEW_AGE.as_secs());
+    let report = harness.apply()?;
+    assert_eq!(outcome(&report, &owned.worktree)?, ReleaseOutcome::Released);
+    Ok(())
+}
+
+#[test]
 fn an_ignored_file_keeps_its_worktree_even_with_an_approval() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
@@ -1935,6 +1982,47 @@ fn workers_the_inventory_omits_are_still_observed_before_their_task_is_reclaimed
     Ok(())
 }
 
+#[test]
+fn a_declined_interactive_run_does_not_block_the_scheduled_release() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    let before = harness.backend.fake.effects_performed();
+    // A person is asked for consent and gives none. The run leaves a release
+    // task that holds no authority to release.
+    let declined = harness.apply_as(&grants()?, &interactive("session")?, &NoConsent)?;
+    assert_eq!(
+        outcome(&declined, &owned.worktree)?,
+        ReleaseOutcome::ConsentMissing
+    );
+    assert_eq!(harness.backend.fake.effects_performed(), before);
+
+    // The scheduled tick, on the same approval, must not inherit that task.
+    harness.clock.advance(60);
+    let scheduled_run = harness.apply()?;
+    assert_eq!(
+        outcome(&scheduled_run, &owned.worktree)?,
+        ReleaseOutcome::Released
+    );
+    assert_eq!(
+        outcome(&scheduled_run, &owned.worker)?,
+        ReleaseOutcome::Released
+    );
+    // The declined session's tasks were settled rather than left claimed.
+    let open = harness
+        .store()
+        .tasks()?
+        .into_iter()
+        .filter(|task| {
+            task.spec().id.as_str().starts_with("dishwasher-")
+                && !matches!(task.state(), kitchen::state::TaskState::Settled { .. })
+        })
+        .count();
+    assert_eq!(open, 0, "no release task is left unsettled");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The Git reader's bounds
 
@@ -2291,19 +2379,75 @@ fn only_ignored_untracked_tagged_directories_are_build_output() -> TestResult {
 }
 
 #[test]
-fn a_directory_named_like_pathspec_magic_is_checked_literally() -> TestResult {
+fn a_tagged_directory_holding_an_unignored_untracked_file_is_not_build_output() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
     let path = harness.path(&owned.worktree)?.to_path_buf();
-    // As a pathspec, `:(top)target/` names the ignored top-level `target/`,
-    // not this directory, which is neither ignored nor free of tracked files.
+    // Everything in `cache/` is ignored except one file a person put there.
+    exclude(&harness.repo, "/cache/*\n!/cache/keep.txt\n")?;
+    let cache = path.join("cache");
+    fs::create_dir_all(&cache)?;
+    fs::write(cache.join("CACHEDIR.TAG"), CACHEDIR_SIGNATURE)?;
+    fs::write(cache.join("out.o"), "generated")?;
+    fs::write(cache.join("keep.txt"), "mine")?;
+    let preview = harness.inspect()?;
+    let entry = preview.entry(&owned.worktree).ok_or("worktree")?;
+    assert!(
+        entry.build_output.is_none(),
+        "a directory with unignored work is not build output"
+    );
+    assert_eq!(
+        reasons(&preview, &owned.worktree)?,
+        [Exclusion::UntrackedFiles, Exclusion::IgnoredFiles]
+    );
+    // Nothing to approve, so nothing is removed.
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    assert!(harness.reclaim()?.results.is_empty());
+    assert!(cache.join("keep.txt").is_file());
+    Ok(())
+}
+
+#[test]
+fn a_self_ignoring_tagged_directory_is_still_build_output() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    // No rule in the repository: the directory ignores its own contents.
+    let out = path.join("out-dir");
+    fs::create_dir_all(out.join("deps"))?;
+    fs::write(out.join("CACHEDIR.TAG"), CACHEDIR_SIGNATURE)?;
+    fs::write(out.join(".gitignore"), "*\n")?;
+    fs::write(out.join("deps").join("lib.rlib"), "generated")?;
+    let preview = harness.inspect()?;
+    let entry = preview.entry(&owned.worktree).ok_or("worktree")?;
+    assert!(entry.build_output_eligible());
+    assert_eq!(reasons(&preview, &owned.worktree)?, []);
+    Ok(())
+}
+
+#[test]
+fn an_ignored_directory_named_like_pathspec_magic_is_checked_for_tracked_files_literally()
+-> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    // This directory is ignored, tagged, and holds a tracked file. As a
+    // pathspec, `:(top)target/` would name the (empty) top-level `target/`.
+    exclude(&harness.repo, "/:(top)target/\n")?;
     let odd = path.join(":(top)target");
     fs::create_dir_all(&odd)?;
     fs::write(odd.join("CACHEDIR.TAG"), CACHEDIR_SIGNATURE)?;
     fs::write(odd.join("kept.txt"), "tracked\n")?;
     git(
         &path,
-        &["--literal-pathspecs", "add", "--", ":(top)target/kept.txt"],
+        &[
+            "--literal-pathspecs",
+            "add",
+            "--force",
+            "--",
+            ":(top)target/kept.txt",
+        ],
     )?;
     git(
         &path,
@@ -2314,7 +2458,7 @@ fn a_directory_named_like_pathspec_magic_is_checked_literally() -> TestResult {
     let entry = preview.entry(&owned.worktree).ok_or("worktree")?;
     assert!(
         entry.build_output.is_none(),
-        "a directory holding tracked files is not build output"
+        "a directory holding a tracked file is not build output"
     );
     Ok(())
 }

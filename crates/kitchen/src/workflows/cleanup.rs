@@ -6,7 +6,8 @@
 //! positive evidence that its ownership ended and nothing would be lost:
 //!
 //! - exactly one Kitchen task created it through an applied effect, and the
-//!   backend's owner record, when present, names that same effect;
+//!   backend's owner record names that same effect (a backend that records no
+//!   owner leaves it unconfirmed, and it is retained);
 //! - that task is settled with every effect resolved, and no other unsettled
 //!   task was given the resource;
 //! - the backend reports it exited, and every worker of the owning task is
@@ -27,7 +28,10 @@
 //! needs an approval that the automation which inspected cannot give itself:
 //! [`approve`] records, for one previewed step, a marker keyed by the resource
 //! and the digest of the evidence it was judged on, and refuses any claimant
-//! that is not [`Trigger::Interactive`], a person present. [`apply`] and
+//! that is not [`Trigger::Interactive`]. That trigger is declared by the
+//! caller: the library cannot tell a person from a script, so scheduled
+//! workflows must never build an interactive claimant, the same boundary as a
+//! person's consent for an effect. [`apply`] and
 //! [`reclaim_build_output`] act only where such a person-recorded approval
 //! names the unchanged digest and is not older than the allowed age, so the
 //! first run against an existing backlog is preview-only and a scheduled run
@@ -750,9 +754,11 @@ pub fn apply(
         )? {
             Approval::Missing => Plan::Report(ReleaseOutcome::NotApproved),
             Approval::Expired => Plan::Report(ReleaseOutcome::ApprovalExpired),
-            Approval::Approved(approved_at) => {
-                Plan::Drive(release_task_id(&entry.observation, approved_at)?)
-            }
+            Approval::Approved(approved_at) => Plan::Drive(release_task_id(
+                &entry.observation,
+                approved_at,
+                claimant.trigger,
+            )?),
         };
         planned.push((entry, plan));
     }
@@ -1187,12 +1193,19 @@ fn is_release_task(task: &TaskRecord) -> bool {
 
 /// The release task for one approved observation. The approval's time is
 /// part of the identity, so a renewed approval starts a new task while an
-/// interrupted run resumes the same one.
-fn release_task_id(observation: &ExternalRef, approved_at: Timestamp) -> Result<TaskId> {
+/// interrupted run resumes the same one. So is the trigger: a scheduled and
+/// an interactive run hold different authority, and neither may inherit a
+/// task the other created.
+fn release_task_id(
+    observation: &ExternalRef,
+    approved_at: Timestamp,
+    trigger: Trigger,
+) -> Result<TaskId> {
     let mut digest = Sha256::new();
-    digest.update(b"kitchen-dishwasher-release-v1\0");
+    digest.update(b"kitchen-dishwasher-release-v2\0");
     digest.update(observation.as_str().as_bytes());
     digest.update(approved_at.as_unix_millis().to_be_bytes());
+    digest.update(trigger.to_string().as_bytes());
     let hex = hex(digest.finalize().as_slice());
     let short = hex.get(..48).ok_or(CleanupError::Encoding)?;
     Ok(TaskId::new(&format!("{TASK_PREFIX}{short}"))?)

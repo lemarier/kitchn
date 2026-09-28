@@ -63,7 +63,8 @@ enum CleanupCommand {
     },
     /// Record your approval of previewed steps, by the digests the preview
     /// showed. A scheduled run acts only on steps a person approved this way,
-    /// and only while the evidence still matches. Releases nothing.
+    /// and only while the evidence still matches. Releases nothing. Run it
+    /// yourself: the command cannot tell a person from a script.
     Approve {
         #[command(flatten)]
         source: Source,

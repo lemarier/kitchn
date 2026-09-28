@@ -1830,6 +1830,43 @@ fn merge_without_a_merged_state_stays_unresolved() -> TestResult {
 }
 
 #[test]
+fn lost_merge_on_a_retargeted_open_pull_request_stays_uncertain() -> TestResult {
+    // The head is unchanged, so the lost request may still merge into the new
+    // base; a retarget alone does not show that it never will.
+    let (report, calls) = reconcile_lost_merge(open_pull_request(HEAD, "release"))?;
+    assert!(report.resolved.is_empty());
+    assert!(matches!(
+        report.unresolved.as_slice(),
+        [record] if matches!(
+            record.state(),
+            EffectState::Uncertain {
+                reason: UncertainReason::LookupInconclusive,
+                ..
+            }
+        )
+    ));
+    assert_eq!(calls, 1, "reconciliation never writes");
+    Ok(())
+}
+
+#[test]
+fn lost_merge_on_a_retargeted_and_moved_pull_request_is_absent() -> TestResult {
+    let (report, _) = reconcile_lost_merge(open_pull_request(MOVED, "release"))?;
+    assert!(report.unresolved.is_empty());
+    assert!(matches!(
+        report.resolved.as_slice(),
+        [record] if matches!(
+            record.state(),
+            EffectState::NotApplied {
+                reason: NotAppliedReason::ConfirmedAbsent,
+                ..
+            }
+        )
+    ));
+    Ok(())
+}
+
+#[test]
 fn already_merged_retargeted_pull_request_is_applied_without_submission() -> TestResult {
     let fixture = Fixture::new()?;
     let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::Merge], "github")?;

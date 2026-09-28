@@ -128,6 +128,10 @@ pub(crate) enum Inspection {
     Applied(Receipt),
     Missing,
     Conflict,
+    /// An unmerged pull request at the expected head now targets another
+    /// base. No new merge may start, but an earlier request carrying the
+    /// expected head can still merge it, so this is not absence evidence.
+    Retargeted,
 }
 
 /// Per-operation read budget; an exhausted page budget is never absence evidence.
@@ -323,7 +327,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                     return Ok(Inspection::Applied(receipt));
                 }
                 if pr.pointer("/base/ref").and_then(Value::as_str) != Some(expected_base.as_str()) {
-                    return Ok(Inspection::Conflict);
+                    return Ok(Inspection::Retargeted);
                 }
                 Ok(Inspection::Missing)
             }

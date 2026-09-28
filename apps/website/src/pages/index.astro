@@ -375,7 +375,7 @@ const menu = [
         </div>
         <p class="setup-note">
           Both arrive with the first release (<a href="https://github.com/lemarier/kitchen/issues/18">#18</a>).
-          Until then, <a href="/docs/start/install/#from-source">build from source</a>, then
+          Until then, <a href="/docs/start/install/#from-source">build from source</a>, then{" "}
           <a href="/docs/start/quickstart/">set up your first house</a>.
         </p>
       </section>
@@ -2754,6 +2754,34 @@ const menu = [
   }
 
   @media (max-width: 40rem) {
+    /* The install command wraps instead of hiding behind the copy button. */
+    .installer-cmd code {
+      white-space: pre-wrap;
+      word-break: break-all;
+      font-size: 0.8125rem;
+    }
+    /* Log lines take space only once printed, so the ticket grows as the
+       order moves instead of opening as a tall blank page. */
+    .live .log-line {
+      display: none;
+    }
+    .live .log-line.shown {
+      display: grid;
+    }
+    /* Terminal lines scroll sideways like a real terminal, keeping the
+       fixed-height screen short. */
+    .term-out {
+      white-space: pre;
+      overflow-x: auto;
+      overflow-wrap: normal;
+      font-size: 0.75rem;
+    }
+    .term-bar {
+      flex-wrap: wrap;
+    }
+    .term-bar [data-term-summary] {
+      flex-basis: 100%;
+    }
     .nav-github {
       display: none;
     }

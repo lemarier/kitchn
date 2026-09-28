@@ -8,9 +8,9 @@ use std::{cell::Cell, time::Duration};
 use kitchen::{
     BackendId, EffectName, HolderId, HouseId, TaskId,
     contracts::{
-        Clock, CommitId, EvidenceRevision, Fence, Grant, HouseGrants, LeaseTtl, Operation,
-        Permission, Provenance, RetryPolicy, Role, TaskAuthority, TaskSpec, Text, Timestamp,
-        Workspace,
+        BackendDescriptor, Capability, CapabilitySet, Clock, CommitId, EvidenceRevision, Fence,
+        Grant, HouseGrants, LeaseTtl, Operation, Permission, Provenance, RetryPolicy, Role,
+        TaskAuthority, TaskSpec, Text, Timestamp, Workspace,
     },
     state::{EffectPlan, HouseStore, StoreOptions},
 };
@@ -166,4 +166,31 @@ impl Clock for ManualClock {
     fn now(&self) -> Timestamp {
         Timestamp::from_unix_millis(self.0.get())
     }
+}
+
+pub fn descriptor_with(
+    capabilities: impl IntoIterator<Item = Capability>,
+) -> TestResult<BackendDescriptor> {
+    Ok(BackendDescriptor {
+        backend: backend_id()?,
+        house: house()?,
+        capabilities: CapabilitySet::supporting(capabilities),
+    })
+}
+
+/// A worker backend with lookup but without provider-side idempotency.
+pub fn refusing() -> TestResult<BackendDescriptor> {
+    descriptor_with([
+        Capability::WorkerLaunchIsolated,
+        Capability::WorkerMessaging,
+        Capability::WorkerCancel,
+        Capability::ResourceRelease,
+        Capability::WorkerStatusAndOutcome,
+        Capability::EffectLookup,
+    ])
+}
+
+/// A backend declaring every capability, including idempotent requests.
+pub fn idempotent() -> TestResult<BackendDescriptor> {
+    descriptor_with(Capability::ALL)
 }

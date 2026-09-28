@@ -25,6 +25,7 @@ fn conformance_fixture() -> TestResult<ConformanceFixture> {
     Ok(ConformanceFixture {
         house: house()?,
         foreign_house: other_house()?,
+        foreign_backend: BackendId::new("fake-other")?,
         task: task_id("conformance")?,
         run_tag: ExternalRef::new("run-1")?,
         brief: Text::new("Conformance probe; exit immediately.")?,
@@ -66,6 +67,7 @@ fn fake_backend_passes_the_shared_contract() -> TestResult {
     for check in [
         Check::DescriptorHouse,
         Check::CrossHouseRefused,
+        Check::ForeignBackendRefused,
         Check::UnsupportedRefused,
         Check::UnknownKeyNotApplied,
         Check::LaunchReceipt,
@@ -135,6 +137,7 @@ impl ExecutionBackend for HouseBlindBackend {
     fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
         let rewritten = EffectRequest::new(
             self.0.descriptor().house.clone(),
+            request.backend().clone(),
             request.task().clone(),
             request.attempt(),
             request.key().clone(),
@@ -510,7 +513,7 @@ fn recovery_after_interruption_reconciles_before_relaunch() -> TestResult {
     let kitchen::state::EffectStart::Execute(intent) = fixture.store.begin_effect(
         plan(&task, old, "launch", launch()?)?,
         &grants()?,
-        kitchen::state::Resubmission::Refuse,
+        &common::refusing()?,
         at(1),
     )?
     else {
@@ -642,5 +645,47 @@ fn settled_task_identity_is_never_reused() -> TestResult {
         matches!(record.effects(), [effect] if effect.request().key() == first.request().key())
     );
     assert_eq!(backend.effects_performed(), 1);
+    Ok(())
+}
+
+#[test]
+fn recovery_stays_on_the_backend_namespace_that_received_the_effect() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = started(&fixture, "task-1")?;
+    let first = FakeBackend::fully_capable(backend_id()?, house()?);
+    let second = FakeBackend::fully_capable(BackendId::new("fake-other")?, house()?);
+    let clock = ManualClock::starting_at(1);
+    first.inject(ExecuteFault::ApplyThenLoseResponse);
+    let lost = run_effect(
+        &fixture.store,
+        &first,
+        &grants()?,
+        plan(&task, fence, "launch", launch()?)?,
+        &clock,
+    )?;
+    assert!(matches!(lost.state(), EffectState::Uncertain { .. }));
+
+    assert!(matches!(
+        run_effect(&fixture.store, &second, &grants()?, plan(&task, fence, "launch", launch()?)?, &clock),
+        Err(Error::State(StateError::BackendMismatch { seq, ref recorded })) if seq == lost.seq() && recorded == &backend_id()?
+    ));
+    let report = reconcile(&fixture.store, &second, &task, fence, &clock)?;
+    assert!(report.resolved.is_empty() && report.unresolved.is_empty());
+    assert!(matches!(report.foreign.as_slice(), [effect] if effect.seq() == lost.seq()));
+    assert_eq!(
+        second.effects_performed(),
+        0,
+        "the other namespace executed the key"
+    );
+    assert!(
+        matches!(fixture.store.task(&task)?.effects(), [effect] if matches!(effect.state(), EffectState::Uncertain { .. })),
+        "the other namespace resolved the effect"
+    );
+    // The namespace that received the launch still resolves it.
+    let report = reconcile(&fixture.store, &first, &task, fence, &clock)?;
+    assert!(
+        matches!(report.resolved.as_slice(), [effect] if matches!(effect.state(), EffectState::Applied { .. }))
+    );
+    assert_eq!(first.effects_performed(), 1);
     Ok(())
 }

@@ -239,7 +239,8 @@ impl CapabilitySet {
 /// selected before any effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendDescriptor {
-    /// Backend identity.
+    /// Backend identity: one provider namespace (instance and account). Effect
+    /// intents record it, and only this backend may execute or reconcile them.
     pub backend: BackendId,
     /// The only house this instance may act for.
     pub house: HouseId,

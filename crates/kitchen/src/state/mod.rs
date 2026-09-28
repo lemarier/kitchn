@@ -29,6 +29,6 @@ pub use model::{
     AttemptRecord, AttemptState, CancelRequest, CancelStatus, Consumption, Creation, EffectOutcome,
     EffectPlan, EffectRecord, EffectStart, EffectState, EvidenceLog, Lease, MAX_CONSUMED_MESSAGES,
     MAX_CONSUMERS, MAX_EFFECTS_PER_TASK, MAX_EVIDENCE_PER_REVISION, MAX_OWNERSHIP_HISTORY,
-    MAX_TASKS, OwnershipEvent, RecoveryItem, Resubmission, TaskRecord, TaskState,
+    MAX_TASKS, OwnershipEvent, RecoveryItem, TaskRecord, TaskState,
 };
 pub use store::{HouseStore, StoreOptions};

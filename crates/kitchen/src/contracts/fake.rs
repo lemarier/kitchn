@@ -182,6 +182,9 @@ impl ExecutionBackend for FakeBackend {
         if request.house() != &self.descriptor.house {
             return Err(EffectFailure::NotApplied(NotAppliedReason::CrossHouse));
         }
+        if request.backend() != &self.descriptor.backend {
+            return Err(EffectFailure::NotApplied(NotAppliedReason::ForeignBackend));
+        }
         let capability = request.operation().required_capability();
         if !self.descriptor.capabilities.supports(capability) {
             return Err(EffectFailure::NotApplied(NotAppliedReason::Unsupported(

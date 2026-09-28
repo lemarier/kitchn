@@ -25,7 +25,7 @@ use kitchen::{
     state::{
         AttemptState, CancelStatus, Consumption, Corruption, Creation, EffectOutcome, EffectStart,
         EffectState, HouseStore, MAX_EVIDENCE_PER_REVISION, OwnershipEvent, RecoveryItem,
-        Resubmission, StateError, StoreOptions, TaskState,
+        StateError, StoreOptions, TaskState,
     },
 };
 
@@ -302,7 +302,7 @@ fn stale_owner_is_fenced_after_takeover() -> TestResult {
             .begin_effect(
                 plan(&task, old, "launch", launch()?)?,
                 &grants,
-                Resubmission::Refuse,
+                &common::refusing()?,
                 at(62)
             )
             .map(|_| ())
@@ -379,7 +379,7 @@ fn repeated_events_are_idempotent_and_contradictions_rejected() -> TestResult {
     let EffectStart::Execute(intent) = store.begin_effect(
         plan(&task, fence, "launch", launch()?)?,
         &grants()?,
-        Resubmission::Refuse,
+        &common::refusing()?,
         at(1),
     )?
     else {
@@ -409,7 +409,7 @@ fn repeated_events_are_idempotent_and_contradictions_rejected() -> TestResult {
         ));
     }
     assert!(matches!(
-        store.begin_effect(plan(&task, fence, "launch", launch()?)?, &grants()?, Resubmission::Refuse, at(5))?,
+        store.begin_effect(plan(&task, fence, "launch", launch()?)?, &grants()?, &common::refusing()?, at(5))?,
         EffectStart::Resolved(record) if record.seq() == seq
     ));
 
@@ -534,7 +534,7 @@ fn cancellation_stops_new_work_and_needs_resolved_effects() -> TestResult {
     let EffectStart::Execute(intent) = store.begin_effect(
         plan(&busy, fence, "launch", launch()?)?,
         &grants()?,
-        Resubmission::Refuse,
+        &common::refusing()?,
         at(1),
     )?
     else {
@@ -548,7 +548,7 @@ fn cancellation_stops_new_work_and_needs_resolved_effects() -> TestResult {
         store.begin_effect(
             plan(&busy, fence, "message", launch()?)?,
             &grants()?,
-            Resubmission::Refuse,
+            &common::refusing()?,
             at(3)
         ),
         Err(Error::State(StateError::CancelRequested))
@@ -613,12 +613,12 @@ fn new_evidence_subject_invalidates_earlier_decisions() -> TestResult {
     let mut stale = plan(&task, fence, "launch", launch()?)?;
     stale.decided_at = first;
     assert!(matches!(
-        store.begin_effect(stale.clone(), &grants()?, Resubmission::Refuse, at(3)),
+        store.begin_effect(stale.clone(), &grants()?, &common::refusing()?, at(3)),
         Err(Error::State(StateError::StaleDecision { decided, current })) if decided == first && current == moved
     ));
     stale.decided_at = moved;
     assert!(matches!(
-        store.begin_effect(stale, &grants()?, Resubmission::Refuse, at(3))?,
+        store.begin_effect(stale, &grants()?, &common::refusing()?, at(3))?,
         EffectStart::Execute(_)
     ));
     assert_eq!(EvidenceRevision::INITIAL.get(), 0);
@@ -657,12 +657,12 @@ fn effects_are_checked_against_current_house_grants() -> TestResult {
 
     let revoked = grants_for(house()?, &[Permission::MessageWorker]);
     assert!(matches!(
-        store.begin_effect(launch_plan()?, &revoked, Resubmission::Refuse, at(1)),
+        store.begin_effect(launch_plan()?, &revoked, &common::refusing()?, at(1)),
         Err(Error::Contract(ContractError::AuthorityExpansion { .. }))
     ));
     let foreign = grants_for(other_house()?, &common::WORKER_PERMISSIONS);
     assert!(matches!(
-        store.begin_effect(launch_plan()?, &foreign, Resubmission::Refuse, at(1)),
+        store.begin_effect(launch_plan()?, &foreign, &common::refusing()?, at(1)),
         Err(Error::Contract(ContractError::CrossHouse { .. }))
     ));
 
@@ -683,7 +683,7 @@ fn effects_are_checked_against_current_house_grants() -> TestResult {
         store.begin_effect(
             plan(&narrow, narrow_fence, "launch", launch()?)?,
             &grants()?,
-            Resubmission::Refuse,
+            &common::refusing()?,
             at(1)
         ),
         Err(Error::Contract(ContractError::PermissionDenied {
@@ -706,7 +706,7 @@ fn unresolved_effect_blocks_new_work_until_resolved() -> TestResult {
     let EffectStart::Execute(intent) = store.begin_effect(
         plan(&task, fence, "launch", launch()?)?,
         &grants()?,
-        Resubmission::Refuse,
+        &common::refusing()?,
         at(1),
     )?
     else {
@@ -721,14 +721,14 @@ fn unresolved_effect_blocks_new_work_until_resolved() -> TestResult {
     )?;
 
     assert!(matches!(
-        store.begin_effect(plan(&task, fence, "launch", launch()?)?, &grants()?, Resubmission::Refuse, at(3)),
+        store.begin_effect(plan(&task, fence, "launch", launch()?)?, &grants()?, &common::refusing()?, at(3)),
         Err(Error::State(StateError::UnsafeRetry(seq))) if seq == intent.seq()
     ));
     assert!(matches!(
         store.begin_effect(
             plan(&task, fence, "other", launch()?)?,
             &grants()?,
-            Resubmission::Refuse,
+            &common::refusing()?,
             at(3)
         ),
         Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
@@ -744,7 +744,7 @@ fn unresolved_effect_blocks_new_work_until_resolved() -> TestResult {
         Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
     ));
     assert!(matches!(
-        store.begin_effect(plan(&task, fence, "launch", launch()?)?, &grants()?, Resubmission::SameKey, at(3))?,
+        store.begin_effect(plan(&task, fence, "launch", launch()?)?, &grants()?, &common::idempotent()?, at(3))?,
         EffectStart::Execute(record) if record.request().key() == intent.request().key()
     ));
 

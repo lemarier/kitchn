@@ -3,7 +3,7 @@
 use std::{fmt, io};
 
 use crate::{
-    ConsumerId, ErrorClass, HolderId, TaskId,
+    BackendId, ConsumerId, ErrorClass, HolderId, TaskId,
     contracts::{AttemptNumber, EffectSeq, EvidenceRevision, Fence, Settlement, Timestamp},
 };
 
@@ -194,6 +194,15 @@ pub enum StateError {
     /// An effect name was reused within an attempt for a different operation.
     #[error("effect {0} already uses this name for a different operation")]
     EffectNameConflict(EffectSeq),
+    /// The effect was persisted for another backend namespace; only that
+    /// backend may execute or reconcile it.
+    #[error("effect {seq} belongs to backend {recorded}")]
+    BackendMismatch {
+        /// The effect.
+        seq: EffectSeq,
+        /// The backend namespace recorded with its intent.
+        recorded: BackendId,
+    },
     /// A reported outcome contradicts the recorded one.
     #[error("effect {0} already has a contradicting recorded outcome")]
     ConflictingOutcome(EffectSeq),
@@ -281,6 +290,7 @@ impl StateError {
             | Self::UnresolvedEffects { .. }
             | Self::EffectNotFound(_)
             | Self::EffectNameConflict(_)
+            | Self::BackendMismatch { .. }
             | Self::ConflictingOutcome(_)
             | Self::ConflictingAttemptOutcome
             | Self::StaleDecision { .. }

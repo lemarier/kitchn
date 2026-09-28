@@ -38,12 +38,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConsumerId, Error, HolderId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, AttemptOutcome, AttemptStart, ContractError, Disposition, EffectSeq,
-        Evidence, EvidenceRevision, ExternalRef, Fence, HouseGrants, LeaseTtl, TaskSpec, Timestamp,
+        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, ContractError, Disposition,
+        EffectSeq, Evidence, EvidenceRevision, ExternalRef, Fence, HouseGrants, LeaseTtl, TaskSpec,
+        Timestamp,
     },
     state::{
         CancelStatus, Consumption, Corruption, Creation, EffectOutcome, EffectPlan, EffectRecord,
-        EffectStart, Lease, RecoveryItem, Resubmission, StateError, StorageOperation, TaskRecord,
+        EffectStart, Lease, RecoveryItem, StateError, StorageOperation, TaskRecord,
         model::{SCHEMA_VERSION, SchemaProbe, StoreState},
     },
 };
@@ -335,12 +336,16 @@ impl HouseStore {
         self.transact(|state| state.settle_cancelled(id, fence, now))
     }
 
-    /// Persist the intent for one effect before it is executed.
+    /// Persist the intent for one effect on `backend` before it is executed.
     ///
-    /// Checks, in one transaction: the grants' house, live ownership, no
-    /// pending cancellation, a running attempt, the decision's evidence
-    /// revision, task authority against the house's current grants, and that
-    /// no other effect is unresolved.
+    /// Checks, in one transaction: the grants' and backend's house, the
+    /// backend's capabilities, live ownership, no pending cancellation, a
+    /// running attempt, the decision's evidence revision, task authority
+    /// against the house's current grants, and that no other effect is
+    /// unresolved. The intent records the backend namespace; a repeated
+    /// request for the same logical effect must come from that backend.
+    /// An uncertain effect is resubmitted with its key only when the backend
+    /// declares [`crate::contracts::Capability::EffectIdempotentRequests`].
     ///
     /// # Errors
     /// Returns the first failed check.
@@ -348,10 +353,10 @@ impl HouseStore {
         &self,
         plan: EffectPlan,
         grants: &HouseGrants,
-        resubmission: Resubmission,
+        backend: &BackendDescriptor,
         now: Timestamp,
     ) -> Result<EffectStart> {
-        self.transact(|state| state.begin_effect(plan, grants, resubmission, now))
+        self.transact(|state| state.begin_effect(plan, grants, backend, now))
     }
 
     /// Record what is known about an effect. Only the current fence may

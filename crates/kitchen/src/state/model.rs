@@ -11,10 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConsumerId, EffectName, Error, HolderId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, AttemptOutcome, AttemptStart, CommitId, ContractError, Disposition,
-        EffectRequest, EffectSeq, Evidence, EvidenceRevision, ExternalRef, FailureClass, Fence,
-        HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation, Receipt, Settlement,
-        TaskSpec, Timestamp, UncertainReason,
+        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Capability, CommitId,
+        ContractError, Disposition, EffectRequest, EffectSeq, Evidence, EvidenceRevision,
+        ExternalRef, FailureClass, Fence, HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason,
+        Operation, Receipt, Settlement, TaskSpec, Timestamp, UncertainReason,
     },
     state::{Corruption, Limit, StateError},
 };
@@ -558,7 +558,7 @@ pub enum Consumption {
 
 /// Whether an uncertain effect may be resubmitted with its original key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Resubmission {
+enum Resubmission {
     /// The backend cannot deduplicate; refuse.
     Refuse,
     /// The backend deduplicates by key; resubmit with the same key.
@@ -1022,16 +1022,29 @@ impl StoreState {
         &mut self,
         plan: EffectPlan,
         grants: &HouseGrants,
-        resubmission: Resubmission,
+        backend: &BackendDescriptor,
         now: Timestamp,
     ) -> Result<EffectStart> {
-        if grants.house() != &self.house {
-            return Err(ContractError::CrossHouse {
-                expected: self.house.clone(),
-                found: grants.house().clone(),
+        for house in [grants.house(), &backend.house] {
+            if house != &self.house {
+                return Err(ContractError::CrossHouse {
+                    expected: self.house.clone(),
+                    found: house.clone(),
+                }
+                .into());
             }
-            .into());
         }
+        backend
+            .capabilities
+            .require([plan.operation.required_capability()])?;
+        let resubmission = if backend
+            .capabilities
+            .supports(Capability::EffectIdempotentRequests)
+        {
+            Resubmission::SameKey
+        } else {
+            Resubmission::Refuse
+        };
         let house = self.house.clone();
         let nonce = self.nonce;
         let task = self.task_mut(&plan.task)?;
@@ -1062,6 +1075,12 @@ impl StoreState {
         if let Some(existing) = same_name {
             if existing.request.operation() != &plan.operation {
                 return fail(StateError::EffectNameConflict(existing.seq));
+            }
+            if existing.request.backend() != &backend.backend {
+                return fail(StateError::BackendMismatch {
+                    seq: existing.seq,
+                    recorded: existing.request.backend().clone(),
+                });
             }
             return match (&existing.state, resubmission) {
                 (EffectState::Applied { .. } | EffectState::Unresolvable { .. }, _) => {
@@ -1100,6 +1119,7 @@ impl StoreState {
             intended_at: now,
             request: EffectRequest::new(
                 house,
+                backend.backend.clone(),
                 plan.task,
                 attempt,
                 IdempotencyKey::from_ref(key),

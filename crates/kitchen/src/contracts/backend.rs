@@ -10,7 +10,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    HouseId, TaskId,
+    BackendId, HouseId, TaskId,
     contracts::{
         AttemptNumber, BackendDescriptor, Capability, ContractError, ExternalRef, Permission,
         ResourceRef, Role, Text, ValueKind,
@@ -116,6 +116,7 @@ impl fmt::Display for IdempotencyKey {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EffectRequest {
     house: HouseId,
+    backend: BackendId,
     task: TaskId,
     attempt: AttemptNumber,
     key: IdempotencyKey,
@@ -129,6 +130,7 @@ impl EffectRequest {
     #[must_use]
     pub const fn new(
         house: HouseId,
+        backend: BackendId,
         task: TaskId,
         attempt: AttemptNumber,
         key: IdempotencyKey,
@@ -136,6 +138,7 @@ impl EffectRequest {
     ) -> Self {
         Self {
             house,
+            backend,
             task,
             attempt,
             key,
@@ -147,6 +150,13 @@ impl EffectRequest {
     #[must_use]
     pub const fn house(&self) -> &HouseId {
         &self.house
+    }
+
+    /// The backend namespace the intent was persisted for. The key is only
+    /// meaningful there, so only that backend may execute or look it up.
+    #[must_use]
+    pub const fn backend(&self) -> &BackendId {
+        &self.backend
     }
 
     /// The owning task.
@@ -247,6 +257,8 @@ pub enum NotAppliedReason {
     Unsupported(Capability),
     /// The request named a house this backend instance does not serve.
     CrossHouse,
+    /// The request was persisted for another backend namespace.
+    ForeignBackend,
     /// The provider refused the request before acting.
     Rejected,
     /// A lookup established that the provider never applied the key.
@@ -339,8 +351,11 @@ pub enum BackendUnavailable {
 ///
 /// - Every call is bounded by a deadline; an expired call reports
 ///   [`EffectFailure::Uncertain`] or [`BackendUnavailable::Timeout`], never success.
+/// - [`BackendDescriptor::backend`] names one provider namespace: the
+///   instance and account whose idempotency keys and lookups it uses.
 /// - `execute` refuses a request for another house with
-///   [`NotAppliedReason::CrossHouse`] and an operation whose capability is not
+///   [`NotAppliedReason::CrossHouse`], a request persisted for another
+///   backend namespace with [`NotAppliedReason::ForeignBackend`], and an operation whose capability is not
 ///   fully supported with [`NotAppliedReason::Unsupported`], in both cases
 ///   without acting.
 /// - `execute` returns [`EffectFailure::NotApplied`] only when the effect

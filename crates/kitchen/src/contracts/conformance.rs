@@ -9,7 +9,7 @@
 use std::fmt;
 
 use crate::{
-    HouseId, TaskId,
+    BackendId, HouseId, TaskId,
     contracts::{
         AttemptNumber, BackendUnavailable, Capability, EffectFailure, EffectRequest,
         ExecutionBackend, ExternalRef, IdempotencyKey, Lookup, NotAppliedReason, Operation,
@@ -27,6 +27,8 @@ pub enum Check {
     DescriptorHouse,
     /// A request for another house is refused without effect.
     CrossHouseRefused,
+    /// A request persisted for another backend namespace is refused without effect.
+    ForeignBackendRefused,
     /// Operations without full capability support are refused without effect.
     UnsupportedRefused,
     /// A never-used key is not reported as applied.
@@ -49,6 +51,7 @@ impl fmt::Display for Check {
             Self::Fixture => "fixture",
             Self::DescriptorHouse => "descriptor house",
             Self::CrossHouseRefused => "cross-house request refused",
+            Self::ForeignBackendRefused => "foreign-backend request refused",
             Self::UnsupportedRefused => "unsupported operation refused",
             Self::UnknownKeyNotApplied => "unknown key not applied",
             Self::LaunchReceipt => "launch receipt",
@@ -107,6 +110,8 @@ pub struct ConformanceFixture {
     pub house: HouseId,
     /// Another house, used to check cross-house refusal.
     pub foreign_house: HouseId,
+    /// Another backend namespace, used to check foreign-backend refusal.
+    pub foreign_backend: BackendId,
     /// A disposable task identity for the run's requests.
     pub task: TaskId,
     /// A tag unique to this run, so idempotency keys never collide with earlier runs.
@@ -165,6 +170,7 @@ impl Runner<'_> {
     ) -> Result<EffectRequest, ConformanceFailure> {
         Ok(EffectRequest::new(
             house.clone(),
+            self.backend.descriptor().backend.clone(),
             self.fixture.task.clone(),
             AttemptNumber::FIRST,
             self.key(suffix)?,
@@ -212,6 +218,7 @@ impl Runner<'_> {
         }
         self.record(Check::DescriptorHouse, CheckResult::Passed);
         self.cross_house()?;
+        self.foreign_backend()?;
         self.unsupported()?;
         self.unknown_key()?;
         let Some((request, receipt)) = self.launch_receipt()? else {
@@ -251,6 +258,33 @@ impl Runner<'_> {
             Err(EffectFailure::NotApplied(NotAppliedReason::CrossHouse)) => {}
             Err(_) => return fail(check, "refusal did not name the house mismatch"),
             Ok(_) => return fail(check, "request for another house was applied"),
+        }
+        self.assert_not_applied(check, request.key())?;
+        self.record(check, CheckResult::Passed);
+        Ok(())
+    }
+
+    fn foreign_backend(&mut self) -> Result<(), ConformanceFailure> {
+        let check = Check::ForeignBackendRefused;
+        let own = self.request(&self.fixture.house, "foreign-backend", self.launch())?;
+        let request = EffectRequest::new(
+            own.house().clone(),
+            self.fixture.foreign_backend.clone(),
+            own.task().clone(),
+            own.attempt(),
+            own.key().clone(),
+            own.operation().clone(),
+        );
+        if request.backend() == &self.backend.descriptor().backend {
+            return fail(
+                Check::Fixture,
+                "foreign backend matches the backend under test",
+            );
+        }
+        match self.backend.execute(&request) {
+            Err(EffectFailure::NotApplied(NotAppliedReason::ForeignBackend)) => {}
+            Err(_) => return fail(check, "refusal did not name the backend mismatch"),
+            Ok(_) => return fail(check, "request for another backend was applied"),
         }
         self.assert_not_applied(check, request.key())?;
         self.record(check, CheckResult::Passed);

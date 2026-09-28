@@ -7,8 +7,7 @@ use crate::{
         Lookup, NotAppliedReason, UncertainReason,
     },
     state::{
-        EffectOutcome, EffectPlan, EffectRecord, EffectStart, HouseStore, Resubmission, StateError,
-        TaskState,
+        EffectOutcome, EffectPlan, EffectRecord, EffectStart, HouseStore, StateError, TaskState,
     },
 };
 
@@ -24,10 +23,9 @@ type Result<T> = std::result::Result<T, Error>;
 /// the effect stays `Intended` and the next owner reconciles it.
 ///
 /// # Errors
-/// Returns [`ContractError::CrossHouse`] when the backend serves another
-/// house, [`ContractError::UnsupportedCapabilities`] before persisting
-/// anything, and any error from [`HouseStore::begin_effect`] or
-/// [`HouseStore::record_effect_outcome`].
+/// Returns any error from [`HouseStore::begin_effect`] (including
+/// [`ContractError::CrossHouse`] and [`ContractError::UnsupportedCapabilities`]
+/// before anything is persisted) or [`HouseStore::record_effect_outcome`].
 pub fn run_effect(
     store: &HouseStore,
     backend: &dyn ExecutionBackend,
@@ -35,28 +33,9 @@ pub fn run_effect(
     plan: EffectPlan,
     clock: &dyn Clock,
 ) -> Result<EffectRecord> {
-    let descriptor = backend.descriptor();
-    if &descriptor.house != store.house() {
-        return Err(ContractError::CrossHouse {
-            expected: store.house().clone(),
-            found: descriptor.house.clone(),
-        }
-        .into());
-    }
-    descriptor
-        .capabilities
-        .require([plan.operation.required_capability()])?;
-    let resubmission = if descriptor
-        .capabilities
-        .supports(Capability::EffectIdempotentRequests)
-    {
-        Resubmission::SameKey
-    } else {
-        Resubmission::Refuse
-    };
     let task = plan.task.clone();
     let fence = plan.fence;
-    let record = match store.begin_effect(plan, grants, resubmission, clock.now())? {
+    let record = match store.begin_effect(plan, grants, backend.descriptor(), clock.now())? {
         EffectStart::Resolved(record) => return Ok(record),
         EffectStart::Execute(record) => record,
     };
@@ -77,12 +56,16 @@ pub struct ReconcileReport {
     /// attempts until resolved, or until the owner records them as
     /// [`EffectOutcome::Unresolvable`] after its own investigation.
     pub unresolved: Vec<EffectRecord>,
+    /// Unresolved effects persisted for another backend namespace. They were
+    /// not looked up; reconcile them with the backend that received them.
+    pub foreign: Vec<EffectRecord>,
 }
 
 /// Ask the backend what happened to each unresolved effect of `task` and
 /// record the answers under `fence`.
 ///
 /// Lookups use the persisted idempotency key and never re-execute an effect.
+/// Only effects persisted for this backend's namespace are looked up.
 /// [`Lookup::Absent`] is trusted only because the backend contract reserves
 /// it for proven absence. Without [`Capability::EffectLookup`], outcomes stay
 /// unknown.
@@ -124,6 +107,10 @@ pub fn reconcile(
     let pending: Vec<EffectRecord> = record.unresolved_effects().cloned().collect();
     let mut report = ReconcileReport::default();
     for effect in pending {
+        if effect.request().backend() != &descriptor.backend {
+            report.foreign.push(effect);
+            continue;
+        }
         let outcome = if can_lookup {
             match backend.lookup(effect.request().key()) {
                 Ok(Lookup::Applied(receipt)) => EffectOutcome::Applied(receipt),

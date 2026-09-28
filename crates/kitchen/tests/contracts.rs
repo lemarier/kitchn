@@ -4,9 +4,11 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestResult, commit, grants, grants_for, house, other_house, spec};
+use common::{
+    TestResult, backend_id, commit, credential, grant, grants, grants_for, house, other_house, spec,
+};
 use kitchen::{
-    Error, ErrorClass, HouseId, IdentifierError,
+    BackendId, CredentialId, Error, ErrorClass, HouseId, IdentifierError,
     contracts::{
         Capability, CapabilitySet, CommitId, ContractError, ExternalRef, Grant, GrantScope,
         HouseGrants, LeaseTtl, MAX_EXTERNAL_REF_BYTES, MAX_TEXT_BYTES, Permission, Repository,
@@ -153,48 +155,67 @@ fn closed_names_round_trip_and_reject_unknown_text() -> TestResult {
 }
 
 #[test]
-fn task_authority_is_a_subset_of_house_grants() -> TestResult {
+fn task_authority_is_a_subset_of_standing_grants() -> TestResult {
     let km43 = Repository::new("origin89hq/km43")?;
     let firmware = Repository::new("origin89hq/firmware")?;
+    let orca = backend_id()?;
     let house_grants = HouseGrants::new(
         house()?,
         [
-            Grant::house(Permission::LaunchWorker),
-            Grant::repository(Permission::PushBranch, km43.clone()),
+            Grant::house(Permission::LaunchWorker, orca.clone(), credential()?),
+            Grant::repository(
+                Permission::PushBranch,
+                km43.clone(),
+                orca.clone(),
+                credential()?,
+            ),
         ],
     );
     let authority = TaskAuthority::delegate(
         &house_grants,
         [
-            Grant::repository(Permission::LaunchWorker, firmware.clone()),
-            Grant::repository(Permission::PushBranch, km43.clone()),
+            Grant::repository(
+                Permission::LaunchWorker,
+                firmware.clone(),
+                orca.clone(),
+                credential()?,
+            ),
+            Grant::repository(
+                Permission::PushBranch,
+                km43.clone(),
+                orca.clone(),
+                credential()?,
+            ),
         ],
     )?;
     assert_eq!(authority.grants().count(), 2);
-    authority.authorize(
-        &house_grants,
-        Permission::PushBranch,
-        &GrantScope::Repository(km43.clone()),
-    )?;
+    assert_eq!(
+        authority.authorize(
+            &house_grants,
+            Permission::PushBranch,
+            &GrantScope::Repository(km43.clone()),
+            &orca,
+        )?,
+        credential()?
+    );
 
+    let other_backend = BackendId::new("elsewhere")?;
+    let other_credential = CredentialId::new("personal-token")?;
     let expansions = [
-        (
-            Grant::house(Permission::Merge),
-            Permission::Merge,
-            GrantScope::House,
-        ),
-        (
-            Grant::house(Permission::PushBranch),
+        Grant::house(Permission::Merge, orca.clone(), credential()?),
+        Grant::house(Permission::PushBranch, orca.clone(), credential()?),
+        Grant::repository(
             Permission::PushBranch,
-            GrantScope::House,
+            firmware.clone(),
+            orca.clone(),
+            credential()?,
         ),
-        (
-            Grant::repository(Permission::PushBranch, firmware.clone()),
-            Permission::PushBranch,
-            GrantScope::Repository(firmware.clone()),
-        ),
+        Grant::house(Permission::LaunchWorker, other_backend, credential()?),
+        Grant::house(Permission::LaunchWorker, orca.clone(), other_credential),
     ];
-    for (requested, permission, scope) in expansions {
+    for requested in expansions {
+        let permission = requested.permission;
+        let scope = requested.scope.clone();
         assert_eq!(
             TaskAuthority::delegate(&house_grants, [requested]),
             Err(ContractError::AuthorityExpansion { permission, scope })
@@ -204,31 +225,144 @@ fn task_authority_is_a_subset_of_house_grants() -> TestResult {
 }
 
 #[test]
-fn authorization_rechecks_current_grants_and_house() -> TestResult {
+fn authorization_binds_destination_credential_and_current_grants() -> TestResult {
     let original = grants()?;
-    let authority = TaskAuthority::delegate(&original, [Grant::house(Permission::LaunchWorker)])?;
-    authority.authorize(&original, Permission::LaunchWorker, &GrantScope::House)?;
-
+    let orca = backend_id()?;
+    let authority = TaskAuthority::delegate(&original, [grant(Permission::LaunchWorker)?])?;
     assert_eq!(
-        authority.authorize(&original, Permission::CancelWorker, &GrantScope::House),
+        authority.authorize(
+            &original,
+            Permission::LaunchWorker,
+            &GrantScope::House,
+            &orca
+        )?,
+        credential()?
+    );
+    assert_eq!(
+        authority.authorize(
+            &original,
+            Permission::LaunchWorker,
+            &GrantScope::House,
+            &BackendId::new("elsewhere")?
+        ),
+        Err(ContractError::PermissionDenied {
+            permission: Permission::LaunchWorker
+        }),
+        "a grant names its destination backend"
+    );
+    assert_eq!(
+        authority.authorize(
+            &original,
+            Permission::CancelWorker,
+            &GrantScope::House,
+            &orca
+        ),
         Err(ContractError::PermissionDenied {
             permission: Permission::CancelWorker
         })
     );
-    let revoked = grants_for(house()?, &[Permission::CancelWorker]);
+    let revoked = grants_for(house()?, &[Permission::CancelWorker])?;
     assert_eq!(
-        authority.authorize(&revoked, Permission::LaunchWorker, &GrantScope::House),
+        authority.authorize(
+            &revoked,
+            Permission::LaunchWorker,
+            &GrantScope::House,
+            &orca
+        ),
         Err(ContractError::AuthorityExpansion {
             permission: Permission::LaunchWorker,
             scope: GrantScope::House
         })
     );
-    let foreign = grants_for(other_house()?, &[Permission::LaunchWorker]);
+    let foreign = grants_for(other_house()?, &[Permission::LaunchWorker])?;
     assert_eq!(
-        authority.authorize(&foreign, Permission::LaunchWorker, &GrantScope::House),
+        authority.authorize(
+            &foreign,
+            Permission::LaunchWorker,
+            &GrantScope::House,
+            &orca
+        ),
         Err(ContractError::CrossHouse {
             expected: house()?,
             found: other_house()?
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn the_most_specific_grant_selects_the_credential() -> TestResult {
+    let km43 = Repository::new("origin89hq/km43")?;
+    let orca = backend_id()?;
+    let deploy = CredentialId::new("km43-deploy")?;
+    let house_wide = Grant::house(Permission::PushBranch, orca.clone(), credential()?);
+    let specific = Grant::repository(
+        Permission::PushBranch,
+        km43.clone(),
+        orca.clone(),
+        deploy.clone(),
+    );
+    let grants = HouseGrants::new(house()?, [house_wide.clone(), specific.clone()]);
+    let authority = TaskAuthority::delegate(&grants, [house_wide, specific])?;
+    let km43_scope = GrantScope::Repository(km43);
+    assert_eq!(
+        authority.authorize(&grants, Permission::PushBranch, &km43_scope, &orca)?,
+        deploy
+    );
+    assert_eq!(
+        authority.authorize(&grants, Permission::PushBranch, &GrantScope::House, &orca)?,
+        credential()?
+    );
+
+    let ambiguous = HouseGrants::new(
+        house()?,
+        [
+            Grant::house(Permission::PushBranch, orca.clone(), credential()?),
+            Grant::house(Permission::PushBranch, orca.clone(), deploy),
+        ],
+    );
+    assert_eq!(
+        ambiguous.permitted(Permission::PushBranch, &GrantScope::House, &orca),
+        Err(ContractError::AmbiguousCredential {
+            permission: Permission::PushBranch
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn house_limits_bound_standing_grants() -> TestResult {
+    let orca = backend_id()?;
+    let limits = [
+        grant(Permission::LaunchWorker)?,
+        grant(Permission::CancelWorker)?,
+    ];
+    let house_grants =
+        HouseGrants::with_limits(house()?, limits.clone(), [grant(Permission::CancelWorker)?])?;
+    assert_eq!(
+        house_grants.permitted(Permission::LaunchWorker, &GrantScope::House, &orca)?,
+        credential()?
+    );
+    assert_eq!(
+        house_grants.permitted(Permission::Merge, &GrantScope::House, &orca),
+        Err(ContractError::AuthorityExpansion {
+            permission: Permission::Merge,
+            scope: GrantScope::House
+        })
+    );
+    // Standing grants, not limits, bound delegation.
+    assert_eq!(
+        TaskAuthority::delegate(&house_grants, [grant(Permission::LaunchWorker)?]),
+        Err(ContractError::AuthorityExpansion {
+            permission: Permission::LaunchWorker,
+            scope: GrantScope::House
+        })
+    );
+    assert_eq!(
+        HouseGrants::with_limits(house()?, limits, [grant(Permission::Merge)?]),
+        Err(ContractError::AuthorityExpansion {
+            permission: Permission::Merge,
+            scope: GrantScope::House
         })
     );
     Ok(())

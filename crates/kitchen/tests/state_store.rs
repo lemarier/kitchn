@@ -12,8 +12,8 @@ use std::{
 };
 
 use common::{
-    Fixture, TestResult, at, commit, grants, grants_for, holder, house, launch, other_house, plan,
-    spec, spec_with, task_id, ttl,
+    Fixture, TestResult, at, commit, creator, grants, grants_for, holder, house, launch,
+    other_house, plan, scheduled, spec, spec_with, task_id, ttl,
 };
 use kitchen::{
     ConsumerId, Error, HouseId,
@@ -37,10 +37,10 @@ const SECOND: AttemptNumber = match AttemptNumber::new(2) {
 
 fn claimed_attempt(fixture: &Fixture, id: &str, now: Timestamp) -> TestResult<Fence> {
     let task = task_id(id)?;
-    fixture.store.create_task(spec(id)?, now)?;
+    fixture.store.create_task(spec(id)?, &creator()?, now)?;
     let lease = fixture
         .store
-        .claim(&task, &holder("coordinator-a")?, ttl(60)?, now)?;
+        .claim(&task, &scheduled("coordinator-a")?, ttl(60)?, now)?;
     assert_eq!(
         fixture.store.start_attempt(&task, lease.fence(), now)?,
         AttemptStart::Started(AttemptNumber::FIRST)
@@ -91,7 +91,7 @@ fn successful_attempt_settles_and_releases_the_claim() -> TestResult {
     assert!(matches!(
         fixture
             .store
-            .claim(&task, &holder("late")?, ttl(60)?, at(6)),
+            .claim(&task, &scheduled("late")?, ttl(60)?, at(6)),
         Err(Error::State(StateError::TaskSettled {
             settlement: Settlement::Succeeded,
             ..
@@ -104,11 +104,15 @@ fn successful_attempt_settles_and_releases_the_claim() -> TestResult {
 fn task_creation_is_idempotent_and_scoped_to_the_house() -> TestResult {
     let fixture = Fixture::new()?;
     assert_eq!(
-        fixture.store.create_task(spec("task-1")?, at(0))?,
+        fixture
+            .store
+            .create_task(spec("task-1")?, &creator()?, at(0))?,
         Creation::Created
     );
     assert_eq!(
-        fixture.store.create_task(spec("task-1")?, at(9))?,
+        fixture
+            .store
+            .create_task(spec("task-1")?, &creator()?, at(9))?,
         Creation::AlreadyExists
     );
     assert_eq!(fixture.store.task(&task_id("task-1")?)?.created_at(), at(0));
@@ -119,14 +123,14 @@ fn task_creation_is_idempotent_and_scoped_to_the_house() -> TestResult {
         &[Permission::LaunchWorker],
     )?;
     assert!(matches!(
-        fixture.store.create_task(different, at(1)),
+        fixture.store.create_task(different, &creator()?, at(1)),
         Err(Error::State(StateError::TaskConflict(_)))
     ));
 
     let dir = tempfile::tempdir()?;
     let foreign = HouseStore::initialize(dir.path(), other_house()?, StoreOptions::default())?;
     assert!(matches!(
-        foreign.create_task(spec("task-1")?, at(0)),
+        foreign.create_task(spec("task-1")?, &creator()?, at(0)),
         Err(Error::Contract(ContractError::CrossHouse { .. }))
     ));
     assert!(matches!(
@@ -139,7 +143,9 @@ fn task_creation_is_idempotent_and_scoped_to_the_house() -> TestResult {
 #[test]
 fn concurrent_claims_have_exactly_one_winner() -> TestResult {
     let fixture = Fixture::new()?;
-    fixture.store.create_task(spec("contested")?, at(0))?;
+    fixture
+        .store
+        .create_task(spec("contested")?, &creator()?, at(0))?;
     let claimants = 8;
     let barrier = Arc::new(Barrier::new(claimants));
     let handles: Vec<_> = (0..claimants)
@@ -150,7 +156,7 @@ fn concurrent_claims_have_exactly_one_winner() -> TestResult {
                 let store = store?;
                 let task = task_id("contested").map_err(|error| error.to_string())?;
                 let claimant =
-                    holder(&format!("tick-{index}")).map_err(|error| error.to_string())?;
+                    scheduled(&format!("tick-{index}")).map_err(|error| error.to_string())?;
                 let lease_ttl = ttl(60).map_err(|error| error.to_string())?;
                 barrier.wait();
                 Ok(store
@@ -183,7 +189,7 @@ fn concurrent_writers_do_not_lose_updates() -> TestResult {
     for index in 0..tasks {
         fixture
             .store
-            .create_task(spec(&format!("task-{index}"))?, at(0))?;
+            .create_task(spec(&format!("task-{index}"))?, &creator()?, at(0))?;
     }
     let barrier = Arc::new(Barrier::new(tasks));
     let handles: Vec<_> = (0..tasks)
@@ -194,7 +200,7 @@ fn concurrent_writers_do_not_lose_updates() -> TestResult {
                 let store = store?;
                 let task = task_id(&format!("task-{index}")).map_err(|error| error.to_string())?;
                 let claimant =
-                    holder(&format!("worker-{index}")).map_err(|error| error.to_string())?;
+                    scheduled(&format!("worker-{index}")).map_err(|error| error.to_string())?;
                 let lease_ttl = ttl(60).map_err(|error| error.to_string())?;
                 barrier.wait();
                 store
@@ -232,7 +238,7 @@ fn coordinator_exit_is_uncertain_not_released() -> TestResult {
     let later = at(61);
 
     assert!(matches!(
-        fixture.store.claim(&task, &holder("coordinator-b")?, ttl(60)?, later),
+        fixture.store.claim(&task, &scheduled("coordinator-b")?, ttl(60)?, later),
         Err(Error::State(StateError::LeaseExpired { expired_at })) if expired_at == at(60)
     ));
     assert!(matches!(
@@ -263,12 +269,12 @@ fn stale_owner_is_fenced_after_takeover() -> TestResult {
     let grants = grants()?;
 
     assert!(matches!(
-        fixture.store.take_over(&task, &holder("coordinator-b")?, ttl(60)?, at(30)),
+        fixture.store.take_over(&task, &scheduled("coordinator-b")?, ttl(60)?, at(30)),
         Err(Error::State(StateError::LeaseLive { expires_at })) if expires_at == at(60)
     ));
     let lease = fixture
         .store
-        .take_over(&task, &holder("coordinator-b")?, ttl(60)?, at(61))?;
+        .take_over(&task, &scheduled("coordinator-b")?, ttl(60)?, at(61))?;
     assert!(lease.fence() > old);
 
     let stale = |result: Result<(), Error>| matches!(result, Err(Error::State(StateError::StaleFence { presented })) if presented == old);
@@ -341,7 +347,7 @@ fn coordinator_relinquish_then_adopt() -> TestResult {
 
     let adopted = fixture
         .store
-        .claim(&task, &holder("coordinator-b")?, ttl(60)?, at(3))?;
+        .claim(&task, &scheduled("coordinator-b")?, ttl(60)?, at(3))?;
     assert!(adopted.fence() > old);
     assert_eq!(
         fixture
@@ -455,10 +461,11 @@ fn retry_budget_bounds_attempt_count_and_elapsed_time() -> TestResult {
     let counted = task_id("counted")?;
     store.create_task(
         spec_with("counted", budget, &[Permission::LaunchWorker])?,
+        &creator()?,
         at(0),
     )?;
     let fence = store
-        .claim(&counted, &holder("a")?, ttl(600)?, at(0))?
+        .claim(&counted, &scheduled("a")?, ttl(600)?, at(0))?
         .fence();
     store.start_attempt(&counted, fence, at(0))?;
     assert_eq!(
@@ -474,10 +481,11 @@ fn retry_budget_bounds_attempt_count_and_elapsed_time() -> TestResult {
     let timed = task_id("timed")?;
     store.create_task(
         spec_with("timed", budget, &[Permission::LaunchWorker])?,
+        &creator()?,
         at(0),
     )?;
     let fence = store
-        .claim(&timed, &holder("a")?, ttl(600)?, at(0))?
+        .claim(&timed, &scheduled("a")?, ttl(600)?, at(0))?
         .fence();
     store.start_attempt(&timed, fence, at(0))?;
     assert_eq!(
@@ -499,10 +507,11 @@ fn retry_budget_bounds_attempt_count_and_elapsed_time() -> TestResult {
     let permanent = task_id("permanent")?;
     store.create_task(
         spec_with("permanent", budget, &[Permission::LaunchWorker])?,
+        &creator()?,
         at(0),
     )?;
     let fence = store
-        .claim(&permanent, &holder("a")?, ttl(600)?, at(0))?
+        .claim(&permanent, &scheduled("a")?, ttl(600)?, at(0))?
         .fence();
     store.start_attempt(&permanent, fence, at(0))?;
     assert_eq!(
@@ -524,7 +533,7 @@ fn cancellation_stops_new_work_and_needs_resolved_effects() -> TestResult {
     let store = &fixture.store;
 
     let open = task_id("open")?;
-    store.create_task(spec("open")?, at(0))?;
+    store.create_task(spec("open")?, &creator()?, at(0))?;
     assert_eq!(
         store.request_cancel(&open, &holder("operator")?, at(1))?,
         CancelStatus::Settled
@@ -656,12 +665,12 @@ fn effects_are_checked_against_current_house_grants() -> TestResult {
     let store = &fixture.store;
     let launch_plan = || plan(&task, fence, "launch", launch().map_err(|e| e.to_string())?);
 
-    let revoked = grants_for(house()?, &[Permission::MessageWorker]);
+    let revoked = grants_for(house()?, &[Permission::MessageWorker])?;
     assert!(matches!(
         store.begin_effect(launch_plan()?, &revoked, &common::refusing()?, at(1)),
         Err(Error::Contract(ContractError::AuthorityExpansion { .. }))
     ));
-    let foreign = grants_for(other_house()?, &common::WORKER_PERMISSIONS);
+    let foreign = grants_for(other_house()?, &common::WORKER_PERMISSIONS)?;
     assert!(matches!(
         store.begin_effect(launch_plan()?, &foreign, &common::refusing()?, at(1)),
         Err(Error::Contract(ContractError::CrossHouse { .. }))
@@ -674,10 +683,11 @@ fn effects_are_checked_against_current_house_grants() -> TestResult {
             RetryPolicy::new(1, Duration::from_secs(60))?,
             &[Permission::MessageWorker],
         )?,
+        &creator()?,
         at(0),
     )?;
     let narrow_fence = store
-        .claim(&narrow, &holder("a")?, ttl(60)?, at(0))?
+        .claim(&narrow, &scheduled("a")?, ttl(60)?, at(0))?
         .fence();
     store.start_attempt(&narrow, narrow_fence, at(0))?;
     assert!(matches!(
@@ -787,16 +797,16 @@ fn pickup_duplicate_tick_single_consumer() -> TestResult {
     let store = &fixture.store;
     let pickup = ConsumerId::new("pickup-origin89")?;
 
-    let first = store.acquire_consumer(&pickup, &holder("tick-1")?, ttl(60)?, at(0))?;
+    let first = store.acquire_consumer(&pickup, &scheduled("tick-1")?, ttl(60)?, at(0))?;
     assert!(matches!(
-        store.acquire_consumer(&pickup, &holder("tick-2")?, ttl(60)?, at(1)),
+        store.acquire_consumer(&pickup, &scheduled("tick-2")?, ttl(60)?, at(1)),
         Err(Error::State(StateError::ClaimHeld { holder: current, .. })) if current.as_str() == "tick-1"
     ));
     let renewed = store.renew_consumer(&pickup, first.fence(), ttl(60)?, at(30))?;
     assert_eq!(renewed.expires_at(), at(90));
 
     assert!(matches!(
-        store.acquire_consumer(&pickup, &holder("tick-3")?, ttl(60)?, at(91)),
+        store.acquire_consumer(&pickup, &scheduled("tick-3")?, ttl(60)?, at(91)),
         Err(Error::State(StateError::LeaseExpired { .. }))
     ));
     assert!(
@@ -805,7 +815,7 @@ fn pickup_duplicate_tick_single_consumer() -> TestResult {
             .iter()
             .any(|item| matches!(item, RecoveryItem::UncertainConsumer { .. }))
     );
-    let second = store.take_over_consumer(&pickup, &holder("tick-3")?, ttl(60)?, at(91))?;
+    let second = store.take_over_consumer(&pickup, &scheduled("tick-3")?, ttl(60)?, at(91))?;
     assert!(second.fence() > first.fence());
     assert!(matches!(
         store.release_consumer(&pickup, first.fence(), at(91)),
@@ -870,12 +880,12 @@ fn lock_wait_is_bounded() -> TestResult {
     let blocker = fs::File::open(dir.path().join("state.lock"))?;
     blocker.lock()?;
     assert!(matches!(
-        store.create_task(spec("task-1")?, at(0)),
+        store.create_task(spec("task-1")?, &creator()?, at(0)),
         Err(Error::State(StateError::LockTimeout { waited_ms })) if waited_ms >= 50
     ));
     blocker.unlock()?;
     assert_eq!(
-        store.create_task(spec("task-1")?, at(0))?,
+        store.create_task(spec("task-1")?, &creator()?, at(0))?,
         Creation::Created
     );
     Ok(())
@@ -971,7 +981,9 @@ fn invalid_persisted_data_is_rejected_without_reset() -> TestResult {
 #[test]
 fn oversized_or_missing_state_is_an_error() -> TestResult {
     let fixture = Fixture::new()?;
-    fixture.store.create_task(spec("task-1")?, at(0))?;
+    fixture
+        .store
+        .create_task(spec("task-1")?, &creator()?, at(0))?;
     let tiny = StoreOptions {
         max_state_bytes: 64,
         ..StoreOptions::default()
@@ -987,7 +999,9 @@ fn oversized_or_missing_state_is_an_error() -> TestResult {
         Err(Error::State(StateError::StateMissing))
     ));
     assert!(matches!(
-        fixture.store.create_task(spec("task-2")?, at(0)),
+        fixture
+            .store
+            .create_task(spec("task-2")?, &creator()?, at(0)),
         Err(Error::State(StateError::StateMissing))
     ));
     Ok(())
@@ -996,14 +1010,16 @@ fn oversized_or_missing_state_is_an_error() -> TestResult {
 #[test]
 fn interrupted_write_leaves_the_committed_state() -> TestResult {
     let fixture = Fixture::new()?;
-    fixture.store.create_task(spec("task-1")?, at(0))?;
+    fixture
+        .store
+        .create_task(spec("task-1")?, &creator()?, at(0))?;
     fs::write(
         fixture.dir.path().join("house").join("state.json.tmp"),
         "{ torn",
     )?;
     let reopened = fixture.reopen()?;
     assert_eq!(reopened.tasks()?.len(), 1);
-    reopened.create_task(spec("task-2")?, at(1))?;
+    reopened.create_task(spec("task-2")?, &creator()?, at(1))?;
     assert_eq!(fixture.store.tasks()?.len(), 2);
     Ok(())
 }
@@ -1028,7 +1044,9 @@ fn a_store_directory_belongs_to_one_house() -> TestResult {
 fn runtime_state_is_private_to_the_owner() -> TestResult {
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new()?;
-    fixture.store.create_task(spec("task-1")?, at(0))?;
+    fixture
+        .store
+        .create_task(spec("task-1")?, &creator()?, at(0))?;
     let mode = |path: std::path::PathBuf| -> TestResult<u32> {
         Ok(fs::metadata(path)?.permissions().mode() & 0o777)
     };
@@ -1072,7 +1090,7 @@ fn initialize_and_open_are_separate() -> TestResult {
         Err(Error::State(StateError::NotInitialized))
     ));
     let store = HouseStore::initialize(&path, house()?, StoreOptions::default())?;
-    store.create_task(spec("task-1")?, at(0))?;
+    store.create_task(spec("task-1")?, &creator()?, at(0))?;
     assert!(matches!(
         HouseStore::initialize(&path, house()?, StoreOptions::default()),
         Err(Error::State(StateError::AlreadyInitialized))
@@ -1089,7 +1107,9 @@ fn initialize_and_open_are_separate() -> TestResult {
 #[test]
 fn a_snapshot_without_its_marker_or_from_another_store_is_rejected() -> TestResult {
     let first = Fixture::new()?;
-    first.store.create_task(spec("task-1")?, at(0))?;
+    first
+        .store
+        .create_task(spec("task-1")?, &creator()?, at(0))?;
     let second = Fixture::new()?;
     let foreign_snapshot = fs::read(second.state_path())?;
 
@@ -1121,7 +1141,9 @@ fn a_snapshot_without_its_marker_or_from_another_store_is_rejected() -> TestResu
 fn redirected_store_paths_are_refused_without_touching_the_target() -> TestResult {
     use std::os::unix::fs::symlink;
     let fixture = Fixture::new()?;
-    fixture.store.create_task(spec("task-1")?, at(0))?;
+    fixture
+        .store
+        .create_task(spec("task-1")?, &creator()?, at(0))?;
     let outside = tempfile::tempdir()?;
     let target = outside.path().join("elsewhere.json");
     fs::write(&target, "untouched")?;
@@ -1129,7 +1151,9 @@ fn redirected_store_paths_are_refused_without_touching_the_target() -> TestResul
     let temp = fixture.dir.path().join("house").join("state.json.tmp");
     symlink(&target, &temp)?;
     assert!(matches!(
-        fixture.store.create_task(spec("task-2")?, at(1)),
+        fixture
+            .store
+            .create_task(spec("task-2")?, &creator()?, at(1)),
         Err(Error::State(StateError::RedirectedPath))
     ));
     assert!(matches!(
@@ -1161,7 +1185,9 @@ fn redirected_store_paths_are_refused_without_touching_the_target() -> TestResul
 fn duplicate_persisted_task_keys_are_rejected() -> TestResult {
     let fixture = Fixture::new()?;
     claimed_attempt(&fixture, "task-1", at(0))?;
-    fixture.store.create_task(spec("task-2")?, at(0))?;
+    fixture
+        .store
+        .create_task(spec("task-2")?, &creator()?, at(0))?;
     let path = fixture.state_path();
     let valid = fs::read_to_string(&path)?;
     // A second, open record for task-1 after the owned one.
@@ -1196,19 +1222,22 @@ fn ownership_history_must_match_the_current_lease() -> TestResult {
     swapped_holder["tasks"]["task-1"]["state"]["lease"]["holder"] = "coordinator-z".into();
     let mut released_then_claimed = valid.clone();
     released_then_claimed["tasks"]["task-1"]["ownership"] = serde_json::json!([
-        {"type": "claimed", "holder": "coordinator-a", "fence": 1, "at": 0},
-        {"type": "released", "fence": 1, "at": 0},
-        {"type": "claimed", "holder": "coordinator-a", "fence": 1, "at": 0},
+        {"type": "claimed", "holder": "coordinator-a", "trigger": "scheduled", "fence": 1, "at": 0},
+        {"type": "released", "trigger": "scheduled", "fence": 1, "at": 0},
+        {"type": "claimed", "holder": "coordinator-a", "trigger": "scheduled", "fence": 1, "at": 0},
     ]);
+    let mut switched_trigger = valid.clone();
+    switched_trigger["tasks"]["task-1"]["state"]["lease"]["trigger"] = "interactive".into();
     let mut adopted_without_relinquish = valid.clone();
     adopted_without_relinquish["tasks"]["task-1"]["ownership"] = serde_json::json!([
-        {"type": "adopted", "previous": 0, "holder": "coordinator-a", "fence": 1, "at": 0},
+        {"type": "adopted", "previous": 0, "holder": "coordinator-a", "trigger": "scheduled", "fence": 1, "at": 0},
     ]);
     for corrupt in [
         erased,
         swapped_holder,
         released_then_claimed,
         adopted_without_relinquish,
+        switched_trigger,
     ] {
         fs::write(&path, serde_json::to_vec_pretty(&corrupt)?)?;
         assert!(matches!(
@@ -1442,7 +1471,7 @@ fn coordinator_transfer_is_a_relinquish_adopt_pair_not_an_expiry() -> TestResult
     let fixture = Fixture::new()?;
     let store = &fixture.store;
     let run = ConsumerId::new("coordinator-origin89")?;
-    let first = store.acquire_consumer(&run, &holder("session-a")?, ttl(60)?, at(0))?;
+    let first = store.acquire_consumer(&run, &scheduled("session-a")?, ttl(60)?, at(0))?;
     store.relinquish_consumer(&run, first.fence(), at(10))?;
     assert!(matches!(
         store.renew_consumer(&run, first.fence(), ttl(60)?, at(11)),
@@ -1456,7 +1485,7 @@ fn coordinator_transfer_is_a_relinquish_adopt_pair_not_an_expiry() -> TestResult
             since: at(10),
         }]
     );
-    let adopted = store.acquire_consumer(&run, &holder("session-b")?, ttl(60)?, at(12))?;
+    let adopted = store.acquire_consumer(&run, &scheduled("session-b")?, ttl(60)?, at(12))?;
     assert!(adopted.fence() > first.fence());
     assert!(store.recovery_queue(at(12))?.is_empty());
     let record = store.consumer(&run)?.ok_or("consumer record")?;
@@ -1472,10 +1501,10 @@ fn coordinator_transfer_is_a_relinquish_adopt_pair_not_an_expiry() -> TestResult
 
     // A quiet holder is not a relinquish: expiry needs an explicit takeover.
     assert!(matches!(
-        store.acquire_consumer(&run, &holder("session-c")?, ttl(60)?, at(73)),
+        store.acquire_consumer(&run, &scheduled("session-c")?, ttl(60)?, at(73)),
         Err(Error::State(StateError::LeaseExpired { .. }))
     ));
-    store.take_over_consumer(&run, &holder("session-c")?, ttl(60)?, at(73))?;
+    store.take_over_consumer(&run, &scheduled("session-c")?, ttl(60)?, at(73))?;
     let record = store.consumer(&run)?.ok_or("consumer record")?;
     assert!(matches!(
         record.history().last(),
@@ -1490,7 +1519,7 @@ fn consumer_history_is_bounded_and_validated() -> TestResult {
     let store = &fixture.store;
     let pickup = ConsumerId::new("pickup-origin89")?;
     for tick in 0..40 {
-        let lease = store.acquire_consumer(&pickup, &holder("tick")?, ttl(60)?, at(tick))?;
+        let lease = store.acquire_consumer(&pickup, &scheduled("tick")?, ttl(60)?, at(tick))?;
         store.release_consumer(&pickup, lease.fence(), at(tick))?;
     }
     let record = store.consumer(&pickup)?.ok_or("consumer record")?;
@@ -1507,7 +1536,7 @@ fn consumer_history_is_bounded_and_validated() -> TestResult {
     let mut state: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
     state["consumers"]["pickup-origin89"]["state"] = serde_json::json!({
         "type": "held",
-        "lease": {"holder": "tick", "fence": 1, "acquiredAt": 0, "expiresAt": 60000}
+        "lease": {"holder": "tick", "trigger": "scheduled", "fence": 1, "acquiredAt": 0, "expiresAt": 60000}
     });
     fs::write(&path, serde_json::to_vec_pretty(&state)?)?;
     assert!(matches!(

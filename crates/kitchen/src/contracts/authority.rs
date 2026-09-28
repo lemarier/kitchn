@@ -1,16 +1,24 @@
 //! House grants and the task authority delegated from them.
 //!
-//! A house grants permissions; a task receives a subset. Task authority is
-//! checked against the house's *current* grants before every external effect,
-//! so revocation takes effect immediately and a persisted record cannot expand
-//! authority on its own.
+//! A grant is an exact tuple: a permission, where it applies, the destination
+//! backend it may act on, and the house-owned credential to use. A house has
+//! two sets of grants:
+//!
+//! - *Limits*: everything house policy permits at all. Nothing, including a
+//!   person's consent in an interactive session, can exceed them.
+//! - *Standing grants*: the subset usable without a person present. Scheduled
+//!   work acts only on these, through the task authority delegated from them.
+//!
+//! Task authority is checked against the house's *current* standing grants
+//! before every external effect, so revocation takes effect immediately and a
+//! persisted record cannot expand authority on its own.
 
 use std::{collections::BTreeSet, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    HouseId,
+    BackendId, CredentialId, HouseId,
     contracts::{ContractError, Repository, ValueKind},
 };
 
@@ -136,57 +144,104 @@ impl fmt::Display for GrantScope {
     }
 }
 
-/// One permission within one scope.
+/// One permission within one scope, on one destination backend, with one
+/// credential. There are no wildcard destinations or credential fallbacks.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Grant {
     /// The permitted action.
     pub permission: Permission,
     /// Where the action is permitted.
     pub scope: GrantScope,
+    /// The backend namespace the action may target.
+    pub destination: BackendId,
+    /// The house-owned credential the action uses.
+    pub credential: CredentialId,
 }
 
 impl Grant {
     /// A grant covering every repository in the house.
     #[must_use]
-    pub const fn house(permission: Permission) -> Self {
+    pub const fn house(
+        permission: Permission,
+        destination: BackendId,
+        credential: CredentialId,
+    ) -> Self {
         Self {
             permission,
             scope: GrantScope::House,
+            destination,
+            credential,
         }
     }
 
     /// A grant limited to one repository.
     #[must_use]
-    pub const fn repository(permission: Permission, repository: Repository) -> Self {
+    pub const fn repository(
+        permission: Permission,
+        repository: Repository,
+        destination: BackendId,
+        credential: CredentialId,
+    ) -> Self {
         Self {
             permission,
             scope: GrantScope::Repository(repository),
+            destination,
+            credential,
         }
     }
 
-    /// Whether this grant includes `other`.
+    /// Whether this grant includes `other`: the same permission, destination,
+    /// and credential, in a scope that covers the other's.
     #[must_use]
     pub fn covers(&self, other: &Self) -> bool {
-        self.permission == other.permission && self.scope.covers(&other.scope)
+        self.permission == other.permission
+            && self.destination == other.destination
+            && self.credential == other.credential
+            && self.scope.covers(&other.scope)
     }
 }
 
-/// The permissions a house currently grants. Supplied by house configuration.
+/// A house's grants: the limits of its policy and the standing subset.
+/// Supplied by house configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HouseGrants {
     house: HouseId,
-    grants: BTreeSet<Grant>,
+    limits: BTreeSet<Grant>,
+    standing: BTreeSet<Grant>,
 }
 
 impl HouseGrants {
-    /// Record a house's grants.
+    /// A house whose policy permits exactly its standing grants.
     #[must_use]
-    pub fn new(house: HouseId, grants: impl IntoIterator<Item = Grant>) -> Self {
+    pub fn new(house: HouseId, standing: impl IntoIterator<Item = Grant>) -> Self {
+        let standing: BTreeSet<Grant> = standing.into_iter().collect();
         Self {
             house,
-            grants: grants.into_iter().collect(),
+            limits: standing.clone(),
+            standing,
         }
+    }
+
+    /// A house whose policy `limits` exceed its `standing` grants, so that
+    /// some actions need a person's consent.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::AuthorityExpansion`] naming a standing grant
+    /// the limits do not cover.
+    pub fn with_limits(
+        house: HouseId,
+        limits: impl IntoIterator<Item = Grant>,
+        standing: impl IntoIterator<Item = Grant>,
+    ) -> Result<Self, ContractError> {
+        let limits: BTreeSet<Grant> = limits.into_iter().collect();
+        let standing: BTreeSet<Grant> = standing.into_iter().collect();
+        ensure_covered(&limits, &standing)?;
+        Ok(Self {
+            house,
+            limits,
+            standing,
+        })
     }
 
     /// The granting house.
@@ -195,33 +250,56 @@ impl HouseGrants {
         &self.house
     }
 
-    /// Whether some house grant covers `grant`.
+    /// Whether some standing grant covers `grant`.
     #[must_use]
     pub fn covers(&self, grant: &Grant) -> bool {
-        self.grants.iter().any(|held| held.covers(grant))
+        self.standing.iter().any(|held| held.covers(grant))
+    }
+
+    /// The credential house policy allows for `permission` in `scope` on
+    /// `destination`, regardless of standing grants. Interactive consent is
+    /// bounded by this check.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::AuthorityExpansion`] when policy does not
+    /// permit the action and [`ContractError::AmbiguousCredential`] when two
+    /// equally specific grants name different credentials.
+    pub fn permitted(
+        &self,
+        permission: Permission,
+        scope: &GrantScope,
+        destination: &BackendId,
+    ) -> Result<CredentialId, ContractError> {
+        select_credential(&self.limits, permission, scope, destination)?.ok_or_else(|| {
+            ContractError::AuthorityExpansion {
+                permission,
+                scope: scope.clone(),
+            }
+        })
     }
 }
 
-/// Authority delegated to one task. Always a subset of its house's grants.
+/// Authority delegated to one task. Always a subset of its house's standing
+/// grants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskAuthority {
     house: HouseId,
     grants: BTreeSet<Grant>,
 }
 
 impl TaskAuthority {
-    /// Delegate `requested` grants from `house`.
+    /// Delegate `requested` grants from `house`'s standing grants.
     ///
     /// # Errors
     /// Returns [`ContractError::AuthorityExpansion`] naming the first requested grant
-    /// (in sorted order) that no house grant covers.
+    /// (in sorted order) that no standing grant covers.
     pub fn delegate(
         house: &HouseGrants,
         requested: impl IntoIterator<Item = Grant>,
     ) -> Result<Self, ContractError> {
         let grants: BTreeSet<Grant> = requested.into_iter().collect();
-        ensure_covered(house, &grants)?;
+        ensure_covered(&house.standing, &grants)?;
         Ok(Self {
             house: house.house.clone(),
             grants,
@@ -239,39 +317,67 @@ impl TaskAuthority {
         self.grants.iter()
     }
 
-    /// Check that `permission` is delegated for `scope` and still granted by `current`.
+    /// Check that `permission` on `destination` is delegated for `scope` and
+    /// still granted by `current`, and return the credential to use.
     ///
     /// # Errors
     /// Returns [`ContractError::CrossHouse`] when `current` belongs to another house,
     /// [`ContractError::AuthorityExpansion`] when the house no longer grants something
-    /// this task holds, and [`ContractError::PermissionDenied`] when the task lacks it.
+    /// this task holds, [`ContractError::PermissionDenied`] when the task lacks it,
+    /// and [`ContractError::AmbiguousCredential`] when two equally specific
+    /// grants name different credentials.
     pub fn authorize(
         &self,
         current: &HouseGrants,
         permission: Permission,
         scope: &GrantScope,
-    ) -> Result<(), ContractError> {
+        destination: &BackendId,
+    ) -> Result<CredentialId, ContractError> {
         if current.house != self.house {
             return Err(ContractError::CrossHouse {
                 expected: self.house.clone(),
                 found: current.house.clone(),
             });
         }
-        ensure_covered(current, &self.grants)?;
-        let needed = Grant {
-            permission,
-            scope: scope.clone(),
-        };
-        if self.grants.iter().any(|held| held.covers(&needed)) {
-            Ok(())
-        } else {
-            Err(ContractError::PermissionDenied { permission })
-        }
+        ensure_covered(&current.standing, &self.grants)?;
+        select_credential(&self.grants, permission, scope, destination)?
+            .ok_or(ContractError::PermissionDenied { permission })
     }
 }
 
-fn ensure_covered(house: &HouseGrants, grants: &BTreeSet<Grant>) -> Result<(), ContractError> {
-    match grants.iter().find(|grant| !house.covers(grant)) {
+/// The credential of the most specific grant covering the action. A
+/// repository grant is more specific than a house grant.
+fn select_credential(
+    grants: &BTreeSet<Grant>,
+    permission: Permission,
+    scope: &GrantScope,
+    destination: &BackendId,
+) -> Result<Option<CredentialId>, ContractError> {
+    let matching = |specific: bool| {
+        grants.iter().filter(move |grant| {
+            grant.permission == permission
+                && &grant.destination == destination
+                && grant.scope.covers(scope)
+                && matches!(grant.scope, GrantScope::Repository(_)) == specific
+        })
+    };
+    for specific in [true, false] {
+        let mut credentials = matching(specific).map(|grant| &grant.credential);
+        if let Some(first) = credentials.next() {
+            if credentials.any(|other| other != first) {
+                return Err(ContractError::AmbiguousCredential { permission });
+            }
+            return Ok(Some(first.clone()));
+        }
+    }
+    Ok(None)
+}
+
+fn ensure_covered(held: &BTreeSet<Grant>, grants: &BTreeSet<Grant>) -> Result<(), ContractError> {
+    match grants
+        .iter()
+        .find(|grant| !held.iter().any(|holding| holding.covers(grant)))
+    {
         Some(grant) => Err(ContractError::AuthorityExpansion {
             permission: grant.permission,
             scope: grant.scope.clone(),

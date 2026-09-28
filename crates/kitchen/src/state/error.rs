@@ -179,6 +179,9 @@ pub enum StateError {
     /// Cancellation was requested; no new attempts or effects may start.
     #[error("cancellation requested")]
     CancelRequested,
+    /// The consent already authorized a different effect.
+    #[error("consent was already used for another effect")]
+    ConsentReused,
     /// The target resource was not reported by an applied effect of this task.
     #[error("the task does not own the target resource")]
     ResourceNotOwned,
@@ -289,7 +292,7 @@ impl StateError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
-            Self::SubmissionBudgetExhausted(_) => ErrorClass::Refused,
+            Self::SubmissionBudgetExhausted(_) | Self::ConsentReused => ErrorClass::Refused,
             Self::TaskNotFound(_)
             | Self::TaskConflict(_)
             | Self::TaskSettled { .. }

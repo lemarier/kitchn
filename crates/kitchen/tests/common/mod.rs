@@ -6,10 +6,10 @@
 use std::{cell::Cell, time::Duration};
 
 use kitchen::{
-    BackendId, EffectName, HolderId, HouseId, TaskId,
+    BackendId, CredentialId, EffectName, HolderId, HouseId, TaskId,
     contracts::{
-        BackendDescriptor, Capability, CapabilitySet, Clock, CommitId, EvidenceRevision, Fence,
-        Grant, HouseGrants, LeaseTtl, Operation, Permission, Provenance, RetryPolicy, Role,
+        BackendDescriptor, Capability, CapabilitySet, Claimant, Clock, CommitId, EvidenceRevision,
+        Fence, Grant, HouseGrants, LeaseTtl, Operation, Permission, Provenance, RetryPolicy, Role,
         TaskAuthority, TaskSpec, Text, Timestamp, Workspace,
     },
     state::{EffectPlan, HouseStore, StoreOptions},
@@ -41,6 +41,29 @@ pub fn backend_id() -> TestResult<BackendId> {
     Ok(BackendId::new("fake")?)
 }
 
+pub fn credential() -> TestResult<CredentialId> {
+    Ok(CredentialId::new("origin89-orca")?)
+}
+
+/// A scheduled claimant, such as one pickup tick.
+pub fn scheduled(value: &str) -> TestResult<Claimant> {
+    Ok(Claimant::scheduled(holder(value)?))
+}
+
+/// An interactive claimant: a session with a person present.
+pub fn interactive(value: &str) -> TestResult<Claimant> {
+    Ok(Claimant::interactive(holder(value)?))
+}
+
+/// The scheduled tick that creates test tasks.
+pub fn creator() -> TestResult<Claimant> {
+    scheduled("pickup")
+}
+
+pub fn grant(permission: Permission) -> TestResult<Grant> {
+    Ok(Grant::house(permission, backend_id()?, credential()?))
+}
+
 pub fn effect(value: &str) -> TestResult<EffectName> {
     Ok(EffectName::new(value)?)
 }
@@ -53,12 +76,16 @@ pub const WORKER_PERMISSIONS: [Permission; 4] = [
     Permission::ReleaseResource,
 ];
 
-pub fn grants_for(house: HouseId, permissions: &[Permission]) -> HouseGrants {
-    HouseGrants::new(house, permissions.iter().copied().map(Grant::house))
+pub fn grants_for(house: HouseId, permissions: &[Permission]) -> TestResult<HouseGrants> {
+    let grants = permissions
+        .iter()
+        .map(|permission| grant(*permission))
+        .collect::<TestResult<Vec<_>>>()?;
+    Ok(HouseGrants::new(house, grants))
 }
 
 pub fn grants() -> TestResult<HouseGrants> {
-    Ok(grants_for(house()?, &WORKER_PERMISSIONS))
+    grants_for(house()?, &WORKER_PERMISSIONS)
 }
 
 pub fn commit(fill: char) -> TestResult<CommitId> {
@@ -66,8 +93,11 @@ pub fn commit(fill: char) -> TestResult<CommitId> {
 }
 
 pub fn spec_with(id: &str, retry: RetryPolicy, permissions: &[Permission]) -> TestResult<TaskSpec> {
-    let authority =
-        TaskAuthority::delegate(&grants()?, permissions.iter().copied().map(Grant::house))?;
+    let requested = permissions
+        .iter()
+        .map(|permission| grant(*permission))
+        .collect::<TestResult<Vec<_>>>()?;
+    let authority = TaskAuthority::delegate(&grants()?, requested)?;
     Ok(TaskSpec {
         id: task_id(id)?,
         role: Role::StationCook,
@@ -119,6 +149,7 @@ pub fn plan(
         name: effect(name)?,
         decided_at: EvidenceRevision::INITIAL,
         operation,
+        consent: None,
     })
 }
 

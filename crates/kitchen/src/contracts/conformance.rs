@@ -9,7 +9,7 @@
 use std::fmt;
 
 use crate::{
-    BackendId, HouseId, TaskId,
+    BackendId, CredentialId, HouseId, TaskId,
     contracts::{
         AttemptNumber, BackendUnavailable, Capability, EffectFailure, EffectRequest,
         ExecutionBackend, ExternalRef, IdempotencyKey, Lookup, NotAppliedReason, Operation,
@@ -112,6 +112,8 @@ pub struct ConformanceFixture {
     pub foreign_house: HouseId,
     /// Another backend namespace, used to check foreign-backend refusal.
     pub foreign_backend: BackendId,
+    /// The credential reference the run's requests name.
+    pub credential: CredentialId,
     /// A disposable task identity for the run's requests.
     pub task: TaskId,
     /// A tag unique to this run, so idempotency keys never collide with earlier runs.
@@ -171,6 +173,7 @@ impl Runner<'_> {
         Ok(EffectRequest::new(
             house.clone(),
             self.backend.descriptor().backend.clone(),
+            self.fixture.credential.clone(),
             self.fixture.task.clone(),
             AttemptNumber::FIRST,
             self.key(suffix)?,
@@ -270,6 +273,7 @@ impl Runner<'_> {
         let request = EffectRequest::new(
             own.house().clone(),
             self.fixture.foreign_backend.clone(),
+            own.credential().clone(),
             own.task().clone(),
             own.attempt(),
             own.key().clone(),

@@ -10,7 +10,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BackendId, HouseId, TaskId,
+    BackendId, CredentialId, HouseId, TaskId,
     contracts::{
         AttemptNumber, BackendDescriptor, Capability, ContractError, ExternalRef, Permission,
         ResourceRef, Role, Text, ValueKind,
@@ -117,6 +117,7 @@ impl fmt::Display for IdempotencyKey {
 pub struct EffectRequest {
     house: HouseId,
     backend: BackendId,
+    credential: CredentialId,
     task: TaskId,
     attempt: AttemptNumber,
     key: IdempotencyKey,
@@ -131,6 +132,7 @@ impl EffectRequest {
     pub const fn new(
         house: HouseId,
         backend: BackendId,
+        credential: CredentialId,
         task: TaskId,
         attempt: AttemptNumber,
         key: IdempotencyKey,
@@ -139,6 +141,7 @@ impl EffectRequest {
         Self {
             house,
             backend,
+            credential,
             task,
             attempt,
             key,
@@ -157,6 +160,13 @@ impl EffectRequest {
     #[must_use]
     pub const fn backend(&self) -> &BackendId {
         &self.backend
+    }
+
+    /// The house-owned credential the authorizing grant names. The backend
+    /// uses exactly this credential; there is no fallback.
+    #[must_use]
+    pub const fn credential(&self) -> &CredentialId {
+        &self.credential
     }
 
     /// The owning task.

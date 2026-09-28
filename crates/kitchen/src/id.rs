@@ -116,6 +116,10 @@ identifier!(
     "An execution backend identity. Backend-native handles stay in adapter mappings."
 );
 identifier!(
+    CredentialId,
+    "A reference to a house-owned credential. It names the credential; it never holds the secret."
+);
+identifier!(
     ConsumerId,
     "A workflow consumer scope that must have at most one live owner, such as a pickup loop."
 );

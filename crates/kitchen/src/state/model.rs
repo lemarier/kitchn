@@ -14,11 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConsumerId, EffectName, Error, HolderId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Capability, CommitId,
-        ContractError, Disposition, EffectRequest, EffectSeq, Evidence, EvidenceRevision,
-        ExternalRef, FailureClass, Fence, HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason,
-        Operation, Receipt, ResourceRef, RetryPolicy, Settlement, TaskSpec, Timestamp,
-        UncertainReason,
+        AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Capability,
+        Claimant, CommitId, Consent, ContractError, Disposition, EffectRequest, EffectSeq,
+        Evidence, EvidenceRevision, ExternalRef, FailureClass, Fence, HouseGrants, IdempotencyKey,
+        LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef, RetryPolicy, Settlement,
+        TaskSpec, Timestamp, Trigger, UncertainReason,
     },
     state::{ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, StateError},
 };
@@ -51,6 +51,7 @@ fn fail<T>(error: StateError) -> Result<T> {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Lease {
     holder: HolderId,
+    trigger: Trigger,
     fence: Fence,
     acquired_at: Timestamp,
     expires_at: Timestamp,
@@ -61,6 +62,13 @@ impl Lease {
     #[must_use]
     pub const fn holder(&self) -> &HolderId {
         &self.holder
+    }
+
+    /// The trigger the owner acts under, which decides where its effects'
+    /// authority comes from.
+    #[must_use]
+    pub const fn trigger(&self) -> Trigger {
+        self.trigger
     }
 
     /// The fence presented by the owner for every change.
@@ -312,6 +320,7 @@ pub struct EffectRecord {
     decided_at: EvidenceRevision,
     intended_at: Timestamp,
     request: EffectRequest,
+    authorization: Authorization,
     submissions: u32,
     state: EffectState,
 }
@@ -347,6 +356,12 @@ impl EffectRecord {
         &self.request
     }
 
+    /// Where the effect's authority came from.
+    #[must_use]
+    pub const fn authorization(&self) -> &Authorization {
+        &self.authorization
+    }
+
     /// How many times the request was handed to the backend under its key.
     #[must_use]
     pub const fn submissions(&self) -> u32 {
@@ -368,6 +383,8 @@ pub enum OwnershipEvent {
     Claimed {
         /// New holder.
         holder: HolderId,
+        /// The trigger the new holder acts under.
+        trigger: Trigger,
         /// New fence.
         fence: Fence,
         /// When.
@@ -379,6 +396,8 @@ pub enum OwnershipEvent {
         previous: Fence,
         /// New holder.
         holder: HolderId,
+        /// The trigger the new holder acts under.
+        trigger: Trigger,
         /// New fence.
         fence: Fence,
         /// When.
@@ -397,6 +416,8 @@ pub enum OwnershipEvent {
         previous: Fence,
         /// New holder.
         holder: HolderId,
+        /// The trigger the new holder acts under.
+        trigger: Trigger,
         /// New fence.
         fence: Fence,
         /// When.
@@ -468,6 +489,7 @@ impl CancelRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskRecord {
     spec: TaskSpec,
+    created_by: Claimant,
     created_at: Timestamp,
     state: TaskState,
     attempts: Vec<AttemptRecord>,
@@ -484,6 +506,12 @@ impl TaskRecord {
     #[must_use]
     pub const fn spec(&self) -> &TaskSpec {
         &self.spec
+    }
+
+    /// Who created the task, and under which trigger.
+    #[must_use]
+    pub const fn created_by(&self) -> &Claimant {
+        &self.created_by
     }
 
     /// When the task was created.
@@ -665,6 +693,23 @@ impl TaskRecord {
         Ok(())
     }
 
+    /// A consent authorizes one logical effect; it cannot authorize another.
+    fn check_consent_unused(
+        &self,
+        consent: &Consent,
+        name: &EffectName,
+        attempt: AttemptNumber,
+    ) -> Result<()> {
+        let reused = self.effects.iter().any(|effect| {
+            matches!(&effect.authorization, Authorization::Consent { id, .. } if *id == consent.id)
+                && (&effect.name != name || effect.request.attempt() != attempt)
+        });
+        if reused {
+            return fail(StateError::ConsentReused);
+        }
+        Ok(())
+    }
+
     /// Whether an applied effect of this task reported `resource`.
     fn owns_resource(&self, resource: &ResourceRef) -> bool {
         self.effects.iter().any(|effect| {
@@ -793,6 +838,9 @@ pub struct EffectPlan {
     pub decided_at: EvidenceRevision,
     /// The effect.
     pub operation: Operation,
+    /// The person's consent for exactly this effect. Required under an
+    /// interactive claim and refused under a scheduled one.
+    pub consent: Option<Consent>,
 }
 
 /// Work needing an explicit recovery decision.
@@ -924,9 +972,10 @@ impl StoreState {
         fence
     }
 
-    fn new_lease(&mut self, holder: &HolderId, ttl: LeaseTtl, now: Timestamp) -> Lease {
+    fn new_lease(&mut self, claimant: &Claimant, ttl: LeaseTtl, now: Timestamp) -> Lease {
         Lease {
-            holder: holder.clone(),
+            holder: claimant.holder.clone(),
+            trigger: claimant.trigger,
             fence: self.issue_fence(),
             acquired_at: now,
             expires_at: now.saturating_add(ttl.duration()),
@@ -953,7 +1002,12 @@ impl StoreState {
         self.consumers.get(id)
     }
 
-    pub(crate) fn create_task(&mut self, spec: TaskSpec, now: Timestamp) -> Result<Creation> {
+    pub(crate) fn create_task(
+        &mut self,
+        spec: TaskSpec,
+        created_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<Creation> {
         if spec.authority.house() != &self.house {
             return Err(ContractError::CrossHouse {
                 expected: self.house.clone(),
@@ -975,6 +1029,7 @@ impl StoreState {
         }
         let record = TaskRecord {
             spec: spec.clone(),
+            created_by: created_by.clone(),
             created_at: now,
             state: TaskState::Open,
             attempts: Vec::new(),
@@ -991,7 +1046,7 @@ impl StoreState {
     pub(crate) fn claim(
         &mut self,
         id: &TaskId,
-        holder: &HolderId,
+        claimant: &Claimant,
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
@@ -1015,14 +1070,15 @@ impl StoreState {
                 });
             }
         }
-        let lease = self.new_lease(holder, ttl, now);
+        let lease = self.new_lease(claimant, ttl, now);
         let task = self.task_mut(id)?;
         let event = match task.ownership.last() {
             Some(OwnershipEvent::Relinquished {
                 fence: previous, ..
             }) => OwnershipEvent::Adopted {
                 previous: *previous,
-                holder: holder.clone(),
+                holder: claimant.holder.clone(),
+                trigger: claimant.trigger,
                 fence: lease.fence,
                 at: now,
             },
@@ -1033,7 +1089,8 @@ impl StoreState {
                 | OwnershipEvent::Released { .. },
             )
             | None => OwnershipEvent::Claimed {
-                holder: holder.clone(),
+                holder: claimant.holder.clone(),
+                trigger: claimant.trigger,
                 fence: lease.fence,
                 at: now,
             },
@@ -1077,12 +1134,12 @@ impl StoreState {
     pub(crate) fn take_over(
         &mut self,
         id: &TaskId,
-        holder: &HolderId,
+        claimant: &Claimant,
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
         let previous = match &self.task(id)?.state {
-            TaskState::Open => return self.claim(id, holder, ttl, now),
+            TaskState::Open => return self.claim(id, claimant, ttl, now),
             TaskState::Claimed { lease } if lease.is_live(now) => {
                 return fail(StateError::LeaseLive {
                     expires_at: lease.expires_at,
@@ -1096,11 +1153,12 @@ impl StoreState {
                 });
             }
         };
-        let lease = self.new_lease(holder, ttl, now);
+        let lease = self.new_lease(claimant, ttl, now);
         let task = self.task_mut(id)?;
         task.push_ownership(OwnershipEvent::TakenOver {
             previous,
-            holder: holder.clone(),
+            holder: claimant.holder.clone(),
+            trigger: claimant.trigger,
             fence: lease.fence,
             at: now,
         })?;
@@ -1294,7 +1352,7 @@ impl StoreState {
                 .copied()
                 .chain([plan.operation.required_capability()]),
         )?;
-        task.owned_lease(plan.fence, now, true)?;
+        let trigger = task.owned_lease(plan.fence, now, true)?.trigger;
         // After a cancellation request, only stopping a worker this task
         // launched may start; it may start while other effects are unresolved.
         let stopping = task.cancel.is_some();
@@ -1317,11 +1375,32 @@ impl StoreState {
                 current: task.evidence.revision,
             });
         }
-        task.spec.authority.authorize(
-            grants,
-            plan.operation.required_permission(),
-            &task.spec.scope(),
-        )?;
+        let permission = plan.operation.required_permission();
+        let scope = task.spec.scope();
+        let (credential, authorization) = match (trigger, &plan.consent) {
+            (Trigger::Scheduled, None) => (
+                task.spec
+                    .authority
+                    .authorize(grants, permission, &scope, &backend.backend)?,
+                Authorization::Standing,
+            ),
+            (Trigger::Scheduled, Some(_)) => return Err(ContractError::ConsentNotAccepted.into()),
+            (Trigger::Interactive, None) => {
+                return Err(ContractError::ConsentRequired { permission }.into());
+            }
+            (Trigger::Interactive, Some(consent)) => {
+                consent.check(&house, &plan.task, &plan.operation, plan.decided_at)?;
+                let credential = grants.permitted(permission, &scope, &backend.backend)?;
+                task.check_consent_unused(consent, &plan.name, attempt)?;
+                (
+                    credential,
+                    Authorization::Consent {
+                        id: consent.id.clone(),
+                        given_by: consent.given_by.clone(),
+                    },
+                )
+            }
+        };
         let same_name = task.effects.iter().rposition(|effect| {
             effect.name == plan.name
                 && effect.request.attempt() == attempt
@@ -1354,11 +1433,13 @@ impl StoreState {
             request: EffectRequest::new(
                 house,
                 backend.backend.clone(),
+                credential,
                 plan.task,
                 attempt,
                 IdempotencyKey::from_ref(key),
                 plan.operation,
             ),
+            authorization,
             submissions: 1,
             state: EffectState::Intended,
         };
@@ -1545,7 +1626,7 @@ impl StoreState {
     pub(crate) fn acquire_consumer(
         &mut self,
         consumer: &ConsumerId,
-        holder: &HolderId,
+        claimant: &Claimant,
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
@@ -1570,16 +1651,16 @@ impl StoreState {
             }
             None => None,
         };
-        let lease = self.new_lease(holder, ttl, now);
+        let lease = self.new_lease(claimant, ttl, now);
         let event = match previous {
             Some(previous) => ConsumerEvent::Adopted {
                 previous,
-                holder: holder.clone(),
+                holder: claimant.holder.clone(),
                 fence: lease.fence,
                 at: now,
             },
             None => ConsumerEvent::Acquired {
-                holder: holder.clone(),
+                holder: claimant.holder.clone(),
                 fence: lease.fence,
                 at: now,
             },
@@ -1673,7 +1754,7 @@ impl StoreState {
     pub(crate) fn take_over_consumer(
         &mut self,
         consumer: &ConsumerId,
-        holder: &HolderId,
+        claimant: &Claimant,
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
@@ -1685,13 +1766,13 @@ impl StoreState {
             }
             Some(ConsumerState::Held { lease }) => lease.fence,
             Some(ConsumerState::Idle | ConsumerState::Relinquished { .. }) | None => {
-                return self.acquire_consumer(consumer, holder, ttl, now);
+                return self.acquire_consumer(consumer, claimant, ttl, now);
             }
         };
-        let lease = self.new_lease(holder, ttl, now);
+        let lease = self.new_lease(claimant, ttl, now);
         let event = ConsumerEvent::TakenOver {
             previous,
-            holder: holder.clone(),
+            holder: claimant.holder.clone(),
             fence: lease.fence,
             at: now,
         };
@@ -1860,7 +1941,7 @@ impl StoreState {
 /// names the current owner's fence; nothing follows a release; the replayed
 /// owner matches the task state; and every attempt ran under an owned fence.
 fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result<(), Corruption> {
-    let mut owner: Option<(&HolderId, Fence)> = None;
+    let mut owner: Option<(&HolderId, Trigger, Fence)> = None;
     let mut owned = BTreeSet::new();
     let mut released = false;
     let mut relinquished = None;
@@ -1878,19 +1959,25 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
         if released {
             return Err(Corruption::Ownership);
         }
-        let current = owner.map(|(_, fence)| fence);
+        let current = owner.map(|(_, _, fence)| fence);
         let after_relinquish = relinquished.take();
         match event {
-            OwnershipEvent::Claimed { holder, fence, .. } => {
+            OwnershipEvent::Claimed {
+                holder,
+                trigger,
+                fence,
+                ..
+            } => {
                 if owner.is_some() || after_relinquish.is_some() {
                     return Err(Corruption::Ownership);
                 }
                 issue(&mut owned, *fence)?;
-                owner = Some((holder, *fence));
+                owner = Some((holder, *trigger, *fence));
             }
             OwnershipEvent::Adopted {
                 previous,
                 holder,
+                trigger,
                 fence,
                 ..
             } => {
@@ -1898,11 +1985,12 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
                     return Err(Corruption::Ownership);
                 }
                 issue(&mut owned, *fence)?;
-                owner = Some((holder, *fence));
+                owner = Some((holder, *trigger, *fence));
             }
             OwnershipEvent::TakenOver {
                 previous,
                 holder,
+                trigger,
                 fence,
                 ..
             } => {
@@ -1910,7 +1998,7 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
                     return Err(Corruption::Ownership);
                 }
                 issue(&mut owned, *fence)?;
-                owner = Some((holder, *fence));
+                owner = Some((holder, *trigger, *fence));
             }
             OwnershipEvent::Relinquished { fence, .. } | OwnershipEvent::Released { fence, .. } => {
                 if current != Some(*fence) {
@@ -1925,7 +2013,7 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
         }
     }
     let consistent = match &task.state {
-        TaskState::Claimed { lease } => owner == Some((&lease.holder, lease.fence)),
+        TaskState::Claimed { lease } => owner == Some((&lease.holder, lease.trigger, lease.fence)),
         TaskState::Open => owner.is_none() && !released,
         TaskState::Settled { .. } => owner.is_none(),
     };

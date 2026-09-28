@@ -14,6 +14,7 @@ pub mod fake;
 mod resource;
 mod role;
 mod task;
+mod trigger;
 mod value;
 
 pub use authority::{Grant, GrantScope, HouseGrants, Permission, TaskAuthority};
@@ -31,6 +32,7 @@ pub use task::{
     AttemptNumber, AttemptOutcome, AttemptStart, Disposition, EffectSeq, FailureClass, Fence,
     Provenance, RetryPolicy, Settlement, TaskSpec,
 };
+pub use trigger::{Authorization, Claimant, Consent, Trigger};
 pub use value::{
     Clock, CommitId, ExternalRef, LeaseTtl, MAX_EXTERNAL_REF_BYTES, MAX_TEXT_BYTES, Repository,
     SystemClock, Text, Timestamp, ValueKind,

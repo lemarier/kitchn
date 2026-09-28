@@ -5,16 +5,17 @@
 mod common;
 
 use common::{
-    Fixture, ManualClock, TestResult, at, backend_id, grants, holder, house, launch, other_house,
-    plan, spec, task_id, ttl,
+    Fixture, ManualClock, TestResult, at, backend_id, creator, grants, holder, house, launch,
+    other_house, plan, scheduled, spec, task_id, ttl,
 };
 use kitchen::{
     BackendId, Error, HouseId, TaskId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, BackendUnavailable,
         Capability, CapabilitySet, ContractError, Disposition, EffectFailure, EffectRequest,
-        ExecutionBackend, ExternalRef, Fence, IdempotencyKey, Lookup, NotAppliedReason, Operation,
-        Receipt, ResourceKind, ResourceRef, Settlement, Text, UncertainReason, WorkerState,
+        ExecutionBackend, ExternalRef, Fence, Grant, HouseGrants, IdempotencyKey, Lookup,
+        NotAppliedReason, Operation, Permission, Receipt, ResourceKind, ResourceRef, Settlement,
+        TaskAuthority, Text, UncertainReason, WorkerState,
         conformance::{self, Check, CheckResult, ConformanceFixture},
         fake::{ExecuteFault, FakeBackend},
     },
@@ -26,6 +27,7 @@ fn conformance_fixture() -> TestResult<ConformanceFixture> {
         house: house()?,
         foreign_house: other_house()?,
         foreign_backend: BackendId::new("fake-other")?,
+        credential: common::credential()?,
         task: task_id("conformance")?,
         run_tag: ExternalRef::new("run-1")?,
         brief: Text::new("Conformance probe; exit immediately.")?,
@@ -51,10 +53,10 @@ fn non_idempotent() -> TestResult<FakeBackend> {
 
 fn started(fixture: &Fixture, id: &str) -> TestResult<(TaskId, Fence)> {
     let task = task_id(id)?;
-    fixture.store.create_task(spec(id)?, at(0))?;
+    fixture.store.create_task(spec(id)?, &creator()?, at(0))?;
     let fence = fixture
         .store
-        .claim(&task, &holder("coordinator-a")?, ttl(60)?, at(0))?
+        .claim(&task, &scheduled("coordinator-a")?, ttl(60)?, at(0))?
         .fence();
     fixture.store.start_attempt(&task, fence, at(0))?;
     Ok((task, fence))
@@ -138,6 +140,7 @@ impl ExecutionBackend for HouseBlindBackend {
         let rewritten = EffectRequest::new(
             self.0.descriptor().house.clone(),
             request.backend().clone(),
+            request.credential().clone(),
             request.task().clone(),
             request.attempt(),
             request.key().clone(),
@@ -640,7 +643,7 @@ fn recovery_after_interruption_reconciles_before_relaunch() -> TestResult {
     // Coordinator B starts in a new process after A's lease expired.
     let store = fixture.reopen()?;
     let clock = ManualClock::starting_at(120);
-    let lease = store.take_over(&task, &holder("coordinator-b")?, ttl(60)?, at(120))?;
+    let lease = store.take_over(&task, &scheduled("coordinator-b")?, ttl(60)?, at(120))?;
     assert!(matches!(
         store.start_attempt(&task, lease.fence(), at(120)),
         Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
@@ -747,13 +750,15 @@ fn settled_task_identity_is_never_reused() -> TestResult {
 
     // The settled record keeps its identity and keys; nothing deletes it.
     assert_eq!(
-        fixture.store.create_task(spec("task-1")?, at(100))?,
+        fixture
+            .store
+            .create_task(spec("task-1")?, &creator()?, at(100))?,
         kitchen::state::Creation::AlreadyExists
     );
     assert!(matches!(
         fixture
             .store
-            .claim(&task, &holder("coordinator-b")?, ttl(60)?, at(101)),
+            .claim(&task, &scheduled("coordinator-b")?, ttl(60)?, at(101)),
         Err(Error::State(StateError::TaskSettled { .. }))
     ));
     let record = fixture.store.task(&task)?;
@@ -767,22 +772,41 @@ fn settled_task_identity_is_never_reused() -> TestResult {
 #[test]
 fn recovery_stays_on_the_backend_namespace_that_received_the_effect() -> TestResult {
     let fixture = Fixture::new()?;
-    let (task, fence) = started(&fixture, "task-1")?;
+    let other = BackendId::new("fake-other")?;
+    // The house and task may launch on both namespaces.
+    let both = [
+        common::grant(Permission::LaunchWorker)?,
+        Grant::house(
+            Permission::LaunchWorker,
+            other.clone(),
+            common::credential()?,
+        ),
+    ];
+    let grants = HouseGrants::new(house()?, both.clone());
+    let mut workflow = spec("task-1")?;
+    workflow.authority = TaskAuthority::delegate(&grants, both)?;
+    let task = task_id("task-1")?;
+    fixture.store.create_task(workflow, &creator()?, at(0))?;
+    let fence = fixture
+        .store
+        .claim(&task, &scheduled("coordinator-a")?, ttl(60)?, at(0))?
+        .fence();
+    fixture.store.start_attempt(&task, fence, at(0))?;
     let first = FakeBackend::fully_capable(backend_id()?, house()?);
-    let second = FakeBackend::fully_capable(BackendId::new("fake-other")?, house()?);
+    let second = FakeBackend::fully_capable(other, house()?);
     let clock = ManualClock::starting_at(1);
     first.inject(ExecuteFault::ApplyThenLoseResponse);
     let lost = run_effect(
         &fixture.store,
         &first,
-        &grants()?,
+        &grants,
         plan(&task, fence, "launch", launch()?)?,
         &clock,
     )?;
     assert!(matches!(lost.state(), EffectState::Uncertain { .. }));
 
     assert!(matches!(
-        run_effect(&fixture.store, &second, &grants()?, plan(&task, fence, "launch", launch()?)?, &clock),
+        run_effect(&fixture.store, &second, &grants, plan(&task, fence, "launch", launch()?)?, &clock),
         Err(Error::State(StateError::BackendMismatch { seq, ref recorded })) if seq == lost.seq() && recorded == &backend_id()?
     ));
     let report = reconcile(&fixture.store, &second, &task, fence, &clock)?;
@@ -816,10 +840,10 @@ fn workflow_capability_requirements_are_checked_at_execution() -> TestResult {
         Capability::ScheduleRunTimeout,
     ]
     .into();
-    fixture.store.create_task(workflow, at(0))?;
+    fixture.store.create_task(workflow, &creator()?, at(0))?;
     let fence = fixture
         .store
-        .claim(&task, &holder("coordinator-a")?, ttl(60)?, at(0))?
+        .claim(&task, &scheduled("coordinator-a")?, ttl(60)?, at(0))?
         .fence();
     fixture.store.start_attempt(&task, fence, at(0))?;
     let clock = ManualClock::starting_at(1);

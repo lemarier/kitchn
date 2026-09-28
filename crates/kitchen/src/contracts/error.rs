@@ -43,6 +43,24 @@ pub enum ContractError {
         /// The missing permission.
         permission: Permission,
     },
+    /// Equally specific grants name different credentials for one action.
+    #[error("grants name more than one credential for {permission}")]
+    AmbiguousCredential {
+        /// The permission.
+        permission: Permission,
+    },
+    /// Work claimed by a scheduled trigger presented a person's consent.
+    #[error("scheduled work acts only on standing grants, not consent")]
+    ConsentNotAccepted,
+    /// Work claimed by an interactive trigger needs the person's consent.
+    #[error("interactive work needs consent for {permission}")]
+    ConsentRequired {
+        /// The permission the effect needs.
+        permission: Permission,
+    },
+    /// The consent is for a different house, task, operation, or revision.
+    #[error("consent does not cover this effect")]
+    ConsentMismatch,
     /// A value from one house was used with another house.
     #[error("house mismatch: expected {expected}, found {found}")]
     CrossHouse {
@@ -62,6 +80,10 @@ impl ContractError {
             Self::UnsupportedCapabilities { .. }
             | Self::AuthorityExpansion { .. }
             | Self::PermissionDenied { .. }
+            | Self::AmbiguousCredential { .. }
+            | Self::ConsentNotAccepted
+            | Self::ConsentRequired { .. }
+            | Self::ConsentMismatch
             | Self::CrossHouse { .. } => ErrorClass::Refused,
         }
     }

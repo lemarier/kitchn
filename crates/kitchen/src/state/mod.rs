@@ -9,6 +9,11 @@
 //!
 //! - A claim is a lease with a fence. Every change presents the fence; a
 //!   stale fence is rejected.
+//! - Scheduled and interactive work share the same claims. A claim records
+//!   its [`crate::contracts::Trigger`]: effects under a scheduled claim use
+//!   the task's standing authority; effects under an interactive claim need
+//!   a [`crate::contracts::Consent`] for exactly that effect, within house
+//!   policy limits.
 //! - Starting work (attempts, effects, message consumption) needs a live
 //!   lease. Recording facts (outcomes, evidence, finishing) needs only the
 //!   current fence.

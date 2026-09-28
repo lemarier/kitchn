@@ -38,9 +38,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConsumerId, Error, HolderId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, ContractError, Disposition,
-        EffectSeq, Evidence, EvidenceRevision, ExternalRef, Fence, HouseGrants, LeaseTtl, TaskSpec,
-        Timestamp,
+        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Claimant, ContractError,
+        Disposition, EffectSeq, Evidence, EvidenceRevision, ExternalRef, Fence, HouseGrants,
+        LeaseTtl, TaskSpec, Timestamp,
     },
     state::{
         CancelStatus, ConsumerRecord, Consumption, Corruption, Creation, EffectOutcome, EffectPlan,
@@ -213,13 +213,20 @@ impl HouseStore {
         &self.house
     }
 
-    /// Create a task. Repeating an identical creation is a no-op.
+    /// Create a task, recording who created it and under which trigger.
+    /// Repeating an identical creation is a no-op and keeps the original
+    /// creator.
     ///
     /// # Errors
     /// Rejects a foreign-house authority, a reused id with a different
     /// specification, and a full store.
-    pub fn create_task(&self, spec: TaskSpec, now: Timestamp) -> Result<Creation> {
-        self.transact(|state| state.create_task(spec, now))
+    pub fn create_task(
+        &self,
+        spec: TaskSpec,
+        created_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<Creation> {
+        self.transact(|state| state.create_task(spec, created_by, now))
     }
 
     /// Read one task.
@@ -238,8 +245,10 @@ impl HouseStore {
         self.read(|state| state.tasks().cloned().collect())
     }
 
-    /// Claim an open task. A live or expired claim by anyone, including the
-    /// same holder id, is refused; an expired claim needs [`Self::take_over`].
+    /// Claim an open task under the claimant's trigger. A live or expired
+    /// claim by anyone, including the same holder id or another trigger, is
+    /// refused; an expired claim needs [`Self::take_over`]. Claiming a task
+    /// its previous owner relinquished records an adoption.
     ///
     /// # Errors
     /// Returns [`StateError::ClaimHeld`], [`StateError::LeaseExpired`], or
@@ -247,11 +256,11 @@ impl HouseStore {
     pub fn claim(
         &self,
         id: &TaskId,
-        holder: &HolderId,
+        claimant: &Claimant,
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
-        self.transact(|state| state.claim(id, holder, ttl, now))
+        self.transact(|state| state.claim(id, claimant, ttl, now))
     }
 
     /// Extend a live claim.
@@ -279,11 +288,11 @@ impl HouseStore {
     pub fn take_over(
         &self,
         id: &TaskId,
-        holder: &HolderId,
+        claimant: &Claimant,
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
-        self.transact(|state| state.take_over(id, holder, ttl, now))
+        self.transact(|state| state.take_over(id, claimant, ttl, now))
     }
 
     /// Start an attempt, or report the running one. Settles the task as
@@ -462,11 +471,11 @@ impl HouseStore {
     pub fn acquire_consumer(
         &self,
         consumer: &ConsumerId,
-        holder: &HolderId,
+        claimant: &Claimant,
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
-        self.transact(|state| state.acquire_consumer(consumer, holder, ttl, now))
+        self.transact(|state| state.acquire_consumer(consumer, claimant, ttl, now))
     }
 
     /// Extend a live consumer lease.
@@ -519,11 +528,11 @@ impl HouseStore {
     pub fn take_over_consumer(
         &self,
         consumer: &ConsumerId,
-        holder: &HolderId,
+        claimant: &Claimant,
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
-        self.transact(|state| state.take_over_consumer(consumer, holder, ttl, now))
+        self.transact(|state| state.take_over_consumer(consumer, claimant, ttl, now))
     }
 
     /// Read a consumer scope's holder and recent transfers.

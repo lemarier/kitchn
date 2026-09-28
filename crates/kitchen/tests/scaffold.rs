@@ -18,9 +18,10 @@ use kitchen::{
     contracts::CommitId,
     house::HouseError,
     scaffold::{
-        Conflict, FilePlan, MAX_RENDERED_BYTES, MAX_TEMPLATE_OUTPUT_BYTES, ManagedState, Manifest,
-        MissingVariable, PlanAction, PlanKind, RenderedFile, RenderedTemplate, ScaffoldError,
-        ScaffoldLimit, Template, TemplateProblem, VariableName, inspect_managed,
+        Activation, Conflict, FilePlan, MAX_RENDERED_BYTES, MAX_TEMPLATE_OUTPUT_BYTES,
+        ManagedState, Manifest, MissingVariable, PlanAction, PlanKind, RenderedFile,
+        RenderedTemplate, ScaffoldError, ScaffoldLimit, Template, TemplateProblem, VariableName,
+        inspect_managed,
     },
 };
 use tempfile::TempDir;
@@ -193,9 +194,24 @@ fn new_repository_plan_adds_every_file_and_previews_it() -> TestResult {
     let preview = plan.to_string();
     assert!(preview.starts_with("Template origin89/rust-workspace revision 2, guidance aaaa"));
     assert!(preview.contains("(new repository)"));
-    assert!(preview.contains("  add        .github/workflows/check.yml\n"));
+    assert!(preview.contains(
+        "  add        .github/workflows/check.yml  [CI workflow: runs on the forge once pushed]\n"
+    ));
+    assert!(preview.contains(
+        "  add        .github/workflows/security.yml  [scheduled workflow: runs on the forge once pushed, then on its schedule from the default branch]\n"
+    ));
+    assert!(preview.contains(
+        "  add        .github/dependabot.yml  [dependency updates: opens forge pull requests once pushed]\n"
+    ));
+    assert!(preview.contains(
+        "  add        .claude/settings.json  [agent or editor settings: applies when an agent or editor opens the repository]\n"
+    ));
+    assert!(preview.contains("  add        README.md\n"));
+    assert!(preview.contains(
+        "4 additions can activate automation once pushed or opened; Kitchen activates none of them."
+    ));
     assert!(preview.contains(&format!(
-        "{} to add, 0 unchanged, 0 conflicts.",
+        "{} to add, 0 unchanged, 0 withheld, 0 conflicts.",
         plan.files().len()
     )));
     assert!(!target.exists(), "planning must not create the target");
@@ -215,6 +231,196 @@ fn new_repository_plan_adds_every_file_and_previews_it() -> TestResult {
             .find(|p| p.file.path.as_str() == "AGENTS.md")
             .map(|p| p.file.contents.as_str())
     );
+    Ok(())
+}
+
+#[test]
+fn authority_bearing_paths_are_classified_with_their_boundary() -> TestResult {
+    use Activation::{
+        AgentSettings, CiWorkflow, DependencyUpdates, Environment, GitHooks, McpServers,
+        ScheduledWorkflow,
+    };
+    let scheduled = "on:\n  push:\n  schedule:\n    - cron: \"0 0 * * *\"\n";
+    let commented = "on:\n  push:\n  # schedule: disabled\n";
+    for (path, text, expected) in [
+        (
+            ".github/workflows/check.yml",
+            "on: push\n",
+            Some(CiWorkflow),
+        ),
+        (
+            ".github/workflows/nightly.yml",
+            scheduled,
+            Some(ScheduledWorkflow),
+        ),
+        (".github/workflows/check.yml", commented, Some(CiWorkflow)),
+        (".GitHub/Workflows/check.yml", "", Some(CiWorkflow)),
+        (".gitlab-ci.yml", "", Some(CiWorkflow)),
+        (
+            ".forgejo/workflows/ci.yml",
+            scheduled,
+            Some(ScheduledWorkflow),
+        ),
+        (".github/dependabot.yml", scheduled, Some(DependencyUpdates)),
+        ("renovate.json", "", Some(DependencyUpdates)),
+        (".claude/settings.json", "", Some(AgentSettings)),
+        (".vscode/tasks.json", "", Some(AgentSettings)),
+        (".mcp.json", "", Some(McpServers)),
+        (".cursor/mcp.json", "", Some(McpServers)),
+        (".env", "", Some(Environment)),
+        (".env.local", "", Some(Environment)),
+        ("app/.envrc", "", Some(Environment)),
+        (".husky/pre-commit", "", Some(GitHooks)),
+        (".env.example", "", None),
+        ("src/.env_utils.rs", "", None),
+        ("justfile", scheduled, None),
+        ("README.md", "", None),
+        (".github/pull_request_template.md", "", None),
+        ("docs/workflows/guide.md", "", None),
+    ] {
+        assert_eq!(
+            Activation::of(&RelativePath::new(path)?, text),
+            expected,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        format!("{}: {}", CiWorkflow, CiWorkflow.boundary()),
+        "CI workflow: runs on the forge once pushed"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_workflow_is_withheld_while_the_justfile_it_runs_conflicts() -> TestResult {
+    let workspace = TempDir::new()?;
+    let target = real(&workspace)?;
+    fs::write(target.join("justfile"), "check:\n    echo local\n")?;
+    let plan = FilePlan::new(render_origin89('a')?, &target)?;
+    assert_eq!(
+        action(&plan, "justfile"),
+        Some(&PlanAction::Conflict(Conflict::Unmanaged))
+    );
+    assert_eq!(
+        action(&plan, ".github/workflows/check.yml"),
+        Some(&PlanAction::Withheld {
+            requires: vec![RelativePath::new("justfile")?],
+        })
+    );
+    // Workflows whose own dependencies are satisfiable are still added.
+    assert_eq!(
+        action(&plan, ".github/workflows/security.yml"),
+        Some(&PlanAction::Add)
+    );
+    let preview = plan.to_string();
+    assert!(
+        preview.contains(
+            "  withheld   .github/workflows/check.yml: requires justfile, which is not added; left uncreated\n"
+        ),
+        "{preview}"
+    );
+    assert!(preview.contains(" 1 withheld,"), "{preview}");
+    plan.apply()?;
+    assert!(!target.join(".github/workflows/check.yml").exists());
+    assert!(target.join(".github/workflows/security.yml").exists());
+    assert_eq!(
+        fs::read_to_string(target.join("justfile"))?,
+        "check:\n    echo local\n"
+    );
+
+    // Once the local justfile is reconciled, a rerun adds the workflow.
+    fs::remove_file(target.join("justfile"))?;
+    let plan = FilePlan::new(render_origin89('a')?, &target)?;
+    assert_eq!(
+        action(&plan, ".github/workflows/check.yml"),
+        Some(&PlanAction::Add)
+    );
+    Ok(())
+}
+
+#[test]
+fn requirements_withhold_transitively_and_must_name_listed_sources() -> TestResult {
+    let manifest = minimal_with(
+        r#"
+[[files]]
+source = "base"
+[[files]]
+source = "middle"
+requires = ["base"]
+[[files]]
+source = "top"
+requires = ["middle"]
+"#,
+    );
+    let sources = [("base", "b"), ("middle", "m"), ("top", "t")];
+    let workspace = TempDir::new()?;
+    let target = real(&workspace)?;
+    fs::write(target.join("base"), "local")?;
+    let plan = FilePlan::new(render_minimal(&manifest, &sources, &[])??, &target)?;
+    assert_eq!(
+        action(&plan, "top"),
+        Some(&PlanAction::Withheld {
+            requires: vec![RelativePath::new("middle")?],
+        })
+    );
+    assert_eq!(plan.additions().count(), 0);
+
+    for requires in [r#"["absent"]"#, r#"["base", "base"]"#, r#"["middle"]"#] {
+        let invalid = minimal_with(&format!(
+            "[[files]]\nsource = \"base\"\n[[files]]\nsource = \"middle\"\nrequires = {requires}\n"
+        ));
+        assert!(
+            matches!(
+                load_error(&invalid, &sources[..2])?,
+                ScaffoldError::Template {
+                    problem: TemplateProblem::InvalidRequirement(_)
+                }
+            ),
+            "{requires}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn applying_writes_files_without_activating_anything() -> TestResult {
+    let workspace = TempDir::new()?;
+    let target = real(&workspace)?.join("new-repo");
+    let plan = FilePlan::new(render_origin89('a')?, &target)?;
+    assert!(
+        plan.files()
+            .iter()
+            .any(|planned| planned.activation() == Some(Activation::ScheduledWorkflow))
+    );
+    plan.apply()?;
+    let mut written = Vec::new();
+    let mut pending = vec![target.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                pending.push(entry.path());
+            } else {
+                written.push(
+                    entry
+                        .path()
+                        .strip_prefix(&target)?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    written.sort();
+    let mut planned: Vec<String> = plan
+        .files()
+        .iter()
+        .map(|planned| planned.file.path.as_str().to_owned())
+        .collect();
+    planned.sort();
+    // Exactly the planned files: no Git repository, hook installation,
+    // environment load, or tool cache appears as a side effect.
+    assert_eq!(written, planned);
     Ok(())
 }
 
@@ -247,7 +453,7 @@ fn adoption_reports_conflicts_and_never_touches_existing_files() -> TestResult {
     let preview = plan.to_string();
     assert!(preview.contains("  conflict   README.md: existing file differs; left untouched\n"));
     assert!(preview.contains("  unchanged  AGENTS.md\n"));
-    assert!(preview.contains("1 to add, 1 unchanged, 2 conflicts."));
+    assert!(preview.contains("1 to add, 1 unchanged, 0 withheld, 2 conflicts."));
     assert!(!target.join(".gitignore").exists());
 
     // Applying creates the addition and leaves every conflict untouched.
@@ -783,6 +989,7 @@ fn binding(bytes: usize) -> TestResult<RenderedFile> {
         contents: "x".repeat(bytes),
         mode: FileMode::Regular,
         managed: false,
+        requires: Vec::new(),
     })
 }
 

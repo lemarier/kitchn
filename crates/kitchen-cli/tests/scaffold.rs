@@ -156,7 +156,7 @@ fn preview_apply_and_bound_rerun() -> Result {
         .arg("--yes")
         .output()?;
     assert!(output.status.success(), "{output:?}");
-    assert!(stdout(&output).contains("0 to add, 3 unchanged, 0 conflicts"));
+    assert!(stdout(&output).contains("0 to add, 3 unchanged, 0 withheld, 0 conflicts"));
     assert!(!f.root.join("consumer/.git").exists());
     Ok(())
 }
@@ -447,5 +447,59 @@ fn init_refuses_a_non_empty_root_and_adopt_accepts_it() -> Result {
         "local"
     );
     assert!(f.root.join("consumer/.kitchen.json").exists());
+    Ok(())
+}
+
+#[test]
+fn a_workflow_needing_a_conflicting_justfile_is_withheld_and_nothing_activates() -> Result {
+    let f = Fixture::new()?;
+    let bundle_manifest = format!(
+        "{}[[files]]\nsource = \"justfile\"\n[[files]]\nsource = \"ci.yml\"\npath = \".github/workflows/ci.yml\"\nrequires = [\"justfile\"]\n",
+        manifest(1)
+    );
+    let house = HouseId::new("crabnebula")?;
+    let mut bundle = InstructionBundle {
+        schema: 1,
+        house,
+        kitchen: CommitId::new(&"a".repeat(40))?,
+        role_cards_digest: role_cards_digest(),
+        guidance: CommitId::new(&"f".repeat(40))?,
+        entrypoint: RelativePath::new("SKILL.md")?,
+        notices: [RelativePath::new("NOTICE.md")?].into(),
+        assets: vec![
+            asset("SKILL.md", "Apply the house rules.")?,
+            asset("NOTICE.md", "Synthetic fixture notice.")?,
+            asset("templates/test/template.toml", &bundle_manifest)?,
+        ],
+    };
+    for (path, contents) in [
+        ("AGENTS.md", "agents\n"),
+        ("README.md", "readme\n"),
+        ("justfile", "check:\n    cargo test\n"),
+        ("ci.yml", "on: push\njobs: {}\n"),
+    ] {
+        bundle
+            .assets
+            .push(asset(&format!("templates/test/files/{path}"), contents)?);
+    }
+    f.install(&bundle)?;
+    fs::create_dir(f.root.join("consumer"))?;
+    fs::write(f.root.join("consumer/justfile"), "check:\n    echo local\n")?;
+
+    let output = f.selected("adopt").output()?;
+    let preview = stdout(&output);
+    assert!(
+        preview.contains("  withheld   .github/workflows/ci.yml: requires justfile"),
+        "{preview}"
+    );
+    let output = f.selected("adopt").arg("--yes").output()?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!f.root.join("consumer/.github").exists());
+    assert!(!f.root.join("consumer/.git").exists());
+    assert_eq!(
+        fs::read_to_string(f.root.join("consumer/justfile"))?,
+        "check:\n    echo local\n"
+    );
+    assert!(f.root.join("consumer/README.md").exists());
     Ok(())
 }

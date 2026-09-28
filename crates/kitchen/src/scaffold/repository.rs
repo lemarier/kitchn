@@ -86,6 +86,7 @@ pub fn plan_repository(
         contents: binding,
         mode: FileMode::Regular,
         managed: false,
+        requires: Vec::new(),
     });
     FilePlan::new(rendered, target)
 }

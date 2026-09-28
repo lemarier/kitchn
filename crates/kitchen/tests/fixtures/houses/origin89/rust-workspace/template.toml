@@ -122,11 +122,13 @@ render = false
 source = "github/workflows/check.yml"
 path = ".github/workflows/check.yml"
 render = false
+requires = ["justfile.tera", "rust-toolchain.toml.tera"]
 
 [[files]]
 source = "github/workflows/security.yml"
 path = ".github/workflows/security.yml"
 render = false
+requires = ["deny.toml"]
 
 [[files]]
 source = "github/dependabot.yml"

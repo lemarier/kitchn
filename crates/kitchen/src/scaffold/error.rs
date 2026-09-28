@@ -273,6 +273,8 @@ pub enum TemplateProblem {
     Empty,
     /// A marker would displace a shebang/front matter, or mark an executable.
     MarkerPlacement(RelativePath),
+    /// A source's `requires` names an unlisted source, itself, or one source twice.
+    InvalidRequirement(RelativePath),
     /// The manifest declares a different name than the guidance directory
     /// the template was selected from.
     NameMismatch,
@@ -312,6 +314,11 @@ impl fmt::Display for TemplateProblem {
             Self::MarkerPlacement(path) => write!(
                 formatter,
                 "{} cannot carry a first-line provenance marker",
+                path.as_str()
+            ),
+            Self::InvalidRequirement(path) => write!(
+                formatter,
+                "source {} requires an unlisted source, itself, or one source twice",
                 path.as_str()
             ),
             Self::NameMismatch => {

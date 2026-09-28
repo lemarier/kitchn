@@ -20,7 +20,13 @@ Supply each variable once as `--set name=value`; the value is everything after
 the first `=`. A missing-value error lists every required variable with its
 description.
 
-The default is a preview of every addition, identical file, and conflict. Repeat
+The default is a preview of every addition, identical file, withheld file, and
+conflict. Additions that can start automation later are flagged with when that
+happens: CI and scheduled workflows run once pushed, dependency-update
+configuration opens pull requests once pushed, agent/editor settings and MCP
+configuration apply when a client opens the repository, environment files load
+through tools such as direnv, and Git hooks run once configured. Kitchen crosses
+none of these boundaries itself. Repeat
 with `--confirm` to answer `yes`, or `--yes` for non-interactive confirmation.
 EOF, a negative answer, or an incomplete answer grants no consent. Invalid input
 exits 2; conflicts and execution failures exit 1. Nothing creates a Git remote,
@@ -70,6 +76,12 @@ template files, preserving their bytes. Kitchen's offline checks do not run such
 a recipe and do not establish that guidance was installed. For pinned tasks use
 the immutable snapshot returned by `house sync`; a refresh script that follows
 upstream must not silently change an active task's pin.
+
+A file entry can declare `requires = ["justfile.tera"]`, listing other sources
+it depends on. When a required output conflicts or is itself withheld, the
+dependent file is withheld: it is reported and not created, even with `--yes`.
+Rerun after reconciling the requirement. Declare this for workflows and other
+activating files that run commands from template files.
 
 Kitchen ships only `example/`. Copy it into your house guidance as
 `templates/<name>/`, with `template.toml` and its `files/` tree as bundle assets,

@@ -45,8 +45,32 @@ pub enum WorkItem {
     },
 }
 
+/// The provider's revision of an issue: when it was last updated and the
+/// newest comment seen. Editing the issue or commenting on it changes the
+/// revision, even when no repository commit moves.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IssueRevision {
+    /// The provider's last-updated time of the issue.
+    pub updated_at: Timestamp,
+    /// The provider's id of the newest comment seen, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_comment: Option<ExternalRef>,
+}
+
+/// The exact revision a marker's fact is about.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "revision", rename_all = "kebab-case")]
+pub enum MarkerSubject {
+    /// A Git head and optional base, such as a pull request under review.
+    Git(EvidenceSubject),
+    /// An issue's provider revision, such as an issue under triage.
+    Issue(IssueRevision),
+}
+
 /// What a marker is keyed by: the workflow, the work item, and the exact
-/// evidence subject. A moved head or base is a different key.
+/// subject revision. A moved head or base, or an edited issue, is a
+/// different key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MarkerKey {
@@ -54,8 +78,8 @@ pub struct MarkerKey {
     pub workflow: WorkflowId,
     /// The work item.
     pub item: WorkItem,
-    /// The exact head and optional base the fact is about.
-    pub subject: EvidenceSubject,
+    /// The exact revision the fact is about.
+    pub subject: MarkerSubject,
 }
 
 /// The fact a marker records.

@@ -10,7 +10,8 @@ use kitchen::{
     ConsumerId, Error, WorkflowId,
     contracts::{EvidenceSubject, EvidenceVerdict, ExternalRef, Repository},
     state::{
-        Corruption, MAX_MARKERS, MarkerFact, MarkerKey, MarkerRecording, StateError, WorkItem,
+        Corruption, IssueRevision, MAX_MARKERS, MarkerFact, MarkerKey, MarkerRecording,
+        MarkerSubject, StateError, WorkItem,
     },
 };
 
@@ -25,10 +26,24 @@ fn key(workflow: &str, item: WorkItem, head: char, base: Option<char>) -> TestRe
     Ok(MarkerKey {
         workflow: WorkflowId::new(workflow)?,
         item,
-        subject: EvidenceSubject {
+        subject: MarkerSubject::Git(EvidenceSubject {
             head: commit(head)?,
             base: base.map(commit).transpose()?,
+        }),
+    })
+}
+
+fn issue_key(number: u64, updated: u64, last_comment: Option<&str>) -> TestResult<MarkerKey> {
+    Ok(MarkerKey {
+        workflow: WorkflowId::new("triage")?,
+        item: WorkItem::Issue {
+            repository: Repository::new("origin89hq/km43")?,
+            number: NonZeroU64::new(number).ok_or("zero")?,
         },
+        subject: MarkerSubject::Issue(IssueRevision {
+            updated_at: at(updated),
+            last_comment: last_comment.map(ExternalRef::new).transpose()?,
+        }),
     })
 }
 
@@ -263,7 +278,11 @@ fn corrupt_markers_are_rejected_without_reset() -> TestResult {
     malformed["markers"][0]["fact"] = serde_json::json!({"type": "verdict", "verdict": "maybe"});
     let mut zero = valid.clone();
     zero["markers"][0]["key"]["item"]["number"] = 0.into();
-    let cases: [(serde_json::Value, Expectation); 3] = [
+    assert_eq!(valid["markers"][0]["key"]["subject"]["type"], "git");
+    let mut bad_head = valid.clone();
+    bad_head["markers"][0]["key"]["subject"]["revision"]["head"] = "not-a-commit".into();
+    let cases: [(serde_json::Value, Expectation); 4] = [
+        (bad_head, syntax),
         (duplicate, |error| {
             matches!(
                 error,
@@ -641,4 +660,112 @@ fn workflow_payloads_and_schemas_are_bounded_and_validated() -> TestResult {
         assert_eq!(fs::read(&path)?, bytes);
     }
     Ok(())
+}
+
+#[test]
+fn an_edited_issue_is_a_new_question_key() -> TestResult {
+    let fixture = Fixture::new()?;
+    let asked = MarkerFact::QuestionAsked {
+        question: ExternalRef::new("roger-ask-1")?,
+    };
+    let revision = issue_key(7, 100, Some("comment-41"))?;
+    fixture.store.record_marker(
+        revision.clone(),
+        asked.clone(),
+        &scheduled("triage")?,
+        at(1),
+    )?;
+    // The same issue revision is the same key: the question is not asked again.
+    assert!(matches!(
+        fixture.store.record_marker(
+            issue_key(7, 100, Some("comment-41"))?,
+            asked.clone(),
+            &scheduled("triage")?,
+            at(2)
+        )?,
+        MarkerRecording::AlreadyRecorded(_)
+    ));
+    // An edit or a new comment is a new key, whatever the repository head.
+    for edited in [
+        issue_key(7, 101, Some("comment-41"))?,
+        issue_key(7, 100, Some("comment-42"))?,
+        issue_key(7, 100, None)?,
+    ] {
+        assert_eq!(fixture.store.marker(&edited)?, None, "{edited:?}");
+    }
+    // A Git subject never collides with an issue revision.
+    let git = key("triage", revision.item.clone(), 'a', None)?;
+    assert_eq!(fixture.store.marker(&git)?, None);
+    assert!(fixture.reopen()?.marker(&revision)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn corrupt_issue_subjects_are_rejected_without_reset() -> TestResult {
+    let fixture = Fixture::new()?;
+    let asked = |id: &str| -> TestResult<MarkerFact> {
+        Ok(MarkerFact::QuestionAsked {
+            question: ExternalRef::new(id)?,
+        })
+    };
+    fixture.store.record_marker(
+        issue_key(7, 100, None)?,
+        asked("q-1")?,
+        &scheduled("triage")?,
+        at(1),
+    )?;
+    fixture.store.record_marker(
+        issue_key(7, 101, None)?,
+        asked("q-2")?,
+        &scheduled("triage")?,
+        at(2),
+    )?;
+    let path = fixture.state_path();
+    let valid: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    assert_eq!(valid["markers"][0]["key"]["subject"]["type"], "issue");
+    let mut duplicate = valid.clone();
+    duplicate["markers"][1]["key"] = valid["markers"][0]["key"].clone();
+    let mut unknown_kind = valid.clone();
+    unknown_kind["markers"][0]["key"]["subject"]["type"] = "wiki".into();
+    let mut missing_time = valid.clone();
+    missing_time["markers"][0]["key"]["subject"]["revision"] = serde_json::json!({});
+    let mut bad_comment = valid.clone();
+    bad_comment["markers"][0]["key"]["subject"]["revision"]["lastComment"] = "has space".into();
+    let mut git_as_issue = valid;
+    git_as_issue["markers"][0]["key"]["subject"]["type"] = "git".into();
+    let cases: [(serde_json::Value, Expectation); 5] = [
+        (duplicate, |error| {
+            matches!(
+                error,
+                Error::State(StateError::CorruptState(
+                    Corruption::DuplicateWorkflowMarker
+                ))
+            )
+        }),
+        (unknown_kind, syntax),
+        (missing_time, syntax),
+        (bad_comment, syntax),
+        (git_as_issue, syntax),
+    ];
+    for (corrupt, expected) in cases {
+        let bytes = serde_json::to_vec_pretty(&corrupt)?;
+        fs::write(&path, &bytes)?;
+        let error = fixture
+            .reopen()
+            .err()
+            .ok_or("corrupt issue subject was accepted")?;
+        let error = error
+            .downcast::<Error>()
+            .map_err(|_| "unexpected error type")?;
+        assert!(expected(&error), "{error:?}");
+        assert_eq!(fs::read(&path)?, bytes, "rejected state is not rewritten");
+    }
+    Ok(())
+}
+
+fn syntax(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::State(StateError::CorruptState(Corruption::Syntax { .. }))
+    )
 }

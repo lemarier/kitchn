@@ -19,8 +19,8 @@ use kitchen::{
     house::HouseError,
     scaffold::{
         Conflict, FilePlan, MAX_RENDERED_BYTES, MAX_TEMPLATE_OUTPUT_BYTES, ManagedState, Manifest,
-        PlanAction, PlanKind, RenderedFile, RenderedTemplate, ScaffoldError, ScaffoldLimit,
-        Template, TemplateProblem, VariableName, inspect_managed,
+        MissingVariable, PlanAction, PlanKind, RenderedFile, RenderedTemplate, ScaffoldError,
+        ScaffoldLimit, Template, TemplateProblem, VariableName, inspect_managed,
     },
 };
 use tempfile::TempDir;
@@ -495,8 +495,11 @@ source = "out.tera"
     let missing = render_minimal(&manifest, &sources, &[])?;
     assert_eq!(
         missing,
-        Err(ScaffoldError::MissingVariable {
-            name: "name".parse()?
+        Err(ScaffoldError::MissingVariables {
+            variables: vec![MissingVariable {
+                name: "name".parse()?,
+                description: "required".into(),
+            }],
         })
     );
     let unknown = render_minimal(&manifest, &sources, &[("name", "x"), ("other", "y")])?;
@@ -528,6 +531,57 @@ source = "out.tera"
             Err(ScaffoldError::InvalidVariableName)
         );
     }
+    Ok(())
+}
+
+#[test]
+fn every_missing_variable_is_reported_with_its_description() -> TestResult {
+    let manifest = minimal_with(
+        r#"
+[variables.project]
+description = "Project name"
+[variables.flavor]
+description = "optional"
+default = "plain"
+[variables.summary]
+description = "One-line \"summary\""
+[[files]]
+source = "out.tera"
+"#,
+    );
+    let sources = [("out.tera", "{{ vars.project }} {{ vars.summary }}")];
+    let error = render_minimal(&manifest, &sources, &[])?
+        .err()
+        .ok_or("rendered without required values")?;
+    assert_eq!(
+        error,
+        ScaffoldError::MissingVariables {
+            variables: vec![
+                MissingVariable {
+                    name: "project".parse()?,
+                    description: "Project name".into(),
+                },
+                MissingVariable {
+                    name: "summary".parse()?,
+                    description: "One-line \"summary\"".into(),
+                },
+            ],
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "missing values for template variables: project (\"Project name\"), summary (\"One-line \\\"summary\\\"\")"
+    );
+    // Supplying one leaves only the other.
+    assert_eq!(
+        render_minimal(&manifest, &sources, &[("summary", "s")])?,
+        Err(ScaffoldError::MissingVariables {
+            variables: vec![MissingVariable {
+                name: "project".parse()?,
+                description: "Project name".into(),
+            }],
+        })
+    );
     Ok(())
 }
 

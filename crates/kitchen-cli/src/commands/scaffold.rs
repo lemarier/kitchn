@@ -5,7 +5,7 @@ use kitchen::{
     adoption::{FileStatus, HouseRegistry},
     contracts::Repository,
     house::HouseError,
-    scaffold::{TemplateName, VariableName, plan_repository},
+    scaffold::{ScaffoldError, TemplateName, VariableName, plan_repository},
 };
 use std::{
     collections::BTreeMap,
@@ -47,13 +47,25 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
         return Err(HouseError::InvalidInput.into());
     }
     let registry = HouseRegistry::new(canonical_target(args.registry)?)?;
+    if !adopt
+        && target.is_dir()
+        && std::fs::read_dir(&target)
+            .map_err(HouseError::from)?
+            .next()
+            .is_some()
+    {
+        return Err(ScaffoldError::TargetNotEmpty { path: target }.into());
+    }
     let mut variables = BTreeMap::new();
     for value in args.variables {
-        let (name, value) = value.split_once('=').ok_or(HouseError::InvalidInput)?;
+        let (name, value) = value
+            .split_once('=')
+            .ok_or(ScaffoldError::MalformedAssignment)?;
         let name: VariableName = name.parse()?;
-        if variables.insert(name, value.to_owned()).is_some() {
-            return Err(HouseError::InvalidInput.into());
+        if variables.contains_key(&name) {
+            return Err(ScaffoldError::DuplicateVariable { name }.into());
         }
+        variables.insert(name, value.to_owned());
     }
     let plan = plan_repository(
         &registry,

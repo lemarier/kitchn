@@ -16,6 +16,10 @@ kitchen init my-project --registry /path/to/registry \
   --template example --set project_name=my-project
 ```
 
+Supply each variable once as `--set name=value`; the value is everything after
+the first `=`. A missing-value error lists every required variable with its
+description.
+
 The default is a preview of every addition, identical file, and conflict. Repeat
 with `--confirm` to answer `yes`, or `--yes` for non-interactive confirmation.
 EOF, a negative answer, or an incomplete answer grants no consent. Invalid input
@@ -23,7 +27,8 @@ exits 2; conflicts and execution failures exit 1. Nothing creates a Git remote,
 pushes, starts schedules, or accesses credentials. `init` creates the repository
 directory and files, without running `git init` or activating workflow files.
 
-For an existing directory, use `kitchen adopt` with the same arguments. Once
+`init` accepts a missing or empty directory and refuses one with content. For an
+existing directory, use `kitchen adopt` with the same arguments. Once
 `.kitchen.json` exists, omit `--house` and `--repository` to use that exact
 binding. Missing selection fails closed, even with only one registered house.
 Existing workflow selections and additional checks/reviewers are retained;

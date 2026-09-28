@@ -115,11 +115,30 @@ pub enum ScaffoldError {
         /// The requested template.
         name: TemplateName,
     },
-    /// A required variable has no value and no default.
-    #[error("missing value for template variable {name}")]
-    MissingVariable {
+    /// Required variables have no value and no default. Lists every one in
+    /// manifest (name) order.
+    #[error("missing values for template variables: {}", list_missing(variables))]
+    MissingVariables {
+        /// Each missing variable with its declared description.
+        variables: Vec<MissingVariable>,
+    },
+    /// A variable assignment is not of the form `name=value`.
+    #[error("variable assignments must have the form name=value")]
+    MalformedAssignment,
+    /// A variable was assigned more than once.
+    #[error("template variable {name} is assigned more than once")]
+    DuplicateVariable {
         /// The variable.
         name: VariableName,
+    },
+    /// `init` was pointed at a directory that already has content.
+    #[error(
+        "target {} is not empty; use `kitchen adopt` to add template files to an existing directory",
+        path.display()
+    )]
+    TargetNotEmpty {
+        /// The existing directory.
+        path: PathBuf,
     },
     /// A supplied variable is not declared by the template.
     #[error("template does not declare variable {name}")]
@@ -185,7 +204,10 @@ impl ScaffoldError {
             | Self::Syntax { .. }
             | Self::Render { .. }
             | Self::TemplateNotFound { .. }
-            | Self::MissingVariable { .. }
+            | Self::MissingVariables { .. }
+            | Self::MalformedAssignment
+            | Self::DuplicateVariable { .. }
+            | Self::TargetNotEmpty { .. }
             | Self::UnknownVariable { .. }
             | Self::InvalidVariableName
             | Self::InvalidVariableValue { .. }
@@ -203,6 +225,23 @@ impl ScaffoldError {
             kind: error.kind(),
         }
     }
+}
+
+/// A required template variable that has no value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingVariable {
+    /// The variable.
+    pub name: VariableName,
+    /// Its manifest description, shown so the caller knows what to supply.
+    pub description: String,
+}
+
+fn list_missing(variables: &[MissingVariable]) -> String {
+    variables
+        .iter()
+        .map(|variable| format!("{} ({:?})", variable.name, variable.description))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// An inconsistency between a template's manifest and its source files.

@@ -53,7 +53,9 @@ mod plan;
 mod provenance;
 mod template;
 
-pub use error::{ScaffoldError, ScaffoldLimit, ScaffoldOperation, TemplateProblem};
+pub use error::{
+    MissingVariable, ScaffoldError, ScaffoldLimit, ScaffoldOperation, TemplateProblem,
+};
 pub use manifest::{
     FileEntry, MAX_VARIABLES, Manifest, MarkerStyle, TEMPLATE_SCHEMA, TemplateName,
     TemplateRevision, VariableKind, VariableName, VariableSpec,

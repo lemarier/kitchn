@@ -1,0 +1,119 @@
+# House-owned example content, used only as a test fixture. This is the
+# Origin89 house's repository template, derived from how the Kitchen repository
+# is laid out under Origin89 engineering conventions. It is not Kitchen's
+# default policy; Kitchen ships only the generic example in `templates/`.
+schema = 1
+name = "rust-workspace"
+house = "origin89"
+revision = 1
+description = "Rust workspace with pinned toolchain, just checks, CI, security policy, and Origin89 agent instructions"
+
+[variables.project_name]
+description = "Human-readable project name"
+
+[variables.summary]
+kind = "quoted-text"
+description = "One-sentence project description"
+
+[variables.crate_name]
+kind = "rust-identifier"
+description = "Name of the first library crate under crates/"
+
+[variables.copyright_holder]
+kind = "quoted-text"
+description = "Copyright holder for the licenses and crate metadata"
+
+[variables.copyright_year]
+kind = "year"
+description = "Year in the MIT copyright notice"
+
+[variables.security_contact]
+description = "Private address for vulnerability reports"
+
+[variables.repository_url]
+kind = "https-url"
+description = "Repository URL recorded in Cargo metadata"
+
+[variables.rust_version]
+kind = "version"
+description = "Pinned Rust toolchain and MSRV"
+default = "1.98.1"
+
+[[files]]
+source = "README.md.tera"
+
+[[files]]
+source = "AGENTS.md.tera"
+provenance = "html-comment"
+
+[[files]]
+source = "CLAUDE.md"
+provenance = "html-comment"
+
+[[files]]
+source = "CONTRIBUTING.md.tera"
+provenance = "html-comment"
+
+[[files]]
+source = "SECURITY.md.tera"
+
+[[files]]
+source = "LICENSE-MIT.tera"
+
+[[files]]
+source = "LICENSE-APACHE"
+render = false
+
+[[files]]
+source = "Cargo.toml.tera"
+
+[[files]]
+source = "Cargo.lock.tera"
+
+[[files]]
+source = "crate/Cargo.toml.tera"
+path = "crates/{{ vars.crate_name }}/Cargo.toml"
+
+[[files]]
+source = "crate/lib.rs.tera"
+path = "crates/{{ vars.crate_name }}/src/lib.rs"
+
+[[files]]
+source = "rust-toolchain.toml.tera"
+
+[[files]]
+source = "justfile.tera"
+
+[[files]]
+source = "deny.toml"
+render = false
+
+[[files]]
+source = "gitignore"
+path = ".gitignore"
+render = false
+
+[[files]]
+source = "claude/settings.json"
+path = ".claude/settings.json"
+render = false
+
+[[files]]
+source = "github/workflows/check.yml"
+path = ".github/workflows/check.yml"
+render = false
+
+[[files]]
+source = "github/workflows/security.yml"
+path = ".github/workflows/security.yml"
+render = false
+
+[[files]]
+source = "github/dependabot.yml"
+path = ".github/dependabot.yml"
+render = false
+
+[[files]]
+source = "github/pull_request_template.md"
+path = ".github/pull_request_template.md"
+render = false

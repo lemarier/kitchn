@@ -30,6 +30,10 @@ enum Command {
     ValidateTask { id: String },
     /// Configure a house and adopt repositories without activating workflows.
     House(commands::house::HouseArgs),
+    /// Preview a new repository from a selected house template.
+    Init(commands::scaffold::ScaffoldArgs),
+    /// Preview house template additions or revisions in an existing repository.
+    Adopt(commands::scaffold::ScaffoldArgs),
 }
 
 fn main() -> ExitCode {
@@ -56,6 +60,8 @@ fn main() -> ExitCode {
             .map(|id| (id.to_string(), true))
             .map_err(kitchen::Error::from),
         Some(Command::House(args)) => commands::house::run(args),
+        Some(Command::Init(args)) => commands::scaffold::run(args, false),
+        Some(Command::Adopt(args)) => commands::scaffold::run(args, true),
         None => return output_status(Cli::command().print_help()),
     };
     match result {

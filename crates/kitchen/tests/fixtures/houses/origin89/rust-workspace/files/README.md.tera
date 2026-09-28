@@ -1,0 +1,23 @@
+# {{ vars.project_name }}
+
+{{ vars.summary }}
+
+## Development
+
+Install Rust through rustup, just, and actionlint. The Rust toolchain and MSRV
+are pinned to {{ vars.rust_version }}. Run `cargo fetch --locked` before the
+offline checks.
+
+```sh
+just skills-sync
+cargo fetch --locked
+just check
+```
+
+Read [contributing](CONTRIBUTING.md) and [agent instructions](AGENTS.md) before
+working. See [security reporting](SECURITY.md) to report a vulnerability.
+
+## License
+
+Copyright {{ vars.copyright_holder }}, licensed under [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE), at your option.

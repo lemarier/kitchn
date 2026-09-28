@@ -1,0 +1,51 @@
+# Synthetic second-house fixture for tests. It is not CrabNebula's real policy.
+schema = 1
+name = "tauri-app"
+house = "crabnebula"
+revision = 3
+description = "Tauri application with specta bindings and a pnpm workspace"
+
+[variables.app_name]
+kind = "rust-identifier"
+description = "Application package name"
+
+[variables.product_name]
+kind = "quoted-text"
+description = "Human-readable product name"
+
+[[files]]
+source = "AGENTS.md.tera"
+provenance = "html-comment"
+
+[[files]]
+source = "CLAUDE.md"
+provenance = "html-comment"
+
+[[files]]
+source = "justfile.tera"
+provenance = "hash-comment"
+
+[[files]]
+source = "Cargo.toml.tera"
+
+[[files]]
+source = "package.json.tera"
+
+[[files]]
+source = "pnpm-workspace.yaml"
+render = false
+
+[[files]]
+source = "app/Cargo.toml.tera"
+path = "apps/{{ vars.app_name }}/src-tauri/Cargo.toml"
+
+[[files]]
+source = "github/workflows/ci.yml"
+path = ".github/workflows/ci.yml"
+render = false
+
+[[files]]
+source = "scripts/bindings.sh"
+path = "scripts/bindings.sh"
+mode = "executable"
+render = false

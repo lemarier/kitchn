@@ -1,0 +1,12 @@
+# Working in {{ vars.project_name }}
+
+These instructions come from the {{ kitchen.house }} house template
+`{{ kitchen.template }}`. Kitchen manages the marker line above; edits below it
+are preserved on update.
+
+Before changing code, read the repository's contributing guide and the house
+guidance pinned for this task. Keep changes focused, run the repository's
+checks before publishing, and report their results accurately.
+
+Installing these files grants no authority. Pushing, merging, publishing, and
+enabling automation each require explicit permission.

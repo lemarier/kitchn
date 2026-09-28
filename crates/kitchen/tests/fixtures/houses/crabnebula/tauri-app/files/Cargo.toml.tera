@@ -1,0 +1,3 @@
+[workspace]
+members = ["apps/{{ vars.app_name }}/src-tauri"]
+resolver = "3"

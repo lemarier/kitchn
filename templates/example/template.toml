@@ -1,0 +1,32 @@
+# A generic example of a house repository template. It carries no house
+# policy: copy it into your house's guidance repository, set `house`, and
+# replace the files with your own conventions. Bump `revision` whenever the
+# template changes.
+schema = 1
+name = "example"
+house = "example"
+revision = 1
+description = "Minimal repository with agent instructions and a README"
+
+[variables.project_name]
+description = "Human-readable project name"
+
+[variables.summary]
+description = "One-sentence project description"
+default = "A new project."
+
+[[files]]
+source = "README.md.tera"
+
+[[files]]
+source = "AGENTS.md.tera"
+provenance = "html-comment"
+
+[[files]]
+source = "CLAUDE.md"
+provenance = "html-comment"
+
+[[files]]
+source = "gitignore"
+path = ".gitignore"
+render = false

@@ -20,8 +20,8 @@ use kitchen::{
         coordination::{LaunchOutcome, launch_worker},
         pickup::{Base, ClaimOutcome, TaskTemplate, WorkerBrief, claim_issue, issue_task_id},
         push::{
-            GitConfigKey, PullRequests, PushBoundary, PushIntent, PushOutcome, PushPermit,
-            PushRefusal, RefUpdater, RemoteBranches, UpdateFailure,
+            GitConfigKey, LayersPermit, PullRequests, PushBoundary, PushIntent, PushOutcome,
+            PushPermit, PushRefusal, RefUpdater, RemoteBranches, UpdateFailure,
         },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
     },
@@ -210,6 +210,11 @@ impl RefUpdater for Recorder {
             commit.clone(),
         ));
         self.result.clone()
+    }
+
+    /// The push boundary updates one branch; only a stack push updates layers.
+    fn update_layers(&self, _: &LayersPermit) -> Result<(), UpdateFailure> {
+        Err(UpdateFailure::Rejected)
     }
 }
 
@@ -1251,6 +1256,10 @@ mod git_remote {
             }
             self.remote.update(permit, branch, commit)
         }
+
+        fn update_layers(&self, permit: &LayersPermit) -> Result<(), UpdateFailure> {
+            self.remote.update_layers(permit)
+        }
     }
 
     #[test]
@@ -1516,6 +1525,10 @@ mod git_remote {
             ) -> Result<(), UpdateFailure> {
                 *self.0.borrow_mut() = Some(permit.clone());
                 Ok(())
+            }
+
+            fn update_layers(&self, _: &LayersPermit) -> Result<(), UpdateFailure> {
+                Err(UpdateFailure::Rejected)
             }
         }
         let capture = Capture(RefCell::new(None));

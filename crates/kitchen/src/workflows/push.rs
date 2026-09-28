@@ -142,6 +142,83 @@ impl PushPermit {
     }
 }
 
+/// One branch of a [`LayersPermit`]: point `branch` at `commit` only if it
+/// still holds `replaces`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerUpdate {
+    branch: BranchName,
+    replaces: Option<CommitId>,
+    commit: CommitId,
+}
+
+impl LayerUpdate {
+    pub(crate) const fn new(
+        branch: BranchName,
+        replaces: Option<CommitId>,
+        commit: CommitId,
+    ) -> Self {
+        Self {
+            branch,
+            replaces,
+            commit,
+        }
+    }
+
+    /// The branch.
+    #[must_use]
+    pub const fn branch(&self) -> &BranchName {
+        &self.branch
+    }
+
+    /// The remote head the update may replace; `None` means the branch must
+    /// not exist.
+    #[must_use]
+    pub const fn replaces(&self) -> Option<&CommitId> {
+        self.replaces.as_ref()
+    }
+
+    /// The commit the branch points at afterwards. For a layer below the
+    /// task's branch it is the head that was checked, so the update only
+    /// holds the layer to that head.
+    #[must_use]
+    pub const fn commit(&self) -> &CommitId {
+        &self.commit
+    }
+}
+
+/// Proof that every layer of a stack push was checked against fresh state,
+/// and the head each may replace. Only
+/// [`crate::workflows::stack::StackBoundary`] builds one. The update is one
+/// compare-and-swap over every branch: if any branch no longer holds its
+/// [`LayerUpdate::replaces`], none changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct LayersPermit {
+    repository: Repository,
+    updates: Vec<LayerUpdate>,
+}
+
+impl LayersPermit {
+    pub(crate) const fn new(repository: Repository, updates: Vec<LayerUpdate>) -> Self {
+        Self {
+            repository,
+            updates,
+        }
+    }
+
+    /// The repository the check granted the push to.
+    #[must_use]
+    pub const fn repository(&self) -> &Repository {
+        &self.repository
+    }
+
+    /// The branches, bottom to top.
+    #[must_use]
+    pub fn updates(&self) -> &[LayerUpdate] {
+        &self.updates
+    }
+}
+
 /// What the check decided.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Decision {
@@ -264,6 +341,16 @@ pub trait RefUpdater {
         branch: &BranchName,
         commit: &CommitId,
     ) -> std::result::Result<(), UpdateFailure>;
+
+    /// Apply every [`LayerUpdate`] of `permit` atomically: all of them if
+    /// every branch still holds its [`LayerUpdate::replaces`], none
+    /// otherwise, with [`UpdateFailure::Rejected`]. A remote that cannot
+    /// apply them atomically must refuse, not apply some.
+    ///
+    /// # Errors
+    /// Returns an [`UpdateFailure`] distinguishing "nothing changed" from
+    /// "outcome unknown".
+    fn update_layers(&self, permit: &LayersPermit) -> std::result::Result<(), UpdateFailure>;
 }
 
 /// What a push attempt did.
@@ -580,9 +667,11 @@ const GIT_POLL: Duration = Duration::from_millis(10);
 /// A Git remote reached through the `git` executable in a worker's
 /// checkout: reads branch heads with `git ls-remote` and updates them with
 /// `git push --force-with-lease=<ref>:<expected>`, which the remote applies
-/// only if the ref still holds the expected value. It never prompts. Every
-/// call has a deadline; an expired call reports unknown or uncertain, never
-/// success.
+/// only if the ref still holds the expected value. Several branches go in
+/// one `git push --atomic`, each with its own lease; a remote that does not
+/// support atomic pushes fails the push rather than applying part of it.
+/// It never prompts. Every call has a deadline; an expired call reports
+/// unknown or uncertain, never success.
 ///
 /// Every call runs Git under one environment: no system configuration,
 /// Kitchen's own [`IsolatedGitConfig`] in place of the user's global one,
@@ -1126,10 +1215,28 @@ impl RefUpdater for GitRemote {
         branch: &BranchName,
         commit: &CommitId,
     ) -> std::result::Result<(), UpdateFailure> {
+        let update = LayerUpdate::new(branch.clone(), permit.replaces.clone(), commit.clone());
+        self.push_leased(permit.repository(), std::slice::from_ref(&update))
+    }
+
+    fn update_layers(&self, permit: &LayersPermit) -> std::result::Result<(), UpdateFailure> {
+        self.push_leased(permit.repository(), permit.updates())
+    }
+}
+
+impl GitRemote {
+    /// Push every update to `repository` with its own lease, atomically
+    /// when there is more than one: a remote without atomic pushes fails the
+    /// push instead of applying part of it.
+    fn push_leased(
+        &self,
+        repository: &Repository,
+        updates: &[LayerUpdate],
+    ) -> std::result::Result<(), UpdateFailure> {
         // Check the checkout's configuration and resolve the destination
         // once more, as late as possible, then push to that URL, never to
         // the remote's name, which the checkout's config can repoint.
-        match self.redirecting_entry(permit.repository()) {
+        match self.redirecting_entry(repository) {
             Observed::Known(None) => {}
             Observed::Known(Some(key)) => return Err(UpdateFailure::Redirected(key)),
             Observed::Unknown => return Err(UpdateFailure::Uncertain),
@@ -1137,32 +1244,45 @@ impl RefUpdater for GitRemote {
         let Some(urls) = self.urls(true) else {
             return Err(UpdateFailure::Uncertain);
         };
-        if !urls.iter().all(|url| self.names(url, permit.repository())) {
+        if !urls.iter().all(|url| self.names(url, repository)) {
             return Err(UpdateFailure::Rejected);
         }
         let Some(destination) = urls.first() else {
             return Err(UpdateFailure::Uncertain);
         };
-        let reference = format!("refs/heads/{branch}");
-        // An empty expected value means the ref must not exist.
-        let lease = format!(
-            "--force-with-lease={reference}:{}",
-            permit.replaces().map_or("", CommitId::as_str)
-        );
-        let refspec = format!("{commit}:{reference}");
-        match self.run(&[
+        let mut args: Vec<String> = [
             "push",
             "--porcelain",
             "--no-follow-tags",
             "--no-recurse-submodules",
             "--receive-pack=git-receive-pack",
-            &lease,
-            destination,
-            &refspec,
-        ]) {
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        if updates.len() > 1 {
+            args.push("--atomic".to_owned());
+        }
+        for update in updates {
+            // An empty expected value means the ref must not exist.
+            args.push(format!(
+                "--force-with-lease=refs/heads/{}:{}",
+                update.branch,
+                update.replaces().map_or("", CommitId::as_str)
+            ));
+        }
+        args.push(destination.clone());
+        args.extend(
+            updates
+                .iter()
+                .map(|update| format!("{}:refs/heads/{}", update.commit, update.branch)),
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match self.run(&args) {
             Some((Some(0), _)) => Ok(()),
             // Git reports a refused ref, such as a failed lease, as a line
-            // starting with `!` under `--porcelain`: nothing changed.
+            // starting with `!` under `--porcelain`: nothing changed, since
+            // an atomic push applies no ref when one is refused.
             Some((Some(1), stdout))
                 if stdout
                     .split(|byte| *byte == b'\n')

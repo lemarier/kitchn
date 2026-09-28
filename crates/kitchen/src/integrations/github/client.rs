@@ -37,6 +37,11 @@ impl ReadLimits {
             bytes,
         })
     }
+    /// Maximum pages per query.
+    #[must_use]
+    pub const fn pages(self) -> u16 {
+        self.pages
+    }
     /// Query timeout.
     #[must_use]
     pub const fn timeout(self) -> Duration {

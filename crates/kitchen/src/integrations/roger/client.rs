@@ -154,28 +154,17 @@ impl RogerCli {
         timeout: Duration,
         max_bytes: usize,
     ) -> Result<super::super::github::process::ProcessOutput, IntegrationError> {
+        let started = Instant::now();
         let token = self.credential.load(reference)?;
-        run(
+        let env = [
+            ("ROGER_TOKEN", token.as_str()),
+            ("ROGER_URL", "https://roger.origin89.com"),
+        ];
+        let output = run(
             &self.executable,
-            args,
-            input,
-            &[
-                ("ROGER_TOKEN", &token),
-                ("ROGER_URL", "https://roger.origin89.com"),
-            ],
-            timeout,
-            max_bytes,
-        )
-    }
-    pub(crate) fn verify_requester(
-        &self,
-        reference: &CredentialRef,
-        timeout: Duration,
-    ) -> Result<(), IntegrationError> {
-        let output = self.call(
-            reference,
             &["get".into(), "--".into(), self.probe.as_str().into()],
             &[],
+            &env,
             timeout,
             128 * 1024,
         )?;
@@ -192,7 +181,11 @@ impl RogerCli {
         if probe.id != self.probe || &probe.requester != reference.requester() {
             return Err(IntegrationError::ScopeMismatch);
         }
-        Ok(())
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or(IntegrationError::Timeout)?;
+        run(&self.executable, args, input, &env, remaining, max_bytes)
     }
 }
 impl RogerReadTransport for RogerCli {
@@ -204,17 +197,11 @@ impl RogerReadTransport for RogerCli {
         max_bytes: usize,
     ) -> Result<Vec<u8>, IntegrationError> {
         validate_id(ask)?;
-        let started = Instant::now();
-        self.verify_requester(credential, timeout)?;
-        let remaining = timeout
-            .checked_sub(started.elapsed())
-            .filter(|d| !d.is_zero())
-            .ok_or(IntegrationError::Timeout)?;
         let output = self.call(
             credential,
             &["get".into(), "--".into(), ask.as_str().into()],
             &[],
-            remaining,
+            timeout,
             max_bytes,
         )?;
         if !matches!(output.code, Some(0 | 10 | 11 | 20 | 21 | 22)) {
@@ -223,7 +210,7 @@ impl RogerReadTransport for RogerCli {
         Ok(output.stdout)
     }
 }
-fn validate_id(id: &ExternalRef) -> Result<(), IntegrationError> {
+pub(crate) fn validate_id(id: &ExternalRef) -> Result<(), IntegrationError> {
     // Roger ids are ULIDs; reject flags, paths, and ambiguous positional input.
     if id.as_str().len() != 26
         || !id

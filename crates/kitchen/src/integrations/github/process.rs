@@ -93,33 +93,15 @@ impl GhCli {
         timeout: Duration,
         max_bytes: usize,
     ) -> Result<ProcessOutput, IntegrationError> {
-        let token = self.credential.load(reference)?;
-        run(
-            &self.executable,
-            args,
-            input,
-            &[
-                ("GH_TOKEN", &token),
-                ("GH_HOST", "github.com"),
-                ("GH_PROMPT_DISABLED", "1"),
-            ],
-            timeout,
-            max_bytes,
-        )
-    }
-}
-impl GitHubReadTransport for GhCli {
-    fn read(
-        &self,
-        credential: &CredentialRef,
-        request: &ReadRequest,
-        timeout: Duration,
-        max_bytes: usize,
-    ) -> Result<Vec<u8>, IntegrationError> {
         let started = Instant::now();
-        // A valid token for another requester is still a scope violation.
-        let identity = self.call(
-            credential,
+        let token = self.credential.load(reference)?;
+        let env = [
+            ("GH_TOKEN", token.as_str()),
+            ("GH_HOST", "github.com"),
+            ("GH_PROMPT_DISABLED", "1"),
+        ];
+        let identity = run(
+            &self.executable,
             &[
                 "api".into(),
                 "--hostname".into(),
@@ -127,6 +109,7 @@ impl GitHubReadTransport for GhCli {
                 "user".into(),
             ],
             &[],
+            &env,
             timeout,
             16 * 1024,
         )?;
@@ -137,7 +120,7 @@ impl GitHubReadTransport for GhCli {
             serde_json::from_slice(&identity.stdout).map_err(|_| IntegrationError::Unknown)?;
         if !user
             .login
-            .eq_ignore_ascii_case(credential.requester().as_str())
+            .eq_ignore_ascii_case(reference.requester().as_str())
         {
             return Err(IntegrationError::ScopeMismatch);
         }
@@ -145,6 +128,17 @@ impl GitHubReadTransport for GhCli {
             .checked_sub(started.elapsed())
             .filter(|d| !d.is_zero())
             .ok_or(IntegrationError::Timeout)?;
+        run(&self.executable, args, input, &env, remaining, max_bytes)
+    }
+}
+impl GitHubReadTransport for GhCli {
+    fn read(
+        &self,
+        credential: &CredentialRef,
+        request: &ReadRequest,
+        timeout: Duration,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, IntegrationError> {
         let mut args = vec![
             "api".into(),
             "--hostname".into(),
@@ -163,7 +157,7 @@ impl GitHubReadTransport for GhCli {
         } else {
             Vec::new()
         };
-        let output = self.call(credential, &args, &input, remaining, max_bytes)?;
+        let output = self.call(credential, &args, &input, timeout, max_bytes)?;
         if output.code != Some(0) {
             return Err(IntegrationError::Unavailable);
         }

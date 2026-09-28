@@ -352,3 +352,82 @@ fn gh_cli_timeout_output_bound_and_failure_are_explicit() -> Result {
     }
     Ok(())
 }
+
+#[test]
+fn exact_head_checks_reviews_dependencies_and_unknown_mergeability() -> Result {
+    use kitchen::contracts::CommitId;
+    let head = "a".repeat(40);
+    let fake = Fake::new(vec![
+        Ok(
+            json!({"number":7,"state":"open","draft":false,"merged":false,"head":{"sha":head,"ref":"feature"},"base":{"sha":"b".repeat(40),"ref":"main"},"mergeable":null}),
+        ),
+        Ok(
+            json!({"check_runs":[{"name":"ci","head_sha":head,"status":"completed","conclusion":"success"}]}),
+        ),
+        Ok(
+            json!([{"id":1,"user":{"login":"reviewer"},"commit_id":"b".repeat(40),"state":"APPROVED"}]),
+        ),
+        Ok(json!([issue(4)])),
+    ])?;
+    let client = GitHubClient::new(scope()?, fake, ReadLimits::default());
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let number = IssueNumber::new(7)?;
+    let Observation::Known(pr) = client.pull_request(&house, &repo, number) else {
+        return Err("expected PR".into());
+    };
+    assert_eq!(pr.head.sha, CommitId::new(&head)?);
+    assert_eq!(pr.mergeable, None);
+    let Observation::Known(checks) = client.checks(&house, &repo, &pr.head.sha) else {
+        return Err("expected checks".into());
+    };
+    assert_eq!(checks[0].conclusion, Some(CheckConclusion::Success));
+    assert_eq!(checks[0].head_sha, pr.head.sha);
+    let Observation::Known(reviews) = client.reviews(&house, &repo, number) else {
+        return Err("expected reviews".into());
+    };
+    assert_ne!(reviews[0].commit_id, pr.head.sha);
+    let Observation::Known(deps) = client.dependencies(&house, &repo, number) else {
+        return Err("expected dependencies".into());
+    };
+    assert_eq!(deps[0].number.get(), 4);
+    Ok(())
+}
+
+#[test]
+fn bounded_mutation_payloads_reject_self_links_and_bad_labels() -> Result {
+    let repo = Repository::new("sample/project")?;
+    let issue = IssueNumber::new(1)?;
+    for action in [
+        GitHubAction::LinkSubIssue {
+            parent: issue,
+            child: issue,
+        },
+        GitHubAction::LinkDependency {
+            issue,
+            blocker: issue,
+        },
+        GitHubAction::SetLabel {
+            issue,
+            label: "\n".into(),
+            present: true,
+        },
+        GitHubAction::CreateLabel {
+            label: LabelDefinition {
+                name: "ready".into(),
+                color: "xyz123".into(),
+                description: String::new(),
+            },
+        },
+    ] {
+        assert_eq!(
+            GitHubMutation {
+                repository: repo.clone(),
+                action
+            }
+            .validate(),
+            Err(IntegrationError::InvalidInput)
+        );
+    }
+    Ok(())
+}

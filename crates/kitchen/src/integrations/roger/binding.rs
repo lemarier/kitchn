@@ -57,6 +57,23 @@ impl DecisionBinding {
     /// # Errors
     /// Refuses oversized keys or action constraints.
     pub fn decision_key(&self) -> Result<String, IntegrationError> {
+        let target = self.target.as_str();
+        let task_target = target == format!("task:{}", self.task);
+        let repository_target = target.split_once('#').is_some_and(|(prefix, number)| {
+            (prefix == format!("pr:{}", self.repository)
+                || prefix == format!("issue:{}", self.repository))
+                && number
+                    .parse::<u64>()
+                    .is_ok_and(|value| value > 0 && value <= i64::MAX as u64)
+        });
+        if !task_target && !repository_target {
+            return Err(IntegrationError::ScopeMismatch);
+        }
+        if self.action == Permission::Merge
+            && !target.starts_with(&format!("pr:{}#", self.repository))
+        {
+            return Err(IntegrationError::ScopeMismatch);
+        }
         let key = format!(
             "{}:{}:{}:{}:{}",
             self.owner.prefix(),

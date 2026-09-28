@@ -23,7 +23,7 @@ fn fixture() -> Result<(HouseScope, DecisionBinding, Value)> {
     )?;
     let binding = DecisionBinding {
         house,
-        task: TaskId::new("task-1")?,
+        task: TaskId::new("t01ARZ3NDEKTSV4RRFFQ69G5FAV")?,
         owner: DecisionOwner::Merge,
         repository: repo,
         action: Permission::Merge,
@@ -32,7 +32,7 @@ fn fixture() -> Result<(HouseScope, DecisionBinding, Value)> {
         limits: Text::new("squash into main")?,
     };
     let action = json!({"verb":"merge","target":"pr:sample/project#1","rev":"a".repeat(40),"limits":"squash into main"});
-    let ask = json!({"id":"ask-1","requester":"sample-gate","repo":"sample/project","decisionKey":binding.decision_key()?,"kind":"approval","action":action,"resume":{"task":"task-1","rev":"a".repeat(40)},"state":"answered","supersededBy":null,"answer":{"decision":"approve","optionId":"approve","action":action,"input":null,"passkey":true}});
+    let ask = json!({"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","requester":"sample-gate","repo":"sample/project","decisionKey":binding.decision_key()?,"kind":"approval","action":action,"resume":{"task":"t01ARZ3NDEKTSV4RRFFQ69G5FAV","rev":"a".repeat(40)},"state":"answered","supersededBy":null,"answer":{"decision":"approve","optionId":"approve","action":action,"input":null,"passkey":true}});
     Ok((scope, binding, ask))
 }
 fn status(
@@ -43,7 +43,7 @@ fn status(
     Ok(validate_answer(
         scope,
         binding,
-        &ExternalRef::new("ask-1")?,
+        &ExternalRef::new("01ARZ3NDEKTSV4RRFFQ69G5FAV")?,
         &serde_json::to_vec(ask)?,
     ))
 }
@@ -69,7 +69,7 @@ fn cross_house_requester_task_target_and_revision_are_rejected() -> Result {
         ),
         (
             "/decisionKey",
-            json!("merge:foreign:task-1:merge:pr:sample/project#1"),
+            json!("merge:foreign:t01ARZ3NDEKTSV4RRFFQ69G5FAV:merge:pr:sample/project#1"),
             IntegrationError::ScopeMismatch,
         ),
         (
@@ -166,10 +166,50 @@ fn ambiguous_answer_unknown_prefix_and_oversized_response_fail_closed() -> Resul
         validate_answer(
             &scope,
             &binding,
-            &ExternalRef::new("ask-1")?,
+            &ExternalRef::new("01ARZ3NDEKTSV4RRFFQ69G5FAV")?,
             &vec![b' '; 128 * 1024 + 1]
         ),
         Err(IntegrationError::LimitExceeded)
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct Offline(std::cell::Cell<u32>);
+impl RogerReadTransport for Offline {
+    fn get(
+        &self,
+        _: &CredentialRef,
+        _: &ExternalRef,
+        _: std::time::Duration,
+        _: usize,
+    ) -> std::result::Result<Vec<u8>, IntegrationError> {
+        self.0.set(self.0.get() + 1);
+        Err(IntegrationError::Unavailable)
+    }
+}
+#[test]
+fn offline_recovery_does_not_create_a_new_ask() -> Result {
+    let (scope, binding, _) = fixture()?;
+    let client = RogerClient::new(
+        scope,
+        Offline::default(),
+        kitchen::integrations::github::ReadLimits::default(),
+    );
+    let id = ExternalRef::new("01ARZ3NDEKTSV4RRFFQ69G5FAV")?;
+    assert_eq!(
+        client.poll(&binding, &id),
+        Err(IntegrationError::Unavailable)
+    );
+    assert_eq!(
+        client.poll(&binding, &id),
+        Err(IntegrationError::Unavailable)
+    );
+    let mut foreign = binding;
+    foreign.house = HouseId::new("foreign")?;
+    assert_eq!(
+        client.poll(&foreign, &id),
+        Err(IntegrationError::ScopeMismatch)
     );
     Ok(())
 }

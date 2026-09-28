@@ -615,6 +615,9 @@ fn invalid_history_budget_and_inspector_inputs_do_not_commit() -> TestResult {
         assert!(l.start_inspection(p, at(5)).is_err());
     }
     assert!(l.inspection(&plan()?.id).is_err());
+    let mut fractional = plan()?;
+    fractional.deadline = kitchen::contracts::Timestamp::from_unix_millis(3_605_001);
+    assert!(l.start_inspection(fractional, at(5)).is_err());
     let mut p = plan()?;
     p.house = other_house()?;
     assert!(l.start_inspection(p, at(5)).is_err());

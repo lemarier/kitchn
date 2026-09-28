@@ -161,12 +161,8 @@ impl Inspection {
         if !(1..=32).contains(&self.plan.max_samples)
             || !(1..=1_000_000).contains(&self.plan.max_tokens)
             || self.plan.deadline <= self.started_at
-            || self
-                .plan
-                .deadline
-                .saturating_since(self.started_at)
-                .as_secs()
-                > 3600
+            || self.plan.deadline.saturating_since(self.started_at)
+                > std::time::Duration::from_secs(3600)
             || self.samples.len() > self.plan.max_samples as usize
         {
             return Err(TrustError::Invalid);

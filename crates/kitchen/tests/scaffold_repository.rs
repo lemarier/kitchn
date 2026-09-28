@@ -317,3 +317,86 @@ fn the_largest_valid_binding_fits_its_installer_reserve() -> TestResult {
     assert_eq!(MAX_TEMPLATE_FILES + 1, MAX_INSTALL_FILES);
     Ok(())
 }
+
+fn binding_path(f: &Fixture) -> PathBuf {
+    f.root.join("consumer/.kitchen.json")
+}
+
+fn binding_action(plan: &FilePlan) -> Option<&PlanAction> {
+    plan.files()
+        .iter()
+        .find(|planned| planned.file.path.as_str() == ".kitchen.json")
+        .map(|planned| &planned.action)
+}
+
+/// Adopt with the `app` template, then remove README.md so reruns have work.
+fn adopted() -> TestResult<Fixture> {
+    let f = Fixture::with(template_assets("app", "pinned")?)?;
+    f.plan("app")?.apply()?;
+    fs::remove_file(f.root.join("consumer/README.md"))?;
+    Ok(f)
+}
+
+#[test]
+fn a_reformatted_binding_is_unchanged_and_kept_byte_for_byte() -> TestResult {
+    let f = adopted()?;
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(binding_path(&f))?)?;
+    for reformatted in [
+        serde_json::to_string(&value)?,
+        format!("{}\n", serde_json::to_string_pretty(&value)?),
+    ] {
+        fs::write(binding_path(&f), &reformatted)?;
+        let plan = f.plan("app")?;
+        assert_eq!(binding_action(&plan), Some(&PlanAction::Unchanged));
+        assert!(plan.conflicts().next().is_none());
+        plan.apply()?;
+        assert_eq!(fs::read_to_string(binding_path(&f))?, reformatted);
+        assert!(f.root.join("consumer/README.md").exists());
+        fs::remove_file(f.root.join("consumer/README.md"))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_meaningful_binding_change_is_used_or_refused_not_ignored() -> TestResult {
+    let f = adopted()?;
+    let original = fs::read_to_string(binding_path(&f))?;
+    // A retained stricter setting is used as the plan's binding.
+    let mut config: RepositoryConfig = serde_json::from_str(&original)?;
+    config.workflows.insert(Workflow::Gate);
+    let stricter = serde_json::to_string(&config)?;
+    fs::write(binding_path(&f), &stricter)?;
+    let plan = f.plan("app")?;
+    assert_eq!(binding_action(&plan), Some(&PlanAction::Unchanged));
+    assert_eq!(fs::read_to_string(binding_path(&f))?, stricter);
+    // Identity changes still fail closed.
+    fs::write(
+        binding_path(&f),
+        original.replace(REPOSITORY, "crabnebula/other"),
+    )?;
+    assert!(matches!(
+        f.plan("app"),
+        Err(Error::House(HouseError::HouseSelection))
+    ));
+    fs::write(binding_path(&f), "{ not json")?;
+    assert!(matches!(
+        f.plan("app"),
+        Err(Error::House(HouseError::InvalidInput))
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_binding_changed_between_preview_and_apply_blocks_apply() -> TestResult {
+    let f = adopted()?;
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(binding_path(&f))?)?;
+    let plan = f.plan("app")?;
+    // Even a formatting-only rewrite after preview invalidates the consent.
+    fs::write(binding_path(&f), serde_json::to_string(&value)?)?;
+    assert!(matches!(
+        plan.apply(),
+        Err(Error::House(HouseError::Conflict))
+    ));
+    assert!(!f.root.join("consumer/README.md").exists());
+    Ok(())
+}

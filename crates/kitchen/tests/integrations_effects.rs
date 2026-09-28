@@ -5,7 +5,7 @@ use kitchen::{
     BackendId, CredentialId, Error, HouseId, TaskId,
     contracts::*,
     integrations::{github::*, roger::*},
-    state::{EffectRecord, EffectState, HouseStore, run_effect},
+    state::{EffectRecord, EffectState, HouseStore, StateError, run_effect},
 };
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, time::Duration};
@@ -15,6 +15,8 @@ enum Fault {
     Reject,
     LoseAfterApply,
     LoseBeforeApply,
+    /// Roger's transport fails with exactly this error.
+    Roger(IntegrationError),
 }
 #[derive(Default)]
 struct Remote {
@@ -755,6 +757,9 @@ impl RogerMutationTransport for Provider {
             json!({"task":ask.binding.task.as_str()}),
         ));
         let fault = remote.fault.take();
+        if let Some(Fault::Roger(error)) = fault {
+            return Err(error);
+        }
         if matches!(fault, Some(Fault::Reject | Fault::LoseBeforeApply)) {
             return Err(IntegrationError::Unavailable);
         }
@@ -1341,5 +1346,186 @@ fn merge_of_a_subject_without_a_base_names_no_base_commit() -> TestResult {
     )?;
     assert!(matches!(merged.state(), EffectState::Applied { .. }));
     assert_eq!(remote.borrow().calls.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn merge_reconciliation_clears_a_moved_head_but_not_an_unchanged_one() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) = setup(
+        &fixture,
+        3,
+        &[Permission::Merge, Permission::PostComment],
+        "github",
+    )?;
+    let revision = record_subject(&fixture, &task, fence, HEAD, Some(BASE))?;
+    let remote = Rc::new(RefCell::new(Remote {
+        pull_request: Some(open_pull_request(HEAD, "main")),
+        fault: Some(Fault::LoseBeforeApply),
+        ..Remote::default()
+    }));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let clock = ManualClock::starting_at(1);
+    let lost = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan_at(
+            &task,
+            fence,
+            "merge",
+            backend.effect(mutation(merge(HEAD, Some(BASE))?)?)?,
+            revision,
+        )?,
+        &clock,
+    )?;
+    assert!(matches!(
+        lost.state(),
+        EffectState::Uncertain {
+            reason: UncertainReason::Timeout,
+            ..
+        }
+    ));
+    let comment = backend.effect(mutation(GitHubAction::PostComment {
+        issue: IssueNumber::new(1)?,
+        body: Text::new("merge could not be completed")?,
+    })?)?;
+    let follow_up = |name: &str| -> TestResult<Result<EffectRecord, Error>> {
+        let plan = plan_at(&task, fence, name, comment.clone(), revision)?;
+        Ok(run_effect(&fixture.store, &backend, &grants, plan, &clock))
+    };
+    // The head is unchanged, so GitHub cannot show the request never arrived:
+    // it stays unresolved and blocks the task's next effect.
+    let unchanged = kitchen::state::reconcile(&fixture.store, &backend, &task, fence, &clock)?;
+    assert!(unchanged.resolved.is_empty());
+    assert_eq!(unchanged.unresolved.len(), 1);
+    assert!(matches!(
+        unchanged.unresolved[0].state(),
+        EffectState::Uncertain {
+            reason: UncertainReason::LookupInconclusive,
+            ..
+        }
+    ));
+    assert!(matches!(
+        follow_up("blocked")?,
+        Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+    ));
+    // A pull request that moved off the approved head can no longer receive
+    // the lost merge, because the request carried the approved head as `sha`.
+    remote.borrow_mut().pull_request = Some(open_pull_request(MOVED, "main"));
+    let moved = kitchen::state::reconcile(&fixture.store, &backend, &task, fence, &clock)?;
+    assert!(moved.unresolved.is_empty());
+    assert_eq!(moved.resolved.len(), 1);
+    assert!(matches!(
+        moved.resolved[0].state(),
+        EffectState::NotApplied {
+            reason: NotAppliedReason::ConfirmedAbsent,
+            ..
+        }
+    ));
+    assert_eq!(
+        remote.borrow().calls.len(),
+        1,
+        "reconciliation never writes"
+    );
+    assert!(matches!(
+        follow_up("proceeds")??.state(),
+        EffectState::Applied { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn roger_submit_errors_map_to_definite_refusal_or_uncertainty() -> TestResult {
+    enum Expected {
+        NotApplied(NotAppliedReason),
+        Uncertain(UncertainReason),
+    }
+    // Only errors raised before Roger could have acted are definite refusals.
+    let cases = [
+        (
+            IntegrationError::InvalidInput,
+            Expected::NotApplied(NotAppliedReason::Rejected),
+        ),
+        (
+            IntegrationError::ScopeMismatch,
+            Expected::NotApplied(NotAppliedReason::Rejected),
+        ),
+        (
+            IntegrationError::Timeout,
+            Expected::Uncertain(UncertainReason::Timeout),
+        ),
+        (
+            IntegrationError::Unavailable,
+            Expected::Uncertain(UncertainReason::Transport),
+        ),
+        (
+            IntegrationError::Unknown,
+            Expected::Uncertain(UncertainReason::Transport),
+        ),
+    ];
+    for (error, expected) in cases {
+        let fixture = Fixture::new()?;
+        let (scope, grants, task, fence) = setup(&fixture, 1, &[Permission::AskHuman], "roger")?;
+        let remote = Rc::new(RefCell::new(Remote {
+            fault: Some(Fault::Roger(error)),
+            ..Remote::default()
+        }));
+        let backend = RogerExecutor::new(
+            BackendId::new("roger")?,
+            scope,
+            provider(&fixture, &task, remote.clone())?,
+            ReadLimits::default(),
+        );
+        let asked = evidenced_question(&fixture, &task, fence)?;
+        let revision = asked.binding.revision;
+        let effect = backend.effect(asked)?;
+        let clock = ManualClock::starting_at(1);
+        let ask = |name: &str| -> TestResult<Result<EffectRecord, Error>> {
+            let plan = plan_at(&task, fence, name, effect.clone(), revision)?;
+            Ok(run_effect(&fixture.store, &backend, &grants, plan, &clock))
+        };
+        let first = ask("ask")??;
+        assert_eq!(remote.borrow().calls.len(), 1, "{error:?}");
+        match expected {
+            Expected::NotApplied(reason) => {
+                assert!(
+                    matches!(
+                        first.state(),
+                        EffectState::NotApplied { reason: got, .. } if *got == reason
+                    ),
+                    "{error:?}: {:?}",
+                    first.state()
+                );
+                // A definite refusal releases the task's single ask.
+                assert!(matches!(
+                    ask("again")??.state(),
+                    EffectState::Applied { .. }
+                ));
+                assert_eq!(remote.borrow().calls.len(), 2);
+            }
+            Expected::Uncertain(reason) => {
+                assert!(
+                    matches!(
+                        first.state(),
+                        EffectState::Uncertain { reason: got, .. } if *got == reason
+                    ),
+                    "{error:?}: {:?}",
+                    first.state()
+                );
+                // An uncertain ask blocks the task until it is reconciled.
+                assert!(matches!(
+                    ask("again")?,
+                    Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+                ));
+                assert_eq!(remote.borrow().calls.len(), 1);
+            }
+        }
+    }
     Ok(())
 }

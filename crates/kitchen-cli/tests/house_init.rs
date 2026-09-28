@@ -293,7 +293,8 @@ fn the_built_in_guidance_is_refused_without_a_recorded_build_commit() -> TestRes
         let stderr = String::from_utf8(output.stderr)?;
         assert!(
             stderr.contains("did not record the commit it was built from")
-                && stderr.contains("--bundle"),
+                && stderr.contains("just install")
+                && stderr.contains("--bundle <path>"),
             "{stderr}"
         );
         assert!(!home.join(".kitchn").exists());

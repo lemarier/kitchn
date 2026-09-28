@@ -128,11 +128,13 @@ just check
 cargo test -p kitchen --locked --offline
 cargo test -p kitchen-cli --locked --offline
 just msrv-check
-cargo install --path crates/kitchen-cli --locked --offline
+just install
 ```
 
-`just check` includes doctests through `just test`. The install command uses the
-committed lockfile; repeat it from the same revision to reinstall that version.
+`just check` includes doctests through `just test`. `just install` uses the
+committed lockfile and records the commit only from a clean tree on a
+remote-tracking branch (see the README); repeat it from the same revision to
+reinstall that version.
 `just security` is a separate networked audit and requires its documented tools.
 
 Local workers load the verified snapshot printed by `just skills-sync`, retain

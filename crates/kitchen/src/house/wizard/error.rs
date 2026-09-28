@@ -19,7 +19,7 @@ pub enum HouseInitError {
     /// The build recorded no Kitchen commit, so the embedded guidance cannot
     /// be labelled with one. Nothing was written.
     #[error(
-        "this kitchen binary did not record the commit it was built from, so it cannot label its built-in guidance; pass --bundle with a verified instruction bundle"
+        "this kitchen binary did not record the commit it was built from, so it cannot label its built-in guidance; install with `just install` from a clean checkout, or pass --bundle <path> with a verified instruction bundle"
     )]
     BuildCommitUnknown,
     /// `--kitchen` names a commit other than this build's. Nothing was
@@ -72,4 +72,23 @@ fn flags(questions: &[InitQuestion]) -> String {
         .map(|question| question.flag())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_build_commit_names_both_fixes() {
+        let message = HouseInitError::BuildCommitUnknown.to_string();
+        assert!(
+            message.contains("install with `just install` from a clean checkout")
+                && message.contains("pass --bundle <path>"),
+            "{message}"
+        );
+        assert_eq!(
+            HouseInitError::BuildCommitUnknown.class(),
+            ErrorClass::InvalidInput
+        );
+    }
 }

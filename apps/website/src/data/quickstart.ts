@@ -90,7 +90,8 @@ export const steps: Step[] = [
         label: "From source, today",
         lines: [
           cmd("git clone https://github.com/lemarier/kitchen && cd kitchen"),
-          cmd("cargo install --path crates/kitchen-cli --locked"),
+          cmd("just install"),
+          ok("recording commit <sha>"),
           cmd("kitchen --version"),
           ok("kitchen 0.1.0"),
         ],

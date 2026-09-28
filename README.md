@@ -34,8 +34,10 @@ The first refresh needs network access; checks do not refresh instructions.
 To install the bootstrap executable locally:
 
 ```sh
-cargo install --path crates/kitchen-cli --locked --offline
+just install
 ```
+
+`just install` records the commit in the binary so guided `house init` can pin the built-in guidance. It does so only from a clean working tree whose commit is on a remote-tracking branch; otherwise it installs without the commit and prints why. Such a binary needs `--bundle <path>` for `house init`. Plain `cargo install --path crates/kitchen-cli --locked --offline` never records the commit.
 
 The `validate-house` and `validate-task` bootstrap diagnostic commands validate
 identifiers without accessing a house, credentials, or a backend:

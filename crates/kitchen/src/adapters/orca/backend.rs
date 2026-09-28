@@ -803,11 +803,25 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         shown.worktree.and_then(|worktree| worktree.branch)
     }
 
+    /// The Run's Tasks, with specs cut down by Orca's `--brief` listing.
     fn run_tasks(&self) -> Result<Vec<OrcaTask>, OrcaError> {
-        let args = wire::Args::command(&["orchestration", "task-list"])
-            .value("run", self.config.run.as_str())
-            .switch("brief")
-            .json();
+        self.list_tasks(true)
+    }
+
+    /// The Run's Tasks with their full specs. `--brief` collapses whitespace
+    /// and caps a spec at 160 characters, which loses the requested-branch
+    /// line, so a caller that reads specs must not use it.
+    fn run_tasks_with_specs(&self) -> Result<Vec<OrcaTask>, OrcaError> {
+        self.list_tasks(false)
+    }
+
+    fn list_tasks(&self, brief: bool) -> Result<Vec<OrcaTask>, OrcaError> {
+        let mut args = wire::Args::command(&["orchestration", "task-list"])
+            .value("run", self.config.run.as_str());
+        if brief {
+            args = args.switch("brief");
+        }
+        let args = args.json();
         let list: TaskList = wire::typed(self.call(args, self.config.call_timeout)?, "task list")?;
         if list.tasks.len() > MAX_RUN_TASKS {
             return Err(OrcaError::ListingTooLong {
@@ -875,12 +889,17 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// records one.
     fn recorded_branch(&self, key: &IdempotencyKey) -> Result<Option<String>, OrcaError> {
         let title = self.task_title(key);
-        Ok(self
-            .run_tasks()?
+        let mut matching = self
+            .run_tasks_with_specs()?
             .into_iter()
-            .find(|task| task.task_title.as_deref() == Some(title.as_str()))
-            .and_then(|task| task.spec)
-            .and_then(|spec| requested_in_spec(&spec).map(str::to_owned)))
+            .filter(|task| task.task_title.as_deref() == Some(title.as_str()));
+        // Several Tasks for one key are an unexplained duplicate: no record.
+        Ok(match (matching.next(), matching.next()) {
+            (Some(task), None) => task
+                .spec
+                .and_then(|spec| requested_in_spec(&spec).map(str::to_owned)),
+            _ => None,
+        })
     }
 
     fn create_task(

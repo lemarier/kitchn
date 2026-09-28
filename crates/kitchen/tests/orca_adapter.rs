@@ -2467,6 +2467,59 @@ fn a_launch_without_a_requested_branch_is_not_a_collision() -> TestResult {
 }
 
 #[test]
+fn a_collision_is_found_when_the_brief_is_long_and_multiline() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().git_branches.push("lemarier/issue-6".to_owned());
+    let backend = connect(&sim)?;
+    // Orca's `--brief` listing would collapse this and cut it at 160
+    // characters, dropping the requested-branch line.
+    let long = format!("Implement it.\n\n{}", "Details.\n".repeat(60));
+    let launch = request(
+        Operation::LaunchWorker {
+            role: Role::StationCook,
+            workspace: Workspace::Isolated,
+            brief: Text::new(&long)?,
+            branch: Some(branch("lemarier/issue-6")?),
+            agent: None,
+        },
+        "long-collision",
+    )?;
+    let _ = backend.execute(&launch);
+    assert!(
+        backend
+            .launch_collision(launch.key(), &branch("lemarier/issue-6")?)?
+            .is_some(),
+        "the collision is reported from the full spec"
+    );
+    Ok(())
+}
+
+#[test]
+fn duplicate_tasks_for_one_key_record_no_requested_branch() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().git_branches.push("lemarier/issue-6".to_owned());
+    let backend = connect(&sim)?;
+    let launch = request(
+        launch_on("lemarier/issue-6", Workspace::Isolated)?,
+        "duplicated",
+    )?;
+    let _ = backend.execute(&launch);
+    let twin = {
+        let state = sim.state();
+        let mut twin = state.tasks.last().ok_or("a task")?.clone();
+        twin.id = "task_twin".to_owned();
+        twin
+    };
+    sim.state().tasks.push(twin);
+    assert_eq!(
+        backend.launch_collision(launch.key(), &branch("lemarier/issue-6")?)?,
+        None,
+        "an unexplained duplicate is not evidence"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_mismatch_under_another_prefix_is_not_a_collision() -> TestResult {
     let sim = SimOrca::default();
     sim.state().branch_prefix = "other/";

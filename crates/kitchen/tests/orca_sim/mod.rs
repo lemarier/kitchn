@@ -366,6 +366,17 @@ struct Parsed {
     flags: BTreeMap<String, String>,
 }
 
+/// Orca's `task-list --brief` form of a spec: whitespace collapsed to single
+/// spaces, then capped at 160 characters.
+fn brief_spec(spec: &str) -> String {
+    spec.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(160)
+        .collect()
+}
+
 fn parse(args: &[String]) -> Parsed {
     let mut path = Vec::new();
     let mut flags = BTreeMap::new();
@@ -533,7 +544,11 @@ impl SimState {
                 "tasks": self.tasks.iter().map(|task| json!({
                     "id": task.id,
                     "task_title": task.title,
-                    "spec": task.spec,
+                    "spec": if flags.contains_key("brief") {
+                        brief_spec(&task.spec)
+                    } else {
+                        task.spec.clone()
+                    },
                     "status": task.status,
                 })).collect::<Vec<_>>(),
             })),

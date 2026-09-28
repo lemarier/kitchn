@@ -172,6 +172,30 @@ fn grant() -> TestResult<AutonomyGrant> {
         at: at(5),
     })
 }
+fn proposal() -> TestResult<AutonomyProposal> {
+    let g = grant()?;
+    Ok(AutonomyProposal {
+        id: g.id,
+        house: g.house,
+        scope: g.scope,
+        claim: g.claim,
+        evidence: g.evidence,
+        source: source("fixture:proposal")?,
+        at: at(5),
+    })
+}
+/// Propose and approve the fixture grant under `policy`.
+fn issue(l: &Ledger, policy: &kitchen::contracts::HouseGrants) -> TestResult {
+    l.propose(proposal()?, policy)?;
+    l.approve(
+        &grant()?.id,
+        holder("owner")?,
+        source("fixture:decision")?,
+        at(5),
+        policy,
+    )?;
+    Ok(())
+}
 fn revoke(l: &Ledger) -> TestResult<bool> {
     Ok(l.revoke(
         &grant()?.id,
@@ -285,9 +309,10 @@ fn unknown_attribution_and_usage_do_not_derive_trust() -> TestResult {
     o.mode = EvidenceMode::Live;
     o.attribution.tokens = Measurement::Unavailable;
     assert!(!o.trust_eligible());
+    bind_evidence(&l, &f)?;
     l.record(&f.store, o.clone())?;
     assert!(matches!(
-        l.grant(grant()?, &grants()?),
+        l.propose(proposal()?, &grants()?),
         Err(TrustError::Refused)
     ));
     assert_eq!(
@@ -568,21 +593,23 @@ fn revocation_succeeds_at_history_capacity_and_stays_revoked() -> TestResult {
     let l = ledger(&f)?;
     l.record(&f.store, eligible(observation(&f)?)?)?;
     bind_evidence(&l, &f)?;
-    l.grant(grant()?, &grants()?)?;
+    issue(&l, &grants()?)?;
     let path = f.dir.path().join("trust/ledger.json");
     let mut document: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
     let audits = document["grants"].as_array_mut().ok_or("grants")?;
     let original = audits.first().cloned().ok_or("grant")?;
     for index in 1..4094 {
         let mut additional = original.clone();
-        additional["Issued"]["id"] = serde_json::json!(format!("fixture:grant-{index}"));
+        let id = serde_json::json!(format!("fixture:grant-{index}"));
+        additional["Issued"]["proposal"]["id"] = id.clone();
+        additional["Issued"]["id"] = id;
         audits.push(additional);
     }
     fs::write(&path, serde_json::to_vec(&document)?)?;
     assert!(revoke(&l)?);
     assert!(!revoke(&reopen(&f)?)?);
     assert!(matches!(
-        l.grant(grant()?, &grants()?),
+        l.propose(proposal()?, &grants()?),
         Err(TrustError::Conflict)
     ));
     assert_eq!(l.grant_history()?.len(), 4094);
@@ -596,7 +623,7 @@ fn waiting_writer_yields_to_pending_revocation() -> TestResult {
     let l = ledger(&f)?;
     l.record(&f.store, eligible(observation(&f)?)?)?;
     bind_evidence(&l, &f)?;
-    l.grant(grant()?, &grants()?)?;
+    issue(&l, &grants()?)?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -635,21 +662,8 @@ fn proposal_within_limits_needs_explicit_approval_and_can_be_revoked() -> TestRe
     bind_evidence(&l, &f)?;
     let g = grant()?;
     let policy = kitchen::contracts::HouseGrants::with_limits(house()?, [g.claim.clone()], [])?;
-    assert!(matches!(
-        l.grant(g.clone(), &policy),
-        Err(TrustError::Refused)
-    ));
-    let proposal = AutonomyProposal {
-        id: g.id.clone(),
-        house: g.house.clone(),
-        scope: g.scope.clone(),
-        claim: g.claim.clone(),
-        evidence: g.evidence.clone(),
-        source: source("fixture:proposal")?,
-        at: at(5),
-    };
-    assert!(l.propose(proposal.clone(), &policy)?);
-    assert!(!l.propose(proposal, &policy)?);
+    assert!(l.propose(proposal()?, &policy)?);
+    assert!(!l.propose(proposal()?, &policy)?);
     assert!(matches!(
         l.grant_history()?.as_slice(),
         [kitchen::trust::GrantAudit::Proposed(_)]
@@ -684,16 +698,7 @@ fn explicit_grant_uses_core_authority_and_revocation_survives_restart() -> TestR
     bind_evidence(&l, &f)?;
     let g = grant()?;
     let policy = kitchen::contracts::HouseGrants::with_limits(house()?, [g.claim.clone()], [])?;
-    let proposal = AutonomyProposal {
-        id: g.id.clone(),
-        house: g.house.clone(),
-        scope: g.scope.clone(),
-        claim: g.claim.clone(),
-        evidence: g.evidence.clone(),
-        source: source("fixture:proposal")?,
-        at: at(5),
-    };
-    l.propose(proposal, &policy)?;
+    l.propose(proposal()?, &policy)?;
     let mut acting = spec("acting")?;
     acting.repository = Some(scope()?.project);
     acting.authority = kitchen::contracts::TaskAuthority::delegate(&policy, [])?;
@@ -773,7 +778,7 @@ fn explicit_grant_uses_core_authority_and_revocation_survives_restart() -> TestR
 }
 
 #[test]
-fn unknown_revocation_and_privileged_grants_are_refused() -> TestResult {
+fn unknown_revocation_and_privileged_proposals_are_refused() -> TestResult {
     let f = Fixture::new()?;
     let l = ledger(&f)?;
     let o = eligible(observation(&f)?)?;
@@ -788,25 +793,102 @@ fn unknown_revocation_and_privileged_grants_are_refused() -> TestResult {
         ),
         Err(TrustError::NotFound)
     ));
-    for permission in [
+    // Only the earned-autonomy allowlist is proposable, whatever the policy says.
+    let excluded = [
         Permission::ReleaseResource,
+        Permission::CloseIssue,
         Permission::PushBranch,
         Permission::OpenPullRequest,
         Permission::Merge,
         Permission::ManageSchedule,
-        Permission::Publish,
-        Permission::OperateEquipment,
         Permission::ActivateSchedule,
         Permission::TrialSchedule,
-    ] {
-        let mut g = grant()?;
-        g.claim.permission = permission;
-        let policy = kitchen::contracts::HouseGrants::new(house()?, [g.claim.clone()]);
-        assert!(matches!(l.grant(g, &policy), Err(TrustError::Refused)));
+        Permission::Publish,
+        Permission::OperateEquipment,
+    ];
+    for permission in Permission::ALL {
+        let mut p = proposal()?;
+        p.id = source(&format!("fixture:proposal-{}", permission.as_str()))?;
+        p.claim.permission = permission;
+        let policy = kitchen::contracts::HouseGrants::new(house()?, [p.claim.clone()]);
+        if excluded.contains(&permission) {
+            assert!(
+                matches!(l.propose(p, &policy), Err(TrustError::Refused)),
+                "{permission:?} must not be proposable"
+            );
+        } else {
+            assert!(l.propose(p, &policy)?, "{permission:?} is on the allowlist");
+        }
     }
-    let mut g = grant()?;
-    g.house = other_house()?;
-    assert!(l.grant(g, &grants()?).is_err());
+    assert_eq!(
+        l.grant_history()?.len(),
+        Permission::ALL.len() - excluded.len()
+    );
+    let mut foreign = proposal()?;
+    foreign.house = other_house()?;
+    assert!(matches!(
+        l.propose(foreign, &grants()?),
+        Err(TrustError::Refused)
+    ));
+    Ok(())
+}
+
+#[test]
+fn replayed_proposal_and_approval_are_no_ops_and_conflicts_are_refused() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    let policy = grants()?;
+    let p = proposal()?;
+    let owner = holder("owner")?;
+    let decision = source("fixture:decision")?;
+    assert!(l.propose(p.clone(), &policy)?);
+    assert!(l.approve(&p.id, owner.clone(), decision.clone(), at(5), &policy)?);
+    let approved = l.grant_history()?;
+    // A retry after an uncertain outcome: same approver and decision, later clock.
+    assert!(!l.approve(&p.id, owner.clone(), decision.clone(), at(9), &policy)?);
+    assert!(!l.propose(p.clone(), &policy)?);
+    assert_eq!(l.grant_history()?, approved);
+    // A different decision, approver, or proposal body is a conflict, not a replay.
+    assert!(matches!(
+        l.approve(
+            &p.id,
+            owner.clone(),
+            source("fixture:other-decision")?,
+            at(9),
+            &policy
+        ),
+        Err(TrustError::Conflict)
+    ));
+    assert!(matches!(
+        l.approve(
+            &p.id,
+            holder("other-owner")?,
+            decision.clone(),
+            at(9),
+            &policy
+        ),
+        Err(TrustError::Conflict)
+    ));
+    let mut changed = p.clone();
+    changed.source = source("fixture:other-proposal")?;
+    assert!(matches!(
+        l.propose(changed, &policy),
+        Err(TrustError::Conflict)
+    ));
+    assert_eq!(l.grant_history()?, approved);
+    // Once revoked, the approval is no longer the current state.
+    assert!(revoke(&l)?);
+    assert!(matches!(
+        l.approve(&p.id, owner.clone(), decision.clone(), at(9), &policy),
+        Err(TrustError::Conflict)
+    ));
+    assert!(matches!(l.propose(p, &policy), Err(TrustError::Conflict)));
+    assert!(matches!(
+        l.approve(&source("fixture:unknown")?, owner, decision, at(9), &policy),
+        Err(TrustError::NotFound)
+    ));
     Ok(())
 }
 
@@ -817,7 +899,7 @@ fn corrected_grant_evidence_requires_new_explicit_approval() -> TestResult {
     let mut o = eligible(observation(&f)?)?;
     l.record(&f.store, o.clone())?;
     bind_evidence(&l, &f)?;
-    l.grant(grant()?, &grants()?)?;
+    issue(&l, &grants()?)?;
     o.revision = NonZeroU32::new(2).ok_or("revision")?;
     o.correction = Some(source("fixture:correction")?);
     l.record(&f.store, o)?;
@@ -1321,7 +1403,7 @@ fn unknown_authority_fields_and_dangling_persisted_evidence_are_rejected() -> Te
     let o = eligible(observation(&f)?)?;
     l.record(&f.store, o)?;
     bind_evidence(&l, &f)?;
-    l.grant(grant()?, &grants()?)?;
+    issue(&l, &grants()?)?;
     let path = f.dir.path().join("trust/ledger.json");
     let mut document: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
     document["observations"] = serde_json::json!([]);

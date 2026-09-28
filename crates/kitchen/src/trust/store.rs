@@ -374,40 +374,9 @@ impl Ledger {
         self.read(|doc| Ok(doc.observations.clone()))
     }
 
-    /// Record an explicit evidence-backed restriction on existing standing grants.
-    /// This never edits policy or creates a task authority from a trust score.
-    ///
-    /// # Errors
-    /// Rejects privileged actions, stale evidence, scope expansion, and conflicts.
-    pub fn grant(&self, grant: AutonomyGrant, current: &HouseGrants) -> Result<bool, TrustError> {
-        if current.house() != self.house() || !current.covers(&grant.claim) {
-            return Err(TrustError::Refused);
-        }
-        validate_grant(&grant)?;
-        self.transact(|doc| {
-            let audit = GrantAudit::Issued(grant.clone());
-            if doc.grants.contains(&audit) {
-                return Ok(false);
-            }
-            if doc.grants.iter().any(|a| audit_identity(a).0 == &grant.id) {
-                return Err(TrustError::Conflict);
-            }
-            for (id, revision) in &grant.evidence {
-                let evidence = doc.latest(id)?;
-                if !evidence.trust_eligible()
-                    || evidence.revision != *revision
-                    || evidence.attribution.scope != grant.scope
-                    || !evidence_matches_binding(doc, evidence)
-                {
-                    return Err(TrustError::Refused);
-                }
-            }
-            doc.grants.push(audit);
-            Ok(true)
-        })
-    }
-
     /// Store a proposal within house limits without adding standing authority.
+    /// Delivering the same proposal again is a no-op, including after its
+    /// approval; the same identity with different content is a conflict.
     ///
     /// # Errors
     /// Rejects claims outside policy limits, stale evidence, and reused identities.
@@ -420,36 +389,45 @@ impl Ledger {
             return Err(TrustError::Refused);
         }
         validate_claim(&proposal.claim, &proposal.scope, proposal.evidence.len())?;
-        if current.permitted(
-            proposal.claim.permission,
-            &proposal.claim.scope,
-            &proposal.claim.destination,
-        )? != proposal.claim.credential
-        {
-            return Err(TrustError::Refused);
-        }
         self.transact(|doc| {
-            let audit = GrantAudit::Proposed(proposal.clone());
-            if doc.grants.contains(&audit) {
-                return Ok(false);
-            }
-            if doc
+            if let Some(existing) = doc
                 .grants
                 .iter()
-                .any(|a| audit_identity(a).0 == &proposal.id)
+                .find(|audit| audit_identity(audit).0 == &proposal.id)
             {
-                return Err(TrustError::Conflict);
+                return match existing {
+                    GrantAudit::Proposed(old) if old == &proposal => Ok(false),
+                    GrantAudit::Issued(grant) if grant.proposal.as_ref() == Some(&proposal) => {
+                        Ok(false)
+                    }
+                    GrantAudit::Proposed(_)
+                    | GrantAudit::Issued(_)
+                    | GrantAudit::Revoked { .. }
+                    | GrantAudit::RevokedProposal { .. } => Err(TrustError::Conflict),
+                };
+            }
+            if current.permitted(
+                proposal.claim.permission,
+                &proposal.claim.scope,
+                &proposal.claim.destination,
+            )? != proposal.claim.credential
+            {
+                return Err(TrustError::Refused);
             }
             validate_evidence(doc, &proposal.evidence, &proposal.scope)?;
-            doc.grants.push(audit);
+            doc.grants.push(GrantAudit::Proposed(proposal));
             Ok(true)
         })
     }
 
     /// Turn a proposal into standing authority only after an explicit decision.
+    /// Repeating an approval by the same approver with the same decision is a
+    /// no-op that returns `false`, whatever its timestamp; a different approver
+    /// or decision, or a revoked entry, is a conflict.
     ///
     /// # Errors
-    /// Rejects stale evidence, withdrawn limits, or an absent proposal.
+    /// Rejects stale evidence, withdrawn limits, a conflicting decision, and an
+    /// unknown identity (`NotFound`).
     pub fn approve(
         &self,
         id: &crate::contracts::ExternalRef,
@@ -466,9 +444,17 @@ impl Ledger {
                 .grants
                 .iter()
                 .position(|a| audit_identity(a).0 == id)
-                .ok_or(TrustError::Incomplete)?;
-            let GrantAudit::Proposed(proposal) = &doc.grants[index] else {
-                return Err(TrustError::Conflict);
+                .ok_or(TrustError::NotFound)?;
+            let proposal = match &doc.grants[index] {
+                GrantAudit::Proposed(proposal) => proposal,
+                GrantAudit::Issued(grant)
+                    if grant.approved_by == approved_by && grant.decision == decision =>
+                {
+                    return Ok(false);
+                }
+                GrantAudit::Issued(_)
+                | GrantAudit::Revoked { .. }
+                | GrantAudit::RevokedProposal { .. } => return Err(TrustError::Conflict),
             };
             if current.permitted(
                 proposal.claim.permission,

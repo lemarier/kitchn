@@ -552,6 +552,13 @@ pub struct TaskRecord {
 }
 
 impl TaskRecord {
+    /// Whether `message` was consumed for this task
+    /// ([`crate::state::HouseStore::consume_message`]).
+    #[must_use]
+    pub fn has_consumed(&self, message: &ExternalRef) -> bool {
+        self.consumed.contains(message)
+    }
+
     /// The immutable specification.
     #[must_use]
     pub const fn spec(&self) -> &TaskSpec {

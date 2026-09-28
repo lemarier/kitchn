@@ -12,6 +12,14 @@
 //! launches only after every earlier attempt's worker is shown stopped, so an
 //! adopted worker is supervised rather than duplicated.
 //!
+//! Recovery acts on typed evidence ([`RecoverySignals`]) and never on
+//! silence: a start is retried only on proof it never began, an idle worker
+//! is stopped only when it sits at its prompt without progress past a bound,
+//! a person's terminal is left alone, a provider refusal parks the task
+//! without spending an attempt, an environment fault is never a test
+//! failure, and every follow-up sent during an attempt must be addressed by
+//! its completion.
+//!
 //! A launch names the exact branch in [`Operation::LaunchWorker`], and the
 //! branch a backend reports in its launch receipt is checked again: a
 //! different branch stops the worker. A terminal a person took over
@@ -31,11 +39,17 @@ use crate::{
         WorkerState, Workspace,
     },
     state::{
-        AttemptRecord, AttemptState, ConsumerState, EffectPlan, EffectRecord, EffectState,
-        HouseStore, Lease, OwnershipEvent, StateError, TaskRecord, TaskState, reconcile,
-        run_effect,
+        AttemptRecord, AttemptState, ConsumerState, Consumption, EffectPlan, EffectRecord,
+        EffectState, HouseStore, Lease, OwnershipEvent, StateError, TaskRecord, TaskState,
+        reconcile, run_effect,
     },
-    workflows::pickup::{WorkerBrief, stable_hash},
+    workflows::{
+        pickup::{WorkerBrief, stable_hash},
+        recovery::{
+            EnvironmentFault, FollowUp, ProviderCheck, ProviderInterruption, QueuedFollowUp,
+            RecoverySignals, TerminalHolder, ValidationFailure, ValidationReport,
+        },
+    },
 };
 
 type Result<T> = std::result::Result<T, crate::Error>;
@@ -205,9 +219,11 @@ pub enum LaunchOutcome {
 
 /// Whether `record` ended an attempt at or after `attempt` with a recorded
 /// outcome. Supervision records an outcome only from positive evidence about
-/// the worker (it settled, or a stop was confirmed), and a new attempt only
-/// launches once earlier workers were accounted for, so a later ended attempt
-/// accounts for every worker launched before it.
+/// the worker (it settled, a stop was confirmed, or a person took its
+/// terminal over and it went idle), and a new attempt only launches once
+/// earlier workers were accounted for, so a later ended attempt accounts for
+/// every worker launched before it. A worker handed to a person keeps
+/// running as theirs; its replacement starts in a fresh workspace.
 fn ended_since(record: &TaskRecord, attempt: AttemptNumber) -> bool {
     record.attempts().iter().any(|later| {
         later.number() >= attempt
@@ -290,7 +306,9 @@ pub fn launch_worker(
     brief: &WorkerBrief,
 ) -> Result<LaunchOutcome> {
     let record = ctx.store.task(task)?;
-    let text = brief.render(record.spec())?;
+    // Follow-ups an earlier worker could not receive or did not address go
+    // into the next brief, so none is dropped.
+    let text = brief.render_with(record.spec(), &outstanding_follow_ups(&record))?;
     if let Some(worker) = unstopped_worker(ctx, &record, fence) {
         return Ok(LaunchOutcome::SuperviseFirst { worker });
     }
@@ -461,6 +479,8 @@ fn stop_misplaced(
 pub struct WorkerView {
     /// The worker.
     pub worker: ResourceRef,
+    /// The attempt that launched it.
+    pub attempt: AttemptNumber,
     /// When the launch was confirmed.
     pub launched_at: Timestamp,
 }
@@ -480,6 +500,7 @@ pub fn current_worker(record: &TaskRecord) -> Option<WorkerView> {
                 .find(|resource| resource.kind == ResourceKind::Worker)
                 .map(|worker| WorkerView {
                     worker: worker.clone(),
+                    attempt: effect.request().attempt(),
                     launched_at: *at,
                 }),
             _ => None,
@@ -495,6 +516,9 @@ pub struct SupervisionPolicy {
     pub readiness_deadline: Duration,
     /// How long a question may wait for an answer before escalation.
     pub question_deadline: Duration,
+    /// How long a worker may sit idle at its prompt without progress and
+    /// without a completion before it counts as stalled.
+    pub idle_deadline: Duration,
     /// Claim renewal period.
     pub claim_ttl: LeaseTtl,
 }
@@ -508,6 +532,24 @@ pub struct Completion {
     pub observed_branch: String,
     /// The worker's readable report, bound to the exact head it describes.
     pub report: Evidence,
+    /// The follow-up ids ([`QueuedFollowUp::id`]) the report says it
+    /// addressed.
+    pub addressed: Vec<ExternalRef>,
+}
+
+/// What the caller observed this tick besides
+/// [`WorkerBackend::observe_worker`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SupervisionInput<'a> {
+    /// Recovery evidence for the current worker. `None` when the backend
+    /// offers none: a stall is then never established.
+    pub signals: Option<&'a RecoverySignals>,
+    /// The worker's completion report, when it reported success.
+    pub completion: Option<&'a Completion>,
+    /// The worker's latest failed validation run, when it reported one.
+    pub validation: Option<ValidationReport>,
+    /// Whether the provider works again, for a parked worker.
+    pub provider: ProviderCheck,
 }
 
 /// Why supervision needs a person or the owning coordinator.
@@ -522,6 +564,24 @@ pub enum Escalation {
     /// its slot stays used until a person or the worker's own settlement
     /// resolves it.
     StopRefused,
+    /// Validation hit an environment fault again after its one retry, or the
+    /// worker could not receive the retry. Never a test failure.
+    EnvironmentPersistent(EnvironmentFault),
+    /// The worker could not receive the message to resume after a provider
+    /// interruption.
+    ResumeRefused,
+}
+
+/// What follows an environment failure. The caller asks the dishwasher to
+/// inspect the workspace first (#11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentNext {
+    /// The worker still runs: after the inspection, call
+    /// [`retry_validation`] to have it run the validation once more.
+    InspectThenRevalidate,
+    /// The worker ended; the attempt ended as retryable, and the next
+    /// attempt runs the validation again.
+    InspectThenRetry(Disposition),
 }
 
 /// The result of one supervision step.
@@ -543,9 +603,55 @@ pub enum Supervision {
     Unobservable,
     /// The backend has no record of the worker: uncertain, never settled.
     WorkerMissing,
-    /// No readiness evidence arrived in time; the worker was stopped and the
-    /// attempt failed.
+    /// The readiness deadline passed without proof either way: the start is
+    /// neither confirmed nor shown to have failed, so supervision waits.
+    StartUnconfirmed,
+    /// The worker's first turn was shown never to start; it was stopped and
+    /// the attempt failed, to be retried as the task's next attempt.
     LaunchStalled {
+        /// What happens next.
+        disposition: Disposition,
+    },
+    /// The worker sat idle at its prompt without progress or completion past
+    /// the idle deadline; it was stopped and the attempt failed.
+    IdleStopped {
+        /// What happens next.
+        disposition: Disposition,
+    },
+    /// A person holds the terminal of a worker that went idle without
+    /// completion. The terminal is left untouched and the attempt ended;
+    /// start a replacement in a fresh workspace.
+    Replace {
+        /// The person's worker, left running.
+        worker: ResourceRef,
+        /// What happens next.
+        disposition: Disposition,
+    },
+    /// The provider refused the agent. The task is parked, not failed, and
+    /// no attempt is spent.
+    Parked {
+        /// What the provider reported.
+        interruption: ProviderInterruption,
+        /// True exactly once per interruption: report it to the owner.
+        report: bool,
+    },
+    /// The provider works again and the worker was told to continue.
+    Resumed,
+    /// Validation failed for an environment fault, not a test failure.
+    EnvironmentFailure {
+        /// The fault.
+        fault: EnvironmentFault,
+        /// The worker whose workspace the dishwasher inspects.
+        workspace: ResourceRef,
+        /// What follows the inspection.
+        next: EnvironmentNext,
+    },
+    /// The worker completed without addressing every follow-up sent during
+    /// the attempt. The attempt ended; the missing requests go into the next
+    /// brief.
+    FollowUpRound {
+        /// The follow-ups not addressed.
+        missing: Vec<ExternalRef>,
         /// What happens next.
         disposition: Disposition,
     },
@@ -571,30 +677,43 @@ fn running_attempt(
     }
 }
 
+/// End the running attempt with `outcome`; `None` when the budget was
+/// already spent.
+fn end_attempt(
+    ctx: &Context<'_>,
+    task: &TaskId,
+    fence: Fence,
+    outcome: AttemptOutcome,
+) -> Result<Option<Disposition>> {
+    let Some(attempt) = running_attempt(ctx, task, fence)? else {
+        return Ok(None);
+    };
+    Ok(Some(ctx.store.finish_attempt(
+        task,
+        fence,
+        attempt,
+        outcome,
+        ctx.clock.now(),
+    )?))
+}
+
 fn finish(
     ctx: &Context<'_>,
     task: &TaskId,
     fence: Fence,
     outcome: AttemptOutcome,
 ) -> Result<Supervision> {
-    let Some(attempt) = running_attempt(ctx, task, fence)? else {
-        return Ok(Supervision::Settled(Settlement::Exhausted));
-    };
-    Ok(
-        match ctx
-            .store
-            .finish_attempt(task, fence, attempt, outcome, ctx.clock.now())?
-        {
-            Disposition::Settled(settlement) => Supervision::Settled(settlement),
-            Disposition::RetryAvailable { remaining } => Supervision::Retry { remaining },
-        },
-    )
+    Ok(match end_attempt(ctx, task, fence, outcome)? {
+        None => Supervision::Settled(Settlement::Exhausted),
+        Some(Disposition::Settled(settlement)) => Supervision::Settled(settlement),
+        Some(Disposition::RetryAvailable { remaining }) => Supervision::Retry { remaining },
+    })
 }
 
 /// Run one supervision step for an owned task: renew the claim, reconcile
-/// unresolved effects, observe the worker, and settle only on positive
+/// unresolved effects, observe the worker, and act only on positive
 /// evidence. Silence, a missing worker, or an unreachable backend never
-/// settles a task.
+/// settles a task or stops a worker.
 ///
 /// # Errors
 /// Returns store failures, including a stale fence or a superseded
@@ -604,7 +723,7 @@ pub fn supervise(
     task: &TaskId,
     fence: Fence,
     policy: &SupervisionPolicy,
-    completion: Option<&Completion>,
+    input: &SupervisionInput<'_>,
 ) -> Result<Supervision> {
     let now = ctx.clock.now();
     ctx.store.renew(task, fence, policy.claim_ttl, now)?;
@@ -632,20 +751,65 @@ pub fn supervise(
     let Ok(state) = ctx.backend.observe_worker(&view.worker) else {
         return Ok(Supervision::Unobservable);
     };
+    let signals = input
+        .signals
+        .filter(|signals| signals.worker == view.worker);
+    let live = matches!(
+        state,
+        WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply
+    );
+    // A person's terminal is theirs, whichever source reports it.
+    let person = state == WorkerState::UserTakeover
+        || (live && signals.is_some_and(|signals| signals.terminal == TerminalHolder::Person));
+    let stalled = signals
+        .and_then(RecoverySignals::idle_since)
+        .is_some_and(|since| now.saturating_since(since) > policy.idle_deadline);
+    if live
+        && !person
+        && let Some(signals) = signals
+        && let Some(interruption) = signals.provider
+    {
+        return park(
+            ctx,
+            task,
+            fence,
+            &view,
+            signals,
+            interruption,
+            input.provider,
+        );
+    }
+    if live
+        && !person
+        && let Some(validation) = input.validation
+        && let ValidationFailure::Environment(fault) = validation.failure
+    {
+        return environment(ctx, task, &view, state, &validation, fault);
+    }
     match state {
+        _ if person && stalled => hand_to_person(ctx, task, fence, &view),
+        _ if person => Ok(Supervision::PersonOwnsTerminal),
         WorkerState::Starting
             if now.saturating_since(view.launched_at) > policy.readiness_deadline =>
         {
-            stop_stalled(ctx, task, fence, &view.worker)
+            if signals.is_some_and(RecoverySignals::proves_never_started) {
+                stop_and_fail(ctx, task, fence, &view, Stall::NeverStarted)
+            } else {
+                Ok(Supervision::StartUnconfirmed)
+            }
+        }
+        WorkerState::Starting | WorkerState::Ready if stalled => {
+            stop_and_fail(ctx, task, fence, &view, Stall::Idle)
         }
         WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply => {
             Ok(Supervision::Running(state))
         }
+        // Reached only when `person` is set, which the guards above handle.
         WorkerState::UserTakeover => Ok(Supervision::PersonOwnsTerminal),
         WorkerState::Missing => Ok(Supervision::WorkerMissing),
         WorkerState::Unknown => Ok(Supervision::Unobservable),
         WorkerState::Settled(WorkerOutcome::Succeeded) => {
-            let Some(completion) = completion else {
+            let Some(completion) = input.completion else {
                 return Ok(Supervision::Escalate(Escalation::MissingEvidence));
             };
             if completion.observed_branch != completion.requested.as_str() {
@@ -656,6 +820,24 @@ pub fn supervise(
             {
                 return Ok(Supervision::Escalate(Escalation::MissingEvidence));
             }
+            let mut missing = Vec::new();
+            for follow_up in outstanding_follow_ups(&record) {
+                if completion.addressed.contains(&follow_up.id) {
+                    ctx.store.consume_message(task, fence, &follow_up.id, now)?;
+                } else {
+                    missing.push(follow_up.id);
+                }
+            }
+            if !missing.is_empty() {
+                let failed = AttemptOutcome::Failed(FailureClass::Retryable);
+                return Ok(match end_attempt(ctx, task, fence, failed)? {
+                    None => Supervision::Settled(Settlement::Exhausted),
+                    Some(disposition) => Supervision::FollowUpRound {
+                        missing,
+                        disposition,
+                    },
+                });
+            }
             ctx.store
                 .record_evidence(task, fence, completion.report.clone(), now)?;
             finish(ctx, task, fence, AttemptOutcome::Succeeded)
@@ -664,7 +846,23 @@ pub fn supervise(
             ctx.store.settle_cancelled(task, fence, now)?;
             Ok(Supervision::Settled(Settlement::Cancelled))
         }
-        WorkerState::Settled(WorkerOutcome::Failed | WorkerOutcome::Cancelled) => finish(
+        WorkerState::Settled(WorkerOutcome::Failed) => {
+            let failed = AttemptOutcome::Failed(FailureClass::Retryable);
+            match input.validation.map(|validation| validation.failure) {
+                Some(ValidationFailure::Environment(fault)) => {
+                    Ok(match end_attempt(ctx, task, fence, failed)? {
+                        None => Supervision::Settled(Settlement::Exhausted),
+                        Some(disposition) => Supervision::EnvironmentFailure {
+                            fault,
+                            workspace: view.worker,
+                            next: EnvironmentNext::InspectThenRetry(disposition),
+                        },
+                    })
+                }
+                Some(ValidationFailure::Tests) | None => finish(ctx, task, fence, failed),
+            }
+        }
+        WorkerState::Settled(WorkerOutcome::Cancelled) => finish(
             ctx,
             task,
             fence,
@@ -673,17 +871,31 @@ pub fn supervise(
     }
 }
 
-fn stop_stalled(
+/// Why a worker is stopped.
+#[derive(Clone, Copy)]
+enum Stall {
+    /// Its first turn never started.
+    NeverStarted,
+    /// It sat idle without progress or completion.
+    Idle,
+}
+
+/// Stop a stalled worker; the attempt fails only once the stop is confirmed.
+fn stop_and_fail(
     ctx: &Context<'_>,
     task: &TaskId,
     fence: Fence,
-    worker: &ResourceRef,
+    view: &WorkerView,
+    stall: Stall,
 ) -> Result<Supervision> {
     let Some(attempt) = running_attempt(ctx, task, fence)? else {
         return Ok(Supervision::Settled(Settlement::Exhausted));
     };
-    let name = format!("stop-stalled-{}", attempt.get());
-    match stop_worker(ctx, task, fence, &name, worker)? {
+    let name = match stall {
+        Stall::NeverStarted => format!("stop-stalled-{}", attempt.get()),
+        Stall::Idle => format!("stop-idle-{}", attempt.get()),
+    };
+    match stop_worker(ctx, task, fence, &name, &view.worker)? {
         Stop::Stopped => {
             let disposition = ctx.store.finish_attempt(
                 task,
@@ -692,11 +904,271 @@ fn stop_stalled(
                 AttemptOutcome::Failed(FailureClass::Retryable),
                 ctx.clock.now(),
             )?;
-            Ok(Supervision::LaunchStalled { disposition })
+            Ok(match stall {
+                Stall::NeverStarted => Supervision::LaunchStalled { disposition },
+                Stall::Idle => Supervision::IdleStopped { disposition },
+            })
         }
         Stop::Refused => Ok(Supervision::Escalate(Escalation::StopRefused)),
         Stop::Unresolved => Ok(Supervision::Reconciling { unresolved: 1 }),
     }
+}
+
+/// Leave an idle worker a person took over untouched and end its attempt,
+/// so a replacement can start in a fresh workspace.
+fn hand_to_person(
+    ctx: &Context<'_>,
+    task: &TaskId,
+    fence: Fence,
+    view: &WorkerView,
+) -> Result<Supervision> {
+    let failed = AttemptOutcome::Failed(FailureClass::Retryable);
+    Ok(match end_attempt(ctx, task, fence, failed)? {
+        None => Supervision::Settled(Settlement::Exhausted),
+        Some(disposition) => Supervision::Replace {
+            worker: view.worker.clone(),
+            disposition,
+        },
+    })
+}
+
+/// Park a worker the provider refused. Nothing fails and no attempt ends.
+/// One interruption is reported once: it is keyed by the attempt, the
+/// class, and the agent's last activity, which stays fixed while parked and
+/// moves once the agent works again.
+fn park(
+    ctx: &Context<'_>,
+    task: &TaskId,
+    fence: Fence,
+    view: &WorkerView,
+    signals: &RecoverySignals,
+    interruption: ProviderInterruption,
+    provider: ProviderCheck,
+) -> Result<Supervision> {
+    let episode = signals
+        .transcript
+        .and_then(|transcript| transcript.last_activity)
+        .map_or(0, Timestamp::as_unix_millis);
+    let key = format!(
+        "provider-{}-{}-{episode}",
+        view.attempt.get(),
+        interruption.as_str()
+    );
+    match provider {
+        ProviderCheck::NotChecked => {
+            let reference = ExternalRef::new(&key)?;
+            let first = ctx
+                .store
+                .consume_message(task, fence, &reference, ctx.clock.now())?
+                == Consumption::New;
+            Ok(Supervision::Parked {
+                interruption,
+                report: first,
+            })
+        }
+        ProviderCheck::Working => {
+            let name = format!("resume-{:016x}", stable_hash(key.as_bytes()));
+            let record = ctx.store.task(task)?;
+            let revision = record.evidence().revision();
+            let effect = Effect::Worker(Operation::MessageWorker {
+                worker: view.worker.clone(),
+                body: Text::new(
+                    "The provider works again. Continue the task from where it stopped.",
+                )?,
+            });
+            let resumed = ctx.run(ctx.backend, task, fence, &name, effect, revision)?;
+            Ok(match resumed.state() {
+                EffectState::Applied { .. } => Supervision::Resumed,
+                EffectState::NotApplied { .. } => Supervision::Escalate(Escalation::ResumeRefused),
+                EffectState::Intended
+                | EffectState::Uncertain { .. }
+                | EffectState::Unresolvable { .. }
+                | EffectState::Waived { .. } => Supervision::Reconciling { unresolved: 1 },
+            })
+        }
+    }
+}
+
+fn revalidate_name(attempt: AttemptNumber) -> String {
+    format!("revalidate-{}", attempt.get())
+}
+
+/// A running worker's validation hit an environment fault. Before its one
+/// retry, report the failure for inspection; after it, a new environment
+/// failure escalates.
+fn environment(
+    ctx: &Context<'_>,
+    task: &TaskId,
+    view: &WorkerView,
+    state: WorkerState,
+    validation: &ValidationReport,
+    fault: EnvironmentFault,
+) -> Result<Supervision> {
+    let record = ctx.store.task(task)?;
+    Ok(
+        match named_effect(&record, &revalidate_name(view.attempt)).map(EffectRecord::state) {
+            None => Supervision::EnvironmentFailure {
+                fault,
+                workspace: view.worker.clone(),
+                next: EnvironmentNext::InspectThenRevalidate,
+            },
+            // A run that finished before the retry was sent is the one
+            // already handled.
+            Some(EffectState::Applied { at, .. }) if validation.finished_at <= *at => {
+                Supervision::Running(state)
+            }
+            Some(EffectState::Applied { .. } | EffectState::NotApplied { .. }) => {
+                Supervision::Escalate(Escalation::EnvironmentPersistent(fault))
+            }
+            Some(
+                EffectState::Intended
+                | EffectState::Uncertain { .. }
+                | EffectState::Unresolvable { .. }
+                | EffectState::Waived { .. },
+            ) => Supervision::Reconciling { unresolved: 1 },
+        },
+    )
+}
+
+/// What asking a worker to rerun its validation did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revalidation {
+    /// The worker received the request. Repeating the call sends nothing.
+    Sent,
+    /// The worker could not receive it.
+    NotApplied,
+    /// The outcome is unknown; reconcile first.
+    Uncertain,
+    /// No worker to ask.
+    NoWorker,
+}
+
+/// After the dishwasher inspected a workspace whose validation hit an
+/// environment fault, ask the worker to run its validation once more. At
+/// most one retry is sent per attempt.
+///
+/// # Errors
+/// Returns store and authority failures.
+pub fn retry_validation(ctx: &Context<'_>, task: &TaskId, fence: Fence) -> Result<Revalidation> {
+    let record = ctx.store.task(task)?;
+    let Some(view) = current_worker(&record) else {
+        return Ok(Revalidation::NoWorker);
+    };
+    let effect = Effect::Worker(Operation::MessageWorker {
+        worker: view.worker,
+        body: Text::new(
+            "The environment fault that broke validation was inspected. Run the validation once more and report the result.",
+        )?,
+    });
+    let revision = record.evidence().revision();
+    let name = revalidate_name(view.attempt);
+    let sent = ctx.run(ctx.backend, task, fence, &name, effect, revision)?;
+    Ok(match sent.state() {
+        EffectState::Applied { .. } => Revalidation::Sent,
+        EffectState::NotApplied { .. } => Revalidation::NotApplied,
+        EffectState::Intended
+        | EffectState::Uncertain { .. }
+        | EffectState::Unresolvable { .. }
+        | EffectState::Waived { .. } => Revalidation::Uncertain,
+    })
+}
+
+const FOLLOW_UP_PREFIX: &str = "follow-up-";
+
+/// The id a worker reports for `follow_up` once it addressed it.
+///
+/// # Errors
+/// Never fails for valid inputs; the id syntax error is propagated defensively.
+pub fn follow_up_id(follow_up: &FollowUp) -> Result<ExternalRef> {
+    Ok(ExternalRef::new(&format!(
+        "{FOLLOW_UP_PREFIX}{:016x}",
+        stable_hash(follow_up.id.as_str().as_bytes())
+    ))?)
+}
+
+/// Follow-ups recorded for the task that no completion has addressed:
+/// those delivered to a worker and those its worker could not receive.
+#[must_use]
+pub fn outstanding_follow_ups(record: &TaskRecord) -> Vec<QueuedFollowUp> {
+    record
+        .effects()
+        .iter()
+        .filter(|effect| effect.name().as_str().starts_with(FOLLOW_UP_PREFIX))
+        .filter(|effect| {
+            matches!(
+                effect.state(),
+                EffectState::Applied { .. } | EffectState::NotApplied { .. }
+            )
+        })
+        .filter_map(|effect| match effect.request().effect() {
+            Effect::Worker(Operation::MessageWorker { body, .. }) => {
+                let id = ExternalRef::new(effect.name().as_str()).ok()?;
+                (!record.has_consumed(&id)).then(|| QueuedFollowUp {
+                    id,
+                    body: body.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// What happened to a follow-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FollowUpRoute {
+    /// The worker received it.
+    Delivered {
+        /// The id the worker reports once it addressed it.
+        id: ExternalRef,
+    },
+    /// The worker could not receive it, for example because its dispatch
+    /// completed. It is queued into the next brief.
+    Queued {
+        /// The id the next worker reports once it addressed it.
+        id: ExternalRef,
+    },
+    /// The outcome is unknown; reconcile first.
+    Uncertain,
+    /// No worker was launched yet; put the request in the first brief.
+    NoWorker,
+}
+
+/// Send a follow-up request to the task's current worker, at most once per
+/// follow-up id. A refusal, such as a dispatch that already completed,
+/// queues the request for the next brief instead of dropping it, and the
+/// completion of the attempt is checked against it.
+///
+/// # Errors
+/// Returns store and authority failures, including a settled task.
+pub fn send_follow_up(
+    ctx: &Context<'_>,
+    task: &TaskId,
+    fence: Fence,
+    follow_up: &FollowUp,
+) -> Result<FollowUpRoute> {
+    let record = ctx.store.task(task)?;
+    let Some(view) = current_worker(&record) else {
+        return Ok(FollowUpRoute::NoWorker);
+    };
+    let id = follow_up_id(follow_up)?;
+    let body = Text::new(&format!(
+        "Follow-up {id}: {}\nList {id} under \"Addressed\" in your report once it is done.",
+        follow_up.body.as_str()
+    ))?;
+    let effect = Effect::Worker(Operation::MessageWorker {
+        worker: view.worker,
+        body,
+    });
+    let revision = record.evidence().revision();
+    let sent = ctx.run(ctx.backend, task, fence, id.as_str(), effect, revision)?;
+    Ok(match sent.state() {
+        EffectState::Applied { .. } => FollowUpRoute::Delivered { id },
+        EffectState::NotApplied { .. } => FollowUpRoute::Queued { id },
+        EffectState::Intended
+        | EffectState::Uncertain { .. }
+        | EffectState::Unresolvable { .. }
+        | EffectState::Waived { .. } => FollowUpRoute::Uncertain,
+    })
 }
 
 /// A question a worker asked, as read by the backend adapter.

@@ -127,6 +127,7 @@ pub fn supervision() -> TestResult<SupervisionPolicy> {
     Ok(SupervisionPolicy {
         readiness_deadline: Duration::from_secs(120),
         question_deadline: Duration::from_secs(600),
+        idle_deadline: Duration::from_secs(240),
         claim_ttl: ttl(300)?,
     })
 }
@@ -309,5 +310,42 @@ impl EffectExecutor for ReportsBranch<'_> {
 impl WorkerBackend for ReportsBranch<'_> {
     fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
         self.inner.observe_worker(worker)
+    }
+}
+
+/// Recovery signals for `worker`: working, agent's terminal, no provider
+/// error, and a transcript whose last activity is `last_activity`.
+pub fn signals(
+    worker: &ResourceRef,
+    last_activity: Option<Timestamp>,
+) -> kitchen::workflows::recovery::RecoverySignals {
+    use kitchen::workflows::recovery::{
+        PromptState, RecoverySignals, StartEvidence, TerminalHolder, TranscriptProgress,
+    };
+    RecoverySignals {
+        worker: worker.clone(),
+        start: StartEvidence::TurnObserved,
+        prompt: PromptState::Working,
+        transcript: Some(TranscriptProgress {
+            agent_spoke: true,
+            last_activity,
+        }),
+        terminal: TerminalHolder::Agent,
+        provider: None,
+    }
+}
+
+/// Positive proof that `worker`'s first turn never started: an empty,
+/// readable transcript and an idle prompt.
+pub fn never_started(worker: &ResourceRef) -> kitchen::workflows::recovery::RecoverySignals {
+    use kitchen::workflows::recovery::{PromptState, StartEvidence, TranscriptProgress};
+    kitchen::workflows::recovery::RecoverySignals {
+        start: StartEvidence::NoTurn,
+        prompt: PromptState::Idle,
+        transcript: Some(TranscriptProgress {
+            agent_spoke: false,
+            last_activity: None,
+        }),
+        ..signals(worker, None)
     }
 }

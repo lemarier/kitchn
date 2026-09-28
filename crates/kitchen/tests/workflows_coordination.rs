@@ -19,8 +19,9 @@ use kitchen::{
     workflows::{
         coordination::{
             Completion, CoordinatorStart, Escalation, HumanDecision, LaunchOutcome,
-            QuestionEscalation, QuestionRoute, Response, RogerChannel, Supervision, WorkerQuestion,
-            handle_question, launch_worker, relinquish_coordinator, start_coordinator, supervise,
+            QuestionEscalation, QuestionRoute, Response, RogerChannel, Supervision,
+            SupervisionInput, WorkerQuestion, handle_question, launch_worker,
+            relinquish_coordinator, start_coordinator, supervise,
         },
         pickup::{ClaimOutcome, claim_issue, issue_task_id},
     },
@@ -63,7 +64,33 @@ fn launched(world: &World, task: &TaskId, fence: Fence, number: u64) -> TestResu
 }
 
 fn step(world: &World, task: &TaskId, fence: Fence) -> TestResult<Supervision> {
-    Ok(supervise(&world.ctx(), task, fence, &supervision()?, None)?)
+    Ok(supervise(
+        &world.ctx(),
+        task,
+        fence,
+        &supervision()?,
+        &SupervisionInput::default(),
+    )?)
+}
+
+/// A step with positive proof that `worker`'s first turn never started.
+fn stalled_step(
+    world: &World,
+    task: &TaskId,
+    fence: Fence,
+    worker: &ResourceRef,
+) -> TestResult<Supervision> {
+    let proof = workflows_support::never_started(worker);
+    Ok(supervise(
+        &world.ctx(),
+        task,
+        fence,
+        &supervision()?,
+        &SupervisionInput {
+            signals: Some(&proof),
+            ..SupervisionInput::default()
+        },
+    )?)
 }
 
 fn report(verdict: EvidenceVerdict) -> TestResult<Evidence> {
@@ -84,6 +111,7 @@ fn completion(observed: &str, verdict: EvidenceVerdict) -> TestResult<Completion
         requested: branch("lemarier/issue-1")?,
         observed_branch: observed.to_owned(),
         report: report(verdict)?,
+        addressed: Vec::new(),
     })
 }
 
@@ -110,8 +138,18 @@ fn a_worker_settles_only_with_readable_passing_evidence_on_its_exact_branch() ->
         Supervision::Escalate(Escalation::MissingEvidence)
     );
     let policy = supervision()?;
-    let run =
-        |completion: &Completion| supervise(&world.ctx(), &task, fence, &policy, Some(completion));
+    let run = |completion: &Completion| {
+        supervise(
+            &world.ctx(),
+            &task,
+            fence,
+            &policy,
+            &SupervisionInput {
+                completion: Some(completion),
+                ..SupervisionInput::default()
+            },
+        )
+    };
     let prefixed = completion("orca/lemarier/issue-1", EvidenceVerdict::Pass)?;
     assert_eq!(
         run(&prefixed)?,
@@ -217,12 +255,12 @@ fn a_launch_without_readiness_evidence_is_stopped_and_counted_as_failed() -> Tes
     let worker = launched(&world, &task, fence, 1)?;
     world.clock.advance(119);
     assert_eq!(
-        step(&world, &task, fence)?,
+        stalled_step(&world, &task, fence, &worker)?,
         Supervision::Running(WorkerState::Starting)
     );
     world.clock.advance(2);
     assert_eq!(
-        step(&world, &task, fence)?,
+        stalled_step(&world, &task, fence, &worker)?,
         Supervision::LaunchStalled {
             disposition: Disposition::RetryAvailable { remaining: 2 }
         }
@@ -790,7 +828,7 @@ fn a_refused_stop_keeps_the_claim_and_the_slot_while_the_worker_may_still_run() 
     world.clock.advance(121);
     // The backend refuses to stop the worker that never became ready.
     world.backend.inject(ExecuteFault::Reject);
-    let refused = step(&world, &task, fence)?;
+    let refused = stalled_step(&world, &task, fence, &worker)?;
     assert_eq!(
         refused,
         Supervision::Escalate(Escalation::StopRefused),
@@ -817,7 +855,7 @@ fn a_refused_stop_keeps_the_claim_and_the_slot_while_the_worker_may_still_run() 
     // Ticks repeat the escalation without asking the backend again, and a
     // repeated launch returns the same worker instead of starting another.
     let calls = world.backend.execute_calls();
-    assert_eq!(step(&world, &task, fence)?, refused);
+    assert_eq!(stalled_step(&world, &task, fence, &worker)?, refused);
     assert_eq!(world.backend.execute_calls(), calls);
     assert_eq!(
         launch(&world, &task, fence, 1)?,
@@ -856,7 +894,7 @@ fn an_uncertain_stop_blocks_until_reconciled_and_then_frees_the_attempt() -> Tes
     world.clock.advance(121);
     world.backend.inject(ExecuteFault::ApplyThenLoseResponse);
     assert_eq!(
-        step(&world, &task, fence)?,
+        stalled_step(&world, &task, fence, &worker)?,
         Supervision::Reconciling { unresolved: 1 }
     );
     let record = world.fixture.store.task(&task)?;
@@ -1169,7 +1207,7 @@ fn a_refused_stop_of_an_adopted_worker_still_reserves_its_branch() -> TestResult
     // the backend refuses to stop it. That attempt has no launch of its own.
     world.backend.inject(ExecuteFault::Reject);
     assert_eq!(
-        step(&world, &task, fence)?,
+        stalled_step(&world, &task, fence, &worker)?,
         Supervision::Escalate(Escalation::StopRefused)
     );
     let effects = world.backend.effects_performed();

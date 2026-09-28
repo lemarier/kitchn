@@ -1,7 +1,7 @@
 //! Typed GitHub effect payloads and atomic per-task admission.
 use crate::contracts::{
-    Capability, ContractError, EffectContext, ExecutorKind, GrantScope, Permission, Repository,
-    Text, ValueKind,
+    Capability, CommitId, ContractError, EffectContext, ExecutorKind, GrantScope, Permission,
+    Repository, Text, ValueKind,
 };
 use serde::{Deserialize, Serialize};
 fn invalid() -> ContractError {
@@ -118,6 +118,15 @@ pub struct GitHubMutation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum GitHubAction {
+    /// Merge only the named head using GitHub's squash method.
+    MergePullRequest {
+        /// Destination pull request.
+        number: IssueNumber,
+        /// Exact head approved for merging.
+        expected_head: CommitId,
+        /// Fixed merge method.
+        method: MergeMethod,
+    },
     /// Add one comment, identified by its persisted idempotency marker.
     PostComment {
         /// Destination issue/PR.
@@ -161,6 +170,13 @@ pub enum GitHubAction {
         label: LabelDefinition,
     },
 }
+/// Merge strategy; this integration permits squash only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MergeMethod {
+    /// Squash the pull request.
+    Squash,
+}
 impl GitHubMutation {
     /// Validate bounded content and relationships.
     ///
@@ -168,6 +184,7 @@ impl GitHubMutation {
     /// Rejects self-links, malformed labels, and oversized titles/bodies.
     pub fn validate(&self) -> Result<(), ContractError> {
         match &self.action {
+            GitHubAction::MergePullRequest { .. } => Ok(()),
             GitHubAction::PostComment { body, .. } if body.as_str().len() > 60 * 1024 => {
                 Err(invalid())
             }
@@ -218,6 +235,7 @@ impl GitHubEffect {
     #[must_use]
     pub const fn required_permission(&self) -> Permission {
         match self.mutation.action {
+            GitHubAction::MergePullRequest { .. } => Permission::Merge,
             GitHubAction::PostComment { .. } => Permission::PostComment,
             GitHubAction::SetLabel { .. } | GitHubAction::CreateLabel { .. } => {
                 Permission::EditLabels

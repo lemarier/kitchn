@@ -81,7 +81,7 @@ pub use effects::{
 
     AskKind, AskRisk, DecisionBinding, DecisionOwner, Effect, EffectContext, ExecutorKind,
     GitHubAction, GitHubEffect, GitHubMutation, IssueNumber, LabelDefinition, MAX_ASKS_PER_TASK,
-    PostingBudget, RogerAsk, RogerEffect, ScheduleEffect, SubmittedEffects,
+    MergeMethod, PostingBudget, RogerAsk, RogerEffect, ScheduleEffect, SubmittedEffects,
 };
 pub use error::ContractError;
 pub use evidence::{Evidence, EvidenceKind, EvidenceRevision, EvidenceSubject, EvidenceVerdict};

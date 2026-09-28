@@ -475,3 +475,198 @@ fn provider_identity_substitution_is_unknown_and_dependency_source_is_retained()
     );
     Ok(())
 }
+
+#[test]
+fn gate_reads_bind_exact_head_and_preserve_missing_protection() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let head = kitchen::contracts::CommitId::new("1111111111111111111111111111111111111111")?;
+    let base = kitchen::contracts::CommitId::new("2222222222222222222222222222222222222222")?;
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![
+            Ok(json!({"behind_by":2,"ahead_by":3})),
+            Ok(json!([{"context":"ci","state":"success","sha":head.as_str()}])),
+            Ok(json!({"contexts":["ci"]})),
+            Ok(json!({"sha":head.as_str(),"commit":{"committer":{"date":"2026-01-01T00:00:00Z"}}})),
+        ])?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        client.compare(&house, &repo, &base, &head),
+        Observation::Known(Compare {
+            behind_by: 2,
+            ahead_by: 3
+        })
+    );
+    assert!(matches!(client.statuses(&house, &repo, &head), Observation::Known(v) if v.len() == 1));
+    assert!(
+        matches!(client.required_checks(&house, &repo, "main"), Observation::Known(v) if v.contexts == ["ci"])
+    );
+    assert!(matches!(client.commit(&house, &repo, &head), Observation::Known(v) if v.sha == head));
+    let missing = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![Err(IntegrationError::Unavailable)])?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        missing.required_checks(&house, &repo, "main"),
+        Observation::Unavailable(IntegrationError::Unavailable)
+    );
+    Ok(())
+}
+
+#[test]
+fn statuses_refuse_moved_head_and_partial_page() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let head = kitchen::contracts::CommitId::new("1111111111111111111111111111111111111111")?;
+    let other = kitchen::contracts::CommitId::new("2222222222222222222222222222222222222222")?;
+    let moved = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![Ok(
+            json!([{"context":"ci","state":"success","sha":other.as_str()}]),
+        )])?,
+        ReadLimits::default(),
+    );
+    assert_eq!(moved.statuses(&house, &repo, &head), Observation::Unknown);
+    let full = json!(
+        (0..100)
+            .map(|_| json!({"context":"ci","state":"success","sha":head.as_str()}))
+            .collect::<Vec<_>>()
+    );
+    let partial = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![Ok(full), Err(IntegrationError::Unavailable)])?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        partial.statuses(&house, &repo, &head),
+        Observation::Unavailable(IntegrationError::Unavailable)
+    );
+    Ok(())
+}
+
+#[test]
+fn required_checks_presence_fails_closed_for_missing_and_app_bound_checks() -> Result {
+    let head = kitchen::contracts::CommitId::new("1111111111111111111111111111111111111111")?;
+    let checks = RequiredChecks {
+        contexts: vec!["ci".into()],
+        checks: vec![],
+    };
+    assert_eq!(
+        checks.presence(&[], &[], &head),
+        RequiredCheckPresence::Missing
+    );
+    let status = CommitStatus {
+        context: "ci".into(),
+        state: StatusState::Success,
+        sha: head.clone(),
+    };
+    assert_eq!(
+        checks.presence(&[], &[status], &head),
+        RequiredCheckPresence::Present
+    );
+    let app = RequiredChecks {
+        contexts: vec![],
+        checks: vec![RequiredCheck {
+            context: "build".into(),
+            app_id: Some(123),
+        }],
+    };
+    assert_eq!(
+        app.presence(&[], &[], &head),
+        RequiredCheckPresence::Unknown
+    );
+    Ok(())
+}
+
+#[test]
+fn graphql_merge_status_requires_same_head() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let head = kitchen::contracts::CommitId::new("1111111111111111111111111111111111111111")?;
+    let other = kitchen::contracts::CommitId::new("2222222222222222222222222222222222222222")?;
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![
+            Ok(
+                json!({"data":{"repository":{"pullRequest":{"headRefOid":head.as_str(),"mergeStateStatus":"CLEAN"}}}}),
+            ),
+            Ok(
+                json!({"data":{"repository":{"pullRequest":{"headRefOid":other.as_str(),"mergeStateStatus":"CLEAN"}}}}),
+            ),
+        ])?,
+        ReadLimits::default(),
+    );
+    assert!(matches!(
+        client.merge_status(&house, &repo, IssueNumber::new(1)?, &head),
+        Observation::Known(MergeStatus {
+            status: MergeStatusValue::Clean,
+            ..
+        })
+    ));
+    assert_eq!(
+        client.merge_status(&house, &repo, IssueNumber::new(1)?, &head),
+        Observation::Unknown
+    );
+    Ok(())
+}
+
+#[test]
+fn triage_reads_detail_timeline_comments_and_linked_pr() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let sha = "1111111111111111111111111111111111111111";
+    let pr = json!({"number":9,"state":"closed","draft":false,"merged":true,"head":{"sha":sha,"ref":"feature","repo":{"full_name":"sample/project"}},"base":{"sha":sha,"ref":"main"},"mergeable":true,"merge_commit_sha":sha,"user":{"login":"author"},"author_association":"OWNER"});
+    let cross = json!({"event":"cross-referenced","created_at":"2026-01-02T00:00:00Z","source":{"issue":{"number":9,"repository_url":"https://api.github.com/repos/sample/project","pull_request":{"url":"https://api.github.com/repos/sample/project/pulls/9"}}}});
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![
+            Ok(
+                json!({"number":1,"state":"open","user":{"login":"author"},"body":"untrusted text","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":null}),
+            ),
+            Ok(
+                json!([{"id":1,"user":{"login":"author"},"body":"comment","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}]),
+            ),
+            Ok(json!([cross.clone()])),
+            Ok(json!([cross])),
+            Ok(pr),
+        ])?,
+        ReadLimits::default(),
+    );
+    assert!(
+        matches!(client.issue_detail(&house, &repo, IssueNumber::new(1)?), Observation::Known(v) if v.body.as_deref() == Some("untrusted text"))
+    );
+    assert!(
+        matches!(client.comments(&house, &repo, IssueNumber::new(1)?), Observation::Known(v) if v.len() == 1)
+    );
+    assert!(
+        matches!(client.timeline(&house, &repo, IssueNumber::new(1)?), Observation::Known(v) if v.len() == 1)
+    );
+    assert!(
+        matches!(client.linked_pull_requests(&house, &repo, IssueNumber::new(1)?), Observation::Known(v) if v.len() == 1 && v[0].pull_request.merged)
+    );
+    Ok(())
+}
+
+#[test]
+fn triage_partial_timeline_is_unavailable() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let full = json!(
+        (0..100)
+            .map(|_| json!({"event":"labeled","label":{"name":"ready"}}))
+            .collect::<Vec<_>>()
+    );
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![Ok(full), Err(IntegrationError::Unavailable)])?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        client.timeline(&house, &repo, IssueNumber::new(1)?),
+        Observation::Unavailable(IntegrationError::Unavailable)
+    );
+    Ok(())
+}

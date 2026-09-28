@@ -25,7 +25,7 @@ mod mutation;
 pub(crate) mod process;
 mod scope;
 pub use crate::contracts::{
-    GitHubAction, GitHubMutation, IssueNumber, LabelDefinition, PostingBudget,
+    GitHubAction, GitHubMutation, IssueNumber, LabelDefinition, MergeMethod, PostingBudget,
 };
 pub use mutation::LabelSetup;
 pub use process::{CredentialFile, GhCli};

@@ -150,6 +150,14 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
         match provider.inspect(&effect.mutation, request.key()) {
             Ok(Inspection::Applied(receipt)) => Ok(Lookup::Applied(receipt)),
             // Even complete absence cannot rule out an earlier request still in flight.
+            Ok(Inspection::Conflict)
+                if matches!(
+                    effect.mutation.action,
+                    super::GitHubAction::MergePullRequest { .. }
+                ) =>
+            {
+                Ok(Lookup::Absent)
+            }
             Ok(Inspection::Missing | Inspection::Conflict) => Ok(Lookup::Unknown),
             Err(IntegrationError::Timeout) => Err(BackendUnavailable::Timeout),
             Err(IntegrationError::LimitExceeded) => Err(BackendUnavailable::LimitExceeded),

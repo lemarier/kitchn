@@ -23,7 +23,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub use github::{
-    GitHubAction, GitHubEffect, GitHubMutation, IssueNumber, LabelDefinition, PostingBudget,
+    GitHubAction, GitHubEffect, GitHubMutation, IssueNumber, LabelDefinition, MergeMethod,
+    PostingBudget,
 };
 pub use roger::{
     AskKind, AskRisk, DecisionBinding, DecisionOwner, MAX_ASKS_PER_TASK, RogerAsk, RogerEffect,

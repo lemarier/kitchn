@@ -18,6 +18,7 @@ enum Fault {
 }
 #[derive(Default)]
 struct Remote {
+    pull_request: Option<Value>,
     labels: Vec<Value>,
     comments: Vec<Value>,
     issues: Vec<Value>,
@@ -57,6 +58,11 @@ impl GitHubReadTransport for Provider {
         let path = request.endpoint();
         let value = if path.contains("/comments?") {
             json!(remote.comments)
+        } else if path.ends_with("/pulls/1") {
+            remote
+                .pull_request
+                .clone()
+                .ok_or(IntegrationError::Unknown)?
         } else if path.contains("/labels?") {
             json!(remote.labels)
         } else if path.ends_with("/issues/2") {
@@ -104,6 +110,16 @@ impl GitHubMutationTransport for Provider {
         let body = request.body();
         if path.ends_with("/comments") {
             remote.comments.push(json!({"id":1,"body":body["body"],"user":{"login":"sample-bot"},"html_url":"https://github.com/sample/project/issues/1#issuecomment-1"}));
+        } else if path.ends_with("/pulls/1/merge") {
+            let pr = remote
+                .pull_request
+                .as_mut()
+                .ok_or(EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
+            if pr["head"]["sha"] != body["sha"] {
+                return Err(EffectFailure::NotApplied(NotAppliedReason::Rejected));
+            }
+            pr["merged"] = json!(true);
+            pr["merge_commit_sha"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         } else if path.ends_with("/issues") {
             remote.issues.push(json!({"id":103,"number":3,"title":body["title"],"body":body["body"],"user":{"login":"sample-bot"},"html_url":"https://github.com/sample/project/issues/3"}));
         } else if path.contains("/sub_issues") || path.contains("/dependencies/blocked_by") {
@@ -737,5 +753,88 @@ fn revoked_posting_still_allows_read_only_reconciliation() -> TestResult {
         Lookup::Applied(_)
     ));
     assert_eq!(remote.borrow().calls.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn squash_merge_is_exact_head_and_reconciles_lost_response() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::Merge], "github")?;
+    let head = CommitId::new("1111111111111111111111111111111111111111")?;
+    let remote = Rc::new(RefCell::new(Remote {
+        pull_request: Some(json!({"number":1,"merged":false,"head":{"sha":head.as_str()}})),
+        fault: Some(Fault::LoseAfterApply),
+        ..Remote::default()
+    }));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope.clone(),
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let effect = backend.effect(mutation(GitHubAction::MergePullRequest {
+        number: IssueNumber::new(1)?,
+        expected_head: head.clone(),
+        method: MergeMethod::Squash,
+    })?)?;
+    assert_eq!(effect.required_permission(), Permission::Merge);
+    let first = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "merge", effect)?,
+        &ManualClock::starting_at(1),
+    )?;
+    assert!(matches!(first.state(), EffectState::Uncertain { .. }));
+    let restarted = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let reconciled = kitchen::state::reconcile(
+        &fixture.reopen()?,
+        &restarted,
+        &task,
+        fence,
+        &ManualClock::starting_at(2),
+    )?;
+    assert_eq!(reconciled.resolved.len(), 1);
+    assert_eq!(remote.borrow().calls.len(), 1);
+    assert_eq!(remote.borrow().calls[0].1["merge_method"], "squash");
+    Ok(())
+}
+
+#[test]
+fn squash_merge_rejects_moved_head_before_submission() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::Merge], "github")?;
+    let expected = CommitId::new("1111111111111111111111111111111111111111")?;
+    let remote = Rc::new(RefCell::new(Remote {
+        pull_request: Some(
+            json!({"number":1,"merged":false,"head":{"sha":"2222222222222222222222222222222222222222"}}),
+        ),
+        ..Remote::default()
+    }));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let effect = backend.effect(mutation(GitHubAction::MergePullRequest {
+        number: IssueNumber::new(1)?,
+        expected_head: expected,
+        method: MergeMethod::Squash,
+    })?)?;
+    let record = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "merge", effect)?,
+        &ManualClock::starting_at(1),
+    )?;
+    assert!(matches!(record.state(), EffectState::NotApplied { .. }));
+    assert!(remote.borrow().calls.is_empty());
     Ok(())
 }

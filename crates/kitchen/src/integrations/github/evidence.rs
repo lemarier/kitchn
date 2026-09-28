@@ -64,6 +64,83 @@ pub struct Issue {
     /// Applied labels.
     pub labels: Vec<Label>,
 }
+/// Issue detail for triage, including untrusted body text as data.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct IssueDetail {
+    /// Repository-local number.
+    pub number: IssueNumber,
+    /// Current lifecycle.
+    pub state: IssueState,
+    /// Author identity.
+    pub user: User,
+    /// Untrusted issue body.
+    pub body: Option<String>,
+    /// Creation timestamp.
+    pub created_at: String,
+    /// Last update timestamp.
+    pub updated_at: String,
+    /// Closure timestamp, if any.
+    pub closed_at: Option<String>,
+}
+/// One issue comment, returned through complete pagination.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct IssueComment {
+    /// Provider comment ID.
+    pub id: u64,
+    /// Author identity.
+    pub user: User,
+    /// Untrusted comment body.
+    pub body: String,
+    /// Creation timestamp.
+    pub created_at: String,
+    /// Last update timestamp.
+    pub updated_at: String,
+}
+/// One issue timeline event; unknown kinds remain visible to callers.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TimelineEvent {
+    /// Provider event kind.
+    pub event: String,
+    /// Event timestamp, if supplied.
+    pub created_at: Option<String>,
+    /// Actor, if supplied.
+    pub actor: Option<User>,
+    /// Label involved in a label event.
+    pub label: Option<TimelineLabel>,
+    /// Cross-referenced source issue or pull request.
+    pub source: Option<TimelineSource>,
+}
+/// Label identity carried by a timeline change.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TimelineLabel {
+    /// Label name at the event.
+    pub name: String,
+}
+/// Source wrapper on cross-reference events.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TimelineSource {
+    /// Referencing issue or PR.
+    pub issue: Option<TimelineIssue>,
+}
+/// Cross-referencing item; a pull_request field marks a PR.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TimelineIssue {
+    /// Item number in its repository.
+    pub number: IssueNumber,
+    /// Source repository.
+    #[serde(deserialize_with = "repository_url")]
+    pub repository_url: Repository,
+    /// Present when the source is a pull request.
+    pub pull_request: Option<serde_json::Value>,
+}
+/// PR referenced by an issue, with its live state and merge result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedPullRequest {
+    /// Source repository.
+    pub repository: Repository,
+    /// Source pull request.
+    pub pull_request: PullRequest,
+}
 
 /// Pull-request head and base, with explicit unknown mergeability.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -82,6 +159,39 @@ pub struct PullRequest {
     pub base: GitRef,
     /// `None` means GitHub has not computed mergeability.
     pub mergeable: Option<bool>,
+    /// GitHub's detailed merge state, when supplied.
+    #[serde(default)]
+    pub mergeable_state: Option<MergeState>,
+    /// Author identity.
+    #[serde(default)]
+    pub user: Option<User>,
+    /// Author relationship to the repository.
+    #[serde(default)]
+    pub author_association: Option<AuthorAssociation>,
+    /// Merge commit when merged.
+    #[serde(default)]
+    pub merge_commit_sha: Option<CommitId>,
+}
+/// Whether the PR source is inside the selected repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadLocation {
+    /// Source and destination repository match.
+    SameRepository,
+    /// Source is a different repository.
+    Fork,
+    /// Provider omitted head repository identity.
+    Unknown,
+}
+impl PullRequest {
+    /// Classify the source repository without guessing after a fork is deleted.
+    #[must_use]
+    pub fn head_location(&self, destination: &Repository) -> HeadLocation {
+        match self.head.repo.as_ref() {
+            Some(repo) if &repo.full_name == destination => HeadLocation::SameRepository,
+            Some(_) => HeadLocation::Fork,
+            None => HeadLocation::Unknown,
+        }
+    }
 }
 
 /// A named Git reference at an exact object id.
@@ -92,6 +202,235 @@ pub struct GitRef {
     /// Branch name.
     #[serde(rename = "ref")]
     pub name: String,
+    /// Head repository; `None` means deleted or unavailable.
+    #[serde(default)]
+    pub repo: Option<GitRepository>,
+}
+/// REST mergeability detail; unknown provider values never grant readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+/// Provider response field.
+pub enum MergeState {
+    /// Provider state.
+    Clean,
+    /// Provider state.
+    Dirty,
+    /// Provider state.
+    Blocked,
+    /// Provider state.
+    Behind,
+    /// Provider state.
+    Unstable,
+    /// Provider state.
+    Draft,
+    /// Provider state.
+    Unknown,
+    #[serde(other)]
+    /// Provider state.
+    Unsupported,
+}
+/// GraphQL merge state tied to the selected PR head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Provider response data.
+pub struct MergeStatus {
+    /// Provider response field.
+    pub head: CommitId,
+    /// Provider response field.
+    pub status: MergeStatusValue,
+}
+/// GitHub GraphQL mergeStateStatus, with future values explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// Provider response field.
+pub enum MergeStatusValue {
+    /// Provider state.
+    Behind,
+    /// Provider state.
+    Blocked,
+    /// Provider state.
+    Clean,
+    /// Provider state.
+    Dirty,
+    /// Provider state.
+    Draft,
+    /// Provider state.
+    HasHooks,
+    /// Provider state.
+    Unstable,
+    /// Provider state.
+    Unknown,
+    #[serde(other)]
+    /// Provider state.
+    Unsupported,
+}
+/// Repository identity on a pull-request head or base.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Provider response data.
+pub struct GitRepository {
+    /// Canonical owner/name identity.
+    pub full_name: Repository,
+}
+/// Author relationship, including unknown future values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// Provider response field.
+pub enum AuthorAssociation {
+    /// Provider state.
+    Owner,
+    /// Provider state.
+    Member,
+    /// Provider state.
+    Collaborator,
+    /// Provider state.
+    Contributor,
+    /// Provider state.
+    FirstTimeContributor,
+    /// Provider state.
+    FirstTimer,
+    /// Provider state.
+    Mannequin,
+    /// Provider state.
+    None,
+    #[serde(other)]
+    /// Provider state.
+    Unknown,
+}
+/// Complete compare result for a base and head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// Provider response data.
+pub struct Compare {
+    /// Provider response field.
+    pub behind_by: u64,
+    /// Provider response field.
+    pub ahead_by: u64,
+}
+/// Commit status at the selected revision.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Provider response data.
+pub struct CommitStatus {
+    /// Provider response field.
+    pub context: String,
+    /// Provider response field.
+    pub state: StatusState,
+    /// Provider response field.
+    pub sha: CommitId,
+}
+/// Provider status, including unsupported values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+/// Provider response field.
+pub enum StatusState {
+    /// Provider state.
+    Pending,
+    /// Provider state.
+    Success,
+    /// Provider state.
+    Failure,
+    /// Provider state.
+    Error,
+    #[serde(other)]
+    /// Provider state.
+    Unknown,
+}
+/// Repository default branch.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Provider response data.
+pub struct RepositoryInfo {
+    /// Provider response field.
+    pub default_branch: String,
+}
+/// Head commit timestamp, as supplied by the provider.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Provider response data.
+pub struct CommitInfo {
+    /// Provider response field.
+    pub sha: CommitId,
+    /// Provider response field.
+    pub commit: CommitDetail,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Provider response data.
+pub struct CommitDetail {
+    /// Provider response field.
+    pub committer: CommitPerson,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Provider response data.
+pub struct CommitPerson {
+    /// Provider response field.
+    pub date: String,
+}
+/// Required status contexts from branch protection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Provider response data.
+pub struct RequiredChecks {
+    /// Provider response field.
+    pub contexts: Vec<String>,
+    /// Required check-run names, optionally bound to a GitHub App.
+    #[serde(default)]
+    pub checks: Vec<RequiredCheck>,
+}
+/// One protected check-run requirement.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RequiredCheck {
+    /// Check-run name.
+    pub context: String,
+    /// Required GitHub App identity, when branch protection specifies one.
+    pub app_id: Option<u64>,
+}
+/// Whether every named required check exists at the selected head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Provider response field.
+pub enum RequiredCheckPresence {
+    /// Provider state.
+    Present,
+    /// Provider state.
+    Missing,
+    /// Provider state.
+    Unknown,
+}
+impl RequiredChecks {
+    /// Compare complete check and status inventories; duplicate required names are ambiguous.
+    #[must_use]
+    pub fn presence(
+        &self,
+        checks: &[CheckRun],
+        statuses: &[CommitStatus],
+        head: &CommitId,
+    ) -> RequiredCheckPresence {
+        if checks.iter().any(|v| &v.head_sha != head)
+            || statuses.iter().any(|v| &v.sha != head)
+            || self.contexts.iter().any(|name| name.is_empty())
+            || self.checks.iter().any(|check| check.context.is_empty())
+        {
+            return RequiredCheckPresence::Unknown;
+        }
+        let mut names = std::collections::BTreeSet::new();
+        if self.contexts.iter().any(|name| !names.insert(name)) {
+            return RequiredCheckPresence::Unknown;
+        }
+        if self
+            .checks
+            .iter()
+            .any(|check| !names.insert(&check.context))
+        {
+            return RequiredCheckPresence::Unknown;
+        }
+        if self.checks.iter().any(|check| check.app_id.is_some()) {
+            return RequiredCheckPresence::Unknown;
+        }
+        if self.contexts.iter().all(|name| {
+            checks.iter().any(|v| &v.name == name) || statuses.iter().any(|v| &v.context == name)
+        }) && self
+            .checks
+            .iter()
+            .all(|required| checks.iter().any(|v| v.name == required.context))
+        {
+            RequiredCheckPresence::Present
+        } else {
+            RequiredCheckPresence::Missing
+        }
+    }
 }
 
 /// A CI check. Unknown statuses and conclusions never pass.

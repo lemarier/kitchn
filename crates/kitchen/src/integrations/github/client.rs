@@ -138,6 +138,93 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             result => result,
         }
     }
+    /// Read issue body, author, lifecycle, and timestamps.
+    pub fn issue_detail(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        number: IssueNumber,
+    ) -> Observation<IssueDetail> {
+        match self.single::<IssueDetail>(house, repo, format!("issues/{}", number.get())) {
+            Observation::Known(issue) if issue.number != number => Observation::Unknown,
+            result => result,
+        }
+    }
+    /// Read all issue comments within the configured page, byte, and time bounds.
+    pub fn comments(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        number: IssueNumber,
+    ) -> Observation<Vec<IssueComment>> {
+        self.pages(
+            house,
+            repo,
+            &format!("issues/{}/comments", number.get()),
+            None,
+            false,
+        )
+    }
+    /// Read issue timeline events, including label changes and cross-references.
+    pub fn timeline(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        number: IssueNumber,
+    ) -> Observation<Vec<TimelineEvent>> {
+        self.pages(
+            house,
+            repo,
+            &format!("issues/{}/timeline", number.get()),
+            None,
+            false,
+        )
+    }
+    /// Resolve referenced PRs, with a total deadline and at most 100 distinct links.
+    pub fn linked_pull_requests(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        number: IssueNumber,
+    ) -> Observation<Vec<LinkedPullRequest>> {
+        observe((|| {
+            let started = Instant::now();
+            let timeline = match self.timeline(house, repo, number) {
+                Observation::Known(v) => v,
+                Observation::Unknown => return Err(IntegrationError::Unknown),
+                Observation::Unavailable(error) => return Err(error),
+            };
+            let mut refs = std::collections::BTreeSet::new();
+            for event in timeline {
+                if let Some(source) = event.source.and_then(|v| v.issue)
+                    && source.pull_request.is_some()
+                {
+                    self.scope.authorize_read(house, &source.repository_url)?;
+                    refs.insert((source.repository_url, source.number.get()));
+                    if refs.len() > 100 {
+                        return Err(IntegrationError::LimitExceeded);
+                    }
+                }
+            }
+            let mut remaining = self.limits.bytes;
+            let mut result = Vec::new();
+            for (repository, linked_number) in refs {
+                let request = ReadRequest {
+                    endpoint: format!("repos/{repository}/pulls/{linked_number}"),
+                    graphql: None,
+                };
+                let pr: PullRequest = self.fetch(&request, started, &mut remaining)?;
+                if pr.number.get() != linked_number {
+                    return Err(IntegrationError::Unknown);
+                }
+                result.push(LinkedPullRequest {
+                    repository,
+                    pull_request: pr,
+                });
+            }
+            Ok(result)
+        })())
+    }
     /// Read all issue pages (pull requests are excluded).
     pub fn issues(&self, house: &HouseId, repo: &Repository) -> Observation<Vec<Issue>> {
         match self.pages::<Issue>(house, repo, "issues?state=all", None, true) {
@@ -189,6 +276,50 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             result => result,
         }
     }
+    /// Read GraphQL mergeStateStatus and bind it to the exact selected head.
+    pub fn merge_status(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        number: IssueNumber,
+        head: &CommitId,
+    ) -> Observation<MergeStatus> {
+        observe((|| {
+            self.scope.authorize_read(house, repo)?;
+            let request = ReadRequest {
+                endpoint: "graphql".into(),
+                graphql: Some(json!({
+                    "query":"query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid mergeStateStatus}}}",
+                    "variables":{"owner":repo.owner(),"name":repo.name(),"number":number.get()}
+                })),
+            };
+            let value: Value =
+                self.fetch(&request, Instant::now(), &mut self.limits.bytes.clone())?;
+            if value.get("errors").is_some() {
+                return Err(IntegrationError::Unknown);
+            }
+            let pr = value
+                .pointer("/data/repository/pullRequest")
+                .ok_or(IntegrationError::Unknown)?;
+            let actual = pr
+                .get("headRefOid")
+                .and_then(Value::as_str)
+                .ok_or(IntegrationError::Unknown)?;
+            if actual != head.as_str() {
+                return Err(IntegrationError::Unknown);
+            }
+            let status: MergeStatusValue = serde_json::from_value(
+                pr.get("mergeStateStatus")
+                    .cloned()
+                    .ok_or(IntegrationError::Unknown)?,
+            )
+            .map_err(|_| IntegrationError::Unknown)?;
+            Ok(MergeStatus {
+                head: head.clone(),
+                status,
+            })
+        })())
+    }
     /// Read check runs at the explicitly selected commit.
     pub fn checks(
         &self,
@@ -206,6 +337,77 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             Observation::Known(checks) if checks.iter().any(|check| &check.head_sha != head) => {
                 Observation::Unknown
             }
+            result => result,
+        }
+    }
+    /// Compare an exact base and head; a partial or mismatched response is unknown.
+    pub fn compare(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        base: &CommitId,
+        head: &CommitId,
+    ) -> Observation<Compare> {
+        self.single(house, repo, format!("compare/{base}...{head}"))
+    }
+    /// Read commit statuses for one exact head, across every page.
+    pub fn statuses(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        head: &CommitId,
+    ) -> Observation<Vec<CommitStatus>> {
+        match self.pages(
+            house,
+            repo,
+            &format!("commits/{head}/statuses"),
+            None,
+            false,
+        ) {
+            Observation::Known(statuses)
+                if statuses
+                    .iter()
+                    .any(|status: &CommitStatus| &status.sha != head) =>
+            {
+                Observation::Unknown
+            }
+            result => result,
+        }
+    }
+    /// Read the repository's default branch.
+    pub fn repository(&self, house: &HouseId, repo: &Repository) -> Observation<RepositoryInfo> {
+        self.single(house, repo, String::new())
+    }
+    /// Read branch-protection requirements; inaccessible protection is unavailable.
+    pub fn required_checks(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        branch: &str,
+    ) -> Observation<RequiredChecks> {
+        if branch.is_empty()
+            || branch.len() > 255
+            || !branch
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._/".contains(&b))
+        {
+            return Observation::Unavailable(IntegrationError::InvalidInput);
+        }
+        self.single(
+            house,
+            repo,
+            format!("branches/{branch}/protection/required_status_checks"),
+        )
+    }
+    /// Read the head commit's provider timestamp.
+    pub fn commit(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        head: &CommitId,
+    ) -> Observation<CommitInfo> {
+        match self.single::<CommitInfo>(house, repo, format!("commits/{head}")) {
+            Observation::Known(info) if &info.sha != head => Observation::Unknown,
             result => result,
         }
     }
@@ -324,7 +526,11 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             self.scope.authorize_read(house, repo)?;
             self.fetch(
                 &ReadRequest {
-                    endpoint: format!("repos/{repo}/{endpoint}"),
+                    endpoint: if endpoint.is_empty() {
+                        format!("repos/{repo}")
+                    } else {
+                        format!("repos/{repo}/{endpoint}")
+                    },
                     graphql: None,
                 },
                 Instant::now(),

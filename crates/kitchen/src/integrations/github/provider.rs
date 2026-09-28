@@ -171,6 +171,38 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
         let root = format!("repos/{}", mutation.repository);
         let reference = receipt(key)?;
         match &mutation.action {
+            GitHubAction::MergePullRequest {
+                number,
+                expected_head,
+                ..
+            } => {
+                let pr = self.read(format!("{root}/pulls/{}", number.get()))?;
+                if pr.get("number").and_then(Value::as_u64) != Some(number.get()) {
+                    return Err(IntegrationError::Unknown);
+                }
+                let head = pr
+                    .pointer("/head/sha")
+                    .and_then(Value::as_str)
+                    .ok_or(IntegrationError::Unknown)?;
+                if head != expected_head.as_str() {
+                    return Ok(Inspection::Conflict);
+                }
+                match pr.get("merged").and_then(Value::as_bool) {
+                    Some(true) => {
+                        let sha = pr
+                            .get("merge_commit_sha")
+                            .and_then(Value::as_str)
+                            .ok_or(IntegrationError::Unknown)?;
+                        let merge = crate::contracts::CommitId::new(sha)
+                            .map_err(|_| IntegrationError::Unknown)?;
+                        let receipt =
+                            Receipt::new(ExternalRef::new(merge.as_str())?, vec![], vec![])?;
+                        Ok(Inspection::Applied(receipt))
+                    }
+                    Some(false) => Ok(Inspection::Missing),
+                    None => Err(IntegrationError::Unknown),
+                }
+            }
             GitHubAction::PostComment { issue, body } => {
                 let expected = marked(body.as_str(), key);
                 let entries = self.pages(&format!("{root}/issues/{}/comments", issue.get()))?;
@@ -280,6 +312,15 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
     ) -> Result<MutationRequest, IntegrationError> {
         let root = format!("repos/{}", mutation.repository);
         let (method, endpoint, body) = match &mutation.action {
+            GitHubAction::MergePullRequest {
+                number,
+                expected_head,
+                ..
+            } => (
+                "PUT",
+                format!("{root}/pulls/{}/merge", number.get()),
+                json!({"sha": expected_head.as_str(), "merge_method": "squash"}),
+            ),
             GitHubAction::PostComment { issue, body } => (
                 "POST",
                 format!("{root}/issues/{}/comments", issue.get()),

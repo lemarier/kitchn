@@ -26,6 +26,10 @@ use kitchen::{
         pickup::{ClaimOutcome, claim_issue, issue_task_id},
     },
 };
+use kitchen::{
+    scheduling::AgentFamily,
+    selection::{AgentModel, AgentSelection, EffortSupport, SelectionSource, SelectionSupport},
+};
 use workflows_support::{
     Approves, World, branch, brief, consumer, issue, supervision, template, template_with,
     under_consumer,
@@ -1374,5 +1378,89 @@ fn a_parked_adopted_worker_resumes_when_the_provider_works() -> TestResult {
     let resumed: TestResult<Supervision> = tick(ProviderCheck::Working);
     assert_eq!(resumed?, Supervision::Resumed);
     assert_eq!(attempt_count(&world, &task)?, 1);
+    Ok(())
+}
+
+fn claim_with_policy(world: &World, number: u64) -> TestResult<(TaskId, Fence)> {
+    let (claimant, _) = under_consumer(world, "coordinator")?;
+    let mut template = template()?;
+    template.agents = Some(workflows_support::agent_policy()?);
+    match claim_issue(
+        &world.fixture.store,
+        &template,
+        &issue(number)?,
+        &claimant,
+        ttl(300)?,
+        world.now(),
+    )? {
+        ClaimOutcome::Claimed(lease) => Ok((issue_task_id(&issue(number)?)?, lease.fence())),
+        other => Err(format!("unexpected claim outcome {other:?}").into()),
+    }
+}
+
+fn codex_model() -> TestResult<AgentSelection> {
+    Ok(AgentSelection {
+        agent: AgentFamily::Codex,
+        model: Some(AgentModel::new("gpt-6-sol")?),
+        effort: None,
+    })
+}
+
+#[test]
+fn a_pickup_launch_carries_the_tasks_resolved_selection() -> TestResult {
+    let mut world = World::new()?;
+    world.backend = FakeBackend::new(
+        common::backend_id()?,
+        common::house()?,
+        CapabilitySet::supporting(Capability::ALL),
+    )
+    .with_worker_selection(SelectionSupport {
+        families: &[AgentFamily::Claude, AgentFamily::Codex],
+        model: true,
+        effort: EffortSupport::WithModel,
+    });
+    let (task, fence) = claim_with_policy(&world, 1)?;
+    let record = world.fixture.store.task(&task)?;
+    assert_eq!(
+        record
+            .spec()
+            .agent
+            .as_ref()
+            .map(|resolved| &resolved.source),
+        Some(&SelectionSource::Repository {
+            repository: workflows_support::repo()?
+        })
+    );
+    launched(&world, &task, fence, 1)?;
+    assert_eq!(world.backend.launched_agents(), vec![Some(codex_model()?)]);
+    Ok(())
+}
+
+#[test]
+fn a_pickup_launch_is_refused_when_the_executor_lacks_the_selection() -> TestResult {
+    // The default fake declares no selection support at all.
+    let world = World::new()?;
+    let (task, fence) = claim_with_policy(&world, 1)?;
+    let error = launch(&world, &task, fence, 1)
+        .err()
+        .ok_or("a launch ran on an executor that cannot honor the selection")?;
+    assert!(matches!(
+        error.downcast_ref::<kitchen::Error>(),
+        Some(kitchen::Error::Contract(
+            ContractError::UnsupportedCapabilities { .. }
+        ))
+    ));
+    assert_eq!(world.backend.effects_performed(), 0);
+    assert_eq!(world.backend.execute_calls(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_pickup_without_a_policy_launches_the_backend_default() -> TestResult {
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    assert_eq!(world.fixture.store.task(&task)?.spec().agent, None);
+    launched(&world, &task, fence, 1)?;
+    assert_eq!(world.backend.launched_agents(), vec![None]);
     Ok(())
 }

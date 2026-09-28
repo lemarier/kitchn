@@ -512,6 +512,13 @@ pub fn launch_worker(
         workspace,
         brief: text,
         branch: Some(brief.branch.clone()),
+        // The store refuses a launch that differs from the task's selection
+        // or that the backend does not declare support for.
+        agent: record
+            .spec()
+            .agent
+            .as_ref()
+            .map(|resolved| resolved.selection.clone()),
     });
     let record = match ctx.run(
         ctx.backend,

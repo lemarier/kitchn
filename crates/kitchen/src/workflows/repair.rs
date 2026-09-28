@@ -20,6 +20,7 @@ use crate::{
     integrations::github::{
         GitHubClient, GitHubReadTransport, IssueState, MergeState, Observation, PullRequest,
     },
+    selection::{AgentPolicy, SelectionRequest},
     workflows::pickup::{FollowUpBudget, derived_task_id},
 };
 
@@ -405,7 +406,9 @@ pub fn repair_task_id(
 }
 
 /// The task spec for a repair writer. The existing worktree is handed to the
-/// task, so the writer works in place and cannot target other resources.
+/// task, so the writer works in place and cannot target other resources. The
+/// task carries the selection `agents` resolves for the writer's role and
+/// repository; `None` only for a house without an agent policy.
 #[must_use]
 pub fn repair_spec(
     id: TaskId,
@@ -414,15 +417,24 @@ pub fn repair_spec(
     authority: TaskAuthority,
     retry: RetryPolicy,
     provenance: Provenance,
+    agents: Option<&AgentPolicy>,
 ) -> TaskSpec {
+    let role = Role::StationCook;
+    let agent = agents.map(|policy| {
+        policy.resolve(&SelectionRequest {
+            repository: Some(repository.clone()),
+            ..SelectionRequest::new(role)
+        })
+    });
     TaskSpec {
         id,
-        role: Role::StationCook,
+        role,
         repository: Some(repository),
         authority,
         retry,
         provenance,
         resources: BTreeSet::from([worktree]),
         requires: CapabilityRequirements::new(),
+        agent,
     }
 }

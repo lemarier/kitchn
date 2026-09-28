@@ -696,6 +696,7 @@ fn doctor_reports_a_configured_stack_tool_that_is_missing() -> TestResult {
         capabilities: CapabilitySet::supporting(Capability::ALL),
         labels: Some(labels),
         access: AccessStatus::Available,
+        agent_models: None,
         stack_tool: Some(StackToolStatus::Missing),
     };
     let report = doctor(&registry, &repository, Some(&evidence))?;

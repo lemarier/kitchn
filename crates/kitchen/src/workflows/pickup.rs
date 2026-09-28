@@ -17,6 +17,7 @@ use crate::{
         Provenance, Repository, RetryPolicy, Role, Settlement, TaskAuthority, TaskSpec, Text,
         Timestamp, Trigger,
     },
+    selection::{AgentPolicy, SelectionRequest},
     state::{HouseStore, Lease, OwnershipEvent, StateError, TaskRecord, TaskState},
     workflows::{coordination::CoordinationError, recovery::QueuedFollowUp},
 };
@@ -509,23 +510,36 @@ pub struct TaskTemplate {
     /// the worker backend. The store applies each family's set only to
     /// executors of that family.
     pub requires: CapabilityRequirements,
+    /// The house agent policy. Each task resolves its selection from it once,
+    /// when the task is created. `None` only for a house without a policy;
+    /// launches then use the backend's default agent.
+    pub agents: Option<AgentPolicy>,
 }
 
 impl TaskTemplate {
-    /// The task spec for `issue`.
+    /// The task spec for `issue`, carrying the selection the house policy
+    /// resolves for the task's role and repository.
     ///
     /// # Errors
     /// Propagates task-id derivation failures.
     pub fn spec_for(&self, issue: &IssueRef) -> Result<TaskSpec> {
+        let role = Role::StationCook;
+        let agent = self.agents.as_ref().map(|policy| {
+            policy.resolve(&SelectionRequest {
+                repository: Some(issue.repository.clone()),
+                ..SelectionRequest::new(role)
+            })
+        });
         Ok(TaskSpec {
             id: issue_task_id(issue)?,
-            role: Role::StationCook,
+            role,
             repository: Some(issue.repository.clone()),
             authority: self.authority.clone(),
             retry: self.retry,
             provenance: self.provenance.clone(),
             resources: std::collections::BTreeSet::new(),
             requires: self.requires.clone(),
+            agent,
         })
     }
 }

@@ -418,7 +418,9 @@ fn a_repair_writer_works_only_in_the_worktree_it_was_given() -> TestResult {
         base.authority,
         RetryPolicy::new(1, Duration::from_secs(3600))?,
         provenance('a')?,
+        None,
     );
+    assert_eq!(spec.agent, None);
     let tick = scheduled("repair-tick")?;
     store.create_task(spec.clone(), &tick, world.now())?;
     let lease = store.claim(&id, &tick, ttl(300)?, world.now())?;
@@ -519,6 +521,39 @@ fn a_restacked_layer_still_gets_its_conflicts_repaired() -> TestResult {
     assert_eq!(
         assess(&policy, &candidate),
         RepairDecision::Repair(RepairKind::Restack)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_repair_task_carries_the_selection_the_house_policy_resolves() -> TestResult {
+    let policy = workflows_support::agent_policy()?;
+    let worktree = ResourceRef {
+        kind: ResourceKind::Worktree,
+        backend: common::backend_id()?,
+        handle: ExternalRef::new("worktree-issue-5")?,
+    };
+    let spec = repair_spec(
+        repair_task_id(&repo()?, number(5)?, 1)?,
+        repo()?,
+        worktree,
+        template()?.authority,
+        RetryPolicy::new(1, Duration::from_secs(3600))?,
+        provenance('a')?,
+        Some(&policy),
+    );
+    assert_eq!(
+        spec.agent,
+        Some(policy.resolve(&kitchen::selection::SelectionRequest {
+            repository: Some(repo()?),
+            ..kitchen::selection::SelectionRequest::new(kitchen::contracts::Role::StationCook)
+        }))
+    );
+    assert_eq!(
+        spec.agent.map(|resolved| resolved.source),
+        Some(kitchen::selection::SelectionSource::Repository {
+            repository: repo()?
+        })
     );
     Ok(())
 }

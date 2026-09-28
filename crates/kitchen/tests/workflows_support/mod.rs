@@ -112,6 +112,7 @@ pub fn template_with(attempts: u32, pins: Provenance) -> TestResult<TaskTemplate
             kitchen::contracts::ExecutorKind::Worker,
             kitchen::workflows::coordination::REQUIRED_WORKER_CAPABILITIES,
         ),
+        agents: None,
     })
 }
 
@@ -362,4 +363,26 @@ pub fn isolated_config(
         settings,
         Duration::from_secs(10),
     )?)
+}
+
+/// A house policy: Claude by default, Codex on the test repository.
+pub fn agent_policy() -> TestResult<kitchen::selection::AgentPolicy> {
+    use kitchen::{
+        scheduling::AgentFamily,
+        selection::{AgentModel, AgentPolicy, AgentSelection, RuleMatch, SelectionRule},
+    };
+    Ok(AgentPolicy {
+        default: AgentSelection::agent_default(AgentFamily::Claude),
+        rules: vec![SelectionRule {
+            when: RuleMatch {
+                repository: Some(repo()?),
+                ..RuleMatch::default()
+            },
+            selection: AgentSelection {
+                agent: AgentFamily::Codex,
+                model: Some(AgentModel::new("gpt-6-sol")?),
+                effort: None,
+            },
+        }],
+    })
 }

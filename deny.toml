@@ -15,6 +15,11 @@ allow = [
     "Zlib",
 ]
 
+# Mozilla's root store data, reached only on wasm32 through rustls-platform-verifier.
+[[licenses.exceptions]]
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

@@ -8,6 +8,8 @@ use std::{
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use kitchen::{HouseId, TaskId};
 
+mod update;
+
 #[derive(Parser)]
 #[command(
     name = "kitchen",
@@ -26,6 +28,8 @@ enum Command {
     ValidateHouse { id: String },
     /// Bootstrap diagnostic: validate a task identifier without contacting a backend.
     ValidateTask { id: String },
+    /// Replace this executable with the latest GitHub release when it is newer.
+    Update,
 }
 
 fn main() -> ExitCode {
@@ -47,6 +51,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Some(Command::ValidateHouse { id }) => HouseId::new(&id).map(|id| id.to_string()),
         Some(Command::ValidateTask { id }) => TaskId::new(&id).map(|id| id.to_string()),
+        Some(Command::Update) => return run_update(),
         None => return output_status(Cli::command().print_help()),
     };
     match result {
@@ -59,6 +64,17 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             ExitCode::from(code)
+        }
+    }
+}
+
+fn run_update() -> ExitCode {
+    match update::run() {
+        Ok(outcome) => output_status(writeln!(io::stdout().lock(), "{outcome}")),
+        Err(error) => {
+            // Exit 1 whether or not the diagnostic can be written.
+            let _ = writeln!(io::stderr().lock(), "error: {error}");
+            ExitCode::FAILURE
         }
     }
 }

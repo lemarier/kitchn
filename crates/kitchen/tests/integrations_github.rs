@@ -773,6 +773,90 @@ fn foreign_timeline_cross_reference_does_not_block_linked_prs() -> Result {
     Ok(())
 }
 
+fn closing_references(nodes: &[(&str, u64)]) -> Value {
+    let nodes: Vec<_> = nodes
+        .iter()
+        .map(|(repository, number)| {
+            json!({"number":number,"repository":{"nameWithOwner":repository}})
+        })
+        .collect();
+    json!({"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}})
+}
+
+#[test]
+fn foreign_closing_reference_is_skipped_and_in_scope_ones_are_kept() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let sha = "1111111111111111111111111111111111111111";
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![
+            Ok(json!([])),
+            Ok(closing_references(&[
+                ("foreign/project", 4),
+                ("sample/project", 9),
+            ])),
+            Ok(
+                json!({"number":9,"state":"open","draft":false,"merged":false,"head":{"sha":sha,"ref":"feature"},"base":{"sha":sha,"ref":"main"},"mergeable":null}),
+            ),
+        ])?,
+        ReadLimits::default(),
+    );
+    let Observation::Known(linked) =
+        client.linked_pull_requests(&house, &repo, IssueNumber::new(1)?)
+    else {
+        return Err("a foreign closing reference must not fail the read".into());
+    };
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].repository, repo);
+    assert_eq!(linked[0].pull_request.number.get(), 9);
+    // Nothing is fetched from the repository outside the house scope.
+    assert_eq!(
+        *client.transport().requests.borrow(),
+        [
+            "repos/sample/project/issues/1/timeline?per_page=100&page=1",
+            "graphql",
+            "repos/sample/project/pulls/9"
+        ]
+    );
+
+    let only_foreign = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![
+            Ok(json!([])),
+            Ok(closing_references(&[("foreign/project", 4)])),
+        ])?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        only_foreign.linked_pull_requests(&house, &repo, IssueNumber::new(1)?),
+        Observation::Known(vec![])
+    );
+    assert_eq!(only_foreign.transport().requests.borrow().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn malformed_closing_reference_still_fails_the_read() -> Result {
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![
+            Ok(json!([])),
+            Ok(closing_references(&[("not a repository", 4)])),
+        ])?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        client.linked_pull_requests(
+            &HouseId::new("sample")?,
+            &Repository::new("sample/project")?,
+            IssueNumber::new(1)?
+        ),
+        Observation::Unknown
+    );
+    Ok(())
+}
+
 #[test]
 fn inventory_filters_and_timestamps_are_typed() -> Result {
     let client = GitHubClient::new(

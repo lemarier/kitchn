@@ -244,7 +244,11 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
                         .ok_or(IntegrationError::Unknown)?;
                     let linked_repo =
                         Repository::new(name).map_err(|_| IntegrationError::Unknown)?;
-                    self.scope.authorize_read(house, &linked_repo)?;
+                    // Like timeline references, a closing PR outside the house scope is
+                    // not evidence for this house and must not hide the in-scope ones.
+                    if self.scope.authorize_read(house, &linked_repo).is_err() {
+                        continue;
+                    }
                     let number = node
                         .get("number")
                         .and_then(Value::as_u64)

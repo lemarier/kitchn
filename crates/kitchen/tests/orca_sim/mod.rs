@@ -43,6 +43,39 @@ pub struct SimWorker {
     pub ownership: &'static str,
     pub retained_reason: Option<&'static str>,
     pub run: &'static str,
+    /// Orca's agent status in the projected stage.
+    pub activity: &'static str,
+    /// Overrides the stage detail derived from the worker state.
+    pub stage_detail: Option<&'static str>,
+    /// Overrides the Dispatch status derived from the outcome.
+    pub dispatch_status: Option<&'static str>,
+    /// Whether the Dispatch was fenced.
+    pub fenced: bool,
+    /// The start error Orca records.
+    pub last_error: Option<&'static str>,
+    /// The last line of terminal output Orca previews.
+    pub preview: Option<&'static str>,
+    /// What `worker-read` returns; Orca refuses the read when `None`.
+    pub output: Option<SimOutput>,
+}
+
+/// What `worker-read --source auto` returns.
+#[derive(Debug, Clone)]
+pub enum SimOutput {
+    /// A proven provider transcript. `complete` is whether it fits the window.
+    Transcript {
+        messages: Vec<SimMessage>,
+        complete: bool,
+    },
+    /// The terminal tail, when there is no proven transcript.
+    Terminal(Vec<String>),
+}
+
+#[derive(Debug, Clone)]
+pub struct SimMessage {
+    pub role: &'static str,
+    pub text: String,
+    pub at: u64,
 }
 
 impl SimWorker {
@@ -64,7 +97,59 @@ impl SimWorker {
             ownership: "owned",
             retained_reason: None,
             run: "run_sim",
+            activity: "unknown",
+            stage_detail: None,
+            dispatch_status: None,
+            fenced: false,
+            last_error: None,
+            preview: None,
+            output: None,
         }
+    }
+
+    /// The Dispatch status Orca derives from the outcome.
+    fn dispatch_status(&self) -> &'static str {
+        self.dispatch_status.unwrap_or(match self.outcome {
+            "in_progress" => "dispatched",
+            "succeeded" => "completed",
+            _ => "failed",
+        })
+    }
+
+    /// The stage detail Orca reports for the worker state.
+    fn stage_detail(&self) -> Option<&'static str> {
+        self.stage_detail.or(match self.worker_state {
+            "ready" => Some("input_accepted"),
+            "stopped" => Some("process_stopped"),
+            "succeeded" | "failed" => Some("settled"),
+            _ => None,
+        })
+    }
+
+    fn transcript(messages: &[SimMessage], complete: bool, limit: usize) -> Value {
+        let start = messages.len().saturating_sub(limit);
+        let window: Vec<Value> = messages
+            .iter()
+            .skip(start)
+            .map(|message| {
+                json!({
+                    "id": format!("m-{}", message.at),
+                    "role": message.role,
+                    "blocks": [{"type": "text", "text": message.text}],
+                    "timestamp": message.at,
+                    "source": "transcript",
+                })
+            })
+            .collect();
+        json!({
+            "source": "transcript",
+            "contentComplete": complete && start == 0,
+            "transcript": {
+                "limited": start > 0 || !complete,
+                "returnedMessageCount": window.len(),
+                "messages": window,
+            },
+        })
     }
 }
 
@@ -433,8 +518,13 @@ impl SimState {
             ["orchestration", "send"] => {
                 let to = Self::flag(flags, "to");
                 let dispatch = to.strip_prefix("dispatch:").unwrap_or_default();
-                if !self.workers.contains_key(dispatch) {
+                let Some(worker) = self.workers.get(dispatch) else {
                     return refuse("dispatch_not_found");
+                };
+                // As Orca 1.4.212 does: a Dispatch that is no longer active
+                // will never read its mailbox, and nothing is queued.
+                if worker.dispatch_status() != "dispatched" || worker.fenced {
+                    return refuse("dispatch_inactive");
                 }
                 self.effects += 1;
                 let message = self.next_id("msg_");
@@ -481,9 +571,16 @@ impl SimState {
                 let dispatch = Self::flag(flags, "dispatch");
                 match self.workers.get(&dispatch) {
                     Some(worker) => ok(json!({
-                        "dispatch": {"id": dispatch, "runId": worker.run},
+                        "dispatch": {
+                            "id": dispatch,
+                            "runId": worker.run,
+                            "status": worker.dispatch_status(),
+                            "capabilityRevokedAt": worker.fenced.then_some("2026-09-28T16:00:00Z"),
+                        },
                         "worker": {
                             "state": worker.worker_state,
+                            "stage": worker.stage_detail(),
+                            "lastError": worker.last_error,
                             "effects": worker.worktree.iter().map(|id| json!({
                                 "kind": "worktree", "action": "created_top_level", "id": id,
                             })).collect::<Vec<_>>(),
@@ -491,12 +588,19 @@ impl SimState {
                         "projection": {
                             "outcome": worker.outcome,
                             "liveness": {"verdict": worker.liveness},
+                            "stage": {
+                                "worker": worker.worker_state,
+                                "dispatch": worker.dispatch_status(),
+                                "detail": worker.stage_detail(),
+                                "activity": worker.activity,
+                            },
                         },
                         "observation": {
                             "status": "live",
                             "agentWait": if worker.waiting { json!({"source": "hook"}) } else { Value::Null },
                         },
-                        "terminal": worker.branch.as_ref().map(|branch| json!({"branch": branch})),
+                        "terminal": (worker.branch.is_some() || worker.preview.is_some())
+                            .then(|| json!({"branch": worker.branch, "preview": worker.preview})),
                         "terminalResource": {
                             "releaseState": worker.release_state,
                             "ownershipState": worker.ownership,
@@ -504,6 +608,28 @@ impl SimState {
                         },
                     })),
                     None => refuse("dispatch_not_found"),
+                }
+            }
+            ["orchestration", "worker-read"] => {
+                let dispatch = Self::flag(flags, "dispatch");
+                let limit = flags
+                    .get("limit")
+                    .and_then(|limit| limit.parse().ok())
+                    .unwrap_or(50);
+                let Some(worker) = self.workers.get(&dispatch) else {
+                    return refuse("dispatch_not_found");
+                };
+                match &worker.output {
+                    None => refuse("worker_read_unavailable"),
+                    Some(SimOutput::Transcript { messages, complete }) => {
+                        ok(SimWorker::transcript(messages, *complete, limit))
+                    }
+                    Some(SimOutput::Terminal(lines)) => ok(json!({
+                        "source": "terminal",
+                        "fallbackReason": "no_transcript",
+                        "contentComplete": false,
+                        "terminal": {"tail": lines},
+                    })),
                 }
             }
             ["orchestration", "worker-list"] => {

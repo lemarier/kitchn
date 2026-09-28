@@ -238,7 +238,7 @@ fn bounded_text(value: Option<&str>) -> Option<Text> {
     value.get(..end).and_then(|text| Text::new(text).ok())
 }
 
-fn liveness(verdict: &str) -> Liveness {
+pub(crate) fn liveness(verdict: &str) -> Liveness {
     match verdict {
         "live" => Liveness::Live,
         "exited" => Liveness::Exited,

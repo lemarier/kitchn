@@ -18,28 +18,31 @@
 //! and the launch's branch is read back again through Orca's worktree record.
 //!
 //! It creates its own coordinator terminal and Run, runs the shared contract
-//! suite (which launches and stops one worker), then stops and releases that
-//! worker, removes the worktree it created, and closes the terminal. Orca has
-//! no command to delete a Run, so each invocation leaves one empty Run whose
-//! objective marks it as a throwaway smoke test. It never
+//! suite (which launches and stops one worker), launches a second worker
+//! whose recovery signals it reads while it runs and after it is stopped
+//! (then messages the stopped worker to see Orca refuse it), then stops and
+//! releases the workers, removes the worktrees it created, and closes the
+//! terminals. Orca has no command to delete a Run, so each invocation leaves
+//! one empty Run whose objective marks it as a throwaway smoke test. It never
 //! reads or changes automations, or any Run, worker, worktree, or terminal it
 //! did not create. Without the gate it reports that it was skipped.
 
 use std::{
     env,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use kitchen::{
     BackendId, CredentialId, HouseId, TaskId,
     adapters::orca::{
-        DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, Invocation,
-        OrcaBackend, OrcaConfig, OrcaRunner, SystemRunner, redact, verify_branch,
+        DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT,
+        DispatchActivity, Invocation, OrcaBackend, OrcaConfig, OrcaRunner, StartWindow,
+        SystemRunner, TerminalOwner, redact, verify_branch,
     },
     contracts::{
-        AttemptNumber, BranchName, EffectExecutor, EffectRequest, ExternalRef, IdempotencyKey,
-        Lookup, Operation, Repository, ResourceKind, Role, Text, WorkerBackend, WorkerOutcome,
-        WorkerState, Workspace,
+        AttemptNumber, BranchName, Clock, EffectExecutor, EffectFailure, EffectRequest,
+        ExternalRef, IdempotencyKey, Lookup, NotAppliedReason, Operation, Repository, ResourceKind,
+        Role, SystemClock, Text, WorkerBackend, WorkerOutcome, WorkerState, Workspace,
         conformance::{self, ConformanceFixture},
     },
     scheduling::AgentFamily,
@@ -478,6 +481,7 @@ fn adapter_checks(
             branch: None,
         },
     )?;
+    let launched_at = SystemClock.now();
     let receipt = backend.execute(&launch)?;
     let again = backend.execute(&launch)?;
     println!(
@@ -498,6 +502,16 @@ fn adapter_checks(
         worker.handle,
         backend.observe_worker(&worker)?
     );
+    // Recovery signals, read-only, of a worker this test launched.
+    let window = || StartWindow::new(launched_at, SystemClock.now(), Duration::from_secs(60));
+    let running = backend
+        .observe_signals(&worker, &window())?
+        .ok_or("Orca has no record of the second worker")?;
+    println!("LIVE second worker signals while running: {running:?}");
+    if running.dispatch != DispatchActivity::Active || running.terminal != TerminalOwner::Supervised
+    {
+        return Err(format!("a fresh worker reads as {running:?}").into());
+    }
     let message = backend.execute(&smoke_request(
         fixture,
         &namespace,
@@ -526,6 +540,31 @@ fn adapter_checks(
         "LIVE second worker after cancel: {:?}",
         backend.observe_worker(&worker)?
     );
+    let stopped = backend
+        .observe_signals(&worker, &window())?
+        .ok_or("Orca has no record of the stopped worker")?;
+    println!("LIVE second worker signals after cancel: {stopped:?}");
+    if stopped.dispatch != DispatchActivity::Ended || stopped.accepts_messages() {
+        return Err(format!("a stopped worker reads as {stopped:?}").into());
+    }
+    // Orca refuses a message to the Dispatch it now shows as ended
+    // (`dispatch_inactive`, observed on 1.4.212), before queueing anything.
+    let late = backend.execute(&smoke_request(
+        fixture,
+        &namespace,
+        "after-stop",
+        Operation::MessageWorker {
+            worker: worker.clone(),
+            body: Text::new("Kitchen smoke test: sent after the stop; no action needed.")?,
+        },
+    )?);
+    println!("LIVE message to the stopped worker: {late:?}");
+    if !matches!(
+        late,
+        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+    ) {
+        return Err(format!("a message to a stopped worker was {late:?}").into());
+    }
     println!("LIVE cancel resolves as {:?}", backend.resolve(&cancel)?);
     let release = smoke_request(
         fixture,

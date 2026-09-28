@@ -65,11 +65,14 @@ pub const MAX_RUN_TASKS: usize = 1000;
 const LAUNCH_MARGIN: Duration = Duration::from_secs(30);
 
 /// Orca error codes documented or observed as refusals before any effect.
-const PREFLIGHT_REFUSALS: [&str; 5] = [
+/// `dispatch_inactive` was observed on 1.4.212 for a message to a stopped
+/// worker: its worker will never read the mailbox, and nothing is queued.
+const PREFLIGHT_REFUSALS: [&str; 6] = [
     "task_not_found",
     "task_not_startable",
     "inject_rejected",
     "dispatch_not_found",
+    "dispatch_inactive",
     "no_active_sender_terminal",
 ];
 
@@ -194,17 +197,17 @@ struct MutationMeta {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct WorkerShow {
+pub(crate) struct WorkerShow {
     #[serde(default)]
-    dispatch: Option<ShowDispatch>,
-    worker: ShowWorker,
-    projection: Projection,
+    pub(crate) dispatch: Option<ShowDispatch>,
+    pub(crate) worker: ShowWorker,
+    pub(crate) projection: Projection,
     #[serde(default)]
-    observation: Option<ShowObservation>,
+    pub(crate) observation: Option<ShowObservation>,
     #[serde(default)]
-    terminal: Option<ShowTerminal>,
+    pub(crate) terminal: Option<ShowTerminal>,
     #[serde(default)]
-    terminal_resource: Option<TerminalResource>,
+    pub(crate) terminal_resource: Option<TerminalResource>,
 }
 
 #[derive(Deserialize)]
@@ -228,36 +231,67 @@ impl TerminalResource {
 }
 
 #[derive(Deserialize)]
-struct ShowWorker {
-    state: String,
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ShowWorker {
+    pub(crate) state: String,
     #[serde(default)]
     effects: Vec<WireEffect>,
+    /// Orca's last error for the start, a string or an object.
+    #[serde(default)]
+    pub(crate) last_error: Option<Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ShowDispatch {
+pub(crate) struct ShowDispatch {
     #[serde(default)]
-    run_id: Option<String>,
+    pub(crate) run_id: Option<String>,
+    /// `dispatched` while the Dispatch is the live attempt.
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    /// Set when the Dispatch was fenced, for example by a stop.
+    #[serde(default)]
+    pub(crate) capability_revoked_at: Option<Value>,
 }
 
 #[derive(Deserialize)]
-struct ShowTerminal {
+pub(crate) struct ShowTerminal {
     #[serde(default)]
     branch: Option<String>,
+    /// The last line of terminal output Orca previews.
+    #[serde(default)]
+    pub(crate) preview: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ShowObservation {
+pub(crate) struct ShowObservation {
     #[serde(default)]
-    agent_wait: Option<Value>,
+    pub(crate) agent_wait: Option<Value>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct Projection {
     pub(crate) outcome: String,
     pub(crate) liveness: Liveness,
+    /// Absent from older hosts.
+    #[serde(default)]
+    pub(crate) stage: Option<ProjectionStage>,
+}
+
+/// Orca's projected stage: where the worker and its Dispatch are and what
+/// the agent is doing. Values are kept as reported and mapped by the caller,
+/// so an unrecognized one stays unknown.
+#[derive(Deserialize)]
+pub(crate) struct ProjectionStage {
+    #[serde(default)]
+    pub(crate) worker: Option<String>,
+    #[serde(default)]
+    pub(crate) dispatch: Option<String>,
+    #[serde(default)]
+    pub(crate) detail: Option<String>,
+    #[serde(default)]
+    pub(crate) activity: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -920,7 +954,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }
     }
 
-    fn show(&self, dispatch: &str) -> Result<Option<WorkerShow>, OrcaError> {
+    pub(crate) fn show(&self, dispatch: &str) -> Result<Option<WorkerShow>, OrcaError> {
         let args = wire::Args::command(&["orchestration", "worker-show"])
             .value("dispatch", dispatch)
             .json();

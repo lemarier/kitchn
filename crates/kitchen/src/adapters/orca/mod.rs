@@ -53,6 +53,15 @@
 //!   and holds the launch as uncertain; [`OrcaBackend::verify_launch_branch`]
 //!   reports both branches. Receipts always name the branch Orca created, and
 //!   [`verify_branch`] checks any receipt.
+//! - Recovery signals. [`OrcaBackend::observe_signals`] reads what a
+//!   coordinator needs to recover without a person, as typed observations
+//!   with an explicit "cannot tell": whether the agent's first turn was seen
+//!   ([`StartOutcome`]), the transcript's progress, whether the agent sits at
+//!   its prompt ([`AgentPrompt`]), who holds the terminal ([`TerminalOwner`]),
+//!   the class of a provider failure ([`ProviderErrorClass`], never its text),
+//!   and whether the Dispatch still accepts messages
+//!   ([`DispatchActivity`]). Absence is never promoted to a fact, and
+//!   nothing in it stops, retries, or releases a worker.
 //! - A terminal a person took over (`user_takeover`) reads as
 //!   [`crate::contracts::WorkerState::UserTakeover`], unless the worker
 //!   already reported its own outcome.
@@ -92,6 +101,7 @@ mod redact;
 mod reserve;
 mod runtime;
 mod schedule;
+mod signals;
 mod wire;
 
 pub use backend::{
@@ -111,3 +121,7 @@ pub use runtime::{
     OrcaVersion, REQUIRED_FEATURES, RuntimeInfo, SUPPORTED_VERSIONS, capabilities, probe,
 };
 pub use schedule::{MAX_AUTOMATIONS, native_schedule_name};
+pub use signals::{
+    AgentPrompt, DispatchActivity, ProviderErrorClass, SIGNAL_WINDOW_ROWS, StartOutcome,
+    StartWindow, TerminalOwner, TranscriptProgress, WorkerSignals,
+};

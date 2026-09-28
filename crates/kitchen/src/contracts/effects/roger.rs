@@ -193,12 +193,11 @@ impl RogerEffect {
     pub const fn required_permission(&self) -> Permission {
         Permission::AskHuman
     }
-
-    /// Atomic binding and task-budget admission.
+    /// Recheck the exact decision binding on every submission.
     ///
     /// # Errors
-    /// Refuses foreign/stale decisions, invalid payloads and exhausted budgets.
-    pub fn admit(&self, context: &EffectContext<'_>) -> Result<(), ContractError> {
+    /// Refuses foreign or stale decisions and invalid payloads.
+    pub fn check(&self, context: &EffectContext<'_>) -> Result<(), ContractError> {
         self.ask.validate()?;
         let binding = &self.ask.binding;
         if &binding.house != context.house
@@ -210,6 +209,13 @@ impl RogerEffect {
         {
             return Err(ContractError::DecisionBindingMismatch);
         }
+        Ok(())
+    }
+    /// Reserve one logical ask within the task budget.
+    ///
+    /// # Errors
+    /// Refuses an exhausted budget.
+    pub fn admit(&self, context: &EffectContext<'_>) -> Result<(), ContractError> {
         let limit = self.posting_budget.limit().min(MAX_ASKS_PER_TASK);
         if context.submitted.for_executor(ExecutorKind::Roger) >= limit {
             return Err(ContractError::EffectBudgetExhausted {

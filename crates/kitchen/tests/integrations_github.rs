@@ -631,6 +631,9 @@ fn triage_reads_detail_timeline_comments_and_linked_pr() -> Result {
             ),
             Ok(json!([cross.clone()])),
             Ok(json!([cross])),
+            Ok(
+                json!({"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}),
+            ),
             Ok(pr),
         ])?,
         ReadLimits::default(),
@@ -667,6 +670,30 @@ fn triage_partial_timeline_is_unavailable() -> Result {
     assert_eq!(
         client.timeline(&house, &repo, IssueNumber::new(1)?),
         Observation::Unavailable(IntegrationError::Unavailable)
+    );
+    Ok(())
+}
+
+#[test]
+fn closing_pr_links_are_found_without_timeline_cross_reference() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let sha = "1111111111111111111111111111111111111111";
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![
+            Ok(json!([])),
+            Ok(
+                json!({"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[{"number":9,"repository":{"nameWithOwner":"sample/project"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}),
+            ),
+            Ok(
+                json!({"number":9,"state":"open","draft":false,"merged":false,"head":{"sha":sha,"ref":"feature"},"base":{"sha":sha,"ref":"main"},"mergeable":null}),
+            ),
+        ])?,
+        ReadLimits::default(),
+    );
+    assert!(
+        matches!(client.linked_pull_requests(&house, &repo, IssueNumber::new(1)?), Observation::Known(v) if v.len() == 1 && !v[0].pull_request.merged)
     );
     Ok(())
 }

@@ -207,6 +207,70 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
                 }
             }
             let mut remaining = self.limits.bytes;
+            let mut cursor: Option<String> = None;
+            let mut closing_complete = false;
+            for _ in 0..self.limits.pages {
+                let request = ReadRequest {
+                    endpoint: "graphql".into(),
+                    graphql: Some(json!({
+                        "query":"query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){issue(number:$number){closedByPullRequestsReferences(first:100,after:$cursor){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}",
+                        "variables":{"owner":repo.owner(),"name":repo.name(),"number":number.get(),"cursor":cursor}
+                    })),
+                };
+                let value: Value = self.fetch(&request, started, &mut remaining)?;
+                if value.get("errors").is_some() {
+                    return Err(IntegrationError::Unknown);
+                }
+                let connection = value
+                    .pointer("/data/repository/issue/closedByPullRequestsReferences")
+                    .ok_or(IntegrationError::Unknown)?;
+                let nodes = connection
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .ok_or(IntegrationError::Unknown)?;
+                if nodes.len() > 100 {
+                    return Err(IntegrationError::LimitExceeded);
+                }
+                for node in nodes {
+                    let name = node
+                        .pointer("/repository/nameWithOwner")
+                        .and_then(Value::as_str)
+                        .ok_or(IntegrationError::Unknown)?;
+                    let linked_repo =
+                        Repository::new(name).map_err(|_| IntegrationError::Unknown)?;
+                    self.scope.authorize_read(house, &linked_repo)?;
+                    let number = node
+                        .get("number")
+                        .and_then(Value::as_u64)
+                        .ok_or(IntegrationError::Unknown)?;
+                    let linked_number =
+                        IssueNumber::new(number).map_err(|_| IntegrationError::Unknown)?;
+                    refs.insert((linked_repo, linked_number.get()));
+                    if refs.len() > 100 {
+                        return Err(IntegrationError::LimitExceeded);
+                    }
+                }
+                let next = connection
+                    .pointer("/pageInfo/hasNextPage")
+                    .and_then(Value::as_bool)
+                    .ok_or(IntegrationError::Unknown)?;
+                if !next {
+                    closing_complete = true;
+                    break;
+                }
+                let next_cursor = connection
+                    .pointer("/pageInfo/endCursor")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty() && v.len() <= 1024)
+                    .ok_or(IntegrationError::Unknown)?;
+                if cursor.as_deref() == Some(next_cursor) {
+                    return Err(IntegrationError::Unknown);
+                }
+                cursor = Some(next_cursor.into());
+            }
+            if !closing_complete {
+                return Err(IntegrationError::LimitExceeded);
+            }
             let mut result = Vec::new();
             for (repository, linked_number) in refs {
                 let request = ReadRequest {

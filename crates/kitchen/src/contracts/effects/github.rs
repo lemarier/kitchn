@@ -251,12 +251,18 @@ impl GitHubEffect {
     pub fn scope(&self) -> GrantScope {
         GrantScope::Repository(self.mutation.repository.clone())
     }
+    /// Validate the mutation on every submission, including same-key retries.
+    ///
+    /// # Errors
+    /// Refuses malformed action payloads.
+    pub fn check(&self, _context: &EffectContext<'_>) -> Result<(), ContractError> {
+        self.mutation.validate()
+    }
     /// Validate input and atomically reserve one logical posting slot.
     ///
     /// # Errors
     /// Refuses invalid payloads and exhausted task budgets.
     pub fn admit(&self, context: &EffectContext<'_>) -> Result<(), ContractError> {
-        self.mutation.validate()?;
         if context.submitted.for_executor(ExecutorKind::GitHub) >= self.posting_budget.limit() {
             return Err(ContractError::EffectBudgetExhausted {
                 executor: ExecutorKind::GitHub,

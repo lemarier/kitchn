@@ -851,8 +851,8 @@ fn revocation_succeeds_at_history_capacity_and_stays_revoked() -> TestResult {
     for index in 1..4094 {
         let mut additional = original.clone();
         let id = serde_json::json!(format!("fixture:grant-{index}"));
-        additional["Issued"]["proposal"]["id"] = id.clone();
-        additional["Issued"]["id"] = id;
+        additional["proposal"]["id"] = id.clone();
+        additional["id"] = id;
         audits.push(additional);
     }
     fs::write(&path, serde_json::to_vec(&document)?)?;
@@ -2002,5 +2002,170 @@ fn revocation_growth_stays_inside_the_per_grant_reserve() -> TestResult {
         assert!(growth <= 1024, "a revocation added {growth} bytes");
         assert!(growth > 512 + 64, "the worst-case fields were not written");
     }
+    Ok(())
+}
+
+#[test]
+fn persisted_records_follow_core_serialization_conventions() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    issue(&l, &grants()?)?;
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(ledger_path(&f))?)?;
+    let observation = &document["observations"][0];
+    assert_eq!(observation["mode"], "live");
+    assert_eq!(observation["pullRequest"]["type"], "observed");
+    assert_eq!(
+        observation["pullRequest"]["value"]["firstPass"]["type"],
+        "observed"
+    );
+    assert_eq!(observation["bench"]["type"], "missing");
+    assert_eq!(
+        observation["attribution"]["scope"]["workType"],
+        "implementation"
+    );
+    assert!(observation.get("pull_request").is_none());
+    let grant = &document["grants"][0];
+    assert_eq!(grant["type"], "issued");
+    assert_eq!(grant["approvedBy"], "owner");
+
+    // Tagged records reject unknown fields and unknown kinds.
+    let mut extra = serde_json::to_value(measured(true)?)?;
+    extra["extra"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<Measurement<bool>>(extra).is_err());
+    let unknown = serde_json::json!({ "type": "estimated" });
+    assert!(serde_json::from_value::<Measurement<bool>>(unknown).is_err());
+    let round_trip: Measurement<bool> =
+        serde_json::from_value(serde_json::to_value(Measurement::<bool>::Untested)?)?;
+    assert_eq!(round_trip, Measurement::Untested);
+    Ok(())
+}
+
+#[test]
+fn proposal_claims_must_be_repository_scoped_with_distinct_evidence() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    let policy = grants()?;
+    let evidence = proposal()?.evidence;
+    let entry = evidence.first().cloned().ok_or("evidence entry")?;
+
+    let mut none = proposal()?;
+    none.evidence = Vec::new();
+    assert!(matches!(l.propose(none, &policy), Err(TrustError::Refused)));
+    let mut repeated = proposal()?;
+    repeated.evidence = vec![entry.clone(), entry.clone()];
+    assert!(matches!(
+        l.propose(repeated, &policy),
+        Err(TrustError::Invalid)
+    ));
+    let mut house_wide = proposal()?;
+    house_wide.claim = Grant::house(
+        Permission::LaunchWorker,
+        common::backend_id()?,
+        common::credential()?,
+    );
+    assert!(matches!(
+        l.propose(house_wide, &policy),
+        Err(TrustError::Refused)
+    ));
+    let mut elsewhere = proposal()?;
+    elsewhere.claim = Grant::repository(
+        Permission::LaunchWorker,
+        Repository::new("other/project")?,
+        common::backend_id()?,
+        common::credential()?,
+    );
+    assert!(matches!(
+        l.propose(elsewhere, &policy),
+        Err(TrustError::Refused)
+    ));
+    let mut oversized = proposal()?;
+    oversized.evidence = (1..=129)
+        .map(|index| Ok((source(&format!("fixture:stream-{index}"))?, entry.1)))
+        .collect::<TestResult<Vec<_>>>()?;
+    assert!(matches!(
+        l.propose(oversized, &policy),
+        Err(TrustError::Refused)
+    ));
+    assert!(l.grant_history()?.is_empty());
+    assert!(l.propose(proposal()?, &policy)?);
+    Ok(())
+}
+
+#[test]
+fn sample_count_and_token_budgets_bound_independently() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, with_pr(observation(&f)?)?)?;
+    let mut by_count = plan()?;
+    by_count.max_samples = 1;
+    by_count.max_tokens = 100;
+    l.start_inspection(by_count.clone(), at(5))?;
+    l.reserve_sample(&by_count.id, 1, 10, at(6))?;
+    l.finish_sample(&by_count.id, 1, SampleResult::Unavailable)?;
+    assert!(matches!(
+        l.reserve_sample(&by_count.id, 2, 10, at(7)),
+        Err(TrustError::Exhausted)
+    ));
+    let mut by_tokens = plan()?;
+    by_tokens.id = source("fixture:token-bound")?;
+    by_tokens.max_samples = 4;
+    by_tokens.max_tokens = 25;
+    l.start_inspection(by_tokens.clone(), at(5))?;
+    for number in 1..=2 {
+        l.reserve_sample(&by_tokens.id, number, 10, at(6))?;
+        l.finish_sample(&by_tokens.id, number, SampleResult::Unavailable)?;
+    }
+    assert!(matches!(
+        l.reserve_sample(&by_tokens.id, 3, 10, at(7)),
+        Err(TrustError::Exhausted)
+    ));
+    assert!(matches!(
+        l.reserve_sample(&by_tokens.id, 4, 5, at(7)),
+        Err(TrustError::Invalid)
+    ));
+    assert!(matches!(
+        l.reserve_sample(&by_tokens.id, 3, 5, at(7))?,
+        SampleReservation::Reserved(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn persisted_inspections_with_broken_sample_sequences_are_invalid() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, with_pr(observation(&f)?)?)?;
+    l.start_inspection(plan()?, at(5))?;
+    l.reserve_sample(&plan()?.id, 1, 1, at(6))?;
+    let path = ledger_path(&f);
+    let original = fs::read(&path)?;
+    let owner = house()?;
+    let open = || Ledger::open(f.dir.path().join("trust"), owner.clone());
+
+    let mut out_of_sequence: serde_json::Value = serde_json::from_slice(&original)?;
+    out_of_sequence["inspections"][0]["samples"][0]["number"] = serde_json::json!(2);
+    fs::write(&path, serde_json::to_vec(&out_of_sequence)?)?;
+    assert!(matches!(open(), Err(TrustError::Invalid)));
+
+    // Three samples exceed a plan that allows two.
+    let mut too_many: serde_json::Value = serde_json::from_slice(&original)?;
+    let first = too_many["inspections"][0]["samples"][0].clone();
+    for number in [2, 3] {
+        let mut sample = first.clone();
+        sample["number"] = serde_json::json!(number);
+        too_many["inspections"][0]["samples"]
+            .as_array_mut()
+            .ok_or("samples")?
+            .push(sample);
+    }
+    fs::write(&path, serde_json::to_vec(&too_many)?)?;
+    assert!(matches!(open(), Err(TrustError::Invalid)));
+
+    fs::write(&path, &original)?;
+    assert_eq!(open()?.inspection(&plan()?.id)?.samples().len(), 1);
     Ok(())
 }

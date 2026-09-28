@@ -4,6 +4,14 @@
 //! reserved sample with its token ceiling and deadline; uncertain execution keeps
 //! that reservation spent. Confirmed findings become scoped issue/test/guidance
 //! follow-ups for existing workflows, which still need their own authority.
+//!
+//! The ledger records inspections; it does not run or fence them. Reserving,
+//! finishing, and cancelling take no claim, so the identity that reports a
+//! result is not compared with [`InspectionPlan::inspector`]. Independence is
+//! checked once, when the inspection starts, against the delivering agent the
+//! adapter attested. Deadlines use the caller's clock, and only the ledger's
+//! history limit bounds how many inspections start. A recorded result is a
+//! routing intent, never authority.
 use crate::{
     HolderId, HouseId,
     contracts::{EvidenceSubject, ExternalRef, Settlement, Text, Timestamp},
@@ -14,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bounds accepted by the inspector, independent of backend capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InspectionPlan {
     /// Idempotent inspection identity.
     pub id: ExternalRef,
@@ -25,8 +33,10 @@ pub struct InspectionPlan {
     /// Concrete question to answer about the delivered revision.
     pub question: Text,
     /// Inspector identity, distinct from the delivering worker when required.
+    /// The ledger does not verify who runs the samples.
     pub inspector: HolderId,
-    /// Require positive evidence of a different delivering agent.
+    /// Require positive evidence of a different delivering agent. Checked when
+    /// the inspection starts, against the attested agent of the observation.
     pub independent: bool,
     /// Maximum samples, 1 through 32.
     pub max_samples: u32,
@@ -38,7 +48,8 @@ pub struct InspectionPlan {
 
 /// Where a confirmed finding should be consumed. This is intent, not a post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum FollowUpRoute {
     /// Existing issue/triage workflow.
     Issue,
@@ -50,7 +61,8 @@ pub enum FollowUpRoute {
 
 /// Sample outcome. A missing result is distinct from an unavailable result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum SampleResult {
     /// Question checked with no confirmed finding; not general acceptance.
     NoFinding {
@@ -70,7 +82,7 @@ pub enum SampleResult {
 
 /// Durable reservation returned before launching any inspection work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Sample {
     /// One-based sample number, stable across restart.
     pub number: u32,
@@ -93,7 +105,7 @@ pub enum SampleReservation {
 
 /// Audit record for one bounded inspection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Inspection {
     plan: InspectionPlan,
     revision: std::num::NonZeroU32,
@@ -163,7 +175,7 @@ impl Inspection {
             || self.plan.deadline <= self.started_at
             || self.plan.deadline.saturating_since(self.started_at)
                 > std::time::Duration::from_secs(3600)
-            || self.samples.len() > self.plan.max_samples as usize
+            || u32::try_from(self.samples.len()).map_or(true, |len| len > self.plan.max_samples)
         {
             return Err(TrustError::Invalid);
         }
@@ -173,7 +185,7 @@ impl Inspection {
                 .checked_add(sample.tokens)
                 .ok_or(TrustError::Exhausted)?;
             if sample.tokens == 0
-                || sample.number as usize != index + 1
+                || u32::try_from(index + 1).ok() != Some(sample.number)
                 || sample.reserved_at < self.started_at
                 || sample.reserved_at >= self.plan.deadline
             {
@@ -292,10 +304,11 @@ impl Ledger {
             if inspection.samples.iter().any(|s| s.result.is_none()) {
                 return Err(TrustError::Incomplete);
             }
-            if number as usize != inspection.samples.len() + 1 {
+            if u32::try_from(inspection.samples.len() + 1).ok() != Some(number) {
                 return Err(TrustError::Invalid);
             }
-            if inspection.samples.len() >= inspection.plan.max_samples as usize
+            if u32::try_from(inspection.samples.len())
+                .map_or(true, |len| len >= inspection.plan.max_samples)
                 || tokens == 0
                 || tokens
                     > inspection

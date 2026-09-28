@@ -19,7 +19,8 @@ pub const MAX_HISTORY: usize = 4096;
 
 /// A missing measurement is not a zero or a pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum Measurement<T> {
     /// No source supplied this measurement.
     Missing,
@@ -40,7 +41,8 @@ pub enum Measurement<T> {
 
 /// Runtime evidence must never be confused with fixtures or local simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum EvidenceMode {
     /// Sanitized fixture or fake backend.
     Simulated,
@@ -50,7 +52,7 @@ pub enum EvidenceMode {
 
 /// Scope of a station's evidence and autonomy. Names are bounded validated text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StationScope {
     /// House-defined station/domain name.
     pub station: Text,
@@ -62,7 +64,7 @@ pub struct StationScope {
 
 /// Attribution supplied by the adapter, including explicit unknowns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Attribution {
     /// Responsible station, project, and work type.
     pub scope: StationScope,
@@ -76,7 +78,7 @@ pub struct Attribution {
 
 /// A confirmed finding with its attribution evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Finding {
     /// Stable source identity, used for deduplication.
     pub source: ExternalRef,
@@ -89,7 +91,7 @@ pub struct Finding {
 /// Narrow input boundary for #7; the adapter supplies exact-head evidence.
 /// Absence of PR evidence is explicit in [`Observation::pull_request`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PullRequestEvidence {
     /// Selected credential house.
     pub house: HouseId,
@@ -115,7 +117,7 @@ pub struct PullRequestEvidence {
 
 /// Bench observation kept separately from CI and worker settlement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BenchResult {
     /// Exact revision exercised.
     pub subject: EvidenceSubject,
@@ -127,7 +129,7 @@ pub struct BenchResult {
 
 /// A versioned observation, including source state captured directly from #4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Observation {
     /// Stable source stream identity (one stream per task).
     pub id: ExternalRef,
@@ -294,7 +296,7 @@ impl Observation {
 
 /// Explicit operator decision, never synthesized from a score.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutonomyGrant {
     /// Stable grant identity; revoked identities cannot be reused.
     pub id: ExternalRef,
@@ -319,7 +321,7 @@ pub struct AutonomyGrant {
 
 /// A requested standing grant that has no approval authority yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutonomyProposal {
     /// Stable identity used by the later approval decision.
     pub id: ExternalRef,
@@ -340,7 +342,7 @@ pub struct AutonomyProposal {
 /// Write-once adapter attribution for a prospective task. Core authority is
 /// delegated after this binding and is checked separately at execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskBinding {
     /// Prospective task specification before earned authority is delegated.
     pub spec: TaskSpec,
@@ -369,7 +371,8 @@ impl TaskBinding {
 /// Grant decision state. Revocation replaces the current entry while retaining
 /// the original proposal or approval and the revocation decision together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum GrantAudit {
     /// Proposal without authority.
     Proposed(AutonomyProposal),

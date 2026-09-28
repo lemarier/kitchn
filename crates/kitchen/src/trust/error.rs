@@ -3,6 +3,7 @@ use crate::ErrorClass;
 
 /// Evidence, autonomy, inspection, or runtime storage failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TrustError {
     /// The shared core authority model refused the action.
     #[error(transparent)]
@@ -22,7 +23,9 @@ pub enum TrustError {
     /// The requested grant identity has never been proposed or issued.
     #[error("trust grant not found")]
     NotFound,
-    /// History, snapshot, or inspection bound exhausted.
+    /// The history-entry or inspection budget is exhausted. A snapshot that
+    /// would outgrow its byte bound is reported as [`Self::Storage`] with
+    /// `StateTooLarge`.
     #[error("trust budget exhausted")]
     Exhausted,
     /// Persisted history violates a ledger invariant; never reset automatically.

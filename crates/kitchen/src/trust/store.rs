@@ -32,7 +32,9 @@ pub const EARNED_AUTONOMY_PERMISSIONS: &[Permission] = &[
 /// Largest snapshot an ordinary write may produce.
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 // Each bounded grant can be replaced by a revocation with at most 1 KiB of
-// extra audit data. This reserve is unavailable to ordinary writers.
+// extra audit data (`revocation_growth_stays_inside_the_per_grant_reserve`
+// measures the worst case). This reserve is unavailable to ordinary writers.
+// `usize` widens to `u64` on every supported target; `TryFrom` is not const.
 const REVOCATION_RESERVE: u64 = MAX_HISTORY as u64 * 1024;
 const OPTIONS: StoreOptions = StoreOptions {
     lock_timeout: Duration::from_secs(2),
@@ -52,7 +54,7 @@ const LAYOUT: StoreLayout = StoreLayout {
 const SCHEMA: u64 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Document {
     schema: u64,
     house: HouseId,
@@ -110,7 +112,7 @@ impl Document {
             if let GrantAudit::Proposed(proposal) | GrantAudit::RevokedProposal { proposal, .. } =
                 audit
             {
-                validate_claim(&proposal.claim, &proposal.scope, proposal.evidence.len())?;
+                validate_claim(&proposal.claim, &proposal.scope, &proposal.evidence)?;
                 for (source, revision) in &proposal.evidence {
                     let evidence = self
                         .observations
@@ -168,7 +170,7 @@ impl Document {
         let mut versions: Vec<_> = self.observations.iter().filter(|o| &o.id == id).collect();
         versions.sort_by_key(|o| o.revision);
         for (index, observation) in versions.iter().enumerate() {
-            if observation.revision.get() as usize != index + 1 {
+            if u32::try_from(index + 1).ok() != Some(observation.revision.get()) {
                 return Err(TrustError::Incomplete);
             }
         }
@@ -223,6 +225,9 @@ impl Ledger {
     }
 
     /// Open an established ledger; missing or invalid history is an error.
+    /// Unlike the core house store, every open requires owner-only storage:
+    /// the directory and each managed file must have no group or other
+    /// permissions on Unix.
     ///
     /// # Errors
     /// Rejects cross-house, redirected, public, missing, or corrupted storage.
@@ -388,7 +393,7 @@ impl Ledger {
         if current.house() != self.house() || &proposal.house != self.house() {
             return Err(TrustError::Refused);
         }
-        validate_claim(&proposal.claim, &proposal.scope, proposal.evidence.len())?;
+        validate_claim(&proposal.claim, &proposal.scope, &proposal.evidence)?;
         self.transact(|doc| {
             if let Some(existing) = doc
                 .grants
@@ -649,7 +654,7 @@ fn role_matches_station(role: Role, scope: &StationScope) -> bool {
         || role.as_str() == scope.station.as_str()
 }
 fn validate_grant(grant: &AutonomyGrant) -> Result<(), TrustError> {
-    validate_claim(&grant.claim, &grant.scope, grant.evidence.len())?;
+    validate_claim(&grant.claim, &grant.scope, &grant.evidence)?;
     if let Some(proposal) = &grant.proposal
         && (proposal.id != grant.id
             || proposal.house != grant.house
@@ -664,15 +669,23 @@ fn validate_grant(grant: &AutonomyGrant) -> Result<(), TrustError> {
 fn validate_claim(
     claim: &crate::contracts::Grant,
     scope: &StationScope,
-    evidence_len: usize,
+    evidence: &[(crate::contracts::ExternalRef, std::num::NonZeroU32)],
 ) -> Result<(), TrustError> {
     // Allowlist: new core permissions do not silently become autonomous.
     if !EARNED_AUTONOMY_PERMISSIONS.contains(&claim.permission)
         || claim.scope != GrantScope::Repository(scope.project.clone())
-        || evidence_len == 0
-        || evidence_len > MAX_ITEMS
+        || evidence.is_empty()
+        || evidence.len() > MAX_ITEMS
     {
         return Err(TrustError::Refused);
+    }
+    // One entry per evidence stream: a repeated stream adds no evidence.
+    if evidence
+        .iter()
+        .enumerate()
+        .any(|(index, (id, _))| evidence[..index].iter().any(|(earlier, _)| earlier == id))
+    {
+        return Err(TrustError::Invalid);
     }
     Ok(())
 }

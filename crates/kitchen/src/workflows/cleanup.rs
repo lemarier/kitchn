@@ -67,7 +67,7 @@ pub use build::{
     BuildDirectory, CACHEDIR_SIGNATURE, DiskUsage, MAX_MEASURED_ENTRIES, MAX_TOP_LEVEL_ENTRIES,
     disk_usage,
 };
-pub use git::{GitLimits, GitReadError, WorktreeState, inspect_worktree};
+pub use git::{GitLimits, GitReadError, MAX_IGNORED_PATHS, WorktreeState, inspect_worktree};
 
 use crate::{
     BackendId, EffectName, Error, ErrorClass, HouseId, Result, TaskId, WorkflowId,
@@ -1292,14 +1292,17 @@ pub fn approve(
     let preview = inspect(inspector, InspectionTrigger::Manual, now)?;
     let mut results = Vec::with_capacity(digests.len());
     for digest in digests {
+        // An eligible step always has a settled owning task; without one
+        // there is nothing to approve.
         let target = preview.entries.iter().find_map(|entry| {
+            let owner = entry.owner_task()?;
             previewed_steps(entry)
                 .find(|(_, observation)| *observation == digest)
-                .map(|(step, _)| (entry, step))
+                .map(|(step, _)| (entry, owner, step))
         });
         let outcome = match target {
-            Some((entry, step)) => {
-                record_approval(inspector.store, entry, step, digest, approver, now)?;
+            Some((entry, owner, step)) => {
+                record_approval(inspector.store, entry, owner, step, digest, approver, now)?;
                 ApprovalOutcome::Approved {
                     resource: entry.resource.clone(),
                     step,
@@ -1329,18 +1332,17 @@ fn marker_key(resource: &ResourceRef, observation: &ExternalRef) -> Result<Marke
     })
 }
 
-/// Record or renew the approval marker for one step of `entry`.
+/// Record or renew the approval marker for one step of `entry`, whose
+/// owning task is `owner`.
 fn record_approval(
     store: &HouseStore,
     entry: &PreviewEntry,
+    owner: &TaskId,
     step: Step,
     observation: &ExternalRef,
     approver: &Claimant,
     now: Timestamp,
 ) -> Result<()> {
-    let Some(owner) = entry.owner_task() else {
-        return Ok(());
-    };
     let fact = MarkerFact::workflow(
         schema()?,
         &ApprovalFact {

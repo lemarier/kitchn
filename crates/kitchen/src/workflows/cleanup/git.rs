@@ -42,7 +42,8 @@ const REDIRECTING_ENV: [&str; 15] = [
 
 /// Longest poll interval while waiting for `git` to exit.
 const MAX_POLL: Duration = Duration::from_millis(20);
-/// Most ignored paths one inspection lists; more is treated as unreadable.
+/// Most ignored paths one inspection lists; more makes the worktree
+/// unreadable, which retains it.
 pub const MAX_IGNORED_PATHS: usize = 256;
 /// Longest single `git ls-files` record accepted while scanning the index.
 const MAX_RECORD_BYTES: u64 = 8192;
@@ -255,7 +256,9 @@ fn list_ignored(path: &Path, limits: &GitLimits) -> Result<Vec<String>, GitReadE
 /// larger than the output limit, so it is filtered while it streams and only
 /// the deadline bounds the scan.
 fn count_hidden_tracked(path: &Path, limits: &GitLimits) -> Result<u32, GitReadError> {
-    let (status, hidden) = run_with(path, ["ls-files", "-v", "-z"], limits, count_hidden)?;
+    let (status, hidden) = run_with(path, ["ls-files", "-v", "-z"], limits, |stdout| {
+        count_hidden(stdout)
+    })?;
     if !status.success() {
         return Err(GitReadError::Failed);
     }
@@ -265,7 +268,7 @@ fn count_hidden_tracked(path: &Path, limits: &GitLimits) -> Result<u32, GitReadE
 /// Count `git ls-files -v -z` records whose tag is not `H` (an ordinary
 /// cached file): `S` is skip-worktree, lowercase is assume-unchanged, and any
 /// unknown tag is treated as hidden rather than as clean.
-fn count_hidden(stdout: ChildStdout) -> io::Result<u32> {
+fn count_hidden(stdout: impl Read) -> io::Result<u32> {
     let mut reader = BufReader::new(stdout);
     let mut record = Vec::new();
     let mut hidden: u32 = 0;
@@ -433,6 +436,27 @@ mod tests {
             count_status(" M a.rs\0?? new.txt\0R  b.rs\0old b.rs\0UU c.rs\0"),
             Ok((3, 1))
         );
+    }
+
+    #[test]
+    fn only_ordinary_cached_files_are_not_hidden() {
+        let index = |records: &[u8]| count_hidden(records);
+        assert_eq!(index(b"").ok(), Some(0));
+        assert_eq!(index(b"H a.rs\0H dir/b.rs\0").ok(), Some(0));
+        // Assume-unchanged (lowercase), skip-worktree, and any unknown tag.
+        assert_eq!(
+            index(b"h a.rs\0S b.rs\0s c.rs\0H d.rs\0X e.rs\0").ok(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn malformed_index_records_are_errors() {
+        let kind = |records: &[u8]| count_hidden(records).map_err(|error| error.kind());
+        assert_eq!(kind(b"H"), Err(io::ErrorKind::InvalidData));
+        assert_eq!(kind(b"H_a.rs\0"), Err(io::ErrorKind::InvalidData));
+        let overlong = [b"H ".as_slice(), &vec![b'a'; 9000], b"\0"].concat();
+        assert_eq!(kind(&overlong), Err(io::ErrorKind::InvalidData));
     }
 
     #[test]

@@ -645,15 +645,15 @@ const menu = [
           <ul class="guardrails">
             <li>
               <h3>One house at a time</h3>
-              <p>Trust earned in one house is never authority in another, and keys never cross.</p>
+              <p>Trust earned in one house is never authority in another. Keys never cross.</p>
             </li>
             <li>
               <h3>Bounded</h3>
-              <p>Minimum intervals, weekly usage budgets per house, one consumer per repository and capped retry rounds.</p>
+              <p>Minimum intervals, weekly budgets, one consumer per repository, capped retries.</p>
             </li>
             <li>
               <h3>Stops cleanly</h3>
-              <p>Pause any schedule at any time. Uncertain work waits for you, and human-only issues are never picked up.</p>
+              <p>Pause any schedule at any time. Uncertain work and human-only issues wait for you.</p>
             </li>
           </ul>
         </div>
@@ -1157,6 +1157,12 @@ const menu = [
 
   a {
     color: inherit;
+  }
+
+  p,
+  li,
+  dd {
+    text-wrap: pretty;
   }
 
   :focus-visible {

@@ -6,21 +6,22 @@ const sources = import.meta.glob<string>("../../../../roles/*.md", {
   eager: true,
 });
 
-/** Brigade order and kitchen names, keyed by role card file name. */
+/** Brigade order, kitchen names and one-line jobs, keyed by role card file name. */
 const BRIGADE = [
-  ["chef-owner", "Chef-owner"],
-  ["sous-chef", "Sous-chef"],
-  ["station-cook", "Station cook"],
-  ["commis", "Commis"],
-  ["expediter", "Expediter"],
-  ["inspector", "Inspector"],
-  ["gardener", "Gardener"],
-  ["dishwasher", "Dishwasher"],
+  ["chef-owner", "Chef-owner", "You. Sets the house rules and makes the calls evidence can't."],
+  ["sous-chef", "Sous-chef", "Runs the line: picks up ready work, hands it out, keeps count."],
+  ["station-cook", "Station cook", "Builds one task in its own worktree, with proof it works."],
+  ["commis", "Commis", "Preps research and small subtasks for a named station."],
+  ["expediter", "Expediter", "Checks every plate at the pass before it leaves the kitchen."],
+  ["inspector", "Inspector", "Tastes what already shipped and reports what's off."],
+  ["gardener", "Gardener", "Keeps the backlog clean: specs, dependencies, duplicates."],
+  ["dishwasher", "Dishwasher", "Clears finished worktrees, and only finished ones."],
 ] as const;
 
 export interface Role {
   slug: (typeof BRIGADE)[number][0];
   kitchenName: string;
+  job: string;
   function: string;
   responsibility: string;
   evidence: string;
@@ -35,7 +36,7 @@ function field(slug: string, text: string, label: string): string {
   return line.slice(label.length + 2).trim();
 }
 
-function parse(slug: Role["slug"], kitchenName: string): Role {
+function parse(slug: Role["slug"], kitchenName: string, job: string): Role {
   const text = sources[`../../../../roles/${slug}.md`];
   if (text === undefined) {
     throw new Error(`roles/${slug}.md is missing`);
@@ -47,6 +48,7 @@ function parse(slug: Role["slug"], kitchenName: string): Role {
   return {
     slug,
     kitchenName,
+    job,
     function: heading.slice(2).trim(),
     responsibility: field(slug, text, "Responsibility"),
     evidence: field(slug, text, "Evidence"),
@@ -62,4 +64,4 @@ if (unlisted.length > 0) {
   throw new Error(`Role cards missing from the site's brigade order: ${unlisted.join(", ")}`);
 }
 
-export const roles: readonly Role[] = BRIGADE.map(([slug, name]) => parse(slug, name));
+export const roles: readonly Role[] = BRIGADE.map(([slug, name, job]) => parse(slug, name, job));

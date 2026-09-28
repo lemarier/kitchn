@@ -1,5 +1,18 @@
 ---
+import {
+  siAmp,
+  siClaude,
+  siCoderabbit,
+  siCrewai,
+  siCursor,
+  siGithubcopilot,
+  siGooglegemini,
+  siLanggraph,
+  siOpencode,
+} from "simple-icons";
 import RoleAvatar from "../components/RoleAvatar.astro";
+import ToolChip from "../components/ToolChip.astro";
+import { nightShift } from "../data/autopilot";
 import { glossary } from "../data/glossary";
 import { commands } from "../data/terminal";
 import { roles } from "../lib/roles";
@@ -85,14 +98,15 @@ const service: Line[] = [
   },
 ];
 
+// Logos from Simple Icons (CC0), where the project has one.
 const agents = [
-  "Claude Code",
-  "Codex",
-  "OpenCode",
-  "Gemini CLI",
-  "Cursor CLI",
-  "Amp",
-  "Any CLI agent",
+  { name: "Claude Code", icon: siClaude },
+  { name: "Codex" },
+  { name: "OpenCode", icon: siOpencode },
+  { name: "Gemini CLI", icon: siGooglegemini },
+  { name: "Cursor CLI", icon: siCursor },
+  { name: "Amp", icon: siAmp },
+  { name: "Any CLI agent" },
 ];
 
 const steps = [
@@ -117,36 +131,51 @@ const steps = [
 const lookedAt = [
   {
     what: "Coding agents",
-    examples: "Claude Code, Codex, Cursor",
+    examples: [
+      { name: "Claude Code", icon: siClaude },
+      { name: "Codex" },
+      { name: "Cursor", icon: siCursor },
+    ],
     good: "A strong cook.",
     missing: "One cook isn't a brigade. Nobody independent checks the plate.",
   },
   {
     what: "Orchestrators",
-    examples: "Orca, Conductor, Claude Squad, Vibe Kanban",
+    examples: [
+      { name: "Orca" },
+      { name: "Conductor" },
+      { name: "Claude Squad" },
+      { name: "Vibe Kanban" },
+    ],
     good: "Many agents in parallel worktrees.",
     missing: "They run the line. Who may ship what, and why, is still up to you.",
   },
   {
     what: "Agent frameworks",
-    examples: "LangGraph, CrewAI",
+    examples: [
+      { name: "LangGraph", icon: siLanggraph },
+      { name: "CrewAI", icon: siCrewai },
+    ],
     good: "Build your own agents in code.",
     missing: "You'd be building the kitchen from scratch.",
   },
   {
     what: "Review bots",
-    examples: "PR review apps",
+    examples: [
+      { name: "CodeRabbit", icon: siCoderabbit },
+      { name: "Copilot review", icon: siGithubcopilot },
+    ],
     good: "A second opinion on a pull request.",
     missing: "A review isn't a gate tied to the exact head and your approvals.",
   },
   {
     what: "Governance layers",
-    examples: "Early projects",
+    examples: [{ name: "Early projects" }],
     good: "Policy and evidence around agent work.",
     missing:
       "Worth watching. None we found combined portable roles, per-house isolation and earned autonomy across orchestrators.",
   },
-] as const;
+];
 
 const guests = [
   {
@@ -327,7 +356,8 @@ const menu = [
         </h1>
         <p class="lede">
           kitchn is the workflow layer for your coding agents: who picks up an issue, who builds it, who
-          checks it and what's allowed to ship. It runs on top of the orchestrator you already use.
+          checks it and what's allowed to ship. Work with it in your session or put it on autopilot, on
+          top of the orchestrator you already use.
         </p>
         <div class="cta">
           <a class="button primary big" href="/docs/start/install/">Install kitchn</a>
@@ -477,6 +507,60 @@ const menu = [
         </div>
       </section>
 
+      <section class="autopilot" aria-labelledby="autopilot-title">
+        <div class="wrap">
+          <h2 id="autopilot-title">Put it on autopilot</h2>
+          <p class="section-lede">
+            Close the laptop. The brigade keeps cooking on the stations you've trusted, stays inside the
+            house budget, and leaves the calls that need you on the pass for the morning.
+          </p>
+          <div class="shift">
+            <ol class="shift-log">
+              {
+                nightShift.log.map((e) => (
+                  <li class:list={[e.tone]}>
+                    <span class="shift-time">{e.time}</span>
+                    <span class="shift-who">{e.who}</span>
+                    <span class="shift-text">{e.text}</span>
+                  </li>
+                ))
+              }
+            </ol>
+            <div class="report">
+              <p class="report-head">
+                <span>Service report</span>
+                <span>07:30</span>
+              </p>
+              <p class="report-title">Good morning. Here's last night at {nightShift.house}.</p>
+              <dl>
+                {
+                  nightShift.report.map((r) => (
+                    <div class:list={[r.tone]}>
+                      <dt>{r.label}</dt>
+                      <dd>{r.value}</dd>
+                    </div>
+                  ))
+                }
+              </dl>
+            </div>
+          </div>
+          <ul class="guardrails">
+            <li>
+              <h3>Earned, not switched on</h3>
+              <p>A station runs alone only after its supervised record meets your bar for that project and kind of work.</p>
+            </li>
+            <li>
+              <h3>Bounded</h3>
+              <p>Minimum intervals, weekly usage budgets per house, one consumer per repository and capped retry rounds.</p>
+            </li>
+            <li>
+              <h3>Stops cleanly</h3>
+              <p>Pause any schedule at any time. Uncertain work waits for you, and human-only issues are never picked up.</p>
+            </li>
+          </ul>
+        </div>
+      </section>
+
       <section class="feature wrap" aria-labelledby="feature-house-title">
         <div class="feature-copy">
           <h2 id="feature-house-title">Your house in one file</h2>
@@ -586,7 +670,7 @@ const menu = [
           <div class="layer">
             <span class="layer-name">Agents</span>
             <span class="layer-body chips">
-              {agents.map((agent) => <span class="chip">{agent}</span>)}
+              {agents.map((agent) => <ToolChip name={agent.name} icon={"icon" in agent ? agent.icon : undefined} />)}
             </span>
           </div>
         </div>
@@ -611,33 +695,60 @@ const menu = [
         </ol>
       </section>
 
-      <section class="brigade wrap" aria-labelledby="brigade-title">
-        <h2 id="brigade-title">The brigade</h2>
-        <p class="section-lede">
-          Eight stations. Each has one job, the evidence it owes and a line it can't cross. Stations open
-          when there's work; installing kitchn starts nothing and grants no authority.
-        </p>
-        <ul class="stations">
-          {
-            roles.map((role) => (
-              <li class="station">
-                <details>
-                  <summary>
-                    <RoleAvatar slug={role.slug} />
-                    <span class="station-name">{role.kitchenName}</span>
-                    <span class="station-duty">{role.responsibility}</span>
-                  </summary>
-                  <dl>
-                    <dt>Owes</dt>
-                    <dd>{role.evidence}</dd>
-                    <dt>Never</dt>
-                    <dd>{role.boundary}</dd>
-                  </dl>
-                </details>
-              </li>
-            ))
-          }
-        </ul>
+      <section class="brigade" aria-labelledby="brigade-title">
+        <div class="wrap">
+          <h2 id="brigade-title">Meet the brigade</h2>
+          <p class="section-lede">
+            Eight stations, each with one job. Every station owes evidence and has a line it can't cross.
+            Stations open when there's work; installing kitchn starts nothing and grants no authority.
+          </p>
+        </div>
+        {
+          [roles.slice(0, 4), roles.slice(4)].map((row) => (
+            <div class="line">
+              <div class="line-rail" aria-hidden="true" />
+              <ul class="stations wrap">
+                {row.map((role, i) => (
+                  <li class="station" style={`--i:${i}`}>
+                    <span class="clip" aria-hidden="true" />
+                    <button type="button" class="station-card" data-open={`contract-${role.slug}`} aria-haspopup="dialog">
+                      <RoleAvatar slug={role.slug} />
+                      <span class="station-name">{role.kitchenName}</span>
+                      <span class="station-job">{role.job}</span>
+                      <span class="station-more">Read the contract</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))
+        }
+        {
+          roles.map((role) => (
+            <dialog class="contract" id={`contract-${role.slug}`} aria-labelledby={`contract-${role.slug}-title`}>
+              <div class="contract-body">
+                <button type="button" class="contract-close" data-close aria-label="Close">
+                  Close
+                </button>
+                <RoleAvatar slug={role.slug} />
+                <p class="contract-kind">{role.function}</p>
+                <h3 id={`contract-${role.slug}-title`}>{role.kitchenName}</h3>
+                <p class="contract-job">{role.job}</p>
+                <dl>
+                  <dt>Does</dt>
+                  <dd>{role.responsibility}</dd>
+                  <dt>Owes</dt>
+                  <dd>{role.evidence}</dd>
+                  <dt>Never</dt>
+                  <dd>{role.boundary}</dd>
+                </dl>
+                <p class="contract-foot">
+                  Installing this station starts no worker or schedule and grants no authority.
+                </p>
+              </div>
+            </dialog>
+          ))
+        }
       </section>
 
       <section class="looked wrap" aria-labelledby="looked-title">
@@ -651,10 +762,14 @@ const menu = [
           {
             lookedAt.map((row) => (
               <div class="review-row" role="row">
-                <p class="review-what" role="cell">
-                  {row.what}
-                  <span>{row.examples}</span>
-                </p>
+                <div class="review-what" role="cell">
+                  <p>{row.what}</p>
+                  <div class="review-tools">
+                    {row.examples.map((tool) => (
+                      <ToolChip name={tool.name} icon={"icon" in tool ? tool.icon : undefined} />
+                    ))}
+                  </div>
+                </div>
                 <p class="review-good" role="cell">{row.good}</p>
                 <p class="review-missing" role="cell">{row.missing}</p>
               </div>
@@ -771,6 +886,19 @@ const menu = [
             tabs[next]?.focus();
           });
         });
+      }
+
+      // Station contracts open in a native dialog; Esc, Close or the backdrop dismiss it.
+      for (const opener of document.querySelectorAll<HTMLButtonElement>("[data-open]")) {
+        const dialog = document.getElementById(opener.dataset.open ?? "");
+        if (!(dialog instanceof HTMLDialogElement)) continue;
+        opener.addEventListener("click", () => dialog.showModal());
+      }
+      for (const dialog of document.querySelectorAll<HTMLDialogElement>("dialog.contract")) {
+        dialog.addEventListener("click", (event) => {
+          if (event.target === dialog) dialog.close();
+        });
+        dialog.querySelector("[data-close]")?.addEventListener("click", () => dialog.close());
       }
 
       for (const button of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
@@ -1464,75 +1592,180 @@ const menu = [
     color: var(--ink-soft);
   }
 
-  /* Brigade: the eight role cards as tickets. */
+  /* Brigade: tickets hanging from a rail, one per station. */
+  section.brigade {
+    padding-top: clamp(5rem, 11vw, 8.5rem);
+  }
+  .line-rail {
+    height: 14px;
+    margin-top: clamp(2.5rem, 5vw, 3.5rem);
+    background: linear-gradient(180deg, #e9eef0 0%, #b9c3c9 40%, #7f8c94 75%, #5d6870 100%);
+    box-shadow: 0 6px 10px -4px rgb(0 0 0 / 55%);
+    position: relative;
+    z-index: 1;
+  }
   .stations {
     list-style: none;
-    margin: clamp(2.5rem, 5vw, 3.5rem) 0 0;
+    margin-top: -4px;
     padding: 0;
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 1rem;
+    gap: 2.5rem 1.25rem;
     align-items: start;
   }
   .station {
-    background: var(--paper);
-    color: var(--print);
-    border-radius: 2px;
-    mask: conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) 50% / 12px 100%;
+    --tilt: calc((mod(var(--i), 3) - 1) * 1.2deg);
+    position: relative;
+    transform: rotate(var(--tilt));
+    transform-origin: 50% 0;
+    transition: transform 250ms ease;
   }
-  .station summary {
+  .line + .line {
+    margin-top: 3rem;
+  }
+  .station:hover,
+  .station:focus-within {
+    transform: none;
+  }
+  .clip {
+    position: absolute;
+    top: -6px;
+    left: 50%;
+    width: 2.5rem;
+    height: 0.9rem;
+    margin-left: -1.25rem;
+    background: #b9c3c9;
+    border-radius: 0 0 4px 4px;
+    z-index: 2;
+  }
+  .station-card {
     display: grid;
-    gap: 0.6rem;
-    padding: 1.25rem 1.1rem 0.9rem;
+    justify-items: center;
+    width: 100%;
+    gap: 0.5rem;
+    padding: 1.75rem 1.25rem 1.5rem;
+    text-align: center;
+    font: inherit;
+    color: var(--print);
+    background: var(--paper);
+    border: 0;
     cursor: pointer;
-    list-style: none;
-  }
-  .station summary::-webkit-details-marker {
-    display: none;
+    mask: conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) 50% / 12px 100%;
+    box-shadow: 0 18px 28px -16px rgb(0 0 0 / 70%);
   }
   .station .avatar {
-    width: 5.5rem;
-    height: 5.5rem;
-    margin: -0.25rem 0 -0.5rem -0.5rem;
+    width: 7.5rem;
+    height: 7.5rem;
     color: var(--print);
+    margin-bottom: -0.25rem;
   }
-  .station summary:hover .avatar {
+  .station-card:hover .avatar,
+  .station-card:focus-visible .avatar {
     color: var(--print-red);
   }
   .station-name {
-    font: 900 1.75rem/1 var(--display);
+    font: 900 1.9rem/1 var(--display);
     text-transform: uppercase;
-    padding-bottom: 0.6rem;
-    border-bottom: 2px dashed var(--print);
   }
-  .station summary:hover .station-name {
-    color: var(--print-red);
-  }
-  .station-duty {
+  .station-job {
     font-size: 0.9375rem;
-    line-height: 1.5;
+    line-height: 1.45;
+    color: #3b4750;
+    max-width: 17rem;
   }
-  .station summary::after {
-    content: "Evidence and limits";
+  .station-more {
+    margin-top: 0.4rem;
+    padding-top: 0.7rem;
+    width: 100%;
+    border-top: 2px dashed var(--print);
     font: 600 0.75rem/1 var(--mono);
     color: var(--print-red);
   }
-  .station details[open] summary::after {
-    content: "Hide";
+
+  .contract {
+    width: min(34rem, calc(100% - 2rem));
+    max-height: calc(100% - 2rem);
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--print);
+    overflow: visible;
   }
-  .station dl {
-    margin: 0;
-    padding: 0 1.1rem 1.5rem;
-    font-size: 0.875rem;
-    line-height: 1.5;
+  .contract::backdrop {
+    background: rgb(8 11 13 / 78%);
+    backdrop-filter: blur(3px);
   }
-  .station dt {
-    font: 600 0.75rem/1.8 var(--mono);
+  .contract[open] {
+    animation: contract-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  @keyframes contract-in {
+    from {
+      opacity: 0;
+      transform: translateY(12px) rotate(-1deg);
+    }
+  }
+  .contract-body {
+    position: relative;
+    background: var(--paper);
+    padding: 1.75rem clamp(1.25rem, 4vw, 2.25rem) 2.25rem;
+    mask: conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) 50% / 12px 100%;
+    max-height: calc(100dvh - 2rem);
+    overflow-y: auto;
+  }
+  .contract .avatar {
+    width: 6.5rem;
+    height: 6.5rem;
+    margin-left: -0.75rem;
+  }
+  .contract-close {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    font: 600 0.8125rem/1 var(--mono);
+    color: var(--print);
+    background: none;
+    border: 2px solid var(--print);
+    border-radius: 3px;
+    padding: 0.45rem 0.6rem;
+    cursor: pointer;
+  }
+  .contract-close:hover {
+    background: var(--print);
+    color: var(--paper);
+  }
+  .contract-kind {
+    margin: 0.25rem 0 0;
+    font: 600 0.8125rem/1 var(--mono);
     color: var(--print-red);
-    margin-top: 0.5rem;
   }
-  .station dd {
+  .contract h3 {
+    margin-top: 0.4rem;
+    font-size: 2.75rem;
+  }
+  .contract-job {
+    margin: 0.6rem 0 0;
+    padding-bottom: 1rem;
+    border-bottom: 2px dashed var(--print);
+    font-size: 1.0625rem;
+  }
+  .contract dl {
     margin: 0;
+  }
+  .contract dt {
+    margin-top: 1rem;
+    font: 600 0.8125rem/1 var(--mono);
+    color: var(--print-red);
+  }
+  .contract dd {
+    margin: 0.35rem 0 0;
+    line-height: 1.55;
+  }
+  .contract-foot {
+    margin: 1.5rem 0 0;
+    padding-top: 1rem;
+    border-top: 1px solid #e3ddcb;
+    font-size: 0.875rem;
+    color: #5b6770;
   }
 
   /* We looked first. */
@@ -1556,16 +1789,16 @@ const menu = [
     padding-block: 0.9rem;
     border-top: 0;
   }
-  .review-what {
+  .review-what p {
+    margin: 0;
     font: 900 1.6rem/1 var(--display);
     text-transform: uppercase;
   }
-  .review-what span {
-    display: block;
-    margin-top: 0.4rem;
-    font: 400 0.8125rem/1.4 var(--mono);
-    text-transform: none;
-    color: var(--ink-soft);
+  .review-tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.7rem;
   }
   .review-good {
     color: var(--ink-soft);
@@ -1816,6 +2049,136 @@ const menu = [
     color: var(--lamp);
   }
 
+  /* Autopilot: the night shift and the morning report. */
+  section.autopilot {
+    margin-top: clamp(5rem, 11vw, 8.5rem);
+    padding: clamp(4rem, 9vw, 7rem) 0;
+    background: #0b0f11;
+    border-block: 1px solid var(--steel-edge);
+  }
+  .autopilot h2 {
+    font-size: clamp(3rem, 8vw, 6.5rem);
+    max-width: none;
+  }
+  .shift {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(0, 0.9fr);
+    gap: 2.5rem clamp(2rem, 5vw, 4rem);
+    align-items: start;
+    margin-top: clamp(2.5rem, 5vw, 3.5rem);
+  }
+  .shift-log {
+    list-style: none;
+    margin: 0;
+    padding: 0 0 0 1.25rem;
+    border-left: 2px solid var(--steel-edge);
+  }
+  .shift-log li {
+    position: relative;
+    display: grid;
+    grid-template-columns: 3.5rem 6.5rem minmax(0, 1fr);
+    gap: 0 1rem;
+    padding: 0.7rem 0;
+    font-size: 0.9375rem;
+  }
+  .shift-log li::before {
+    content: "";
+    position: absolute;
+    left: calc(-1.25rem - 6px);
+    top: 1.05rem;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--steel-edge);
+  }
+  .shift-log li.good::before {
+    background: #8fd694;
+  }
+  .shift-log li.flag::before {
+    background: var(--lamp);
+  }
+  .shift-time {
+    font: 400 0.875rem/1.6 var(--mono);
+    color: var(--ink-soft);
+  }
+  .shift-who {
+    font-weight: 700;
+  }
+  .shift-text {
+    color: var(--ink-soft);
+  }
+  .shift-log li.flag .shift-text {
+    color: var(--lamp);
+  }
+  .shift-log li.good .shift-text {
+    color: #8fd694;
+  }
+  .report {
+    background: var(--paper);
+    color: var(--print);
+    padding: 1.5rem 1.5rem 2rem;
+    transform: rotate(1.2deg);
+    mask: conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg) 50% / 12px 100%;
+    box-shadow: 0 24px 40px -18px rgb(0 0 0 / 80%);
+  }
+  .report-head {
+    display: flex;
+    justify-content: space-between;
+    margin: 0;
+    padding-bottom: 0.6rem;
+    border-bottom: 2px dashed var(--print);
+    font: 600 0.8125rem/1 var(--mono);
+  }
+  .report-title {
+    margin: 1rem 0 0.75rem;
+    font: 900 1.6rem/1.05 var(--display);
+    text-transform: uppercase;
+  }
+  .report dl {
+    margin: 0;
+  }
+  .report dl div {
+    display: grid;
+    grid-template-columns: 9.5rem minmax(0, 1fr);
+    gap: 1rem;
+    padding: 0.55rem 0;
+    border-top: 1px solid #e3ddcb;
+    font-size: 0.9375rem;
+  }
+  .report dt {
+    font-weight: 700;
+  }
+  .report dd {
+    margin: 0;
+  }
+  .report .good dd {
+    color: #2b7a38;
+    font-weight: 600;
+  }
+  .report .flag dd {
+    color: var(--print-red);
+    font-weight: 600;
+  }
+  .guardrails {
+    list-style: none;
+    margin: clamp(3rem, 6vw, 4.5rem) 0 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 2rem 3rem;
+  }
+  .guardrails li {
+    padding-top: 1rem;
+    border-top: 3px solid var(--red);
+  }
+  .guardrails h3 {
+    font-size: 1.9rem;
+  }
+  .guardrails p {
+    margin: 0.6rem 0 0;
+    color: var(--ink-soft);
+  }
+
   /* Feature rows: a file window with a result card laid over it. */
   .feature {
     display: grid;
@@ -1950,6 +2313,10 @@ const menu = [
   }
 
   @media (max-width: 60rem) {
+    .shift,
+    .guardrails {
+      grid-template-columns: minmax(0, 1fr);
+    }
     .terms {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
@@ -1978,6 +2345,16 @@ const menu = [
   }
 
   @media (max-width: 40rem) {
+    .shift-log li {
+      grid-template-columns: 3.25rem minmax(0, 1fr);
+    }
+    .shift-text {
+      grid-column: 2;
+    }
+    .report dl div {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 0.1rem;
+    }
     .printout-head span:first-child {
       display: none;
     }
@@ -2006,6 +2383,7 @@ const menu = [
     .stations {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+
     .steps {
       grid-template-columns: repeat(2, minmax(0, 1fr));
       row-gap: 2rem;
@@ -2069,6 +2447,12 @@ const menu = [
   }
 
   @media (prefers-reduced-motion: reduce) {
+    .contract[open] {
+      animation: none;
+    }
+    .station {
+      transition: none;
+    }
     .marker,
     .lamp {
       transition: none;

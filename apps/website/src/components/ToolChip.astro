@@ -1,0 +1,35 @@
+---
+import type { SimpleIcon } from "simple-icons";
+
+interface Props {
+  name: string;
+  icon?: SimpleIcon | undefined;
+}
+
+const { name, icon } = Astro.props;
+---
+
+<span class="chip tool">
+  {
+    icon && (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d={icon.path} />
+      </svg>
+    )
+  }
+  {name}
+</span>
+
+<style>
+  .tool {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+  }
+  svg {
+    width: 0.95rem;
+    height: 0.95rem;
+    fill: currentColor;
+    flex: none;
+  }
+</style>

@@ -15,17 +15,23 @@
 //! - An expired lease means ownership is uncertain, not released. It appears
 //!   in the recovery queue and changes hands only through an explicit
 //!   takeover, which interrupts the old attempt and issues a larger fence.
+//! - A deliberate transfer is a recorded relinquish followed by an adoption,
+//!   distinct from a takeover after expiry. Neither proves that workers the
+//!   previous owner started have stopped; their effects stay recorded for the
+//!   new owner to reconcile.
 //! - Intent is persisted before every effect. While any effect is unresolved,
 //!   no new effect or attempt starts; the owner reconciles first.
 //! - An effect whose outcome cannot be established is handed over, not
 //!   resolved: the task keeps its reservation until positive evidence or a
 //!   scoped [`RiskDecision`] allows one specific action.
 
+mod consumer;
 mod effects;
 mod error;
 mod model;
 mod store;
 
+pub use consumer::{ConsumerEvent, ConsumerRecord, ConsumerState, MAX_CONSUMER_HISTORY};
 pub use effects::{ReconcileReport, reconcile, run_effect};
 pub use error::{Corruption, Limit, StateError, StorageOperation};
 pub use model::{

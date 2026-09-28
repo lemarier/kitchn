@@ -43,8 +43,9 @@ use crate::{
         Timestamp,
     },
     state::{
-        CancelStatus, Consumption, Corruption, Creation, EffectOutcome, EffectPlan, EffectRecord,
-        EffectStart, Lease, RecoveryItem, RiskDecision, StateError, StorageOperation, TaskRecord,
+        CancelStatus, ConsumerRecord, Consumption, Corruption, Creation, EffectOutcome, EffectPlan,
+        EffectRecord, EffectStart, Lease, RecoveryItem, RiskDecision, StateError, StorageOperation,
+        TaskRecord,
         model::{SCHEMA_VERSION, SchemaProbe, StoreState},
     },
 };
@@ -452,7 +453,8 @@ impl HouseStore {
         self.transact(|state| state.consume_message(id, fence, message, now))
     }
 
-    /// Acquire the single-consumer lease for a workflow scope.
+    /// Acquire the single-consumer lease for a workflow scope. Acquiring a
+    /// relinquished scope records an adoption of it.
     ///
     /// # Errors
     /// Returns [`StateError::ClaimHeld`] while another lease is live and
@@ -481,15 +483,36 @@ impl HouseStore {
         self.transact(|state| state.renew_consumer(consumer, fence, ttl, now))
     }
 
-    /// Release a consumer lease. Releasing an absent lease is a no-op.
+    /// Hand the scope over with work possibly in flight. The next consumer
+    /// adopts it; until then it waits in the recovery queue.
+    ///
+    /// # Errors
+    /// Returns [`StateError::StaleFence`] unless `fence` holds the lease.
+    pub fn relinquish_consumer(
+        &self,
+        consumer: &ConsumerId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.transact(|state| state.relinquish_consumer(consumer, fence, now))
+    }
+
+    /// Release a consumer lease when nothing is in flight. Repeating the
+    /// release, or releasing an unknown scope, is a no-op.
     ///
     /// # Errors
     /// Returns [`StateError::StaleFence`] when another fence holds the lease.
-    pub fn release_consumer(&self, consumer: &ConsumerId, fence: Fence) -> Result<()> {
-        self.transact(|state| state.release_consumer(consumer, fence))
+    pub fn release_consumer(
+        &self,
+        consumer: &ConsumerId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.transact(|state| state.release_consumer(consumer, fence, now))
     }
 
-    /// Explicitly take over an expired consumer lease.
+    /// Explicitly take over an expired consumer lease. The history records a
+    /// takeover, distinct from a relinquish and adoption.
     ///
     /// # Errors
     /// Returns [`StateError::LeaseLive`] while the lease is live.
@@ -503,11 +526,11 @@ impl HouseStore {
         self.transact(|state| state.take_over_consumer(consumer, holder, ttl, now))
     }
 
-    /// Read a consumer lease.
+    /// Read a consumer scope's holder and recent transfers.
     ///
     /// # Errors
     /// Returns a storage error.
-    pub fn consumer(&self, consumer: &ConsumerId) -> Result<Option<Lease>> {
+    pub fn consumer(&self, consumer: &ConsumerId) -> Result<Option<ConsumerRecord>> {
         self.read(|state| state.consumer(consumer).cloned())
     }
 

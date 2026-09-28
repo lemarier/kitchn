@@ -23,9 +23,10 @@ use kitchen::{
         NotAppliedReason, Permission, Receipt, RetryPolicy, Settlement, Timestamp, UncertainReason,
     },
     state::{
-        AttemptState, CancelStatus, Consumption, Corruption, Creation, EffectOutcome, EffectStart,
-        EffectState, HouseStore, MAX_EVIDENCE_PER_REVISION, OwnershipEvent, RecoveryItem,
-        RiskAction, RiskDecision, StateError, StoreOptions, TaskState,
+        AttemptState, CancelStatus, ConsumerEvent, ConsumerState, Consumption, Corruption,
+        Creation, EffectOutcome, EffectStart, EffectState, HouseStore, MAX_EVIDENCE_PER_REVISION,
+        OwnershipEvent, RecoveryItem, RiskAction, RiskDecision, StateError, StoreOptions,
+        TaskState,
     },
 };
 
@@ -355,8 +356,8 @@ fn coordinator_relinquish_then_adopt() -> TestResult {
         [
             OwnershipEvent::Claimed { .. },
             OwnershipEvent::Relinquished { fence, .. },
-            OwnershipEvent::Claimed { .. }
-        ] if *fence == old
+            OwnershipEvent::Adopted { previous, fence: adopted_fence, .. }
+        ] if *fence == old && *previous == old && *adopted_fence == adopted.fence()
     ));
     assert!(
         matches!(record.attempts(), [first] if first.state() == AttemptState::Interrupted { at: at(2) })
@@ -807,19 +808,38 @@ fn pickup_duplicate_tick_single_consumer() -> TestResult {
     let second = store.take_over_consumer(&pickup, &holder("tick-3")?, ttl(60)?, at(91))?;
     assert!(second.fence() > first.fence());
     assert!(matches!(
-        store.release_consumer(&pickup, first.fence()),
+        store.release_consumer(&pickup, first.fence(), at(91)),
         Err(Error::State(StateError::StaleFence { .. }))
     ));
     assert!(matches!(
         store.renew_consumer(&pickup, first.fence(), ttl(60)?, at(92)),
         Err(Error::State(StateError::StaleFence { .. }))
     ));
-    store.release_consumer(&pickup, second.fence())?;
-    store.release_consumer(&pickup, second.fence())?;
-    assert_eq!(store.consumer(&pickup)?, None);
+    store.release_consumer(&pickup, second.fence(), at(92))?;
+    store.release_consumer(&pickup, second.fence(), at(93))?;
+    let record = store.consumer(&pickup)?.ok_or("consumer record kept")?;
+    assert_eq!(record.state(), &ConsumerState::Idle);
     assert!(matches!(
         store.renew_consumer(&pickup, second.fence(), ttl(60)?, at(93)),
+        Err(Error::State(StateError::StaleFence { .. }))
+    ));
+    assert!(matches!(
+        store.renew_consumer(
+            &ConsumerId::new("unknown")?,
+            second.fence(),
+            ttl(60)?,
+            at(93)
+        ),
         Err(Error::State(StateError::ConsumerNotFound(_)))
+    ));
+    let events: Vec<_> = record.history().cloned().collect();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            ConsumerEvent::Acquired { fence: a, .. },
+            ConsumerEvent::TakenOver { previous, fence: b, .. },
+            ConsumerEvent::Released { fence: c, .. },
+        ] if *a == first.fence() && *previous == first.fence() && *b == second.fence() && *c == second.fence()
     ));
     Ok(())
 }
@@ -1180,7 +1200,16 @@ fn ownership_history_must_match_the_current_lease() -> TestResult {
         {"type": "released", "fence": 1, "at": 0},
         {"type": "claimed", "holder": "coordinator-a", "fence": 1, "at": 0},
     ]);
-    for corrupt in [erased, swapped_holder, released_then_claimed] {
+    let mut adopted_without_relinquish = valid.clone();
+    adopted_without_relinquish["tasks"]["task-1"]["ownership"] = serde_json::json!([
+        {"type": "adopted", "previous": 0, "holder": "coordinator-a", "fence": 1, "at": 0},
+    ]);
+    for corrupt in [
+        erased,
+        swapped_holder,
+        released_then_claimed,
+        adopted_without_relinquish,
+    ] {
         fs::write(&path, serde_json::to_vec_pretty(&corrupt)?)?;
         assert!(matches!(
             open_error(&fixture),
@@ -1405,5 +1434,87 @@ fn a_handed_over_effect_keeps_blocking_new_work_and_success() -> TestResult {
         at(8),
     )?;
     assert!(matches!(applied.state(), EffectState::Applied { .. }));
+    Ok(())
+}
+
+#[test]
+fn coordinator_transfer_is_a_relinquish_adopt_pair_not_an_expiry() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let run = ConsumerId::new("coordinator-origin89")?;
+    let first = store.acquire_consumer(&run, &holder("session-a")?, ttl(60)?, at(0))?;
+    store.relinquish_consumer(&run, first.fence(), at(10))?;
+    assert!(matches!(
+        store.renew_consumer(&run, first.fence(), ttl(60)?, at(11)),
+        Err(Error::State(StateError::StaleFence { .. }))
+    ));
+    assert_eq!(
+        store.recovery_queue(at(11))?,
+        vec![RecoveryItem::AwaitingAdoption {
+            consumer: run.clone(),
+            holder: holder("session-a")?,
+            since: at(10),
+        }]
+    );
+    let adopted = store.acquire_consumer(&run, &holder("session-b")?, ttl(60)?, at(12))?;
+    assert!(adopted.fence() > first.fence());
+    assert!(store.recovery_queue(at(12))?.is_empty());
+    let record = store.consumer(&run)?.ok_or("consumer record")?;
+    assert_eq!(record.lease(), Some(&adopted));
+    assert!(matches!(
+        record.history().collect::<Vec<_>>().as_slice(),
+        [
+            ConsumerEvent::Acquired { .. },
+            ConsumerEvent::Relinquished { fence, .. },
+            ConsumerEvent::Adopted { previous, .. },
+        ] if *fence == first.fence() && *previous == first.fence()
+    ));
+
+    // A quiet holder is not a relinquish: expiry needs an explicit takeover.
+    assert!(matches!(
+        store.acquire_consumer(&run, &holder("session-c")?, ttl(60)?, at(73)),
+        Err(Error::State(StateError::LeaseExpired { .. }))
+    ));
+    store.take_over_consumer(&run, &holder("session-c")?, ttl(60)?, at(73))?;
+    let record = store.consumer(&run)?.ok_or("consumer record")?;
+    assert!(matches!(
+        record.history().last(),
+        Some(ConsumerEvent::TakenOver { previous, .. }) if *previous == adopted.fence()
+    ));
+    Ok(())
+}
+
+#[test]
+fn consumer_history_is_bounded_and_validated() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let pickup = ConsumerId::new("pickup-origin89")?;
+    for tick in 0..40 {
+        let lease = store.acquire_consumer(&pickup, &holder("tick")?, ttl(60)?, at(tick))?;
+        store.release_consumer(&pickup, lease.fence(), at(tick))?;
+    }
+    let record = store.consumer(&pickup)?.ok_or("consumer record")?;
+    assert_eq!(
+        record.history().count(),
+        kitchen::state::MAX_CONSUMER_HISTORY
+    );
+    assert!(matches!(
+        record.history().last(),
+        Some(ConsumerEvent::Released { .. })
+    ));
+
+    let path = fixture.state_path();
+    let mut state: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    state["consumers"]["pickup-origin89"]["state"] = serde_json::json!({
+        "type": "held",
+        "lease": {"holder": "tick", "fence": 1, "acquiredAt": 0, "expiresAt": 60000}
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&state)?)?;
+    assert!(matches!(
+        open_error(&fixture),
+        Some(Error::State(StateError::CorruptState(
+            Corruption::Ownership
+        )))
+    ));
     Ok(())
 }

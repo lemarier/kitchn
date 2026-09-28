@@ -20,7 +20,7 @@ use crate::{
         Operation, Receipt, ResourceRef, RetryPolicy, Settlement, TaskSpec, Timestamp,
         UncertainReason,
     },
-    state::{Corruption, Limit, StateError},
+    state::{ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, StateError},
 };
 
 /// The persisted schema version.
@@ -366,6 +366,17 @@ impl EffectRecord {
 pub enum OwnershipEvent {
     /// A holder claimed an open task.
     Claimed {
+        /// New holder.
+        holder: HolderId,
+        /// New fence.
+        fence: Fence,
+        /// When.
+        at: Timestamp,
+    },
+    /// A holder claimed a task its previous owner relinquished.
+    Adopted {
+        /// The relinquished fence.
+        previous: Fence,
         /// New holder.
         holder: HolderId,
         /// New fence.
@@ -816,6 +827,15 @@ pub enum RecoveryItem {
         /// The task.
         task: TaskId,
     },
+    /// A consumer relinquished its scope; the next consumer adopts it.
+    AwaitingAdoption {
+        /// The consumer scope.
+        consumer: ConsumerId,
+        /// The relinquishing holder.
+        holder: HolderId,
+        /// When it was relinquished.
+        since: Timestamp,
+    },
     /// A consumer lease expired; ownership is uncertain until someone takes over.
     UncertainConsumer {
         /// The consumer scope.
@@ -837,7 +857,7 @@ pub(crate) struct StoreState {
     #[serde(deserialize_with = "unique_map")]
     tasks: BTreeMap<TaskId, TaskRecord>,
     #[serde(deserialize_with = "unique_map")]
-    consumers: BTreeMap<ConsumerId, Lease>,
+    consumers: BTreeMap<ConsumerId, ConsumerRecord>,
 }
 
 /// Deserialize a map, rejecting a repeated key instead of letting a later
@@ -929,7 +949,7 @@ impl StoreState {
         self.tasks.values()
     }
 
-    pub(crate) fn consumer(&self, id: &ConsumerId) -> Option<&Lease> {
+    pub(crate) fn consumer(&self, id: &ConsumerId) -> Option<&ConsumerRecord> {
         self.consumers.get(id)
     }
 
@@ -997,11 +1017,28 @@ impl StoreState {
         }
         let lease = self.new_lease(holder, ttl, now);
         let task = self.task_mut(id)?;
-        task.push_ownership(OwnershipEvent::Claimed {
-            holder: holder.clone(),
-            fence: lease.fence,
-            at: now,
-        })?;
+        let event = match task.ownership.last() {
+            Some(OwnershipEvent::Relinquished {
+                fence: previous, ..
+            }) => OwnershipEvent::Adopted {
+                previous: *previous,
+                holder: holder.clone(),
+                fence: lease.fence,
+                at: now,
+            },
+            Some(
+                OwnershipEvent::Claimed { .. }
+                | OwnershipEvent::Adopted { .. }
+                | OwnershipEvent::TakenOver { .. }
+                | OwnershipEvent::Released { .. },
+            )
+            | None => OwnershipEvent::Claimed {
+                holder: holder.clone(),
+                fence: lease.fence,
+                at: now,
+            },
+        };
+        task.push_ownership(event)?;
         task.state = TaskState::Claimed {
             lease: lease.clone(),
         };
@@ -1512,22 +1549,66 @@ impl StoreState {
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
-        match self.consumers.get(consumer) {
-            Some(lease) if lease.is_live(now) => fail(StateError::ClaimHeld {
-                holder: lease.holder.clone(),
-                expires_at: lease.expires_at,
-            }),
-            Some(lease) => fail(StateError::LeaseExpired {
-                expired_at: lease.expires_at,
-            }),
-            None if self.consumers.len() >= MAX_CONSUMERS => fail(StateError::CapacityExceeded {
-                limit: Limit::Consumers,
-            }),
-            None => {
-                let lease = self.new_lease(holder, ttl, now);
-                self.consumers.insert(consumer.clone(), lease.clone());
-                Ok(lease)
+        let previous = match self.consumers.get(consumer).map(ConsumerRecord::state) {
+            Some(ConsumerState::Held { lease }) if lease.is_live(now) => {
+                return fail(StateError::ClaimHeld {
+                    holder: lease.holder.clone(),
+                    expires_at: lease.expires_at,
+                });
             }
+            Some(ConsumerState::Held { lease }) => {
+                return fail(StateError::LeaseExpired {
+                    expired_at: lease.expires_at,
+                });
+            }
+            Some(ConsumerState::Relinquished { lease, .. }) => Some(lease.fence),
+            Some(ConsumerState::Idle) => None,
+            None if self.consumers.len() >= MAX_CONSUMERS => {
+                return fail(StateError::CapacityExceeded {
+                    limit: Limit::Consumers,
+                });
+            }
+            None => None,
+        };
+        let lease = self.new_lease(holder, ttl, now);
+        let event = match previous {
+            Some(previous) => ConsumerEvent::Adopted {
+                previous,
+                holder: holder.clone(),
+                fence: lease.fence,
+                at: now,
+            },
+            None => ConsumerEvent::Acquired {
+                holder: holder.clone(),
+                fence: lease.fence,
+                at: now,
+            },
+        };
+        self.consumers
+            .entry(consumer.clone())
+            .or_insert_with(|| ConsumerRecord::new(ConsumerState::Idle))
+            .record(
+                ConsumerState::Held {
+                    lease: lease.clone(),
+                },
+                event,
+            );
+        Ok(lease)
+    }
+
+    fn held_consumer(
+        &mut self,
+        consumer: &ConsumerId,
+        fence: Fence,
+    ) -> Result<&mut ConsumerRecord> {
+        let Some(record) = self.consumers.get_mut(consumer) else {
+            return fail(StateError::ConsumerNotFound(consumer.clone()));
+        };
+        match &record.state {
+            ConsumerState::Held { lease } if lease.fence == fence => Ok(record),
+            ConsumerState::Held { .. }
+            | ConsumerState::Relinquished { .. }
+            | ConsumerState::Idle => fail(StateError::StaleFence { presented: fence }),
         }
     }
 
@@ -1538,30 +1619,55 @@ impl StoreState {
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
-        let Some(lease) = self.consumers.get_mut(consumer) else {
-            return fail(StateError::ConsumerNotFound(consumer.clone()));
-        };
-        if lease.fence != fence {
-            return fail(StateError::StaleFence { presented: fence });
-        }
-        if !lease.is_live(now) {
-            return fail(StateError::LeaseExpired {
+        let record = self.held_consumer(consumer, fence)?;
+        match &mut record.state {
+            ConsumerState::Held { lease } if lease.is_live(now) => {
+                lease.expires_at = now.saturating_add(ttl.duration());
+                Ok(lease.clone())
+            }
+            ConsumerState::Held { lease } => fail(StateError::LeaseExpired {
                 expired_at: lease.expires_at,
-            });
+            }),
+            ConsumerState::Relinquished { .. } | ConsumerState::Idle => {
+                fail(StateError::StaleFence { presented: fence })
+            }
         }
-        lease.expires_at = now.saturating_add(ttl.duration());
-        Ok(lease.clone())
     }
 
-    pub(crate) fn release_consumer(&mut self, consumer: &ConsumerId, fence: Fence) -> Result<()> {
-        match self.consumers.get(consumer) {
-            None => Ok(()),
-            Some(lease) if lease.fence == fence => {
-                self.consumers.remove(consumer);
-                Ok(())
-            }
-            Some(_) => fail(StateError::StaleFence { presented: fence }),
+    pub(crate) fn relinquish_consumer(
+        &mut self,
+        consumer: &ConsumerId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<()> {
+        let record = self.held_consumer(consumer, fence)?;
+        if let ConsumerState::Held { lease } = &record.state {
+            let lease = lease.clone();
+            record.record(
+                ConsumerState::Relinquished { lease, at: now },
+                ConsumerEvent::Relinquished { fence, at: now },
+            );
         }
+        Ok(())
+    }
+
+    pub(crate) fn release_consumer(
+        &mut self,
+        consumer: &ConsumerId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<()> {
+        let released = self.consumers.get(consumer).is_none_or(|record| {
+            matches!(record.history.back(), Some(ConsumerEvent::Released { fence: last, .. }) if *last == fence)
+        });
+        if released {
+            return Ok(());
+        }
+        self.held_consumer(consumer, fence)?.record(
+            ConsumerState::Idle,
+            ConsumerEvent::Released { fence, at: now },
+        );
+        Ok(())
     }
 
     pub(crate) fn take_over_consumer(
@@ -1571,17 +1677,33 @@ impl StoreState {
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
-        match self.consumers.get(consumer) {
-            None => self.acquire_consumer(consumer, holder, ttl, now),
-            Some(lease) if lease.is_live(now) => fail(StateError::LeaseLive {
-                expires_at: lease.expires_at,
-            }),
-            Some(_) => {
-                let lease = self.new_lease(holder, ttl, now);
-                self.consumers.insert(consumer.clone(), lease.clone());
-                Ok(lease)
+        let previous = match self.consumers.get(consumer).map(ConsumerRecord::state) {
+            Some(ConsumerState::Held { lease }) if lease.is_live(now) => {
+                return fail(StateError::LeaseLive {
+                    expires_at: lease.expires_at,
+                });
             }
+            Some(ConsumerState::Held { lease }) => lease.fence,
+            Some(ConsumerState::Idle | ConsumerState::Relinquished { .. }) | None => {
+                return self.acquire_consumer(consumer, holder, ttl, now);
+            }
+        };
+        let lease = self.new_lease(holder, ttl, now);
+        let event = ConsumerEvent::TakenOver {
+            previous,
+            holder: holder.clone(),
+            fence: lease.fence,
+            at: now,
+        };
+        if let Some(record) = self.consumers.get_mut(consumer) {
+            record.record(
+                ConsumerState::Held {
+                    lease: lease.clone(),
+                },
+                event,
+            );
         }
+        Ok(lease)
     }
 
     pub(crate) fn recovery_queue(&self, now: Timestamp) -> Vec<RecoveryItem> {
@@ -1617,15 +1739,26 @@ impl StoreState {
                 },
             }
         });
-        let consumers = self
-            .consumers
-            .iter()
-            .filter(|(_, lease)| !lease.is_live(now))
-            .map(|(consumer, lease)| RecoveryItem::UncertainConsumer {
-                consumer: consumer.clone(),
-                holder: lease.holder.clone(),
-                expired_at: lease.expires_at,
-            });
+        let consumers =
+            self.consumers
+                .iter()
+                .filter_map(|(consumer, record)| match &record.state {
+                    ConsumerState::Held { lease } if !lease.is_live(now) => {
+                        Some(RecoveryItem::UncertainConsumer {
+                            consumer: consumer.clone(),
+                            holder: lease.holder.clone(),
+                            expired_at: lease.expires_at,
+                        })
+                    }
+                    ConsumerState::Relinquished { lease, at } => {
+                        Some(RecoveryItem::AwaitingAdoption {
+                            consumer: consumer.clone(),
+                            holder: lease.holder.clone(),
+                            since: *at,
+                        })
+                    }
+                    ConsumerState::Held { .. } | ConsumerState::Idle => None,
+                });
         tasks.chain(handed_over).chain(consumers).collect()
     }
 
@@ -1634,12 +1767,8 @@ impl StoreState {
         if self.tasks.len() > MAX_TASKS || self.consumers.len() > MAX_CONSUMERS {
             return Err(Corruption::LimitExceeded);
         }
-        if self
-            .consumers
-            .values()
-            .any(|lease| lease.fence.get() >= self.next_fence)
-        {
-            return Err(Corruption::FenceAhead);
+        for record in self.consumers.values() {
+            record.validate(self.next_fence)?;
         }
         self.tasks
             .iter()
@@ -1734,6 +1863,7 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
     let mut owner: Option<(&HolderId, Fence)> = None;
     let mut owned = BTreeSet::new();
     let mut released = false;
+    let mut relinquished = None;
     let issue = |owned: &mut BTreeSet<Fence>, fence: Fence| {
         if fence.get() >= next_fence {
             return Err(Corruption::FenceAhead);
@@ -1749,9 +1879,22 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
             return Err(Corruption::Ownership);
         }
         let current = owner.map(|(_, fence)| fence);
+        let after_relinquish = relinquished.take();
         match event {
             OwnershipEvent::Claimed { holder, fence, .. } => {
-                if owner.is_some() {
+                if owner.is_some() || after_relinquish.is_some() {
+                    return Err(Corruption::Ownership);
+                }
+                issue(&mut owned, *fence)?;
+                owner = Some((holder, *fence));
+            }
+            OwnershipEvent::Adopted {
+                previous,
+                holder,
+                fence,
+                ..
+            } => {
+                if owner.is_some() || after_relinquish != Some(*previous) {
                     return Err(Corruption::Ownership);
                 }
                 issue(&mut owned, *fence)?;
@@ -1775,6 +1918,9 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
                 }
                 owner = None;
                 released = matches!(event, OwnershipEvent::Released { .. });
+                if matches!(event, OwnershipEvent::Relinquished { .. }) {
+                    relinquished = Some(*fence);
+                }
             }
         }
     }

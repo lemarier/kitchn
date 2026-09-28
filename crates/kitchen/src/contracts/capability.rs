@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BackendId, HouseId,
     contracts::{ContractError, Effect, ValueKind},
+    selection::{AgentSelection, SelectionGap, SelectionSupport},
 };
 
 closed_names! {
@@ -221,6 +222,46 @@ impl CapabilitySet {
 }
 
 impl BackendDescriptor {
+    /// Declare what worker launches can honor of an agent selection.
+    #[must_use]
+    pub const fn with_worker_selection(mut self, support: SelectionSupport) -> Self {
+        self.worker_selection = Some(support);
+        self
+    }
+
+    /// Check that worker launches can provide all of `selection`.
+    ///
+    /// # Errors
+    /// [`ContractError::UnsupportedCapabilities`] naming the selection
+    /// capability behind every gap; with no declaration, the family
+    /// capability plus model and effort when the selection sets them.
+    pub fn check_worker_selection(&self, selection: &AgentSelection) -> Result<(), ContractError> {
+        let mut missing: Vec<Capability> = match &self.worker_selection {
+            Some(support) => support
+                .gaps(selection)
+                .into_iter()
+                .map(SelectionGap::capability)
+                .collect(),
+            None => {
+                let mut all = vec![Capability::AgentSelectFamily];
+                if selection.model.is_some() || selection.effort.is_some() {
+                    all.push(Capability::AgentSelectModel);
+                }
+                all
+            }
+        };
+        missing.sort_unstable();
+        missing.dedup();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(ContractError::UnsupportedCapabilities {
+                missing,
+                partial: Vec::new(),
+            })
+        }
+    }
+
     /// Whether the executor can look up `effect`'s outcome by its persisted
     /// request: [`Capability::EffectLookup`] or the effect kind's own lookup
     /// capability is fully supported.
@@ -258,4 +299,95 @@ pub struct BackendDescriptor {
     pub house: HouseId,
     /// Declared capabilities.
     pub capabilities: CapabilitySet,
+    /// What this backend's worker launches can honor of an agent selection.
+    /// `None` means launches cannot honor any selection: the state store
+    /// refuses a launch that names one rather than let it run on the
+    /// backend's default agent.
+    pub worker_selection: Option<SelectionSupport>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        scheduling::AgentFamily,
+        selection::{AgentModel, EffortLevel, EffortSupport},
+    };
+
+    fn descriptor(worker_selection: Option<SelectionSupport>) -> Option<BackendDescriptor> {
+        Some(BackendDescriptor {
+            backend: BackendId::new("orca-local").ok()?,
+            house: HouseId::new("origin89").ok()?,
+            capabilities: CapabilitySet::new(),
+            worker_selection,
+        })
+    }
+
+    fn chosen(model: bool, effort: bool) -> Option<AgentSelection> {
+        Some(AgentSelection {
+            agent: AgentFamily::Codex,
+            model: if model {
+                Some(AgentModel::new("gpt-6-sol").ok()?)
+            } else {
+                None
+            },
+            effort: if effort {
+                Some(EffortLevel::new("high").ok()?)
+            } else {
+                None
+            },
+        })
+    }
+
+    const CODEX_MODEL: SelectionSupport = SelectionSupport {
+        families: &[AgentFamily::Codex],
+        model: true,
+        effort: EffortSupport::WithModel,
+    };
+
+    #[test]
+    fn an_undeclared_surface_provides_no_selection() {
+        let none = descriptor(None);
+        let family = none
+            .as_ref()
+            .zip(chosen(false, false))
+            .map(|(descriptor, selection)| descriptor.check_worker_selection(&selection));
+        assert_eq!(
+            family,
+            Some(Err(ContractError::UnsupportedCapabilities {
+                missing: vec![Capability::AgentSelectFamily],
+                partial: Vec::new(),
+            }))
+        );
+        let detailed = none
+            .zip(chosen(true, true))
+            .map(|(descriptor, selection)| descriptor.check_worker_selection(&selection));
+        assert_eq!(
+            detailed,
+            Some(Err(ContractError::UnsupportedCapabilities {
+                missing: vec![Capability::AgentSelectFamily, Capability::AgentSelectModel],
+                partial: Vec::new(),
+            }))
+        );
+    }
+
+    #[test]
+    fn a_declared_surface_accepts_what_it_provides_and_names_the_rest() {
+        let declared = descriptor(None).map(|d| d.with_worker_selection(CODEX_MODEL));
+        let accepted = declared
+            .as_ref()
+            .zip(chosen(true, true))
+            .map(|(descriptor, selection)| descriptor.check_worker_selection(&selection));
+        assert_eq!(accepted, Some(Ok(())));
+        let effort_only = declared
+            .zip(chosen(false, true))
+            .map(|(descriptor, selection)| descriptor.check_worker_selection(&selection));
+        assert_eq!(
+            effort_only,
+            Some(Err(ContractError::UnsupportedCapabilities {
+                missing: vec![Capability::AgentSelectModel],
+                partial: Vec::new(),
+            }))
+        );
+    }
 }

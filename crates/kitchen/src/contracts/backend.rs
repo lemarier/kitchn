@@ -52,8 +52,10 @@ pub enum Operation {
         branch: Option<BranchName>,
         /// The agent, model, and effort to launch: the task's resolved
         /// selection, which the state store enforces. `None` only for a task
-        /// without one; the backend then launches its default agent. An
-        /// executor that cannot provide the selection refuses the launch.
+        /// without one; the backend then launches its default agent. The
+        /// state store refuses the launch unless the executor's descriptor
+        /// declares [`BackendDescriptor::worker_selection`] support for
+        /// exactly this selection, and executors refuse it again themselves.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<AgentSelection>,
     },

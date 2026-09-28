@@ -210,6 +210,7 @@ pub fn descriptor_with(
     Ok(BackendDescriptor {
         backend: backend_id()?,
         house: house()?,
+        worker_selection: None,
         capabilities: CapabilitySet::supporting(capabilities),
     })
 }

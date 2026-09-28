@@ -188,7 +188,9 @@ pub fn capabilities() -> CapabilitySet {
     .with(C::SchedulePrecheck, Support::Partial)
     // `run-use` binds a terminal but records no relinquish; Kitchen owns the checkpoint.
     .with(C::RunTransfer, Support::Partial)
-    // Workers accept `--model`; automations cannot select one.
+    // Partial: automations cannot select a model. Worker launches can, and
+    // declare it through the descriptor's `worker_selection`, which the
+    // state store checks before every launch that names a selection.
     .with(C::AgentSelectModel, Support::Partial)
     // Automation run usage is mostly reported as unavailable.
     .with(C::UsageAttribution, Support::Partial)

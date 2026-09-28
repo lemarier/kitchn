@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::{contracts::Capability, scheduling::AgentFamily};
 
-use super::{AgentSelection, SelectionError};
+use super::{AgentModel, AgentSelection, EffortLevel, SelectionError};
 
 /// Whether a launch surface accepts a reasoning effort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +103,39 @@ impl SelectionSupport {
         gaps
     }
 
+    /// A selection this surface cannot provide, for conformance checks;
+    /// `None` when it provides every selection.
+    #[must_use]
+    pub fn undeclared_example(&self) -> Option<AgentSelection> {
+        let model = AgentModel::new("conformance-model").ok()?;
+        let effort = EffortLevel::new("high").ok()?;
+        let missing_family = [AgentFamily::Claude, AgentFamily::Codex]
+            .into_iter()
+            .find(|family| !self.families.contains(family));
+        let candidate = if let Some(agent) = missing_family {
+            AgentSelection::agent_default(agent)
+        } else if !self.model {
+            AgentSelection {
+                model: Some(model),
+                ..AgentSelection::agent_default(AgentFamily::Claude)
+            }
+        } else if self.effort == EffortSupport::Unsupported {
+            AgentSelection {
+                model: Some(model),
+                effort: Some(effort),
+                ..AgentSelection::agent_default(AgentFamily::Claude)
+            }
+        } else if self.effort == EffortSupport::WithModel {
+            AgentSelection {
+                effort: Some(effort),
+                ..AgentSelection::agent_default(AgentFamily::Claude)
+            }
+        } else {
+            return None;
+        };
+        Some(candidate)
+    }
+
     /// Accept `selection` only when the surface can provide all of it.
     ///
     /// # Errors
@@ -116,6 +149,53 @@ impl SelectionSupport {
                 agent: selection.agent,
                 gaps,
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: SelectionSupport = SelectionSupport {
+        families: &[AgentFamily::Claude, AgentFamily::Codex],
+        model: true,
+        effort: EffortSupport::Always,
+    };
+
+    #[test]
+    fn a_surface_providing_everything_has_no_undeclared_example() {
+        assert_eq!(ALL.undeclared_example(), None);
+    }
+
+    #[test]
+    fn every_example_is_refused_by_the_surface_it_was_made_for() {
+        let surfaces = [
+            SelectionSupport {
+                families: &[AgentFamily::Claude],
+                ..ALL
+            },
+            SelectionSupport {
+                model: false,
+                ..ALL
+            },
+            SelectionSupport {
+                effort: EffortSupport::Unsupported,
+                ..ALL
+            },
+            SelectionSupport {
+                effort: EffortSupport::WithModel,
+                ..ALL
+            },
+        ];
+        for surface in surfaces {
+            let example = surface.undeclared_example();
+            assert!(
+                example
+                    .as_ref()
+                    .is_some_and(|selection| surface.check(selection).is_err()),
+                "{surface:?} -> {example:?}"
+            );
         }
     }
 }

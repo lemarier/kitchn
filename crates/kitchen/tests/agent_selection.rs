@@ -15,21 +15,21 @@ use kitchen::{
     BackendId, CredentialId, Error, TaskId,
     adapters::orca::{OrcaBackend, OrcaConfig, WORKER_SELECTION},
     adoption::HouseRegistry,
-    contracts::CapabilitySet,
     contracts::{
         AttemptNumber, AttemptOutcome, BranchName, Capability, CapabilityRequirements, Effect,
         EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, FailureClass,
         Fence, Grant, HouseGrants, IdempotencyKey, NotAppliedReason, Operation, Permission,
         Provenance, Repository, RetryPolicy, Role, TaskAuthority, TaskSpec, Text, Workspace,
     },
+    contracts::{CapabilitySet, ContractError, fake::FakeBackend},
     house::{
         AccessStatus, DoctorCode, DoctorEvidence, HouseConfig, HouseError, RepositoryConfig, doctor,
     },
     scheduling::AgentFamily,
     selection::{
-        AgentModel, AgentPolicy, AgentSelection, EffortLevel, MAX_SELECTION_RULES, OfferedModels,
-        ResolvedSelection, RuleMatch, SelectionError, SelectionGap, SelectionRequest,
-        SelectionRule, SelectionSource, TaskGroup, WorkType,
+        AgentModel, AgentPolicy, AgentSelection, EffortLevel, EffortSupport, MAX_SELECTION_RULES,
+        OfferedModels, ResolvedSelection, RuleMatch, SelectionError, SelectionGap,
+        SelectionRequest, SelectionRule, SelectionSource, SelectionSupport, TaskGroup, WorkType,
     },
     state::{EffectPlan, EffectState, StateError, run_effect},
 };
@@ -793,5 +793,409 @@ fn orca_passes_the_selection_and_refuses_what_it_cannot_provide() -> TestResult 
         tasks_before
     );
     assert_eq!(starts(&sim).len(), 3);
+    Ok(())
+}
+
+/// A started task holding `agent`, ready for `run_effect`.
+fn started(
+    fixture: &Fixture,
+    id: &str,
+    agent: Option<ResolvedSelection>,
+) -> TestResult<(TaskId, Fence)> {
+    let task = task_id(id)?;
+    fixture
+        .store
+        .create_task(spec(id, agent)?, &creator()?, at(0))?;
+    let fence = fixture
+        .store
+        .claim(&task, &scheduled("coordinator")?, ttl(600)?, at(0))?
+        .fence();
+    fixture.store.start_attempt(&task, fence, at(0))?;
+    Ok((task, fence))
+}
+
+fn fake(support: Option<SelectionSupport>) -> TestResult<FakeBackend> {
+    let backend = FakeBackend::new(
+        orca_id()?,
+        house()?,
+        CapabilitySet::supporting(Capability::ALL),
+    );
+    Ok(match support {
+        Some(support) => backend.with_worker_selection(support),
+        None => backend,
+    })
+}
+
+fn missing<T>(result: Result<T, Error>) -> Option<Vec<Capability>> {
+    match result {
+        Err(Error::Contract(ContractError::UnsupportedCapabilities { missing, partial }))
+            if partial.is_empty() =>
+        {
+            Some(missing)
+        }
+        _ => None,
+    }
+}
+
+const CLAUDE_ONLY: SelectionSupport = SelectionSupport {
+    families: &[AgentFamily::Claude],
+    model: false,
+    effort: EffortSupport::Unsupported,
+};
+
+#[test]
+fn the_store_refuses_a_selection_the_executor_does_not_declare() -> TestResult {
+    let fixture = Fixture::new()?;
+    let clock = ManualClock::starting_at(1);
+    let pinned = ResolvedSelection::owner(selection(
+        AgentFamily::Codex,
+        Some("gpt-6-sol"),
+        Some("high"),
+    )?);
+    let (task, fence) = started(&fixture, "task-gate", Some(pinned.clone()))?;
+    // Declaring nothing: family, model, and effort are all unprovided.
+    let silent = fake(None)?;
+    let refused = run_effect(
+        &fixture.store,
+        &silent,
+        &grants()?,
+        plan(
+            &task,
+            fence,
+            "none",
+            launch(Some(pinned.selection.clone()))?,
+        )?,
+        &clock,
+    );
+    assert_eq!(
+        missing(refused),
+        Some(vec![
+            Capability::AgentSelectFamily,
+            Capability::AgentSelectModel
+        ])
+    );
+    // Refused before the executor was called, and before any intent was kept.
+    assert_eq!(silent.execute_calls(), 0);
+    assert!(silent.launched_agents().is_empty());
+
+    // Declaring a family the selection does not use, and no model or effort.
+    let claude_only = fake(Some(CLAUDE_ONLY))?;
+    let refused = run_effect(
+        &fixture.store,
+        &claude_only,
+        &grants()?,
+        plan(
+            &task,
+            fence,
+            "claude",
+            launch(Some(pinned.selection.clone()))?,
+        )?,
+        &clock,
+    );
+    assert_eq!(
+        missing(refused),
+        Some(vec![
+            Capability::AgentSelectFamily,
+            Capability::AgentSelectModel
+        ])
+    );
+    assert_eq!(claude_only.execute_calls(), 0);
+
+    // The same name is still free: a capable executor launches exactly the
+    // recorded selection.
+    let capable = FakeBackend::fully_capable(orca_id()?, house()?);
+    let applied = run_effect(
+        &fixture.store,
+        &capable,
+        &grants()?,
+        plan(
+            &task,
+            fence,
+            "none",
+            launch(Some(pinned.selection.clone()))?,
+        )?,
+        &clock,
+    )?;
+    assert!(matches!(applied.state(), EffectState::Applied { .. }));
+    assert_eq!(capable.launched_agents(), vec![Some(pinned.selection)]);
+    Ok(())
+}
+
+#[test]
+fn the_store_names_each_gap_of_a_partly_supported_selection() -> TestResult {
+    let fixture = Fixture::new()?;
+    let clock = ManualClock::starting_at(1);
+    let effort_only = selection(AgentFamily::Claude, None, Some("high"))?;
+    let (task, fence) = started(
+        &fixture,
+        "task-effort",
+        Some(ResolvedSelection::owner(effort_only.clone())),
+    )?;
+    // The fully capable fake, like Orca, accepts an effort only with a model.
+    let backend = FakeBackend::fully_capable(orca_id()?, house()?);
+    let refused = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(&task, fence, "launch", launch(Some(effort_only))?)?,
+        &clock,
+    );
+    assert_eq!(missing(refused), Some(vec![Capability::AgentSelectModel]));
+    assert_eq!(backend.execute_calls(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_task_without_a_selection_launches_on_an_executor_that_declares_none() -> TestResult {
+    let fixture = Fixture::new()?;
+    let clock = ManualClock::starting_at(1);
+    let (task, fence) = started(&fixture, "task-plain", None)?;
+    let backend = fake(None)?;
+    let applied = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(&task, fence, "launch", launch(None)?)?,
+        &clock,
+    )?;
+    assert!(matches!(applied.state(), EffectState::Applied { .. }));
+    assert_eq!(backend.launched_agents(), vec![None]);
+
+    // A launch may not add a selection the task never recorded.
+    let extra = run_effect(
+        &fixture.store,
+        &FakeBackend::fully_capable(orca_id()?, house()?),
+        &grants()?,
+        plan(
+            &task,
+            fence,
+            "second",
+            launch(Some(AgentSelection::agent_default(AgentFamily::Codex)))?,
+        )?,
+        &clock,
+    );
+    assert!(matches!(
+        extra,
+        Err(Error::State(StateError::AgentSelectionMismatch))
+    ));
+    Ok(())
+}
+
+#[test]
+fn the_fake_refuses_what_it_does_not_declare_and_records_what_it_launches() -> TestResult {
+    let request = |agent: Option<AgentSelection>, key: &str| -> TestResult<EffectRequest> {
+        Ok(EffectRequest::new(
+            house()?,
+            orca_id()?,
+            credential()?,
+            task_id("task-1")?,
+            AttemptNumber::FIRST,
+            IdempotencyKey::from_ref(ExternalRef::new(key)?),
+            Effect::from(launch(agent)?),
+        ))
+    };
+    let undeclared = fake(None)?;
+    let asked = selection(AgentFamily::Codex, Some("gpt-6-sol"), None)?;
+    assert_eq!(
+        undeclared
+            .execute(&request(Some(asked.clone()), "k-1")?)
+            .err(),
+        Some(EffectFailure::NotApplied(NotAppliedReason::Unsupported(
+            Capability::AgentSelectFamily
+        )))
+    );
+    assert_eq!(undeclared.effects_performed(), 0);
+    assert!(undeclared.launched_agents().is_empty());
+
+    let capable = FakeBackend::fully_capable(orca_id()?, house()?);
+    capable.execute(&request(Some(asked.clone()), "k-2")?)?;
+    capable.execute(&request(None, "k-3")?)?;
+    assert_eq!(capable.launched_agents(), vec![Some(asked), None]);
+    Ok(())
+}
+
+#[test]
+fn orca_declares_the_selection_its_adapter_enforces() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    assert_eq!(
+        backend.descriptor().worker_selection,
+        Some(WORKER_SELECTION)
+    );
+    let fixture = Fixture::new()?;
+    let clock = ManualClock::starting_at(1);
+
+    // The store admits what Orca declares and Orca launches it.
+    let pinned = ResolvedSelection::owner(selection(
+        AgentFamily::Claude,
+        Some("sonnet"),
+        Some("high"),
+    )?);
+    let (task, fence) = started(&fixture, "task-orca", Some(pinned.clone()))?;
+    run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(&task, fence, "launch", launch(Some(pinned.selection))?)?,
+        &clock,
+    )?;
+    assert_eq!(
+        starts(&sim),
+        vec![owned(("claude", Some("sonnet"), Some("high")))]
+    );
+
+    // An effort without a model is refused by the store, before Orca sees it.
+    let bare_effort = selection(AgentFamily::Claude, None, Some("high"))?;
+    let (other, other_fence) = started(
+        &fixture,
+        "task-orca-2",
+        Some(ResolvedSelection::owner(bare_effort.clone())),
+    )?;
+    let refused = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(&other, other_fence, "launch", launch(Some(bare_effort))?)?,
+        &clock,
+    );
+    assert_eq!(missing(refused), Some(vec![Capability::AgentSelectModel]));
+    assert_eq!(starts(&sim).len(), 1);
+    assert_eq!(sim.calls_to(&["orchestration", "task-create"]).len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_launch_naming_a_selection_the_task_never_recorded_is_refused() -> TestResult {
+    let fixture = Fixture::new()?;
+    let clock = ManualClock::starting_at(1);
+    let backend = FakeBackend::fully_capable(orca_id()?, house()?);
+    let (task, fence) = started(&fixture, "task-none", None)?;
+    let refused = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(
+            &task,
+            fence,
+            "launch",
+            launch(Some(selection(
+                AgentFamily::Codex,
+                Some("gpt-6-sol"),
+                None,
+            )?))?,
+        )?,
+        &clock,
+    );
+    assert!(matches!(
+        refused,
+        Err(Error::State(StateError::AgentSelectionMismatch))
+    ));
+    assert_eq!(backend.execute_calls(), 0);
+
+    // A recorded selection is not replaced by the backend default.
+    let pinned = ResolvedSelection::owner(selection(AgentFamily::Codex, Some("gpt-6-sol"), None)?);
+    let (pinned_task, pinned_fence) = started(&fixture, "task-some", Some(pinned))?;
+    let dropped = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(&pinned_task, pinned_fence, "launch", launch(None)?)?,
+        &clock,
+    );
+    assert!(matches!(
+        dropped,
+        Err(Error::State(StateError::AgentSelectionMismatch))
+    ));
+    assert_eq!(backend.execute_calls(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_repository_rule_without_a_role_does_not_replace_the_reviewer_default() -> TestResult {
+    let policy: AgentPolicy = serde_json::from_value(json!({
+        "default": {"agent": "codex", "model": "gpt-6-sol", "effort": "high"},
+        "rules": [
+            {"when": {"role": "inspector"}, "use": {"agent": "claude", "model": "sonnet"}},
+            {"when": {"repository": "origin89hq/firmware"}, "use": {"agent": "codex", "model": "gpt-6-sol", "effort": "xhigh"}},
+            {"when": {"taskGroup": "release-1"}, "use": {"agent": "claude", "model": "opus"}}
+        ]
+    }))?;
+    let repositories = BTreeSet::from([firmware()?]);
+    policy.validate(&repositories)?;
+    let in_firmware = |role| SelectionRequest {
+        repository: Some(firmware().ok()).flatten(),
+        ..SelectionRequest::new(role)
+    };
+
+    // The house chose a lighter reviewer; a repository-wide rule leaves it.
+    let review = policy.resolve(&in_firmware(Role::Inspector));
+    assert_eq!(review.source, SelectionSource::HouseRule);
+    assert_eq!(
+        review.selection,
+        selection(AgentFamily::Claude, Some("sonnet"), None)?
+    );
+    // The same for a group rule without a role.
+    let group_review = policy.resolve(&SelectionRequest {
+        task_group: Some(TaskGroup::new("release-1")?),
+        ..in_firmware(Role::Inspector)
+    });
+    assert_eq!(group_review.source, SelectionSource::HouseRule);
+
+    // Roles the house did not single out still take the repository rule.
+    let cook = policy.resolve(&in_firmware(Role::StationCook));
+    assert_eq!(
+        cook.source,
+        SelectionSource::Repository {
+            repository: firmware()?
+        }
+    );
+
+    // A repository rule that names the role does override the house rule.
+    let named: AgentPolicy = serde_json::from_value(json!({
+        "default": {"agent": "codex"},
+        "rules": [
+            {"when": {"role": "inspector"}, "use": {"agent": "claude", "model": "sonnet"}},
+            {"when": {"repository": "origin89hq/firmware", "role": "inspector"}, "use": {"agent": "codex", "model": "gpt-6-sol"}}
+        ]
+    }))?;
+    let review = named.resolve(&in_firmware(Role::Inspector));
+    assert_eq!(
+        review.selection,
+        selection(AgentFamily::Codex, Some("gpt-6-sol"), None)?
+    );
+    Ok(())
+}
+
+#[test]
+fn launches_and_specs_persisted_before_selection_still_load() -> TestResult {
+    // A LaunchWorker operation and a task spec written before agent selection
+    // existed carry no `agent`; they load as "no selection".
+    let mut written = serde_json::to_value(launch(None)?)?;
+    assert!(
+        written.get("agent").is_none(),
+        "an absent selection is not written"
+    );
+    let operation: Operation = serde_json::from_value(written.clone())?;
+    assert!(matches!(
+        operation,
+        Operation::LaunchWorker { agent: None, .. }
+    ));
+
+    written["agent"] = serde_json::to_value(AgentSelection::agent_default(AgentFamily::Codex))?;
+    let with_agent: Operation = serde_json::from_value(written)?;
+    assert!(matches!(
+        with_agent,
+        Operation::LaunchWorker { agent: Some(_), .. }
+    ));
+
+    let mut stored = serde_json::to_value(spec("task-old", None)?)?;
+    assert!(stored.get("agent").is_none());
+    let reloaded: TaskSpec = serde_json::from_value(stored.clone())?;
+    assert_eq!(reloaded.agent, None);
+    // A spec that carries one round-trips exactly.
+    let pinned = policy()?.resolve(&SelectionRequest::new(Role::Inspector));
+    stored = serde_json::to_value(spec("task-new", Some(pinned.clone()))?)?;
+    let reloaded: TaskSpec = serde_json::from_value(stored)?;
+    assert_eq!(reloaded.agent, Some(pinned));
     Ok(())
 }

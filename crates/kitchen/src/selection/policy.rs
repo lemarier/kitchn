@@ -74,7 +74,10 @@ pub struct SelectionRule {
 ///
 /// Resolution for a task checks the task's group, then its repository, then
 /// house-wide rules, and takes the most specific matching rule at the first
-/// level that has one; with none, it uses `default`. A model or effort left
+/// level that has one; with none, it uses `default`. A repository or group
+/// rule that does not name a role yields to a house rule that does, so the
+/// house's per-role choice, such as a lighter reviewer, is overridden only by
+/// a repository or group rule that names that role. A model or effort left
 /// unset is the agent's own default. Selection is configuration: it grants no
 /// authority, and model diversity alone is not review evidence.
 ///
@@ -194,11 +197,23 @@ impl AgentPolicy {
             }),
             Some((SelectionSource::HouseRule, Scope::House)),
         ];
+        // A house rule naming this role beats a repository or group rule that
+        // does not, so a repository-wide model cannot silently replace the
+        // lighter model the house chose for reviewers.
+        let house_names_role = self.rules.iter().any(|rule| {
+            Scope::House.contains(&rule.when) && rule.when.role.is_some() && rule.when.fits(request)
+        });
         for (source, scope) in levels.into_iter().flatten() {
             let best = self
                 .rules
                 .iter()
-                .filter(|rule| scope.contains(&rule.when) && rule.when.fits(request))
+                .filter(|rule| {
+                    scope.contains(&rule.when)
+                        && rule.when.fits(request)
+                        && !(house_names_role
+                            && !matches!(scope, Scope::House)
+                            && rule.when.role.is_none())
+                })
                 .max_by_key(|rule| rule.when.specificity());
             if let Some(rule) = best {
                 return ResolvedSelection {

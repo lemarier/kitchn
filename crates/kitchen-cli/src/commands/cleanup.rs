@@ -423,6 +423,7 @@ impl SnapshotBackend {
             descriptor: BackendDescriptor {
                 backend: snapshot.backend.clone(),
                 house,
+                worker_selection: None,
                 capabilities: CapabilitySet::supporting([
                     Capability::ResourceInventory,
                     Capability::WorkerStatusAndOutcome,

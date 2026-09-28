@@ -1508,6 +1508,15 @@ impl StoreState {
         {
             return fail(StateError::AgentSelectionMismatch);
         }
+        // The executor must declare that it can launch exactly this
+        // selection; one that cannot is refused before anything is reserved,
+        // never left to run its default agent under the recorded selection.
+        if let Effect::Worker(Operation::LaunchWorker {
+            agent: Some(agent), ..
+        }) = &plan.effect
+        {
+            backend.check_worker_selection(agent)?;
+        }
         if let Some(target) = plan.effect.target()
             && (target.backend != backend.backend || !task.owns_resource(target))
         {

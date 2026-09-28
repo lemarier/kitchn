@@ -127,6 +127,7 @@ fn assert_shared_suite_passed(report: &conformance::ConformanceReport) {
         Check::LookupMatchesReceipt,
         Check::IdempotentResubmission,
         Check::LaunchReceipt,
+        Check::SelectionRefused,
         Check::LaunchObservable,
         Check::InventoryListsLaunch,
         Check::MessageRecovery,

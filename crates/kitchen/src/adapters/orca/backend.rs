@@ -556,6 +556,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         let descriptor = BackendDescriptor {
             backend: config.backend.clone(),
             house: config.house.clone(),
+            worker_selection: Some(WORKER_SELECTION),
             capabilities: runtime::capabilities(),
         };
         Ok(Self {

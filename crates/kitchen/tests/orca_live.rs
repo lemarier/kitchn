@@ -20,9 +20,11 @@
 //! It creates its own coordinator terminal and Run, runs the shared contract
 //! suite (which launches and stops one worker), launches a second worker
 //! whose recovery signals it reads while it runs and after it is stopped
-//! (then messages the stopped worker to see Orca refuse it), then stops and
-//! releases the workers, removes the worktrees it created, and closes the
-//! terminals. Orca has no command to delete a Run, so each invocation leaves
+//! (then messages the stopped worker to see Orca refuse it), and launches a
+//! third worker on its own requested branch whose agent terminal it closes,
+//! so the worker's process exits without a stop: its launch must still be
+//! found, and resubmitting it must start nothing. It then stops and releases
+//! the workers, removes the worktrees it created, and closes the terminals. Orca has no command to delete a Run, so each invocation leaves
 //! one empty Run whose objective marks it as a throwaway smoke test. It never
 //! reads or changes automations, or any Run, worker, worktree, or terminal it
 //! did not create. Without the gate it reports that it was skipped.
@@ -37,7 +39,7 @@ use kitchen::{
     adapters::orca::{
         DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT,
         DispatchActivity, Invocation, OrcaBackend, OrcaConfig, OrcaRunner, StartWindow,
-        SystemRunner, TerminalOwner, redact, verify_branch,
+        SystemRunner, TerminalOwner, launch_marker, redact, verify_branch,
     },
     contracts::{
         AttemptNumber, BranchName, Clock, EffectExecutor, EffectFailure, EffectRequest,
@@ -370,6 +372,7 @@ fn exercise(
     let adapter = report
         .is_ok()
         .then(|| adapter_checks(runner, &backend, &fixture, &branch))
+        .map(|checked| checked.and_then(|()| exit_checks(runner, &backend, &fixture, &branch)))
         .map(|checked| checked.and_then(|()| adoption(runner, settings, &backend, terminals)));
     if let Some(Err(error)) = &adapter {
         println!("LIVE adapter check failed: {error}");
@@ -578,6 +581,168 @@ fn adapter_checks(
         "LIVE release twice gives the same receipt: {}",
         first == second
     );
+    Ok(())
+}
+
+/// A worker whose process exits without a stop keeps its launch: Orca
+/// returns its Task to `ready`, and the adapter must still find the original
+/// Dispatch, return it on resubmission without a second worker, and read a
+/// cancel of the settled worker as applied.
+fn exit_checks(
+    runner: &SystemRunner,
+    backend: &OrcaBackend<&SystemRunner>,
+    fixture: &ConformanceFixture,
+    requested: &BranchName,
+) -> TestResult {
+    let namespace = backend.descriptor().backend.clone();
+    let branch = BranchName::new(&format!("{requested}-exit"))?;
+    let launch = smoke_request(
+        fixture,
+        &namespace,
+        "exit",
+        Operation::LaunchWorker {
+            role: Role::StationCook,
+            workspace: Workspace::Isolated,
+            brief: fixture.brief.clone(),
+            branch: Some(branch.clone()),
+        },
+    )?;
+    let launched_at = SystemClock.now();
+    let receipt = backend.execute(&launch)?;
+    let worker = receipt
+        .created()
+        .iter()
+        .find(|resource| resource.kind == ResourceKind::Worker)
+        .cloned()
+        .ok_or("the exit receipt names no worker")?;
+    let dispatch = worker.handle.as_str();
+    let shown = orca(
+        runner,
+        &[
+            "orchestration",
+            "worker-show",
+            &format!("--dispatch={dispatch}"),
+            "--json",
+        ],
+    )?;
+    let agent_terminal = shown
+        .pointer("/worker/agentTerminalHandle")
+        .and_then(Value::as_str)
+        .ok_or("the exit worker has no agent terminal")?
+        .to_owned();
+    // End the agent's process without a stop: close the terminal this test's
+    // worker runs in.
+    orca(
+        runner,
+        &[
+            "terminal",
+            "close",
+            &format!("--terminal={agent_terminal}"),
+            "--json",
+        ],
+    )?;
+    println!("LIVE closed the exit worker's terminal {agent_terminal}");
+    let mut state = backend.observe_worker(&worker)?;
+    for _ in 0..30 {
+        if matches!(state, WorkerState::Settled(_)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        state = backend.observe_worker(&worker)?;
+    }
+    let exited = orca(
+        runner,
+        &[
+            "orchestration",
+            "worker-show",
+            &format!("--dispatch={dispatch}"),
+            "--json",
+        ],
+    )?;
+    println!(
+        "LIVE exit worker: {state:?}, worker {:?} at {:?}, dispatch {:?}, terminal shown: {}",
+        exited.pointer("/worker/state").and_then(Value::as_str),
+        exited.pointer("/worker/stage").and_then(Value::as_str),
+        exited.pointer("/dispatch/status").and_then(Value::as_str),
+        exited
+            .pointer("/terminal")
+            .is_some_and(|terminal| !terminal.is_null()),
+    );
+    let task = receipt.reference().as_str();
+    let tasks = orca(
+        runner,
+        &[
+            "orchestration",
+            "task-list",
+            &format!("--run={}", backend.config().run),
+            "--json",
+        ],
+    )?;
+    let status = tasks
+        .get("tasks")
+        .and_then(Value::as_array)
+        .and_then(|tasks| {
+            tasks
+                .iter()
+                .find(|row| row.get("id").and_then(Value::as_str) == Some(task))
+        })
+        .and_then(|row| row.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    println!("LIVE exit worker's Task {task} is now {status:?}");
+    if state != WorkerState::Settled(WorkerOutcome::Failed) {
+        return Err(format!("an exited worker reads as {state:?}").into());
+    }
+    let found = backend.lookup_launch(launch.key())?;
+    println!(
+        "LIVE lookup after the exit finds the original launch: {}",
+        found == Lookup::Applied(receipt.clone())
+    );
+    if found != Lookup::Applied(receipt.clone()) {
+        return Err(format!("after the exit, lookup gives {found:?}, not {receipt:?}").into());
+    }
+    let resolved = backend.resolve(&launch)?;
+    let again = backend.execute(&launch);
+    let marker = launch_marker(&fixture.house, launch.key());
+    let workers = backend
+        .worker_records()?
+        .into_iter()
+        .filter(|record| record.owner.as_ref().map(ExternalRef::as_str) == Some(marker.as_str()))
+        .count();
+    println!(
+        "LIVE resolve after the exit: {resolved:?}; resubmission returns the original: {}; \
+         workers for the key: {workers}",
+        again.as_ref() == Ok(&receipt)
+    );
+    if resolved != Lookup::Applied(receipt.clone()) || again != Ok(receipt.clone()) || workers != 1
+    {
+        return Err(format!(
+            "after the exit: resolve {resolved:?}, resubmit {again:?}, {workers} workers"
+        )
+        .into());
+    }
+    let signals = backend
+        .observe_signals(
+            &worker,
+            &StartWindow::new(launched_at, SystemClock.now(), Duration::from_secs(60)),
+        )?
+        .ok_or("Orca has no record of the exited worker")?;
+    println!("LIVE exit worker signals: {signals:?}");
+    let cancel = smoke_request(
+        fixture,
+        &namespace,
+        "exit-cancel",
+        Operation::CancelWorker { worker },
+    )?;
+    let cancelled = backend.execute(&cancel);
+    println!(
+        "LIVE cancel of the exited worker: {:?}; resolves as {:?}",
+        cancelled
+            .as_ref()
+            .map(|receipt| receipt.reference().as_str()),
+        backend.resolve(&cancel)?
+    );
+    cancelled?;
     Ok(())
 }
 

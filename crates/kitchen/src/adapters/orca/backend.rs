@@ -10,10 +10,13 @@
 //!
 //! Orca's `--retry-request` accepts only request ids Orca issued, so a
 //! Kitchen idempotency key cannot be an Orca request id. Launches are keyed by
-//! an Orca Task instead: one Task per key, titled with [`launch_marker`], and Orca
-//! refuses to dispatch a dispatched Task again. Resubmitting a launch key
-//! therefore returns the original Dispatch without starting a second worker,
-//! and [`OrcaBackend::lookup_launch`] finds it after a lost response. Lookup
+//! an Orca Task instead: one Task per key, titled with [`launch_marker`]. A
+//! Task that ever had a Dispatch is the launch for its key, whatever its
+//! status: Orca returns a Task to `ready` when its worker's process exits,
+//! and would dispatch it again, so the adapter asks for the Task's Dispatch
+//! before starting anything. Resubmitting a launch key therefore returns the
+//! original Dispatch without starting a second worker, and
+//! [`OrcaBackend::lookup_launch`] finds it after a lost response. Lookup
 //! and same-key idempotency are declared per effect kind, for launches,
 //! cancels, releases, and schedule installs, state changes, and removals.
 //! Messages and replies carry no key Orca records and a trial starts a new
@@ -65,16 +68,27 @@ pub const MAX_RUN_TASKS: usize = 1000;
 const LAUNCH_MARGIN: Duration = Duration::from_secs(30);
 
 /// Orca error codes documented or observed as refusals before any effect.
-/// `dispatch_inactive` was observed on 1.4.212 for a message to a stopped
-/// worker: its worker will never read the mailbox, and nothing is queued.
-const PREFLIGHT_REFUSALS: [&str; 6] = [
+const PREFLIGHT_REFUSALS: [&str; 5] = [
     "task_not_found",
     "task_not_startable",
     "inject_rejected",
     "dispatch_not_found",
-    "dispatch_inactive",
     "no_active_sender_terminal",
 ];
+
+/// Refused before any effect by a message or reply only: observed on 1.4.212
+/// for a message to a stopped worker, whose mailbox will never be read and
+/// where nothing is queued. `worker-start` raises the same code after it
+/// created a worktree and terminal, so it is not a refusal there.
+const MESSAGE_REFUSALS: [&str; 1] = ["dispatch_inactive"];
+
+/// Worker states Orca treats as settled: `worker-stop` changes nothing for
+/// them and answers `alreadySettled`.
+const SETTLED_WORKER_STATES: [&str; 4] = ["stopped", "failed", "succeeded", "abandoned"];
+
+/// Stop attempts for a worker a launch started on the wrong branch, before
+/// the launch is left held with the worker reported as running.
+const WRONG_BRANCH_STOP_ATTEMPTS: usize = 3;
 
 /// Where and as whom one backend instance acts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +178,18 @@ struct CreatedTask {
 }
 
 #[derive(Deserialize)]
+struct WorktreeShow {
+    #[serde(default)]
+    worktree: Option<WorktreeRow>,
+}
+
+#[derive(Deserialize)]
+struct WorktreeRow {
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StartResult {
     dispatch_id: String,
@@ -187,6 +213,10 @@ struct MutationResult {
     verdict: Option<String>,
     #[serde(default)]
     action: Option<String>,
+    /// Set by `worker-stop` for a worker that had already settled; `state`
+    /// then names the state it settled in.
+    #[serde(default)]
+    already_settled: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -383,9 +413,13 @@ pub(crate) fn worker_state(
     }
 }
 
-/// Whether Orca's record shows the Dispatch stopped.
-fn is_stopped(shown: &WorkerShow) -> bool {
-    shown.worker.state == "stopped" || shown.projection.outcome == "stopped"
+/// Whether Orca's record shows the worker no longer runs under its
+/// Dispatch: stopped, or settled by its own report, a failure (including a
+/// process exit), or an abandonment. A cancel of such a worker has nothing
+/// left to do.
+fn is_settled(shown: &WorkerShow) -> bool {
+    SETTLED_WORKER_STATES.contains(&shown.worker.state.as_str())
+        || shown.projection.outcome == "stopped"
 }
 
 /// A person who took over a worker's terminal keeps it: that is neither
@@ -449,6 +483,7 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::ScheduleNotFound
         | OrcaError::DuplicateSchedules { .. }
         | OrcaError::BranchMismatch { .. }
+        | OrcaError::WrongBranchRunning { .. }
         | OrcaError::TrialRequiresPaused
         | OrcaError::InstallUncertain
         | OrcaError::StateMismatch
@@ -474,6 +509,7 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::ScheduleNotFound
         | OrcaError::DuplicateSchedules { .. }
         | OrcaError::BranchMismatch { .. }
+        | OrcaError::WrongBranchRunning { .. }
         | OrcaError::TrialRequiresPaused
         | OrcaError::ScheduleActive
         | OrcaError::ScheduleDiffers { .. }
@@ -567,28 +603,53 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// listed: Orca's records do not name it, and the task already owns it.
     fn launch_receipt(&self, task: &str, dispatch: &str, shown: &WorkerShow) -> Option<Receipt> {
         let mut resources = vec![self.resource(ResourceKind::Worker, external(dispatch)?)];
+        let worktrees: Vec<ExternalRef> = shown
+            .worker
+            .effects
+            .iter()
+            .filter(|effect| effect.kind == "worktree")
+            .filter_map(|effect| effect.id.as_deref().and_then(external))
+            .collect();
         // The branch Orca actually created: Orca prefixes the requested
         // name, so the receipt names the real branch rather than a guess.
+        // Orca reports it with the agent's terminal only, so when that
+        // terminal can no longer be shown it is read from the worktree record.
+        let branch = shown
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.branch.clone())
+            .or_else(|| worktrees.first().and_then(|id| self.worktree_branch(id)));
         resources.extend(
-            shown
-                .terminal
-                .as_ref()
-                .and_then(|terminal| terminal.branch.as_deref())
+            branch
+                .as_deref()
                 // Orca reports the full ref, such as `refs/heads/lemarier/x`.
                 .map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch))
                 .and_then(external)
                 .map(|branch| self.resource(ResourceKind::Branch, branch)),
         );
-        let effects = &shown.worker.effects;
         resources.extend(
-            effects
-                .iter()
-                .filter(|effect| effect.kind == "worktree")
-                .filter_map(|effect| effect.id.as_deref().and_then(external))
+            worktrees
+                .into_iter()
                 .map(|handle| self.resource(ResourceKind::Worktree, handle)),
         );
         resources.truncate(MAX_RECEIPT_RESOURCES);
         Receipt::new(external(task)?, resources, Vec::new()).ok()
+    }
+
+    /// The branch Orca's worktree record names, or `None` when the worktree
+    /// is gone or cannot be read. A receipt without a branch confirms no
+    /// requested branch, so a failed read holds such a launch rather than
+    /// accepting it.
+    fn worktree_branch(&self, worktree: &ExternalRef) -> Option<String> {
+        let args = wire::Args::command(&["worktree", "show"])
+            .value("worktree", &format!("id:{worktree}"))
+            .json();
+        let shown: WorktreeShow = wire::typed(
+            self.call(args, self.config.call_timeout).ok()?,
+            "worktree show",
+        )
+        .ok()?;
+        shown.worktree.and_then(|worktree| worktree.branch)
     }
 
     fn run_tasks(&self) -> Result<Vec<OrcaTask>, OrcaError> {
@@ -624,6 +685,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     }
 
     /// Read what Orca holds for a launch key.
+    ///
+    /// The Task's newest Dispatch decides, not its status: a Task whose
+    /// worker process exited is `ready` again but still names that Dispatch.
     fn task_launch(&self, key: &IdempotencyKey) -> Result<TaskLaunch, OrcaError> {
         let title = self.task_title(key);
         let mut matching = self
@@ -636,25 +700,24 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             // Several Tasks for one key would be an unexplained duplicate.
             (Some(_), Some(_)) => return Ok(TaskLaunch::Unclear),
         };
-        match task.status.as_str() {
-            "pending" | "ready" => Ok(TaskLaunch::Undispatched(task.id)),
-            _ => {
-                let args = wire::Args::command(&["orchestration", "dispatch-show"])
-                    .value("task", &task.id)
-                    .json();
-                let shown: DispatchShow =
-                    wire::typed(self.call(args, self.config.call_timeout)?, "dispatch show")?;
-                let Some(dispatch) = shown.dispatch else {
-                    return Ok(TaskLaunch::Unclear);
-                };
-                let Some(shown) = self.show(&dispatch.id)? else {
-                    return Ok(TaskLaunch::Unclear);
-                };
-                Ok(self
-                    .launch_receipt(&task.id, &dispatch.id, &shown)
-                    .map_or(TaskLaunch::Unclear, TaskLaunch::Dispatched))
-            }
-        }
+        let args = wire::Args::command(&["orchestration", "dispatch-show"])
+            .value("task", &task.id)
+            .json();
+        let found: DispatchShow =
+            wire::typed(self.call(args, self.config.call_timeout)?, "dispatch show")?;
+        let Some(dispatch) = found.dispatch else {
+            return Ok(match task.status.as_str() {
+                "pending" | "ready" => TaskLaunch::Undispatched(task.id),
+                // Past `ready` with no Dispatch is not a state Orca produces.
+                _ => TaskLaunch::Unclear,
+            });
+        };
+        let Some(shown) = self.show(&dispatch.id)? else {
+            return Ok(TaskLaunch::Unclear);
+        };
+        Ok(self
+            .launch_receipt(&task.id, &dispatch.id, &shown)
+            .map_or(TaskLaunch::Unclear, TaskLaunch::Dispatched))
     }
 
     fn create_task(&self, key: &IdempotencyKey, brief: &Text) -> Result<String, EffectFailure> {
@@ -781,18 +844,23 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         if verify_branch(&receipt, branch.as_str()).is_ok() {
             return Ok(receipt);
         }
-        // The worker already runs on another branch and could push to it.
-        // Stop it while the reservation still keeps other callers out. The
-        // launch is uncertain whether or not the stop took effect, because a
-        // worker, its worktree, and its branch exist, so the stop's result is
-        // not reported here: `observe_worker` shows a worker that still runs,
-        // and `verify_launch_branch` reports why the launch was held.
+        // The worker may run on another branch and could push to it. Stop
+        // it, retrying a bounded number of times. The launch is held as
+        // uncertain either way, because a worker, its worktree, and its
+        // branch exist. A stop that never took effect leaves the launch
+        // unresolved: lookup reports it unknown, each resubmission within the
+        // store's budget stops again, and `verify_launch_branch` reports
+        // [`OrcaError::WrongBranchRunning`] until the worker is stopped.
         if let Some(worker) = receipt
             .created()
             .iter()
             .find(|resource| resource.kind == ResourceKind::Worker)
         {
-            let _ = self.cancel(worker);
+            for _ in 0..WRONG_BRANCH_STOP_ATTEMPTS {
+                if self.cancel(worker).is_ok() {
+                    break;
+                }
+            }
         }
         Err(response_lost())
     }
@@ -863,6 +931,17 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }
     }
 
+    /// A message or reply mutation: `dispatch_inactive` is a refusal here.
+    fn message_mutation(&self, args: Vec<String>) -> Result<MutationResult, EffectFailure> {
+        match self.call(args, self.config.call_timeout) {
+            Ok(value) => wire::typed(value, "mutation").map_err(|_| response_lost()),
+            Err(OrcaError::Refused { code, .. }) if MESSAGE_REFUSALS.contains(&code.as_str()) => {
+                Err(not_applied())
+            }
+            Err(error) => Err(call_failure(&error)),
+        }
+    }
+
     fn message(&self, worker: &ResourceRef, body: &Text) -> Result<Receipt, EffectFailure> {
         let dispatch = self.dispatch_or_reject(worker)?;
         self.check_target(dispatch)?;
@@ -874,7 +953,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .value("subject", "Kitchen coordinator")
             .value("body", body.as_str())
             .json();
-        self.message_receipt(worker, &self.mutation(args)?)
+        self.message_receipt(worker, &self.message_mutation(args)?)
     }
 
     fn reply(
@@ -891,7 +970,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .value("run", self.config.run.as_str())
             .value("from", self.config.coordinator.as_str())
             .json();
-        self.message_receipt(worker, &self.mutation(args)?)
+        self.message_receipt(worker, &self.message_mutation(args)?)
     }
 
     /// Messages are referenced by Orca's request id for the send.
@@ -908,19 +987,27 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         Receipt::new(reference, Vec::new(), vec![worker.clone()]).map_err(|_| response_lost())
     }
 
+    /// Stop a worker. A worker that already settled (stopped, reported,
+    /// failed, exited, or abandoned) has nothing left to cancel, so the
+    /// cancel is applied without changing anything.
     fn cancel(&self, worker: &ResourceRef) -> Result<Receipt, EffectFailure> {
         let dispatch = self.dispatch_or_reject(worker)?;
         // A repeat is answered from Orca's record, so cancel is idempotent
         // without depending on how Orca answers a second stop.
-        if is_stopped(&self.check_target(dispatch)?) {
+        if is_settled(&self.check_target(dispatch)?) {
             return self.dispatch_receipt(worker);
         }
         let args = wire::Args::command(&["orchestration", "worker-stop"])
             .value("dispatch", dispatch)
             .json();
         let result = self.mutation(args)?;
+        let settled = result.already_settled == Some(true);
         match result.state.or(result.verdict).as_deref() {
             Some("stopped") => self.dispatch_receipt(worker),
+            // The worker settled on its own before the stop reached it.
+            Some(state) if settled && SETTLED_WORKER_STATES.contains(&state) => {
+                self.dispatch_receipt(worker)
+            }
             // `stop_unknown`, `stopping`, and anything new: not proven stopped.
             _ => Err(response_lost()),
         }
@@ -992,17 +1079,43 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// uncertain.
     ///
     /// # Errors
-    /// [`OrcaError::BranchMismatch`] naming both branches. `actual` is `None`
-    /// when Orca records no branch or the key has no dispatched launch: the
-    /// request cannot be confirmed either way. Other errors when Orca cannot
-    /// be read.
+    /// [`OrcaError::WrongBranchRunning`] when the launched worker is on
+    /// another branch and Orca's record does not show it settled: it could
+    /// still push, and needs a stop or a person. [`OrcaError::BranchMismatch`]
+    /// naming both branches otherwise. `actual` is `None` when Orca records no
+    /// branch or the key has no dispatched launch: the request cannot be
+    /// confirmed either way. Other errors when Orca cannot be read.
     pub fn verify_launch_branch(
         &self,
         key: &IdempotencyKey,
         requested: &BranchName,
     ) -> Result<(), OrcaError> {
         match self.task_launch(key)? {
-            TaskLaunch::Dispatched(receipt) => verify_branch(&receipt, requested.as_str()),
+            TaskLaunch::Dispatched(receipt) => {
+                let Err(mismatch) = verify_branch(&receipt, requested.as_str()) else {
+                    return Ok(());
+                };
+                let Some(dispatch) = receipt
+                    .created()
+                    .iter()
+                    .find(|resource| resource.kind == ResourceKind::Worker)
+                    .and_then(|worker| self.dispatch_of(worker))
+                else {
+                    return Err(mismatch);
+                };
+                // Only a record showing the worker settled clears it.
+                if self.show(dispatch)?.is_some_and(|shown| is_settled(&shown)) {
+                    return Err(mismatch);
+                }
+                let OrcaError::BranchMismatch { requested, actual } = mismatch else {
+                    return Err(mismatch);
+                };
+                Err(OrcaError::WrongBranchRunning {
+                    requested,
+                    actual,
+                    worker: dispatch.to_owned(),
+                })
+            }
             TaskLaunch::None | TaskLaunch::Undispatched(_) | TaskLaunch::Unclear => {
                 Err(OrcaError::BranchMismatch {
                     requested: requested.to_string(),
@@ -1055,7 +1168,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 };
                 let shown = self.show(dispatch).map_err(|error| read_failure(&error))?;
                 let applied = shown.is_some_and(|shown| match operation {
-                    Operation::CancelWorker { .. } => is_stopped(&shown),
+                    Operation::CancelWorker { .. } => is_settled(&shown),
                     _ => shown.terminal_resource.is_some_and(|terminal| {
                         terminal.release_state.as_deref() == Some("released")
                     }),

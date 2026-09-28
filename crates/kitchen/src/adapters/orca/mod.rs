@@ -18,9 +18,12 @@
 //! - Idempotency. `--retry-request` accepts only request ids Orca issued, so a
 //!   Kitchen key cannot be one. A launch creates one Orca Task titled with
 //!   [`launch_marker`] (a fixed-length digest of house and key, because Orca
-//!   truncates titles to 80 characters) and dispatches it; Orca refuses to dispatch a
-//!   dispatched Task again, so resubmitting a launch key returns the original
-//!   Dispatch. A response lost before the Task exists stays unknown: a
+//!   truncates titles to 80 characters) and dispatches it. Orca returns a
+//!   Task to `ready` when its worker's process exits (after a stop it does
+//!   not) and would then dispatch it again, so the Task's newest Dispatch, as
+//!   `dispatch-show --task` reports it whatever the Task's status, is the
+//!   launch: resubmitting a launch key returns that Dispatch and starts
+//!   nothing. A response lost before the Task exists stays unknown: a
 //!   missing Task is not proof the create will not land. Messages and replies
 //!   carry no key, and a trial starts a new run each time, so lookup and
 //!   idempotency are declared per effect kind and not for those.

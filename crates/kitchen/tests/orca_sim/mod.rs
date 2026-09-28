@@ -57,6 +57,11 @@ pub struct SimWorker {
     pub preview: Option<&'static str>,
     /// What `worker-read` returns; Orca refuses the read when `None`.
     pub output: Option<SimOutput>,
+    /// Whether the agent's terminal can still be shown. Orca reports the
+    /// terminal, and its branch, only from the live terminal; the branch stays
+    /// in the worktree record. A stop kept it on the live host (1.4.212); an
+    /// exit is modelled as closing it.
+    pub terminal_open: bool,
 }
 
 /// What `worker-read --source auto` returns.
@@ -104,6 +109,7 @@ impl SimWorker {
             last_error: None,
             preview: None,
             output: None,
+            terminal_open: true,
         }
     }
 
@@ -270,6 +276,9 @@ pub struct SimState {
     pub branch_prefix: &'static str,
     /// The branch an existing worktree is on, when Orca reports one.
     pub existing_branch: Option<&'static str>,
+    /// When set, the worker settles in this state just before Orca handles
+    /// the next `worker-stop`, as when it exits while the stop is sent.
+    pub settle_before_stop: Option<&'static str>,
     gate: Option<Gate>,
     next: u64,
 }
@@ -310,6 +319,7 @@ impl Default for SimOrca {
                 start_state: "ready",
                 branch_prefix: "lemarier/",
                 existing_branch: None,
+                settle_before_stop: None,
                 gate: None,
                 next: 0,
             }),
@@ -397,6 +407,31 @@ impl SimOrca {
 
     pub fn set_worker(&self, dispatch: &str, worker: SimWorker) {
         self.state().workers.insert(dispatch.to_owned(), worker);
+    }
+
+    /// End a worker's process without a stop, as Orca 1.4.212 records it
+    /// (`failDispatch` with `workerProcessExited`): the Dispatch and worker
+    /// fail at stage `process_exited`, and the Task returns to `ready` so
+    /// a new Dispatch may start it. `dispatch-show --task` still names the
+    /// failed Dispatch.
+    pub fn exit_worker(&self, dispatch: &str) -> Result<(), &'static str> {
+        let mut state = self.state();
+        let worker = state.workers.get_mut(dispatch).ok_or("no such worker")?;
+        worker.worker_state = "failed";
+        worker.outcome = "failed";
+        worker.liveness = "exited";
+        worker.stage_detail = Some("process_exited");
+        worker.dispatch_status = Some("failed");
+        worker.fenced = true;
+        worker.terminal_open = false;
+        let task = worker.task.clone().ok_or("the worker has no Task")?;
+        let task = state
+            .tasks
+            .iter_mut()
+            .find(|candidate| candidate.id == task)
+            .ok_or("no such Task")?;
+        task.status = "ready";
+        Ok(())
     }
 
     /// Calls whose command path starts with `path`.
@@ -538,13 +573,33 @@ impl SimState {
             ["orchestration", "worker-stop"] => {
                 let dispatch = Self::flag(flags, "dispatch");
                 let stop_state = self.stop_state;
+                let settle = self.settle_before_stop.take();
                 let Some(worker) = self.workers.get_mut(&dispatch) else {
                     return refuse("dispatch_not_found");
                 };
+                if let Some(settled) = settle {
+                    worker.worker_state = settled;
+                    worker.outcome = settled;
+                    worker.liveness = "exited";
+                }
+                // As Orca 1.4.212 does (`wMn`): a settled worker is not
+                // stopped again; the answer names the state it settled in.
+                if matches!(
+                    worker.worker_state,
+                    "stopped" | "failed" | "succeeded" | "abandoned"
+                ) {
+                    let settled = worker.worker_state;
+                    return self.mutation(json!({
+                        "dispatchId": dispatch,
+                        "state": settled,
+                        "alreadySettled": true,
+                        "processAction": "none",
+                    }));
+                }
                 // As Orca 1.4.212 does: the worker state records the stop,
                 // the projected outcome reads `failed`, and the terminal is
                 // released with it.
-                if stop_state == "stopped" && worker.worker_state != "stopped" {
+                if stop_state == "stopped" {
                     worker.worker_state = "stopped";
                     worker.outcome = "failed";
                     worker.liveness = "exited";
@@ -599,7 +654,8 @@ impl SimState {
                             "status": "live",
                             "agentWait": if worker.waiting { json!({"source": "hook"}) } else { Value::Null },
                         },
-                        "terminal": (worker.branch.is_some() || worker.preview.is_some())
+                        "terminal": (worker.terminal_open
+                            && (worker.branch.is_some() || worker.preview.is_some()))
                             .then(|| json!({"branch": worker.branch, "preview": worker.preview})),
                         "terminalResource": {
                             "releaseState": worker.release_state,
@@ -608,6 +664,20 @@ impl SimState {
                         },
                     })),
                     None => refuse("dispatch_not_found"),
+                }
+            }
+            ["worktree", "show"] => {
+                let selector = Self::flag(flags, "worktree");
+                let id = selector.strip_prefix("id:").unwrap_or_default();
+                match self
+                    .workers
+                    .values()
+                    .find(|worker| worker.worktree.as_deref() == Some(id))
+                {
+                    Some(worker) => ok(json!({
+                        "worktree": {"id": id, "branch": worker.branch},
+                    })),
+                    None => refuse("worktree_not_found"),
                 }
             }
             ["orchestration", "worker-read"] => {

@@ -451,6 +451,12 @@ fn refusals_distinguish_preflight_from_unknown_failures() -> TestResult {
             Fault::Garbage,
             EffectFailure::Uncertain(UncertainReason::ResponseLost),
         ),
+        // Orca raises this from inside a start, after a worktree and terminal
+        // exist; only a message or reply gets it before any effect.
+        (
+            Fault::Refuse("dispatch_inactive"),
+            EffectFailure::Uncertain(UncertainReason::ResponseLost),
+        ),
     ];
     for (index, (fault, expected)) in cases.into_iter().enumerate() {
         sim.fault_on(&["orchestration", "worker-start"], fault);
@@ -1983,20 +1989,29 @@ fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
 }
 
 #[test]
-fn a_stop_that_fails_still_reports_the_wrong_branch() -> TestResult {
+fn a_stop_that_fails_is_retried_then_reported_as_a_running_mismatch() -> TestResult {
     let sim = SimOrca::default();
     sim.state().branch_prefix = "other/";
     let backend = connect(&sim)?;
-    sim.fault_on(
-        &["orchestration", "worker-stop"],
-        Fault::TimeoutBeforeEffect,
+    let launch = request(
+        launch_on("lemarier/issue-6", Workspace::Isolated)?,
+        "stop-fails",
+    )?;
+    // Every stop attempt of the first submission fails.
+    for _ in 0..3 {
+        sim.fault_on(
+            &["orchestration", "worker-stop"],
+            Fault::TimeoutBeforeEffect,
+        );
+    }
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
     );
     assert_eq!(
-        backend.execute(&request(
-            launch_on("lemarier/issue-6", Workspace::Isolated)?,
-            "stop-fails"
-        )?),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        stops(&sim),
+        3,
+        "the stop is retried, a bounded number of times"
     );
     let dispatch = sim
         .state()
@@ -2007,8 +2022,62 @@ fn a_stop_that_fails_still_reports_the_wrong_branch() -> TestResult {
         .ok_or("a worker")?;
     assert_eq!(
         backend.observe_worker(&worker(&dispatch)?)?,
-        WorkerState::Ready,
-        "the worker still runs, and the launch is held as uncertain"
+        WorkerState::Ready
+    );
+    // The report says the worker on the wrong branch still runs, unlike a
+    // mismatch whose worker was stopped.
+    assert_eq!(
+        backend.verify_launch_branch(launch.key(), &branch("lemarier/issue-6")?),
+        Err(OrcaError::WrongBranchRunning {
+            requested: "lemarier/issue-6".to_owned(),
+            actual: Some("other/issue-6".to_owned()),
+            worker: dispatch.clone(),
+        })
+    );
+    // Lookup never calls it applied, so the store resubmits within its
+    // budget, and a resubmission tries the stop again without a new worker.
+    assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    assert_eq!(stops(&sim), 4);
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
+    assert_eq!(
+        backend.observe_worker(&worker(&dispatch)?)?,
+        WorkerState::Settled(WorkerOutcome::Cancelled)
+    );
+    assert_eq!(
+        backend.verify_launch_branch(launch.key(), &branch("lemarier/issue-6")?),
+        Err(OrcaError::BranchMismatch {
+            requested: "lemarier/issue-6".to_owned(),
+            actual: Some("other/issue-6".to_owned()),
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn a_stop_that_fails_once_is_retried_within_the_launch() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().branch_prefix = "other/";
+    let backend = connect(&sim)?;
+    sim.fault_on(&["orchestration", "worker-stop"], Fault::Garbage);
+    let launch = request(
+        launch_on("lemarier/issue-6", Workspace::Isolated)?,
+        "stop-retried",
+    )?;
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    assert_eq!(stops(&sim), 2);
+    assert_eq!(
+        backend.verify_launch_branch(launch.key(), &branch("lemarier/issue-6")?),
+        Err(OrcaError::BranchMismatch {
+            requested: "lemarier/issue-6".to_owned(),
+            actual: Some("other/issue-6".to_owned()),
+        })
     );
     Ok(())
 }
@@ -2099,6 +2168,151 @@ fn a_repeated_cancel_is_answered_from_orcas_record() -> TestResult {
     assert_eq!(backend.execute(&cancel)?, first);
     assert_eq!(stops(&sim), 1);
     assert_eq!(backend.resolve(&cancel)?, Lookup::Applied(first));
+    Ok(())
+}
+
+#[test]
+fn cancelling_a_worker_that_already_settled_is_applied() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    for (index, settled) in ["failed", "succeeded", "abandoned"].into_iter().enumerate() {
+        let receipt = backend.execute(&request(
+            launch_op("Implement it.")?,
+            &format!("settled-{index}"),
+        )?)?;
+        let target = launched(&receipt)?;
+        if let Some(worker) = sim.state().workers.get_mut(target.handle.as_str()) {
+            worker.worker_state = settled;
+            worker.outcome = settled;
+            worker.liveness = "exited";
+        }
+        let cancel = request(
+            Operation::CancelWorker {
+                worker: target.clone(),
+            },
+            &format!("cancel-settled-{index}"),
+        )?;
+        let applied = backend.execute(&cancel)?;
+        assert_eq!(
+            applied.touched(),
+            std::slice::from_ref(&target),
+            "{settled}"
+        );
+        assert_eq!(
+            backend.resolve(&cancel)?,
+            Lookup::Applied(applied),
+            "{settled}"
+        );
+    }
+    assert_eq!(
+        stops(&sim),
+        0,
+        "a settled worker is answered from the record"
+    );
+
+    // The worker settles while the stop is sent: Orca answers
+    // `alreadySettled` with the state it settled in.
+    let receipt = backend.execute(&request(launch_op("Implement it.")?, "racing")?)?;
+    let target = launched(&receipt)?;
+    sim.state().settle_before_stop = Some("failed");
+    let cancel = request(Operation::CancelWorker { worker: target }, "cancel-racing")?;
+    let applied = backend.execute(&cancel)?;
+    assert_eq!(stops(&sim), 1);
+    assert_eq!(backend.resolve(&cancel)?, Lookup::Applied(applied));
+
+    // A stop Orca could not confirm is still not a cancel.
+    let receipt = backend.execute(&request(launch_op("Implement it.")?, "unknown")?)?;
+    sim.state().stop_state = "stop_unknown";
+    let cancel = request(
+        Operation::CancelWorker {
+            worker: launched(&receipt)?,
+        },
+        "cancel-unknown",
+    )?;
+    assert_eq!(
+        backend.execute(&cancel),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    assert_eq!(backend.resolve(&cancel)?, Lookup::Unknown);
+    Ok(())
+}
+
+#[test]
+fn an_exited_worker_keeps_its_launch_and_is_never_started_again() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let launch = request(launch_op("Implement it.")?, "exits")?;
+    let receipt = backend.execute(&launch)?;
+    let dispatch = launched(&receipt)?;
+    // The agent's process ends without a stop: Orca returns the Task to
+    // `ready`, where a new Dispatch could start it.
+    sim.exit_worker(dispatch.handle.as_str())?;
+    assert_eq!(
+        backend.lookup_launch(launch.key())?,
+        Lookup::Applied(receipt.clone())
+    );
+    assert_eq!(backend.resolve(&launch)?, Lookup::Applied(receipt.clone()));
+    assert_eq!(
+        backend.execute(&launch)?,
+        receipt,
+        "resubmission returns it"
+    );
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
+    assert_eq!(sim.state().workers.len(), 1);
+    assert_eq!(
+        backend.observe_worker(&dispatch)?,
+        WorkerState::Settled(WorkerOutcome::Failed),
+        "the exit is reported as the worker's failure"
+    );
+    // A requested branch is still verified against the dead worker's record.
+    let on_branch = request(
+        launch_on("lemarier/issue-6", Workspace::Isolated)?,
+        "exits-on-branch",
+    )?;
+    let receipt = backend.execute(&on_branch)?;
+    sim.exit_worker(launched(&receipt)?.handle.as_str())?;
+    assert_eq!(backend.execute(&on_branch)?, receipt);
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 2);
+    assert_eq!(stops(&sim), 0);
+    Ok(())
+}
+
+#[test]
+fn a_lost_launch_whose_worker_exited_is_reconciled_without_a_second_worker() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = running_task(&fixture, "task-exit", &[Permission::LaunchWorker])?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let clock = ManualClock::starting_at(1);
+    let grants = house_grants(&[Permission::LaunchWorker])?;
+    let launch = plan(&task, fence, "launch", launch_op("Implement the issue.")?)?;
+
+    sim.fault_on(
+        &["orchestration", "worker-start"],
+        Fault::TimeoutAfterEffect,
+    );
+    let record = run_effect(&fixture.store, &backend, &grants, launch.clone(), &clock)?;
+    assert!(matches!(record.state(), EffectState::Uncertain { .. }));
+    let dispatch = sim
+        .state()
+        .workers
+        .keys()
+        .next()
+        .cloned()
+        .ok_or("a worker")?;
+    sim.exit_worker(&dispatch)?;
+
+    // Running the effect again reconciles first: the lookup finds the
+    // original Dispatch although its Task is `ready` again.
+    let again = run_effect(&fixture.store, &backend, &grants, launch.clone(), &clock)?;
+    let EffectState::Applied { receipt, .. } = again.state() else {
+        return Err("the launch was not resolved as applied".into());
+    };
+    assert_eq!(launched(receipt)?.handle.as_str(), dispatch);
+    let once_more = run_effect(&fixture.store, &backend, &grants, launch, &clock)?;
+    assert!(matches!(once_more.state(), EffectState::Applied { .. }));
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
+    assert_eq!(sim.state().workers.len(), 1, "no second worker");
     Ok(())
 }
 

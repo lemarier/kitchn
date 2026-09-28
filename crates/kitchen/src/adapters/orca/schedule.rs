@@ -634,7 +634,10 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::MissingRuntimeFeature(_)
         | OrcaError::ListingTooLong { .. }
         | OrcaError::InstallUncertain
-        | OrcaError::StateMismatch => EffectFailure::Uncertain(UncertainReason::ResponseLost),
+        | OrcaError::StateMismatch
+        | OrcaError::WrongBranchRunning { .. } => {
+            EffectFailure::Uncertain(UncertainReason::ResponseLost)
+        }
     }
 }
 

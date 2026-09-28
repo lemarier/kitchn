@@ -111,6 +111,18 @@ pub enum OrcaError {
         /// The branch Orca created, if the receipt names one.
         actual: Option<String>,
     },
+    /// The launched worker's branch is not the one requested, and no stop
+    /// took effect: the worker still runs on that branch and could push to
+    /// it. This needs a person or a later stop; Kitchen holds the launch.
+    #[error("worker {worker} still runs on branch {actual:?}, not the requested {requested}")]
+    WrongBranchRunning {
+        /// The branch the caller wanted.
+        requested: String,
+        /// The branch Orca created, if the receipt names one.
+        actual: Option<String>,
+        /// The Orca Dispatch of the worker that still runs.
+        worker: String,
+    },
     /// Another caller held the reservation for this key for the whole wait.
     /// Nothing was sent to Orca; the effect may still be in flight under that
     /// caller, so reconcile before submitting it again.
@@ -158,6 +170,7 @@ impl OrcaError {
             | Self::ScheduleDiffers { .. }
             | Self::ReservationBusy
             | Self::BranchMismatch { .. }
+            | Self::WrongBranchRunning { .. }
             | Self::InstallUncertain
             | Self::StateMismatch
             | Self::ScheduleNotFound => ErrorClass::Conflict,

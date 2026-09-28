@@ -1534,6 +1534,13 @@ mod git_remote {
     fn a_git_remote_needs_absolute_paths_a_plain_name_and_a_deadline() -> TestResult {
         let kitchen = tempfile::tempdir()?;
         let config = workflows_support::isolated_config(kitchen.path(), &[])?;
+        // A checkout that does not contain Kitchen's configuration; the
+        // system temp directory does on Linux, where both live under `/tmp`.
+        let checkout = tempfile::tempdir()?;
+        let work = checkout
+            .path()
+            .to_str()
+            .ok_or("temp directory path is not UTF-8")?;
         let good = |git: &str, worktree: &str, remote: &str, deadline: Duration| {
             GitRemote::new(
                 PathBuf::from(git),
@@ -1543,23 +1550,23 @@ mod git_remote {
                 deadline,
             )
         };
-        assert!(good(GIT, "/tmp", "origin", Duration::from_secs(1)).is_ok());
-        assert!(good(GIT, "/tmp", "up-stream_2.x", Duration::from_secs(1)).is_ok());
+        assert!(good(GIT, work, "origin", Duration::from_secs(1)).is_ok());
+        assert!(good(GIT, work, "up-stream_2.x", Duration::from_secs(1)).is_ok());
         for (git, worktree, remote, deadline) in [
-            ("git", "/tmp", "origin", Duration::from_secs(1)),
+            ("git", work, "origin", Duration::from_secs(1)),
             (GIT, "worktree", "origin", Duration::from_secs(1)),
-            (GIT, "/tmp", "", Duration::from_secs(1)),
-            (GIT, "/tmp", "-origin", Duration::from_secs(1)),
-            (GIT, "/tmp", "--upload-pack=x", Duration::from_secs(1)),
-            (GIT, "/tmp", "or igin", Duration::from_secs(1)),
-            (GIT, "/tmp", "origin/../x", Duration::from_secs(1)),
+            (GIT, work, "", Duration::from_secs(1)),
+            (GIT, work, "-origin", Duration::from_secs(1)),
+            (GIT, work, "--upload-pack=x", Duration::from_secs(1)),
+            (GIT, work, "or igin", Duration::from_secs(1)),
+            (GIT, work, "origin/../x", Duration::from_secs(1)),
             (
                 GIT,
-                "/tmp",
+                work,
                 &"a".repeat(GitRemote::MAX_REMOTE_BYTES + 1),
                 Duration::from_secs(1),
             ),
-            (GIT, "/tmp", "origin", Duration::ZERO),
+            (GIT, work, "origin", Duration::ZERO),
         ] {
             let error = good(git, worktree, remote, deadline)
                 .err()
@@ -1569,7 +1576,7 @@ mod git_remote {
                 ErrorClass::InvalidInput
             );
         }
-        let remote = || good(GIT, "/tmp", "origin", Duration::from_secs(1));
+        let remote = || good(GIT, work, "origin", Duration::from_secs(1));
         assert!(remote()?.with_url_bases(&["https://git.example/"]).is_ok());
         let long = "a".repeat(513);
         for bases in [

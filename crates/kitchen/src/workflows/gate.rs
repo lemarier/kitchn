@@ -16,6 +16,8 @@ pub struct GateEvidence {
     pub number: IssueNumber,
     /// Exact proposed commit.
     pub head: CommitId,
+    /// Validated source branch for a fix worker; absent if the forge ref is unsafe.
+    pub head_branch: Option<String>,
     /// Exact base tip.
     pub base: CommitId,
     /// Seconds since the head was pushed.
@@ -32,6 +34,8 @@ pub struct GateEvidence {
     pub author_allowed: Option<bool>,
     /// Provider reports CLEAN merge state.
     pub merge_clean: Option<bool>,
+    /// Provider reports BEHIND as the sole merge-state obstacle.
+    pub merge_behind: Option<bool>,
     /// Required branch protection is satisfied without admin bypass.
     pub protection_satisfied: Option<bool>,
     /// Rule 3: head contains the current base.
@@ -72,6 +76,20 @@ pub struct GateEvidence {
     pub writer_working: bool,
     /// Revision to which acceptance, hardware, and risk observations apply.
     pub supporting_subject: Option<(CommitId, CommitId)>,
+    /// Verified removal of the handover label by a person, if observed.
+    pub reopen_event: Option<GateReopenEvent>,
+}
+/// Scoped evidence that a person removed the handover label after a verdict.
+#[derive(Debug, Clone)]
+pub struct GateReopenEvent {
+    /// Exact head when the event was observed.
+    pub head: CommitId,
+    /// Exact base when the event was observed.
+    pub base: CommitId,
+    /// Provider event time.
+    pub at_unix_secs: u64,
+    /// Named actor whose write permission was checked.
+    pub actor: String,
 }
 
 /// Check conclusion for the full set at the head.
@@ -143,6 +161,10 @@ pub enum RiskClass {
 /// Human decision checked against the house, action, revision, and write permission.
 #[derive(Debug, Clone)]
 pub struct RiskApproval {
+    /// Named human whose repository access is checked by the scoped client.
+    pub approver: String,
+    /// Stable review or decision reference.
+    pub source: ExternalRef,
     /// House that made the decision.
     pub house: HouseId,
     /// Repository where the decision applies.
@@ -153,6 +175,8 @@ pub struct RiskApproval {
     pub base: CommitId,
     /// Positive repository write-permission evidence for the approver.
     pub write_access: bool,
+    /// Positive exact-head approving review evidence from the scoped client.
+    pub approval_verified: bool,
 }
 /// Review priority for a demonstrated finding within this PR's scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +211,8 @@ pub struct GateGrants {
     pub merge: bool,
     /// Permit a bounded request to a branch worker to edit, commit, and push.
     pub fix_request: bool,
+    /// Backend positively supports owned-branch delivery and readiness.
+    pub fix_delivery_capable: bool,
     /// Permit asking specifically configured reviewers for a fresh review.
     pub reviewer_invocation: bool,
     /// Exact reviewer triggers granted by house policy for this subject.
@@ -221,12 +247,16 @@ pub struct GateHistory {
     pub reported_subject: Option<(CommitId, CommitId)>,
     /// A person removed the handover label or answered a head-bound Ask.
     pub explicit_reopen: bool,
+    /// Most recent handover time for this PR and exact subject.
+    pub last_handover_unix_secs: Option<u64>,
 }
 /// The distinct failed conditions. Consumers can render these without parsing prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Gap {
     /// The PR does not satisfy rule one or its evidence is unknown.
     Eligibility,
+    /// The source branch cannot be safely targeted for a fix request.
+    BranchTarget,
     /// Clean protected mergeability is unproven.
     Mergeability,
     /// Head timestamp is unavailable or malformed.
@@ -293,6 +323,8 @@ pub struct GateDecision {
     pub number: IssueNumber,
     /// Pinned head.
     pub head: CommitId,
+    /// Validated branch target, if available.
+    pub head_branch: Option<String>,
     /// Pinned base.
     pub base: CommitId,
     /// Chosen outcome.
@@ -315,10 +347,16 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     {
         gaps.push(Gap::Eligibility);
     }
+    if e.head_branch.is_none() {
+        gaps.push(Gap::BranchTarget);
+    }
     if e.head_age_secs.is_none() {
         gaps.push(Gap::HeadAge);
     }
-    if e.merge_clean != Some(true) || e.protection_satisfied != Some(true) {
+    let fixable_behind = e.contains_base == Some(false)
+        && e.merge_behind == Some(true)
+        && e.protection_satisfied == Some(true);
+    if (e.merge_clean != Some(true) && !fixable_behind) || e.protection_satisfied != Some(true) {
         gaps.push(Gap::Mergeability);
     }
     if e.contains_base != Some(true) {
@@ -376,21 +414,23 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
             .risk_classes
             .as_ref()
             .is_some_and(|classes| !classes.is_empty())
-            && !matches!(&e.risk_approval, Some(approval) if approval.write_access && approval.house == e.house && approval.repository == e.repository && approval.head == e.head && approval.base == e.base))
+            && !matches!(&e.risk_approval, Some(approval) if approval.write_access && approval.approval_verified && approval.house == e.house && approval.repository == e.repository && approval.head == e.head && approval.base == e.base))
     {
         gaps.push(Gap::RiskApproval);
     }
     gaps.sort_by_key(|gap| *gap as u8);
     gaps.dedup();
     let age = e.head_age_secs.unwrap_or(86400);
-    let verdict = if history.handovers >= 2
+    let verdict = if e.open == Some(false)
+        || e.draft == Some(true)
+        || history.handovers >= 2
         || (history.reported_subject.as_ref() == Some(&(e.head.clone(), e.base.clone()))
             && !history.explicit_reopen)
         || age < 1800
         || e.writer_working
         || (e.checks == Checks::Pending && age < 86400)
         || (gaps.contains(&Gap::ReviewerPending) && age < 86400)
-        || (e.merge_clean == Some(false) && age < 86400)
+        || (e.merge_clean == Some(false) && !fixable_behind && age < 86400)
     {
         Verdict::Skip
     } else if gaps.is_empty() {
@@ -416,6 +456,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
                 | Gap::ReviewerStale
         )
     }) && grants.fix_request
+        && grants.fix_delivery_capable
         && history.fix_rounds < 2
         && !history.requested_this_head
         && (!gaps.contains(&Gap::ReviewerStale) || can_invoke_missing(e, &grants))
@@ -436,6 +477,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
         repository: e.repository.clone(),
         number: e.number,
         head: e.head.clone(),
+        head_branch: e.head_branch.clone(),
         base: e.base.clone(),
         verdict,
         verified_findings: e.verified_findings.clone(),
@@ -580,6 +622,8 @@ pub struct FixRequest {
     pub number: IssueNumber,
     /// Head on which the findings were established.
     pub head: CommitId,
+    /// Exact branch to message or launch a worker on.
+    pub head_branch: String,
     /// Base against which the diff was inspected.
     pub base: CommitId,
     /// Only failed fixable conditions; the worker receives no merge or publication grant.
@@ -606,6 +650,9 @@ pub fn fix_request(
     let Verdict::FixRequest { gaps } = &decision.verdict else {
         return Err(RequestRefusal::WrongVerdict);
     };
+    let Some(head_branch) = &decision.head_branch else {
+        return Err(RequestRefusal::WrongVerdict);
+    };
     if !grants.reviewer_invocation && !grants.review_triggers.is_empty() {
         return Err(RequestRefusal::EffectsDisabled);
     }
@@ -621,6 +668,7 @@ pub fn fix_request(
         repository: decision.repository.clone(),
         number: decision.number,
         head: decision.head.clone(),
+        head_branch: head_branch.clone(),
         base: decision.base.clone(),
         gaps: gaps.clone(),
         verified_findings: decision.verified_findings.clone(),
@@ -631,6 +679,48 @@ pub fn fix_request(
             Vec::new()
         },
     })
+}
+
+/// Narrow capability boundary for a branch worker. An Orca implementation
+/// checks ownership and launch readiness; another backend can implement the
+/// same contract without exposing terminal commands to gate policy.
+pub trait GateWorkerBackend {
+    /// Execution failure. An uncertain delivery must be reconciled, not retried.
+    type Error;
+    /// Whether this exact request can be delivered to one owned branch writer.
+    fn supports(&self, request: &FixRequest) -> bool;
+    /// Send once and return positive delivery or readiness evidence.
+    ///
+    /// # Errors
+    /// Returns a backend failure or uncertain result without claiming success.
+    fn deliver(&mut self, request: FixRequest) -> Result<ExternalRef, Self::Error>;
+}
+/// Failure while dispatching a fix request.
+#[derive(Debug)]
+pub enum FixDispatchError<E> {
+    /// Decision or grant does not permit this request.
+    Refused(RequestRefusal),
+    /// Backend cannot provide owned-branch delivery/readiness.
+    Unsupported,
+    /// Backend did not provide positive delivery evidence.
+    Backend(E),
+}
+/// Deliver a newly recorded fix request through one capable backend. No retry
+/// happens here; the next tick reconciles its marker and worker state.
+///
+/// # Errors
+/// Refuses report-only and duplicate decisions, unsupported capability, or
+/// unconfirmed backend delivery.
+pub fn dispatch_fix<B: GateWorkerBackend>(
+    recorded: &RecordedDecision,
+    grants: &GateGrants,
+    backend: &mut B,
+) -> Result<ExternalRef, FixDispatchError<B::Error>> {
+    let request = fix_request(recorded, grants).map_err(FixDispatchError::Refused)?;
+    if !backend.supports(&request) {
+        return Err(FixDispatchError::Unsupported);
+    }
+    backend.deliver(request).map_err(FixDispatchError::Backend)
 }
 
 /// Bounded person handoff at an exact revision.
@@ -800,10 +890,10 @@ pub struct RecordedDecision {
     pub new_record: bool,
 }
 /// One scheduled pass; at most three PRs may be evaluated and merged.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GateRun {
     evaluated: u8,
-    merges: u8,
+    confirmed: Vec<(Repository, IssueNumber, CommitId)>,
 }
 impl GateRun {
     /// Start a bounded pass.
@@ -811,12 +901,12 @@ impl GateRun {
     pub const fn new() -> Self {
         Self {
             evaluated: 0,
-            merges: 0,
+            confirmed: Vec::new(),
         }
     }
     /// Number of PRs already evaluated.
     #[must_use]
-    pub const fn evaluated(self) -> u8 {
+    pub const fn evaluated(&self) -> u8 {
         self.evaluated
     }
     /// Evaluate and record the next PR, or return `None` at the three-PR cap.
@@ -838,8 +928,8 @@ impl GateRun {
         self.evaluated += 1;
         Ok(Some(decision))
     }
-    /// Prepare the next merge after a fresh forge reread. The caller increments
-    /// the merge count only after a confirmed merged readback.
+    /// Prepare the next merge after a fresh forge reread. Confirmed readback
+    /// counts each distinct PR once.
     ///
     /// # Errors
     /// Refuses a fourth merge or stale provider state.
@@ -848,18 +938,49 @@ impl GateRun {
         recorded: &RecordedDecision,
         client: &crate::integrations::github::GitHubClient<T>,
     ) -> Result<MergeRequest, crate::integrations::github::IntegrationError> {
-        merge_request_from_forge(recorded, client, self.merges)
+        merge_request_from_forge(
+            recorded,
+            client,
+            u8::try_from(self.confirmed.len()).unwrap_or(u8::MAX),
+        )
     }
-    /// Count a positively confirmed merge; an uncertain request must be
-    /// reconciled before this call or another merge.
+    /// Read back a merged PR and merge commit before counting it. An uncertain
+    /// request remains unresolved and prevents treating the run as successful.
     ///
     /// # Errors
-    /// Refuses a count beyond the three-merge ceiling.
-    pub fn confirm_merge(&mut self) -> Result<(), RequestRefusal> {
-        if self.merges >= 3 {
-            return Err(RequestRefusal::MergeLimit);
+    /// Refuses missing readback evidence, a moved head, or a fourth merge.
+    pub fn confirm_merge<T: crate::integrations::github::GitHubReadTransport>(
+        &mut self,
+        request: &MergeRequest,
+        client: &crate::integrations::github::GitHubClient<T>,
+    ) -> Result<(), crate::integrations::github::IntegrationError> {
+        use crate::integrations::github::{IntegrationError, IssueState, Observation};
+        if self.confirmed.len() >= 3
+            || self.confirmed.iter().any(|(repo, number, head)| {
+                repo == &request.repository
+                    && number == &request.number
+                    && head == &request.match_head
+            })
+        {
+            return Err(IntegrationError::StaleDecision);
         }
-        self.merges += 1;
+        let pr = match client.pull_request(&request.house, &request.repository, request.number) {
+            Observation::Known(pr) => pr,
+            Observation::Unknown => return Err(IntegrationError::Unknown),
+            Observation::Unavailable(error) => return Err(error),
+        };
+        if pr.state != IssueState::Closed
+            || !pr.merged
+            || pr.merge_commit_sha.is_none()
+            || pr.head.sha != request.match_head
+        {
+            return Err(IntegrationError::Unknown);
+        }
+        self.confirmed.push((
+            request.repository.clone(),
+            request.number,
+            request.match_head.clone(),
+        ));
         Ok(())
     }
 }
@@ -884,6 +1005,14 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
     )?;
     let round = history.handovers;
     let fix_round = history.fix_rounds;
+    let mut history = history;
+    history.explicit_reopen = evidence.reopen_event.as_ref().is_some_and(|event| {
+        event.head == evidence.head
+            && event.base == evidence.base
+            && history
+                .last_handover_unix_secs
+                .is_some_and(|last| event.at_unix_secs > last)
+    });
     let mut decision = evaluate(evidence, grants, history);
     if decision.verdict == Verdict::Skip {
         return Ok(RecordedDecision {
@@ -958,6 +1087,42 @@ pub struct GateSupplement {
     pub subject: Option<(CommitId, CommitId)>,
 }
 
+/// Narrow independent inspection request. A reviewer reads only committed
+/// content at these refs; the request contains no credential or command to run
+/// PR code. The returned evidence must name the same refs and its source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticReviewRequest {
+    /// Selected house.
+    pub house: HouseId,
+    /// House-scoped repository.
+    pub repository: Repository,
+    /// Exact base for the committed diff.
+    pub base: CommitId,
+    /// Exact head for the committed diff.
+    pub head: CommitId,
+    /// The only permitted inspection mode.
+    pub mode: CommittedDiffReview,
+}
+/// Review mode fixed by the gate; it has no execute-PR-code variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommittedDiffReview {
+    /// Read committed base...head content without executing the PR.
+    ReadOnly,
+}
+impl GateEvidence {
+    /// Build the exact-revision review request.
+    #[must_use]
+    pub fn semantic_request(&self) -> SemanticReviewRequest {
+        SemanticReviewRequest {
+            house: self.house.clone(),
+            repository: self.repository.clone(),
+            base: self.base.clone(),
+            head: self.head.clone(),
+            mode: CommittedDiffReview::ReadOnly,
+        }
+    }
+}
+
 /// Collect forge facts through #7's scoped read side. Missing secondary observations
 /// remain unknown and cannot produce a merge decision. The caller supplies a Unix
 /// seconds clock value and separately attested non-forge evidence.
@@ -990,6 +1155,44 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
     let reviews = known(client.reviews(house, repository, number));
     let threads = known(client.threads(house, repository, number));
     let commit = known(client.commit(house, repository, &head));
+    let reopen_event = known(client.timeline(house, repository, number))
+        .and_then(|events| {
+            events
+                .into_iter()
+                .filter_map(|event| {
+                    if event.event != crate::integrations::github::TimelineKind::Unlabeled
+                        || !event.label.as_ref().is_some_and(|label| {
+                            label.name.eq_ignore_ascii_case("needs-human-review")
+                        })
+                    {
+                        return None;
+                    }
+                    Some((
+                        parse_github_utc(event.created_at.as_deref()?)?,
+                        event.actor?.login,
+                    ))
+                })
+                .max_by_key(|(at, _)| *at)
+        })
+        .and_then(|(at_unix_secs, actor)| {
+            use crate::integrations::github::RepositoryPermission;
+            let permission = known(client.permission(house, repository, &actor))?;
+            if !matches!(
+                permission.permission,
+                RepositoryPermission::Write
+                    | RepositoryPermission::Maintain
+                    | RepositoryPermission::Admin
+                    | RepositoryPermission::Push
+            ) {
+                return None;
+            }
+            Some(GateReopenEvent {
+                head: head.clone(),
+                base: base.clone(),
+                at_unix_secs,
+                actor,
+            })
+        });
     let head_age_secs = commit
         .as_ref()
         .and_then(|commit| parse_github_utc(&commit.commit.committer.date))
@@ -1013,6 +1216,22 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
         }
         Some(outstanding.values().all(|requested| !requested))
     });
+    let risk_approval = supplement.risk_approval.map(|mut approval| {
+        use crate::integrations::github::RepositoryPermission;
+        approval.approval_verified = reviews.as_deref().is_some_and(|reviews| {
+            reviews.iter().any(|review| {
+                review.user.login.eq_ignore_ascii_case(&approval.approver)
+                    && review.commit_id == head
+                    && review.state == crate::integrations::github::ReviewState::Approved
+                    && review.submitted_at.is_some()
+            })
+        });
+        approval.write_access = matches!(
+            known(client.permission(house, repository, &approval.approver)),
+            Some(permission) if matches!(permission.permission, RepositoryPermission::Write | RepositoryPermission::Maintain | RepositoryPermission::Admin | RepositoryPermission::Push)
+        );
+        approval
+    });
     let checks = classify_checks(
         runs.as_deref(),
         statuses.as_deref(),
@@ -1024,6 +1243,7 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
         repository: repository.clone(),
         number,
         head,
+        head_branch: safe_branch(&pr.head.name),
         base,
         head_age_secs,
         open: Some(pr.state == crate::integrations::github::IssueState::Open && !pr.merged),
@@ -1043,7 +1263,15 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
         merge_clean: merge_status
             .as_ref()
             .map(|status| status.status == MergeStatusValue::Clean),
-        protection_satisfied: merge_status.map(|status| status.status == MergeStatusValue::Clean),
+        merge_behind: merge_status
+            .as_ref()
+            .map(|status| status.status == MergeStatusValue::Behind),
+        protection_satisfied: merge_status.map(|status| {
+            matches!(
+                status.status,
+                MergeStatusValue::Clean | MergeStatusValue::Behind
+            )
+        }),
         contains_base: comparison.map(|comparison| comparison.behind_by == 0),
         checks,
         reviewers,
@@ -1060,9 +1288,10 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
         acceptance_met: supplement.acceptance_met,
         hardware_complete: supplement.hardware_complete,
         risk_classes: supplement.risk_classes,
-        risk_approval: supplement.risk_approval,
+        risk_approval,
         writer_working: supplement.writer_working,
         supporting_subject: supplement.subject,
+        reopen_event,
     })
 }
 fn known<T>(observation: crate::integrations::github::Observation<T>) -> Option<T> {
@@ -1071,6 +1300,26 @@ fn known<T>(observation: crate::integrations::github::Observation<T>) -> Option<
         crate::integrations::github::Observation::Unavailable(_)
         | crate::integrations::github::Observation::Unknown => None,
     }
+}
+fn safe_branch(branch: &str) -> Option<String> {
+    if branch.is_empty()
+        || branch.len() > 255
+        || branch.starts_with('-')
+        || branch.starts_with('/')
+        || branch.ends_with(['/', '.'])
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch.contains("//")
+        || branch
+            .split('/')
+            .any(|part| part.starts_with('.') || part.ends_with(".lock"))
+        || branch
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && !b"-._/".contains(&byte))
+    {
+        return None;
+    }
+    Some(branch.to_owned())
 }
 fn classify_checks(
     runs: Option<&[crate::integrations::github::CheckRun]>,
@@ -1141,18 +1390,24 @@ fn expected_reviews(
             let (reviewed_head, outcome) = match matching {
                 None => (None, ReviewerOutcome::Pending),
                 Some(review) => {
-                    let outcome = match review.state {
-                        crate::integrations::github::ReviewState::Approved
-                        | crate::integrations::github::ReviewState::Commented => {
-                            ReviewerOutcome::Clean
-                        }
-                        crate::integrations::github::ReviewState::ChangesRequested => {
-                            ReviewerOutcome::Findings
-                        }
-                        crate::integrations::github::ReviewState::Dismissed
-                        | crate::integrations::github::ReviewState::Pending
-                        | crate::integrations::github::ReviewState::Unknown => {
-                            ReviewerOutcome::Pending
+                    let outcome = if review_unavailable(review.body.as_deref()) {
+                        ReviewerOutcome::Unavailable
+                    } else if review.submitted_at.is_none() {
+                        ReviewerOutcome::Pending
+                    } else {
+                        match review.state {
+                            crate::integrations::github::ReviewState::Approved
+                            | crate::integrations::github::ReviewState::Commented => {
+                                ReviewerOutcome::Clean
+                            }
+                            crate::integrations::github::ReviewState::ChangesRequested => {
+                                ReviewerOutcome::Findings
+                            }
+                            crate::integrations::github::ReviewState::Dismissed
+                            | crate::integrations::github::ReviewState::Pending
+                            | crate::integrations::github::ReviewState::Unknown => {
+                                ReviewerOutcome::Pending
+                            }
                         }
                     };
                     (Some(review.commit_id.clone()), outcome)
@@ -1165,6 +1420,23 @@ fn expected_reviews(
             }
         })
         .collect()
+}
+fn review_unavailable(body: Option<&str>) -> bool {
+    let Some(body) = body else {
+        return false;
+    };
+    let lower = body.to_ascii_lowercase();
+    [
+        "reached their quota limit",
+        "quota limit",
+        "quota exceeded",
+        "unable to review",
+        "could not review",
+        "review was skipped",
+        "review skipped",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
 }
 fn parse_github_utc(value: &str) -> Option<u64> {
     let b = value.as_bytes();

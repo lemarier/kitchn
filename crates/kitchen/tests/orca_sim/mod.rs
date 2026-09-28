@@ -163,6 +163,7 @@ impl SimWorker {
 pub struct SimTask {
     pub id: String,
     pub title: String,
+    pub spec: String,
     pub status: &'static str,
     pub dispatch: Option<String>,
 }
@@ -521,6 +522,7 @@ impl SimState {
                     id: id.clone(),
                     // Orca truncates titles to 80 characters.
                     title: Self::flag(flags, "task-title").chars().take(80).collect(),
+                    spec: Self::flag(flags, "spec"),
                     status: "ready",
                     dispatch: None,
                 });
@@ -531,6 +533,7 @@ impl SimState {
                 "tasks": self.tasks.iter().map(|task| json!({
                     "id": task.id,
                     "task_title": task.title,
+                    "spec": task.spec,
                     "status": task.status,
                 })).collect::<Vec<_>>(),
             })),

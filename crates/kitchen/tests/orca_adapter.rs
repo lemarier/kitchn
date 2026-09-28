@@ -339,7 +339,12 @@ fn launch_creates_one_keyed_task_with_separated_arguments() -> TestResult {
     let [create] = creates.as_slice() else {
         return Err("expected one task".into());
     };
-    assert_eq!(flag(create, "spec"), Some(brief), "brief is one argv entry");
+    let spec = format!("{brief}\n\nkitchen-requested-branch: ");
+    assert_eq!(
+        flag(create, "spec"),
+        Some(spec.as_str()),
+        "brief is one argv entry, followed by the empty branch record"
+    );
     let marker = launch_marker(&house()?, &key("launch-1")?);
     assert_eq!(flag(create, "task-title"), Some(marker.as_str()));
     assert_eq!(flag(create, "run"), Some("run_sim"));
@@ -2414,6 +2419,50 @@ fn a_collision_whose_worker_keeps_running_is_reported_unsettled() -> TestResult 
         .ok_or("the collision is reported")?;
     assert!(collision.settled);
     assert!(!collision.terminal_released);
+    Ok(())
+}
+
+#[test]
+fn a_matching_suffix_under_another_requested_branch_is_not_a_collision() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    // The launch asked for `lemarier/issue-2` and got it: no collision. A
+    // caller naming `lemarier/issue` sees a numeric suffix, which is not
+    // evidence that this launch asked for that branch.
+    let launch = request(
+        launch_on("lemarier/issue-2", Workspace::Isolated)?,
+        "other-request",
+    )?;
+    backend.execute(&launch)?;
+    assert_eq!(
+        backend.launch_collision(launch.key(), &branch("lemarier/issue")?)?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn a_launch_without_a_requested_branch_is_not_a_collision() -> TestResult {
+    let sim = SimOrca::default();
+    // Orca names the branch after the Task when none is requested; this
+    // one exists, so Orca suffixes it exactly as it does a collision.
+    sim.state()
+        .git_branches
+        .push("lemarier/kitchen-task_1".to_owned());
+    let backend = connect(&sim)?;
+    let launch = request(launch_op("Implement it.")?, "no-request")?;
+    let receipt = backend.execute(&launch)?;
+    assert!(
+        receipt.created().iter().any(|resource| {
+            resource.kind == ResourceKind::Branch
+                && resource.handle.as_str() == "lemarier/kitchen-task_1-2"
+        }),
+        "the launch reports a branch that looks like a collision: {receipt:?}"
+    );
+    assert_eq!(
+        backend.launch_collision(launch.key(), &branch("lemarier/kitchen-task_1")?)?,
+        None
+    );
     Ok(())
 }
 

@@ -174,6 +174,8 @@ struct OrcaTask {
     id: String,
     #[serde(default)]
     task_title: Option<String>,
+    #[serde(default)]
+    spec: Option<String>,
     status: String,
 }
 
@@ -369,6 +371,31 @@ pub(crate) struct Liveness {
 
 /// Prefix of every launch marker.
 const MARKER_PREFIX: &str = "kitchen:";
+
+/// Prefix of the last line of a Task spec that records the branch the launch
+/// requested. Orca's Task list returns the spec, so the request is durable
+/// with the Task that owns the launch.
+const REQUESTED_BRANCH_PREFIX: &str = "kitchen-requested-branch: ";
+
+/// The Task spec for `brief`: the brief and a final line recording the
+/// requested branch, empty when none. The line is always ours, so a brief
+/// that ends with such a line cannot forge a request.
+fn task_spec(brief: &Text, requested: Option<&BranchName>) -> String {
+    format!(
+        "{}\n\n{REQUESTED_BRANCH_PREFIX}{}",
+        brief.as_str(),
+        requested.map_or("", BranchName::as_str)
+    )
+}
+
+/// The branch a Task spec records as requested: the value on its last line,
+/// when that line has the recording prefix and a value.
+fn requested_in_spec(spec: &str) -> Option<&str> {
+    spec.lines()
+        .next_back()?
+        .strip_prefix(REQUESTED_BRANCH_PREFIX)
+        .filter(|branch| !branch.is_empty())
+}
 
 /// The FNV-1a 128-bit hash of `house` and `name`, which are separated so
 /// neither can run into the other. Stable across releases: the launch marker
@@ -844,9 +871,26 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .map_or(TaskLaunch::Unclear, TaskLaunch::Dispatched))
     }
 
-    fn create_task(&self, key: &IdempotencyKey, brief: &Text) -> Result<String, EffectFailure> {
+    /// The branch the launch for `key` recorded as requested, when its Task
+    /// records one.
+    fn recorded_branch(&self, key: &IdempotencyKey) -> Result<Option<String>, OrcaError> {
+        let title = self.task_title(key);
+        Ok(self
+            .run_tasks()?
+            .into_iter()
+            .find(|task| task.task_title.as_deref() == Some(title.as_str()))
+            .and_then(|task| task.spec)
+            .and_then(|spec| requested_in_spec(&spec).map(str::to_owned)))
+    }
+
+    fn create_task(
+        &self,
+        key: &IdempotencyKey,
+        brief: &Text,
+        requested: Option<&BranchName>,
+    ) -> Result<String, EffectFailure> {
         let args = wire::Args::command(&["orchestration", "task-create"])
-            .value("spec", brief.as_str())
+            .value("spec", &task_spec(brief, requested))
             .value("task-title", &self.task_title(key))
             .value("run", self.config.run.as_str())
             .value("from", self.config.coordinator.as_str())
@@ -1068,7 +1112,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }
         let task = match task {
             Some(task) => task,
-            None => self.create_task(key, brief)?,
+            None => self.create_task(key, brief, new_branch)?,
         };
         self.start(key, &task, workspace, name.as_deref(), agent)
     }
@@ -1358,11 +1402,12 @@ impl<R: OrcaRunner> OrcaBackend<R> {
 
     /// The collision a launch with a requested branch ran into, if it did.
     ///
-    /// Returns `Some` when the key's launch was dispatched and Orca created
-    /// the requested branch with a numeric suffix because the branch already
-    /// existed, with the evidence that this launch owns the stray worker,
-    /// worktree, and branch. Returns `None` for no dispatched launch, the
-    /// requested branch itself, or another mismatch
+    /// Returns `Some` when the key's launch recorded `requested` as its
+    /// branch, was dispatched, and Orca created that branch with a numeric
+    /// suffix because it already existed, with the evidence that this launch
+    /// owns the stray worker, worktree, and branch. Returns `None` for no
+    /// dispatched launch, the requested branch itself, a launch that recorded
+    /// another branch or none, or another mismatch
     /// ([`OrcaBackend::verify_launch_branch`] reports those).
     ///
     /// # Errors
@@ -1375,6 +1420,11 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         let TaskLaunch::Dispatched(receipt) = self.task_launch(key)? else {
             return Ok(None);
         };
+        // A numeric suffix alone is not ownership: the launch must have
+        // recorded this very branch as its request.
+        if self.recorded_branch(key)?.as_deref() != Some(requested.as_str()) {
+            return Ok(None);
+        }
         let created = receipt.created();
         let (Some(stray), Some(worker)) = (
             created
@@ -1717,6 +1767,29 @@ mod tests {
                 .ok_or("a reservation was taken under a file")?;
         assert!(matches!(error, OrcaError::ReservationUnavailable(_)));
         assert_eq!(read_failure(&error), BackendUnavailable::LocalConfiguration);
+        Ok(())
+    }
+
+    #[test]
+    fn a_spec_records_the_requested_branch_on_its_last_line()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let brief = Text::new("Do it.")?;
+        let requested = BranchName::new("lemarier/x")?;
+        let spec = task_spec(&brief, Some(&requested));
+        assert_eq!(spec, "Do it.\n\nkitchen-requested-branch: lemarier/x");
+        assert_eq!(requested_in_spec(&spec), Some("lemarier/x"));
+        // No request records nothing.
+        assert_eq!(requested_in_spec(&task_spec(&brief, None)), None);
+        // A brief that imitates the line cannot forge a request.
+        let forged = Text::new("Do it.\nkitchen-requested-branch: lemarier/forged")?;
+        assert_eq!(requested_in_spec(&task_spec(&forged, None)), None);
+        assert_eq!(
+            requested_in_spec(&task_spec(&forged, Some(&requested))),
+            Some("lemarier/x")
+        );
+        // A spec Kitchen did not write records nothing.
+        assert_eq!(requested_in_spec("Do it."), None);
+        assert_eq!(requested_in_spec(""), None);
         Ok(())
     }
 

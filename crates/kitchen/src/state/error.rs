@@ -94,6 +94,8 @@ pub enum Corruption {
     Marker,
     /// The snapshot belongs to a different store than its marker names.
     StoreIdentity,
+    /// Ownership history does not replay to the current claim.
+    Ownership,
 }
 
 impl fmt::Display for Corruption {
@@ -113,6 +115,7 @@ impl fmt::Display for Corruption {
             Self::SettledWithWork => formatter.write_str("settled task has unfinished work"),
             Self::LimitExceeded => formatter.write_str("stored collection exceeds its bound"),
             Self::Marker => formatter.write_str("store marker is missing or invalid"),
+            Self::Ownership => formatter.write_str("ownership history contradicts the claim"),
             Self::StoreIdentity => {
                 formatter.write_str("snapshot belongs to a different store than its marker")
             }

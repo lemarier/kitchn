@@ -1088,3 +1088,60 @@ fn redirected_store_paths_are_refused_without_touching_the_target() -> TestResul
     ));
     Ok(())
 }
+
+#[test]
+fn duplicate_persisted_task_keys_are_rejected() -> TestResult {
+    let fixture = Fixture::new()?;
+    claimed_attempt(&fixture, "task-1", at(0))?;
+    fixture.store.create_task(spec("task-2")?, at(0))?;
+    let path = fixture.state_path();
+    let valid = fs::read_to_string(&path)?;
+    // A second, open record for task-1 after the owned one.
+    let duplicated = valid
+        .replace("\"task-2\": {", "\"task-1\": {")
+        .replace("\"id\": \"task-2\"", "\"id\": \"task-1\"");
+    assert_ne!(duplicated, valid);
+    fs::write(&path, &duplicated)?;
+    assert!(matches!(
+        open_error(&fixture),
+        Some(Error::State(StateError::CorruptState(
+            Corruption::Syntax { .. }
+        )))
+    ));
+    assert_eq!(
+        fs::read_to_string(&path)?,
+        duplicated,
+        "rejected state is not rewritten"
+    );
+    Ok(())
+}
+
+#[test]
+fn ownership_history_must_match_the_current_lease() -> TestResult {
+    let fixture = Fixture::new()?;
+    claimed_attempt(&fixture, "task-1", at(0))?;
+    let path = fixture.state_path();
+    let valid: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let mut erased = valid.clone();
+    erased["tasks"]["task-1"]["ownership"] = serde_json::json!([]);
+    let mut swapped_holder = valid.clone();
+    swapped_holder["tasks"]["task-1"]["state"]["lease"]["holder"] = "coordinator-z".into();
+    let mut released_then_claimed = valid.clone();
+    released_then_claimed["tasks"]["task-1"]["ownership"] = serde_json::json!([
+        {"type": "claimed", "holder": "coordinator-a", "fence": 1, "at": 0},
+        {"type": "released", "fence": 1, "at": 0},
+        {"type": "claimed", "holder": "coordinator-a", "fence": 1, "at": 0},
+    ]);
+    for corrupt in [erased, swapped_holder, released_then_claimed] {
+        fs::write(&path, serde_json::to_vec_pretty(&corrupt)?)?;
+        assert!(matches!(
+            open_error(&fixture),
+            Some(Error::State(StateError::CorruptState(
+                Corruption::Ownership
+            )))
+        ));
+    }
+    fs::write(&path, serde_json::to_vec_pretty(&valid)?)?;
+    assert!(fixture.reopen().is_ok());
+    Ok(())
+}

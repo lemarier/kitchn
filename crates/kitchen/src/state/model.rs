@@ -621,8 +621,46 @@ pub(crate) struct StoreState {
     house: HouseId,
     nonce: u64,
     next_fence: u64,
+    #[serde(deserialize_with = "unique_map")]
     tasks: BTreeMap<TaskId, TaskRecord>,
+    #[serde(deserialize_with = "unique_map")]
     consumers: BTreeMap<ConsumerId, Lease>,
+}
+
+/// Deserialize a map, rejecting a repeated key instead of letting a later
+/// entry silently replace an earlier one (and, with it, recorded ownership).
+fn unique_map<'de, D, K, V>(deserializer: D) -> std::result::Result<BTreeMap<K, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    struct UniqueMap<K, V>(std::marker::PhantomData<(K, V)>);
+
+    impl<'de, K: Deserialize<'de> + Ord, V: Deserialize<'de>> serde::de::Visitor<'de>
+        for UniqueMap<K, V>
+    {
+        type Value = BTreeMap<K, V>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map with unique keys")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut map = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry()? {
+                if map.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate key"));
+                }
+            }
+            Ok(map)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueMap(std::marker::PhantomData))
 }
 
 #[derive(Deserialize)]
@@ -1298,6 +1336,7 @@ impl StoreState {
         {
             return Err(Corruption::LimitExceeded);
         }
+        validate_ownership(task, self.next_fence)?;
         let current_fence = match &task.state {
             TaskState::Claimed { lease } => {
                 if lease.fence.get() >= self.next_fence {
@@ -1348,6 +1387,74 @@ impl StoreState {
         }
         Ok(())
     }
+}
+
+/// Replay the ownership history: each claim, adoption, or takeover gets a
+/// larger fence than every earlier one; a relinquish, takeover, or release
+/// names the current owner's fence; nothing follows a release; the replayed
+/// owner matches the task state; and every attempt ran under an owned fence.
+fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result<(), Corruption> {
+    let mut owner: Option<(&HolderId, Fence)> = None;
+    let mut owned = BTreeSet::new();
+    let mut released = false;
+    let issue = |owned: &mut BTreeSet<Fence>, fence: Fence| {
+        if fence.get() >= next_fence {
+            return Err(Corruption::FenceAhead);
+        }
+        if owned.last().is_some_and(|last| *last >= fence) {
+            return Err(Corruption::Ownership);
+        }
+        owned.insert(fence);
+        Ok(())
+    };
+    for event in &task.ownership {
+        if released {
+            return Err(Corruption::Ownership);
+        }
+        let current = owner.map(|(_, fence)| fence);
+        match event {
+            OwnershipEvent::Claimed { holder, fence, .. } => {
+                if owner.is_some() {
+                    return Err(Corruption::Ownership);
+                }
+                issue(&mut owned, *fence)?;
+                owner = Some((holder, *fence));
+            }
+            OwnershipEvent::TakenOver {
+                previous,
+                holder,
+                fence,
+                ..
+            } => {
+                if current != Some(*previous) {
+                    return Err(Corruption::Ownership);
+                }
+                issue(&mut owned, *fence)?;
+                owner = Some((holder, *fence));
+            }
+            OwnershipEvent::Relinquished { fence, .. } | OwnershipEvent::Released { fence, .. } => {
+                if current != Some(*fence) {
+                    return Err(Corruption::Ownership);
+                }
+                owner = None;
+                released = matches!(event, OwnershipEvent::Released { .. });
+            }
+        }
+    }
+    let consistent = match &task.state {
+        TaskState::Claimed { lease } => owner == Some((&lease.holder, lease.fence)),
+        TaskState::Open => owner.is_none() && !released,
+        TaskState::Settled { .. } => owner.is_none(),
+    };
+    if !consistent
+        || task
+            .attempts
+            .iter()
+            .any(|attempt| !owned.contains(&attempt.fence))
+    {
+        return Err(Corruption::Ownership);
+    }
+    Ok(())
 }
 
 fn state_for(outcome: EffectOutcome, at: Timestamp) -> EffectState {

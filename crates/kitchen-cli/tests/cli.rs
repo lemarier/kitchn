@@ -57,7 +57,15 @@ fn unknown_flags_are_rejected() -> Result<(), Box<dyn Error>> {
 #[test]
 fn identifiers_are_validated_by_the_library() -> Result<(), Box<dyn Error>> {
     for command in ["validate-house", "validate-task"] {
-        for id in ["a".to_owned(), "A".repeat(64)] {
+        for id in [
+            "a".to_owned(),
+            "A".repeat(64),
+            "42".to_owned(),
+            "9-task".to_owned(),
+            "a-".to_owned(),
+            "a_".to_owned(),
+            "a--b".to_owned(),
+        ] {
             let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
                 .args([command, &id])
                 .output()?;
@@ -96,7 +104,13 @@ fn closed_output_is_a_failure() -> Result<(), Box<dyn Error>> {
     use std::os::unix::net::UnixStream;
     use std::process::Stdio;
 
-    for args in [vec![], vec!["validate-house", "home"]] {
+    for args in [
+        vec![],
+        vec!["--help"],
+        vec!["--version"],
+        vec!["validate-house", "--help"],
+        vec!["validate-house", "home"],
+    ] {
         let (writer, reader) = UnixStream::pair()?;
         drop(reader);
         let fd: OwnedFd = writer.into();
@@ -105,7 +119,9 @@ fn closed_output_is_a_failure() -> Result<(), Box<dyn Error>> {
             .stdout(Stdio::from(fd))
             .output()?;
         assert_eq!(output.status.code(), Some(1));
-        assert!(String::from_utf8(output.stderr)?.contains("failed to write command output"));
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains("failed to write command output"));
+        assert!(stderr.contains("BrokenPipe"));
     }
     Ok(())
 }

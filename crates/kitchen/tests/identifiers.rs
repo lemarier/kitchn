@@ -13,6 +13,15 @@ fn identities_preserve_case_and_round_trip() -> Result<(), Error> {
 }
 
 #[test]
+fn leading_digits_and_trailing_or_repeated_separators_are_accepted() -> Result<(), Error> {
+    for value in ["42", "9-task", "a-", "a_", "a--b"] {
+        assert_eq!(HouseId::new(value)?.as_str(), value);
+        assert_eq!(TaskId::new(value)?.as_str(), value);
+    }
+    Ok(())
+}
+
+#[test]
 fn length_boundaries_are_inclusive() -> Result<(), Error> {
     for value in ["a".to_owned(), "a".repeat(64)] {
         assert_eq!(HouseId::new(&value)?.as_str(), value);

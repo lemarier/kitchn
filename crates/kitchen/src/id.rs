@@ -8,6 +8,7 @@ use crate::Error;
 ///
 /// Accepts 1–64 bytes, starting with an ASCII letter or digit, followed by ASCII
 /// letters, digits, hyphens or underscores. Whitespace and Unicode are rejected.
+/// Trailing and repeated separators are accepted (for example, `a-`, `a_`, `a--b`).
 /// This is not path validation: callers must separately enforce storage ownership.
 ///
 /// # Errors

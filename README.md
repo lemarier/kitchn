@@ -37,7 +37,8 @@ To install the bootstrap executable locally:
 cargo install --path crates/kitchen-cli --locked --offline
 ```
 
-Validate identifiers without accessing a house, credentials, or a backend:
+The `validate-house` and `validate-task` bootstrap diagnostic commands validate
+identifiers without accessing a house, credentials, or a backend:
 
 ```sh
 kitchen validate-house home

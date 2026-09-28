@@ -54,7 +54,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | Owner | Library paths under `crates/kitchen/src/` | Other boundaries |
 | --- | --- | --- |
 | #4 core contracts and durable ownership | `id.rs`, `error.rs`, `contracts/`, `state/` | Shared exports; state-store integration tests |
-| #5 house configuration and adoption | `house/`, `adoption/` | CLI adoption commands and managed instruction installation |
+| #5 house configuration and adoption | `house/`, `adoption/` | House/repository config adoption and safe-write installer; role cards and instruction assets in root `roles/` |
 | #6 Orca adapter and scheduling | `adapters/orca/`, `scheduling/` | Backend execution only; generic capability contracts belong to #4 |
 | #7 GitHub and Roger | `integrations/github/`, `integrations/roger/` | House-scoped external access |
 | #8 pickup, coordination and repair | `workflows/pickup.rs`, `workflows/coordination.rs`, `workflows/repair.rs` | Workflow integration tests |
@@ -62,6 +62,13 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #10 triage and gardener | `workflows/triage.rs`, `workflows/gardener.rs` | Hygiene tests |
 | #11 dishwasher | `workflows/cleanup.rs` | Ownership and preservation tests |
 | #12 trust and inspector | `trust/`, `workflows/inspector.rs` | Evidence and autonomy tests |
+| #13 end-to-end validation and operations | — | End-to-end harness in `crates/kitchen/tests/e2e_*`; operational docs in `docs/` |
+| #16 house repository templates and scaffold/adopt flow | `scaffold/` | Template assets in root `templates/`; template rendering and repository scaffolding through #5's installer |
+
+#5 owns house/repository config adoption and the safe-write installer. #16 owns
+template assets, rendering, and repository scaffolding, built on #5's installer.
+For shared parents (`workflows/mod.rs` and CLI command registration):
+#4 defines the pattern; until it lands, the first PR that needs a shared parent creates it and later PRs add one line.
 
 Each owner keeps its integration tests in `crates/kitchen/tests/` with a matching
 area name. Coordinate shared `mod.rs`, exports, CLI command registration, and
@@ -80,8 +87,7 @@ uncertain external result must be reconciled before retrying; cancellation does
 not prove rollback. Persist intent and idempotency identity before durable or
 external effects. Check cancellation before effects and between bounded waits,
 and define how interrupted work resumes after restart. Never hold a state lock
-across unrelated I/O. No background work or external I/O is implemented by the
-identifier validation commands.
+across unrelated I/O.
 
 ## Commands and review context
 

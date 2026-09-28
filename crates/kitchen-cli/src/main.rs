@@ -5,7 +5,7 @@ use std::{
     process::ExitCode,
 };
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use kitchen::{HouseId, TaskId};
 
 #[derive(Parser)]
@@ -22,14 +22,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Validate a house identifier without accessing configuration or credentials.
+    /// Bootstrap diagnostic: validate a house identifier without configuration or credentials.
     ValidateHouse { id: String },
-    /// Validate a Kitchen task identifier without contacting a backend.
+    /// Bootstrap diagnostic: validate a task identifier without contacting a backend.
     ValidateTask { id: String },
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                return output_status(write!(io::stdout().lock(), "{}", error.render()));
+            }
+            if write!(io::stderr().lock(), "{}", error.render()).is_err() {
+                return ExitCode::FAILURE;
+            }
+            return ExitCode::from(2);
+        }
+    };
     let result = match cli.command {
         Some(Command::ValidateHouse { id }) => HouseId::new(&id).map(|id| id.to_string()),
         Some(Command::ValidateTask { id }) => TaskId::new(&id).map(|id| id.to_string()),
@@ -52,9 +66,13 @@ fn main() -> ExitCode {
 fn output_status(result: io::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(_) => {
+        Err(error) => {
             // The diagnostic channel can also be closed; exit failure either way.
-            let _ = writeln!(io::stderr().lock(), "error: failed to write command output");
+            let _ = writeln!(
+                io::stderr().lock(),
+                "error: failed to write command output ({:?})",
+                error.kind()
+            );
             ExitCode::FAILURE
         }
     }

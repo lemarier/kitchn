@@ -92,9 +92,11 @@ fn look_up(backend: &dyn ExecutionBackend, effect: &EffectRecord) -> EffectOutco
 pub struct ReconcileReport {
     /// Effects whose outcome is now established.
     pub resolved: Vec<EffectRecord>,
-    /// Effects whose outcome is still unknown. They block new effects and
-    /// attempts until resolved, or until the owner records them as
-    /// [`EffectOutcome::Unresolvable`] after its own investigation.
+    /// Effects whose outcome is still unknown. They block new effects,
+    /// attempts, and settlement until resolved. When the owner cannot
+    /// establish the outcome it records [`EffectOutcome::Unresolvable`] to
+    /// hand the effect over; that still blocks until a
+    /// [`crate::state::RiskDecision`] or positive evidence.
     pub unresolved: Vec<EffectRecord>,
     /// Unresolved effects persisted for another backend namespace. They were
     /// not looked up; reconcile them with the backend that received them.

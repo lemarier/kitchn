@@ -25,7 +25,7 @@ use kitchen::{
     state::{
         AttemptState, CancelStatus, Consumption, Corruption, Creation, EffectOutcome, EffectStart,
         EffectState, HouseStore, MAX_EVIDENCE_PER_REVISION, OwnershipEvent, RecoveryItem,
-        StateError, StoreOptions, TaskState,
+        RiskAction, RiskDecision, StateError, StoreOptions, TaskState,
     },
 };
 
@@ -764,7 +764,7 @@ fn unresolved_effect_blocks_new_work_until_resolved() -> TestResult {
         &task,
         fence,
         intent.seq(),
-        EffectOutcome::Unresolvable,
+        EffectOutcome::Applied(receipt("request-1")?),
         at(4),
     )?;
     assert_eq!(
@@ -1305,5 +1305,105 @@ fn a_late_response_from_an_older_submission_cannot_clear_a_newer_one() -> TestRe
         at(5),
     )?;
     assert!(matches!(current.state(), EffectState::Applied { .. }));
+    Ok(())
+}
+
+#[test]
+fn a_handed_over_effect_keeps_blocking_new_work_and_success() -> TestResult {
+    let fixture = Fixture::new()?;
+    let fence = claimed_attempt(&fixture, "task-1", at(0))?;
+    let task = task_id("task-1")?;
+    let store = &fixture.store;
+    let EffectStart::Execute(intent) = store.begin_effect(
+        plan(&task, fence, "launch", launch()?)?,
+        &grants()?,
+        &common::refusing()?,
+        at(1),
+    )?
+    else {
+        return Err("expected a new effect".into());
+    };
+    store.record_effect_outcome(
+        &task,
+        fence,
+        intent.seq(),
+        EffectOutcome::Unresolvable,
+        at(2),
+    )?;
+    assert!(matches!(
+        store.begin_effect(
+            plan(&task, fence, "relaunch", launch()?)?,
+            &grants()?,
+            &common::refusing()?,
+            at(3)
+        ),
+        Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+    ));
+    assert!(matches!(
+        store.finish_attempt(
+            &task,
+            fence,
+            AttemptNumber::FIRST,
+            AttemptOutcome::Succeeded,
+            at(3)
+        ),
+        Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+    ));
+
+    let decision = |action, revision| -> TestResult<RiskDecision> {
+        Ok(RiskDecision {
+            effect: intent.request().key().clone(),
+            decided_by: holder("operator")?,
+            revision,
+            action,
+        })
+    };
+    let other = RiskDecision {
+        effect: kitchen::contracts::IdempotencyKey::from_ref(ExternalRef::new("another-key")?),
+        ..decision(RiskAction::ContinueWork, EvidenceRevision::INITIAL)?
+    };
+    assert!(matches!(
+        store.accept_risk(&task, fence, intent.seq(), other, at(4)),
+        Err(Error::State(StateError::DecisionScope(seq))) if seq == intent.seq()
+    ));
+    let moved = store.record_evidence(&task, fence, evidence('c', "ci-1")?, at(4))?;
+    assert!(matches!(
+        store.accept_risk(
+            &task,
+            fence,
+            intent.seq(),
+            decision(RiskAction::ContinueWork, EvidenceRevision::INITIAL)?,
+            at(4)
+        ),
+        Err(Error::State(StateError::StaleDecision { .. }))
+    ));
+    let proceed = decision(RiskAction::ContinueWork, moved)?;
+    store.accept_risk(&task, fence, intent.seq(), proceed.clone(), at(5))?;
+    assert_eq!(
+        store
+            .accept_risk(&task, fence, intent.seq(), proceed, at(6))?
+            .state(),
+        &EffectState::Waived {
+            decision: decision(RiskAction::ContinueWork, moved)?,
+            at: at(5)
+        },
+        "repeating the decision changes nothing"
+    );
+    // The explicit decision, not the owner's report, allows new work.
+    let mut relaunch = plan(&task, fence, "relaunch", launch()?)?;
+    relaunch.decided_at = moved;
+    assert!(matches!(
+        store.begin_effect(relaunch, &grants()?, &common::refusing()?, at(7))?,
+        EffectStart::Execute(_)
+    ));
+    // Late positive evidence still replaces the decision.
+    let applied = store.record_effect_outcome(
+        &task,
+        fence,
+        intent.seq(),
+        EffectOutcome::Applied(receipt("request-1")?),
+        at(8),
+    )?;
+    assert!(matches!(applied.state(), EffectState::Applied { .. }));
     Ok(())
 }

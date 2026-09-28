@@ -516,7 +516,7 @@ fn reconcile_confirms_absence_and_allows_a_fresh_effect() -> TestResult {
 }
 
 #[test]
-fn without_lookup_an_uncertain_effect_needs_an_explicit_owner_decision() -> TestResult {
+fn without_lookup_an_uncertain_launch_is_handed_over_for_a_decision() -> TestResult {
     let fixture = Fixture::new()?;
     let (task, fence) = started(&fixture, "task-1")?;
     let backend = fake([Capability::WorkerLaunchIsolated])?;
@@ -552,15 +552,68 @@ fn without_lookup_an_uncertain_effect_needs_an_explicit_owner_decision() -> Test
         kitchen::state::EffectOutcome::Unresolvable,
         at(3),
     )?;
-    assert_eq!(
+    // Handing over is not success: the reservation holds.
+    assert!(matches!(
         fixture.store.finish_attempt(
             &task,
             fence,
             AttemptNumber::FIRST,
             AttemptOutcome::Succeeded,
             at(4)
+        ),
+        Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+    ));
+    assert!(matches!(
+        fixture.store.settle_cancelled(&task, fence, at(4)),
+        Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+    ));
+    assert!(fixture.store.recovery_queue(at(4))?.contains(
+        &kitchen::state::RecoveryItem::HandedOver {
+            task: task.clone(),
+            seq: lost.seq()
+        }
+    ));
+
+    let stop = kitchen::state::RiskDecision {
+        effect: lost.request().key().clone(),
+        decided_by: holder("operator")?,
+        revision: kitchen::contracts::EvidenceRevision::INITIAL,
+        action: kitchen::state::RiskAction::SettleUnsuccessfully,
+    };
+    let waived = fixture
+        .store
+        .accept_risk(&task, fence, lost.seq(), stop.clone(), at(5))?;
+    assert!(matches!(waived.state(), EffectState::Waived { decision, .. } if *decision == stop));
+    assert!(matches!(
+        fixture.store.finish_attempt(
+            &task,
+            fence,
+            AttemptNumber::FIRST,
+            AttemptOutcome::Succeeded,
+            at(6)
+        ),
+        Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+    ));
+    assert!(matches!(
+        run_effect(
+            &fixture.store,
+            &backend,
+            &grants()?,
+            plan(&task, fence, "relaunch", launch()?)?,
+            &clock
+        ),
+        Err(Error::State(StateError::UnresolvedEffects { count: 1 }))
+    ));
+    assert_eq!(
+        fixture.store.finish_attempt(
+            &task,
+            fence,
+            AttemptNumber::FIRST,
+            AttemptOutcome::Failed(kitchen::contracts::FailureClass::Retryable),
+            at(6)
         )?,
-        Disposition::Settled(Settlement::Succeeded)
+        Disposition::Settled(Settlement::Failed),
+        "the decision allows only an unsuccessful settlement"
     );
     Ok(())
 }

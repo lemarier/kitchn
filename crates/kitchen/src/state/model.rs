@@ -196,23 +196,97 @@ pub enum EffectState {
         /// When recorded.
         at: Timestamp,
     },
-    /// The owner accepted that the provider cannot establish the outcome.
-    /// Resources it may have created keep uncertain ownership.
+    /// Handed over: the owner reported that the outcome cannot be
+    /// established. This is not a resolution. The task keeps its reservation
+    /// and cannot start new work or settle until positive evidence arrives
+    /// or a [`RiskDecision`] authorizes one specific action.
     Unresolvable {
+        /// When recorded.
+        at: Timestamp,
+    },
+    /// A handed-over effect whose outcome is still unknown, with a scoped
+    /// decision about how the task may proceed. Resources it may have created
+    /// keep uncertain ownership.
+    Waived {
+        /// The decision.
+        decision: RiskDecision,
         /// When recorded.
         at: Timestamp,
     },
 }
 
 impl EffectState {
-    /// Whether the outcome is settled (applied, not applied, or explicitly unresolvable).
+    /// Whether the outcome is established: applied or not applied.
     #[must_use]
     pub const fn is_resolved(&self) -> bool {
         match self {
-            Self::Intended | Self::Uncertain { .. } => false,
-            Self::Applied { .. } | Self::NotApplied { .. } | Self::Unresolvable { .. } => true,
+            Self::Applied { .. } | Self::NotApplied { .. } => true,
+            Self::Intended
+            | Self::Uncertain { .. }
+            | Self::Unresolvable { .. }
+            | Self::Waived { .. } => false,
         }
     }
+
+    /// Whether the outcome still needs evidence and no decision covers it.
+    const fn needs_outcome(&self) -> bool {
+        match self {
+            Self::Intended | Self::Uncertain { .. } | Self::Unresolvable { .. } => true,
+            Self::Applied { .. } | Self::NotApplied { .. } | Self::Waived { .. } => false,
+        }
+    }
+
+    /// Whether this effect prevents new attempts and new effects.
+    const fn blocks_work(&self) -> bool {
+        match self {
+            Self::Waived { decision, .. } => match decision.action {
+                RiskAction::ContinueWork => false,
+                RiskAction::SettleUnsuccessfully => true,
+            },
+            Self::Intended | Self::Uncertain { .. } | Self::Unresolvable { .. } => true,
+            Self::Applied { .. } | Self::NotApplied { .. } => false,
+        }
+    }
+
+    /// Whether this effect prevents settling the task, successfully or not.
+    const fn blocks_settlement(&self, success: bool) -> bool {
+        match self {
+            Self::Waived { decision, .. } => match decision.action {
+                RiskAction::ContinueWork => false,
+                RiskAction::SettleUnsuccessfully => success,
+            },
+            Self::Intended | Self::Uncertain { .. } | Self::Unresolvable { .. } => true,
+            Self::Applied { .. } | Self::NotApplied { .. } => false,
+        }
+    }
+}
+
+/// What a [`RiskDecision`] allows for a handed-over effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RiskAction {
+    /// Accept that the effect may have happened and continue: new attempts
+    /// and effects may start, which can duplicate the unknown effect.
+    ContinueWork,
+    /// Stop: the task may only settle as failed or cancelled.
+    SettleUnsuccessfully,
+}
+
+/// A decision, made outside the owner's own report, about one handed-over
+/// effect. It is bound to the effect's idempotency key and to the evidence
+/// revision it was made at; who may decide is house policy enforced by the
+/// caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RiskDecision {
+    /// The effect the decision is about.
+    pub effect: IdempotencyKey,
+    /// Who decided.
+    pub decided_by: HolderId,
+    /// The evidence revision the decision was made at.
+    pub revision: EvidenceRevision,
+    /// What it allows.
+    pub action: RiskAction,
 }
 
 /// A reported effect outcome.
@@ -224,7 +298,7 @@ pub enum EffectOutcome {
     NotApplied(NotAppliedReason),
     /// Still unknown.
     Uncertain(UncertainReason),
-    /// Unknown, and the owner accepts that it cannot be established.
+    /// Unknown, and the owner cannot establish it: hand the effect over.
     Unresolvable,
 }
 
@@ -442,15 +516,34 @@ impl TaskRecord {
         self.cancel.as_ref()
     }
 
-    /// Effects whose outcome is not yet resolved.
+    /// Effects whose outcome is unknown and not covered by a decision:
+    /// intended, uncertain, or handed over.
     pub fn unresolved_effects(&self) -> impl Iterator<Item = &EffectRecord> {
         self.effects
             .iter()
-            .filter(|effect| !effect.state.is_resolved())
+            .filter(|effect| effect.state.needs_outcome())
     }
 
-    fn unresolved_count(&self) -> usize {
-        self.unresolved_effects().count()
+    fn blocking_work(&self) -> usize {
+        self.effects
+            .iter()
+            .filter(|effect| effect.state.blocks_work())
+            .count()
+    }
+
+    fn blocking_settlement(&self, success: bool) -> usize {
+        self.effects
+            .iter()
+            .filter(|effect| effect.state.blocks_settlement(success))
+            .count()
+    }
+
+    /// Whether a decision limits the task to an unsuccessful settlement.
+    fn must_settle_unsuccessfully(&self) -> bool {
+        self.effects.iter().any(|effect| {
+            matches!(&effect.state, EffectState::Waived { decision, .. }
+                if decision.action == RiskAction::SettleUnsuccessfully)
+        })
     }
 
     fn settlement(&self) -> Option<Settlement> {
@@ -505,7 +598,9 @@ impl TaskRecord {
             });
         }
         let reconciled = match &existing.state {
-            EffectState::Applied { .. } | EffectState::Unresolvable { .. } => {
+            EffectState::Applied { .. }
+            | EffectState::Unresolvable { .. }
+            | EffectState::Waived { .. } => {
                 return Ok(EffectStart::Resolved(existing.clone()));
             }
             EffectState::NotApplied { .. } => {
@@ -698,6 +793,14 @@ pub enum RecoveryItem {
         task: TaskId,
         /// Number of unresolved effects.
         count: usize,
+    },
+    /// An effect was handed over: its outcome cannot be established, and the
+    /// task waits for positive evidence or a [`RiskDecision`].
+    HandedOver {
+        /// The task.
+        task: TaskId,
+        /// The effect.
+        seq: EffectSeq,
     },
     /// An unowned task has a pending cancellation that needs an owner to settle it.
     PendingCancellation {
@@ -976,7 +1079,7 @@ impl StoreState {
         if task.cancel.is_some() {
             return fail(StateError::CancelRequested);
         }
-        let unresolved = task.unresolved_count();
+        let unresolved = task.blocking_work();
         if unresolved > 0 {
             return fail(StateError::UnresolvedEffects { count: unresolved });
         }
@@ -1024,10 +1127,11 @@ impl StoreState {
             }
         }
         task.owned_lease(fence, now, false)?;
-        let unresolved = task.unresolved_count();
+        let unresolved = task.blocking_settlement(outcome == AttemptOutcome::Succeeded);
         if unresolved > 0 {
             return fail(StateError::UnresolvedEffects { count: unresolved });
         }
+        let stop = task.must_settle_unsuccessfully();
         let Some(attempt) = task.running_attempt_mut(fence) else {
             return fail(StateError::NoRunningAttempt);
         };
@@ -1038,6 +1142,7 @@ impl StoreState {
             AttemptOutcome::Failed(FailureClass::Retryable) if task.cancel.is_some() => {
                 Some(Settlement::Cancelled)
             }
+            AttemptOutcome::Failed(FailureClass::Retryable) if stop => Some(Settlement::Failed),
             AttemptOutcome::Failed(FailureClass::Retryable) if task.budget_spent(now) => {
                 Some(Settlement::Exhausted)
             }
@@ -1070,7 +1175,7 @@ impl StoreState {
                 at: now,
             });
         }
-        if task.state == TaskState::Open && task.unresolved_count() == 0 {
+        if task.state == TaskState::Open && task.blocking_settlement(false) == 0 {
             task.state = TaskState::Settled {
                 settlement: Settlement::Cancelled,
                 at: now,
@@ -1093,7 +1198,7 @@ impl StoreState {
             return Ok(());
         }
         let holder = task.owned_lease(fence, now, false)?.holder.clone();
-        let unresolved = task.unresolved_count();
+        let unresolved = task.blocking_settlement(false);
         if unresolved > 0 {
             return fail(StateError::UnresolvedEffects { count: unresolved });
         }
@@ -1170,7 +1275,7 @@ impl StoreState {
         if let Some(index) = same_name {
             return task.repeat_effect(index, &plan, backend, resubmission, now);
         }
-        let unresolved = task.unresolved_count();
+        let unresolved = task.blocking_work();
         if unresolved > 0 {
             return fail(StateError::UnresolvedEffects { count: unresolved });
         }
@@ -1257,12 +1362,14 @@ impl StoreState {
             (EffectState::Intended | EffectState::Uncertain { .. }, outcome) => {
                 Some(state_for(outcome, now))
             }
-            (EffectState::Unresolvable { .. }, EffectOutcome::Applied(receipt)) => {
-                Some(EffectState::Applied { receipt, at: now })
-            }
-            (EffectState::Unresolvable { .. }, EffectOutcome::NotApplied(reason)) => {
-                Some(EffectState::NotApplied { reason, at: now })
-            }
+            (
+                EffectState::Unresolvable { .. } | EffectState::Waived { .. },
+                EffectOutcome::Applied(receipt),
+            ) => Some(EffectState::Applied { receipt, at: now }),
+            (
+                EffectState::Unresolvable { .. } | EffectState::Waived { .. },
+                EffectOutcome::NotApplied(reason),
+            ) => Some(EffectState::NotApplied { reason, at: now }),
             (EffectState::Applied { receipt, .. }, EffectOutcome::Applied(reported))
                 if *receipt != reported =>
             {
@@ -1275,7 +1382,8 @@ impl StoreState {
             (
                 EffectState::Applied { .. }
                 | EffectState::NotApplied { .. }
-                | EffectState::Unresolvable { .. },
+                | EffectState::Unresolvable { .. }
+                | EffectState::Waived { .. },
                 EffectOutcome::Applied(_)
                 | EffectOutcome::NotApplied(_)
                 | EffectOutcome::Uncertain(_)
@@ -1284,6 +1392,49 @@ impl StoreState {
         };
         if let Some(next) = next {
             effect.state = next;
+        }
+        Ok(effect.clone())
+    }
+
+    pub(crate) fn accept_risk(
+        &mut self,
+        id: &TaskId,
+        fence: Fence,
+        seq: EffectSeq,
+        decision: RiskDecision,
+        now: Timestamp,
+    ) -> Result<EffectRecord> {
+        let task = self.task_mut(id)?;
+        task.owned_lease(fence, now, false)?;
+        let revision = task.evidence.revision;
+        let effect = task
+            .effects
+            .iter_mut()
+            .find(|effect| effect.seq == seq)
+            .ok_or(Error::State(StateError::EffectNotFound(seq)))?;
+        if &decision.effect != effect.request.key() {
+            return fail(StateError::DecisionScope(seq));
+        }
+        if decision.revision != revision {
+            return fail(StateError::StaleDecision {
+                decided: decision.revision,
+                current: revision,
+            });
+        }
+        match &effect.state {
+            EffectState::Unresolvable { .. } => {
+                effect.state = EffectState::Waived { decision, at: now };
+            }
+            EffectState::Waived {
+                decision: recorded, ..
+            } if *recorded == decision => {}
+            EffectState::Waived { .. }
+            | EffectState::Intended
+            | EffectState::Uncertain { .. }
+            | EffectState::Applied { .. }
+            | EffectState::NotApplied { .. } => {
+                return fail(StateError::NotHandedOver(seq));
+            }
         }
         Ok(effect.clone())
     }
@@ -1416,6 +1567,18 @@ impl StoreState {
     }
 
     pub(crate) fn recovery_queue(&self, now: Timestamp) -> Vec<RecoveryItem> {
+        let handed_over = self.tasks.values().flat_map(|task| {
+            let open = task.settlement().is_none();
+            task.effects
+                .iter()
+                .filter(move |effect| {
+                    open && matches!(effect.state, EffectState::Unresolvable { .. })
+                })
+                .map(|effect| RecoveryItem::HandedOver {
+                    task: task.spec.id.clone(),
+                    seq: effect.seq,
+                })
+        });
         let tasks = self.tasks.values().filter_map(|task| {
             let id = task.spec.id.clone();
             match &task.state {
@@ -1427,7 +1590,7 @@ impl StoreState {
                     })
                 }
                 TaskState::Claimed { .. } | TaskState::Settled { .. } => None,
-                TaskState::Open => match task.unresolved_count() {
+                TaskState::Open => match task.unresolved_effects().count() {
                     0 if task.cancel.is_some() => {
                         Some(RecoveryItem::PendingCancellation { task: id })
                     }
@@ -1445,7 +1608,7 @@ impl StoreState {
                 holder: lease.holder.clone(),
                 expired_at: lease.expires_at,
             });
-        tasks.chain(consumers).collect()
+        tasks.chain(handed_over).chain(consumers).collect()
     }
 
     /// Check invariants that the type system cannot express.
@@ -1528,8 +1691,12 @@ impl StoreState {
                 return Err(Corruption::EffectReference);
             }
         }
+        let blocked = match task.settlement() {
+            None => 0,
+            Some(settlement) => task.blocking_settlement(settlement == Settlement::Succeeded),
+        };
         if task.settlement().is_some()
-            && (task.unresolved_count() > 0
+            && (blocked > 0
                 || task
                     .attempts
                     .iter()

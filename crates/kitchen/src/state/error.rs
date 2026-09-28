@@ -207,6 +207,12 @@ pub enum StateError {
         /// The backend namespace recorded with its intent.
         recorded: BackendId,
     },
+    /// A risk decision needs a handed-over effect without another decision.
+    #[error("effect {0} is not handed over for a decision")]
+    NotHandedOver(EffectSeq),
+    /// A risk decision names a different effect.
+    #[error("the decision does not name effect {0}")]
+    DecisionScope(EffectSeq),
     /// A reported outcome contradicts the recorded one.
     #[error("effect {0} already has a contradicting recorded outcome")]
     ConflictingOutcome(EffectSeq),
@@ -296,6 +302,8 @@ impl StateError {
             | Self::EffectNotFound(_)
             | Self::EffectNameConflict(_)
             | Self::BackendMismatch { .. }
+            | Self::NotHandedOver(_)
+            | Self::DecisionScope(_)
             | Self::ConflictingOutcome(_)
             | Self::ConflictingAttemptOutcome
             | Self::StaleDecision { .. }

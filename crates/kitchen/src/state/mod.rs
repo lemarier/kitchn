@@ -17,6 +17,9 @@
 //!   takeover, which interrupts the old attempt and issues a larger fence.
 //! - Intent is persisted before every effect. While any effect is unresolved,
 //!   no new effect or attempt starts; the owner reconciles first.
+//! - An effect whose outcome cannot be established is handed over, not
+//!   resolved: the task keeps its reservation until positive evidence or a
+//!   scoped [`RiskDecision`] allows one specific action.
 
 mod effects;
 mod error;
@@ -29,6 +32,6 @@ pub use model::{
     AttemptRecord, AttemptState, CancelRequest, CancelStatus, Consumption, Creation, EffectOutcome,
     EffectPlan, EffectRecord, EffectStart, EffectState, EvidenceLog, Lease, MAX_CONSUMED_MESSAGES,
     MAX_CONSUMERS, MAX_EFFECTS_PER_TASK, MAX_EVIDENCE_PER_REVISION, MAX_OWNERSHIP_HISTORY,
-    MAX_TASKS, OwnershipEvent, RecoveryItem, TaskRecord, TaskState,
+    MAX_TASKS, OwnershipEvent, RecoveryItem, RiskAction, RiskDecision, TaskRecord, TaskState,
 };
 pub use store::{HouseStore, StoreOptions};

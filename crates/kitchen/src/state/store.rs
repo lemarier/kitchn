@@ -44,7 +44,7 @@ use crate::{
     },
     state::{
         CancelStatus, Consumption, Corruption, Creation, EffectOutcome, EffectPlan, EffectRecord,
-        EffectStart, Lease, RecoveryItem, StateError, StorageOperation, TaskRecord,
+        EffectStart, Lease, RecoveryItem, RiskDecision, StateError, StorageOperation, TaskRecord,
         model::{SCHEMA_VERSION, SchemaProbe, StoreState},
     },
 };
@@ -395,6 +395,26 @@ impl HouseStore {
         self.transact(|state| {
             state.record_submission_outcome(id, fence, seq, submission, outcome, now)
         })
+    }
+
+    /// Record a scoped decision about a handed-over effect (one recorded as
+    /// [`EffectOutcome::Unresolvable`]). The decision must name the effect's
+    /// idempotency key and the task's current evidence revision. Repeating
+    /// the same decision is a no-op.
+    ///
+    /// # Errors
+    /// Returns [`StateError::DecisionScope`] for another effect,
+    /// [`StateError::StaleDecision`] for an older revision, and
+    /// [`StateError::NotHandedOver`] unless the effect is handed over.
+    pub fn accept_risk(
+        &self,
+        id: &TaskId,
+        fence: Fence,
+        seq: EffectSeq,
+        decision: RiskDecision,
+        now: Timestamp,
+    ) -> Result<EffectRecord> {
+        self.transact(|state| state.accept_risk(id, fence, seq, decision, now))
     }
 
     /// Record evidence. A new subject revision starts a new evidence revision

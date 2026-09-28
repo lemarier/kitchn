@@ -58,7 +58,7 @@ pub enum ContractError {
         /// The permission the effect needs.
         permission: Permission,
     },
-    /// The consent is for a different house, task, operation, or revision.
+    /// The consent is for a different house, task, effect, or revision.
     #[error("consent does not cover this effect")]
     ConsentMismatch,
     /// Current authority selects a different credential than the one an

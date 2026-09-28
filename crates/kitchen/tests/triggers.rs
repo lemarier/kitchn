@@ -10,7 +10,7 @@ use common::{
 use kitchen::{
     Error, TaskId,
     contracts::{
-        Authorization, Consent, ContractError, Evidence, EvidenceKind, EvidenceRevision,
+        Authorization, Consent, ContractError, Effect, Evidence, EvidenceKind, EvidenceRevision,
         EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, HouseGrants, Operation, Permission,
         Role, TaskAuthority, Text, Trigger, Workspace, fake::FakeBackend,
     },
@@ -47,8 +47,8 @@ fn interactive_task(fixture: &Fixture, id: &str) -> TestResult<(TaskId, Fence)> 
     Ok((task, fence))
 }
 
-fn consent(id: &str, task: &TaskId, operation: Operation) -> TestResult<Consent> {
-    let effect = operation.into();
+fn consent(id: &str, task: &TaskId, effect: impl Into<Effect>) -> TestResult<Consent> {
+    let effect = effect.into();
     Ok(Consent {
         id: ExternalRef::new(id)?,
         given_by: holder("person")?,

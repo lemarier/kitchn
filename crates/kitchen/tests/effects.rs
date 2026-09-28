@@ -78,29 +78,7 @@ fn install() -> TestResult<Effect> {
 
 /// House grants for every executor family, on its own namespace.
 fn grants_everywhere() -> TestResult<HouseGrants> {
-    Ok(HouseGrants::new(
-        house()?,
-        [
-            grant(Permission::LaunchWorker)?,
-            grant(Permission::MessageWorker)?,
-            grant(Permission::CancelWorker)?,
-            Grant::house(
-                Permission::EditLabels,
-                namespace(ExecutorKind::GitHub)?,
-                credential()?,
-            ),
-            Grant::house(
-                Permission::AskHuman,
-                namespace(ExecutorKind::Roger)?,
-                credential()?,
-            ),
-            Grant::house(
-                Permission::ManageSchedule,
-                namespace(ExecutorKind::Schedule)?,
-                credential()?,
-            ),
-        ],
-    ))
+    Ok(HouseGrants::new(house()?, grants_everywhere_list()?))
 }
 
 /// A claimed, running task with every grant, optionally for one repository.

@@ -13,10 +13,11 @@
 //! runs backwards is refused. At most [`MAX_OPEN_INSPECTIONS`] inspections
 //! are open at once. A recorded result is a routing intent, never authority.
 //!
-//! The fence is checked against the core store before the ledger write, so
-//! the core lock is not held across it: a takeover in that gap lets the
-//! previous owner complete one operation. The ledger's own fence record then
-//! refuses that owner.
+//! The claim is read from the core store inside the ledger transaction, after
+//! the ledger lock is taken. A takeover that commits before that read is
+//! refused; one that commits after it waits behind the ledger write, as if the
+//! write had finished first. The core lock is taken only for that read and is
+//! never held while waiting for the ledger lock.
 use crate::{
     HolderId, HouseId, TaskId,
     contracts::{Clock, EvidenceSubject, ExternalRef, Fence, Role, Settlement, Text, Timestamp},
@@ -246,7 +247,8 @@ impl Inspection {
 
 impl Ledger {
     /// Refuse unless `plan.inspector` holds a live claim on the inspector
-    /// task with `fence` at `now`.
+    /// task with `fence` at `now`. Call it inside the ledger transaction that
+    /// the claim authorizes, so no takeover can commit between the two.
     fn check_inspector(
         &self,
         store: &HouseStore,
@@ -273,17 +275,6 @@ impl Ledger {
         }
     }
 
-    /// Plan of a stored inspection, for the ownership check before a write.
-    fn stored_plan(&self, id: &ExternalRef) -> Result<InspectionPlan, TrustError> {
-        self.read(|doc| {
-            doc.inspections
-                .iter()
-                .find(|i| i.id() == id)
-                .map(|i| i.plan.clone())
-                .ok_or(TrustError::Incomplete)
-        })
-    }
-
     /// Start an inspection only for positively delivered work and an exact PR
     /// head, under the inspector task's live claim. Repeating an identical plan
     /// returns its existing state without resetting budgets.
@@ -300,9 +291,9 @@ impl Ledger {
         fence: Fence,
         clock: &dyn Clock,
     ) -> Result<Inspection, TrustError> {
-        let now = clock.now();
-        self.check_inspector(store, &plan, fence, now)?;
         self.transact(|doc| {
+            let now = clock.now();
+            self.check_inspector(store, &plan, fence, now)?;
             if let Some(old) = doc.inspections.iter_mut().find(|i| i.id() == &plan.id) {
                 if old.plan != plan {
                     return Err(TrustError::Conflict);
@@ -365,14 +356,14 @@ impl Ledger {
         tokens: u64,
         clock: &dyn Clock,
     ) -> Result<SampleReservation, TrustError> {
-        let now = clock.now();
-        self.check_inspector(store, &self.stored_plan(id)?, fence, now)?;
         self.transact(|doc| {
+            let now = clock.now();
             let index = doc
                 .inspections
                 .iter()
                 .position(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
+            self.check_inspector(store, &doc.inspections[index].plan, fence, now)?;
             doc.inspections[index].advance_fence(fence)?;
             let inspection = &doc.inspections[index];
             if let Some(old) = inspection.samples.iter().find(|s| s.number == number) {
@@ -444,13 +435,13 @@ impl Ledger {
         result: SampleResult,
         clock: &dyn Clock,
     ) -> Result<bool, TrustError> {
-        self.check_inspector(store, &self.stored_plan(id)?, fence, clock.now())?;
         self.transact(|doc| {
             let inspection = doc
                 .inspections
                 .iter_mut()
                 .find(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
+            self.check_inspector(store, &inspection.plan, fence, clock.now())?;
             inspection.advance_fence(fence)?;
             let sample = inspection
                 .samples
@@ -481,13 +472,13 @@ impl Ledger {
         fence: Fence,
         clock: &dyn Clock,
     ) -> Result<(), TrustError> {
-        self.check_inspector(store, &self.stored_plan(id)?, fence, clock.now())?;
         self.transact(|doc| {
             let inspection = doc
                 .inspections
                 .iter_mut()
                 .find(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
+            self.check_inspector(store, &inspection.plan, fence, clock.now())?;
             inspection.advance_fence(fence)?;
             inspection.cancelled = true;
             Ok(())

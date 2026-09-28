@@ -56,7 +56,9 @@ const LAYOUT: StoreLayout = StoreLayout {
     priority_intent: Some("revoke.pending"),
     priority_reserve_bytes: REVOCATION_RESERVE,
 };
-const SCHEMA: u64 = 1;
+// Version 2 added the inspector task and fence to inspections. Older stores
+// are refused as unsupported before decoding; there is no migration.
+const SCHEMA: u64 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

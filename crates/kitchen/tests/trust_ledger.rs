@@ -2661,6 +2661,135 @@ fn a_taken_over_inspection_refuses_the_previous_fence() -> TestResult {
 }
 
 #[test]
+fn a_takeover_before_the_ledger_commit_refuses_the_stale_write() -> TestResult {
+    use std::{fs::OpenOptions, sync::mpsc, thread, time::Duration};
+    let f = Fixture::new()?;
+    let l = inspectable(&f)?;
+    let inspector = task_id("inspector")?;
+    let reviewer = scheduled("independent-reviewer")?;
+    let first = f.store.claim(&inspector, &reviewer, ttl(10)?, at(0))?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.dir.path().join("trust/ledger.lock"))?;
+    // Run `stale` while the test holds the ledger lock, and commit a
+    // takeover in core before the stale call can reach the ledger.
+    let interleave = |stale: Box<dyn FnOnce() -> Result<(), TrustError> + Send>,
+                      at_seconds: u64|
+     -> TestResult<(Result<(), TrustError>, Fence)> {
+        lock.lock()?;
+        let (ready, started) = mpsc::channel();
+        let call = thread::spawn(move || {
+            // A send fails only if the test already ended.
+            let _ = ready.send(());
+            stale()
+        });
+        started.recv_timeout(Duration::from_secs(1))?;
+        // Give a check made before the ledger lock time to pass first.
+        thread::sleep(Duration::from_millis(50));
+        let next = f
+            .store
+            .take_over(&inspector, &reviewer, ttl(10)?, at(at_seconds))?;
+        lock.unlock()?;
+        Ok((
+            call.join().map_err(|_| "stale call panicked")?,
+            next.fence(),
+        ))
+    };
+    // The stale owner's clock still reads inside its lease.
+    let (store, ledger, stale_plan) = (f.store.clone(), l.clone(), plan()?);
+    let (started, second) = interleave(
+        Box::new(move || {
+            ledger
+                .start_inspection(&store, stale_plan, first.fence(), &clock(9))
+                .map(drop)
+        }),
+        12,
+    )?;
+    assert!(matches!(started, Err(TrustError::Refused)), "{started:?}");
+    assert!(matches!(
+        l.inspection(&plan()?.id),
+        Err(TrustError::Incomplete)
+    ));
+    // The new owner starts and reserves; a takeover then lands before the
+    // previous owner's result, which would otherwise route a finding.
+    l.start_inspection(&f.store, plan()?, second, &clock(13))?;
+    l.reserve_sample(&f.store, &plan()?.id, second, 1, 1, &clock(14))?;
+    let (store, ledger, id) = (f.store.clone(), l.clone(), plan()?.id);
+    let forged = SampleResult::Confirmed {
+        finding: confirmed("fixture:stale-finding")?,
+        route: FollowUpRoute::Issue,
+    };
+    let (finished, _) = interleave(
+        Box::new(move || {
+            ledger
+                .finish_sample(&store, &id, second, 1, forged, &clock(21))
+                .map(drop)
+        }),
+        23,
+    )?;
+    assert!(matches!(finished, Err(TrustError::Refused)), "{finished:?}");
+    let inspection = l.inspection(&plan()?.id)?;
+    assert_eq!(
+        inspection.samples().first().and_then(|s| s.result.as_ref()),
+        None
+    );
+    assert_eq!(inspection.follow_ups().count(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_schema_one_ledger_with_an_inspection_reports_its_version() -> TestResult {
+    let f = Fixture::new()?;
+    let l = inspectable(&f)?;
+    l.start_inspection(&f.store, plan()?, fence(&f)?, &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 1, 1, &clock(6))?;
+    // Rewrite the store in the schema-1 shape: inspections had no task or fence.
+    tamper(&f, |d| {
+        *d.pointer_mut("/schema").ok_or("schema")? = serde_json::json!(1);
+        let inspection = d
+            .pointer_mut("/inspections/0")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("inspection")?;
+        inspection.remove("fence").ok_or("fence")?;
+        inspection
+            .get_mut("plan")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|p| p.remove("task"))
+            .ok_or("task")?;
+        Ok(())
+    })?;
+    let marker = f.dir.path().join("trust/store.json");
+    let mut stored: serde_json::Value = serde_json::from_slice(&fs::read(&marker)?)?;
+    *stored.pointer_mut("/schema").ok_or("marker schema")? = serde_json::json!(1);
+    fs::write(&marker, serde_json::to_vec(&stored)?)?;
+    let before = fs::read(ledger_path(&f))?;
+    let error = try_open(&f)?.err();
+    assert!(
+        matches!(
+            error,
+            Some(TrustError::Storage(StateError::UnsupportedSchema {
+                found: 1
+            }))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.map(|e| e.class()),
+        Some(kitchen::ErrorClass::Execution)
+    );
+    // An existing handle reports the same version and rewrites nothing.
+    assert!(matches!(
+        l.cancel_inspection(&f.store, &plan()?.id, fence(&f)?, &clock(7)),
+        Err(TrustError::Storage(StateError::UnsupportedSchema {
+            found: 1
+        }))
+    ));
+    assert_eq!(fs::read(ledger_path(&f))?, before);
+    Ok(())
+}
+
+#[test]
 fn open_inspections_are_capped_until_cancelled_or_past_deadline() -> TestResult {
     use kitchen::workflows::inspector::MAX_OPEN_INSPECTIONS;
     let f = Fixture::new()?;

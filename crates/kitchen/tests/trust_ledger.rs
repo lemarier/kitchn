@@ -16,7 +16,9 @@ use kitchen::{
         GrantAudit, Ledger, Measurement, Observation, PullRequestEvidence, StationScope,
         TrustError,
     },
-    workflows::inspector::{FollowUpRoute, InspectionPlan, SampleReservation, SampleResult},
+    workflows::inspector::{
+        FollowUpRoute, InspectionPlan, SampleReservation, SampleResult, test_hooks,
+    },
 };
 use std::{fs, num::NonZeroU32};
 
@@ -2671,35 +2673,9 @@ fn a_taken_over_inspection_refuses_the_previous_fence() -> TestResult {
     Ok(())
 }
 
-/// A clock that runs `pause` the first time it is read. Inspector
-/// operations read the clock after taking the core and ledger locks, so
-/// `pause` runs after the claim is read and before the ledger write.
-struct PausingClock<'a> {
-    time: ManualClock,
-    pause: std::cell::RefCell<Option<Box<dyn FnOnce() + 'a>>>,
-}
-
-impl<'a> PausingClock<'a> {
-    fn new(seconds: u64, pause: impl FnOnce() + 'a) -> Self {
-        Self {
-            time: clock(seconds),
-            pause: std::cell::RefCell::new(Some(Box::new(pause))),
-        }
-    }
-}
-
-impl kitchen::contracts::Clock for PausingClock<'_> {
-    fn now(&self) -> kitchen::contracts::Timestamp {
-        if let Some(pause) = self.pause.borrow_mut().take() {
-            pause();
-        }
-        self.time.now()
-    }
-}
-
 #[test]
 fn a_takeover_cannot_commit_between_the_claim_check_and_the_ledger_write() -> TestResult {
-    use std::{cell::RefCell, thread, time::Duration};
+    use std::{cell::RefCell, rc::Rc, thread, time::Duration};
     let f = Fixture::new()?;
     let l = inspectable(&f)?;
     let inspector = task_id("inspector")?;
@@ -2717,21 +2693,24 @@ fn a_takeover_cannot_commit_between_the_claim_check_and_the_ledger_write() -> Te
     )?;
     let waiting = f.reopen()?;
     let long = ttl(600)?;
-    let blocked = RefCell::new(None);
-    let background = RefCell::new(None);
+    let blocked = Rc::new(RefCell::new(None));
+    let background = Rc::new(RefCell::new(None));
     let finding = SampleResult::Confirmed {
         finding: confirmed("fixture:finding")?,
         route: FollowUpRoute::Issue,
     };
     // The first owner's lease has expired in core by 12, but its operation
-    // read the claim at 9 and has not written yet.
-    let paused = PausingClock::new(9, || {
+    // has read the claim at 9 and has not written yet. The hook runs right
+    // after the claim check accepts the claim.
+    test_hooks::on_next_claim_check({
         let (inspector, reviewer) = (inspector.clone(), reviewer.clone());
-        let waiting = waiting.clone();
-        blocked.replace(Some(quick.take_over(&inspector, &reviewer, long, at(12))));
-        background.replace(Some(thread::spawn(move || {
-            waiting.take_over(&inspector, &reviewer, long, at(12))
-        })));
+        let (blocked, background) = (Rc::clone(&blocked), Rc::clone(&background));
+        move || {
+            blocked.replace(Some(quick.take_over(&inspector, &reviewer, long, at(12))));
+            background.replace(Some(thread::spawn(move || {
+                waiting.take_over(&inspector, &reviewer, long, at(12))
+            })));
+        }
     });
     let written = l.finish_sample(
         &f.store,
@@ -2739,11 +2718,11 @@ fn a_takeover_cannot_commit_between_the_claim_check_and_the_ledger_write() -> Te
         first.fence(),
         1,
         finding.clone(),
-        &paused,
+        &clock(9),
     );
-    drop(paused);
     // No takeover committed while the claim was held.
-    let blocked = blocked.into_inner().ok_or("pause did not run")?;
+    let blocked = blocked.take().ok_or("hook did not run")?;
+    // No takeover committed while the claim was held.
     assert!(
         matches!(
             blocked,
@@ -2755,8 +2734,8 @@ fn a_takeover_cannot_commit_between_the_claim_check_and_the_ledger_write() -> Te
     // then completed after it instead of deadlocking.
     assert!(written?);
     let second = background
-        .into_inner()
-        .ok_or("pause did not run")?
+        .take()
+        .ok_or("hook did not run")?
         .join()
         .map_err(|_| "takeover panicked")??;
     assert!(second.fence() > first.fence());
@@ -2779,6 +2758,88 @@ fn a_takeover_cannot_commit_between_the_claim_check_and_the_ledger_write() -> Te
         Err(TrustError::Refused)
     ));
     assert_eq!(fs::read(ledger_path(&f))?, before);
+    Ok(())
+}
+
+/// A clock that runs `on_read` whenever it is read.
+struct ReadHook<F: Fn()>(ManualClock, F);
+
+impl<F: Fn()> kitchen::contracts::Clock for ReadHook<F> {
+    fn now(&self) -> kitchen::contracts::Timestamp {
+        (self.1)();
+        self.0.now()
+    }
+}
+
+type Operation =
+    fn(&Ledger, &HouseStore, Fence, &dyn kitchen::contracts::Clock) -> TestResult<bool>;
+
+#[test]
+fn every_inspector_operation_reads_the_clock_before_taking_a_lock() -> TestResult {
+    use std::{cell::RefCell, time::Duration};
+    let operations: [(&str, Operation); 4] = [
+        ("start", |l, s, fence, clock| {
+            let other = InspectionPlan {
+                id: source("fixture:other")?,
+                ..plan()?
+            };
+            Ok(matches!(
+                l.start_inspection(s, other, fence, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("reserve", |l, s, fence, clock| {
+            Ok(matches!(
+                l.reserve_sample(s, &plan()?.id, fence, 1, 1, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("finish", |l, s, fence, clock| {
+            Ok(matches!(
+                l.finish_sample(s, &plan()?.id, fence, 1, SampleResult::Unavailable, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("cancel", |l, s, fence, clock| {
+            Ok(matches!(
+                l.cancel_inspection(s, &plan()?.id, fence, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+    ];
+    for (name, operation) in operations {
+        let f = Fixture::new()?;
+        let l = inspectable(&f)?;
+        let inspector = task_id("inspector")?;
+        let reviewer = scheduled("independent-reviewer")?;
+        let first = f.store.claim(&inspector, &reviewer, ttl(10)?, at(0))?;
+        l.start_inspection(&f.store, plan()?, first.fence(), &clock(5))?;
+        l.reserve_sample(&f.store, &plan()?.id, first.fence(), 1, 1, &clock(6))?;
+        let quick = HouseStore::open(
+            f.dir.path().join("house"),
+            house()?,
+            StoreOptions {
+                lock_timeout: Duration::from_millis(30),
+                ..StoreOptions::default()
+            },
+        )?;
+        // The clock takes the task over with a 30 ms lock timeout. That only
+        // succeeds if the operation holds no core lock while reading it.
+        let long = ttl(600)?;
+        let taken = RefCell::new(None);
+        let reading = ReadHook(clock(9), || {
+            taken.replace(Some(quick.take_over(&inspector, &reviewer, long, at(12))));
+        });
+        let before = fs::read(ledger_path(&f))?;
+        let refused = operation(&l, &f.store, first.fence(), &reading)?;
+        let taken = taken.take().ok_or("the clock was not read")?;
+        assert!(
+            taken.is_ok(),
+            "{name}: takeover blocked by the clock read: {taken:?}"
+        );
+        assert!(refused, "{name}: the taken-over claim was not refused");
+        assert_eq!(fs::read(ledger_path(&f))?, before, "{name}");
+    }
     Ok(())
 }
 

@@ -974,3 +974,49 @@ fn a_refused_revision_and_the_same_preview_retry_do_not_duplicate() -> TestResul
     assert_eq!(forge.borrow().created().len(), 3);
     Ok(())
 }
+
+#[test]
+fn distinct_blocked_by_edges_never_share_an_effect_name() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge::seeded());
+    // Key `n7` beside existing issue #7, and keys that read as one another
+    // once joined with hyphens: `a-by-b` blocked by `c`, `a` blocked by `b-by-c`.
+    let proposal = Proposal {
+        repository: Repository::new(REPO)?,
+        parent: None,
+        issues: vec![
+            issue("n7", &["one/"], vec![])?,
+            issue("c", &["two/"], vec![])?,
+            issue("b-by-c", &["three/"], vec![])?,
+            issue("a-by-b", &["four/"], vec![proposed("c")?])?,
+            issue("a", &["five/"], vec![proposed("b-by-c")?])?,
+            issue(
+                "x",
+                &["six/"],
+                vec![proposed("n7")?, Blocker::Existing(IssueNumber::new(7)?)],
+            )?,
+        ],
+    };
+    let shown = preview(&proposal)?;
+    let report = house.apply(&forge, &proposal, &approval_of(&shown)?)?;
+    assert_eq!(report.outcome, ApplyOutcome::Completed);
+    let number = |name: &str| -> TestResult<u64> {
+        report
+            .issues
+            .get(&key(name)?)
+            .map(|n| n.get())
+            .ok_or_else(|| format!("{name} not created").into())
+    };
+    let seen = forge.borrow();
+    let blocked_by = |name: &str| -> TestResult<Vec<u64>> {
+        let mut found = seen.relation(number(name)?, "dependencies/blocked_by");
+        found.sort_unstable();
+        Ok(found)
+    };
+    let mut x = vec![number("n7")?, 7];
+    x.sort_unstable();
+    assert_eq!(blocked_by("x")?, x);
+    assert_eq!(blocked_by("a-by-b")?, [number("c")?]);
+    assert_eq!(blocked_by("a")?, [number("b-by-c")?]);
+    Ok(())
+}

@@ -1001,10 +1001,15 @@ fn steps(preview: &Preview) -> Result<Vec<Step>> {
             });
         }
     }
-    for issue in &preview.issues {
+    // Keys may contain hyphens and may look like `n7`, so an edge is named
+    // by preview positions and the existing issue number, never by key text.
+    for (position, issue) in preview.issues.iter().enumerate() {
         for blocker in &issue.blocked_by {
             let target = match blocker {
-                Blocker::Proposed(key) => key.to_string(),
+                Blocker::Proposed(key) => format!(
+                    "p{}",
+                    preview.position(key).ok_or(DecompositionError::Encoding)?
+                ),
                 Blocker::Existing(number) => format!("n{}", number.get()),
             };
             steps.push(Step {
@@ -1012,7 +1017,7 @@ fn steps(preview: &Preview) -> Result<Vec<Step>> {
                 write: WriteKind::BlockedBy {
                     blocker: blocker.clone(),
                 },
-                name: EffectName::new(&format!("blocked-{}-by-{target}", issue.key))?,
+                name: EffectName::new(&format!("blocked-p{position}-by-{target}"))?,
             });
         }
     }

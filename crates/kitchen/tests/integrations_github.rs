@@ -576,7 +576,21 @@ fn required_checks_presence_fails_closed_for_missing_and_app_bound_checks() -> R
     };
     assert_eq!(
         app.presence(&[], &[], &head),
-        RequiredCheckPresence::Unknown
+        RequiredCheckPresence::Missing
+    );
+    let wrong_app: CheckRun = serde_json::from_value(
+        json!({"name":"build","head_sha":head.as_str(),"status":"completed","conclusion":"success","app":{"id":122}}),
+    )?;
+    assert_eq!(
+        app.presence(&[wrong_app], &[], &head),
+        RequiredCheckPresence::Missing
+    );
+    let matching_app: CheckRun = serde_json::from_value(
+        json!({"name":"build","head_sha":head.as_str(),"status":"completed","conclusion":"success","app":{"id":123}}),
+    )?;
+    assert_eq!(
+        app.presence(&[matching_app], &[], &head),
+        RequiredCheckPresence::Present
     );
     Ok(())
 }

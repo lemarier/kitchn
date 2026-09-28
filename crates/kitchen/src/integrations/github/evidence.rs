@@ -100,7 +100,7 @@ pub struct IssueComment {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TimelineEvent {
     /// Provider event kind.
-    pub event: String,
+    pub event: TimelineKind,
     /// Event timestamp, if supplied.
     pub created_at: Option<String>,
     /// Actor, if supplied.
@@ -109,6 +109,32 @@ pub struct TimelineEvent {
     pub label: Option<TimelineLabel>,
     /// Cross-referenced source issue or pull request.
     pub source: Option<TimelineSource>,
+}
+/// Issue history event kinds used by triage; other kinds remain explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TimelineKind {
+    /// Label added.
+    Labeled,
+    /// Label removed.
+    Unlabeled,
+    /// Issue or PR cross-reference.
+    CrossReferenced,
+    /// Issue closed.
+    Closed,
+    /// Issue reopened.
+    Reopened,
+    /// Commit reference.
+    Committed,
+    /// Other reference.
+    Referenced,
+    /// Connected issue.
+    Connected,
+    /// Disconnected issue.
+    Disconnected,
+    /// Future or unsupported event kind.
+    #[serde(other)]
+    Unknown,
 }
 /// Label identity carried by a timeline change.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -376,7 +402,7 @@ pub struct RequiredCheck {
     /// Check-run name.
     pub context: String,
     /// Required GitHub App identity, when branch protection specifies one.
-    pub app_id: Option<u64>,
+    pub app_id: Option<i64>,
 }
 /// Whether every named required check exists at the selected head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,27 +431,36 @@ impl RequiredChecks {
         {
             return RequiredCheckPresence::Unknown;
         }
-        let mut names = std::collections::BTreeSet::new();
-        if self.contexts.iter().any(|name| !names.insert(name)) {
+        let mut contexts = std::collections::BTreeSet::new();
+        if self.contexts.iter().any(|name| !contexts.insert(name)) {
+            return RequiredCheckPresence::Unknown;
+        }
+        let mut check_names = std::collections::BTreeSet::new();
+        if self
+            .checks
+            .iter()
+            .any(|check| !check_names.insert(&check.context))
+        {
             return RequiredCheckPresence::Unknown;
         }
         if self
             .checks
             .iter()
-            .any(|check| !names.insert(&check.context))
+            .any(|check| check.app_id.is_some_and(|id| id < -1 || id == 0))
         {
-            return RequiredCheckPresence::Unknown;
-        }
-        if self.checks.iter().any(|check| check.app_id.is_some()) {
             return RequiredCheckPresence::Unknown;
         }
         if self.contexts.iter().all(|name| {
             checks.iter().any(|v| &v.name == name) || statuses.iter().any(|v| &v.context == name)
-        }) && self
-            .checks
-            .iter()
-            .all(|required| checks.iter().any(|v| v.name == required.context))
-        {
+        }) && self.checks.iter().all(|required| {
+            checks.iter().any(|v| {
+                v.name == required.context
+                    && match required.app_id {
+                        None | Some(-1) => true,
+                        Some(id) => v.app.as_ref().is_some_and(|app| app.id == id),
+                    }
+            })
+        }) {
             RequiredCheckPresence::Present
         } else {
             RequiredCheckPresence::Missing
@@ -444,6 +479,15 @@ pub struct CheckRun {
     pub status: CheckStatus,
     /// Completed result, if known.
     pub conclusion: Option<CheckConclusion>,
+    /// GitHub App identity when supplied by the provider.
+    #[serde(default)]
+    pub app: Option<CheckApp>,
+}
+/// App that submitted a check run.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CheckApp {
+    /// Provider app ID.
+    pub id: i64,
 }
 
 /// Check execution state.

@@ -25,6 +25,7 @@ mod id;
 pub mod integrations;
 pub mod scaffold;
 pub mod state;
+pub mod workflows;
 
 pub use error::{Error, ErrorClass, Result};
 pub use id::{

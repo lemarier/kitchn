@@ -1,0 +1,1322 @@
+//! The dishwasher: ownership-aware resource inspection and cleanup.
+//!
+//! The dishwasher owns reclamation of worker, terminal, and worktree
+//! resources. It never decides from age, silence, or disk pressure: those
+//! only start an inspection. A resource is eligible for release only with
+//! positive evidence that its ownership ended and nothing would be lost:
+//!
+//! - exactly one Kitchen task created it through an applied effect, and the
+//!   backend's owner record, when present, names that same effect;
+//! - that task is settled with every effect resolved, and no other unsettled
+//!   task was given the resource;
+//! - the backend reports it exited, and every worker of the owning task is
+//!   settled; a person's takeover of any of them retains everything the task
+//!   owns;
+//! - a worktree is a linked, unlocked worktree with no tracked or untracked
+//!   changes whose `HEAD` is contained in a remote-tracking ref or equals the
+//!   head of the pull request that merged it (for squash merges).
+//!
+//! Anything else is retained with every reason that applies. Unknown and
+//! legacy resources are retained. Branches and schedules are never removed.
+//!
+//! [`preview`] records one workflow marker per eligible resource, keyed by the
+//! resource and a digest of the evidence it was judged on. [`apply`] acts only
+//! on resources whose unchanged evidence was previewed by an *earlier* call,
+//! so the first run against an existing backlog is preview-only. Each release
+//! runs as its own dishwasher task given exactly that resource, through the
+//! durable effect path ([`crate::state::run_effect`]) and the explicit
+//! release grant, and is revalidated immediately before the effect. An
+//! interrupted release is reconciled by the next run before anything else.
+
+mod git;
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    num::NonZeroU32,
+    path::PathBuf,
+    time::Duration,
+};
+
+use serde::{Deserialize, Serialize, Serializer};
+use sha2::{Digest, Sha256};
+
+pub use git::{GitLimits, GitReadError, WorktreeState, inspect_worktree};
+
+use crate::{
+    BackendId, EffectName, Error, ErrorClass, HouseId, Result, TaskId, WorkflowId,
+    contracts::{
+        AttemptNumber, AttemptOutcome, AttemptStart, BackendUnavailable, Capability,
+        CapabilityRequirements, Claimant, Clock, CommitId, Consent, ContractError, Effect,
+        EffectExecutor, EvidenceRevision, ExecutorKind, ExternalRef, FailureClass, Grant,
+        HouseGrants, IdempotencyKey, LeaseTtl, Liveness, NotAppliedReason, Operation, Permission,
+        Provenance, ResourceKind, ResourceObservation, ResourceRef, RetryPolicy, Role, Settlement,
+        TaskAuthority, TaskSpec, Timestamp, Trigger, WorkerBackend, WorkerOutcome, WorkerState,
+    },
+    state::{
+        EffectPlan, EffectRecord, EffectState, HouseStore, MarkerFact, MarkerKey, MarkerSchema,
+        MarkerSubject, StateError, TaskRecord, TaskState, WorkItem, WorkflowMarker, reconcile,
+        run_effect,
+    },
+};
+
+/// The workflow id the dishwasher records markers under.
+pub const WORKFLOW: &str = "dishwasher";
+/// The marker schema of a recorded preview.
+pub const PREVIEW_SCHEMA: &str = "cleanup.preview";
+/// Prefix of the tasks the dishwasher creates for releases.
+pub const TASK_PREFIX: &str = "dishwasher-";
+/// Attempts a release task may use, including ones spent on recovery.
+const RELEASE_ATTEMPTS: u32 = 4;
+/// Longest a release task may keep retrying after its first attempt.
+const RELEASE_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Failures specific to the dishwasher. Store and contract failures keep
+/// their own types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CleanupError {
+    /// A read-only backend call failed; nothing may be inferred from it.
+    #[error("backend read failed: {0}")]
+    Backend(#[from] BackendUnavailable),
+    /// The inventory listed one resource more than once.
+    #[error("backend inventory lists a resource more than once")]
+    DuplicateResource,
+    /// The release grant is not a release permission on this backend.
+    #[error("the release grant must permit release-resource on the inspected backend")]
+    GrantMismatch,
+    /// Evidence could not be encoded for its digest or marker.
+    #[error("cleanup evidence could not be encoded")]
+    Encoding,
+}
+
+impl CleanupError {
+    /// The broad handling class.
+    #[must_use]
+    pub const fn class(&self) -> ErrorClass {
+        match self {
+            Self::GrantMismatch => ErrorClass::InvalidInput,
+            Self::Backend(_) | Self::DuplicateResource | Self::Encoding => ErrorClass::Execution,
+        }
+    }
+}
+
+/// What started an inspection. Recorded with the preview; it never changes
+/// eligibility, so disk pressure can prompt an inspection but not a deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InspectionTrigger {
+    /// A scheduled run.
+    Schedule,
+    /// Low disk space on the host.
+    DiskPressure,
+    /// A person asked for it.
+    Manual,
+}
+
+/// Maps a worktree resource to its local checkout. Adapters that know where
+/// the backend placed worktrees implement it.
+pub trait WorktreeLocator {
+    /// The worktree's top-level directory, if known.
+    fn locate(&self, worktree: &ResourceRef) -> Option<PathBuf>;
+}
+
+impl WorktreeLocator for BTreeMap<ResourceRef, PathBuf> {
+    fn locate(&self, worktree: &ResourceRef) -> Option<PathBuf> {
+        self.get(worktree).cloned()
+    }
+}
+
+/// Everything an inspection reads. All reads are bounded and read-only.
+#[derive(Clone, Copy)]
+pub struct Inspector<'a> {
+    /// The house's durable task store: the source of task ownership.
+    pub store: &'a HouseStore,
+    /// The backend whose resources are inspected.
+    pub backend: &'a dyn WorkerBackend,
+    /// Where worktrees are checked out.
+    pub worktrees: &'a dyn WorktreeLocator,
+    /// For worktrees whose pull request merged: the head commit the forge
+    /// merged. Equality with the local head preserves squash-merged work.
+    pub merged_heads: &'a BTreeMap<ResourceRef, CommitId>,
+    /// Bounds for each Git call.
+    pub git: &'a GitLimits,
+}
+
+/// A reason a resource is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Exclusion {
+    /// The resource belongs to another backend namespace.
+    ForeignBackend,
+    /// The dishwasher never removes this kind (branches, schedules).
+    NotReclaimable,
+    /// No Kitchen task created it: a legacy or foreign resource.
+    UnknownOwner,
+    /// More than one creating effect names it: a reused identifier.
+    AmbiguousOwner,
+    /// The backend's owner record names a different effect.
+    BackendOwnerMismatch,
+    /// The owning task is not settled.
+    OwnerActive,
+    /// The owning task has an effect whose outcome is unknown or waived.
+    UnresolvedEffects,
+    /// Another unsettled task was given this resource.
+    SharedWithTask,
+    /// The backend reports it in use.
+    InUse,
+    /// The backend cannot tell whether it is in use.
+    LivenessUnverifiable,
+    /// A person took over a worker of the owning task.
+    UserTakeover,
+    /// This worker has not reported a settled outcome.
+    WorkerNotSettled,
+    /// Another resource of the owning task is in use or unsettled.
+    SiblingInUse,
+    /// The worktree's checkout location is unknown.
+    WorktreeUnlocated,
+    /// The worktree could not be inspected.
+    WorktreeUnreadable,
+    /// The path is a repository's main checkout, not a linked worktree.
+    MainCheckout,
+    /// The worktree is locked.
+    WorktreeLocked,
+    /// Tracked files have changes.
+    TrackedChanges,
+    /// Untracked files exist.
+    UntrackedFiles,
+    /// `HEAD` has commits that are neither pushed nor the merged head.
+    UnpreservedCommits,
+}
+
+/// What the dishwasher would do with a resource.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum Decision {
+    /// Release it through the backend.
+    Release,
+    /// Keep it, for every listed reason.
+    Retain {
+        /// The reasons, in a stable order.
+        reasons: Vec<Exclusion>,
+    },
+}
+
+/// The owning task's state as seen by the dishwasher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum OwnerState {
+    /// Unclaimed and unsettled.
+    Open,
+    /// Claimed, live or expired.
+    Claimed,
+    /// Settled.
+    Settled {
+        /// The settlement.
+        settlement: Settlement,
+        /// When it settled.
+        at: Timestamp,
+    },
+}
+
+/// The task and effect that created a resource.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskOwner {
+    /// The owning task.
+    pub task: TaskId,
+    /// The attempt whose effect created it.
+    pub attempt: AttemptNumber,
+    /// The idempotency key of the creating effect.
+    pub key: IdempotencyKey,
+    /// The task's state.
+    pub state: OwnerState,
+    /// Other unsettled tasks the resource was given to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shared_with: Vec<TaskId>,
+}
+
+/// Who owns a resource, according to the durable store.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum Ownership {
+    /// No applied effect of any task created it.
+    Unknown,
+    /// Several creating effects name it.
+    Ambiguous {
+        /// The tasks whose effects name it.
+        tasks: Vec<TaskId>,
+    },
+    /// Exactly one task created it.
+    Task(TaskOwner),
+}
+
+/// What Git reported about a worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum WorktreeEvidence {
+    /// No location is known.
+    Unlocated,
+    /// Inspection failed.
+    Unreadable {
+        /// Why.
+        error: GitReadError,
+    },
+    /// Inspection succeeded.
+    #[serde(rename_all = "camelCase")]
+    Read {
+        /// The state.
+        state: WorktreeState,
+        /// The merged pull-request head, when the forge reported one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        merged_head: Option<CommitId>,
+    },
+}
+
+/// One inventoried resource with its evidence and decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewEntry {
+    /// The resource.
+    pub resource: ResourceRef,
+    /// Digest of the evidence the decision rests on. A different digest
+    /// means different evidence.
+    pub observation: ExternalRef,
+    /// The backend's liveness report.
+    #[serde(serialize_with = "serialize_liveness")]
+    pub liveness: Liveness,
+    /// The backend's owner record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_owner: Option<ExternalRef>,
+    /// The worker's observed state, for workers.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_worker"
+    )]
+    pub worker: Option<WorkerState>,
+    /// Ownership from the durable store.
+    pub ownership: Ownership,
+    /// Git evidence, for worktrees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeEvidence>,
+    /// Time since the owning task settled: a signal for review only.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_age"
+    )]
+    pub settled_for: Option<Duration>,
+    /// The decision.
+    pub decision: Decision,
+}
+
+impl PreviewEntry {
+    /// Whether the decision is to release.
+    #[must_use]
+    pub fn eligible(&self) -> bool {
+        self.decision == Decision::Release
+    }
+
+    fn owner_task(&self) -> Option<&TaskId> {
+        match &self.ownership {
+            Ownership::Task(owner) => Some(&owner.task),
+            Ownership::Unknown | Ownership::Ambiguous { .. } => None,
+        }
+    }
+}
+
+/// Whether an inspection found anything to act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Precheck {
+    /// Nothing is eligible.
+    Idle,
+    /// At least one resource is eligible.
+    Actionable,
+}
+
+/// A reviewable inspection of every inventoried resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preview {
+    /// The house.
+    pub house: HouseId,
+    /// The backend namespace inspected.
+    pub backend: BackendId,
+    /// What started the inspection.
+    pub trigger: InspectionTrigger,
+    /// When it was observed.
+    pub observed_at: Timestamp,
+    /// Every inventoried resource, in inventory order.
+    pub entries: Vec<PreviewEntry>,
+}
+
+impl Preview {
+    /// [`Precheck::Idle`] when nothing is eligible.
+    #[must_use]
+    pub fn precheck(&self) -> Precheck {
+        if self.entries.iter().any(PreviewEntry::eligible) {
+            Precheck::Actionable
+        } else {
+            Precheck::Idle
+        }
+    }
+
+    /// The entry for `resource`.
+    #[must_use]
+    pub fn entry(&self, resource: &ResourceRef) -> Option<&PreviewEntry> {
+        self.entries
+            .iter()
+            .find(|entry| &entry.resource == resource)
+    }
+}
+
+/// The payload recorded in a preview marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PreviewFact {
+    owner: TaskId,
+    trigger: InspectionTrigger,
+    previewed_at: Timestamp,
+}
+
+/// Inspect every inventoried resource without recording anything.
+///
+/// # Errors
+/// Refuses a backend for another house or without inventory and worker
+/// status; returns [`CleanupError::Backend`] when a backend read fails and
+/// store errors. A failed read is never reported as an idle inspection.
+pub fn inspect(
+    inspector: &Inspector<'_>,
+    trigger: InspectionTrigger,
+    now: Timestamp,
+) -> Result<Preview> {
+    let entries = evaluate(inspector, now, |_| true)?;
+    let descriptor = inspector.backend.descriptor();
+    Ok(Preview {
+        house: descriptor.house.clone(),
+        backend: descriptor.backend.clone(),
+        trigger,
+        observed_at: now,
+        entries,
+    })
+}
+
+/// Inspect and record a preview marker for each eligible resource. A marker
+/// for the same evidence is kept, or refreshed once older than `max_age`.
+///
+/// # Errors
+/// As [`inspect`], plus marker and consumer lease errors from the store.
+pub fn preview(
+    inspector: &Inspector<'_>,
+    trigger: InspectionTrigger,
+    recorder: &Claimant,
+    max_age: Duration,
+    now: Timestamp,
+) -> Result<Preview> {
+    let preview = inspect(inspector, trigger, now)?;
+    for entry in preview.entries.iter().filter(|entry| entry.eligible()) {
+        let key = marker_key(entry)?;
+        let current = inspector.store.marker(&key)?;
+        let fresh = current
+            .as_ref()
+            .is_some_and(|marker| now.saturating_since(marker.recorded_at()) <= max_age);
+        if !fresh {
+            record_preview(
+                inspector.store,
+                entry,
+                current.as_ref(),
+                trigger,
+                recorder,
+                now,
+            )?;
+        }
+    }
+    Ok(preview)
+}
+
+/// Bounds and authority for [`apply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyOptions {
+    /// The explicit release grant. Scheduled runs delegate it to each release
+    /// task, so the house must hold it as a standing grant; interactive runs
+    /// need a person's consent per release within house policy instead.
+    pub release: Grant,
+    /// Instruction revisions pinned on each release task.
+    pub provenance: Provenance,
+    /// Lease on each release task.
+    pub lease: LeaseTtl,
+    /// Oldest preview that still authorizes a release.
+    pub max_preview_age: Duration,
+    /// Most releases attempted in one call; the rest are deferred.
+    pub max_releases: usize,
+}
+
+/// Supplies a person's consent for one release under an interactive claim.
+pub trait ConsentSource {
+    /// The consent for exactly `effect` on `task` at `revision`, if given.
+    fn consent(
+        &self,
+        task: &TaskId,
+        effect: &Effect,
+        revision: EvidenceRevision,
+    ) -> Option<Consent>;
+}
+
+/// No consent: the source for scheduled runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoConsent;
+
+impl ConsentSource for NoConsent {
+    fn consent(&self, _: &TaskId, _: &Effect, _: EvidenceRevision) -> Option<Consent> {
+        None
+    }
+}
+
+/// What happened to one resource in [`apply`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "type", content = "detail", rename_all = "kebab-case")]
+pub enum ReleaseOutcome {
+    /// The backend released it.
+    Released,
+    /// Eligible, but no earlier preview covers this exact evidence; this
+    /// call recorded one.
+    NotPreviewed,
+    /// The preview for this evidence is older than allowed; this call
+    /// refreshed it.
+    StalePreview,
+    /// The evidence changed between the preview and the effect.
+    Changed,
+    /// Another run holds the release task.
+    HeldElsewhere,
+    /// An interactive run had no consent for this release.
+    ConsentMissing,
+    /// The backend did not apply the release.
+    NotApplied(NotAppliedReason),
+    /// The outcome is unknown; the next run reconciles it.
+    Uncertain,
+    /// The release task had already settled.
+    AlreadySettled(Settlement),
+    /// Over this call's release bound.
+    Deferred,
+}
+
+/// One resource's result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseResult {
+    /// The resource.
+    pub resource: ResourceRef,
+    /// The release task, once one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskId>,
+    /// The outcome.
+    pub outcome: ReleaseOutcome,
+}
+
+/// The result of [`apply`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyReport {
+    /// The inspection this call acted on.
+    pub preview: Preview,
+    /// Interrupted releases from earlier runs, reconciled first.
+    pub recovered: Vec<ReleaseResult>,
+    /// Results for the eligible resources.
+    pub results: Vec<ReleaseResult>,
+}
+
+/// Reconcile interrupted releases, then release each eligible resource whose
+/// exact evidence an earlier call previewed.
+///
+/// # Errors
+/// As [`preview`]; [`CleanupError::GrantMismatch`] for a grant that is not
+/// release on this backend; [`ContractError::AuthorityExpansion`] when a
+/// scheduled claimant's house does not hold the release grant as a standing
+/// grant; and store errors, which leave interrupted work for the next run.
+pub fn apply(
+    inspector: &Inspector<'_>,
+    grants: &HouseGrants,
+    claimant: &Claimant,
+    consents: &dyn ConsentSource,
+    options: &ApplyOptions,
+    clock: &dyn Clock,
+) -> Result<ApplyReport> {
+    let descriptor = inspector.backend.descriptor();
+    if options.release.permission != Permission::ReleaseResource
+        || options.release.destination != descriptor.backend
+    {
+        return Err(CleanupError::GrantMismatch.into());
+    }
+    let authority = match claimant.trigger {
+        Trigger::Scheduled => TaskAuthority::delegate(grants, [options.release.clone()])?,
+        Trigger::Interactive => TaskAuthority::delegate(grants, [])?,
+    };
+    let run = Run {
+        inspector,
+        grants,
+        claimant,
+        consents,
+        options,
+        clock,
+        authority,
+    };
+    let trigger = match claimant.trigger {
+        Trigger::Scheduled => InspectionTrigger::Schedule,
+        Trigger::Interactive => InspectionTrigger::Manual,
+    };
+    let preview = inspect(inspector, trigger, clock.now())?;
+    let eligible: Vec<&PreviewEntry> = preview
+        .entries
+        .iter()
+        .filter(|entry| entry.eligible())
+        .collect();
+
+    let mut recovered = Vec::new();
+    for task in inspector.store.tasks()? {
+        if !is_release_task(&task) || matches!(task.state(), TaskState::Settled { .. }) {
+            continue;
+        }
+        let Some(resource) = task.spec().resources.iter().next() else {
+            continue;
+        };
+        if eligible.iter().any(|entry| &entry.resource == resource) {
+            // Driven below with fresh evidence.
+            continue;
+        }
+        let outcome = run.drive(task.spec().id.clone(), resource, None)?;
+        recovered.push(ReleaseResult {
+            resource: resource.clone(),
+            task: Some(task.spec().id.clone()),
+            outcome,
+        });
+    }
+
+    let mut results = Vec::with_capacity(eligible.len());
+    let mut attempted = 0_usize;
+    for entry in eligible {
+        let key = marker_key(entry)?;
+        let marker = inspector.store.marker(&key)?;
+        let now = clock.now();
+        let Some(marker) = marker else {
+            record_preview(inspector.store, entry, None, preview.trigger, claimant, now)?;
+            results.push(ReleaseResult {
+                resource: entry.resource.clone(),
+                task: None,
+                outcome: ReleaseOutcome::NotPreviewed,
+            });
+            continue;
+        };
+        if now.saturating_since(marker.recorded_at()) > options.max_preview_age {
+            record_preview(
+                inspector.store,
+                entry,
+                Some(&marker),
+                preview.trigger,
+                claimant,
+                now,
+            )?;
+            results.push(ReleaseResult {
+                resource: entry.resource.clone(),
+                task: None,
+                outcome: ReleaseOutcome::StalePreview,
+            });
+            continue;
+        }
+        let task = release_task_id(&entry.observation, marker.recorded_at())?;
+        if attempted >= options.max_releases {
+            results.push(ReleaseResult {
+                resource: entry.resource.clone(),
+                task: None,
+                outcome: ReleaseOutcome::Deferred,
+            });
+            continue;
+        }
+        attempted = attempted.saturating_add(1);
+        let outcome = run.drive(task.clone(), &entry.resource, Some(entry))?;
+        results.push(ReleaseResult {
+            resource: entry.resource.clone(),
+            task: Some(task),
+            outcome,
+        });
+    }
+    Ok(ApplyReport {
+        preview,
+        recovered,
+        results,
+    })
+}
+
+/// One [`apply`] call's fixed inputs.
+struct Run<'a> {
+    inspector: &'a Inspector<'a>,
+    grants: &'a HouseGrants,
+    claimant: &'a Claimant,
+    consents: &'a dyn ConsentSource,
+    options: &'a ApplyOptions,
+    clock: &'a dyn Clock,
+    authority: TaskAuthority,
+}
+
+impl Run<'_> {
+    /// Move one release task forward. With `entry`, a missing task is
+    /// created and a release not yet attempted runs after revalidation;
+    /// without it (recovery), only reconciliation and settlement happen.
+    fn drive(
+        &self,
+        id: TaskId,
+        resource: &ResourceRef,
+        entry: Option<&PreviewEntry>,
+    ) -> Result<ReleaseOutcome> {
+        let store = self.inspector.store;
+        let effect = Effect::Worker(Operation::ReleaseResource {
+            resource: resource.clone(),
+        });
+        let record = match store.task(&id) {
+            Ok(record) => record,
+            Err(Error::State(StateError::TaskNotFound(_))) if entry.is_some() => {
+                store.create_task(self.spec(&id, resource)?, self.claimant, self.clock.now())?;
+                store.task(&id)?
+            }
+            Err(error) => return Err(error),
+        };
+        let consent = match self.claimant.trigger {
+            Trigger::Scheduled => None,
+            Trigger::Interactive => {
+                match self
+                    .consents
+                    .consent(&id, &effect, record.evidence().revision())
+                {
+                    Some(consent) => Some(consent),
+                    None => return Ok(ReleaseOutcome::ConsentMissing),
+                }
+            }
+        };
+        let now = self.clock.now();
+        let lease = match record.state() {
+            TaskState::Settled { settlement, .. } => {
+                return Ok(match settlement {
+                    Settlement::Succeeded => ReleaseOutcome::Released,
+                    Settlement::Failed | Settlement::Cancelled | Settlement::Exhausted => {
+                        ReleaseOutcome::AlreadySettled(*settlement)
+                    }
+                });
+            }
+            TaskState::Open => store.claim(&id, self.claimant, self.options.lease, now),
+            TaskState::Claimed { lease } if lease.is_live(now) => {
+                return Ok(ReleaseOutcome::HeldElsewhere);
+            }
+            TaskState::Claimed { .. } => {
+                store.take_over(&id, self.claimant, self.options.lease, now)
+            }
+        };
+        let fence = match lease {
+            Ok(lease) => lease.fence(),
+            Err(Error::State(
+                StateError::ClaimHeld { .. }
+                | StateError::LeaseExpired { .. }
+                | StateError::LeaseLive { .. },
+            )) => return Ok(ReleaseOutcome::HeldElsewhere),
+            Err(error) => return Err(error),
+        };
+        let report = reconcile(store, self.executor(), &id, fence, self.clock)?;
+        if !report.unresolved.is_empty() || !report.foreign.is_empty() {
+            store.relinquish(&id, fence, self.clock.now())?;
+            return Ok(ReleaseOutcome::Uncertain);
+        }
+        let attempt = match store.start_attempt(&id, fence, self.clock.now())? {
+            AttemptStart::Started(attempt) | AttemptStart::AlreadyRunning(attempt) => attempt,
+            AttemptStart::Exhausted => {
+                return Ok(ReleaseOutcome::AlreadySettled(Settlement::Exhausted));
+            }
+        };
+        let finish = |outcome: AttemptOutcome| {
+            store.finish_attempt(&id, fence, attempt, outcome, self.clock.now())
+        };
+        let failed = AttemptOutcome::Failed(FailureClass::Permanent);
+        match release_state(&store.task(&id)?) {
+            Some(EffectState::Applied { .. }) => {
+                finish(AttemptOutcome::Succeeded)?;
+                return Ok(ReleaseOutcome::Released);
+            }
+            Some(EffectState::NotApplied { reason, .. }) => {
+                let reason = *reason;
+                finish(failed)?;
+                return Ok(ReleaseOutcome::NotApplied(reason));
+            }
+            Some(_) => {
+                // Unreachable after a clean reconcile; never act on it.
+                store.relinquish(&id, fence, self.clock.now())?;
+                return Ok(ReleaseOutcome::Uncertain);
+            }
+            None => {}
+        }
+        let Some(entry) = entry else {
+            // No longer eligible and never attempted: give it up.
+            finish(failed)?;
+            return Ok(ReleaseOutcome::Changed);
+        };
+        // Revalidate immediately before the effect.
+        let owner = entry.owner_task();
+        let fresh = evaluate(self.inspector, self.clock.now(), |observation| {
+            observation.resource == resource
+                || owner.is_some_and(|task| observation.owner == Some(task))
+        })?;
+        let unchanged = fresh
+            .iter()
+            .find(|candidate| &candidate.resource == resource)
+            .is_some_and(|candidate| {
+                candidate.eligible() && candidate.observation == entry.observation
+            });
+        if !unchanged {
+            finish(failed)?;
+            return Ok(ReleaseOutcome::Changed);
+        }
+        let plan = EffectPlan {
+            task: id.clone(),
+            fence,
+            name: EffectName::new("release")?,
+            decided_at: store.task(&id)?.evidence().revision(),
+            effect,
+            consent,
+        };
+        let record = run_effect(store, self.executor(), self.grants, plan, self.clock)?;
+        match record.state() {
+            EffectState::Applied { .. } => {
+                finish(AttemptOutcome::Succeeded)?;
+                Ok(ReleaseOutcome::Released)
+            }
+            EffectState::NotApplied { reason, .. } => {
+                let reason = *reason;
+                finish(failed)?;
+                Ok(ReleaseOutcome::NotApplied(reason))
+            }
+            EffectState::Intended
+            | EffectState::Uncertain { .. }
+            | EffectState::Unresolvable { .. }
+            | EffectState::Waived { .. } => {
+                store.relinquish(&id, fence, self.clock.now())?;
+                Ok(ReleaseOutcome::Uncertain)
+            }
+        }
+    }
+
+    fn executor(&self) -> &dyn EffectExecutor {
+        self.inspector.backend
+    }
+
+    fn spec(&self, id: &TaskId, resource: &ResourceRef) -> Result<TaskSpec> {
+        Ok(TaskSpec {
+            id: id.clone(),
+            role: Role::Dishwasher,
+            repository: None,
+            authority: self.authority.clone(),
+            retry: RetryPolicy::new(RELEASE_ATTEMPTS, RELEASE_BUDGET)?,
+            provenance: self.options.provenance.clone(),
+            resources: BTreeSet::from([resource.clone()]),
+            requires: CapabilityRequirements::new().with(
+                ExecutorKind::Worker,
+                [
+                    Capability::ResourceInventory,
+                    Capability::WorkerStatusAndOutcome,
+                    Capability::ResourceRelease,
+                ],
+            ),
+        })
+    }
+}
+
+/// The latest release effect of a release task.
+fn release_state(task: &TaskRecord) -> Option<&EffectState> {
+    task.effects()
+        .iter()
+        .rev()
+        .find(|effect| {
+            matches!(
+                effect.request().effect(),
+                Effect::Worker(Operation::ReleaseResource { .. })
+            )
+        })
+        .map(EffectRecord::state)
+}
+
+fn is_release_task(task: &TaskRecord) -> bool {
+    task.spec().role == Role::Dishwasher && task.spec().id.as_str().starts_with(TASK_PREFIX)
+}
+
+/// The release task for one previewed observation. The preview's time is
+/// part of the identity, so a refreshed preview starts a new task while an
+/// interrupted run resumes the same one.
+fn release_task_id(observation: &ExternalRef, previewed_at: Timestamp) -> Result<TaskId> {
+    let mut digest = Sha256::new();
+    digest.update(b"kitchen-dishwasher-release-v1\0");
+    digest.update(observation.as_str().as_bytes());
+    digest.update(previewed_at.as_unix_millis().to_be_bytes());
+    let hex = hex(digest.finalize().as_slice());
+    let short = hex.get(..48).ok_or(CleanupError::Encoding)?;
+    Ok(TaskId::new(&format!("{TASK_PREFIX}{short}"))?)
+}
+
+fn schema() -> Result<MarkerSchema> {
+    Ok(MarkerSchema::new(PREVIEW_SCHEMA, NonZeroU32::MIN)?)
+}
+
+fn marker_key(entry: &PreviewEntry) -> Result<MarkerKey> {
+    Ok(MarkerKey {
+        workflow: WorkflowId::new(WORKFLOW)?,
+        item: WorkItem::Resource {
+            resource: entry.resource.clone(),
+        },
+        subject: MarkerSubject::Observation(entry.observation.clone()),
+    })
+}
+
+/// Record or refresh the preview marker for `entry`. A concurrent recorder
+/// of the same evidence is not an error.
+fn record_preview(
+    store: &HouseStore,
+    entry: &PreviewEntry,
+    current: Option<&WorkflowMarker>,
+    trigger: InspectionTrigger,
+    recorder: &Claimant,
+    now: Timestamp,
+) -> Result<()> {
+    let Some(owner) = entry.owner_task() else {
+        return Ok(());
+    };
+    let fact = MarkerFact::workflow(
+        schema()?,
+        &PreviewFact {
+            owner: owner.clone(),
+            trigger,
+            previewed_at: now,
+        },
+    )?;
+    let key = marker_key(entry)?;
+    let recorded = match current {
+        None => store.record_marker(key, fact, recorder, now).map(drop),
+        Some(marker) => store
+            .supersede_marker(&key, marker.fact(), fact, recorder, now)
+            .map(drop),
+    };
+    match recorded {
+        Ok(()) | Err(Error::State(StateError::MarkerConflict)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Evaluate the inventoried resources that `include` selects. Sibling
+/// checks still see every resource of the same owning task.
+fn evaluate(
+    inspector: &Inspector<'_>,
+    now: Timestamp,
+    include: impl Fn(&Observed<'_>) -> bool,
+) -> Result<Vec<PreviewEntry>> {
+    let descriptor = inspector.backend.descriptor();
+    if &descriptor.house != inspector.store.house() {
+        return Err(ContractError::CrossHouse {
+            expected: inspector.store.house().clone(),
+            found: descriptor.house.clone(),
+        }
+        .into());
+    }
+    descriptor.capabilities.require([
+        Capability::ResourceInventory,
+        Capability::WorkerStatusAndOutcome,
+    ])?;
+    let inventory = inspector
+        .backend
+        .inventory()
+        .map_err(CleanupError::Backend)?;
+    let mut seen = BTreeSet::new();
+    if !inventory
+        .iter()
+        .all(|observation| seen.insert(&observation.resource))
+    {
+        return Err(CleanupError::DuplicateResource.into());
+    }
+    let tasks = inspector.store.tasks()?;
+    let mut observed = Vec::with_capacity(inventory.len());
+    for observation in &inventory {
+        let ownership = ownership(&tasks, &observation.resource);
+        let owner = match &ownership {
+            Ownership::Task(owner) => Some(owner.task.clone()),
+            Ownership::Unknown | Ownership::Ambiguous { .. } => None,
+        };
+        observed.push((observation, ownership, owner));
+    }
+    // Workers are observed only when they are selected or share a selected
+    // resource's owner, so a narrow revalidation stays narrow.
+    let selected: Vec<bool> = observed
+        .iter()
+        .map(|(observation, _, owner)| {
+            include(&Observed {
+                resource: &observation.resource,
+                owner: owner.as_ref(),
+            })
+        })
+        .collect();
+    let relevant_owners: BTreeSet<&TaskId> = observed
+        .iter()
+        .zip(&selected)
+        .filter_map(|((_, _, owner), chosen)| owner.as_ref().filter(|_| *chosen))
+        .collect();
+    let mut workers = Vec::with_capacity(observed.len());
+    for ((observation, _, owner), chosen) in observed.iter().zip(&selected) {
+        let relevant = *chosen
+            || owner
+                .as_ref()
+                .is_some_and(|task| relevant_owners.contains(task));
+        let state = if relevant && observation.resource.kind == ResourceKind::Worker {
+            Some(
+                inspector
+                    .backend
+                    .observe_worker(&observation.resource)
+                    .map_err(CleanupError::Backend)?,
+            )
+        } else {
+            None
+        };
+        workers.push(state);
+    }
+    // Per owning task: is anything it owns in use, or taken over?
+    let mut busy: BTreeMap<&TaskId, (bool, bool)> = BTreeMap::new();
+    for ((observation, _, owner), worker) in observed.iter().zip(&workers) {
+        let Some(task) = owner else { continue };
+        let flags = busy.entry(task).or_default();
+        flags.0 |= observation.liveness != Liveness::Exited
+            || worker.is_some_and(|state| !matches!(state, WorkerState::Settled(_)));
+        flags.1 |= *worker == Some(WorkerState::UserTakeover);
+    }
+    let mut entries = Vec::new();
+    for (((observation, ownership, owner), worker), chosen) in
+        observed.iter().zip(&workers).zip(&selected)
+    {
+        if !*chosen {
+            continue;
+        }
+        let worktree = (observation.resource.kind == ResourceKind::Worktree)
+            .then(|| worktree_evidence(inspector, &observation.resource));
+        let mut reasons = BTreeSet::new();
+        own_reasons(
+            &mut reasons,
+            observation,
+            descriptor.backend == observation.resource.backend,
+            ownership,
+            &tasks,
+            *worker,
+            worktree.as_ref(),
+        );
+        if let Some(task) = owner
+            && let Some((in_use, takeover)) = busy.get(task)
+        {
+            let own_busy = observation.liveness != Liveness::Exited
+                || worker.is_some_and(|state| !matches!(state, WorkerState::Settled(_)));
+            if *in_use && !own_busy {
+                reasons.insert(Exclusion::SiblingInUse);
+            }
+            if *takeover {
+                reasons.insert(Exclusion::UserTakeover);
+            }
+        }
+        let decision = if reasons.is_empty() {
+            Decision::Release
+        } else {
+            Decision::Retain {
+                reasons: reasons.into_iter().collect(),
+            }
+        };
+        let settled_for = match ownership {
+            Ownership::Task(TaskOwner {
+                state: OwnerState::Settled { at, .. },
+                ..
+            }) => Some(now.saturating_since(*at)),
+            Ownership::Task(_) | Ownership::Unknown | Ownership::Ambiguous { .. } => None,
+        };
+        let digest = digest(&DigestInput {
+            resource: &observation.resource,
+            liveness: liveness_name(observation.liveness),
+            backend_owner: observation.owner.as_ref(),
+            worker: worker.map(worker_name),
+            ownership,
+            worktree: worktree.as_ref(),
+            decision: &decision,
+        })?;
+        entries.push(PreviewEntry {
+            resource: observation.resource.clone(),
+            observation: digest,
+            liveness: observation.liveness,
+            backend_owner: observation.owner.clone(),
+            worker: *worker,
+            ownership: ownership.clone(),
+            worktree,
+            settled_for,
+            decision,
+        });
+    }
+    Ok(entries)
+}
+
+/// A resource and its owner, for selecting what [`evaluate`] inspects.
+struct Observed<'a> {
+    resource: &'a ResourceRef,
+    owner: Option<&'a TaskId>,
+}
+
+fn own_reasons(
+    reasons: &mut BTreeSet<Exclusion>,
+    observation: &ResourceObservation,
+    same_backend: bool,
+    ownership: &Ownership,
+    tasks: &[TaskRecord],
+    worker: Option<WorkerState>,
+    worktree: Option<&WorktreeEvidence>,
+) {
+    if !same_backend {
+        reasons.insert(Exclusion::ForeignBackend);
+    }
+    match observation.resource.kind {
+        ResourceKind::Worker | ResourceKind::Terminal | ResourceKind::Worktree => {}
+        ResourceKind::Branch | ResourceKind::Schedule => {
+            reasons.insert(Exclusion::NotReclaimable);
+        }
+    }
+    match ownership {
+        Ownership::Unknown => {
+            reasons.insert(Exclusion::UnknownOwner);
+        }
+        Ownership::Ambiguous { .. } => {
+            reasons.insert(Exclusion::AmbiguousOwner);
+        }
+        Ownership::Task(owner) => {
+            if observation
+                .owner
+                .as_ref()
+                .is_some_and(|recorded| recorded.as_str() != owner.key.as_str())
+            {
+                reasons.insert(Exclusion::BackendOwnerMismatch);
+            }
+            if !matches!(owner.state, OwnerState::Settled { .. }) {
+                reasons.insert(Exclusion::OwnerActive);
+            }
+            let unresolved = tasks
+                .iter()
+                .find(|task| task.spec().id == owner.task)
+                .is_some_and(|task| {
+                    task.unresolved_effects().next().is_some()
+                        || task
+                            .effects()
+                            .iter()
+                            .any(|effect| matches!(effect.state(), EffectState::Waived { .. }))
+                });
+            if unresolved {
+                reasons.insert(Exclusion::UnresolvedEffects);
+            }
+            if !owner.shared_with.is_empty() {
+                reasons.insert(Exclusion::SharedWithTask);
+            }
+        }
+    }
+    match observation.liveness {
+        Liveness::Exited => {}
+        Liveness::Live => {
+            reasons.insert(Exclusion::InUse);
+        }
+        Liveness::Unverifiable => {
+            reasons.insert(Exclusion::LivenessUnverifiable);
+        }
+    }
+    match worker {
+        None | Some(WorkerState::Settled(_)) => {}
+        Some(WorkerState::UserTakeover) => {
+            reasons.insert(Exclusion::UserTakeover);
+        }
+        Some(
+            WorkerState::Starting
+            | WorkerState::Ready
+            | WorkerState::AwaitingReply
+            | WorkerState::Missing
+            | WorkerState::Unknown,
+        ) => {
+            reasons.insert(Exclusion::WorkerNotSettled);
+        }
+    }
+    match worktree {
+        None => {}
+        Some(WorktreeEvidence::Unlocated) => {
+            reasons.insert(Exclusion::WorktreeUnlocated);
+        }
+        Some(WorktreeEvidence::Unreadable { .. }) => {
+            reasons.insert(Exclusion::WorktreeUnreadable);
+        }
+        Some(WorktreeEvidence::Read { state, merged_head }) => {
+            let checks = [
+                (!state.linked, Exclusion::MainCheckout),
+                (state.locked, Exclusion::WorktreeLocked),
+                (state.tracked_changes > 0, Exclusion::TrackedChanges),
+                (state.untracked_files > 0, Exclusion::UntrackedFiles),
+                (
+                    state.unpushed_commits && merged_head.as_ref() != Some(&state.head),
+                    Exclusion::UnpreservedCommits,
+                ),
+            ];
+            reasons.extend(
+                checks
+                    .into_iter()
+                    .filter_map(|(applies, reason)| applies.then_some(reason)),
+            );
+        }
+    }
+}
+
+/// Ownership of `resource` according to the store's applied effects.
+fn ownership(tasks: &[TaskRecord], resource: &ResourceRef) -> Ownership {
+    let creators: Vec<(&TaskRecord, &EffectRecord)> = tasks
+        .iter()
+        .flat_map(|task| task.effects().iter().map(move |effect| (task, effect)))
+        .filter(|(_, effect)| {
+            matches!(effect.state(), EffectState::Applied { receipt, .. }
+                if receipt.created().contains(resource))
+        })
+        .collect();
+    let [(task, effect)] = creators.as_slice() else {
+        if creators.is_empty() {
+            return Ownership::Unknown;
+        }
+        let tasks: BTreeSet<TaskId> = creators
+            .iter()
+            .map(|(task, _)| task.spec().id.clone())
+            .collect();
+        return Ownership::Ambiguous {
+            tasks: tasks.into_iter().collect(),
+        };
+    };
+    let state = match task.state() {
+        TaskState::Open => OwnerState::Open,
+        TaskState::Claimed { .. } => OwnerState::Claimed,
+        TaskState::Settled { settlement, at } => OwnerState::Settled {
+            settlement: *settlement,
+            at: *at,
+        },
+    };
+    let shared_with = tasks
+        .iter()
+        .filter(|other| {
+            other.spec().id != task.spec().id
+                && !is_release_task(other)
+                && !matches!(other.state(), TaskState::Settled { .. })
+                && other.spec().resources.contains(resource)
+        })
+        .map(|other| other.spec().id.clone())
+        .collect();
+    Ownership::Task(TaskOwner {
+        task: task.spec().id.clone(),
+        attempt: effect.request().attempt(),
+        key: effect.request().key().clone(),
+        state,
+        shared_with,
+    })
+}
+
+fn worktree_evidence(inspector: &Inspector<'_>, resource: &ResourceRef) -> WorktreeEvidence {
+    let Some(path) = inspector.worktrees.locate(resource) else {
+        return WorktreeEvidence::Unlocated;
+    };
+    match inspect_worktree(&path, inspector.git) {
+        Ok(state) => WorktreeEvidence::Read {
+            state,
+            merged_head: inspector.merged_heads.get(resource).cloned(),
+        },
+        Err(error) => WorktreeEvidence::Unreadable { error },
+    }
+}
+
+/// The evidence a decision rests on. Time-dependent values are excluded so
+/// unchanged evidence keeps its digest.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DigestInput<'a> {
+    resource: &'a ResourceRef,
+    liveness: &'static str,
+    backend_owner: Option<&'a ExternalRef>,
+    worker: Option<&'static str>,
+    ownership: &'a Ownership,
+    worktree: Option<&'a WorktreeEvidence>,
+    decision: &'a Decision,
+}
+
+fn digest(input: &DigestInput<'_>) -> Result<ExternalRef> {
+    let bytes = serde_json::to_vec(input).map_err(|_| CleanupError::Encoding)?;
+    let mut digest = Sha256::new();
+    digest.update(b"kitchen-dishwasher-observation-v1\0");
+    digest.update(&bytes);
+    Ok(ExternalRef::new(&format!(
+        "sha256:{}",
+        hex(digest.finalize().as_slice())
+    ))?)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut text, byte| {
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
+}
+
+const fn liveness_name(liveness: Liveness) -> &'static str {
+    match liveness {
+        Liveness::Live => "live",
+        Liveness::Exited => "exited",
+        Liveness::Unverifiable => "unverifiable",
+    }
+}
+
+const fn worker_name(state: WorkerState) -> &'static str {
+    match state {
+        WorkerState::Starting => "starting",
+        WorkerState::Ready => "ready",
+        WorkerState::AwaitingReply => "awaiting-reply",
+        WorkerState::UserTakeover => "user-takeover",
+        WorkerState::Settled(WorkerOutcome::Succeeded) => "settled-succeeded",
+        WorkerState::Settled(WorkerOutcome::Failed) => "settled-failed",
+        WorkerState::Settled(WorkerOutcome::Cancelled) => "settled-cancelled",
+        WorkerState::Missing => "missing",
+        WorkerState::Unknown => "unknown",
+    }
+}
+
+fn serialize_liveness<S: Serializer>(
+    liveness: &Liveness,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(liveness_name(*liveness))
+}
+
+#[expect(
+    clippy::ref_option,
+    reason = "serde's serialize_with passes a reference to the field"
+)]
+fn serialize_worker<S: Serializer>(
+    state: &Option<WorkerState>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match state {
+        Some(state) => serializer.serialize_str(worker_name(*state)),
+        None => serializer.serialize_none(),
+    }
+}
+
+#[expect(
+    clippy::ref_option,
+    reason = "serde's serialize_with passes a reference to the field"
+)]
+fn serialize_age<S: Serializer>(
+    age: &Option<Duration>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match age {
+        Some(age) => serializer.serialize_u64(u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
+        None => serializer.serialize_none(),
+    }
+}

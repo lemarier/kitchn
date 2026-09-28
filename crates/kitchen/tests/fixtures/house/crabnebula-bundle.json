@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "house": "crabnebula",
+  "kitchen": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "guidance": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "entrypoint": "SKILL.md",
+  "notices": [
+    "NOTICE.md"
+  ],
+  "assets": [
+    {
+      "path": "SKILL.md",
+      "contents": "Apply Tauri and specta conventions. Review IPC types and desktop release checks."
+    },
+    {
+      "path": "NOTICE.md",
+      "contents": "Synthetic fixture notice; retained verbatim."
+    }
+  ],
+  "roleCardsDigest": "d3662041ee49c47d4738e3ae126b4d5da57675a8f98b2dcdb581616685a5547b"
+}

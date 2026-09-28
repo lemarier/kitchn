@@ -1,0 +1,25 @@
+[workspace]
+members = ["crates/kitchen", "crates/kitchen-cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+authors = ["lemarier"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lemarier/kitchen"
+publish = false
+
+[workspace.dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+kitchen = { path = "crates/kitchen", version = "0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

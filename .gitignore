@@ -1,0 +1,12 @@
+/target/
+/.origin89/engineering/
+/.agents/skills/origin89-*
+/.claude/skills/origin89-*
+/.claude/settings.local.json
+/.kitchen/state/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.DS_Store

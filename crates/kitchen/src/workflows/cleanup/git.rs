@@ -1,103 +1,30 @@
 //! A bounded, read-only Git reader for worktree preservation evidence.
 //!
-//! Every call runs `git` with a deadline and an output limit, without a
-//! terminal prompt, optional locks, replace refs, or the file-system monitor,
-//! and with the caller's `GIT_DIR`-style, configuration, and pathspec
-//! overrides removed so the path alone selects the repository. Nothing here
-//! writes to the repository.
+//! Every call goes through the shared bounded runner in `crate::git`, so it
+//! has a deadline and an output limit and ignores the caller's `GIT_DIR`-style
+//! overrides. Nothing here writes to the repository.
 
 use std::{
-    ffi::OsStr,
     fmt,
     io::{self, BufRead, BufReader, Read},
-    path::{Path, PathBuf},
-    process::{ChildStdout, Command, ExitStatus, Stdio},
+    path::Path,
     str::FromStr,
-    sync::mpsc::{self, RecvTimeoutError},
-    thread,
-    time::{Duration, Instant},
 };
 
 use serde::{Serialize, Serializer};
 
 use super::CleanupError;
-use crate::contracts::CommitId;
+pub use crate::git::{GitLimits, GitReadError};
+use crate::{
+    contracts::CommitId,
+    git::{run, run_raw, run_with},
+};
 
-/// Environment variables that would redirect Git away from the given path or
-/// change what its answers mean.
-const REDIRECTING_ENV: [&str; 15] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
-    "GIT_REPLACE_REF_BASE",
-    "GIT_LITERAL_PATHSPECS",
-    "GIT_GLOB_PATHSPECS",
-    "GIT_NOGLOB_PATHSPECS",
-    "GIT_ICASE_PATHSPECS",
-];
-
-/// Longest poll interval while waiting for `git` to exit.
-const MAX_POLL: Duration = Duration::from_millis(20);
 /// Most ignored paths one inspection lists; more makes the worktree
 /// unreadable, which retains it.
 pub const MAX_IGNORED_PATHS: usize = 256;
 /// Longest single `git ls-files` record accepted while scanning the index.
 const MAX_RECORD_BYTES: u64 = 8192;
-
-/// Bounds for one worktree inspection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitLimits {
-    /// The `git` executable.
-    pub program: PathBuf,
-    /// Deadline for each `git` call.
-    pub call_timeout: Duration,
-    /// Largest standard output accepted from one call.
-    pub max_output_bytes: usize,
-}
-
-impl Default for GitLimits {
-    fn default() -> Self {
-        Self {
-            program: PathBuf::from("git"),
-            call_timeout: Duration::from_secs(10),
-            max_output_bytes: 1024 * 1024,
-        }
-    }
-}
-
-/// Why a worktree could not be inspected. Any of these retains the worktree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, thiserror::Error)]
-#[serde(rename_all = "kebab-case")]
-pub enum GitReadError {
-    /// The path is not absolute or not a directory.
-    #[error("worktree path is not an absolute directory")]
-    InvalidPath,
-    /// `git` could not be started.
-    #[error("git could not be started")]
-    Spawn,
-    /// A call exceeded its deadline and was killed.
-    #[error("git call timed out")]
-    Timeout,
-    /// A call produced more output than allowed.
-    #[error("git output exceeded its limit")]
-    OutputTooLarge,
-    /// A call exited unsuccessfully.
-    #[error("git call failed")]
-    Failed,
-    /// Output did not have the expected shape.
-    #[error("git output was malformed")]
-    Malformed,
-    /// The path is inside a checkout but is not its top level.
-    #[error("path is not the top level of a checkout")]
-    NotCheckoutRoot,
-}
 
 /// Longest remote name accepted.
 const MAX_REMOTE_NAME_BYTES: usize = 64;
@@ -535,114 +462,10 @@ pub(super) fn ignored_untracked(
     )?;
     Ok(unignored.is_empty())
 }
-/// Run one read-only `git` call in `dir` that must succeed.
-fn run<S: AsRef<OsStr>>(
-    dir: &Path,
-    args: impl IntoIterator<Item = S>,
-    limits: &GitLimits,
-) -> Result<String, GitReadError> {
-    let (status, output) = run_raw(dir, args, limits)?;
-    if !status.success() {
-        return Err(GitReadError::Failed);
-    }
-    Ok(output)
-}
-
-/// Run one read-only `git` call in `dir` within the limits and return its
-/// exit status with its output.
-fn run_raw<S: AsRef<OsStr>>(
-    dir: &Path,
-    args: impl IntoIterator<Item = S>,
-    limits: &GitLimits,
-) -> Result<(ExitStatus, String), GitReadError> {
-    let max = limits.max_output_bytes;
-    let (status, output) = run_with(dir, args, limits, move |stdout| {
-        let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
-        let mut buffer = Vec::new();
-        stdout.take(limit).read_to_end(&mut buffer)?;
-        Ok(buffer)
-    })?;
-    if output.len() > max {
-        return Err(GitReadError::OutputTooLarge);
-    }
-    let output = String::from_utf8(output).map_err(|_| GitReadError::Malformed)?;
-    Ok((status, output))
-}
-
-/// Run one read-only `git` call in `dir` under its deadline, handing its
-/// standard output to `read` on a separate thread.
-fn run_with<S: AsRef<OsStr>, T: Send + 'static>(
-    dir: &Path,
-    args: impl IntoIterator<Item = S>,
-    limits: &GitLimits,
-    read: impl FnOnce(ChildStdout) -> io::Result<T> + Send + 'static,
-) -> Result<(ExitStatus, T), GitReadError> {
-    let mut command = Command::new(&limits.program);
-    command
-        .arg("--no-optional-locks")
-        .arg("--no-replace-objects")
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-        ])
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    for name in REDIRECTING_ENV {
-        command.env_remove(name);
-    }
-    let mut child = command.spawn().map_err(|_| GitReadError::Spawn)?;
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(GitReadError::Spawn);
-    };
-    // The reader reports through a channel so that waiting for it is bounded
-    // too: a grandchild process can keep the pipe open after `git` exits.
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let _ = sender.send(read(stdout));
-    });
-    let started = Instant::now();
-    let mut poll = Duration::from_millis(1);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if started.elapsed() >= limits.call_timeout => {
-                break Err(GitReadError::Timeout);
-            }
-            Ok(None) => {
-                thread::sleep(poll);
-                poll = poll.saturating_mul(2).min(MAX_POLL);
-            }
-            Err(_) => break Err(GitReadError::Failed),
-        }
-    };
-    if status.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let status = status?;
-    let remaining = limits.call_timeout.saturating_sub(started.elapsed());
-    let output = match receiver.recv_timeout(remaining) {
-        Ok(Ok(output)) => output,
-        Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => return Err(GitReadError::Failed),
-        // The detached reader ends when the last writer closes the pipe.
-        Err(RecvTimeoutError::Timeout) => return Err(GitReadError::Timeout),
-    };
-    Ok((status, output))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// A Git directory holding exactly `names`, each an empty file except
     /// those ending in `/`, which are directories.

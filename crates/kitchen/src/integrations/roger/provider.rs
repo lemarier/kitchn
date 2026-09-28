@@ -163,11 +163,17 @@ impl RogerMutationTransport for RogerCli {
                     && candidate.pointer("/action/rev").and_then(Value::as_str)
                         == Some(ask.binding.head()?.as_str())
                 {
-                    let id = validate_receipt(
+                    let id = match validate_receipt(
                         credential,
                         ask,
                         &serde_json::to_vec(&candidate).map_err(|_| IntegrationError::Unknown)?,
-                    )?;
+                    ) {
+                        Ok(id) => id,
+                        // An earlier Ask can share the decision key and head with other
+                        // content; it is not this request, so keep looking.
+                        Err(IntegrationError::ScopeMismatch) => continue,
+                        Err(error) => return Err(error),
+                    };
                     if found.as_ref().is_some_and(|prior| prior != &id) {
                         return Err(IntegrationError::Unknown);
                     }

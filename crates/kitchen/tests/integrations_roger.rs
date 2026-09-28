@@ -376,3 +376,132 @@ esac
     );
     Ok(())
 }
+
+#[cfg(unix)]
+const CURRENT_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+#[cfg(unix)]
+const EARLIER_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+
+/// A Roger CLI whose `list --open` and `list --answered` print the given Asks.
+#[cfg(unix)]
+fn roger_listing(
+    scope: &HouseScope,
+    open: &[Value],
+    answered: &[Value],
+) -> Result<(tempfile::TempDir, RogerCli)> {
+    use kitchen::integrations::github::CredentialFile;
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir()?;
+    let executable = directory.path().join("roger");
+    let token_path = directory.path().join("token");
+    std::fs::write(&token_path, "fixture-roger-token")?;
+    let script = format!(
+        r##"#!/bin/sh
+if [ "$1" = ask ] && [ "$2" = --help ]; then printf '%s' '--idem --decision-key --action-rev --action-target --action-limits --resume-task --resume-rev --body-file'; exit 0; fi
+[ "$ROGER_TOKEN" = fixture-roger-token ] || exit 8
+case "$1 $2" in
+  "get --") printf '%s' '{{"id":"{CURRENT_ID}","requester":"sample-gate"}}' ;;
+  "list --open") printf '%s' '{}' ;;
+  "list --answered") printf '%s' '{}' ;;
+  *) exit 8 ;;
+esac
+"##,
+        json!({"asks": open}),
+        json!({"asks": answered})
+    );
+    std::fs::write(&executable, script)?;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+    let cli = RogerCli::new(
+        executable,
+        CredentialFile::new(scope.credential().clone(), token_path)?,
+        ExternalRef::new(CURRENT_ID)?,
+        "https://roger.example.test".into(),
+    )?;
+    Ok((directory, cli))
+}
+
+/// The Ask being looked up, and the receipt Roger holds for it as an open request.
+#[cfg(unix)]
+fn lookup_fixture() -> Result<(HouseScope, RogerAsk, Value)> {
+    let (scope, binding, mut receipt) = fixture()?;
+    receipt["title"] = json!("Approve this revision?");
+    receipt["body"] = json!("current evidence");
+    receipt["state"] = json!("open");
+    let ask = RogerAsk {
+        binding,
+        kind: AskKind::Approval,
+        risk: AskRisk::Sensitive,
+        title: Text::new("Approve this revision?")?,
+        body: Text::new("current evidence")?,
+        supersedes: None,
+    };
+    Ok((scope, ask, receipt))
+}
+
+/// An earlier Ask for the same decision key and head, with different content.
+#[cfg(unix)]
+fn earlier_ask(current: &Value) -> Value {
+    let mut earlier = current.clone();
+    earlier["id"] = json!(EARLIER_ID);
+    earlier["title"] = json!("Approve the earlier revision?");
+    earlier["body"] = json!("earlier evidence");
+    earlier["state"] = json!("answered");
+    earlier
+}
+
+#[cfg(unix)]
+#[test]
+fn find_skips_an_earlier_ask_that_shares_the_key_and_head() -> Result {
+    use std::time::Duration;
+    let (scope, ask, current) = lookup_fixture()?;
+    let earlier = earlier_ask(&current);
+    let find = |open: Vec<Value>, answered: Vec<Value>| -> Result<_> {
+        let (_directory, cli) = roger_listing(&scope, &open, &answered)?;
+        Ok(cli.find(scope.credential(), &ask, Duration::from_secs(5), 64 * 1024))
+    };
+    let current_id = Some(ExternalRef::new(CURRENT_ID)?);
+    // The current request is open and the earlier one was answered.
+    assert_eq!(
+        find(vec![current.clone()], vec![earlier.clone()])?,
+        Ok(current_id.clone())
+    );
+    // The listing order does not matter: the earlier request may come first.
+    assert_eq!(find(vec![earlier.clone()], vec![current])?, Ok(current_id));
+    // Only an unrelated request exists, so there is no Ask to recover.
+    assert_eq!(find(vec![], vec![earlier])?, Ok(None));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn find_still_rejects_a_matching_candidate_that_is_malformed_or_ambiguous() -> Result {
+    use std::time::Duration;
+    let (scope, ask, current) = lookup_fixture()?;
+    let earlier = earlier_ask(&current);
+    let find = |open: Vec<Value>, answered: Vec<Value>| -> Result<_> {
+        let (_directory, cli) = roger_listing(&scope, &open, &answered)?;
+        Ok(cli.find(scope.credential(), &ask, Duration::from_secs(5), 64 * 1024))
+    };
+    // A candidate with this content but no id is not skipped.
+    let mut no_id = current.clone();
+    no_id.as_object_mut().ok_or("object")?.remove("id");
+    assert_eq!(
+        find(vec![no_id], vec![earlier.clone()])?,
+        Err(IntegrationError::Unknown)
+    );
+    // Nor is one whose id is not a Roger id.
+    let mut bad_id = current.clone();
+    bad_id["id"] = json!("--flag");
+    assert_eq!(
+        find(vec![bad_id], vec![earlier])?,
+        Err(IntegrationError::InvalidInput)
+    );
+    // Two different Asks with exactly this content stay ambiguous.
+    let mut duplicate = current.clone();
+    duplicate["id"] = json!(EARLIER_ID);
+    assert_eq!(
+        find(vec![current], vec![duplicate])?,
+        Err(IntegrationError::Unknown)
+    );
+    Ok(())
+}

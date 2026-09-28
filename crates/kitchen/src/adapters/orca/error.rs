@@ -5,7 +5,7 @@ use std::io;
 use crate::{
     ErrorClass,
     contracts::ContractError,
-    scheduling::{ScheduleError, ScheduleField},
+    scheduling::{BudgetError, ScheduleError, ScheduleField},
 };
 
 /// An Orca adapter failure. Messages from Orca are redacted and truncated;
@@ -150,6 +150,9 @@ pub enum OrcaError {
     /// A schedule value was rejected.
     #[error(transparent)]
     Schedule(#[from] ScheduleError),
+    /// The house's schedule limits refused the change; nothing was sent.
+    #[error(transparent)]
+    ScheduleLimit(#[from] BudgetError),
     /// A contract value was rejected.
     #[error(transparent)]
     Contract(#[from] ContractError),
@@ -161,6 +164,7 @@ impl OrcaError {
     pub const fn class(&self) -> ErrorClass {
         match self {
             Self::Schedule(_) => ErrorClass::InvalidInput,
+            Self::ScheduleLimit(error) => error.class(),
             Self::Contract(error) => error.class(),
             Self::UnsupportedVersion { .. }
             | Self::MissingRuntimeFeature(_)

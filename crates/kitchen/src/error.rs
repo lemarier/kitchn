@@ -68,6 +68,9 @@ pub enum Error {
     /// A pickup, coordination, or repair workflow refused its input.
     #[error(transparent)]
     Coordination(#[from] crate::workflows::coordination::CoordinationError),
+    /// A schedule interval or usage budget check refused the request.
+    #[error(transparent)]
+    Budget(#[from] crate::scheduling::BudgetError),
 }
 
 impl Error {
@@ -89,6 +92,7 @@ impl Error {
             Self::Event(error) => error.class(),
             Self::Verification(error) => error.class(),
             Self::Coordination(error) => error.class(),
+            Self::Budget(error) => error.class(),
         }
     }
 }

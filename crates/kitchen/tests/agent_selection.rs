@@ -415,6 +415,7 @@ fn doctor_reports_configured_models_the_agents_do_not_offer() -> TestResult {
         capabilities: CapabilitySet::new(),
         labels: None,
         access: AccessStatus::Unobserved,
+        schedules: None,
         agent_models: Some(vec![
             OfferedModels {
                 agent: AgentFamily::Codex,

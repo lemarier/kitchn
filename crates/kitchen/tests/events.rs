@@ -61,6 +61,7 @@ fn house_config() -> TestResult<HouseConfig> {
         grants: BTreeSet::new(),
         agents: None,
         stack_tool: None,
+        schedules: None,
     })
 }
 

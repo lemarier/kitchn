@@ -1,16 +1,20 @@
 //! What started a piece of work, and where its authority comes from.
 //!
-//! The same task and effect code serves both triggers:
+//! The same task and effect code serves every trigger:
 //!
 //! - [`Trigger::Scheduled`]: no person is present. Effects act only on the
 //!   task's authority delegated from the house's standing grants.
+//! - [`Trigger::Event`]: a delivered forge event started the work. No person
+//!   is present, so it is unattended exactly like a scheduled run: effects
+//!   use standing grants only and consent is refused, even when a person's
+//!   action caused the event.
 //! - [`Trigger::Interactive`]: a person is present. Each effect needs that
 //!   person's [`Consent`] for exactly that effect, bounded by house policy
 //!   limits. Consent is never stored as a grant and never covers another
 //!   effect.
 //!
-//! Both triggers claim work through the same durable claims, so an item
-//! claimed by one is refused to the other until a recorded relinquish and
+//! Every trigger claims work through the same durable claims, so an item
+//! claimed by one is refused to the others until a recorded relinquish and
 //! adoption, a takeover after expiry, or settlement.
 
 use std::fmt;
@@ -18,26 +22,63 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ConsumerId, HolderId, HouseId, TaskId,
+    BackendId, ConsumerId, HolderId, HouseId, TaskId,
     contracts::{ContractError, Effect, EvidenceRevision, ExternalRef, Fence},
 };
 
 /// What started a piece of work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Trigger {
     /// A scheduled run with no person present.
     Scheduled,
     /// A session with a person present.
     Interactive,
+    /// A delivered forge event, with no person present.
+    Event(EventOrigin),
+}
+
+impl Trigger {
+    /// Whether no person is present, so effects use standing grants only
+    /// and consent is refused.
+    #[must_use]
+    pub const fn is_unattended(&self) -> bool {
+        match self {
+            Self::Scheduled | Self::Event(_) => true,
+            Self::Interactive => false,
+        }
+    }
 }
 
 impl fmt::Display for Trigger {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Scheduled => "scheduled",
-            Self::Interactive => "interactive",
-        })
+        match self {
+            Self::Scheduled => formatter.write_str("scheduled"),
+            Self::Interactive => formatter.write_str("interactive"),
+            Self::Event(origin) => write!(formatter, "event {origin}"),
+        }
+    }
+}
+
+/// Where a delivered event came from: the house it was delivered for, the
+/// source namespace that delivered it, and the source's own identity for the
+/// event. A redelivery of the same event carries the same origin.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventOrigin {
+    /// The house the event was delivered for.
+    pub house: HouseId,
+    /// The delivering source: one forge namespace (instance and account),
+    /// named like a backend.
+    pub source: BackendId,
+    /// The source's identity for this event, such as a webhook delivery id.
+    /// Unique within `source`; a redelivery keeps it.
+    pub event: ExternalRef,
+}
+
+impl fmt::Display for EventOrigin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}/{}", self.house, self.source, self.event)
     }
 }
 
@@ -73,6 +114,16 @@ impl Claimant {
         Self {
             holder,
             trigger: Trigger::Scheduled,
+            consumer: None,
+        }
+    }
+
+    /// A claimant acting on a delivered event.
+    #[must_use]
+    pub const fn event(holder: HolderId, origin: EventOrigin) -> Self {
+        Self {
+            holder,
+            trigger: Trigger::Event(origin),
             consumer: None,
         }
     }

@@ -856,7 +856,9 @@ pub fn apply(
         return Err(CleanupError::GrantMismatch.into());
     }
     let authority = match claimant.trigger {
-        Trigger::Scheduled => TaskAuthority::delegate(grants, [options.release.clone()])?,
+        Trigger::Scheduled | Trigger::Event(_) => {
+            TaskAuthority::delegate(grants, [options.release.clone()])?
+        }
         Trigger::Interactive => TaskAuthority::delegate(grants, [])?,
     };
     let run = Run {
@@ -869,7 +871,7 @@ pub fn apply(
         authority,
     };
     let trigger = match claimant.trigger {
-        Trigger::Scheduled => InspectionTrigger::Schedule,
+        Trigger::Scheduled | Trigger::Event(_) => InspectionTrigger::Schedule,
         Trigger::Interactive => InspectionTrigger::Manual,
     };
     let preview = inspect(inspector, trigger, clock.now())?;
@@ -882,17 +884,17 @@ pub fn apply(
     // Decide what each eligible resource needs before acting on anything.
     let mut planned = Vec::with_capacity(eligible.len());
     for entry in eligible {
-        let plan = match claimant.trigger {
+        let plan = match &claimant.trigger {
             // A person present gives one consent per release, for exactly the
             // evidence in this preview; that consent is the whole gate.
             Trigger::Interactive => Plan::Drive(release_task_id(
                 &entry.observation,
                 preview.observed_at,
-                claimant.trigger,
+                &claimant.trigger,
             )?),
             // Nobody is present, so a person's earlier approval of this
             // evidence must stand in for them.
-            Trigger::Scheduled => match approval(
+            Trigger::Scheduled | Trigger::Event(_) => match approval(
                 inspector.store,
                 &entry.resource,
                 Step::Release,
@@ -905,7 +907,7 @@ pub fn apply(
                 Approval::Approved(approved_at) => Plan::Drive(release_task_id(
                     &entry.observation,
                     approved_at,
-                    claimant.trigger,
+                    &claimant.trigger,
                 )?),
             },
         };
@@ -1193,8 +1195,8 @@ impl Run<'_> {
         // starts one. It is asked for before anything is written, so a declined
         // run leaves no task behind in the house's bounded store. A task that
         // does not exist yet starts at the initial evidence revision.
-        let consent = match (self.claimant.trigger, entry) {
-            (Trigger::Scheduled, _) | (Trigger::Interactive, None) => None,
+        let consent = match (&self.claimant.trigger, entry) {
+            (Trigger::Scheduled | Trigger::Event(_), _) | (Trigger::Interactive, None) => None,
             (Trigger::Interactive, Some(entry)) => {
                 let revision = existing
                     .as_ref()
@@ -1383,7 +1385,7 @@ fn is_release_task(task: &TaskRecord) -> bool {
 /// the identity, so a consent minted for one release task names one piece of
 /// evidence. So is the trigger: a scheduled and an interactive run hold
 /// different authority, and neither may inherit a task the other created.
-fn release_task_id(observation: &ExternalRef, at: Timestamp, trigger: Trigger) -> Result<TaskId> {
+fn release_task_id(observation: &ExternalRef, at: Timestamp, trigger: &Trigger) -> Result<TaskId> {
     let mut digest = Sha256::new();
     digest.update(b"kitchen-dishwasher-release-v2\0");
     digest.update(observation.as_str().as_bytes());
@@ -2165,21 +2167,21 @@ mod tests {
     fn a_release_task_names_its_digest_time_and_trigger() -> Result<()> {
         let first = digest_of("sha256:aaaa")?;
         let at = Timestamp::from_unix_millis(1_000);
-        let id = release_task_id(&first, at, Trigger::Interactive)?;
+        let id = release_task_id(&first, at, &Trigger::Interactive)?;
         assert!(id.as_str().starts_with(TASK_PREFIX));
         // The same evidence at the same time by the same kind of run resumes
         // the same task.
-        assert_eq!(release_task_id(&first, at, Trigger::Interactive)?, id);
+        assert_eq!(release_task_id(&first, at, &Trigger::Interactive)?, id);
         // A consent minted for one release task cannot serve another piece of
         // evidence, a later run or approval, or the other kind of run.
         for other in [
-            release_task_id(&digest_of("sha256:bbbb")?, at, Trigger::Interactive)?,
+            release_task_id(&digest_of("sha256:bbbb")?, at, &Trigger::Interactive)?,
             release_task_id(
                 &first,
                 Timestamp::from_unix_millis(1_001),
-                Trigger::Interactive,
+                &Trigger::Interactive,
             )?,
-            release_task_id(&first, at, Trigger::Scheduled)?,
+            release_task_id(&first, at, &Trigger::Scheduled)?,
         ] {
             assert_ne!(other, id);
         }

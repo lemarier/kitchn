@@ -303,11 +303,11 @@ fn triggers_share_claims_and_hand_over_through_relinquish_and_adopt() -> TestRes
     // The person hands the issue to scheduled work.
     store.relinquish(&issue, person.fence(), at(3))?;
     let adopted = store.claim(&issue, &scheduled("pickup-tick")?, ttl(60)?, at(4))?;
-    assert_eq!(adopted.trigger(), Trigger::Scheduled);
+    assert_eq!(adopted.trigger(), &Trigger::Scheduled);
     let record = store.task(&issue)?;
     assert_eq!(record.created_by().trigger, Trigger::Interactive);
     assert!(
-        matches!(record.state(), TaskState::Claimed { lease } if lease.trigger() == Trigger::Scheduled)
+        matches!(record.state(), TaskState::Claimed { lease } if lease.trigger() == &Trigger::Scheduled)
     );
     assert!(matches!(
         record.ownership(),

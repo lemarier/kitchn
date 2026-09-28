@@ -59,6 +59,9 @@ pub enum Error {
     /// An agent policy or selection was rejected.
     #[error(transparent)]
     Selection(#[from] crate::selection::SelectionError),
+    /// An event was refused or malformed.
+    #[error(transparent)]
+    Event(#[from] crate::events::EventError),
 }
 
 impl Error {
@@ -77,6 +80,7 @@ impl Error {
             Self::Trust(error) => error.class(),
             Self::Workflow(error) => error.class(),
             Self::Selection(error) => error.class(),
+            Self::Event(error) => error.class(),
         }
     }
 }

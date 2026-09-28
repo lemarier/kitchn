@@ -58,6 +58,8 @@ closed_names! {
         ForgeMutation = "forge.mutation",
         /// Ask a human through a decision service and read the answer.
         AskHuman = "human.ask",
+        /// Deliver forge events, such as webhooks, to Kitchen's event intake.
+        EventDelivery = "event.delivery",
         /// Look up any effect's outcome by its persisted request; shorthand
         /// for every per-kind lookup capability.
         EffectLookup = "effect.lookup",

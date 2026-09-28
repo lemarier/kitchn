@@ -75,8 +75,8 @@ impl Lease {
     /// The trigger the owner acts under, which decides where its effects'
     /// authority comes from.
     #[must_use]
-    pub const fn trigger(&self) -> Trigger {
-        self.trigger
+    pub const fn trigger(&self) -> &Trigger {
+        &self.trigger
     }
 
     /// The workflow consumer lease the owner acts under, if any.
@@ -1078,7 +1078,7 @@ impl StoreState {
     fn new_lease(&mut self, claimant: &Claimant, ttl: LeaseTtl, now: Timestamp) -> Lease {
         Lease {
             holder: claimant.holder.clone(),
-            trigger: claimant.trigger,
+            trigger: claimant.trigger.clone(),
             consumer: claimant.consumer.clone(),
             fence: self.issue_fence(),
             acquired_at: now,
@@ -1218,7 +1218,7 @@ impl StoreState {
             }) => OwnershipEvent::Adopted {
                 previous: *previous,
                 holder: claimant.holder.clone(),
-                trigger: claimant.trigger,
+                trigger: claimant.trigger.clone(),
                 fence: lease.fence,
                 at: now,
             },
@@ -1230,7 +1230,7 @@ impl StoreState {
             )
             | None => OwnershipEvent::Claimed {
                 holder: claimant.holder.clone(),
-                trigger: claimant.trigger,
+                trigger: claimant.trigger.clone(),
                 fence: lease.fence,
                 at: now,
             },
@@ -1307,7 +1307,7 @@ impl StoreState {
         task.push_ownership(OwnershipEvent::TakenOver {
             previous,
             holder: claimant.holder.clone(),
-            trigger: claimant.trigger,
+            trigger: claimant.trigger.clone(),
             fence: lease.fence,
             at: now,
         })?;
@@ -1501,7 +1501,7 @@ impl StoreState {
                 .for_executor(plan.effect.executor())
                 .chain([plan.effect.required_capability()]),
         )?;
-        let trigger = task.owned_lease(plan.fence, now, true)?.trigger;
+        let trigger = task.owned_lease(plan.fence, now, true)?.trigger.clone();
         // Every launch uses the selection fixed when the task was created.
         if let Effect::Worker(Operation::LaunchWorker { agent, .. }) = &plan.effect
             && agent.as_ref() != task.spec.agent.as_ref().map(|resolved| &resolved.selection)
@@ -1566,13 +1566,15 @@ impl StoreState {
             .into());
         }
         let (credential, authorization) = match (trigger, &plan.consent) {
-            (Trigger::Scheduled, None) => (
+            (Trigger::Scheduled | Trigger::Event(_), None) => (
                 task.spec
                     .authority
                     .authorize(grants, permission, &scope, &backend.backend)?,
                 Authorization::Standing,
             ),
-            (Trigger::Scheduled, Some(_)) => return Err(ContractError::ConsentNotAccepted.into()),
+            (Trigger::Scheduled | Trigger::Event(_), Some(_)) => {
+                return Err(ContractError::ConsentNotAccepted.into());
+            }
             (Trigger::Interactive, None) => {
                 return Err(ContractError::ConsentRequired { permission }.into());
             }
@@ -2211,7 +2213,7 @@ fn marker_refusal<T>(refusal: MarkerRefusal) -> Result<T> {
 /// names the current owner's fence; nothing follows a release; the replayed
 /// owner matches the task state; and every attempt ran under an owned fence.
 fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result<(), Corruption> {
-    let mut owner: Option<(&HolderId, Trigger, Fence)> = None;
+    let mut owner: Option<(&HolderId, &Trigger, Fence)> = None;
     let mut owned = BTreeSet::new();
     let mut released = false;
     let mut relinquished = None;
@@ -2229,7 +2231,7 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
         if released {
             return Err(Corruption::Ownership);
         }
-        let current = owner.map(|(_, _, fence)| fence);
+        let current = owner.as_ref().map(|(_, _, fence)| *fence);
         let after_relinquish = relinquished.take();
         match event {
             OwnershipEvent::Claimed {
@@ -2242,7 +2244,7 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
                     return Err(Corruption::Ownership);
                 }
                 issue(&mut owned, *fence)?;
-                owner = Some((holder, *trigger, *fence));
+                owner = Some((holder, trigger, *fence));
             }
             OwnershipEvent::Adopted {
                 previous,
@@ -2255,7 +2257,7 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
                     return Err(Corruption::Ownership);
                 }
                 issue(&mut owned, *fence)?;
-                owner = Some((holder, *trigger, *fence));
+                owner = Some((holder, trigger, *fence));
             }
             OwnershipEvent::TakenOver {
                 previous,
@@ -2268,7 +2270,7 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
                     return Err(Corruption::Ownership);
                 }
                 issue(&mut owned, *fence)?;
-                owner = Some((holder, *trigger, *fence));
+                owner = Some((holder, trigger, *fence));
             }
             OwnershipEvent::Relinquished { fence, .. } | OwnershipEvent::Released { fence, .. } => {
                 if current != Some(*fence) {
@@ -2283,7 +2285,7 @@ fn validate_ownership(task: &TaskRecord, next_fence: u64) -> std::result::Result
         }
     }
     let consistent = match &task.state {
-        TaskState::Claimed { lease } => owner == Some((&lease.holder, lease.trigger, lease.fence)),
+        TaskState::Claimed { lease } => owner == Some((&lease.holder, &lease.trigger, lease.fence)),
         TaskState::Open => owner.is_none() && !released,
         TaskState::Settled { .. } => owner.is_none(),
     };

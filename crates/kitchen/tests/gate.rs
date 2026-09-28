@@ -3,9 +3,23 @@ mod common;
 use common::{TestResult, commit};
 use kitchen::workflows::gate::{self, *};
 use kitchen::{
-    HouseId,
-    contracts::{ExternalRef, IssueNumber, Repository, Text},
+    BackendId, CredentialId, HouseId, TaskId, WorkflowId,
+    contracts::{
+        BackendDescriptor, BranchName, Capability, CapabilitySet, Effect, Evidence, EvidenceKind,
+        EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, GitHubAction, GitHubEffect, Grant,
+        HouseGrants, IdempotencyKey, IssueNumber, NotAppliedReason, Permission, PostingBudget,
+        Receipt, Repository, TaskAuthority, Text, Timestamp,
+    },
+    state::{
+        EffectOutcome, EffectRecord, EffectState, HouseStore, MarkerFact, MarkerKey, MarkerSubject,
+        StateError, WorkItem,
+    },
 };
+use std::{num::NonZeroU64, time::Duration};
+
+const fn secs(seconds: u64) -> Timestamp {
+    Timestamp::from_unix_millis(seconds * 1000)
+}
 
 fn ready() -> TestResult<GateEvidence> {
     let head = commit('a')?;
@@ -16,7 +30,8 @@ fn ready() -> TestResult<GateEvidence> {
         head: head.clone(),
         head_branch: Some("feature/gate".into()),
         base: commit('b')?,
-        head_age_secs: Some(3600),
+        base_branch: Some(BranchName::new("main")?),
+        head_age: Some(Duration::from_secs(3600)),
         open: Some(true),
         draft: Some(false),
         same_repository: Some(true),
@@ -107,7 +122,7 @@ fn stale_reviews_and_approvals_do_not_pass() -> TestResult {
         gate::evaluate(&e, grants(), GateHistory::default()).verdict,
         Verdict::HandOver { gaps } if gaps.contains(&Gap::ReviewerStale)
     ));
-    e.head_age_secs = Some(86400);
+    e.head_age = Some(Duration::from_secs(86400));
     assert!(
         matches!(gate::evaluate(&e,grants(),GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::ReviewerStale))
     );
@@ -166,7 +181,7 @@ fn report_marker_suppresses_repeat_and_fix_is_once_per_head() -> TestResult {
             grants(),
             GateHistory {
                 requested_this_head: true,
-                request_age_secs: Some(100),
+                request_age: Some(Duration::from_secs(100)),
                 ..GateHistory::default()
             }
         )
@@ -179,7 +194,7 @@ fn report_marker_suppresses_repeat_and_fix_is_once_per_head() -> TestResult {
             grants(),
             GateHistory {
                 requested_this_head: true,
-                request_age_secs: Some(7200),
+                request_age: Some(Duration::from_secs(7200)),
                 ..GateHistory::default()
             }
         )
@@ -226,9 +241,23 @@ fn merge_request_rechecks_refs_and_run_limit() -> TestResult {
     );
     let mutation = gate::merge_request(&d, &e.head, &e.base, 0)?.mutation();
     assert_eq!(mutation.repository, e.repository);
-    assert!(
-        matches!(mutation.action,kitchen::contracts::GitHubAction::MergePullRequest{number,expected_head,method:kitchen::contracts::MergeMethod::Squash} if number==e.number && expected_head==e.head)
+    assert_eq!(
+        mutation.action,
+        kitchen::contracts::GitHubAction::MergePullRequest {
+            number: e.number,
+            expected_head: e.head.clone(),
+            expected_base: BranchName::new("main")?,
+            expected_base_commit: Some(e.base.clone()),
+            method: kitchen::contracts::MergeMethod::Squash,
+        }
     );
+    // A decision without a validated base branch cannot merge.
+    let mut unbranched = ready()?;
+    unbranched.base_branch = None;
+    assert!(matches!(
+        gate::evaluate(&unbranched, grants(), GateHistory::default()).verdict,
+        Verdict::HandOver { gaps } if gaps.contains(&Gap::Eligibility)
+    ));
     Ok(())
 }
 #[test]
@@ -345,45 +374,19 @@ impl GateMarkerStore for FakeMarkers {
         number: IssueNumber,
         head: &kitchen::contracts::CommitId,
         base: &kitchen::contracts::CommitId,
-        now_unix_secs: u64,
+        now: Timestamp,
     ) -> Result<GateHistory, Self::Error> {
-        let matching: Vec<_> = self
-            .current
-            .iter()
-            .chain(&self.superseded)
-            .filter_map(|r| Self::at(r, house, repository, number))
-            .filter(|r| self.counted(r))
-            .collect();
-        let subject = |r: &&&GateVerdictRecord| &r.head == head && &r.base == base;
-        let current = self
-            .current
-            .iter()
-            .filter_map(|r| Self::at(r, house, repository, number))
-            .filter(|r| self.counted(r))
-            .find(|r| &r.head == head && &r.base == base);
-        let request = current.filter(|r| matches!(r.verdict, Verdict::FixRequest { .. }));
-        let count = |f: fn(&Verdict) -> bool| {
-            u8::try_from(matching.iter().filter(|r| f(&r.verdict)).count()).unwrap_or(u8::MAX)
-        };
-        Ok(GateHistory {
-            fix_rounds: count(|v| matches!(v, Verdict::FixRequest { .. })),
-            requested_this_head: request.is_some(),
-            request_age_secs: request.and_then(|r| now_unix_secs.checked_sub(r.recorded_unix_secs)),
-            last_handover_unix_secs: matching
-                .iter()
-                .filter(subject)
-                .filter(|r| matches!(r.verdict, Verdict::HandOver { .. }))
-                .map(|r| r.recorded_unix_secs)
-                .max(),
-            handovers: count(|v| matches!(v, Verdict::HandOver { .. })),
-            reported_subject: current
-                .is_some_and(|r| {
-                    r.mode == GateMode::ReportOnly
-                        || matches!(r.verdict, Verdict::HandOver { .. } | Verdict::Merge)
-                })
-                .then(|| (head.clone(), base.clone())),
-            ..GateHistory::default()
-        })
+        let current = self.current.iter().map(|r| (r, true));
+        let superseded = self.superseded.iter().map(|r| (r, false));
+        Ok(GateHistory::from_records(
+            current
+                .chain(superseded)
+                .filter(|(r, _)| Self::at(r, house, repository, number).is_some())
+                .filter(|(r, _)| self.counted(r)),
+            head,
+            base,
+            now,
+        ))
     }
     fn current(
         &self,
@@ -477,26 +480,31 @@ impl GateMarkerStore for FakeMarkers {
 fn report_only_records_once_per_exact_subject_without_effect() -> TestResult {
     let mut store = FakeMarkers::default();
     let mut e = ready()?;
-    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, 100)?;
+    let first =
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, secs(100))?;
     assert_eq!(first.decision.verdict, Verdict::Merge);
     assert_eq!(first.mode, GateMode::ReportOnly);
     assert_eq!(
         gate::merge_request(&first, &e.head, &e.base, 0),
         Err(RequestRefusal::EffectsDisabled)
     );
-    let second = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, 100)?;
+    let second =
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, secs(100))?;
     assert_eq!(second.decision.verdict, Verdict::Skip);
     assert_eq!(store.current.len(), 1);
     e.repository = Repository::new("other/repository")?;
-    let other = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, 100)?;
+    let other =
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, secs(100))?;
     assert_eq!(other.admission, Admission::Satisfied);
     assert_eq!(store.current.len(), 2);
     e.house = HouseId::new("other-house")?;
-    let cross = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, 100)?;
+    let cross =
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, secs(100))?;
     assert_eq!(cross.admission, Admission::Satisfied);
     assert_eq!(store.current.len(), 3);
     e.base = commit('c')?;
-    let moved = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, 100)?;
+    let moved =
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, secs(100))?;
     assert_eq!(moved.admission, Admission::Satisfied);
     assert_eq!(store.current.len(), 4);
     Ok(())
@@ -508,25 +516,27 @@ fn uncertain_marker_write_stops_decision() -> TestResult {
         ..FakeMarkers::default()
     };
     let e = ready()?;
-    assert!(gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 100).is_err());
+    assert!(
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(100)).is_err()
+    );
     assert!(store.current.is_empty());
     Ok(())
 }
 #[test]
 fn moving_and_conflicting_heads_skip_until_stalled() -> TestResult {
     let mut e = ready()?;
-    e.head_age_secs = Some(1799);
+    e.head_age = Some(Duration::from_secs(1799));
     assert_eq!(
         gate::evaluate(&e, grants(), GateHistory::default()).verdict,
         Verdict::Skip
     );
-    e.head_age_secs = Some(3600);
+    e.head_age = Some(Duration::from_secs(3600));
     e.merge_clean = Some(false);
     assert_eq!(
         gate::evaluate(&e, grants(), GateHistory::default()).verdict,
         Verdict::Skip
     );
-    e.head_age_secs = Some(86400);
+    e.head_age = Some(Duration::from_secs(86400));
     assert!(
         matches!(gate::evaluate(&e,grants(),GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::Mergeability))
     );
@@ -564,7 +574,7 @@ fn request_review_grant(repository: &Repository) -> TestResult<kitchen::contract
 fn reviewer_request_needs_its_separate_grant() -> TestResult {
     let mut e = ready()?;
     e.reviewers[0].reviewed_head = Some(commit('c')?);
-    e.head_age_secs = Some(86400);
+    e.head_age = Some(Duration::from_secs(86400));
     let github = kitchen::BackendId::new("github")?;
     // Policy permits the invocation, but no standing grant covers it: a
     // scheduled gate run has no consent, so nothing resolves.
@@ -636,7 +646,7 @@ fn reviewer_trigger_is_resolved_from_policy_and_head_scoped() -> TestResult {
         ..grants()
     };
     let mut history = GateHistory::default();
-    e.head_age_secs = Some(3600);
+    e.head_age = Some(Duration::from_secs(3600));
     let recorded = admitted(gate::evaluate(&e, granted.clone(), history.clone()))?;
     assert!(matches!(
         recorded.decision.verdict,
@@ -790,9 +800,10 @@ fn scoped_forge_reads_feed_exact_head_gate() -> TestResult {
             expected_reviewers: vec!["reviewer".into()],
         },
         supplement(&e),
-        1790607600,
+        secs(1_790_607_600),
     )?;
-    assert_eq!(observed.head_age_secs, Some(3600));
+    assert_eq!(observed.head_age, Some(Duration::from_secs(3600)));
+    assert_eq!(observed.base_branch, Some(BranchName::new("main")?));
     assert_eq!(observed.checks, Checks::Passed);
     assert_eq!(
         gate::evaluate(&observed, grants(), GateHistory::default()).verdict,
@@ -820,7 +831,7 @@ fn forge_behind_state_requests_a_bounded_fix() -> TestResult {
             expected_reviewers: vec!["reviewer".into()],
         },
         supplement(&e),
-        1790607600,
+        secs(1_790_607_600),
     )?;
     assert!(matches!(
         gate::evaluate(&observed, grants(), GateHistory::default()).verdict,
@@ -842,7 +853,7 @@ fn required_check_absence_from_forge_refuses_merge() -> TestResult {
             expected_reviewers: vec!["reviewer".into()],
         },
         supplement(&e),
-        1790607600,
+        secs(1_790_607_600),
     )?;
     assert_eq!(observed.checks, Checks::Missing);
     assert!(
@@ -855,18 +866,20 @@ fn fix_request_record_times_out_to_one_handover() -> TestResult {
     let mut store = FakeMarkers::default();
     let mut e = ready()?;
     e.checks = Checks::Failed;
-    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 100)?;
+    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(100))?;
     assert!(matches!(first.decision.verdict, Verdict::FixRequest { .. }));
     store.apply(&first)?;
-    let waiting = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 7299)?;
+    let waiting =
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(7299))?;
     assert_eq!(waiting.decision.verdict, Verdict::Skip);
-    let handover = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 7300)?;
+    let handover =
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(7300))?;
     assert!(matches!(
         handover.decision.verdict,
         Verdict::HandOver { .. }
     ));
     store.apply(&handover)?;
-    let repeat = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 7301)?;
+    let repeat = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(7301))?;
     assert_eq!(repeat.decision.verdict, Verdict::Skip);
     // One marker at the subject; the fix request moved to its history.
     assert_eq!(store.current.len(), 1);
@@ -887,6 +900,18 @@ fn forge_reread_blocks_a_moved_head_before_merge_effect() -> TestResult {
     let moved = forge_client(moved_head.as_str(), false)?;
     assert_eq!(
         gate::merge_request_from_forge(&recorded, &moved, 0),
+        Err(kitchen::integrations::github::IntegrationError::StaleDecision)
+    );
+    // A PR retargeted away from the judged base branch is stale as well.
+    let mut judged_on_release = e.clone();
+    judged_on_release.base_branch = Some(BranchName::new("release")?);
+    let retargeted = admitted(gate::evaluate(
+        &judged_on_release,
+        grants(),
+        GateHistory::default(),
+    ))?;
+    assert_eq!(
+        gate::merge_request_from_forge(&retargeted, &forge_client(e.head.as_str(), false)?, 0),
         Err(kitchen::integrations::github::IntegrationError::StaleDecision)
     );
     Ok(())
@@ -952,7 +977,7 @@ fn comment_after_change_request_does_not_clear_it() -> TestResult {
             expected_reviewers: vec!["reviewer".into()],
         },
         supplement(&e),
-        1790607600,
+        secs(1_790_607_600),
     )?;
     assert_eq!(observed.no_change_request, Some(false));
     assert!(
@@ -966,12 +991,12 @@ fn run_caps_evaluations_and_confirmed_merges() -> TestResult {
     let e = ready()?;
     let mut run = GateRun::new();
     for i in 0..3 {
-        let result = run.evaluate_next(&mut store, &e, grants(), GateMode::ReportOnly, i)?;
+        let result = run.evaluate_next(&mut store, &e, grants(), GateMode::ReportOnly, secs(i))?;
         assert!(result.is_some());
     }
     assert_eq!(run.evaluated(), 3);
     assert!(
-        run.evaluate_next(&mut store, &e, grants(), GateMode::ReportOnly, 4)?
+        run.evaluate_next(&mut store, &e, grants(), GateMode::ReportOnly, secs(4))?
             .is_none()
     );
     let recorded = admitted(gate::evaluate(&e, grants(), GateHistory::default()))?;
@@ -1020,7 +1045,7 @@ fn quota_review_from_forge_is_unavailable() -> TestResult {
             expected_reviewers: vec!["reviewer".into()],
         },
         supplement(&e),
-        1790607600,
+        secs(1_790_607_600),
     )?;
     assert_eq!(observed.reviewers[0].outcome, ReviewerOutcome::Unavailable);
     assert!(
@@ -1091,7 +1116,7 @@ fn invalid_forge_branch_cannot_target_fix_worker() -> TestResult {
             expected_reviewers: vec!["reviewer".into()],
         },
         supplement(&e),
-        1790607600,
+        secs(1_790_607_600),
     )?;
     assert!(observed.head_branch.is_none());
     assert!(
@@ -1218,7 +1243,7 @@ fn risk_approval_requires_scoped_write_permission() -> TestResult {
         e.number,
         &policy,
         supplement(&e),
-        1790607600,
+        secs(1_790_607_600),
     )?;
     assert_eq!(
         gate::evaluate(&observed, grants(), GateHistory::default()).verdict,
@@ -1242,7 +1267,7 @@ fn risk_approval_requires_scoped_write_permission() -> TestResult {
         e.number,
         &policy,
         supplement(&e),
-        1790607600,
+        secs(1_790_607_600),
     )?;
     assert!(
         matches!(gate::evaluate(&observed,grants(),GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::RiskApproval))
@@ -1279,7 +1304,7 @@ fn write_permission_without_current_head_approval_is_insufficient() -> TestResul
             expected_reviewers: vec!["reviewer".into()],
         },
         supplement(&e),
-        1790607600,
+        secs(1_790_607_600),
     )?;
     assert!(
         matches!(gate::evaluate(&observed,grants(),GateHistory::default()).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::RiskApproval))
@@ -1291,19 +1316,19 @@ fn label_removal_allows_one_same_head_reevaluation() -> TestResult {
     let mut store = FakeMarkers::default();
     let mut e = ready()?;
     e.hardware_complete = Some(false);
-    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 100)?;
+    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(100))?;
     assert!(matches!(first.decision.verdict, Verdict::HandOver { .. }));
     store.apply(&first)?;
     e.reopen_event = Some(GateReopenEvent {
         head: e.head.clone(),
         base: e.base.clone(),
-        at_unix_secs: 101,
+        at: secs(101),
         actor: "human".into(),
     });
-    let second = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 102)?;
+    let second = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(102))?;
     assert!(matches!(second.decision.verdict, Verdict::HandOver { .. }));
     store.apply(&second)?;
-    let third = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 103)?;
+    let third = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(103))?;
     assert_eq!(third.decision.verdict, Verdict::Skip);
     assert_eq!(store.current.len(), 1);
     assert_eq!(store.superseded.len(), 1);
@@ -1333,7 +1358,7 @@ fn forge_label_removal_requires_actor_write_access() -> TestResult {
         e.number,
         &policy,
         supplement(&e),
-        1790607600,
+        secs(1_790_607_600),
     )?;
     assert_eq!(
         observed
@@ -1357,7 +1382,7 @@ fn forge_label_removal_requires_actor_write_access() -> TestResult {
         e.number,
         &policy,
         supplement(&e),
-        1790607600,
+        secs(1_790_607_600),
     )?;
     assert!(observed.reopen_event.is_none());
     Ok(())
@@ -1393,10 +1418,13 @@ fn crash_after_intent_reconciles_instead_of_resubmitting() -> TestResult {
     };
     let e = ready()?;
     // Intent persists, then the process dies before the marker is written.
-    assert!(gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 100).is_err());
+    assert!(
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(100)).is_err()
+    );
     assert_eq!(store.effects.len(), 1);
     assert!(store.current.is_empty());
-    let restarted = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 200)?;
+    let restarted =
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(200))?;
     let intent = store.effects[0].1.clone();
     assert_eq!(restarted.admission, Admission::Reconcile(intent.clone()));
     assert_eq!(
@@ -1405,7 +1433,7 @@ fn crash_after_intent_reconciles_instead_of_resubmitting() -> TestResult {
     );
     assert_eq!(store.current[0].effect.as_ref(), Some(&intent));
     // Later passes keep reconciling the same key and never add an intent.
-    let again = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 300)?;
+    let again = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(300))?;
     assert_eq!(again.admission, Admission::Reconcile(intent));
     assert_eq!(again.decision.verdict, Verdict::Merge);
     assert_eq!(store.effects.len(), 1);
@@ -1415,14 +1443,14 @@ fn crash_after_intent_reconciles_instead_of_resubmitting() -> TestResult {
 fn refused_submission_is_reevaluated_and_superseded_within_a_bound() -> TestResult {
     let mut store = FakeMarkers::default();
     let e = ready()?;
-    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 100)?;
+    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(100))?;
     let refused = submitted(&first)?;
     assert_eq!(
         gate::merge_request(&first, &e.head, &e.base, 0)?.key,
         refused
     );
     store.settle(&refused, GateEffectState::NotApplied);
-    let retry = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 200)?;
+    let retry = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(200))?;
     let second = submitted(&retry)?;
     assert_ne!(second, refused);
     assert_eq!(retry.decision.verdict, Verdict::Merge);
@@ -1430,7 +1458,7 @@ fn refused_submission_is_reevaluated_and_superseded_within_a_bound() -> TestResu
     assert_eq!(store.superseded[0].effect.as_ref(), Some(&refused));
     store.settle(&second, GateEffectState::NotApplied);
     // The bound turns a repeatedly refused merge into one handover.
-    let bounded = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 300)?;
+    let bounded = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(300))?;
     let handover = submitted(&bounded)?;
     assert_eq!(
         bounded.decision.verdict,
@@ -1440,7 +1468,7 @@ fn refused_submission_is_reevaluated_and_superseded_within_a_bound() -> TestResu
     );
     store.settle(&handover, GateEffectState::NotApplied);
     // A refused handover stops at this subject instead of looping.
-    let stopped = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 400)?;
+    let stopped = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(400))?;
     assert_eq!(stopped.decision.verdict, Verdict::Skip);
     assert_eq!(stopped.admission, Admission::None);
     assert_eq!(store.effects.len(), 3);
@@ -1450,17 +1478,17 @@ fn refused_submission_is_reevaluated_and_superseded_within_a_bound() -> TestResu
 fn uncertain_submission_reconciles_then_applied_is_satisfied() -> TestResult {
     let mut store = FakeMarkers::default();
     let e = ready()?;
-    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 100)?;
+    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(100))?;
     let key = submitted(&first)?;
     store.settle(&key, GateEffectState::Uncertain);
-    let pending = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 200)?;
+    let pending = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(200))?;
     assert_eq!(pending.admission, Admission::Reconcile(key.clone()));
     store.settle(&key, GateEffectState::HandedOver);
-    let handed = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 250)?;
+    let handed = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(250))?;
     assert_eq!(handed.admission, Admission::Reconcile(key.clone()));
     // A lookup later proves the merge applied: the marker is satisfied.
     store.settle(&key, GateEffectState::Applied);
-    let done = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 300)?;
+    let done = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(300))?;
     assert_eq!(done.decision.verdict, Verdict::Skip);
     assert_eq!(done.admission, Admission::None);
     assert_eq!(store.effects.len(), 1);
@@ -1472,17 +1500,17 @@ fn uncertain_submission_proven_absent_is_superseded() -> TestResult {
     let mut store = FakeMarkers::default();
     let mut e = ready()?;
     e.checks = Checks::Failed;
-    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 100)?;
+    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(100))?;
     let key = submitted(&first)?;
     store.settle(&key, GateEffectState::Uncertain);
     assert_eq!(
-        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 200)?.admission,
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(200))?.admission,
         Admission::Reconcile(key.clone())
     );
     // The lookup proves the fix request never arrived: a new intent replaces it,
     // and the refused request does not consume a repair round.
     store.settle(&key, GateEffectState::NotApplied);
-    let retry = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 300)?;
+    let retry = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(300))?;
     assert_ne!(submitted(&retry)?, key);
     assert!(matches!(retry.decision.verdict, Verdict::FixRequest { .. }));
     assert_eq!(store.current[0].round, 0);
@@ -1494,7 +1522,8 @@ fn report_only_marker_is_satisfied_without_an_effect() -> TestResult {
     let mut store = FakeMarkers::default();
     let mut e = ready()?;
     e.hardware_complete = Some(false);
-    let first = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, 100)?;
+    let first =
+        gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, secs(100))?;
     assert!(matches!(first.decision.verdict, Verdict::HandOver { .. }));
     assert_eq!(first.admission, Admission::Satisfied);
     assert_eq!(store.current[0].effect, None);
@@ -1506,7 +1535,7 @@ fn report_only_marker_is_satisfied_without_an_effect() -> TestResult {
     // The same head is never handed over again, even many passes later.
     for now in [200, 3_600, 86_400] {
         let repeat =
-            gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, now)?;
+            gate::evaluate_and_record(&mut store, &e, grants(), GateMode::ReportOnly, secs(now))?;
         assert_eq!(repeat.decision.verdict, Verdict::Skip);
     }
     assert_eq!(store.current.len(), 1);
@@ -1521,9 +1550,9 @@ fn marker_race_admits_no_effect() -> TestResult {
     // Another writer records a report-only verdict between this pass's read
     // and its compare-and-supersede.
     let mut other = FakeMarkers::default();
-    gate::evaluate_and_record(&mut other, &e, grants(), GateMode::ReportOnly, 100)?;
+    gate::evaluate_and_record(&mut other, &e, grants(), GateMode::ReportOnly, secs(100))?;
     store.interloper = other.current.pop();
-    let lost = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, 100)?;
+    let lost = gate::evaluate_and_record(&mut store, &e, grants(), GateMode::Active, secs(100))?;
     assert_eq!(lost.admission, Admission::None);
     assert_eq!(lost.decision.verdict, Verdict::Skip);
     assert_eq!(
@@ -1531,5 +1560,578 @@ fn marker_race_admits_no_effect() -> TestResult {
         Err(RequestRefusal::EffectsDisabled)
     );
     assert_eq!(store.current[0].mode, GateMode::ReportOnly);
+    Ok(())
+}
+
+/// A temp-dir house store with one claimed gate task whose evidence subject
+/// is the ready PR's head and base. Only the store is real: no forge call is
+/// made, and effect outcomes are recorded by the test.
+struct Durable {
+    fixture: common::Fixture,
+    grants: HouseGrants,
+    delegated: Vec<Grant>,
+    backend: BackendDescriptor,
+    task: TaskId,
+    fence: Fence,
+}
+fn durable() -> TestResult<Durable> {
+    let repository = Repository::new("lemarier/kitchen")?;
+    let backend = BackendId::new("github")?;
+    let credential = CredentialId::new("gate-credential")?;
+    let delegated: Vec<Grant> = [Permission::Merge, Permission::PostComment]
+        .into_iter()
+        .map(|permission| {
+            Grant::repository(
+                permission,
+                repository.clone(),
+                backend.clone(),
+                credential.clone(),
+            )
+        })
+        .collect();
+    let grants = HouseGrants::new(common::house()?, delegated.clone());
+    let fixture = common::Fixture::new()?;
+    let (task, fence) = start_task(&fixture, &grants, &delegated, "gate-9")?;
+    Ok(Durable {
+        fixture,
+        grants,
+        delegated,
+        backend: BackendDescriptor {
+            backend,
+            house: common::house()?,
+            capabilities: CapabilitySet::supporting(Capability::ALL),
+        },
+        task,
+        fence,
+    })
+}
+/// Create, claim, and start a gate task at the ready subject.
+fn start_task(
+    fixture: &common::Fixture,
+    grants: &HouseGrants,
+    delegated: &[Grant],
+    id: &str,
+) -> TestResult<(TaskId, Fence)> {
+    let mut work = common::spec(id)?;
+    work.repository = Some(Repository::new("lemarier/kitchen")?);
+    work.authority = TaskAuthority::delegate(grants, delegated.to_vec())?;
+    let store = &fixture.store;
+    store.create_task(work, &common::creator()?, common::at(0))?;
+    let task = TaskId::new(id)?;
+    let fence = store
+        .claim(
+            &task,
+            &common::scheduled(id)?,
+            common::ttl(86_400)?,
+            common::at(0),
+        )?
+        .fence();
+    store.start_attempt(&task, fence, common::at(0))?;
+    record_subject(fixture, &task, fence, 'a')?;
+    Ok((task, fence))
+}
+/// Record check evidence at `head` against base `b`.
+fn record_subject(
+    fixture: &common::Fixture,
+    task: &TaskId,
+    fence: Fence,
+    head: char,
+) -> TestResult {
+    fixture.store.record_evidence(
+        task,
+        fence,
+        Evidence {
+            kind: EvidenceKind::Check,
+            verdict: EvidenceVerdict::Pass,
+            subject: EvidenceSubject {
+                head: commit(head)?,
+                base: Some(commit('b')?),
+            },
+            source: ExternalRef::new("https://example.invalid/checks/9")?,
+            observed_at: common::at(1),
+        },
+        common::at(1),
+    )?;
+    Ok(())
+}
+impl Durable {
+    fn add_task(&self, id: &str) -> TestResult<(TaskId, Fence)> {
+        start_task(&self.fixture, &self.grants, &self.delegated, id)
+    }
+    fn subject(&self, task: &TaskId, fence: Fence, head: char) -> TestResult {
+        record_subject(&self.fixture, task, fence, head)
+    }
+    fn gate<'a>(&'a self, store: &'a HouseStore) -> TestResult<HouseGateStore<'a>> {
+        Ok(HouseGateStore {
+            store,
+            task: self.task.clone(),
+            fence: self.fence,
+            claimant: common::scheduled("gate-9")?,
+            grants: &self.grants,
+            backend: &self.backend,
+            requester: ExternalRef::new("kitchen-gate")?,
+            posting_budget: PostingBudget::new(10)?,
+        })
+    }
+    /// Every effect in the house, across tasks.
+    fn effects(&self) -> TestResult<Vec<EffectRecord>> {
+        Ok(self
+            .fixture
+            .store
+            .tasks()?
+            .iter()
+            .flat_map(|task| task.effects().to_vec())
+            .collect())
+    }
+    fn settle(&self, key: &IdempotencyKey, outcome: EffectOutcome) -> TestResult {
+        let effect = self
+            .effects()?
+            .into_iter()
+            .find(|effect| effect.request().key() == key)
+            .ok_or("effect missing")?;
+        self.fixture.store.record_effect_outcome(
+            effect.request().task(),
+            self.fence,
+            effect.seq(),
+            outcome,
+            common::at(2),
+        )?;
+        Ok(())
+    }
+    fn marker(&self, head: char) -> TestResult<Option<kitchen::state::WorkflowMarker>> {
+        Ok(self.fixture.reopen()?.marker(&MarkerKey {
+            workflow: WorkflowId::new(GATE_WORKFLOW)?,
+            item: WorkItem::PullRequest {
+                repository: Repository::new("lemarier/kitchen")?,
+                number: NonZeroU64::new(9).ok_or("zero")?,
+            },
+            subject: MarkerSubject::Git(EvidenceSubject {
+                head: commit(head)?,
+                base: Some(commit('b')?),
+            }),
+        })?)
+    }
+}
+/// The ready evidence in the durable store's house.
+fn durable_evidence() -> TestResult<GateEvidence> {
+    let mut e = ready()?;
+    e.house = common::house()?;
+    Ok(e)
+}
+fn record_at(e: &GateEvidence, verdict: Verdict, mode: GateMode, at: u64) -> GateVerdictRecord {
+    GateVerdictRecord {
+        house: e.house.clone(),
+        repository: e.repository.clone(),
+        number: e.number,
+        head: e.head.clone(),
+        base: e.base.clone(),
+        verdict,
+        mode,
+        round: 0,
+        refused: 0,
+        recorded_at: secs(at),
+        effect: None,
+    }
+}
+fn schema() -> TestResult<kitchen::state::MarkerSchema> {
+    Ok("gate.verdict/1".parse()?)
+}
+#[test]
+fn durable_merge_intent_precedes_its_marker_and_survives_restart() -> TestResult {
+    let d = durable()?;
+    let e = durable_evidence()?;
+    let first = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &e,
+        grants(),
+        GateMode::Active,
+        secs(100),
+    )?;
+    let Admission::Submit(key) = first.admission.clone() else {
+        return Err(format!("expected a submission, got {:?}", first.admission).into());
+    };
+    let effects = d.effects()?;
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].request().key(), &key);
+    assert_eq!(effects[0].state(), &EffectState::Intended);
+    assert_eq!(effects[0].request().task(), &d.task);
+    assert_eq!(
+        effects[0].request().effect(),
+        &Effect::GitHub(GitHubEffect {
+            requester: ExternalRef::new("kitchen-gate")?,
+            mutation: gate::merge_request(&first, &e.head, &e.base, 0)?.mutation(),
+            posting_budget: PostingBudget::new(10)?,
+        })
+    );
+    let marker = d.marker('a')?.ok_or("marker missing")?;
+    assert!(
+        matches!(marker.fact(), MarkerFact::Workflow { schema, .. } if schema.to_string() == "gate.verdict/1")
+    );
+    let record: GateVerdictRecord = marker.fact().decode(&schema()?)?;
+    assert_eq!(record.verdict, Verdict::Merge);
+    assert_eq!(record.effect, Some(key.clone()));
+    assert_eq!(record.recorded_at, secs(100));
+    // Another process opens the store: the unresolved merge is reconciled,
+    // never submitted again.
+    let reopened = d.fixture.reopen()?;
+    let again = gate::evaluate_and_record(
+        &mut d.gate(&reopened)?,
+        &e,
+        grants(),
+        GateMode::Active,
+        secs(200),
+    )?;
+    assert_eq!(again.admission, Admission::Reconcile(key.clone()));
+    assert_eq!(
+        gate::merge_request(&again, &e.head, &e.base, 0),
+        Err(RequestRefusal::EffectsDisabled)
+    );
+    assert_eq!(d.effects()?.len(), 1);
+    // Once applied, the subject is settled.
+    d.settle(
+        &key,
+        EffectOutcome::Applied(Receipt::new(
+            ExternalRef::new("merge-9")?,
+            Vec::new(),
+            Vec::new(),
+        )?),
+    )?;
+    let done = gate::evaluate_and_record(
+        &mut d.gate(&reopened)?,
+        &e,
+        grants(),
+        GateMode::Active,
+        secs(300),
+    )?;
+    assert_eq!(done.decision.verdict, Verdict::Skip);
+    assert_eq!(done.admission, Admission::None);
+    assert_eq!(d.effects()?.len(), 1);
+    Ok(())
+}
+#[test]
+fn durable_crash_before_marker_reconciles_under_a_new_task() -> TestResult {
+    let d = durable()?;
+    let e = durable_evidence()?;
+    let decision = gate::evaluate(&e, grants(), GateHistory::default());
+    let record = record_at(&e, Verdict::Merge, GateMode::Active, 100);
+    let GateIntent::Submit(key) = d.gate(&d.fixture.store)?.begin_effect(&record, &decision)?
+    else {
+        return Err("expected a new intent".into());
+    };
+    // The process stops before the marker. A later run holds another task.
+    assert!(d.marker('a')?.is_none());
+    let (task, fence) = d.add_task("gate-9-rerun")?;
+    let reopened = d.fixture.reopen()?;
+    let mut rerun = HouseGateStore {
+        task,
+        fence,
+        ..d.gate(&reopened)?
+    };
+    let recovered =
+        gate::evaluate_and_record(&mut rerun, &e, grants(), GateMode::Active, secs(200))?;
+    assert_eq!(recovered.admission, Admission::Reconcile(key.clone()));
+    assert_eq!(d.effects()?.len(), 1);
+    let marker = d.marker('a')?.ok_or("marker missing")?;
+    assert_eq!(
+        marker
+            .fact()
+            .decode::<GateVerdictRecord>(&schema()?)?
+            .effect,
+        Some(key)
+    );
+    Ok(())
+}
+#[test]
+fn durable_refusals_supersede_the_marker_then_hand_over_once() -> TestResult {
+    let d = durable()?;
+    let e = durable_evidence()?;
+    let run = |at: u64| -> TestResult<RecordedDecision> {
+        Ok(gate::evaluate_and_record(
+            &mut d.gate(&d.fixture.store)?,
+            &e,
+            grants(),
+            GateMode::Active,
+            secs(at),
+        )?)
+    };
+    let first: RecordedDecision = run(100)?;
+    let Admission::Submit(k1) = first.admission else {
+        return Err("expected a first submission".into());
+    };
+    d.settle(&k1, EffectOutcome::NotApplied(NotAppliedReason::Rejected))?;
+    let second: RecordedDecision = run(200)?;
+    let Admission::Submit(k2) = second.admission else {
+        return Err("expected a resubmission".into());
+    };
+    assert_ne!(k1, k2);
+    let marker = d.marker('a')?.ok_or("marker missing")?;
+    assert_eq!(marker.history().len(), 1);
+    let current: GateVerdictRecord = marker.fact().decode(&schema()?)?;
+    assert_eq!((current.refused, current.effect), (1, Some(k2.clone())));
+    d.settle(&k2, EffectOutcome::NotApplied(NotAppliedReason::Rejected))?;
+    let third: RecordedDecision = run(300)?;
+    assert!(
+        matches!(&third.decision.verdict, Verdict::HandOver { gaps } if gaps.contains(&Gap::EffectRefused))
+    );
+    let Admission::Submit(k3) = third.admission.clone() else {
+        return Err("expected a handover submission".into());
+    };
+    let effects = d.effects()?;
+    assert_eq!(effects.len(), 3);
+    let handover = effects
+        .iter()
+        .find(|effect| effect.request().key() == &k3)
+        .ok_or("handover missing")?;
+    assert!(matches!(
+        handover.request().effect(),
+        Effect::GitHub(GitHubEffect { mutation, .. })
+            if matches!(&mutation.action, GitHubAction::PostComment { issue, body } if *issue == e.number && body.as_str().contains("EffectRefused"))
+    ));
+    let history = d.gate(&d.fixture.store)?.history(
+        &e.house,
+        &e.repository,
+        e.number,
+        &e.head,
+        &e.base,
+        secs(310),
+    )?;
+    assert_eq!(history.handovers, 1);
+    assert_eq!(history.last_handover, Some(secs(300)));
+    assert_eq!(
+        history.reported_subject,
+        Some((e.head.clone(), e.base.clone()))
+    );
+    d.settle(
+        &k3,
+        EffectOutcome::Applied(Receipt::new(
+            ExternalRef::new("comment-9")?,
+            Vec::new(),
+            Vec::new(),
+        )?),
+    )?;
+    assert_eq!(run(400)?.decision.verdict, Verdict::Skip);
+    assert_eq!(d.effects()?.len(), 3);
+    Ok(())
+}
+#[test]
+fn durable_report_only_records_a_marker_without_an_effect() -> TestResult {
+    let d = durable()?;
+    let e = durable_evidence()?;
+    let mut gate = d.gate(&d.fixture.store)?;
+    let first =
+        gate::evaluate_and_record(&mut gate, &e, grants(), GateMode::ReportOnly, secs(100))?;
+    assert_eq!(first.admission, Admission::Satisfied);
+    assert!(d.effects()?.is_empty());
+    let marker = d.marker('a')?.ok_or("marker missing")?;
+    assert_eq!(
+        marker
+            .fact()
+            .decode::<GateVerdictRecord>(&schema()?)?
+            .effect,
+        None
+    );
+    let repeat =
+        gate::evaluate_and_record(&mut gate, &e, grants(), GateMode::ReportOnly, secs(200))?;
+    assert_eq!(repeat.decision.verdict, Verdict::Skip);
+    assert!(d.effects()?.is_empty());
+    Ok(())
+}
+#[test]
+fn durable_store_refuses_other_subjects_houses_and_fix_delivery_before_writing() -> TestResult {
+    let d = durable()?;
+    let e = durable_evidence()?;
+    // The task's evidence moved to another head.
+    d.subject(&d.task, d.fence, 'c')?;
+    assert!(matches!(
+        gate::evaluate_and_record(
+            &mut d.gate(&d.fixture.store)?,
+            &e,
+            grants(),
+            GateMode::Active,
+            secs(100)
+        ),
+        Err(GateStoreError::SubjectNotRecorded)
+    ));
+    d.subject(&d.task, d.fence, 'a')?;
+    let mut foreign = e.clone();
+    foreign.house = HouseId::new("kitchen")?;
+    assert!(matches!(
+        gate::evaluate_and_record(
+            &mut d.gate(&d.fixture.store)?,
+            &foreign,
+            grants(),
+            GateMode::Active,
+            secs(100)
+        ),
+        Err(GateStoreError::Kitchen(kitchen::Error::Contract(
+            kitchen::contracts::ContractError::CrossHouse { .. }
+        )))
+    ));
+    let mut behind = e.clone();
+    behind.contains_base = Some(false);
+    assert!(matches!(
+        gate::evaluate_and_record(
+            &mut d.gate(&d.fixture.store)?,
+            &behind,
+            grants(),
+            GateMode::Active,
+            secs(100)
+        ),
+        Err(GateStoreError::NoHouseStoreEffect)
+    ));
+    assert!(d.effects()?.is_empty());
+    assert!(d.marker('a')?.is_none());
+    Ok(())
+}
+#[test]
+fn durable_marker_writes_compare_and_supersede() -> TestResult {
+    let d = durable()?;
+    let e = durable_evidence()?;
+    let mut gate = d.gate(&d.fixture.store)?;
+    let merge = record_at(&e, Verdict::Merge, GateMode::ReportOnly, 100);
+    let handover = record_at(
+        &e,
+        Verdict::HandOver {
+            gaps: vec![Gap::Checks],
+        },
+        GateMode::ReportOnly,
+        200,
+    );
+    let later = record_at(&e, Verdict::Skip, GateMode::ReportOnly, 300);
+    assert!(gate.record(None, merge.clone())?);
+    assert!(
+        gate.record(None, merge.clone())?,
+        "repeating the same fact is a no-op"
+    );
+    assert!(
+        !gate.record(None, handover.clone())?,
+        "a different first fact lost the race"
+    );
+    assert!(
+        !gate.record(Some(&handover), later)?,
+        "a stale expectation lost the race"
+    );
+    assert!(gate.record(Some(&merge), handover.clone())?);
+    assert_eq!(
+        gate.current(&e.house, &e.repository, e.number, &e.head, &e.base)?,
+        Some(handover)
+    );
+    assert_eq!(d.marker('a')?.ok_or("marker missing")?.history().len(), 1);
+    Ok(())
+}
+#[test]
+fn durable_history_counts_records_and_fails_closed() -> TestResult {
+    let d = durable()?;
+    let mut e = durable_evidence()?;
+    let mut gate = d.gate(&d.fixture.store)?;
+    e.head = commit('c')?;
+    let fix = record_at(
+        &e,
+        Verdict::FixRequest {
+            gaps: vec![Gap::Checks],
+        },
+        GateMode::ReportOnly,
+        100,
+    );
+    assert!(gate.record(None, fix)?);
+    let at_fix = gate.history(
+        &e.house,
+        &e.repository,
+        e.number,
+        &e.head,
+        &e.base,
+        secs(160),
+    )?;
+    assert_eq!(at_fix.fix_rounds, 1);
+    assert!(at_fix.requested_this_head);
+    assert_eq!(at_fix.request_age, Some(Duration::from_secs(60)));
+    assert_eq!(
+        at_fix.reported_subject,
+        Some((e.head.clone(), e.base.clone()))
+    );
+    let elsewhere = gate.history(
+        &e.house,
+        &e.repository,
+        e.number,
+        &commit('a')?,
+        &e.base,
+        secs(160),
+    )?;
+    assert_eq!(
+        (elsewhere.fix_rounds, elsewhere.requested_this_head),
+        (1, false)
+    );
+    // A marker naming an effect the house does not hold stops the gate.
+    e.head = commit('d')?;
+    let mut unknown = record_at(&e, Verdict::Merge, GateMode::Active, 100);
+    unknown.effect = Some(IdempotencyKey::from_ref(ExternalRef::new("fake:missing")?));
+    assert!(gate.record(None, unknown.clone())?);
+    assert!(matches!(
+        gate.history(
+            &e.house,
+            &e.repository,
+            e.number,
+            &e.head,
+            &e.base,
+            secs(200)
+        ),
+        Err(GateStoreError::UnknownEffect)
+    ));
+    assert!(matches!(
+        gate.effect_state(unknown.effect.as_ref().ok_or("key")?),
+        Err(GateStoreError::UnknownEffect)
+    ));
+    // Truncated marker history on another PR cannot undercount its rounds.
+    let mut other = durable_evidence()?;
+    other.number = IssueNumber::new(10)?;
+    let mut previous = record_at(&other, Verdict::Skip, GateMode::ReportOnly, 0);
+    assert!(gate.record(None, previous.clone())?);
+    for at in 1..=17 {
+        let next = record_at(&other, Verdict::Skip, GateMode::ReportOnly, at);
+        assert!(gate.record(Some(&previous), next.clone())?);
+        previous = next;
+    }
+    assert!(matches!(
+        gate.history(
+            &other.house,
+            &other.repository,
+            other.number,
+            &other.head,
+            &other.base,
+            secs(20)
+        ),
+        Err(GateStoreError::HistoryIncomplete)
+    ));
+    // Another schema under the gate's key is refused, not reinterpreted.
+    other.head = commit('e')?;
+    let key = MarkerKey {
+        workflow: WorkflowId::new(GATE_WORKFLOW)?,
+        item: WorkItem::PullRequest {
+            repository: other.repository.clone(),
+            number: NonZeroU64::new(10).ok_or("zero")?,
+        },
+        subject: MarkerSubject::Git(EvidenceSubject {
+            head: other.head.clone(),
+            base: Some(other.base.clone()),
+        }),
+    };
+    d.fixture.store.record_marker(
+        key,
+        MarkerFact::workflow("gate.verdict/2".parse()?, &"future")?,
+        &common::scheduled("gate-9")?,
+        common::at(1),
+    )?;
+    assert!(matches!(
+        gate.current(
+            &other.house,
+            &other.repository,
+            other.number,
+            &other.head,
+            &other.base
+        ),
+        Err(GateStoreError::Kitchen(kitchen::Error::State(
+            StateError::MarkerSchemaMismatch { .. }
+        )))
+    ));
     Ok(())
 }

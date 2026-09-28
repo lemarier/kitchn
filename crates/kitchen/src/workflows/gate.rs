@@ -1,12 +1,24 @@
 //! Exact-revision merge gate policy. All observations are supplied by a scoped reader;
 //! this module performs no I/O and never runs code from a proposed change.
+use std::time::Duration;
+
 use crate::{
     BackendId, CredentialId, HouseId,
     contracts::{
-        CommitId, ExternalRef, Grant, GrantScope, HouseGrants, IdempotencyKey, IssueNumber,
-        Permission, Repository, Text,
+        BranchName, CommitId, ExternalRef, Grant, GrantScope, HouseGrants, IdempotencyKey,
+        IssueNumber, Permission, Repository, Text, Timestamp,
     },
 };
+
+mod store;
+pub use store::{GATE_WORKFLOW, GateStoreError, HouseGateStore};
+
+/// A new head waits this long before the gate judges it.
+pub const SETTLE_TIME: Duration = Duration::from_secs(30 * 60);
+/// Pending checks, pending reviews, or a conflict hand over after this long.
+pub const STALL_TIME: Duration = Duration::from_secs(24 * 60 * 60);
+/// A fix request without a new head hands over after this long.
+pub const FIX_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Evidence for one PR, collected completely at a single head and base.
 #[derive(Debug, Clone)]
@@ -23,8 +35,10 @@ pub struct GateEvidence {
     pub head_branch: Option<String>,
     /// Exact base tip.
     pub base: CommitId,
-    /// Seconds since the head was pushed.
-    pub head_age_secs: Option<u64>,
+    /// Validated base branch the merge must still target; absent if unknown.
+    pub base_branch: Option<BranchName>,
+    /// Time since the head was committed.
+    pub head_age: Option<Duration>,
     /// PR is currently open.
     pub open: Option<bool>,
     /// PR is a draft.
@@ -90,7 +104,7 @@ pub struct GateReopenEvent {
     /// Exact base when the event was observed.
     pub base: CommitId,
     /// Provider event time.
-    pub at_unix_secs: u64,
+    pub at: Timestamp,
     /// Named actor whose write permission was checked.
     pub actor: String,
 }
@@ -330,8 +344,8 @@ pub struct GateHistory {
     pub fix_rounds: u8,
     /// Whether this head already received a fix request.
     pub requested_this_head: bool,
-    /// Seconds since that request, if any.
-    pub request_age_secs: Option<u64>,
+    /// Time since that request, if any.
+    pub request_age: Option<Duration>,
     /// Handovers already posted for the PR.
     pub handovers: u8,
     /// Same-head verdict marker, including report-only verdicts.
@@ -339,7 +353,50 @@ pub struct GateHistory {
     /// A person removed the handover label or answered a head-bound Ask.
     pub explicit_reopen: bool,
     /// Most recent handover time for this PR and exact subject.
-    pub last_handover_unix_secs: Option<u64>,
+    pub last_handover: Option<Timestamp>,
+}
+impl GateHistory {
+    /// Summarize one PR's counted verdict records: every record except those
+    /// whose effect the destination refused. Each item pairs a record with
+    /// whether it is the current record of its subject. A marker store
+    /// implementation filters to the PR and counts records itself; this
+    /// function applies the shared accounting rules.
+    #[must_use]
+    pub fn from_records<'a>(
+        records: impl IntoIterator<Item = (&'a GateVerdictRecord, bool)>,
+        head: &CommitId,
+        base: &CommitId,
+        now: Timestamp,
+    ) -> Self {
+        let mut history = Self::default();
+        for (record, current) in records {
+            let at_subject = &record.head == head && &record.base == base;
+            match record.verdict {
+                Verdict::FixRequest { .. } => {
+                    history.fix_rounds = history.fix_rounds.saturating_add(1);
+                    if current && at_subject {
+                        history.requested_this_head = true;
+                        history.request_age = Some(now.saturating_since(record.recorded_at));
+                    }
+                }
+                Verdict::HandOver { .. } => {
+                    history.handovers = history.handovers.saturating_add(1);
+                    if at_subject {
+                        history.last_handover = history.last_handover.max(Some(record.recorded_at));
+                    }
+                }
+                Verdict::Merge | Verdict::Skip => (),
+            }
+            if current
+                && at_subject
+                && (record.mode == GateMode::ReportOnly
+                    || matches!(record.verdict, Verdict::HandOver { .. } | Verdict::Merge))
+            {
+                history.reported_subject = Some((head.clone(), base.clone()));
+            }
+        }
+        history
+    }
 }
 /// The distinct failed conditions. Consumers can render these without parsing prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -420,6 +477,8 @@ pub struct GateDecision {
     pub head_branch: Option<String>,
     /// Pinned base.
     pub base: CommitId,
+    /// Base branch the merge must still target.
+    pub base_branch: Option<BranchName>,
     /// Chosen outcome.
     pub verdict: Verdict,
     /// Verified findings carried to a worker or handover.
@@ -436,6 +495,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
         || e.draft != Some(false)
         || e.same_repository != Some(true)
         || e.targets_default != Some(true)
+        || e.base_branch.is_none()
         || e.author_allowed != Some(true)
     {
         gaps.push(Gap::Eligibility);
@@ -443,7 +503,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     if e.head_branch.is_none() {
         gaps.push(Gap::BranchTarget);
     }
-    if e.head_age_secs.is_none() {
+    if e.head_age.is_none() {
         gaps.push(Gap::HeadAge);
     }
     let fixable_behind = e.contains_base == Some(false)
@@ -515,17 +575,17 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     }
     gaps.sort_by_key(|gap| *gap as u8);
     gaps.dedup();
-    let age = e.head_age_secs.unwrap_or(86400);
+    let age = e.head_age.unwrap_or(STALL_TIME);
     let verdict = if e.open == Some(false)
         || e.draft == Some(true)
         || history.handovers >= 2
         || (history.reported_subject.as_ref() == Some(&(e.head.clone(), e.base.clone()))
             && !history.explicit_reopen)
-        || age < 1800
+        || age < SETTLE_TIME
         || e.writer_working
-        || (e.checks == Checks::Pending && age < 86400)
-        || (gaps.contains(&Gap::ReviewerPending) && age < 86400)
-        || (e.merge_clean == Some(false) && !fixable_behind && age < 86400)
+        || (e.checks == Checks::Pending && age < STALL_TIME)
+        || (gaps.contains(&Gap::ReviewerPending) && age < STALL_TIME)
+        || (e.merge_clean == Some(false) && !fixable_behind && age < STALL_TIME)
     {
         Verdict::Skip
     } else if gaps.is_empty() {
@@ -536,7 +596,8 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
                 gaps: vec![Gap::MergeGrant],
             }
         }
-    } else if age >= 86400 && (e.checks == Checks::Pending || gaps.contains(&Gap::ReviewerPending))
+    } else if age >= STALL_TIME
+        && (e.checks == Checks::Pending || gaps.contains(&Gap::ReviewerPending))
     {
         Verdict::HandOver { gaps }
     } else if gaps.iter().all(|gap| {
@@ -558,7 +619,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     {
         Verdict::FixRequest { gaps }
     } else if history.requested_this_head
-        && (e.writer_working || history.request_age_secs.is_some_and(|age| age < 7200))
+        && (e.writer_working || history.request_age.is_some_and(|age| age < FIX_TIMEOUT))
     {
         Verdict::Skip
     } else {
@@ -574,6 +635,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
         head: e.head.clone(),
         head_branch: e.head_branch.clone(),
         base: e.base.clone(),
+        base_branch: e.base_branch.clone(),
         verdict,
         verified_findings: e.verified_findings.clone(),
         disproved_findings: e.disproved_findings.clone(),
@@ -614,22 +676,43 @@ pub struct MergeRequest {
     pub match_head: CommitId,
     /// Base tip re-read just before submission.
     pub checked_base: CommitId,
+    /// Base branch the PR must still target.
+    pub base_branch: BranchName,
     /// Persisted intent key; the executor submits and records under it.
     pub key: IdempotencyKey,
 }
 impl MergeRequest {
     /// Build the typed #7 effect; the state store must persist and authorize it
-    /// before execution. The provider checks `expected_head` and uses squash.
+    /// before execution. The store admits it only while the task's evidence
+    /// subject is this head and base; the provider checks the head and base
+    /// branch and uses squash.
     #[must_use]
     pub fn mutation(&self) -> crate::contracts::GitHubMutation {
-        crate::contracts::GitHubMutation {
-            repository: self.repository.clone(),
-            action: crate::contracts::GitHubAction::MergePullRequest {
-                number: self.number,
-                expected_head: self.match_head.clone(),
-                method: crate::contracts::MergeMethod::Squash,
-            },
-        }
+        merge_mutation(
+            &self.repository,
+            self.number,
+            &self.match_head,
+            &self.checked_base,
+            &self.base_branch,
+        )
+    }
+}
+fn merge_mutation(
+    repository: &Repository,
+    number: IssueNumber,
+    head: &CommitId,
+    base: &CommitId,
+    base_branch: &BranchName,
+) -> crate::contracts::GitHubMutation {
+    crate::contracts::GitHubMutation {
+        repository: repository.clone(),
+        action: crate::contracts::GitHubAction::MergePullRequest {
+            number,
+            expected_head: head.clone(),
+            expected_base: base_branch.clone(),
+            expected_base_commit: Some(base.clone()),
+            method: crate::contracts::MergeMethod::Squash,
+        },
     }
 }
 /// Why an effect request could not be prepared.
@@ -670,12 +753,16 @@ pub fn merge_request(
     if merges_this_run >= 3 {
         return Err(RequestRefusal::MergeLimit);
     }
+    let Some(base_branch) = &decision.base_branch else {
+        return Err(RequestRefusal::WrongVerdict);
+    };
     Ok(MergeRequest {
         house: decision.house.clone(),
         repository: decision.repository.clone(),
         number: decision.number,
         match_head: decision.head.clone(),
         checked_base: decision.base.clone(),
+        base_branch: base_branch.clone(),
         key: key.clone(),
     })
 }
@@ -698,7 +785,14 @@ pub fn merge_request_from_forge<T: crate::integrations::github::GitHubReadTransp
         Observation::Unknown => return Err(IntegrationError::Unknown),
         Observation::Unavailable(error) => return Err(error),
     };
-    if pr.state != crate::integrations::github::IssueState::Open || pr.draft || pr.merged {
+    if pr.state != crate::integrations::github::IssueState::Open
+        || pr.draft
+        || pr.merged
+        || decision
+            .base_branch
+            .as_ref()
+            .is_none_or(|branch| branch.as_str() != pr.base.name)
+    {
         return Err(IntegrationError::StaleDecision);
     }
     merge_request(recorded, &pr.head.sha, &pr.base.sha, merges_this_run)
@@ -870,48 +964,61 @@ impl HandOverRequest {
         &self,
     ) -> Result<Vec<crate::contracts::GitHubMutation>, crate::contracts::ContractError> {
         use crate::contracts::{GitHubAction, GitHubMutation};
-        let mut body = format!(
-            "Gate handover for head {} against base {}.\nFailed conditions: {:?}.",
-            self.head, self.base, self.gaps
-        );
-        for finding in &self.findings {
-            use std::fmt::Write as _;
-            let _ = write!(
-                body,
-                "\nFinding: {} — {}",
-                finding.source,
-                finding.reason.as_str()
-            );
-        }
-        use std::fmt::Write as _;
+        let label = GitHubMutation {
+            repository: self.repository.clone(),
+            action: GitHubAction::SetLabel {
+                issue: self.number,
+                label: "needs-human-review".into(),
+                present: true,
+            },
+        };
+        label.validate()?;
+        let comment = handover_comment(
+            &self.repository,
+            self.number,
+            &self.head,
+            &self.base,
+            &self.gaps,
+            &self.findings,
+        )?;
+        Ok(vec![label, comment])
+    }
+}
+/// The handover comment, the primary effect of a handover verdict. The body
+/// is derived only from the recorded decision, so a retry after a crash
+/// persists the same payload.
+fn handover_comment(
+    repository: &Repository,
+    number: IssueNumber,
+    head: &CommitId,
+    base: &CommitId,
+    gaps: &[Gap],
+    findings: &[VerifiedFinding],
+) -> Result<crate::contracts::GitHubMutation, crate::contracts::ContractError> {
+    use std::fmt::Write as _;
+    let mut body =
+        format!("Gate handover for head {head} against base {base}.\nFailed conditions: {gaps:?}.");
+    for finding in findings {
         let _ = write!(
             body,
-            "\n<!-- kitchen-gate handover head={} base={} -->",
-            self.head, self.base
+            "\nFinding: {} — {}",
+            finding.source,
+            finding.reason.as_str()
         );
-        let text = Text::new(&body)?;
-        let mutations = vec![
-            GitHubMutation {
-                repository: self.repository.clone(),
-                action: GitHubAction::SetLabel {
-                    issue: self.number,
-                    label: "needs-human-review".into(),
-                    present: true,
-                },
-            },
-            GitHubMutation {
-                repository: self.repository.clone(),
-                action: GitHubAction::PostComment {
-                    issue: self.number,
-                    body: text,
-                },
-            },
-        ];
-        for mutation in &mutations {
-            mutation.validate()?;
-        }
-        Ok(mutations)
     }
+    let _ = write!(
+        body,
+        "\n<!-- kitchen-gate handover head={head} base={base} -->"
+    );
+    let mutation = crate::contracts::GitHubMutation {
+        repository: repository.clone(),
+        action: crate::contracts::GitHubAction::PostComment {
+            issue: number,
+            body: Text::new(&body)?,
+        },
+    };
+    mutation.validate()?;
+    Ok(mutation)
 }
 
 /// Trial mode records a verdict while forbidding every external effect.
@@ -953,8 +1060,8 @@ pub struct GateVerdictRecord {
     pub round: u8,
     /// Earlier submissions at this subject that the destination refused.
     pub refused: u8,
-    /// Wall-clock second when the decision was recorded, for the fix timeout.
-    pub recorded_unix_secs: u64,
+    /// When the decision was recorded, for the fix timeout.
+    pub recorded_at: Timestamp,
     /// Idempotency key of the persisted effect intent this verdict drives.
     /// Absent for report-only verdicts, which are satisfied by the marker.
     pub effect: Option<IdempotencyKey>,
@@ -1012,7 +1119,7 @@ pub trait GateMarkerStore {
         number: IssueNumber,
         head: &CommitId,
         base: &CommitId,
-        now_unix_secs: u64,
+        now: Timestamp,
     ) -> Result<GateHistory, Self::Error>;
     /// The current record for this exact subject.
     ///
@@ -1121,12 +1228,12 @@ impl GateRun {
         evidence: &GateEvidence,
         grants: GateGrants,
         mode: GateMode,
-        now_unix_secs: u64,
+        now: Timestamp,
     ) -> Result<Option<RecordedDecision>, S::Error> {
         if self.evaluated >= 3 {
             return Ok(None);
         }
-        let decision = evaluate_and_record(store, evidence, grants, mode, now_unix_secs)?;
+        let decision = evaluate_and_record(store, evidence, grants, mode, now)?;
         self.evaluated += 1;
         Ok(Some(decision))
     }
@@ -1205,7 +1312,7 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
     evidence: &GateEvidence,
     grants: GateGrants,
     mode: GateMode,
-    now_unix_secs: u64,
+    now: Timestamp,
 ) -> Result<RecordedDecision, S::Error> {
     let (house, repository, number) = (&evidence.house, &evidence.repository, evidence.number);
     let current = store.current(house, repository, number, &evidence.head, &evidence.base)?;
@@ -1235,14 +1342,12 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
         number,
         &evidence.head,
         &evidence.base,
-        now_unix_secs,
+        now,
     )?;
     history.explicit_reopen = evidence.reopen_event.as_ref().is_some_and(|event| {
         event.head == evidence.head
             && event.base == evidence.base
-            && history
-                .last_handover_unix_secs
-                .is_some_and(|last| event.at_unix_secs > last)
+            && history.last_handover.is_some_and(|last| event.at > last)
     });
     let (round, fix_round) = (history.handovers, history.fix_rounds);
     let mut decision = evaluate(evidence, grants, history);
@@ -1288,7 +1393,7 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
             round
         },
         refused,
-        recorded_unix_secs: now_unix_secs,
+        recorded_at: now,
         effect: None,
     };
     if current
@@ -1412,8 +1517,8 @@ impl GateEvidence {
 }
 
 /// Collect forge facts through #7's scoped read side. Missing secondary observations
-/// remain unknown and cannot produce a merge decision. The caller supplies a Unix
-/// seconds clock value and separately attested non-forge evidence.
+/// remain unknown and cannot produce a merge decision. The caller supplies the
+/// current time and separately attested non-forge evidence.
 ///
 /// # Errors
 /// Returns an integration error if the PR itself cannot be identified.
@@ -1424,7 +1529,7 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
     number: IssueNumber,
     policy: &ForgeGatePolicy,
     supplement: GateSupplement,
-    now_unix_secs: u64,
+    now: Timestamp,
 ) -> Result<GateEvidence, crate::integrations::github::IntegrationError> {
     use crate::integrations::github::{HeadLocation, MergeStatusValue, Observation};
     let pr = match client.pull_request(house, repository, number) {
@@ -1456,13 +1561,13 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
                         return None;
                     }
                     Some((
-                        parse_github_utc(event.created_at.as_deref()?)?,
+                        parse_provider_time(event.created_at.as_deref()?)?,
                         event.actor?.login,
                     ))
                 })
                 .max_by_key(|(at, _)| *at)
         })
-        .and_then(|(at_unix_secs, actor)| {
+        .and_then(|(at, actor)| {
             use crate::integrations::github::RepositoryPermission;
             let permission = known(client.permission(house, repository, &actor))?;
             if !matches!(
@@ -1477,14 +1582,16 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
             Some(GateReopenEvent {
                 head: head.clone(),
                 base: base.clone(),
-                at_unix_secs,
+                at,
                 actor,
             })
         });
-    let head_age_secs = commit
+    // A commit dated in the future has no known age.
+    let head_age = commit
         .as_ref()
-        .and_then(|commit| parse_github_utc(&commit.commit.committer.date))
-        .and_then(|committed| now_unix_secs.checked_sub(committed));
+        .map(|commit| commit.commit.committer.date)
+        .filter(|committed| *committed <= now)
+        .map(|committed| now.saturating_since(committed));
     let reviewers = expected_reviews(&policy.expected_reviewers, reviews.as_deref(), &head);
     let no_change_request = reviews.as_deref().and_then(|reviews| {
         use crate::integrations::github::ReviewState;
@@ -1533,7 +1640,8 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
         head,
         head_branch: safe_branch(&pr.head.name),
         base,
-        head_age_secs,
+        base_branch: BranchName::new(&pr.base.name).ok(),
+        head_age,
         open: Some(pr.state == crate::integrations::github::IssueState::Open && !pr.merged),
         draft: Some(pr.draft),
         same_repository: match pr.head_location(repository) {
@@ -1728,56 +1836,17 @@ fn review_unavailable(body: Option<&str>) -> bool {
     .iter()
     .any(|phrase| lower.contains(phrase))
 }
-fn parse_github_utc(value: &str) -> Option<u64> {
-    let b = value.as_bytes();
-    if b.len() != 20
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-        || b[19] != b'Z'
-    {
-        return None;
-    }
-    let part = |start: usize, end: usize| -> Option<u64> {
-        b[start..end].iter().try_fold(0_u64, |acc, digit| {
-            if digit.is_ascii_digit() {
-                Some(acc * 10 + u64::from(digit - b'0'))
-            } else {
-                None
-            }
-        })
-    };
-    let year = part(0, 4)?;
-    let month = part(5, 7)?;
-    let day = part(8, 10)?;
-    let hour = part(11, 13)?;
-    let minute = part(14, 16)?;
-    let second = part(17, 19)?;
-    if !(1970..=9999).contains(&year)
-        || !(1..=12).contains(&month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return None;
-    }
-    let leap = |y: u64| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
-    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let index = usize::try_from(month - 1).ok()?;
-    let max_day = month_days[index] + u64::from(index == 1 && leap(year));
-    if day == 0 || day > max_day {
-        return None;
-    }
-    let years = (1970..year).map(|y| 365 + u64::from(leap(y))).sum::<u64>();
-    let months = month_days[..index].iter().sum::<u64>() + u64::from(month > 2 && leap(year));
-    Some(((years + months + day - 1) * 24 + hour) * 3600 + minute * 60 + second)
+/// Parse a provider RFC 3339 time; instants before the Unix epoch are unknown.
+fn parse_provider_time(value: &str) -> Option<Timestamp> {
+    let date =
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()?;
+    let millis = u64::try_from(date.unix_timestamp_nanos() / 1_000_000).ok()?;
+    Some(Timestamp::from_unix_millis(millis))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_github_utc, review_unavailable};
+    use super::{Timestamp, parse_provider_time, review_unavailable};
     #[test]
     fn quota_and_skip_wording_is_unavailable_but_findings_are_not() {
         assert!(review_unavailable(Some(
@@ -1793,14 +1862,17 @@ mod tests {
         assert!(!review_unavailable(None));
     }
     #[test]
-    fn parses_github_utc_and_refuses_invalid_calendar_dates() {
-        assert_eq!(parse_github_utc("1970-01-01T00:00:00Z"), Some(0));
+    fn provider_time_is_rfc3339_after_the_epoch() {
         assert_eq!(
-            parse_github_utc("2026-09-28T14:00:00Z"),
-            Some(1_790_604_000)
+            parse_provider_time("1970-01-01T00:00:00Z"),
+            Some(Timestamp::from_unix_millis(0))
         );
-        assert!(parse_github_utc("2025-02-29T00:00:00Z").is_none());
-        assert!(parse_github_utc("2024-02-29T23:59:59Z").is_some());
-        assert!(parse_github_utc("2026-09-28T14:00:00+02:00").is_none());
+        assert_eq!(
+            parse_provider_time("2026-09-28T16:00:00+02:00"),
+            Some(Timestamp::from_unix_millis(1_790_604_000_000))
+        );
+        assert!(parse_provider_time("2025-02-29T00:00:00Z").is_none());
+        assert!(parse_provider_time("1969-12-31T23:59:59Z").is_none());
+        assert!(parse_provider_time("yesterday").is_none());
     }
 }

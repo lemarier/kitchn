@@ -1095,3 +1095,91 @@ fn a_directory_that_is_not_a_repository_is_unreadable() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn an_unresolved_release_blocks_any_new_release_of_that_resource() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    harness.preview()?;
+    harness.clock.advance(60);
+    // The worker's release times out and its outcome cannot be looked up.
+    harness
+        .backend
+        .fake
+        .inject(ExecuteFault::TimeoutWithoutApplying);
+    harness.backend.fake.fail_lookups(usize::MAX);
+    let first = harness.apply()?;
+    assert_eq!(outcome(&first, &owned.worker)?, ReleaseOutcome::Uncertain);
+    let calls = harness.backend.fake.execute_calls();
+
+    // The preview expires and is refreshed, which plans a new release task.
+    harness.clock.advance(PREVIEW_AGE.as_secs() + 1);
+    let refreshed = harness.apply()?;
+    assert_eq!(
+        outcome(&refreshed, &owned.worker)?,
+        ReleaseOutcome::StalePreview
+    );
+    harness.clock.advance(60);
+    let blocked = harness.apply()?;
+    let result = blocked
+        .results
+        .iter()
+        .find(|result| result.resource == owned.worker)
+        .ok_or("worker not planned")?;
+    assert_eq!(result.outcome, ReleaseOutcome::Uncertain);
+    assert_eq!(
+        harness.backend.fake.execute_calls(),
+        calls,
+        "no second release while the first is unresolved"
+    );
+
+    // Once the backend proves the first release never applied, the old task
+    // settles and the new one releases.
+    harness.backend.fake.fail_lookups(0);
+    harness.clock.advance(60);
+    let resolved = harness.apply()?;
+    let old = resolved
+        .recovered
+        .iter()
+        .find(|result| result.resource == owned.worker)
+        .ok_or("old task not recovered")?;
+    assert_eq!(
+        old.outcome,
+        ReleaseOutcome::NotApplied(kitchen::contracts::NotAppliedReason::ConfirmedAbsent)
+    );
+    let new = resolved
+        .results
+        .iter()
+        .find(|result| result.resource == owned.worker)
+        .ok_or("new task not driven")?;
+    assert_eq!(new.outcome, ReleaseOutcome::Released);
+    assert_ne!(old.task, new.task);
+    Ok(())
+}
+
+#[test]
+fn a_release_proven_absent_is_retried_within_its_task() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    harness.preview()?;
+    harness.clock.advance(60);
+    harness
+        .backend
+        .fake
+        .inject(ExecuteFault::TimeoutWithoutApplying);
+    let first = harness.apply()?;
+    assert_eq!(outcome(&first, &owned.worker)?, ReleaseOutcome::Uncertain);
+    harness.clock.advance(60);
+    // The lookup proves absence, so the same task revalidates and releases.
+    let second = harness.apply()?;
+    let result = second
+        .results
+        .iter()
+        .find(|result| result.resource == owned.worker)
+        .ok_or("worker")?;
+    assert_eq!(result.outcome, ReleaseOutcome::Released);
+    let task = harness.store().task(result.task.as_ref().ok_or("task")?)?;
+    assert_eq!(task.effects().len(), 2, "one absent, one applied");
+    assert_eq!(task.attempts().len(), 2);
+    Ok(())
+}

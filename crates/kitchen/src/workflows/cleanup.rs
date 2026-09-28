@@ -145,6 +145,7 @@ pub struct Inspector<'a> {
 
 /// A reason a resource is retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Exclusion {
     /// The resource belongs to another backend namespace.
     ForeignBackend,
@@ -514,9 +515,10 @@ impl ConsentSource for NoConsent {
 
 /// What happened to one resource in [`apply`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[non_exhaustive]
 #[serde(tag = "type", content = "detail", rename_all = "kebab-case")]
 pub enum ReleaseOutcome {
-    /// The backend released it.
+    /// The backend released it in this call.
     Released,
     /// Eligible, but no earlier preview covers this exact evidence; this
     /// call recorded one.
@@ -526,15 +528,17 @@ pub enum ReleaseOutcome {
     StalePreview,
     /// The evidence changed between the preview and the effect.
     Changed,
-    /// Another run holds the release task.
+    /// Another run holds the release task, or an earlier release of this
+    /// resource that another run holds.
     HeldElsewhere,
     /// An interactive run had no consent for this release.
     ConsentMissing,
     /// The backend did not apply the release.
     NotApplied(NotAppliedReason),
-    /// The outcome is unknown; the next run reconciles it.
+    /// The outcome is unknown, here or in an earlier release of this
+    /// resource; the next run reconciles it before any new release.
     Uncertain,
-    /// The release task had already settled.
+    /// The release task had already settled; nothing was repeated.
     AlreadySettled(Settlement),
     /// Over this call's release bound.
     Deferred,
@@ -611,7 +615,41 @@ pub fn apply(
         .filter(|entry| entry.eligible())
         .collect();
 
+    // Decide what each eligible resource needs before acting on anything.
+    let mut planned = Vec::with_capacity(eligible.len());
+    for entry in eligible {
+        let key = marker_key(entry)?;
+        let now = clock.now();
+        let plan = match inspector.store.marker(&key)? {
+            None => {
+                record_preview(inspector.store, entry, None, preview.trigger, claimant, now)?;
+                Plan::Report(ReleaseOutcome::NotPreviewed)
+            }
+            Some(marker) => {
+                // Only the dishwasher's own preview fact authorizes a release.
+                marker.fact().decode::<PreviewFact>(&schema()?)?;
+                if now.saturating_since(marker.recorded_at()) > options.max_preview_age {
+                    record_preview(
+                        inspector.store,
+                        entry,
+                        Some(&marker),
+                        preview.trigger,
+                        claimant,
+                        now,
+                    )?;
+                    Plan::Report(ReleaseOutcome::StalePreview)
+                } else {
+                    Plan::Drive(release_task_id(&entry.observation, marker.recorded_at())?)
+                }
+            }
+        };
+        planned.push((entry, plan));
+    }
+
+    // Reconcile every other unfinished release first. A resource whose
+    // earlier release is still unresolved gets no second release.
     let mut recovered = Vec::new();
+    let mut blocked: BTreeMap<ResourceRef, ReleaseOutcome> = BTreeMap::new();
     for task in inspector.store.tasks()? {
         if !is_release_task(&task) || matches!(task.state(), TaskState::Settled { .. }) {
             continue;
@@ -619,63 +657,47 @@ pub fn apply(
         let Some(resource) = task.spec().resources.iter().next() else {
             continue;
         };
-        if eligible.iter().any(|entry| &entry.resource == resource) {
-            // Driven below with fresh evidence.
+        let id = &task.spec().id;
+        if planned
+            .iter()
+            .any(|(_, plan)| matches!(plan, Plan::Drive(planned) if planned == id))
+        {
             continue;
         }
-        let outcome = run.drive(task.spec().id.clone(), resource, None)?;
+        let outcome = run.drive(id.clone(), resource, None)?;
+        if matches!(
+            outcome,
+            ReleaseOutcome::Uncertain | ReleaseOutcome::HeldElsewhere
+        ) {
+            blocked.insert(resource.clone(), outcome);
+        }
         recovered.push(ReleaseResult {
             resource: resource.clone(),
-            task: Some(task.spec().id.clone()),
+            task: Some(id.clone()),
             outcome,
         });
     }
 
-    let mut results = Vec::with_capacity(eligible.len());
+    let mut results = Vec::with_capacity(planned.len());
     let mut attempted = 0_usize;
-    for entry in eligible {
-        let key = marker_key(entry)?;
-        let marker = inspector.store.marker(&key)?;
-        let now = clock.now();
-        let Some(marker) = marker else {
-            record_preview(inspector.store, entry, None, preview.trigger, claimant, now)?;
-            results.push(ReleaseResult {
-                resource: entry.resource.clone(),
-                task: None,
-                outcome: ReleaseOutcome::NotPreviewed,
-            });
-            continue;
+    for (entry, plan) in planned {
+        let (task, outcome) = match plan {
+            Plan::Report(outcome) => (None, outcome),
+            Plan::Drive(task) => {
+                if let Some(outcome) = blocked.get(&entry.resource) {
+                    (Some(task), *outcome)
+                } else if attempted >= options.max_releases {
+                    (Some(task), ReleaseOutcome::Deferred)
+                } else {
+                    attempted = attempted.saturating_add(1);
+                    let outcome = run.drive(task.clone(), &entry.resource, Some(entry))?;
+                    (Some(task), outcome)
+                }
+            }
         };
-        if now.saturating_since(marker.recorded_at()) > options.max_preview_age {
-            record_preview(
-                inspector.store,
-                entry,
-                Some(&marker),
-                preview.trigger,
-                claimant,
-                now,
-            )?;
-            results.push(ReleaseResult {
-                resource: entry.resource.clone(),
-                task: None,
-                outcome: ReleaseOutcome::StalePreview,
-            });
-            continue;
-        }
-        let task = release_task_id(&entry.observation, marker.recorded_at())?;
-        if attempted >= options.max_releases {
-            results.push(ReleaseResult {
-                resource: entry.resource.clone(),
-                task: None,
-                outcome: ReleaseOutcome::Deferred,
-            });
-            continue;
-        }
-        attempted = attempted.saturating_add(1);
-        let outcome = run.drive(task.clone(), &entry.resource, Some(entry))?;
         results.push(ReleaseResult {
             resource: entry.resource.clone(),
-            task: Some(task),
+            task,
             outcome,
         });
     }
@@ -684,6 +706,14 @@ pub fn apply(
         recovered,
         results,
     })
+}
+
+/// What [`apply`] does with one eligible resource.
+enum Plan {
+    /// Report without acting.
+    Report(ReleaseOutcome),
+    /// Drive this release task.
+    Drive(TaskId),
 }
 
 /// One [`apply`] call's fixed inputs.
@@ -719,9 +749,11 @@ impl Run<'_> {
             }
             Err(error) => return Err(error),
         };
-        let consent = match self.claimant.trigger {
-            Trigger::Scheduled => None,
-            Trigger::Interactive => {
+        // Consent is needed only where a release may run; recovery never
+        // starts one.
+        let consent = match (self.claimant.trigger, entry) {
+            (Trigger::Scheduled, _) | (Trigger::Interactive, None) => None,
+            (Trigger::Interactive, Some(_)) => {
                 match self
                     .consents
                     .consent(&id, &effect, record.evidence().revision())
@@ -734,12 +766,7 @@ impl Run<'_> {
         let now = self.clock.now();
         let lease = match record.state() {
             TaskState::Settled { settlement, .. } => {
-                return Ok(match settlement {
-                    Settlement::Succeeded => ReleaseOutcome::Released,
-                    Settlement::Failed | Settlement::Cancelled | Settlement::Exhausted => {
-                        ReleaseOutcome::AlreadySettled(*settlement)
-                    }
-                });
+                return Ok(ReleaseOutcome::AlreadySettled(*settlement));
             }
             TaskState::Open => store.claim(&id, self.claimant, self.options.lease, now),
             TaskState::Claimed { lease } if lease.is_live(now) => {
@@ -778,6 +805,11 @@ impl Run<'_> {
                 finish(AttemptOutcome::Succeeded)?;
                 return Ok(ReleaseOutcome::Released);
             }
+            // Proven absent: the release may run again after revalidation.
+            Some(EffectState::NotApplied {
+                reason: NotAppliedReason::ConfirmedAbsent,
+                ..
+            }) if entry.is_some() => {}
             Some(EffectState::NotApplied { reason, .. }) => {
                 let reason = *reason;
                 finish(failed)?;

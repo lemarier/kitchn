@@ -36,6 +36,8 @@ enum Command {
     Adopt(commands::scaffold::ScaffoldArgs),
     /// Preview dishwasher cleanup decisions and record a person's approval; releases nothing.
     Cleanup(commands::cleanup::CleanupArgs),
+    /// Preview a project's decomposition into dependency-linked issues; writes nothing.
+    Decompose(commands::decompose::DecomposeArgs),
     /// Daily issue hygiene: the scheduled precheck. Reads only.
     Gardener(commands::gardener::GardenerArgs),
     /// Offline issue pickup diagnostics.
@@ -69,6 +71,7 @@ fn main() -> ExitCode {
         Some(Command::Init(args)) => commands::scaffold::run(args, false),
         Some(Command::Adopt(args)) => commands::scaffold::run(args, true),
         Some(Command::Cleanup(args)) => commands::cleanup::run(args),
+        Some(Command::Decompose(args)) => commands::decompose::run(args),
         // The precheck reports through its exit status, not the codes below.
         Some(Command::Gardener(args)) => return commands::gardener::run(args),
         Some(Command::Pickup(args)) => commands::pickup::run(args).map(|output| (output, true)),

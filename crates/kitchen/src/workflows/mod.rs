@@ -7,6 +7,7 @@
 
 pub mod cleanup;
 pub mod coordination;
+pub mod decomposition;
 pub mod gardener;
 pub mod gate;
 pub mod inspector;

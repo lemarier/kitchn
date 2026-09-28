@@ -71,6 +71,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #40 schedule intervals and usage budgets | `scheduling/budget.rs` | The house `schedules` policy field and schedule doctor findings in `house/`; install refusal in the Orca schedule adapter; `tests/schedule_budgets.rs` |
 | #46 report intake | `workflows/intake.rs` | Intake source, grouping, and redaction tests |
 | #149 fake-executable test helper | `crates/kitchen/tests/common/executable.rs` | Test support only; `tests/fake_executable.rs` covers it |
+| #47 project decomposition | `workflows/decomposition.rs` | Decomposition tests; `kitchen decompose` CLI command |
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.

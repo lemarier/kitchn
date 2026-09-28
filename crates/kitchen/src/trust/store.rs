@@ -699,6 +699,7 @@ pub(crate) fn store_error(error: crate::Error) -> TrustError {
         | crate::Error::Scaffold(_)
         | crate::Error::Orca(_)
         | crate::Error::Cleanup(_)
+        | crate::Error::Decomposition(_)
         | crate::Error::Workflow(_)
         | crate::Error::Selection(_)
         | crate::Error::Event(_)

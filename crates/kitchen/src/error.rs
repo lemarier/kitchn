@@ -50,6 +50,9 @@ pub enum Error {
     /// A dishwasher inspection or cleanup failed.
     #[error(transparent)]
     Cleanup(#[from] crate::workflows::cleanup::CleanupError),
+    /// A project decomposition was refused or failed.
+    #[error(transparent)]
+    Decomposition(#[from] crate::workflows::decomposition::DecompositionError),
     /// Trust evidence or autonomy operation failed.
     #[error(transparent)]
     Trust(#[from] crate::trust::TrustError),
@@ -89,6 +92,7 @@ impl Error {
             Self::Integration(error) => error.class(),
             Self::Scaffold(error) => error.class(),
             Self::Cleanup(error) => error.class(),
+            Self::Decomposition(error) => error.class(),
             Self::Trust(error) => error.class(),
             Self::Workflow(error) => error.class(),
             Self::Selection(error) => error.class(),

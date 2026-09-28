@@ -8,6 +8,7 @@ use crate::{
         BackendDescriptor, BranchName, Capability, CommitId, ExternalRef, Grant, GrantScope,
         HouseGrants, IdempotencyKey, IssueNumber, Permission, Repository, Text, Timestamp,
     },
+    house::{HouseError, IssuedAuthority, MergeSubject},
     integrations::github::MergeStatusValue,
 };
 
@@ -223,8 +224,8 @@ pub struct DisprovedFinding {
 /// Explicit grants are independent of one another.
 #[derive(Debug, Clone, Default)]
 pub struct GateGrants {
-    /// Permit exact-head squash merge.
-    pub merge: bool,
+    /// Permit exact-head squash merge. Only [`MergeGrant::resolve`] grants it.
+    pub merge: MergeGrant,
     /// Permit a bounded request to a branch worker to edit, commit, and push.
     /// Only [`FixGrant::resolve`] grants it.
     pub fix_request: FixGrant,
@@ -288,6 +289,69 @@ impl FixGrant {
     #[must_use]
     pub fn covers(&self, house: &HouseId, repository: &Repository) -> bool {
         matches!(&self.0, Some((granted, repo)) if granted == house && repo == repository)
+    }
+}
+/// Authority to merge one pull request at an exact head and base: the
+/// house's standing [`Permission::Merge`] for the repository on the forge,
+/// issued through [`crate::house::HouseConfig::issue_authority`] and cleared
+/// by house readiness policy for that subject. Only [`MergeGrant::resolve`]
+/// produces a grant, so a caller cannot authorize a merge by setting a flag,
+/// and the durable gate store refuses a merge effect it does not cover.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergeGrant(Option<(HouseId, MergeSubject)>);
+impl MergeGrant {
+    /// No merge may be performed.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(None)
+    }
+    /// Resolve the merge grant for `subject` from readiness-checked house
+    /// authority. Without a standing merge grant on `forge`, the result is
+    /// no grant.
+    ///
+    /// # Errors
+    /// Returns [`HouseError::BelowReadiness`] when the house has a merge
+    /// grant but a work type is below policy and no owner approved merging
+    /// this exact pull request, head, and base.
+    pub fn resolve(
+        authority: &IssuedAuthority,
+        subject: &MergeSubject,
+        forge: &BackendId,
+    ) -> Result<Self, HouseError> {
+        let grants = authority.grants();
+        let scope = GrantScope::Repository(subject.repository.clone());
+        let standing = grants
+            .permitted(Permission::Merge, &scope, forge)
+            .is_ok_and(|credential| {
+                grants.covers(&Grant::repository(
+                    Permission::Merge,
+                    subject.repository.clone(),
+                    forge.clone(),
+                    credential,
+                ))
+            });
+        if !standing {
+            return Ok(Self::none());
+        }
+        authority.merge_clearance(subject)?;
+        Ok(Self(Some((grants.house().clone(), subject.clone()))))
+    }
+    /// Whether a merge of exactly this pull request, head, and base in
+    /// `house` is granted.
+    #[must_use]
+    pub fn covers(
+        &self,
+        house: &HouseId,
+        repository: &Repository,
+        number: IssueNumber,
+        head: &CommitId,
+        base: &CommitId,
+    ) -> bool {
+        matches!(&self.0, Some((granted, subject)) if granted == house
+            && &subject.repository == repository
+            && subject.number == number
+            && &subject.head == head
+            && &subject.base == base)
     }
 }
 /// House-configured command that asks one reviewer for a fresh review.
@@ -680,7 +744,10 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     {
         Verdict::Skip
     } else if gaps.is_empty() {
-        if grants.merge {
+        if grants
+            .merge
+            .covers(&e.house, &e.repository, e.number, &e.head, &e.base)
+        {
             Verdict::Merge
         } else {
             Verdict::HandOver {
@@ -850,14 +917,21 @@ pub enum RequestRefusal {
     /// The house has not granted fix requests for this repository.
     #[error("no fix-request grant for this repository")]
     NoFixGrant,
+    /// No readiness-checked merge grant covers this pull request and revision.
+    #[error("no readiness-checked merge grant for this pull request and revision")]
+    NoMergeGrant,
 }
-/// Prepare at most three head-matched squash merges per run. A merge executor still
-/// checks the house and task grants, branch protection, and provider readback.
+/// Prepare at most three head-matched squash merges per run. `merge` must
+/// be the readiness-checked grant for the decision's exact subject. A merge
+/// executor still checks the house and task grants, branch protection, and
+/// provider readback.
 ///
 /// # Errors
-/// Refuses an unapproved verdict, moving refs, or a fourth request.
+/// Refuses an unapproved verdict, a missing merge grant, moving refs, or a
+/// fourth request.
 pub fn merge_request(
     recorded: &RecordedDecision,
+    merge: &MergeGrant,
     current_head: &CommitId,
     current_base: &CommitId,
     merges_this_run: u8,
@@ -866,6 +940,9 @@ pub fn merge_request(
     let decision = &recorded.decision;
     if decision.verdict != Verdict::Merge {
         return Err(RequestRefusal::WrongVerdict);
+    }
+    if !covers_decision(merge, decision) {
+        return Err(RequestRefusal::NoMergeGrant);
     }
     if !still_current(decision, current_head, current_base) {
         return Err(RequestRefusal::MovedRevision);
@@ -893,14 +970,19 @@ pub fn merge_request(
 /// provider still enforces the head match when it receives the squash request.
 ///
 /// # Errors
-/// Refuses incomplete reads, a moved revision, or a non-merge verdict.
+/// Refuses a merge `merge` does not cover as a scope mismatch before any
+/// read, then incomplete reads, a moved revision, or a non-merge verdict.
 pub fn merge_request_from_forge<T: crate::integrations::github::GitHubReadTransport>(
     recorded: &RecordedDecision,
+    merge: &MergeGrant,
     client: &crate::integrations::github::GitHubClient<T>,
     merges_this_run: u8,
 ) -> Result<MergeRequest, crate::integrations::github::IntegrationError> {
     use crate::integrations::github::{IntegrationError, Observation};
     let decision = &recorded.decision;
+    if !covers_decision(merge, decision) {
+        return Err(IntegrationError::ScopeMismatch);
+    }
     let pr = match client.pull_request(&decision.house, &decision.repository, decision.number) {
         Observation::Known(pr) => pr,
         Observation::Unknown => return Err(IntegrationError::Unknown),
@@ -924,8 +1006,18 @@ pub fn merge_request_from_forge<T: crate::integrations::github::GitHubReadTransp
         Observation::Unknown => return Err(IntegrationError::Unknown),
         Observation::Unavailable(error) => return Err(error),
     };
-    merge_request(recorded, &pr.head.sha, &base, merges_this_run)
+    merge_request(recorded, merge, &pr.head.sha, &base, merges_this_run)
         .map_err(|_| IntegrationError::StaleDecision)
+}
+
+fn covers_decision(merge: &MergeGrant, decision: &GateDecision) -> bool {
+    merge.covers(
+        &decision.house,
+        &decision.repository,
+        decision.number,
+        &decision.head,
+        &decision.base,
+    )
 }
 
 /// Narrow work request for the branch worker, never a shell command. The
@@ -1473,10 +1565,12 @@ impl GateRun {
     pub fn next_merge<T: crate::integrations::github::GitHubReadTransport>(
         &self,
         recorded: &RecordedDecision,
+        merge: &MergeGrant,
         client: &crate::integrations::github::GitHubClient<T>,
     ) -> Result<MergeRequest, crate::integrations::github::IntegrationError> {
         merge_request_from_forge(
             recorded,
+            merge,
             client,
             u8::try_from(self.confirmed.len()).unwrap_or(u8::MAX),
         )

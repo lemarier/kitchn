@@ -6,13 +6,20 @@
 //! an explicit `Merge` grant.
 use super::{HouseConfig, HouseError, RepositoryConfig, validate_names};
 use crate::{
-    HolderId, HouseId,
+    HouseId, TaskId,
     contracts::{
-        CommitId, ExternalRef, GrantScope, HouseGrants, Permission, Repository, Text, Timestamp,
+        AskKind, AskRisk, CommitId, DecisionBinding, DecisionOwner, Effect, EvidenceRevision,
+        EvidenceSubject, ExternalRef, GrantScope, HouseGrants, IssueNumber, Permission, Repository,
+        RogerAsk, Text,
     },
-    integrations::github::{
-        CheckConclusion, CheckRun, CheckStatus, CommitStatus, RequiredChecks, StatusState,
+    integrations::{
+        github::{
+            CheckConclusion, CheckRun, CheckStatus, CommitStatus, HouseScope, RequiredChecks,
+            StatusState,
+        },
+        roger::{DecisionStatus, validate_answer},
     },
+    state::{EffectState, HouseStore},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -75,6 +82,10 @@ pub struct CheckRunRecord {
     pub head: CommitId,
     /// Run result.
     pub outcome: CheckOutcome,
+    /// GitHub App that reported the run; absent for commit statuses and
+    /// runs whose app is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<i64>,
 }
 
 impl CheckRunRecord {
@@ -107,6 +118,7 @@ impl CheckRunRecord {
             check: run.name.clone(),
             head: run.head_sha.clone(),
             outcome,
+            app_id: run.app.as_ref().map(|app| app.id),
         }
     }
 
@@ -122,6 +134,7 @@ impl CheckRunRecord {
             check: status.context.clone(),
             head: status.sha.clone(),
             outcome,
+            app_id: None,
         }
     }
 }
@@ -137,6 +150,22 @@ pub fn required_check_names(required: &RequiredChecks) -> BTreeSet<String> {
         .collect()
 }
 
+/// The GitHub App each required check must come from, where branch
+/// protection names one. A check that accepts any source is absent.
+#[must_use]
+pub fn required_check_apps(required: &RequiredChecks) -> BTreeMap<String, i64> {
+    required
+        .checks
+        .iter()
+        .filter_map(|check| {
+            check
+                .app_id
+                .filter(|id| *id > 0)
+                .map(|id| (check.context.clone(), id))
+        })
+        .collect()
+}
+
 /// Read-only repository observations. `None` means not observed, which is
 /// reported as unknown; an empty collection means observed and absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +174,11 @@ pub struct ReadinessEvidence {
     /// Checks the forge requires on the default branch.
     #[serde(default)]
     pub required_checks: Option<BTreeSet<String>>,
+    /// The GitHub App a required check must come from, where branch
+    /// protection names one. History from another app or a commit status
+    /// does not count for that check.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub required_check_apps: BTreeMap<String, i64>,
     /// Recent check runs on the default branch and its pull requests.
     #[serde(default)]
     pub check_history: Option<Vec<CheckRunRecord>>,
@@ -165,6 +199,14 @@ impl ReadinessEvidence {
         if let Some(required) = &self.required_checks
             && (required.len() > MAX_REQUIRED_CHECKS
                 || required.iter().any(|name| !valid_name(name)))
+        {
+            return Err(HouseError::InvalidInput);
+        }
+        if self.required_check_apps.len() > MAX_REQUIRED_CHECKS
+            || self
+                .required_check_apps
+                .iter()
+                .any(|(name, id)| !valid_name(name) || *id <= 0)
         {
             return Err(HouseError::InvalidInput);
         }
@@ -428,7 +470,11 @@ pub fn assess(
     let mut reliable = true;
     let mut check_history = BTreeMap::new();
     for check in tracked {
-        let history = summarize(evidence.check_history.as_deref(), check);
+        let history = summarize(
+            evidence.check_history.as_deref(),
+            check,
+            evidence.required_check_apps.get(check.as_str()).copied(),
+        );
         match &history {
             Assessed::Unknown => {
                 reliable = false;
@@ -510,13 +556,22 @@ fn known<T>(value: Option<T>) -> Assessed<T> {
     value.map_or(Assessed::Unknown, Assessed::Known)
 }
 
-fn summarize(records: Option<&[CheckRunRecord]>, check: &str) -> Assessed<CheckHistory> {
+/// History of one check. When `app` is set, only runs that app reported
+/// count; commit statuses and other apps' runs with the same name do not.
+fn summarize(
+    records: Option<&[CheckRunRecord]>,
+    check: &str,
+    app: Option<i64>,
+) -> Assessed<CheckHistory> {
     let Some(records) = records else {
         return Assessed::Unknown;
     };
     let mut history = CheckHistory::default();
     let mut heads: BTreeMap<&CommitId, (bool, bool)> = BTreeMap::new();
-    for record in records.iter().filter(|record| record.check == check) {
+    for record in records
+        .iter()
+        .filter(|record| record.check == check && app.is_none_or(|id| record.app_id == Some(id)))
+    {
         let head = heads.entry(&record.head).or_default();
         match record.outcome {
             CheckOutcome::Passed => {
@@ -554,157 +609,359 @@ pub(super) fn validate_work_type(work_type: &Text) -> Result<(), HouseError> {
     }
 }
 
-/// An owner's decision to allow a merge grant below the required level.
-/// It is bound to the exact scope and levels it was made for. Who may decide
-/// is house policy: `decided_by` must be listed in [`HouseConfig::owners`],
-/// or the decision is refused.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct BelowReadinessDecision {
-    /// Deciding house.
-    pub house: HouseId,
-    /// Repository the decision covers.
+/// The pull request and exact revision a merge is judged at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeSubject {
+    /// Destination repository.
     pub repository: Repository,
-    /// Work type the decision covers.
+    /// Pull request.
+    pub number: IssueNumber,
+    /// Exact head.
+    pub head: CommitId,
+    /// Exact base.
+    pub base: CommitId,
+}
+
+/// What an owner is asked to accept: merging one pull request at an exact
+/// head and base although a work type is below the level house policy
+/// requires, for a stated reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BelowReadinessRequest {
+    /// Work type below its required level.
     pub work_type: Text,
-    /// Level the owner saw; a different assessment needs a new decision.
-    pub assessed: ReadinessLevel,
-    /// Required level the owner accepted missing.
-    pub required: ReadinessLevel,
-    /// Decision author.
-    pub decided_by: HolderId,
-    /// Why proceeding below the required level is acceptable.
+    /// Pull request and revision the decision covers.
+    pub subject: MergeSubject,
+    /// Why proceeding is acceptable; the owner approves this exact text.
     pub reason: Text,
-    /// Durable decision source.
-    pub decision: ExternalRef,
-    /// Decision time.
-    pub at: Timestamp,
 }
 
-/// Readiness outcome for a proposed merge grant. It is a precondition, not
-/// authority: the grant itself must still be issued and checked separately.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-#[must_use]
-pub enum ReadinessClearance {
-    /// House policy sets no level for this work type.
-    NotRequired {
-        /// Assessed level.
-        assessed: ReadinessLevel,
-    },
-    /// The assessed level meets the policy.
-    Met {
-        /// Required level.
-        required: ReadinessLevel,
-        /// Assessed level.
-        assessed: ReadinessLevel,
-    },
-    /// An owner accepted the gap; record this decision with the grant.
-    AcceptedBelow(BelowReadinessDecision),
-}
-
-/// Check house readiness policy before a merge grant for a work type.
-///
-/// # Errors
-/// Returns [`HouseError::BelowReadiness`] when the level is below policy and
-/// no matching owner decision is supplied, [`HouseError::ReadinessDecision`]
-/// when the decision's scope or levels do not match, and
-/// [`HouseError::HouseSelection`] when the assessment belongs to another house.
-pub fn merge_readiness(
-    house: &HouseConfig,
-    readiness: &RepositoryReadiness,
-    work_type: &Text,
-    decision: Option<&BelowReadinessDecision>,
-) -> Result<ReadinessClearance, HouseError> {
-    if readiness.house != house.house || !house.repositories.contains(&readiness.repository) {
-        return Err(HouseError::HouseSelection);
-    }
-    let assessed = readiness.level_for(work_type);
-    let Some(&required) = house.merge_readiness.get(work_type) else {
-        return Ok(ReadinessClearance::NotRequired { assessed });
-    };
-    if assessed >= required {
-        return Ok(ReadinessClearance::Met { required, assessed });
-    }
-    let Some(decision) = decision else {
-        return Err(HouseError::BelowReadiness { required, assessed });
-    };
-    verify_decision(
-        house,
-        &readiness.repository,
-        work_type,
-        assessed,
-        required,
-        decision,
-    )?;
-    Ok(ReadinessClearance::AcceptedBelow(decision.clone()))
-}
-
-fn decision_in_scope(
-    house: &HouseConfig,
-    repository: &Repository,
-    work_type: &Text,
-    decision: &BelowReadinessDecision,
-) -> bool {
-    decision.house == house.house
-        && &decision.repository == repository
-        && &decision.work_type == work_type
-}
-
-/// A decision counts only for the exact house, repository, work type, and
-/// levels it was made for, with a reason, by a holder the house lists as owner.
-fn verify_decision(
-    house: &HouseConfig,
-    repository: &Repository,
-    work_type: &Text,
+/// An owner's approval to merge one pull request below the required
+/// readiness. It exists only as the result of [`accept_below_readiness`],
+/// which reads it back from a Roger approval Ask persisted in the house
+/// store, so a caller cannot assert one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BelowReadinessDecision {
+    house: HouseId,
+    task: TaskId,
+    subject: MergeSubject,
+    work_type: Text,
     assessed: ReadinessLevel,
     required: ReadinessLevel,
-    decision: &BelowReadinessDecision,
-) -> Result<(), HouseError> {
-    if !decision_in_scope(house, repository, work_type, decision)
-        || decision.assessed != assessed
-        || decision.required != required
-        || decision.reason.as_str().trim().is_empty()
-    {
-        return Err(HouseError::ReadinessDecision);
-    }
-    if !house.owners.contains(&decision.decided_by) {
-        return Err(HouseError::ReadinessDeciderNotOwner);
-    }
-    Ok(())
+    reason: Text,
+    ask: ExternalRef,
 }
 
-/// House authority issued with the readiness evidence behind any merge grant.
+impl BelowReadinessDecision {
+    /// Deciding house.
+    #[must_use]
+    pub const fn house(&self) -> &HouseId {
+        &self.house
+    }
+    /// Task that persisted the Ask.
+    #[must_use]
+    pub const fn task(&self) -> &TaskId {
+        &self.task
+    }
+    /// Pull request and revision the decision covers.
+    #[must_use]
+    pub const fn subject(&self) -> &MergeSubject {
+        &self.subject
+    }
+    /// Work type the decision covers.
+    #[must_use]
+    pub const fn work_type(&self) -> &Text {
+        &self.work_type
+    }
+    /// Level the owner saw.
+    #[must_use]
+    pub const fn assessed(&self) -> ReadinessLevel {
+        self.assessed
+    }
+    /// Required level the owner accepted missing.
+    #[must_use]
+    pub const fn required(&self) -> ReadinessLevel {
+        self.required
+    }
+    /// The reason the owner approved.
+    #[must_use]
+    pub const fn reason(&self) -> &Text {
+        &self.reason
+    }
+    /// Roger Ask that holds the approval.
+    #[must_use]
+    pub const fn ask(&self) -> &ExternalRef {
+        &self.ask
+    }
+}
+
+/// The shortfall a request asks the owner to accept, checked against house
+/// policy and the current assessment.
+fn shortfall(
+    house: &HouseConfig,
+    readiness: &RepositoryReadiness,
+    request: &BelowReadinessRequest,
+) -> Result<(ReadinessLevel, ReadinessLevel), HouseError> {
+    if readiness.house != house.house
+        || readiness.repository != request.subject.repository
+        || !house.repositories.contains(&readiness.repository)
+    {
+        return Err(HouseError::HouseSelection);
+    }
+    let assessed = readiness.level_for(&request.work_type);
+    match house.merge_readiness.get(&request.work_type) {
+        Some(&required) if assessed < required && !request.reason.as_str().trim().is_empty() => {
+            Ok((assessed, required))
+        }
+        Some(_) | None => Err(HouseError::ReadinessDecision),
+    }
+}
+
+/// The exact action text the owner approves. Roger compares it, so any
+/// change to the work type, levels, or reason needs a new approval.
+fn below_readiness_limits(
+    request: &BelowReadinessRequest,
+    assessed: ReadinessLevel,
+    required: ReadinessLevel,
+) -> Result<Text, HouseError> {
+    Text::new(&format!(
+        "Merge below readiness for work type {}: assessed {}, required {}. Reason: {}",
+        request.work_type.as_str(),
+        assessed.as_str(),
+        required.as_str(),
+        request.reason.as_str()
+    ))
+    .map_err(|_| HouseError::ReadinessDecision)
+}
+
+fn below_readiness_target(subject: &MergeSubject) -> Result<ExternalRef, HouseError> {
+    ExternalRef::new(&format!(
+        "pr:{}#{}",
+        subject.repository,
+        subject.number.get()
+    ))
+    .map_err(|_| HouseError::ReadinessDecision)
+}
+
+/// Build the Roger approval Ask for a below-readiness merge. The caller
+/// persists it as the task's effect before it is sent; that record is what
+/// [`accept_below_readiness`] later verifies. `revision` is the task's
+/// evidence revision at the subject's head and base.
+///
+/// # Errors
+/// Returns [`HouseError::HouseSelection`] for an assessment of another house
+/// or repository, and [`HouseError::ReadinessDecision`] when the work type is
+/// not below policy, the reason is blank, or the Ask would be invalid.
+pub fn below_readiness_ask(
+    house: &HouseConfig,
+    readiness: &RepositoryReadiness,
+    request: &BelowReadinessRequest,
+    task: &TaskId,
+    revision: EvidenceRevision,
+) -> Result<RogerAsk, HouseError> {
+    let (assessed, required) = shortfall(house, readiness, request)?;
+    let subject = &request.subject;
+    let ask = RogerAsk {
+        binding: DecisionBinding {
+            house: house.house.clone(),
+            task: task.clone(),
+            owner: DecisionOwner::Merge,
+            repository: subject.repository.clone(),
+            action: Permission::Merge,
+            target: below_readiness_target(subject)?,
+            revision,
+            subject: Some(EvidenceSubject {
+                head: subject.head.clone(),
+                base: Some(subject.base.clone()),
+            }),
+            limits: below_readiness_limits(request, assessed, required)?,
+        },
+        kind: AskKind::Approval,
+        risk: AskRisk::Irreversible,
+        title: Text::new("Merge below the required readiness?")
+            .map_err(|_| HouseError::ReadinessDecision)?,
+        body: Text::new(&format!(
+            "House policy requires {} readiness for {} work in {} before a merge; it is assessed {}. Approving allows merging PR #{} at head {} only.",
+            required.as_str(),
+            request.work_type.as_str(),
+            subject.repository,
+            assessed.as_str(),
+            subject.number.get(),
+            subject.head
+        ))
+        .map_err(|_| HouseError::ReadinessDecision)?,
+        supersedes: None,
+    };
+    ask.validate().map_err(|_| HouseError::ReadinessDecision)?;
+    Ok(ask)
+}
+
+/// Verify an owner's approval of a below-readiness merge from the house
+/// store. The task must hold a Roger approval Ask for exactly this house,
+/// pull request, head, base, work type, levels, and reason, and Roger must
+/// have acknowledged it. `answer` is the Roger reply read for that Ask; it
+/// counts only as an explicit, passkey-confirmed approval of the persisted
+/// binding under the house's Roger scope. The decider is whoever holds that
+/// house's Roger approval; nothing the caller states identifies them.
+///
+/// # Errors
+/// Returns the [`below_readiness_ask`] refusals,
+/// [`HouseError::DecisionRecord`] when the task cannot be read from this
+/// house's store, and [`HouseError::ReadinessNotApproved`] when no matching
+/// Ask was persisted and acknowledged or the answer does not approve it.
+pub fn accept_below_readiness(
+    house: &HouseConfig,
+    readiness: &RepositoryReadiness,
+    request: &BelowReadinessRequest,
+    store: &HouseStore,
+    task: &TaskId,
+    scope: &HouseScope,
+    answer: &[u8],
+) -> Result<BelowReadinessDecision, HouseError> {
+    let (assessed, required) = shortfall(house, readiness, request)?;
+    if store.house() != &house.house {
+        return Err(HouseError::HouseSelection);
+    }
+    let subject = &request.subject;
+    let target = below_readiness_target(subject)?;
+    let limits = below_readiness_limits(request, assessed, required)?;
+    let persisted = EvidenceSubject {
+        head: subject.head.clone(),
+        base: Some(subject.base.clone()),
+    };
+    let record = store.task(task).map_err(|_| HouseError::DecisionRecord)?;
+    let (binding, ask) = record
+        .effects()
+        .iter()
+        .rev()
+        .find_map(|effect| {
+            let (Effect::Roger(roger), EffectState::Applied { receipt, .. }) =
+                (effect.request().effect(), effect.state())
+            else {
+                return None;
+            };
+            let binding = &roger.ask.binding;
+            (roger.ask.kind == AskKind::Approval
+                && &roger.requester == scope.requester()
+                && binding.house == house.house
+                && &binding.task == task
+                && binding.owner == DecisionOwner::Merge
+                && binding.action == Permission::Merge
+                && binding.repository == subject.repository
+                && binding.target == target
+                && binding.subject.as_ref() == Some(&persisted)
+                && binding.limits == limits)
+                .then(|| (binding, receipt.reference()))
+        })
+        .ok_or(HouseError::ReadinessNotApproved)?;
+    match validate_answer(scope, binding, ask, answer) {
+        Ok(DecisionStatus::Approved) => Ok(BelowReadinessDecision {
+            house: house.house.clone(),
+            task: task.clone(),
+            subject: subject.clone(),
+            work_type: request.work_type.clone(),
+            assessed,
+            required,
+            reason: request.reason.clone(),
+            ask: ask.clone(),
+        }),
+        Ok(
+            DecisionStatus::Unanswered
+            | DecisionStatus::Expired
+            | DecisionStatus::Closed
+            | DecisionStatus::Rejected
+            | DecisionStatus::Instructions(_),
+        )
+        | Err(_) => Err(HouseError::ReadinessNotApproved),
+    }
+}
+
+/// A work type whose assessed level is below the level house policy requires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Shortfall {
+    work_type: Text,
+    assessed: ReadinessLevel,
+    required: ReadinessLevel,
+}
+
+/// House authority issued with the readiness behind its merge grants. It is
+/// the only source of a gate merge grant, so every merge effect is checked
+/// against readiness.
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct IssuedAuthority {
-    /// Standing grants, including merge grants that passed the readiness gate.
-    pub authority: HouseGrants,
-    /// Owner decisions that let a merge grant proceed below the required
-    /// level; record each with the grant.
-    pub accepted_below: Vec<BelowReadinessDecision>,
+    authority: HouseGrants,
+    shortfalls: BTreeMap<Repository, Vec<Shortfall>>,
+    accepted_below: Vec<BelowReadinessDecision>,
+}
+
+impl IssuedAuthority {
+    /// The house's standing grants, including configured merge grants.
+    #[must_use]
+    pub const fn grants(&self) -> &HouseGrants {
+        &self.authority
+    }
+
+    /// Owner approvals supplied at issuance that match a current shortfall.
+    #[must_use]
+    pub fn accepted_below(&self) -> &[BelowReadinessDecision] {
+        &self.accepted_below
+    }
+
+    /// Check readiness for merging `subject`. Every work type below policy
+    /// in its repository needs an owner approval for exactly this pull
+    /// request, head, base, and levels. Returns those approvals so the caller
+    /// can record them with the merge.
+    ///
+    /// # Errors
+    /// Returns [`HouseError::BelowReadiness`] naming the first unaccepted
+    /// work type's required and assessed level.
+    pub fn merge_clearance(
+        &self,
+        subject: &MergeSubject,
+    ) -> Result<Vec<&BelowReadinessDecision>, HouseError> {
+        let Some(shortfalls) = self.shortfalls.get(&subject.repository) else {
+            return Ok(Vec::new());
+        };
+        shortfalls
+            .iter()
+            .map(|shortfall| {
+                self.accepted_below
+                    .iter()
+                    .find(|decision| {
+                        &decision.subject == subject
+                            && decision.work_type == shortfall.work_type
+                            && decision.assessed == shortfall.assessed
+                            && decision.required == shortfall.required
+                    })
+                    .ok_or(HouseError::BelowReadiness {
+                        required: shortfall.required,
+                        assessed: shortfall.assessed,
+                    })
+            })
+            .collect()
+    }
 }
 
 impl HouseConfig {
-    /// Issue house authority, gating every configured [`Permission::Merge`]
-    /// grant on readiness. For each repository with a merge grant and each
-    /// work type in `merge_readiness`, the repository's assessed level must
-    /// meet the requirement, or `decisions` must hold an owner decision bound
-    /// to that house, repository, work type, and both levels. A repository
-    /// without an assessment counts as unready.
+    /// Issue house authority with readiness recorded for every configured
+    /// [`Permission::Merge`] grant. For each repository with a merge grant,
+    /// every work type in `merge_readiness` whose level is below policy is
+    /// recorded as a shortfall; [`IssuedAuthority::merge_clearance`] then
+    /// refuses a merge there unless `decisions` holds an owner approval for
+    /// that exact pull request. A repository without an assessment counts as
+    /// unready, and several assessments count at their lowest level.
+    /// Approvals for another house or a stale shortfall are dropped.
     ///
     /// # Errors
-    /// Returns [`HouseError::BelowReadiness`] naming the required and
-    /// assessed level, [`HouseError::ReadinessDecision`] or
-    /// [`HouseError::ReadinessDeciderNotOwner`] for an unusable decision, and
-    /// the validation errors of [`HouseConfig::authority`].
+    /// Returns the validation errors of [`HouseConfig::authority`].
     pub fn issue_authority(
         &self,
         readiness: &[RepositoryReadiness],
         decisions: &[BelowReadinessDecision],
     ) -> Result<IssuedAuthority, HouseError> {
         let authority = self.build_authority()?;
-        let mut accepted_below = Vec::new();
         let merge_repositories: BTreeSet<&Repository> = self
             .grants
             .iter()
@@ -714,37 +971,48 @@ impl HouseConfig {
                 GrantScope::House => None,
             })
             .collect();
+        let mut shortfalls = BTreeMap::new();
         for repository in merge_repositories {
-            for (work_type, &required) in &self.merge_readiness {
-                let assessed = readiness
-                    .iter()
-                    .filter(|r| r.house == self.house && &r.repository == repository)
-                    .map(|r| r.level_for(work_type))
-                    .min()
-                    .unwrap_or(ReadinessLevel::Unready);
-                if assessed >= required {
-                    continue;
-                }
-                let mut refusal = HouseError::BelowReadiness { required, assessed };
-                let mut accepted = None;
-                for decision in decisions
-                    .iter()
-                    .filter(|d| decision_in_scope(self, repository, work_type, d))
-                {
-                    match verify_decision(self, repository, work_type, assessed, required, decision)
-                    {
-                        Ok(()) => {
-                            accepted = Some(decision.clone());
-                            break;
-                        }
-                        Err(error) => refusal = error,
-                    }
-                }
-                accepted_below.push(accepted.ok_or(refusal)?);
+            let below: Vec<Shortfall> = self
+                .merge_readiness
+                .iter()
+                .filter_map(|(work_type, &required)| {
+                    let assessed = readiness
+                        .iter()
+                        .filter(|r| r.house == self.house && &r.repository == repository)
+                        .map(|r| r.level_for(work_type))
+                        .min()
+                        .unwrap_or(ReadinessLevel::Unready);
+                    (assessed < required).then(|| Shortfall {
+                        work_type: work_type.clone(),
+                        assessed,
+                        required,
+                    })
+                })
+                .collect();
+            if !below.is_empty() {
+                shortfalls.insert(repository.clone(), below);
             }
         }
+        let accepted_below = decisions
+            .iter()
+            .filter(|decision| {
+                decision.house == self.house
+                    && shortfalls
+                        .get(&decision.subject.repository)
+                        .is_some_and(|below| {
+                            below.iter().any(|shortfall| {
+                                shortfall.work_type == decision.work_type
+                                    && shortfall.assessed == decision.assessed
+                                    && shortfall.required == decision.required
+                            })
+                        })
+            })
+            .cloned()
+            .collect();
         Ok(IssuedAuthority {
             authority,
+            shortfalls,
             accepted_below,
         })
     }

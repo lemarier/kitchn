@@ -65,7 +65,7 @@ pub enum HouseError {
     Git(crate::git::GitReadError),
     /// A merge grant was attempted below the house's required readiness.
     #[error(
-        "repository readiness {} is below the required {}; record an owner decision with a reason to proceed",
+        "repository readiness {} is below the required {}; an owner must approve this merge with a reason to proceed",
         assessed.as_str(),
         required.as_str()
     )]
@@ -75,14 +75,18 @@ pub enum HouseError {
         /// Assessed level.
         assessed: super::ReadinessLevel,
     },
-    /// An owner decision does not match the assessed scope or levels.
-    #[error(
-        "readiness decision does not match this house, repository, work type, or assessed level"
-    )]
+    /// A below-readiness request does not match house policy and the
+    /// assessment: the work type is not below its required level, the
+    /// reason is blank, or the Ask would be invalid.
+    #[error("readiness request is not below this house's policy, or has no reason")]
     ReadinessDecision,
-    /// The readiness decision was not made by a holder listed as house owner.
-    #[error("readiness decision was not made by a house owner")]
-    ReadinessDeciderNotOwner,
+    /// No owner approval of this below-readiness merge was persisted, or
+    /// the Roger answer does not approve it.
+    #[error("no persisted owner approval covers this below-readiness merge")]
+    ReadinessNotApproved,
+    /// The task holding a readiness decision could not be read.
+    #[error("the persisted readiness decision could not be read")]
+    DecisionRecord,
     /// A configured merge grant cannot become authority without a readiness check.
     #[error("merge grants are issued through the readiness check, not plain authority")]
     MergeNeedsReadiness,
@@ -107,7 +111,7 @@ impl HouseError {
             | Self::RemotesDisagree { .. }
             | Self::BelowReadiness { .. }
             | Self::ReadinessDecision
-            | Self::ReadinessDeciderNotOwner
+            | Self::ReadinessNotApproved
             | Self::MergeNeedsReadiness => ErrorClass::Refused,
             Self::Conflict | Self::Conflicts(_) | Self::LegacyChanged | Self::Busy => {
                 ErrorClass::Conflict
@@ -115,6 +119,7 @@ impl HouseError {
             Self::UnverifiedSnapshot
             | Self::PartialInstallation { .. }
             | Self::Git(_)
+            | Self::DecisionRecord
             | Self::Io(_) => ErrorClass::Execution,
         }
     }

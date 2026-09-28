@@ -45,7 +45,7 @@ use crate::{
 
 use super::{
     GATE_VERDICT_SCHEMA, GATE_VERDICT_VERSION, Gap, GateDecision, GateEffectState, GateHistory,
-    GateIntent, GateMarkerStore, GateVerdictRecord, Verdict, fix_brief, fix_marker,
+    GateIntent, GateMarkerStore, GateVerdictRecord, MergeGrant, Verdict, fix_brief, fix_marker,
     handover_comment, merge_mutation,
 };
 
@@ -78,6 +78,9 @@ pub enum GateStoreError {
     /// The worker backend could not be queried.
     #[error(transparent)]
     WorkerObservation(#[from] BackendUnavailable),
+    /// A merge verdict is not covered by the readiness-checked merge grant.
+    #[error("no readiness-checked merge grant covers this pull request and revision")]
+    MergeNotGranted,
     /// A merge verdict lacks its validated base branch.
     #[error("a merge verdict lacks its base branch")]
     MissingBaseBranch,
@@ -119,6 +122,9 @@ pub struct HouseGateStore<'a> {
     pub claimant: Claimant,
     /// The house's current grants, checked when an intent is persisted.
     pub grants: &'a HouseGrants,
+    /// The readiness-checked merge grant; a merge intent it does not cover
+    /// is refused before anything is persisted.
+    pub merge: &'a MergeGrant,
     /// The forge backend that will perform the effects.
     pub backend: &'a BackendDescriptor,
     /// Authenticated forge requester persisted with each intent.
@@ -183,16 +189,27 @@ impl HouseGateStore<'_> {
         decision: &GateDecision,
     ) -> Result<Effect, GateStoreError> {
         let mutation = match &record.verdict {
-            Verdict::Merge => merge_mutation(
-                &record.repository,
-                record.number,
-                &record.head,
-                &record.base,
-                decision
-                    .base_branch
-                    .as_ref()
-                    .ok_or(GateStoreError::MissingBaseBranch)?,
-            ),
+            Verdict::Merge => {
+                if !self.merge.covers(
+                    &record.house,
+                    &record.repository,
+                    record.number,
+                    &record.head,
+                    &record.base,
+                ) {
+                    return Err(GateStoreError::MergeNotGranted);
+                }
+                merge_mutation(
+                    &record.repository,
+                    record.number,
+                    &record.head,
+                    &record.base,
+                    decision
+                        .base_branch
+                        .as_ref()
+                        .ok_or(GateStoreError::MissingBaseBranch)?,
+                )
+            }
             Verdict::HandOver { gaps } => handover_comment(
                 &record.repository,
                 record.number,

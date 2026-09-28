@@ -334,7 +334,7 @@ pub fn doctor(
     for (work_type, required) in &house.merge_readiness {
         let assessed = readiness.level_for(work_type);
         if assessed < *required {
-            findings.push(DoctorFinding { code: DoctorCode::Readiness, message: format!("Work type {} requires {} readiness before a merge grant; assessed {}.", work_type.as_str(), required.as_str(), assessed.as_str()), next_step: "Close the readiness gaps below and rerun doctor, or keep merges for this work type manual. An owner can proceed below the level only with a recorded reason; readiness never grants merge authority.".into() });
+            findings.push(DoctorFinding { code: DoctorCode::Readiness, message: format!("Work type {} requires {} readiness before a merge grant; assessed {}.", work_type.as_str(), required.as_str(), assessed.as_str()), next_step: "Close the readiness gaps below and rerun doctor, or keep merges for this work type manual. Below the level, a merge needs an owner's Roger approval with a reason for that exact pull request; readiness never grants merge authority.".into() });
         }
     }
     let access = evidence.map_or(AccessStatus::Unobserved, |evidence| evidence.access);

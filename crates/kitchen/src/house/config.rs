@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{HouseError, ReadinessLevel, Workflow, readiness::validate_work_type};
 use crate::{
-    HolderId, HouseId,
+    HouseId,
     contracts::{CommitId, Grant, HouseGrants, Repository, Text},
     scheduling::{BudgetError, SchedulePolicy},
     selection::{AgentPolicy, SelectionError},
@@ -69,10 +69,6 @@ pub struct HouseConfig {
     /// Readiness never grants merge authority itself.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub merge_readiness: BTreeMap<Text, ReadinessLevel>,
-    /// Holders who may accept a merge grant below its required readiness.
-    /// Absent means no one may.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub owners: BTreeSet<HolderId>,
 }
 
 impl HouseConfig {
@@ -85,7 +81,6 @@ impl HouseConfig {
             || self.grants.len() > 256
             || self.policy_limits.len() > 256
             || self.merge_readiness.len() > super::MAX_WORK_TYPES
-            || self.owners.len() > 64
         {
             return Err(HouseError::InvalidInput);
         }

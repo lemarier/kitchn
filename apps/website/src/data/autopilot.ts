@@ -1,6 +1,6 @@
 // Intended behavior of unattended runs (issues #8, #9, #11, #12, #40, #44,
 // #49). Replace with a real night's log once scheduled runs ship;
-// `just website-deploy` refuses to publish while this is planned.
+// deploys list it while it is planned.
 
 export interface ShiftEntry {
   time: string;

@@ -5,7 +5,7 @@
 //
 // Entries marked `planned: true` show the intended behavior of features that
 // are still being built (see issue #1). Replace each with captured output when
-// its feature lands; `just website-deploy` refuses to publish while any remain.
+// its feature lands; deploys list any that remain.
 
 export type Tone = "cmd" | "out" | "dim" | "ok" | "warn";
 export interface TermLine {

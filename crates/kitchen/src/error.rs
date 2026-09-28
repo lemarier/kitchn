@@ -53,6 +53,9 @@ pub enum Error {
     /// Trust evidence or autonomy operation failed.
     #[error(transparent)]
     Trust(#[from] crate::trust::TrustError),
+    /// A triage or hygiene decision failed.
+    #[error(transparent)]
+    Workflow(#[from] crate::workflows::WorkflowError),
 }
 
 impl Error {
@@ -69,6 +72,7 @@ impl Error {
             Self::Scaffold(error) => error.class(),
             Self::Cleanup(error) => error.class(),
             Self::Trust(error) => error.class(),
+            Self::Workflow(error) => error.class(),
         }
     }
 }

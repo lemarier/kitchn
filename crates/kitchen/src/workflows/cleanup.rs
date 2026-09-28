@@ -6,8 +6,10 @@
 //! positive evidence that its ownership ended and nothing would be lost:
 //!
 //! - exactly one Kitchen task created it through an applied effect, and the
-//!   backend's owner record names that same effect (a backend that records no
-//!   owner leaves it unconfirmed, and it is retained);
+//!   backend's owner record names that same effect. A backend that records no
+//!   owner leaves the resource unconfirmed and it is retained; that is fixed
+//!   policy, not a house option, because Kitchen's own record alone is not
+//!   enough to delete on;
 //! - that task is settled with every effect resolved, and no other unsettled
 //!   task was given the resource;
 //! - the backend reports it exited, and every worker of the owning task is
@@ -41,18 +43,30 @@
 //! legacy resources are retained. Branches and schedules are never removed.
 //!
 //! [`inspect`] only reads; it records nothing and approves nothing. Acting
-//! needs an approval that the automation which inspected cannot give itself:
-//! [`approve`] records, for one previewed step, a marker keyed by the resource
-//! and the digest of the evidence it was judged on, and refuses any claimant
-//! that is not [`Trigger::Interactive`]. That trigger is declared by the
-//! caller: the library cannot tell a person from a script, so scheduled
-//! workflows must never build an interactive claimant, the same boundary as a
-//! person's consent for an effect. [`apply`] and
-//! [`reclaim_build_output`] act only where such a person-recorded approval
-//! names the unchanged digest and is not older than the allowed age, so the
-//! first run against an existing backlog is preview-only and a scheduled run
-//! never approves its own preview. Neither run writes a marker, so a full
-//! marker table cannot stop them, and recovery never depends on one.
+//! needs an approval that the automation which inspected cannot give itself.
+//!
+//! - A scheduled run needs a person's stored approval. [`approve`] records,
+//!   for one previewed step, a marker keyed by the resource and the digest of
+//!   the evidence it was judged on, and refuses any claimant that is not
+//!   [`Trigger::Interactive`]. [`apply`] and [`reclaim_build_output`] act only
+//!   where such a marker names the unchanged digest and is not older than the
+//!   allowed age, so the first run against an existing backlog is
+//!   preview-only and a scheduled run never approves its own preview.
+//!   Neither run writes a marker, so a full marker table cannot stop them, and
+//!   recovery never depends on one.
+//! - An interactive [`apply`] needs no stored approval. A person present
+//!   gives one consent per release ([`ConsentSource`]), bound to the digest of
+//!   the evidence they previewed; evidence that changed since has a different
+//!   digest and needs a new consent.
+//!
+//! The approval marker is not a grant: no [`Permission`] names it, so nothing
+//! in a house's grants says who may approve. A house `approve-cleanup` grant
+//! may come later; until then the marker, recorded by an interactive claimant,
+//! is the durable form. The same holds for consent. The library cannot tell a
+//! person from a script: an approval is whatever an interactive claimant
+//! records, and a consent is whatever a [`ConsentSource`] returns, the same
+//! trust boundary as a person's consent for any other effect. Scheduled
+//! workflows must never build an interactive claimant or a consent source.
 //!
 //! Each release runs as its own dishwasher task given exactly that resource,
 //! through the durable effect path ([`crate::state::run_effect`]) and the
@@ -643,20 +657,39 @@ pub struct ApplyOptions {
     pub provenance: Provenance,
     /// Lease on each release task.
     pub lease: LeaseTtl,
-    /// Oldest approval that still authorizes a release.
+    /// Oldest stored approval that still authorizes a scheduled release. An
+    /// interactive run uses no stored approval.
     pub max_approval_age: Duration,
     /// Most releases attempted in one call; the rest are deferred.
     pub max_releases: usize,
 }
 
 /// Supplies a person's consent for one release under an interactive claim.
+///
+/// An interactive [`apply`] needs nothing else: no stored approval. It asks
+/// for a consent before it writes anything. What binds the consent to the
+/// evidence has two parts. The library enforces that the release task is
+/// derived from the evidence's digest, so a [`Consent`] minted for one digest
+/// names another task than the release of different evidence and is refused,
+/// and it checks the evidence again immediately before the effect. That the
+/// person actually read that digest is attested by the implementation, which is
+/// given the digest in `observation` for that purpose: `apply` inspects again,
+/// so this is the digest of the evidence as it is now, and an implementation
+/// that consents to whatever it is asked consents to evidence nobody saw.
+///
+/// The library cannot tell a person from a script: an implementation must
+/// return a consent only for something a person present agreed to, the same
+/// trust boundary as consent for any other effect. Scheduled workflows never
+/// build one.
 pub trait ConsentSource {
-    /// The consent for exactly `effect` on `task` at `revision`, if given.
+    /// The consent for exactly `effect` on `task` at `revision`, if the person
+    /// gave it for the evidence with digest `observation`.
     fn consent(
         &self,
         task: &TaskId,
         effect: &Effect,
         revision: EvidenceRevision,
+        observation: &ExternalRef,
     ) -> Option<Consent>;
 }
 
@@ -665,7 +698,13 @@ pub trait ConsentSource {
 pub struct NoConsent;
 
 impl ConsentSource for NoConsent {
-    fn consent(&self, _: &TaskId, _: &Effect, _: EvidenceRevision) -> Option<Consent> {
+    fn consent(
+        &self,
+        _: &TaskId,
+        _: &Effect,
+        _: EvidenceRevision,
+        _: &ExternalRef,
+    ) -> Option<Consent> {
         None
     }
 }
@@ -677,7 +716,9 @@ impl ConsentSource for NoConsent {
 pub enum ReleaseOutcome {
     /// The backend released it in this call.
     Released,
-    /// Eligible, but no person has approved this exact evidence.
+    /// Eligible, but no person has approved this exact evidence. Only a
+    /// scheduled run reports it; an interactive run reports
+    /// [`Self::ConsentMissing`].
     NotApproved,
     /// The approval of this evidence is older than allowed; a person must
     /// approve it again.
@@ -687,7 +728,8 @@ pub enum ReleaseOutcome {
     /// Another run holds the release task, or an earlier release of this
     /// resource that another run holds.
     HeldElsewhere,
-    /// An interactive run had no consent for this release.
+    /// An interactive run had no consent for this release and this evidence.
+    /// Nothing was written: no task exists and the release bound is untouched.
     ConsentMissing,
     /// The backend did not apply the release.
     NotApplied(NotAppliedReason),
@@ -731,7 +773,9 @@ pub struct ApplyReport {
 }
 
 /// Reconcile interrupted releases, then release each eligible resource whose
-/// exact evidence a person approved with [`approve`]. Writes no marker.
+/// exact evidence a person approved with [`approve`] (a scheduled `claimant`)
+/// or consented to through `consents` (an interactive `claimant`, which needs
+/// no stored approval). Writes no marker.
 ///
 /// # Errors
 /// As [`inspect`]; [`CleanupError::GrantMismatch`] for a grant that is not
@@ -779,21 +823,32 @@ pub fn apply(
     // Decide what each eligible resource needs before acting on anything.
     let mut planned = Vec::with_capacity(eligible.len());
     for entry in eligible {
-        let plan = match approval(
-            inspector.store,
-            &entry.resource,
-            Step::Release,
-            &entry.observation,
-            options.max_approval_age,
-            clock.now(),
-        )? {
-            Approval::Missing => Plan::Report(ReleaseOutcome::NotApproved),
-            Approval::Expired => Plan::Report(ReleaseOutcome::ApprovalExpired),
-            Approval::Approved(approved_at) => Plan::Drive(release_task_id(
+        let plan = match claimant.trigger {
+            // A person present gives one consent per release, for exactly the
+            // evidence in this preview; that consent is the whole gate.
+            Trigger::Interactive => Plan::Drive(release_task_id(
                 &entry.observation,
-                approved_at,
+                preview.observed_at,
                 claimant.trigger,
             )?),
+            // Nobody is present, so a person's earlier approval of this
+            // evidence must stand in for them.
+            Trigger::Scheduled => match approval(
+                inspector.store,
+                &entry.resource,
+                Step::Release,
+                &entry.observation,
+                options.max_approval_age,
+                clock.now(),
+            )? {
+                Approval::Missing => Plan::Report(ReleaseOutcome::NotApproved),
+                Approval::Expired => Plan::Report(ReleaseOutcome::ApprovalExpired),
+                Approval::Approved(approved_at) => Plan::Drive(release_task_id(
+                    &entry.observation,
+                    approved_at,
+                    claimant.trigger,
+                )?),
+            },
         };
         planned.push((entry, plan));
     }
@@ -843,9 +898,16 @@ pub fn apply(
                 } else if attempted >= options.max_releases {
                     (None, ReleaseOutcome::Deferred)
                 } else {
-                    attempted = attempted.saturating_add(1);
                     let outcome = run.drive(task.clone(), &entry.resource, Some(entry))?;
-                    (Some(task), outcome)
+                    if outcome == ReleaseOutcome::ConsentMissing {
+                        // Declined before anything was written: no task, and
+                        // no share of the bound, so a person can refuse some
+                        // releases and still consent to others in one run.
+                        (None, outcome)
+                    } else {
+                        attempted = attempted.saturating_add(1);
+                        (Some(task), outcome)
+                    }
                 }
             }
         };
@@ -1057,26 +1119,44 @@ impl Run<'_> {
         let effect = Effect::Worker(Operation::ReleaseResource {
             resource: resource.clone(),
         });
-        let record = match store.task(&id) {
-            Ok(record) => record,
-            Err(Error::State(StateError::TaskNotFound(_))) if entry.is_some() => {
-                store.create_task(self.spec(&id, resource)?, self.claimant, self.clock.now())?;
-                store.task(&id)?
-            }
+        let existing = match store.task(&id) {
+            Ok(record) => Some(record),
+            Err(Error::State(StateError::TaskNotFound(_))) if entry.is_some() => None,
             Err(error) => return Err(error),
         };
+        // A settled task needs nothing more, least of all a consent.
+        if let Some(record) = &existing
+            && let TaskState::Settled { settlement, .. } = record.state()
+        {
+            return Ok(ReleaseOutcome::AlreadySettled(*settlement));
+        }
         // Consent is needed only where a release may run; recovery never
-        // starts one.
+        // starts one. It is asked for before anything is written, so a declined
+        // run leaves no task behind in the house's bounded store. A task that
+        // does not exist yet starts at the initial evidence revision.
         let consent = match (self.claimant.trigger, entry) {
             (Trigger::Scheduled, _) | (Trigger::Interactive, None) => None,
-            (Trigger::Interactive, Some(_)) => {
+            (Trigger::Interactive, Some(entry)) => {
+                let revision = existing
+                    .as_ref()
+                    .map_or(EvidenceRevision::INITIAL, |record| {
+                        record.evidence().revision()
+                    });
                 match self
                     .consents
-                    .consent(&id, &effect, record.evidence().revision())
+                    .consent(&id, &effect, revision, &entry.observation)
                 {
                     Some(consent) => Some(consent),
                     None => return Ok(ReleaseOutcome::ConsentMissing),
                 }
+            }
+        };
+        // Read again after the person answered: the record may have moved.
+        let record = match existing {
+            Some(_) => store.task(&id)?,
+            None => {
+                store.create_task(self.spec(&id, resource)?, self.claimant, self.clock.now())?;
+                store.task(&id)?
             }
         };
         let now = self.clock.now();
@@ -1231,20 +1311,19 @@ fn is_release_task(task: &TaskRecord) -> bool {
     task.spec().role == Role::Dishwasher && task.spec().id.as_str().starts_with(TASK_PREFIX)
 }
 
-/// The release task for one approved observation. The approval's time is
-/// part of the identity, so a renewed approval starts a new task while an
-/// interrupted run resumes the same one. So is the trigger: a scheduled and
-/// an interactive run hold different authority, and neither may inherit a
-/// task the other created.
-fn release_task_id(
-    observation: &ExternalRef,
-    approved_at: Timestamp,
-    trigger: Trigger,
-) -> Result<TaskId> {
+/// The release task for one observation. `at` is the approval's time for a
+/// scheduled run and the run's own time for an interactive one, whose consent
+/// is given per release: either way a new approval or a new run starts a new
+/// task, while an interrupted run resumes the same one (or, once its time has
+/// passed, is reconciled as an unfinished task first). The digest is part of
+/// the identity, so a consent minted for one release task names one piece of
+/// evidence. So is the trigger: a scheduled and an interactive run hold
+/// different authority, and neither may inherit a task the other created.
+fn release_task_id(observation: &ExternalRef, at: Timestamp, trigger: Trigger) -> Result<TaskId> {
     let mut digest = Sha256::new();
     digest.update(b"kitchen-dishwasher-release-v2\0");
     digest.update(observation.as_str().as_bytes());
-    digest.update(approved_at.as_unix_millis().to_be_bytes());
+    digest.update(at.as_unix_millis().to_be_bytes());
     digest.update(trigger.to_string().as_bytes());
     let hex = hex(digest.finalize().as_slice());
     let short = hex.get(..48).ok_or(CleanupError::Encoding)?;
@@ -2007,5 +2086,39 @@ fn serialize_age<S: Serializer>(
     match age {
         Some(age) => serializer.serialize_u64(u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
         None => serializer.serialize_none(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest_of(text: &str) -> Result<ExternalRef> {
+        Ok(ExternalRef::new(text)?)
+    }
+
+    #[test]
+    fn a_release_task_names_its_digest_time_and_trigger() -> Result<()> {
+        let first = digest_of("sha256:aaaa")?;
+        let at = Timestamp::from_unix_millis(1_000);
+        let id = release_task_id(&first, at, Trigger::Interactive)?;
+        assert!(id.as_str().starts_with(TASK_PREFIX));
+        // The same evidence at the same time by the same kind of run resumes
+        // the same task.
+        assert_eq!(release_task_id(&first, at, Trigger::Interactive)?, id);
+        // A consent minted for one release task cannot serve another piece of
+        // evidence, a later run or approval, or the other kind of run.
+        for other in [
+            release_task_id(&digest_of("sha256:bbbb")?, at, Trigger::Interactive)?,
+            release_task_id(
+                &first,
+                Timestamp::from_unix_millis(1_001),
+                Trigger::Interactive,
+            )?,
+            release_task_id(&first, at, Trigger::Scheduled)?,
+        ] {
+            assert_ne!(other, id);
+        }
+        Ok(())
     }
 }

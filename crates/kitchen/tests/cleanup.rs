@@ -1988,7 +1988,7 @@ fn an_interrupted_release_is_reconciled_not_repeated() -> TestResult {
     Ok(())
 }
 
-/// A person approving every release they are asked about.
+/// A person consenting to every release they are asked about.
 struct Approve(kitchen::HouseId);
 
 impl ConsentSource for Approve {
@@ -1997,6 +1997,7 @@ impl ConsentSource for Approve {
         task: &TaskId,
         effect: &Effect,
         revision: EvidenceRevision,
+        _: &ExternalRef,
     ) -> Option<Consent> {
         Some(Consent {
             id: ExternalRef::new(&format!("consent-{task}")).ok()?,
@@ -2009,17 +2010,67 @@ impl ConsentSource for Approve {
     }
 }
 
+/// A person who read a preview and consented to the steps whose digests they
+/// name, and to nothing else.
+struct ApproveDigests {
+    house: kitchen::HouseId,
+    digests: Vec<ExternalRef>,
+}
+
+impl ConsentSource for ApproveDigests {
+    fn consent(
+        &self,
+        task: &TaskId,
+        effect: &Effect,
+        revision: EvidenceRevision,
+        observation: &ExternalRef,
+    ) -> Option<Consent> {
+        self.digests
+            .contains(observation)
+            .then(|| Approve(self.house.clone()).consent(task, effect, revision, observation))?
+    }
+}
+
+/// The digests of every step `preview` would take.
+fn eligible_digests(preview: &Preview) -> Vec<ExternalRef> {
+    preview
+        .entries
+        .iter()
+        .filter(|entry| entry.eligible())
+        .map(|entry| entry.observation.clone())
+        .collect()
+}
+
 #[test]
 fn interactive_release_needs_consent_for_each_resource() -> TestResult {
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
-    harness.approve_all()?;
-    harness.clock.advance(60);
     let before = harness.backend.fake.effects_performed();
     let session = interactive("session")?;
     let refused = harness.apply_as(&grants()?, &session, &NoConsent)?;
     assert_eq!(
         outcome(&refused, &owned.worktree)?,
+        ReleaseOutcome::ConsentMissing
+    );
+    assert_eq!(harness.backend.fake.effects_performed(), before);
+    // Consent is asked before anything is written: a declined run leaves no
+    // release task behind to accumulate in the house's bounded store.
+    for result in &refused.results {
+        assert_eq!(result.task, None);
+    }
+    assert!(
+        harness.store().tasks()?.iter().all(|task| !task
+            .spec()
+            .id
+            .as_str()
+            .starts_with("dishwasher-")),
+        "a declined run created a task"
+    );
+    // A person's stored approval is for scheduled runs; it is not a consent.
+    harness.approve_all()?;
+    let still_refused = harness.apply_as(&grants()?, &session, &NoConsent)?;
+    assert_eq!(
+        outcome(&still_refused, &owned.worktree)?,
         ReleaseOutcome::ConsentMissing
     );
     assert_eq!(harness.backend.fake.effects_performed(), before);
@@ -2029,6 +2080,230 @@ fn interactive_release_needs_consent_for_each_resource() -> TestResult {
         ReleaseOutcome::Released
     );
     assert_eq!(outcome(&approved, &owned.worker)?, ReleaseOutcome::Released);
+    Ok(())
+}
+
+#[test]
+fn an_interactive_release_needs_no_stored_approval() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let before = harness.backend.fake.effects_performed();
+    // The person reads the preview, then consents to those digests.
+    let consents = ApproveDigests {
+        house: house()?,
+        digests: eligible_digests(&harness.inspect()?),
+    };
+    assert_eq!(consents.digests.len(), 2, "worker and worktree");
+    let report = harness.apply_as(&grants()?, &interactive("session")?, &consents)?;
+    assert_eq!(outcome(&report, &owned.worker)?, ReleaseOutcome::Released);
+    assert_eq!(outcome(&report, &owned.worktree)?, ReleaseOutcome::Released);
+    assert_eq!(harness.backend.fake.effects_performed(), before + 2);
+    // Nothing was approved before or recorded: the consent was the only gate.
+    assert!(harness.markers()?.is_empty());
+    // The release ran under the person's consent, not a standing grant.
+    for result in &report.results {
+        let task = harness.store().task(result.task.as_ref().ok_or("task")?)?;
+        assert!(task.effects().iter().all(|effect| matches!(
+            effect.authorization(),
+            kitchen::contracts::Authorization::Consent { .. }
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn a_consent_covers_only_the_evidence_the_person_previewed() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let previewed = eligible_digests(&harness.inspect()?);
+    // After the preview, a commit is pushed: still releasable, but different
+    // evidence, so the digest the person consented to no longer names it.
+    let path = harness.path(&owned.worktree)?.to_path_buf();
+    commit_locally(&path, "more.txt")?;
+    git(&path, &["push", "--quiet", "origin", "task-1"])?;
+    let before = harness.backend.fake.effects_performed();
+    let consents = ApproveDigests {
+        house: house()?,
+        digests: previewed,
+    };
+    let report = harness.apply_as(&grants()?, &interactive("session")?, &consents)?;
+    assert_eq!(
+        outcome(&report, &owned.worktree)?,
+        ReleaseOutcome::ConsentMissing
+    );
+    // The worker's evidence did not change, so its consent still holds.
+    assert_eq!(outcome(&report, &owned.worker)?, ReleaseOutcome::Released);
+    assert_eq!(harness.backend.fake.effects_performed(), before + 1);
+    assert!(
+        harness
+            .backend
+            .extra
+            .borrow()
+            .iter()
+            .any(|observation| observation.resource == owned.worktree)
+    );
+    // The person previews again and consents to what they now see.
+    let consents = ApproveDigests {
+        house: house()?,
+        digests: eligible_digests(&harness.inspect()?),
+    };
+    harness.clock.advance(1);
+    let report = harness.apply_as(&grants()?, &interactive("session")?, &consents)?;
+    assert_eq!(outcome(&report, &owned.worktree)?, ReleaseOutcome::Released);
+    Ok(())
+}
+
+/// A source that hands back a consent minted earlier for another release.
+struct Replay(Consent);
+
+impl ConsentSource for Replay {
+    fn consent(
+        &self,
+        _: &TaskId,
+        _: &Effect,
+        _: EvidenceRevision,
+        _: &ExternalRef,
+    ) -> Option<Consent> {
+        Some(self.0.clone())
+    }
+}
+
+#[test]
+fn a_consent_minted_for_another_release_is_refused() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let stale = Consent {
+        id: ExternalRef::new("consent-earlier")?,
+        given_by: kitchen::HolderId::new("david")?,
+        house: house()?,
+        task: TaskId::new("dishwasher-earlier-run")?,
+        effect: Effect::Worker(Operation::ReleaseResource {
+            resource: owned.worktree.clone(),
+        }),
+        revision: EvidenceRevision::INITIAL,
+    };
+    let before = harness.backend.fake.effects_performed();
+    let error = harness
+        .apply_as(&grants()?, &interactive("session")?, &Replay(stale))
+        .err()
+        .ok_or("a consent for another task released something")?;
+    assert_eq!(error.class(), ErrorClass::Refused);
+    assert_eq!(harness.backend.fake.effects_performed(), before);
+    assert!(
+        harness
+            .backend
+            .extra
+            .borrow()
+            .iter()
+            .any(|observation| observation.resource == owned.worktree)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_declined_interactive_release_can_be_consented_to_later() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let session = interactive("session")?;
+    let declined = harness.apply_as(&grants()?, &session, &NoConsent)?;
+    assert_eq!(
+        outcome(&declined, &owned.worktree)?,
+        ReleaseOutcome::ConsentMissing
+    );
+    // The evidence is unchanged and the person now consents: the earlier
+    // declined attempt neither blocks nor is reused.
+    harness.clock.advance(30);
+    let later = harness.apply_as(&grants()?, &session, &Approve(house()?))?;
+    assert_eq!(outcome(&later, &owned.worktree)?, ReleaseOutcome::Released);
+    assert_eq!(outcome(&later, &owned.worker)?, ReleaseOutcome::Released);
+    let unsettled = harness
+        .store()
+        .tasks()?
+        .into_iter()
+        .filter(|task| {
+            task.spec().id.as_str().starts_with("dishwasher-")
+                && !matches!(task.state(), kitchen::state::TaskState::Settled { .. })
+        })
+        .count();
+    assert_eq!(unsettled, 0, "the declined attempts were settled");
+    Ok(())
+}
+
+#[test]
+fn declined_releases_do_not_use_up_the_release_bound() -> TestResult {
+    let mut harness = Harness::new()?;
+    harness.owner("task-1", true)?;
+    let wanted = harness.owner("task-2", true)?;
+    let preview = harness.inspect()?;
+    let digest = preview
+        .entry(&wanted.worktree)
+        .ok_or("worktree")?
+        .observation
+        .clone();
+    // The person consents to one resource, which the inventory lists last.
+    let consents = ApproveDigests {
+        house: house()?,
+        digests: vec![digest],
+    };
+    let mut bounded = options()?;
+    bounded.max_releases = 1;
+    let before = harness.backend.fake.effects_performed();
+    let report = apply(
+        &harness.inspector(),
+        &grants()?,
+        &interactive("session")?,
+        &consents,
+        &bounded,
+        &harness.clock,
+    )?;
+    assert_eq!(
+        outcome(&report, &wanted.worktree)?,
+        ReleaseOutcome::Released
+    );
+    // Everything the person did not consent to was declined, not deferred.
+    let declined = report
+        .results
+        .iter()
+        .filter(|result| result.outcome == ReleaseOutcome::ConsentMissing)
+        .count();
+    assert_eq!(declined, 3, "{:?}", report.results);
+    assert_eq!(harness.backend.fake.effects_performed(), before + 1);
+    Ok(())
+}
+
+#[test]
+fn an_interrupted_interactive_release_is_reconciled_by_the_next_run() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let session = interactive("session")?;
+    let before = harness.backend.fake.effects_performed();
+    // The first release is applied but its response is lost.
+    harness
+        .backend
+        .fake
+        .inject(ExecuteFault::ApplyThenLoseResponse);
+    let partial = harness.apply_as(&grants()?, &session, &Approve(house()?))?;
+    let uncertain = partial
+        .results
+        .iter()
+        .find(|result| result.outcome == ReleaseOutcome::Uncertain)
+        .ok_or("no uncertain release")?;
+    let task = uncertain.task.clone().ok_or("task")?;
+    let resource = uncertain.resource.clone();
+    let performed = harness.backend.fake.effects_performed();
+    assert_eq!(performed, before + 2);
+
+    // A later session, later evidence: the earlier release is looked up and
+    // settled, never sent again, and asks nobody for consent again.
+    harness.clock.advance(400);
+    let recovered = harness.apply_as(&grants()?, &session, &Approve(house()?))?;
+    assert_eq!(outcome(&recovered, &resource)?, ReleaseOutcome::Released);
+    assert!(matches!(
+        harness.store().task(&task)?.state(),
+        kitchen::state::TaskState::Settled { .. }
+    ));
+    assert_eq!(harness.backend.fake.effects_performed(), performed);
+    let _ = owned;
     Ok(())
 }
 

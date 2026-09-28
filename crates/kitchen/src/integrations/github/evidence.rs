@@ -132,7 +132,8 @@ pub struct TimelineEvent {
     /// Provider event kind.
     pub event: TimelineKind,
     /// Event timestamp, if supplied.
-    pub created_at: Option<String>,
+    #[serde(default, deserialize_with = "optional_timestamp")]
+    pub created_at: Option<Timestamp>,
     /// Actor, if supplied.
     pub actor: Option<User>,
     /// Label involved in a label event.

@@ -1900,10 +1900,7 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
                     {
                         return None;
                     }
-                    Some((
-                        parse_provider_time(event.created_at.as_deref()?)?,
-                        event.actor?.login,
-                    ))
+                    Some((event.created_at?, event.actor?.login))
                 })
                 .max_by_key(|(at, _)| *at)
         })
@@ -2172,17 +2169,10 @@ fn review_unavailable(body: Option<&str>) -> bool {
     .iter()
     .any(|phrase| lower.contains(phrase))
 }
-/// Parse a provider RFC 3339 time; instants before the Unix epoch are unknown.
-fn parse_provider_time(value: &str) -> Option<Timestamp> {
-    let date =
-        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()?;
-    let millis = u64::try_from(date.unix_timestamp_nanos() / 1_000_000).ok()?;
-    Some(Timestamp::from_unix_millis(millis))
-}
 
 #[cfg(test)]
 mod tests {
-    use super::{Timestamp, parse_provider_time, review_unavailable};
+    use super::review_unavailable;
     #[test]
     fn quota_and_skip_wording_is_unavailable_but_findings_are_not() {
         assert!(review_unavailable(Some(
@@ -2196,19 +2186,5 @@ mod tests {
         )));
         assert!(!review_unavailable(Some("")));
         assert!(!review_unavailable(None));
-    }
-    #[test]
-    fn provider_time_is_rfc3339_after_the_epoch() {
-        assert_eq!(
-            parse_provider_time("1970-01-01T00:00:00Z"),
-            Some(Timestamp::from_unix_millis(0))
-        );
-        assert_eq!(
-            parse_provider_time("2026-09-28T16:00:00+02:00"),
-            Some(Timestamp::from_unix_millis(1_790_604_000_000))
-        );
-        assert!(parse_provider_time("2025-02-29T00:00:00Z").is_none());
-        assert!(parse_provider_time("1969-12-31T23:59:59Z").is_none());
-        assert!(parse_provider_time("yesterday").is_none());
     }
 }

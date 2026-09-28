@@ -24,6 +24,7 @@ The policy is a reviewed JSON document registered with `kitchn house init`.
 | `requiredChecks` | Checks every change needs. |
 | `grants` | Standing, repository-scoped grants with explicit backend and credential identifiers. |
 | `policyLimits` | Limits kept separate from grants. |
+| `mergeReadiness` | Optional. The readiness level (`checked`, `reliable` or `covered`) each work type must reach before a merge grant. Readiness never grants merge authority. |
 
 Permission given during an interactive session is never promoted into a
 standing grant.

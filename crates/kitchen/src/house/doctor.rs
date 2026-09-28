@@ -1,6 +1,7 @@
 use super::{
-    HouseError, LabelPreview, LabelStatus, RepositoryConfig, RepositoryLabel, StackTool, Workflow,
-    missing_capabilities, preview_labels, workflow_requirements,
+    Assessed, HouseError, LabelPreview, LabelStatus, ReadinessEvidence, RepositoryConfig,
+    RepositoryLabel, RepositoryReadiness, StackTool, Workflow, assess, missing_capabilities,
+    preview_labels, workflow_requirements,
 };
 use crate::{
     HouseId,
@@ -48,6 +49,9 @@ pub struct DoctorEvidence {
     /// The house's schedules and their recent runs; `None` means not observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedules: Option<ScheduleEvidence>,
+    /// Repository readiness observations; `None` reports every fact as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ReadinessEvidence>,
 }
 
 /// Whether the house's stack tool is usable on this host.
@@ -95,6 +99,8 @@ pub enum DoctorCode {
     ScheduleBudget,
     /// A schedule's precheck mostly reports idle; a recommendation only.
     IdleSchedule,
+    /// A work type is below the readiness house policy requires for a merge grant.
+    Readiness,
 }
 impl DoctorFinding {
     /// Report a leftover legacy binding file. Kitchen never deletes it.
@@ -127,6 +133,8 @@ pub struct DoctorReport {
     pub missing_capabilities: BTreeMap<Workflow, BTreeSet<Capability>>,
     /// Scoped access observation.
     pub access: AccessStatus,
+    /// Diagnostic merge readiness; it never grants merge authority.
+    pub readiness: RepositoryReadiness,
     /// Every known incomplete setup item and its next step.
     pub findings: Vec<DoctorFinding>,
     /// Suggestions that do not make setup incomplete, such as mostly idle
@@ -172,6 +180,37 @@ impl DoctorReport {
                 "\nRecommendation: {}\nConsider: {}\n",
                 recommendation.message, recommendation.next_step
             ));
+        }
+        text.push_str(&format!(
+            "\nReadiness: {} (diagnostic; grants no merge authority)\n",
+            self.readiness.level.as_str()
+        ));
+        text.push_str(&format!(
+            "Required checks: {}\n",
+            match &self.readiness.required_checks {
+                Assessed::Known(checks) if checks.is_empty() => "none".to_owned(),
+                Assessed::Known(checks) => checks.iter().cloned().collect::<Vec<_>>().join(", "),
+                Assessed::Unknown => "unknown".to_owned(),
+            }
+        ));
+        for (check, history) in &self.readiness.check_history {
+            match history {
+                Assessed::Known(history) => text.push_str(&format!(
+                    "Check {check}: {} passed, {} failed, {} inconclusive, {} flaky head(s)\n",
+                    history.passed, history.failed, history.inconclusive, history.flaky_heads
+                )),
+                Assessed::Unknown => text.push_str(&format!("Check {check}: history unknown\n")),
+            }
+        }
+        for work_type in self.readiness.acceptance_checks.keys() {
+            text.push_str(&format!(
+                "Work type {}: {}\n",
+                work_type.as_str(),
+                self.readiness.level_for(work_type).as_str()
+            ));
+        }
+        for gap in &self.readiness.gaps {
+            text.push_str(&format!("{}\nNext: {}\n", gap.message(), gap.next_step()));
         }
         if let Some(instructions) = &self.instructions {
             text.push_str(&format!(
@@ -287,6 +326,17 @@ pub fn doctor(
         evidence.and_then(|evidence| evidence.schedules.as_ref()),
         &mut findings,
     )?;
+    let readiness = assess(
+        &house,
+        repository,
+        evidence.and_then(|evidence| evidence.readiness.as_ref()),
+    )?;
+    for (work_type, required) in &house.merge_readiness {
+        let assessed = readiness.level_for(work_type);
+        if assessed < *required {
+            findings.push(DoctorFinding { code: DoctorCode::Readiness, message: format!("Work type {} requires {} readiness before a merge grant; assessed {}.", work_type.as_str(), required.as_str(), assessed.as_str()), next_step: "Close the readiness gaps below and rerun doctor, or keep merges for this work type manual. An owner can proceed below the level only with a recorded reason; readiness never grants merge authority.".into() });
+        }
+    }
     let access = evidence.map_or(AccessStatus::Unobserved, |evidence| evidence.access);
     if access != AccessStatus::Available {
         findings.push(DoctorFinding { code: DoctorCode::Access, message: format!("House-scoped repository access: {access:?}."), next_step: format!("Configure {} access in the external credential provider, then probe {} through the house-scoped integration and rerun doctor; never put credential values in repository files.", house.house, repository.repository) });
@@ -298,6 +348,7 @@ pub fn doctor(
         labels,
         missing_capabilities,
         access,
+        readiness,
         findings,
         recommendations,
     })

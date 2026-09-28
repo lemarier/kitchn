@@ -63,6 +63,23 @@ pub enum HouseError {
     /// A bounded Git read failed; nothing was decided from it.
     #[error("git could not be read: {0}")]
     Git(crate::git::GitReadError),
+    /// A merge grant was attempted below the house's required readiness.
+    #[error(
+        "repository readiness {} is below the required {}; record an owner decision with a reason to proceed",
+        assessed.as_str(),
+        required.as_str()
+    )]
+    BelowReadiness {
+        /// Level house policy requires.
+        required: super::ReadinessLevel,
+        /// Assessed level.
+        assessed: super::ReadinessLevel,
+    },
+    /// An owner decision does not match the assessed scope or levels.
+    #[error(
+        "readiness decision does not match this house, repository, work type, or assessed level"
+    )]
+    ReadinessDecision,
     /// Bounded filesystem I/O failed.
     #[error("house storage operation failed ({0:?})")]
     Io(std::io::ErrorKind),
@@ -81,7 +98,9 @@ impl HouseError {
             | Self::PinMismatch
             | Self::RepositoryUnidentified
             | Self::AmbiguousHouse { .. }
-            | Self::RemotesDisagree { .. } => ErrorClass::Refused,
+            | Self::RemotesDisagree { .. }
+            | Self::BelowReadiness { .. }
+            | Self::ReadinessDecision => ErrorClass::Refused,
             Self::Conflict | Self::Conflicts(_) | Self::LegacyChanged | Self::Busy => {
                 ErrorClass::Conflict
             }

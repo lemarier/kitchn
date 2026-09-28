@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::{HouseError, Workflow};
+use super::{HouseError, ReadinessLevel, Workflow, readiness::validate_work_type};
 use crate::{
     HouseId,
-    contracts::{CommitId, Grant, HouseGrants, Repository},
+    contracts::{CommitId, Grant, HouseGrants, Repository, Text},
     scheduling::{BudgetError, SchedulePolicy},
     selection::{AgentPolicy, SelectionError},
 };
@@ -65,6 +65,10 @@ pub struct HouseConfig {
     /// schedule installs are not limited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedules: Option<SchedulePolicy>,
+    /// Readiness level each work type must reach before a merge grant.
+    /// Readiness never grants merge authority itself.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub merge_readiness: BTreeMap<Text, ReadinessLevel>,
 }
 
 impl HouseConfig {
@@ -76,11 +80,15 @@ impl HouseConfig {
             || !self.posting_destinations.is_subset(&self.repositories)
             || self.grants.len() > 256
             || self.policy_limits.len() > 256
+            || self.merge_readiness.len() > super::MAX_WORK_TYPES
         {
             return Err(HouseError::InvalidInput);
         }
         validate_names(&self.required_reviewers)?;
         validate_names(&self.required_checks)?;
+        for work_type in self.merge_readiness.keys() {
+            validate_work_type(work_type)?;
+        }
         if let Some(agents) = &self.agents {
             agents.validate(&self.repositories).map_err(|error| {
                 if error == SelectionError::RepositoryNotServed {
@@ -239,7 +247,7 @@ pub fn resolve_house<'a>(
     Ok(house)
 }
 
-fn validate_names(names: &BTreeSet<String>) -> Result<(), HouseError> {
+pub(super) fn validate_names(names: &BTreeSet<String>) -> Result<(), HouseError> {
     if names.len() > 64
         || names
             .iter()

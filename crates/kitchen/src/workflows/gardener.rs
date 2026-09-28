@@ -1,34 +1,199 @@
-//! Independent daily issue hygiene policy. The schedule owner supplies an
-//! inventory; this workflow only previews changes under separate house grants.
+//! Independent daily issue hygiene policy. [`install`] declares the paused
+//! daily schedule and its precheck; this workflow only previews changes under
+//! separate house grants.
+
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use super::{ClaimState, Precheck, WorkflowError, known, valid_label};
 use crate::{
-    BackendId, HouseId,
+    BackendId, ConsumerId, CredentialId, HouseId,
     contracts::{
-        Capability, CloseReason, ContractError, GitHubAction, Grant, GrantScope, HouseGrants,
-        IssueNumber, Permission, Repository, Timestamp,
+        Capability, CloseReason, ContractError, Effect, ExternalRef, GitHubAction, Grant,
+        GrantScope, HouseGrants, IssueNumber, Permission, Repository, ScheduleEffect, Text,
+        Timestamp,
     },
     integrations::github::{GitHubClient, GitHubReadTransport, IssueState},
+    scheduling::{
+        self, AgentFamily, PrecheckTimeout, Recurrence, ScheduleSpec, TimeOfDay, Timezone,
+        WorkflowName,
+    },
 };
 
-/// Portable declaration until #6's schedule payload accepts a workflow owner
-/// and typed precheck binding. This declaration cannot activate a live job.
+/// The workflow name the gardener schedule runs under.
+pub const WORKFLOW: &str = "gardener";
+
+/// Bound on one precheck run: an identity check and two bounded inventory
+/// reads, each limited by the client's read timeout.
+const PRECHECK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Longest change lookback, one week.
+const MAX_LOOKBACK_HOURS: u16 = 7 * 24;
+/// Longest staleness cutoff, one year.
+const MAX_STALE_DAYS: u16 = 365;
+
+/// How far back a precheck looks for changes and how old an untouched open
+/// issue must be to count as stale. A lookback longer than the schedule's
+/// period re-reads a missed day instead of skipping it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Schedule {
-    /// Stable workflow owner.
-    pub owner: &'static str,
-    /// Cadence selected by the house scheduler.
-    pub cadence: &'static str,
-    /// Stable typed precheck name.
-    pub precheck: &'static str,
+pub struct PrecheckWindow {
+    lookback_hours: u16,
+    stale_days: u16,
 }
 
-/// Gardener's independent daily schedule.
-pub const SCHEDULE: Schedule = Schedule {
-    owner: "gardener",
-    cadence: "daily",
-    precheck: "gardener-hygiene",
-};
+impl PrecheckWindow {
+    /// A lookback of 1–168 hours and a staleness cutoff of 1–365 days that
+    /// is at least as old as the lookback.
+    ///
+    /// # Errors
+    /// Refuses values outside those bounds.
+    pub fn new(lookback_hours: u16, stale_days: u16) -> Result<Self, WorkflowError> {
+        let valid = (1..=MAX_LOOKBACK_HOURS).contains(&lookback_hours)
+            && (1..=MAX_STALE_DAYS).contains(&stale_days)
+            && u32::from(stale_days) * 24 >= u32::from(lookback_hours);
+        if valid {
+            Ok(Self {
+                lookback_hours,
+                stale_days,
+            })
+        } else {
+            Err(WorkflowError::IncompleteEvidence)
+        }
+    }
+
+    /// The inventory window ending at `now`. Cutoffs before the epoch start
+    /// at zero.
+    ///
+    /// # Errors
+    /// None for a validated window; kept fallible because [`Window::new`] is.
+    pub fn window(self, now: Timestamp) -> Result<Window, WorkflowError> {
+        let before = |hours: u64| {
+            Timestamp::from_unix_millis(
+                now.as_unix_millis()
+                    .saturating_sub(hours.saturating_mul(3_600_000)),
+            )
+        };
+        Window::new(
+            before(u64::from(self.lookback_hours)),
+            before(u64::from(self.stale_days) * 24),
+        )
+    }
+}
+
+/// Everything the scheduled precheck needs, rendered as its argument vector
+/// for `kitchen gardener precheck`. Paths are absolute because the backend
+/// runs the precheck outside any checkout. The credential file path is
+/// recorded in the schedule; the token itself never is.
+#[derive(Debug, Clone)]
+pub struct PrecheckArgs {
+    /// The installed `kitchen` executable.
+    pub kitchen: PathBuf,
+    /// The house.
+    pub house: HouseId,
+    /// The repository to inspect.
+    pub repository: Repository,
+    /// The authenticated GitHub login the credential must belong to.
+    pub requester: ExternalRef,
+    /// The house's read credential name.
+    pub credential: CredentialId,
+    /// The private file holding that credential.
+    pub credential_file: PathBuf,
+    /// The GitHub CLI executable.
+    pub gh: PathBuf,
+    /// House agent labels.
+    pub labels: AgentLabels,
+    /// Lookback and staleness bounds.
+    pub window: PrecheckWindow,
+}
+
+impl PrecheckArgs {
+    /// The precheck's argument vector.
+    ///
+    /// # Errors
+    /// Refuses a relative or non-UTF-8 path and invalid or equal labels.
+    pub fn argv(&self) -> Result<Vec<Text>, WorkflowError> {
+        if !labels_valid(&self.labels) {
+            return Err(WorkflowError::IncompleteEvidence);
+        }
+        let lookback = self.window.lookback_hours.to_string();
+        let stale = self.window.stale_days.to_string();
+        [
+            absolute(&self.kitchen)?,
+            "gardener",
+            "precheck",
+            "--house",
+            self.house.as_str(),
+            "--repository",
+            self.repository.as_str(),
+            "--requester",
+            self.requester.as_str(),
+            "--credential",
+            self.credential.as_str(),
+            "--credential-file",
+            absolute(&self.credential_file)?,
+            "--gh",
+            absolute(&self.gh)?,
+            "--ready-label",
+            &self.labels.ready,
+            "--working-label",
+            &self.labels.working,
+            "--lookback-hours",
+            &lookback,
+            "--stale-days",
+            &stale,
+        ]
+        .into_iter()
+        .map(|arg| Text::new(arg).map_err(|_| WorkflowError::IncompleteEvidence))
+        .collect()
+    }
+}
+
+fn absolute(path: &Path) -> Result<&str, WorkflowError> {
+    path.is_absolute()
+        .then(|| path.to_str())
+        .flatten()
+        .ok_or(WorkflowError::IncompleteEvidence)
+}
+
+/// The effect that installs the gardener's daily schedule for `consumer`,
+/// paused. There is no gardener path that activates it: turning it on is a
+/// separate schedule effect under its own permission.
+///
+/// # Errors
+/// Refuses invalid precheck arguments.
+pub fn install(
+    consumer: ConsumerId,
+    at: TimeOfDay,
+    timezone: Timezone,
+    agent: AgentFamily,
+    precheck: &PrecheckArgs,
+) -> Result<Effect, WorkflowError> {
+    let invalid = |_| WorkflowError::IncompleteEvidence;
+    let check = scheduling::Precheck::new(
+        precheck.argv()?,
+        PrecheckTimeout::new(PRECHECK_TIMEOUT).map_err(invalid)?,
+    )
+    .map_err(invalid)?;
+    let prompt = Text::new(&format!(
+        "Run the Kitchen gardener hygiene pass for {} in house {}. Preview findings only; every label change, dependency link, or close needs its own house grant.",
+        precheck.repository, precheck.house
+    ))
+    .map_err(|_| WorkflowError::IncompleteEvidence)?;
+    let schedule = ScheduleSpec::new(
+        WorkflowName::new(WORKFLOW).map_err(invalid)?,
+        consumer,
+        Recurrence::Daily(at),
+        timezone,
+        prompt,
+        agent,
+    )
+    .with_precheck(check);
+    Ok(Effect::Schedule(ScheduleEffect::InstallDisabled {
+        schedule,
+    }))
+}
 
 /// Required backend support before scheduling is permitted.
 pub const REQUIRED_CAPABILITIES: [Capability; 4] = [
@@ -74,6 +239,24 @@ pub struct AgentLabels {
     pub ready: String,
     /// Label mirrored from a durable claim.
     pub working: String,
+}
+
+impl AgentLabels {
+    /// Check both labels are valid and distinct.
+    ///
+    /// # Errors
+    /// Refuses an invalid or shared label.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if labels_valid(self) {
+            Ok(())
+        } else {
+            Err(WorkflowError::IncompleteEvidence)
+        }
+    }
+}
+
+fn labels_valid(labels: &AgentLabels) -> bool {
+    valid_label(&labels.ready) && valid_label(&labels.working) && labels.ready != labels.working
 }
 
 /// Why the independent gardener should inspect a repository.
@@ -232,10 +415,7 @@ pub fn plan(
     labels: &AgentLabels,
     close: Option<&CloseAuthority>,
 ) -> Result<Vec<Finding>, WorkflowError> {
-    if !valid_label(&labels.ready)
-        || !valid_label(&labels.working)
-        || labels.ready == labels.working
-    {
+    if !labels_valid(labels) {
         return Err(WorkflowError::IncompleteEvidence);
     }
     if close.is_some_and(|authority| &authority.repository != repository) {

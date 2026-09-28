@@ -1,7 +1,13 @@
 //! Evidence based needs-spec decisions. Callers collect complete, bounded
 //! issue history and code evidence; this module never reads an Orca session.
 
-use std::num::NonZeroU64;
+use std::{
+    fmt::Write as _,
+    num::{NonZeroU32, NonZeroU64},
+};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{ClaimState, Precheck, WorkflowError, known, valid_label};
 use crate::{
@@ -16,8 +22,8 @@ use crate::{
     },
     integrations::roger::{DecisionStatus, RogerClient, RogerReadTransport},
     state::{
-        HouseStore, IssueRevision, MarkerFact, MarkerKey, MarkerRecording, MarkerSubject,
-        StateError, WorkItem,
+        HouseStore, IssueRevision, MarkerFact, MarkerKey, MarkerRecording, MarkerSchema,
+        MarkerSubject, StateError, WorkItem,
     },
 };
 
@@ -198,15 +204,10 @@ pub struct Evidence {
     pub open_dependencies: bool,
     /// Factual resolution.
     pub factual_resolution: Option<String>,
-    /// Resolution already posted.
-    pub resolution_already_posted: bool,
     /// Pending product questions.
     pub pending_product_questions: u32,
     /// Existing decisions.
     pub existing_decisions: Vec<Decision>,
-    /// Revisions at which a question about this issue was already asked.
-    /// [`plan_with_markers`] replaces it from the durable marker store.
-    pub asked_at: Vec<IssueRevision>,
     /// Ready label present.
     pub ready_label_present: bool,
     /// House-configured ready label.
@@ -215,8 +216,8 @@ pub struct Evidence {
     pub needs_spec_label: String,
 }
 
-/// Reads durable no-repeat question state for one issue. A missing or failed
-/// read is an error, never an empty history.
+/// Reads durable no-repeat state for one issue. A missing or failed read is
+/// an error, never an empty history.
 pub trait MarkerView {
     /// Every revision at which a question about `issue` was asked.
     fn asked(
@@ -224,6 +225,69 @@ pub trait MarkerView {
         repository: &Repository,
         issue: IssueNumber,
     ) -> Result<Vec<IssueRevision>, WorkflowError>;
+
+    /// Whether this exact `resolution` was already posted on `issue`, at any
+    /// revision. Posting a comment moves the revision, so the lookup cannot
+    /// be keyed by the current one.
+    fn resolution_posted(
+        &self,
+        repository: &Repository,
+        issue: IssueNumber,
+        resolution: &str,
+    ) -> Result<bool, WorkflowError>;
+}
+
+/// What earlier passes did about one issue, read only through a
+/// [`MarkerView`] so callers cannot assert it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct History {
+    asked_at: Vec<IssueRevision>,
+    resolution_posted: bool,
+}
+
+impl History {
+    /// Read `evidence`'s issue history from `markers`.
+    ///
+    /// # Errors
+    /// Returns the view's error; a failed read never becomes empty history.
+    pub fn read(markers: &impl MarkerView, evidence: &Evidence) -> Result<Self, WorkflowError> {
+        let resolution_posted = match &evidence.factual_resolution {
+            Some(body) => markers.resolution_posted(&evidence.repository, evidence.issue, body)?,
+            None => false,
+        };
+        Ok(Self {
+            asked_at: markers.asked(&evidence.repository, evidence.issue)?,
+            resolution_posted,
+        })
+    }
+}
+
+/// Schema of the triage marker recording a posted resolution.
+const RESOLUTION_SCHEMA: &str = "triage.resolution";
+
+/// The posted resolution, identified by its SHA-256 digest so issue text is
+/// not copied into the store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolutionPosted {
+    digest: String,
+}
+
+impl ResolutionPosted {
+    fn of(body: &str) -> Self {
+        let digest = Sha256::digest(body.trim().as_bytes());
+        let mut hex = String::with_capacity(64);
+        for byte in digest {
+            // Writing to a String cannot fail.
+            let _ = write!(hex, "{byte:02x}");
+        }
+        Self { digest: hex }
+    }
+}
+
+fn resolution_schema() -> Result<MarkerSchema, WorkflowError> {
+    MarkerSchema::new(RESOLUTION_SCHEMA, NonZeroU32::MIN)
+        .map_err(|_| WorkflowError::IncompleteEvidence)
 }
 
 /// Question markers in the house store, keyed by workflow, issue, and
@@ -272,6 +336,36 @@ impl MarkerView for IssueMarkers<'_> {
             })
             .collect()
     }
+
+    fn resolution_posted(
+        &self,
+        repository: &Repository,
+        issue: IssueNumber,
+        resolution: &str,
+    ) -> Result<bool, WorkflowError> {
+        let item = work_item(repository, issue)?;
+        let schema = resolution_schema()?;
+        let wanted = ResolutionPosted::of(resolution);
+        let markers = self
+            .store
+            .markers(&self.workflow)
+            .map_err(|_| WorkflowError::PrecheckFailed)?;
+        let mut posted = false;
+        for marker in markers.iter().filter(|marker| marker.key().item == item) {
+            match marker.fact() {
+                MarkerFact::QuestionAsked { .. } => {}
+                // Any other fact under the triage workflow is unexpected; it
+                // proves neither outcome, so the pass stops.
+                fact @ (MarkerFact::Workflow { .. } | MarkerFact::Verdict { .. }) => {
+                    let recorded: ResolutionPosted = fact
+                        .decode(&schema)
+                        .map_err(|_| WorkflowError::IncompleteEvidence)?;
+                    posted |= recorded == wanted;
+                }
+            }
+        }
+        Ok(posted)
+    }
 }
 
 /// Record that `question` was asked about `issue` at `revision`. Recording
@@ -296,13 +390,56 @@ pub fn record_question(
         item: work_item(repository, issue)?,
         subject: MarkerSubject::Issue(revision.clone()),
     };
+    record(
+        store,
+        key,
+        MarkerFact::QuestionAsked { question },
+        recorded_by,
+        now,
+    )
+}
+
+/// Record that `resolution` was posted on `issue` after being judged at
+/// `revision`. Record it before submitting the comment effect, which owns
+/// delivery and reconciliation; the marker then outlives the revision change
+/// the comment causes. Recording the same text again changes nothing; other
+/// text at the same judged revision is refused.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each value is part of the durable marker key or its provenance"
+)]
+pub fn record_resolution(
+    store: &HouseStore,
+    workflow: &WorkflowId,
+    repository: &Repository,
+    issue: IssueNumber,
+    revision: &IssueRevision,
+    resolution: &str,
+    recorded_by: &Claimant,
+    now: Timestamp,
+) -> Result<MarkerRecording, WorkflowError> {
+    if resolution.trim().is_empty() {
+        return Err(WorkflowError::IncompleteEvidence);
+    }
+    let key = MarkerKey {
+        workflow: workflow.clone(),
+        item: work_item(repository, issue)?,
+        subject: MarkerSubject::Issue(revision.clone()),
+    };
+    let fact = MarkerFact::workflow(resolution_schema()?, &ResolutionPosted::of(resolution))
+        .map_err(|_| WorkflowError::IncompleteEvidence)?;
+    record(store, key, fact, recorded_by, now)
+}
+
+fn record(
+    store: &HouseStore,
+    key: MarkerKey,
+    fact: MarkerFact,
+    recorded_by: &Claimant,
+    now: Timestamp,
+) -> Result<MarkerRecording, WorkflowError> {
     store
-        .record_marker(
-            key,
-            MarkerFact::QuestionAsked { question },
-            recorded_by,
-            now,
-        )
+        .record_marker(key, fact, recorded_by, now)
         .map_err(|error| match error {
             crate::Error::State(StateError::MarkerConflict) => WorkflowError::DecisionMismatch,
             _ => WorkflowError::PrecheckFailed,
@@ -320,9 +457,7 @@ pub fn plan_with_markers(
     if evidence.claim == ClaimState::Unknown {
         return Err(WorkflowError::IncompleteEvidence);
     }
-    let mut current = evidence.clone();
-    current.asked_at = markers.asked(&current.repository, current.issue)?;
-    plan(&current)
+    plan(evidence, &History::read(markers, evidence)?)
 }
 
 /// Changes to preview; the caller persists and executes each typed effect only
@@ -343,8 +478,11 @@ pub enum Change {
 /// Request bounded judgment when evidence alone cannot resolve the issue or
 /// identify a concrete product question. The store must claim the issue and
 /// persist this effect before any backend launch.
-pub fn judgment_request(evidence: &Evidence) -> Result<Option<Operation>, WorkflowError> {
-    if precheck(evidence)? == Precheck::Idle
+pub fn judgment_request(
+    evidence: &Evidence,
+    history: &History,
+) -> Result<Option<Operation>, WorkflowError> {
+    if precheck(evidence, history)? == Precheck::Idle
         || evidence.factual_resolution.is_some()
         || evidence.pending_product_questions > 0
         || !evidence.existing_decisions.is_empty()
@@ -371,7 +509,7 @@ pub fn judgment_request(evidence: &Evidence) -> Result<Option<Operation>, Workfl
 }
 
 /// No changes means an idle pass. There is never a repeated informational comment.
-pub fn precheck(evidence: &Evidence) -> Result<Precheck, WorkflowError> {
+pub fn precheck(evidence: &Evidence, history: &History) -> Result<Precheck, WorkflowError> {
     if !evidence.coverage.is_complete()
         || !valid_label(&evidence.ready_label)
         || !valid_label(&evidence.needs_spec_label)
@@ -391,7 +529,7 @@ pub fn precheck(evidence: &Evidence) -> Result<Precheck, WorkflowError> {
         .any(|decision| decision.state != DecisionState::Answered);
     let pending_resolution = evidence.needs_spec
         && evidence.factual_resolution.is_some()
-        && (!evidence.resolution_already_posted
+        && (!history.resolution_posted
             || !evidence.ready_label_present && !unresolved && !evidence.open_dependencies
             || evidence.needs_spec && evidence.ready_label_present);
     if evidence.changed_since_last_pass || pending_resolution {
@@ -403,8 +541,8 @@ pub fn precheck(evidence: &Evidence) -> Result<Precheck, WorkflowError> {
 
 /// Plan one pass. An answered decision is useful only at the exact revision;
 /// unresolved or expired questions never promote readiness.
-pub fn plan(evidence: &Evidence) -> Result<Vec<Change>, WorkflowError> {
-    if precheck(evidence)? == Precheck::Idle {
+pub fn plan(evidence: &Evidence, history: &History) -> Result<Vec<Change>, WorkflowError> {
+    if precheck(evidence, history)? == Precheck::Idle {
         return Ok(Vec::new());
     }
     if evidence.existing_decisions.iter().any(|decision| {
@@ -422,14 +560,14 @@ pub fn plan(evidence: &Evidence) -> Result<Vec<Change>, WorkflowError> {
         .iter()
         .any(|decision| decision.state != DecisionState::Answered);
     let mut changes = Vec::new();
-    if let Some(operation) = judgment_request(evidence)? {
+    if let Some(operation) = judgment_request(evidence, history)? {
         changes.push(Change::Judgment(operation));
     }
     if let Some(body) = &evidence.factual_resolution {
         if body.trim().is_empty() {
             return Err(WorkflowError::IncompleteEvidence);
         }
-        if !evidence.resolution_already_posted {
+        if !history.resolution_posted {
             changes.push(Change::Mutation(GitHubAction::PostComment {
                 issue: evidence.issue,
                 body: crate::contracts::Text::new(body)
@@ -439,11 +577,11 @@ pub fn plan(evidence: &Evidence) -> Result<Vec<Change>, WorkflowError> {
     }
     // One ask per issue revision batches its questions, so a marker keyed by
     // the revision prevents repeating it. Prior asks count toward the budget.
-    let asked = u32::try_from(evidence.asked_at.len()).unwrap_or(u32::MAX);
+    let asked = u32::try_from(history.asked_at.len()).unwrap_or(u32::MAX);
     if evidence.factual_resolution.is_none()
         && evidence.pending_product_questions > 0
         && evidence.existing_decisions.is_empty()
-        && !evidence.asked_at.contains(&evidence.revision)
+        && !history.asked_at.contains(&evidence.revision)
         && asked < MAX_ASKS_PER_TASK
     {
         changes.push(Change::Ask { ordinal: asked });

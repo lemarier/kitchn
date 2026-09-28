@@ -245,14 +245,43 @@ fn triage_input() -> triage::Evidence {
         claim: ClaimState::Unclaimed,
         open_dependencies: false,
         factual_resolution: Some("Resolved from code".into()),
-        resolution_already_posted: false,
         pending_product_questions: 0,
         existing_decisions: vec![],
-        asked_at: vec![],
         ready_label_present: false,
         ready_label: "agent-ready".into(),
         needs_spec_label: "needs-spec".into(),
     }
+}
+/// Marker history supplied directly; the store-backed view has its own tests.
+#[derive(Default)]
+struct Recorded {
+    asked: Vec<IssueRevision>,
+    posted: Vec<String>,
+}
+impl triage::MarkerView for Recorded {
+    fn asked(&self, _: &Repository, _: IssueNumber) -> Result<Vec<IssueRevision>, WorkflowError> {
+        Ok(self.asked.clone())
+    }
+    fn resolution_posted(
+        &self,
+        _: &Repository,
+        _: IssueNumber,
+        resolution: &str,
+    ) -> Result<bool, WorkflowError> {
+        Ok(self.posted.iter().any(|posted| posted == resolution))
+    }
+}
+fn plan_after(
+    markers: &Recorded,
+    input: &triage::Evidence,
+) -> Result<Vec<triage::Change>, WorkflowError> {
+    triage::plan(input, &triage::History::read(markers, input)?)
+}
+fn precheck_after(markers: &Recorded, input: &triage::Evidence) -> Result<Precheck, WorkflowError> {
+    triage::precheck(input, &triage::History::read(markers, input)?)
+}
+fn fresh_plan(input: &triage::Evidence) -> Result<Vec<triage::Change>, WorkflowError> {
+    plan_after(&Recorded::default(), input)
 }
 #[test]
 fn routing_is_closed_and_reports_unknown_keys() {
@@ -275,7 +304,8 @@ fn routing_is_closed_and_reports_unknown_keys() {
 )]
 fn triage_resolves_then_rerun_is_idle() {
     let mut input = triage_input();
-    let plan = triage::plan(&input).unwrap();
+    let mut markers = Recorded::default();
+    let plan = plan_after(&markers, &input).unwrap();
     assert_eq!(plan.len(), 2);
     assert!(
         matches!(&plan[0], triage::Change::Mutation(GitHubAction::PostComment { body, .. }) if body.as_str() == "Resolved from code")
@@ -285,14 +315,14 @@ fn triage_resolves_then_rerun_is_idle() {
         triage::Change::Mutation(GitHubAction::SetLabel { present: true, .. })
     ));
     input.changed_since_last_pass = false;
-    assert_eq!(triage::precheck(&input), Ok(Precheck::Actionable));
-    input.resolution_already_posted = true;
-    assert_eq!(triage::plan(&input).unwrap().len(), 1);
+    assert_eq!(precheck_after(&markers, &input), Ok(Precheck::Actionable));
+    markers.posted.push("Resolved from code".into());
+    assert_eq!(plan_after(&markers, &input).unwrap().len(), 1);
     input.ready_label_present = true;
-    assert_eq!(triage::plan(&input).unwrap().len(), 1); // clear needs-spec
+    assert_eq!(plan_after(&markers, &input).unwrap().len(), 1); // clear needs-spec
     input.needs_spec = false;
-    assert_eq!(triage::precheck(&input), Ok(Precheck::Idle));
-    assert!(triage::plan(&input).unwrap().is_empty());
+    assert_eq!(precheck_after(&markers, &input), Ok(Precheck::Idle));
+    assert!(plan_after(&markers, &input).unwrap().is_empty());
 }
 #[test]
 #[expect(
@@ -307,17 +337,17 @@ fn triage_keeps_unanswered_and_expired_decisions() {
         revision: revision(1, None),
         state: triage::DecisionState::Expired,
     });
-    assert_eq!(triage::plan(&input).unwrap().len(), 1); // comment only
+    assert_eq!(fresh_plan(&input).unwrap().len(), 1); // comment only
     input.existing_decisions[0].revision = revision(0, None);
-    assert_eq!(triage::plan(&input), Err(WorkflowError::DecisionMismatch));
+    assert_eq!(fresh_plan(&input), Err(WorkflowError::DecisionMismatch));
     input.existing_decisions[0].revision = revision(1, None);
     input.existing_decisions[0].issue = issue(11);
-    assert_eq!(triage::plan(&input), Err(WorkflowError::DecisionMismatch));
+    assert_eq!(fresh_plan(&input), Err(WorkflowError::DecisionMismatch));
     input.existing_decisions.clear();
     input.claim = ClaimState::ClaimedByOther;
-    assert!(triage::plan(&input).unwrap().is_empty());
+    assert!(fresh_plan(&input).unwrap().is_empty());
     input.claim = ClaimState::Unknown;
-    assert_eq!(triage::plan(&input), Err(WorkflowError::IncompleteEvidence));
+    assert_eq!(fresh_plan(&input), Err(WorkflowError::IncompleteEvidence));
 }
 #[test]
 #[expect(
@@ -326,11 +356,12 @@ fn triage_keeps_unanswered_and_expired_decisions() {
 )]
 fn triage_asks_once_per_revision_within_the_task_budget() {
     let mut input = triage_input();
+    let mut markers = Recorded::default();
     input.factual_resolution = None;
     input.pending_product_questions = 4;
     // Questions are batched into one ask per issue revision.
-    let asks = |input: &triage::Evidence| {
-        triage::plan(input)
+    let asks = |markers: &Recorded, input: &triage::Evidence| {
+        plan_after(markers, input)
             .unwrap()
             .into_iter()
             .filter_map(|change| match change {
@@ -339,41 +370,47 @@ fn triage_asks_once_per_revision_within_the_task_budget() {
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(asks(&input), vec![0]);
-    input.asked_at = vec![revision(0, None)];
-    assert_eq!(asks(&input), vec![1]);
-    input.asked_at.push(revision(1, None));
-    assert!(asks(&input).is_empty(), "already asked at this revision");
-    input.asked_at = vec![
+    assert_eq!(asks(&markers, &input), vec![0]);
+    markers.asked = vec![revision(0, None)];
+    assert_eq!(asks(&markers, &input), vec![1]);
+    markers.asked.push(revision(1, None));
+    assert!(
+        asks(&markers, &input).is_empty(),
+        "already asked at this revision"
+    );
+    markers.asked = vec![
         revision(0, None),
         revision(0, Some("3")),
         revision(0, Some("4")),
     ];
     assert!(
-        asks(&input).is_empty(),
+        asks(&markers, &input).is_empty(),
         "task budget of three asks is spent"
     );
-    input.asked_at.clear();
+    markers.asked.clear();
     input.existing_decisions.push(triage::Decision {
         issue: issue(10),
         owner: DecisionOwner::Spec,
         revision: revision(1, None),
         state: triage::DecisionState::Open,
     });
-    assert!(asks(&input).is_empty(), "an open decision is not repeated");
+    assert!(
+        asks(&markers, &input).is_empty(),
+        "an open decision is not repeated"
+    );
     input.coverage.history = false;
     assert_eq!(
-        triage::precheck(&input),
+        precheck_after(&markers, &input),
         Err(WorkflowError::IncompleteEvidence)
     );
 }
 
 #[test]
-fn unresolved_issue_requests_one_bounded_gardener_worker() {
+fn unresolved_issue_requests_one_bounded_gardener_worker() -> common::TestResult {
     use kitchen::contracts::{Capability, Operation, Role, Workspace};
     let mut input = triage_input();
     input.factual_resolution = None;
-    let plan = triage::plan(&input);
+    let plan = fresh_plan(&input);
     assert!(matches!(
         plan,
         Ok(changes) if matches!(&changes[..], [triage::Change::Judgment(Operation::LaunchWorker {
@@ -383,12 +420,22 @@ fn unresolved_issue_requests_one_bounded_gardener_worker() {
             branch: None,
         })] if brief.as_str().contains("sample/project issue #10"))
     ));
-    let request = triage::judgment_request(&input);
+    let request = triage::judgment_request(
+        &input,
+        &triage::History::read(&Recorded::default(), &input)?,
+    );
     assert!(
         matches!(request, Ok(Some(op)) if op.required_capability() == Capability::WorkerLaunchIsolated)
     );
     input.claim = ClaimState::ClaimedByOther;
-    assert_eq!(triage::judgment_request(&input), Ok(None));
+    assert_eq!(
+        triage::judgment_request(
+            &input,
+            &triage::History::read(&Recorded::default(), &input)?
+        ),
+        Ok(None)
+    );
+    Ok(())
 }
 
 fn triage_workflow() -> common::TestResult<WorkflowId> {
@@ -470,6 +517,122 @@ fn unreadable_marker_store_fails_instead_of_asking_again() -> common::TestResult
     Ok(())
 }
 
+fn posts_resolution(changes: &[triage::Change]) -> bool {
+    changes.iter().any(|change| {
+        matches!(
+            change,
+            triage::Change::Mutation(GitHubAction::PostComment { .. })
+        )
+    })
+}
+
+#[test]
+fn store_marker_stops_a_repeated_resolution_after_the_post_moves_the_revision() -> common::TestResult
+{
+    let fixture = common::Fixture::new()?;
+    let workflow = triage_workflow()?;
+    let markers = triage::IssueMarkers::new(&fixture.store, workflow.clone());
+    let recorder = common::scheduled("triage-tick")?;
+    let mut input = triage_input();
+    let judged = input.revision.clone();
+    assert!(posts_resolution(&triage::plan_with_markers(
+        &input, &markers
+    )?));
+    let record = |at: &IssueRevision, body: &str| {
+        triage::record_resolution(
+            &fixture.store,
+            &workflow,
+            &input.repository,
+            input.issue,
+            at,
+            body,
+            &recorder,
+            common::at(5),
+        )
+    };
+    assert!(matches!(
+        record(&judged, "Resolved from code"),
+        Ok(kitchen::state::MarkerRecording::Recorded(_))
+    ));
+    assert!(matches!(
+        record(&judged, "Resolved from code"),
+        Ok(kitchen::state::MarkerRecording::AlreadyRecorded(_))
+    ));
+    // Posting adds a comment, so the next pass sees a new revision. The
+    // marker still matches after a restart and the comment is not repeated.
+    input.revision = revision(2, Some("50"));
+    input.changed_since_last_pass = true;
+    let reopened = fixture.reopen()?;
+    let restarted = triage::IssueMarkers::new(&reopened, triage_workflow()?);
+    let changes = triage::plan_with_markers(&input, &restarted)?;
+    assert!(!posts_resolution(&changes));
+    assert!(
+        changes.contains(&triage::Change::Mutation(GitHubAction::SetLabel {
+            issue: issue(10),
+            label: "agent-ready".into(),
+            present: true,
+        }))
+    );
+    // A different resolution after new evidence is posted.
+    input.factual_resolution = Some("Resolved by the new comment".into());
+    assert!(posts_resolution(&triage::plan_with_markers(
+        &input, &restarted
+    )?));
+    // One judged revision records one resolution.
+    assert_eq!(
+        record(&judged, "Another resolution"),
+        Err(WorkflowError::DecisionMismatch)
+    );
+    assert_eq!(
+        record(&judged, "  "),
+        Err(WorkflowError::IncompleteEvidence)
+    );
+    // Another issue's marker does not suppress this one.
+    input.issue = issue(11);
+    input.factual_resolution = Some("Resolved from code".into());
+    assert!(posts_resolution(&triage::plan_with_markers(
+        &input, &restarted
+    )?));
+    Ok(())
+}
+
+#[test]
+fn unreadable_or_foreign_resolution_markers_fail_closed() -> common::TestResult {
+    use kitchen::state::{MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, WorkItem};
+    use std::num::{NonZeroU32, NonZeroU64};
+    let fixture = common::Fixture::new()?;
+    let input = triage_input();
+    // A triage marker written under another schema is not proof of either
+    // outcome, so the pass stops instead of posting or skipping.
+    fixture.store.record_marker(
+        MarkerKey {
+            workflow: triage_workflow()?,
+            item: WorkItem::Issue {
+                repository: project(),
+                number: NonZeroU64::new(10).ok_or("issue")?,
+            },
+            subject: MarkerSubject::Issue(revision(0, None)),
+        },
+        MarkerFact::workflow(
+            MarkerSchema::new("triage.other", NonZeroU32::MIN)?,
+            &"payload",
+        )?,
+        &common::scheduled("triage-tick")?,
+        common::at(1),
+    )?;
+    let markers = triage::IssueMarkers::new(&fixture.store, triage_workflow()?);
+    assert_eq!(
+        triage::plan_with_markers(&input, &markers),
+        Err(WorkflowError::IncompleteEvidence)
+    );
+    fs::write(fixture.state_path(), b"{not json")?;
+    assert_eq!(
+        triage::plan_with_markers(&input, &markers),
+        Err(WorkflowError::PrecheckFailed)
+    );
+    Ok(())
+}
+
 fn hygiene_issue() -> gardener::Issue {
     gardener::Issue {
         number: issue(20),
@@ -501,11 +664,154 @@ fn project() -> Repository {
 fn hygiene_plan(issues: &[gardener::Issue]) -> Vec<gardener::Finding> {
     gardener::plan(&project(), issues, &agent_labels(), None).unwrap()
 }
+fn precheck_args() -> common::TestResult<gardener::PrecheckArgs> {
+    Ok(gardener::PrecheckArgs {
+        kitchen: "/opt/kitchen/bin/kitchen".into(),
+        house: HouseId::new("sample")?,
+        repository: project(),
+        requester: ExternalRef::new("sample-bot")?,
+        credential: CredentialId::new("read")?,
+        credential_file: "/etc/kitchen/sample/read.token".into(),
+        gh: "/usr/local/bin/gh".into(),
+        labels: agent_labels(),
+        window: gardener::PrecheckWindow::new(48, 30)?,
+    })
+}
+
+#[test]
+fn gardener_installs_a_disabled_daily_schedule_with_its_own_precheck() -> common::TestResult {
+    use kitchen::{
+        ConsumerId,
+        contracts::{Effect, Permission, ScheduleEffect},
+        scheduling::{AgentFamily, Recurrence, TimeOfDay, Timezone},
+    };
+    let consumer = ConsumerId::new("gardener-sample-project")?;
+    let at = TimeOfDay::new(6, 30)?;
+    let zone = Timezone::new("America/Toronto")?;
+    let install = |args: &gardener::PrecheckArgs| {
+        gardener::install(consumer.clone(), at, zone.clone(), AgentFamily::Codex, args)
+    };
+    let Effect::Schedule(effect) = install(&precheck_args()?)? else {
+        return Err("expected a schedule effect".into());
+    };
+    assert_eq!(effect.required_permission(), Permission::ManageSchedule);
+    let ScheduleEffect::InstallDisabled { schedule } = effect else {
+        return Err("expected a disabled install".into());
+    };
+    assert_eq!(schedule.workflow().as_str(), "gardener");
+    assert_eq!(schedule.consumer(), &consumer);
+    assert_eq!(schedule.recurrence(), &Recurrence::Daily(at));
+    assert_eq!(schedule.timezone(), &zone);
+    assert_eq!(schedule.agent(), AgentFamily::Codex);
+    assert!(schedule.prompt().as_str().contains("sample/project"));
+    let precheck = schedule.precheck().ok_or("missing precheck")?;
+    let argv: Vec<&str> = precheck.argv().iter().map(Text::as_str).collect();
+    assert_eq!(
+        argv,
+        [
+            "/opt/kitchen/bin/kitchen",
+            "gardener",
+            "precheck",
+            "--house",
+            "sample",
+            "--repository",
+            "sample/project",
+            "--requester",
+            "sample-bot",
+            "--credential",
+            "read",
+            "--credential-file",
+            "/etc/kitchen/sample/read.token",
+            "--gh",
+            "/usr/local/bin/gh",
+            "--ready-label",
+            "agent-ready",
+            "--working-label",
+            "agent-working",
+            "--lookback-hours",
+            "48",
+            "--stale-days",
+            "30",
+        ]
+    );
+    assert_eq!(precheck.timeout().whole_seconds(), 120);
+
+    // Relative programs and ambiguous labels never reach a schedule.
+    for broken in [
+        gardener::PrecheckArgs {
+            kitchen: "kitchen".into(),
+            ..precheck_args()?
+        },
+        gardener::PrecheckArgs {
+            gh: "bin/gh".into(),
+            ..precheck_args()?
+        },
+        gardener::PrecheckArgs {
+            credential_file: "read.token".into(),
+            ..precheck_args()?
+        },
+        gardener::PrecheckArgs {
+            labels: gardener::AgentLabels {
+                ready: "agent-ready".into(),
+                working: "agent-ready".into(),
+            },
+            ..precheck_args()?
+        },
+    ] {
+        assert_eq!(install(&broken), Err(WorkflowError::IncompleteEvidence));
+    }
+    Ok(())
+}
+
+#[test]
+fn gardener_precheck_window_is_bounded_and_ordered() -> common::TestResult {
+    // One day of lookback, one stale day: the boundary where both cutoffs meet.
+    let window = gardener::PrecheckWindow::new(24, 1)?;
+    let now = Timestamp::from_unix_millis(10 * 86_400_000);
+    assert_eq!(
+        window.window(now),
+        gardener::Window::new(
+            Timestamp::from_unix_millis(9 * 86_400_000),
+            Timestamp::from_unix_millis(9 * 86_400_000)
+        )
+    );
+    // Near the epoch the change window starts at zero instead of wrapping.
+    assert_eq!(
+        window.window(Timestamp::from_unix_millis(1_000)),
+        gardener::Window::new(
+            Timestamp::from_unix_millis(0),
+            Timestamp::from_unix_millis(0)
+        )
+    );
+    assert!(gardener::PrecheckWindow::new(168, 365).is_ok());
+    for (lookback, stale) in [(0, 30), (169, 30), (48, 0), (48, 366), (48, 1)] {
+        assert_eq!(
+            gardener::PrecheckWindow::new(lookback, stale),
+            Err(WorkflowError::IncompleteEvidence),
+            "{lookback}h/{stale}d"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn precheck_results_decode_to_schedule_outcomes() {
+    use kitchen::{scheduling::PrecheckOutcome, workflows::precheck_outcome};
+    assert_eq!(
+        precheck_outcome(Ok(Precheck::Actionable)),
+        PrecheckOutcome::Actionable
+    );
+    assert_eq!(precheck_outcome(Ok(Precheck::Idle)), PrecheckOutcome::Idle);
+    for error in [
+        WorkflowError::PrecheckFailed,
+        WorkflowError::IncompleteEvidence,
+    ] {
+        assert_eq!(precheck_outcome(Err(error)), PrecheckOutcome::Error);
+    }
+}
+
 #[test]
 fn gardener_has_independent_idle_error_and_actionable_precheck() {
-    assert_eq!(gardener::SCHEDULE.owner, "gardener");
-    assert_eq!(gardener::SCHEDULE.cadence, "daily");
-    assert_eq!(gardener::SCHEDULE.precheck, "gardener-hygiene");
     let quiet = gardener::Signal {
         daily_changes: false,
         stale_issue: false,

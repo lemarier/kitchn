@@ -5,7 +5,7 @@ pub mod gardener;
 pub mod inspector;
 pub mod triage;
 
-use crate::integrations::github::Observation;
+use crate::{integrations::github::Observation, scheduling::PrecheckOutcome};
 
 fn valid_label(label: &str) -> bool {
     !label.is_empty() && label.len() <= 50 && !label.chars().any(char::is_control)
@@ -59,6 +59,17 @@ pub enum Precheck {
     Idle,
     /// At least one item needs inspection.
     Actionable,
+}
+
+/// The schedule outcome of a precheck result. Any error is
+/// [`PrecheckOutcome::Error`], never idle.
+#[must_use]
+pub const fn precheck_outcome(result: Result<Precheck, WorkflowError>) -> PrecheckOutcome {
+    match result {
+        Ok(Precheck::Actionable) => PrecheckOutcome::Actionable,
+        Ok(Precheck::Idle) => PrecheckOutcome::Idle,
+        Err(_) => PrecheckOutcome::Error,
+    }
 }
 
 /// Durable ownership observation. An unknown claim cannot be treated as free.

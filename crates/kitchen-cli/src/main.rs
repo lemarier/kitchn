@@ -36,6 +36,8 @@ enum Command {
     Adopt(commands::scaffold::ScaffoldArgs),
     /// Preview dishwasher cleanup decisions and record a person's approval; releases nothing.
     Cleanup(commands::cleanup::CleanupArgs),
+    /// Daily issue hygiene: the scheduled precheck. Reads only.
+    Gardener(commands::gardener::GardenerArgs),
 }
 
 fn main() -> ExitCode {
@@ -65,6 +67,8 @@ fn main() -> ExitCode {
         Some(Command::Init(args)) => commands::scaffold::run(args, false),
         Some(Command::Adopt(args)) => commands::scaffold::run(args, true),
         Some(Command::Cleanup(args)) => commands::cleanup::run(args),
+        // The precheck reports through its exit status, not the codes below.
+        Some(Command::Gardener(args)) => return commands::gardener::run(args),
         None => return output_status(Cli::command().print_help()),
     };
     match result {

@@ -211,7 +211,7 @@ macro_rules! validated_string {
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                 let value = String::deserialize(deserializer)?;
-                $validate(&value).map_err(|error| serde::de::Error::custom(error.to_string()))?;
+                $validate(&value).map_err(serde::de::Error::custom)?;
                 Ok(Self(value))
             }
         }

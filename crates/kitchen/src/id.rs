@@ -92,8 +92,7 @@ macro_rules! identifier {
         impl<'de> serde::Deserialize<'de> for $name {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                 let value = String::deserialize(deserializer)?;
-                validate_identifier(&value)
-                    .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+                validate_identifier(&value).map_err(serde::de::Error::custom)?;
                 Ok(Self(value))
             }
         }

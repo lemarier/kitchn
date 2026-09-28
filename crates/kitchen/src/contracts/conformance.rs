@@ -21,6 +21,8 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Check {
+    /// The fixture's run tag leaves room for derived keys and handles.
+    Fixture,
     /// The descriptor names the fixture's house.
     DescriptorHouse,
     /// A request for another house is refused without effect.
@@ -44,6 +46,7 @@ pub enum Check {
 impl fmt::Display for Check {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Fixture => "fixture",
             Self::DescriptorHouse => "descriptor house",
             Self::CrossHouseRefused => "cross-house request refused",
             Self::UnsupportedRefused => "unsupported operation refused",
@@ -151,7 +154,7 @@ impl Runner<'_> {
     fn key(&self, suffix: &str) -> Result<IdempotencyKey, ConformanceFailure> {
         ExternalRef::new(&format!("{}-{suffix}", self.fixture.run_tag))
             .map(IdempotencyKey::from_ref)
-            .or_else(|_| fail(Check::DescriptorHouse, "run tag too long for a key"))
+            .or_else(|_| fail(Check::Fixture, "run tag too long for a key"))
     }
 
     fn request(
@@ -179,7 +182,7 @@ impl Runner<'_> {
 
     fn absent_worker(&self) -> Result<ResourceRef, ConformanceFailure> {
         let handle = ExternalRef::new(&format!("{}-absent-worker", self.fixture.run_tag))
-            .or_else(|_| fail(Check::DescriptorHouse, "run tag too long for a handle"))?;
+            .or_else(|_| fail(Check::Fixture, "run tag too long for a handle"))?;
         Ok(ResourceRef {
             kind: ResourceKind::Worker,
             backend: self.backend.descriptor().backend.clone(),

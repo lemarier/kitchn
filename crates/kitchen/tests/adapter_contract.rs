@@ -205,6 +205,16 @@ fn contract_detects_misbehaving_backends() -> TestResult {
         "a refused request must not look applied"
     );
 
+    let mut long_tag = fixture.clone();
+    long_tag.run_tag = ExternalRef::new(&"t".repeat(250))?;
+    let failure = conformance::run(
+        &FakeBackend::fully_capable(backend_id()?, house()?),
+        &long_tag,
+    )
+    .err()
+    .ok_or("oversized run tag passed")?;
+    assert_eq!(failure.check, Check::Fixture);
+
     let foreign = FakeBackend::fully_capable(backend_id()?, other_house()?);
     let failure = conformance::run(&foreign, &fixture)
         .err()

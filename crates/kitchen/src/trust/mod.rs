@@ -18,3 +18,4 @@ pub use error::TrustError;
 pub use model::*;
 pub use store::EARNED_AUTONOMY_PERMISSIONS;
 pub use store::Ledger;
+pub(crate) use store::store_error;

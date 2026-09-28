@@ -637,7 +637,7 @@ impl Ledger {
 }
 /// An absent task is a policy refusal; any other core-store failure keeps its
 /// own class so a caller can tell a transient fault from a refusal.
-fn store_error(error: crate::Error) -> TrustError {
+pub(crate) fn store_error(error: crate::Error) -> TrustError {
     match error {
         crate::Error::State(StateError::TaskNotFound(_)) => TrustError::Refused,
         crate::Error::State(error) => TrustError::Storage(error),

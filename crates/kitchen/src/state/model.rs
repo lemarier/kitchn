@@ -1359,6 +1359,30 @@ impl StoreState {
         Ok(AttemptStart::Started(number))
     }
 
+    pub(crate) fn continue_attempt(
+        &mut self,
+        id: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<Option<AttemptNumber>> {
+        let task = self.task_mut(id)?;
+        task.owned_lease(fence, now, true)?;
+        let Some(attempt) = task.attempts.last_mut() else {
+            return Ok(None);
+        };
+        match attempt.state {
+            AttemptState::Running if attempt.fence == fence => Ok(Some(attempt.number)),
+            AttemptState::Interrupted { .. } => {
+                attempt.fence = fence;
+                attempt.state = AttemptState::Running;
+                Ok(Some(attempt.number))
+            }
+            AttemptState::Running
+            | AttemptState::Finished { .. }
+            | AttemptState::Cancelled { .. } => Ok(None),
+        }
+    }
+
     pub(crate) fn finish_attempt(
         &mut self,
         id: &TaskId,

@@ -1,8 +1,11 @@
 //! Compose house selection, repository binding and template files in one plan.
-use super::{FilePlan, RenderedFile, Template, VariableName};
+use super::{FilePlan, RenderedFile, Template, TemplateName, VariableName};
 use crate::{
     HouseId,
-    adoption::{FileMode, HouseRegistry, REPOSITORY_CONFIG, RelativePath, encode, read_repository},
+    adoption::{
+        FileMode, HouseRegistry, REPOSITORY_CONFIG, RelativePath, encode, read_repository,
+        verified_snapshot,
+    },
     contracts::Repository,
     house::{HouseError, RepositoryConfig, resolve_house},
 };
@@ -15,15 +18,20 @@ use std::{
 /// Existing bindings retain their workflows and stricter local requirements.
 /// Templates cannot supply or override Kitchen's repository binding.
 ///
+/// The template is resolved by name from the selected house's verified
+/// instruction snapshot for its configured guidance revision, so the revision
+/// recorded in provenance markers is the revision that supplied the content.
+///
 /// # Errors
-/// Refuses missing/mismatched house or repository selection, invalid templates,
-/// and unsafe destinations through the house installer.
+/// Refuses missing/mismatched house or repository selection, a missing or
+/// modified snapshot, a template absent from the pinned guidance, invalid
+/// templates, and unsafe destinations through the house installer.
 pub fn plan_repository(
     registry: &HouseRegistry,
     target: &Path,
     house: Option<HouseId>,
     repository: Option<Repository>,
-    template: &Template,
+    template: &TemplateName,
     variables: &BTreeMap<VariableName, String>,
 ) -> crate::Result<FilePlan> {
     let config = match read_repository(target) {
@@ -49,6 +57,8 @@ pub fn plan_repository(
     };
     let houses = registry.houses()?;
     let house = resolve_house(&config, &houses.available)?;
+    let (_, guidance) = verified_snapshot(registry.root(), house, None)?;
+    let template = Template::from_guidance(&guidance.assets, template)?;
     let mut rendered = template.render(&house.house, &house.guidance, variables)?;
     if rendered.files.iter().any(|file| {
         file.path.as_str().eq_ignore_ascii_case(REPOSITORY_CONFIG)

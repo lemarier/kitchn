@@ -10,10 +10,10 @@ use serde::Serialize;
 
 use crate::{
     HouseId,
-    adoption::{FileMode, RelativePath},
+    adoption::{FileMode, InstructionAsset, RelativePath},
     contracts::CommitId,
     scaffold::{
-        Manifest, ScaffoldError, ScaffoldLimit, ScaffoldOperation, TemplateProblem,
+        Manifest, ScaffoldError, ScaffoldLimit, ScaffoldOperation, TemplateName, TemplateProblem,
         TemplateProvenance, VariableName, provenance::mark,
     },
 };
@@ -34,6 +34,8 @@ pub const MAX_OUTPUT_PATH_BYTES: usize = 1024;
 pub const MAX_TEMPLATE_DEPTH: usize = 16;
 
 const MANIFEST_FILE: &str = "template.toml";
+/// Directory of house guidance that holds one subdirectory per template.
+const GUIDANCE_TEMPLATES: &str = "templates";
 const SOURCES_DIR: &str = "files";
 
 /// A loaded, validated house template.
@@ -66,6 +68,62 @@ impl Template {
             ScaffoldLimit::ManifestBytes,
         )?)?;
         let sources = read_sources(&dir.join(SOURCES_DIR))?;
+        Self::from_parts(manifest, sources)
+    }
+
+    /// Load template `name` from a house's verified guidance assets.
+    ///
+    /// The template is `templates/<name>/template.toml` and every asset below
+    /// `templates/<name>/files/`. Pass assets from the immutable snapshot for
+    /// the guidance revision the output will be stamped with, so provenance
+    /// markers can only name content that revision actually contains.
+    ///
+    /// # Errors
+    /// Returns [`ScaffoldError::TemplateNotFound`] when the assets hold no
+    /// manifest for `name`, [`TemplateProblem::NameMismatch`] when the manifest
+    /// declares another name, and the same validation errors as [`Template::load`].
+    pub fn from_guidance(
+        assets: &[InstructionAsset],
+        name: &TemplateName,
+    ) -> Result<Self, ScaffoldError> {
+        let prefix = format!("{GUIDANCE_TEMPLATES}/{name}/");
+        let manifest_path = format!("{prefix}{MANIFEST_FILE}");
+        let files_prefix = format!("{prefix}{SOURCES_DIR}/");
+        let mut manifest = None;
+        let mut sources = BTreeMap::new();
+        for asset in assets {
+            let path = asset.path.as_str();
+            if path == manifest_path {
+                if u64::try_from(asset.contents.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES {
+                    return Err(ScaffoldError::Limit {
+                        limit: ScaffoldLimit::ManifestBytes,
+                    });
+                }
+                manifest = Some(Manifest::parse(&asset.contents)?);
+            } else if let Some(source) = path.strip_prefix(&files_prefix) {
+                // One component per directory level, plus the file itself.
+                if source.split('/').count() > MAX_TEMPLATE_DEPTH + 1 {
+                    return Err(ScaffoldError::Limit {
+                        limit: ScaffoldLimit::TemplateDepth,
+                    });
+                }
+                if sources.len() >= MAX_TEMPLATE_FILES {
+                    return Err(ScaffoldError::Limit {
+                        limit: ScaffoldLimit::TemplateFiles,
+                    });
+                }
+                let source =
+                    RelativePath::new(source).map_err(|_| ScaffoldError::InvalidSourceName {
+                        path: PathBuf::from(path),
+                    })?;
+                sources.insert(source, asset.contents.clone());
+            }
+        }
+        let manifest =
+            manifest.ok_or_else(|| ScaffoldError::TemplateNotFound { name: name.clone() })?;
+        if manifest.name != *name {
+            return Err(template_problem(TemplateProblem::NameMismatch));
+        }
         Self::from_parts(manifest, sources)
     }
 
@@ -141,6 +199,8 @@ impl Template {
     ///
     /// Templates see `house`, `template`, `template_revision`, and
     /// `guidance_revision` under `kitchen`, and variable values under `vars`.
+    /// Provenance records `guidance` as given; [`super::plan_repository`]
+    /// passes the revision whose verified snapshot supplied the template.
     ///
     /// # Errors
     /// Returns [`ScaffoldError::CrossHouse`] when `house` does not own the

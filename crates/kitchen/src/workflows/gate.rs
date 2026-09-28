@@ -2002,18 +2002,20 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
     let (base, base_ref_unreadable) = match &base_branch {
         Some(branch) => match client.branch_tip(house, repository, branch) {
             Observation::Known(tip) => (tip, false),
-            // The provider answered with another branch or an unusable
-            // response; retrying cannot change that, so hand the PR over.
+            // The provider answered with another branch, an unusable
+            // response, or one over the read limit; retrying cannot change
+            // that, so hand the PR over.
             Observation::Unavailable(
                 IntegrationError::InvalidInput
                 | IntegrationError::LimitExceeded
                 | IntegrationError::Unknown,
             )
             | Observation::Unknown => (pr.base.sha.clone(), true),
-            // A timeout or transport failure may clear on the next pass, and
-            // the gate posts nothing outside its read or house scope. The
+            // A timeout or transport failure may clear on the next pass. The
             // transport cannot tell a missing ref from an outage, so both
-            // retry.
+            // retry. Scope, permission, budget, and decision errors are not
+            // expected from a read the PR read already authorized; the pass
+            // ends without a verdict rather than posting under them.
             Observation::Unavailable(
                 error @ (IntegrationError::Timeout
                 | IntegrationError::Unavailable

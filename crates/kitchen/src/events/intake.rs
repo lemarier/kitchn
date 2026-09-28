@@ -76,7 +76,7 @@ pub enum Admission {
     Ignored,
 }
 
-/// How work was admitted, for audit and ordering.
+/// How work was admitted, for audit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum Via {

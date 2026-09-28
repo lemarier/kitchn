@@ -642,6 +642,51 @@ fn recovery_of_an_older_event_is_stale_once_a_newer_event_was_admitted() -> Test
 }
 
 #[test]
+fn a_poll_received_later_makes_an_interrupted_event_stale() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (config, source) = (house_config()?, delivering()?);
+    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    // The event carries a later provider time than the poll; only receipt
+    // order counts.
+    let event = pushed("delivery-1", 'c', 50)?;
+    let fence = receiver_fence(&fixture.store, 0)?;
+    let failed = intake.admit_event(
+        &event,
+        &receiver(&event, fence)?,
+        |_| Err(Error::from(StateError::MarkerPayloadInvalid)),
+        at(1),
+    );
+    assert!(failed.is_err());
+    assert!(fixture.store.tasks()?.is_empty());
+
+    // The receiver stops; the fallback tick polls a newer head.
+    fixture
+        .store
+        .release_consumer(&consumer_id()?, fence, at(2))?;
+    let tick = scheduled("fallback-tick")?;
+    let tick_fence = acquire(&fixture.store, &tick, 3)?;
+    let polled = PolledWork::new(pull_request(60)?, head('d')?, at(4))?;
+    let polled_task = task_of(&intake.admit_polled(
+        &polled,
+        &tick.clone().under(consumer_id()?, tick_fence),
+        planned,
+        at(4),
+    )?)?;
+    fixture
+        .store
+        .release_consumer(&consumer_id()?, tick_fence, at(5))?;
+
+    // Redelivering the interrupted event does not finish its admission.
+    let fence = receiver_fence(&fixture.store, 6)?;
+    assert_eq!(
+        admit(&intake, &event, &receiver(&event, fence)?, 7)?,
+        Admission::Stale(polled_task)
+    );
+    assert_eq!(fixture.store.tasks()?.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn foreign_events_are_refused_before_any_state_changes() -> TestResult {
     let fixture = Fixture::new()?;
     let (config, source) = (house_config()?, delivering()?);

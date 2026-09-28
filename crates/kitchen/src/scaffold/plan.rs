@@ -26,7 +26,11 @@ pub enum PlanKind {
 }
 
 /// Why an existing path blocks a planned file. Conflicts are never applied.
+///
+/// New reasons may be added. Callers outside Kitchen should treat an unknown
+/// reason as a conflict that needs manual reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Conflict {
     /// A local file with different content and no provenance marker.
     Unmanaged,
@@ -78,7 +82,11 @@ impl fmt::Display for Conflict {
 }
 
 /// What applying the plan would do with one file.
+///
+/// New actions may be added. Only [`PlanAction::Add`] writes; callers
+/// outside Kitchen should treat any other or unknown action as not written.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PlanAction {
     /// Create the file; nothing exists at its path.
     Add,

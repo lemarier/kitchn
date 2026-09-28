@@ -215,8 +215,11 @@ impl VariableKind {
 }
 
 /// How a rendered file records its provenance.
+///
+/// New comment styles may be added for other file formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MarkerStyle {
     /// A first line `<!-- kitchen-managed: … -->`, for Markdown and HTML.
     HtmlComment,

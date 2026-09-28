@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BackendId, CredentialId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, BackendDescriptor, Capability, ContractError, Effect, ExternalRef,
-        Permission, ResourceRef, Role, Text, ValueKind,
+        AttemptNumber, BackendDescriptor, BranchName, Capability, ContractError, Effect,
+        ExternalRef, Permission, ResourceRef, Role, Text, ValueKind,
     },
 };
 
@@ -42,6 +42,13 @@ pub enum Operation {
         workspace: Workspace,
         /// The standalone brief given to the worker.
         brief: Text,
+        /// The branch the worker must work on. When set, the executor creates
+        /// exactly this branch and reports it as a created
+        /// [`crate::contracts::ResourceKind::Branch`] resource whose handle is
+        /// the branch name; if it cannot, it refuses or holds the worker
+        /// rather than let it run on another branch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<BranchName>,
     },
     /// Deliver a message to a worker.
     MessageWorker {

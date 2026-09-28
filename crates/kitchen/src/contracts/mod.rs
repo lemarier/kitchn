@@ -91,6 +91,6 @@ pub use task::{
 };
 pub use trigger::{Authorization, Claimant, Consent, ConsumerFence, Trigger};
 pub use value::{
-    Clock, CommitId, ExternalRef, LeaseTtl, MAX_EXTERNAL_REF_BYTES, MAX_TEXT_BYTES, Repository,
-    SystemClock, Text, Timestamp, ValueKind,
+    BranchName, Clock, CommitId, ExternalRef, LeaseTtl, MAX_BRANCH_NAME_BYTES,
+    MAX_EXTERNAL_REF_BYTES, MAX_TEXT_BYTES, Repository, SystemClock, Text, Timestamp, ValueKind,
 };

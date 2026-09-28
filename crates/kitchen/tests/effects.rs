@@ -611,6 +611,7 @@ fn targeted_operations_need_a_resource_the_task_owns() -> TestResult {
             role: kitchen::contracts::Role::StationCook,
             workspace: kitchen::contracts::Workspace::Existing(worker.clone()),
             brief: Text::new("reuse")?,
+            branch: None,
         },
     ];
     for (index, operation) in targeted.into_iter().enumerate() {

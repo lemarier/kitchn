@@ -131,9 +131,15 @@ impl FakeBackend {
     ) -> Result<Receipt, EffectFailure> {
         let rejected = EffectFailure::NotApplied(NotAppliedReason::Rejected);
         let (created, touched) = match request.effect() {
-            Effect::Worker(Operation::LaunchWorker { workspace, .. }) => {
+            Effect::Worker(Operation::LaunchWorker {
+                workspace, branch, ..
+            }) => {
                 let worker = self.handle(state, "worker")?;
                 let mut created = vec![self.resource(ResourceKind::Worker, worker.clone())];
+                if let Some(branch) = branch {
+                    let handle = ExternalRef::new(branch.as_str()).map_err(|_| rejected)?;
+                    created.push(self.resource(ResourceKind::Branch, handle));
+                }
                 let mut touched = Vec::new();
                 match workspace {
                     Workspace::Isolated => {

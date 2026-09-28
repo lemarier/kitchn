@@ -576,3 +576,55 @@ fn standing_grants_can_be_extended_only_within_house_limits() -> TestResult {
     assert_eq!(narrow.with_added_standing([])?, narrow);
     Ok(())
 }
+
+#[test]
+fn branch_names_follow_git_ref_rules() -> TestResult {
+    for valid in [
+        "main",
+        "lemarier/core-contracts",
+        "fix-42",
+        "a.b",
+        "release/v1.2",
+    ] {
+        assert_eq!(kitchen::contracts::BranchName::new(valid)?.as_str(), valid);
+    }
+    let too_long = "b".repeat(kitchen::contracts::MAX_BRANCH_NAME_BYTES + 1);
+    for invalid in [
+        "",
+        "-leading",
+        "@",
+        "a..b",
+        "a@{1}",
+        "trailing.",
+        "trailing/",
+        "/leading",
+        "a//b",
+        ".hidden",
+        "a/.hidden",
+        "x.lock",
+        "a/x.lock/b",
+        "has space",
+        "tilde~",
+        "caret^",
+        "colon:",
+        "q?",
+        "star*",
+        "bracket[",
+        "back\\slash",
+        "tab\t",
+        too_long.as_str(),
+    ] {
+        assert_eq!(
+            kitchen::contracts::BranchName::new(invalid),
+            Err(invalid_kind(ValueKind::BranchName)),
+            "{invalid:?}"
+        );
+    }
+    let longest = "b".repeat(kitchen::contracts::MAX_BRANCH_NAME_BYTES);
+    assert!(kitchen::contracts::BranchName::new(&longest).is_ok());
+    Ok(())
+}
+
+fn invalid_kind(kind: ValueKind) -> ContractError {
+    ContractError::InvalidValue { kind }
+}

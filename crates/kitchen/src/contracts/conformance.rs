@@ -13,11 +13,11 @@ use std::fmt;
 use crate::{
     BackendId, ConsumerId, CredentialId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, BackendUnavailable, Capability, DecisionBinding, Effect, EffectExecutor,
-        EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, GitHubEffect, IdempotencyKey,
-        Liveness, Lookup, MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation, Permission,
-        Receipt, Repository, ResourceKind, ResourceRef, RogerEffect, Role, ScheduleEffect, Text,
-        WorkerBackend, WorkerState, Workspace,
+        AttemptNumber, BackendUnavailable, BranchName, Capability, DecisionBinding, Effect,
+        EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, GitHubEffect,
+        IdempotencyKey, Liveness, Lookup, MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation,
+        Permission, Receipt, Repository, ResourceKind, ResourceRef, RogerEffect, Role,
+        ScheduleEffect, Text, WorkerBackend, WorkerState, Workspace,
     },
 };
 
@@ -43,7 +43,8 @@ pub enum Check {
     LookupMatchesReceipt,
     /// Resubmitting the probe key returns the same receipt.
     IdempotentResubmission,
-    /// A launch receipt names a worker on this backend.
+    /// A launch receipt names a worker on this backend and exactly the
+    /// requested branch.
     LaunchReceipt,
     /// The launched worker is observable and not reported as settled.
     LaunchObservable,
@@ -174,7 +175,7 @@ pub fn run_worker(
     fixture: &ConformanceFixture,
 ) -> Result<ConformanceReport, ConformanceFailure> {
     let mut runner = Runner::new(backend, fixture);
-    let launch = runner.launch();
+    let launch = runner.launch()?;
     let Some(receipt) = runner.executor_checks(&launch)? else {
         for check in [
             Check::LaunchReceipt,
@@ -204,6 +205,18 @@ pub fn run_worker(
             "receipt names no worker on this backend",
         );
     };
+    let requested = runner.branch()?;
+    let names_branch = receipt.created().iter().any(|resource| {
+        resource.kind == ResourceKind::Branch
+            && &resource.backend == own
+            && resource.handle.as_str() == requested.as_str()
+    });
+    if !names_branch {
+        return fail(
+            Check::LaunchReceipt,
+            "receipt does not name exactly the requested branch",
+        );
+    }
     runner.record(Check::LaunchReceipt, CheckResult::Passed);
     runner.observable(backend, &worker)?;
     runner.inventory(backend, &worker)?;
@@ -265,12 +278,19 @@ impl<'a> Runner<'a> {
         self.request(&self.fixture.house, &backend, suffix, effect)
     }
 
-    fn launch(&self) -> Effect {
-        Effect::Worker(Operation::LaunchWorker {
+    /// The branch the probe launch requests, unique to this run.
+    fn branch(&self) -> Result<BranchName, ConformanceFailure> {
+        BranchName::new(&format!("kitchen/{}", self.fixture.run_tag))
+            .or_else(|_| fail(Check::Fixture, "run tag is not a valid branch name"))
+    }
+
+    fn launch(&self) -> Result<Effect, ConformanceFailure> {
+        Ok(Effect::Worker(Operation::LaunchWorker {
             role: Role::StationCook,
             workspace: Workspace::Isolated,
             brief: self.fixture.brief.clone(),
-        })
+            branch: Some(self.branch()?),
+        }))
     }
 
     /// One sample of every effect, for refusal checks.
@@ -283,7 +303,7 @@ impl<'a> Runner<'a> {
         let consumer = ConsumerId::new("conformance")
             .or_else(|_| fail(Check::Fixture, "invalid sample consumer"))?;
         Ok(vec![
-            ("unsupported-launch", self.launch()),
+            ("unsupported-launch", self.launch()?),
             (
                 "unsupported-message",
                 Effect::Worker(Operation::MessageWorker {

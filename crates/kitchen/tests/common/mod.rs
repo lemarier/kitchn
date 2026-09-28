@@ -135,6 +135,7 @@ pub fn launch() -> TestResult<Operation> {
         role: Role::StationCook,
         workspace: Workspace::Isolated,
         brief: Text::new("Implement the task described in the issue.")?,
+        branch: None,
     })
 }
 

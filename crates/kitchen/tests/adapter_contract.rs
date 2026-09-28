@@ -1579,3 +1579,63 @@ fn a_user_takeover_is_not_evidence_of_cancellation() -> TestResult {
     assert_eq!(failure.check, Check::CancelObserved);
     Ok(())
 }
+
+/// Creates the worker on a branch other than the one requested.
+struct WrongBranch(FakeBackend);
+
+impl EffectExecutor for WrongBranch {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.0.descriptor()
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        let receipt = self.0.execute(request)?;
+        let created = receipt
+            .created()
+            .iter()
+            .map(|resource| {
+                if resource.kind == ResourceKind::Branch {
+                    ExternalRef::new("some-other-branch").map(|handle| ResourceRef {
+                        handle,
+                        ..resource.clone()
+                    })
+                } else {
+                    Ok(resource.clone())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| EffectFailure::Uncertain(UncertainReason::ResponseLost))?;
+        Receipt::new(
+            receipt.reference().clone(),
+            created,
+            receipt.touched().to_vec(),
+        )
+        .map_err(|_| EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.0.lookup(request)
+    }
+}
+
+impl WorkerBackend for WrongBranch {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.0.observe_worker(worker)
+    }
+}
+
+#[test]
+fn a_backend_reporting_another_branch_fails_the_contract() -> TestResult {
+    // Without lookup or idempotency, only the receipt itself is checked.
+    let backend = WrongBranch(fake([
+        Capability::WorkerLaunchIsolated,
+        Capability::WorkerStatusAndOutcome,
+    ])?);
+    let failure = conformance::run_worker(&backend, &conformance_fixture()?)
+        .err()
+        .ok_or("a launch on another branch passed")?;
+    assert_eq!(failure.check, Check::LaunchReceipt);
+    assert_eq!(
+        failure.problem,
+        "receipt does not name exactly the requested branch"
+    );
+    Ok(())
+}

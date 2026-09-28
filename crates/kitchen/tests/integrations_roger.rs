@@ -241,3 +241,108 @@ fn optional_roger_capability_detection_needs_no_credentials() -> Result {
     );
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn roger_cli_uses_selected_house_url_and_isolated_token_for_get_find_submit() -> Result {
+    use kitchen::contracts::IdempotencyKey;
+    use kitchen::integrations::github::CredentialFile;
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+    let (scope, binding, mut receipt) = fixture()?;
+    receipt["title"] = json!("-review");
+    receipt["body"] = json!("fixture body");
+    let directory = tempfile::tempdir()?;
+    let executable = directory.path().join("roger");
+    let log = directory.path().join("calls");
+    let token_path = directory.path().join("token");
+    std::fs::write(&token_path, "fixture-roger-token")?;
+    let script = format!(
+        r##"#!/bin/sh
+if [ "$1" = ask ] && [ "$2" = --help ]; then printf '%s' '--idem --decision-key --action-rev --action-target --action-limits --resume-task --resume-rev --body-file'; exit 0; fi
+[ "$ROGER_URL" = https://roger.example.test ] || exit 8
+[ "$ROGER_TOKEN" = fixture-roger-token ] || exit 8
+[ -z "$GH_TOKEN" ] || exit 8
+for arg in "$@"; do [ "$arg" != fixture-roger-token ] || exit 8; done
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  get) printf '%s' '{{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","requester":"sample-gate"}}' ;;
+  list) printf '%s' '{{"asks":[]}}' ;;
+  ask) input=$(/bin/cat); [ "$input" = 'fixture body' ] || exit 8; printf '%s' '{}' ;;
+  *) exit 8 ;;
+esac
+"##,
+        log.display(),
+        receipt
+    );
+    std::fs::write(&executable, script)?;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+    let credential = CredentialFile::new(scope.credential().clone(), token_path)?;
+    let probe = ExternalRef::new("01ARZ3NDEKTSV4RRFFQ69G5FAV")?;
+    assert!(matches!(
+        RogerCli::new(executable.clone(), credential.clone(), probe.clone()),
+        Err(IntegrationError::InvalidInput)
+    ));
+    assert!(matches!(
+        RogerCli::new_with_url(
+            executable.clone(),
+            credential.clone(),
+            probe.clone(),
+            "http://wrong.test".into()
+        ),
+        Err(IntegrationError::InvalidInput)
+    ));
+    let cli = RogerCli::new_with_url(
+        executable,
+        credential,
+        probe.clone(),
+        "https://roger.example.test".into(),
+    )?;
+    let bytes = cli.get(scope.credential(), &probe, Duration::from_secs(2), 4096)?;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes)?["requester"],
+        "sample-gate"
+    );
+    let ask = RogerAsk {
+        binding,
+        kind: AskKind::Approval,
+        risk: AskRisk::Routine,
+        title: Text::new("-review")?,
+        body: Text::new("fixture body")?,
+        supersedes: Some(probe),
+    };
+    assert_eq!(
+        cli.find(scope.credential(), &ask, Duration::from_secs(2), 4096)?,
+        None
+    );
+    let key = IdempotencyKey::from_ref(ExternalRef::new("fixture-key")?);
+    let bytes = cli.submit(scope.credential(), &ask, &key, Duration::from_secs(2), 4096)?;
+    assert_eq!(serde_json::from_slice::<Value>(&bytes)?["title"], "-review");
+    let calls = std::fs::read_to_string(log)?;
+    assert!(calls.contains("--title=-review"));
+    assert!(calls.contains("--idem fixture-key"));
+    assert!(calls.contains("--supersedes 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    let wrong_binary = directory.path().join("wrong-roger");
+    std::fs::write(
+        &wrong_binary,
+        "#!/bin/sh\nif [ \"$2\" = --help ]; then printf '%s' '--idem --decision-key --action-rev --action-target --action-limits --resume-task --resume-rev --body-file'; else printf '%s' '{\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"requester\":\"foreign\"}'; fi\n",
+    )?;
+    std::fs::set_permissions(&wrong_binary, std::fs::Permissions::from_mode(0o700))?;
+    let wrong_credential =
+        CredentialFile::new(scope.credential().clone(), directory.path().join("token"))?;
+    let wrong = RogerCli::new_with_url(
+        wrong_binary,
+        wrong_credential,
+        ExternalRef::new("01ARZ3NDEKTSV4RRFFQ69G5FAV")?,
+        "https://roger.example.test".into(),
+    )?;
+    assert_eq!(
+        wrong.get(
+            scope.credential(),
+            &ExternalRef::new("01ARZ3NDEKTSV4RRFFQ69G5FAV")?,
+            Duration::from_secs(2),
+            4096
+        ),
+        Err(IntegrationError::ScopeMismatch)
+    );
+    Ok(())
+}

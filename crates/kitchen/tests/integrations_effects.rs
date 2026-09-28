@@ -2,7 +2,7 @@
 mod common;
 use common::{Fixture, ManualClock, TestResult, at, creator, house, plan, scheduled, spec, ttl};
 use kitchen::{
-    BackendId, CredentialId, Error, TaskId,
+    BackendId, CredentialId, Error, HouseId, TaskId,
     contracts::*,
     integrations::{github::*, roger::*},
     state::{EffectState, HouseStore, run_effect},
@@ -20,6 +20,7 @@ enum Fault {
 struct Remote {
     pull_request: Option<Value>,
     labels: Vec<Value>,
+    defined_labels: Option<Vec<Value>>,
     comments: Vec<Value>,
     issues: Vec<Value>,
     relations: BTreeMap<String, Vec<Value>>,
@@ -33,6 +34,7 @@ struct Provider {
     remote: Rc<RefCell<Remote>>,
     store: HouseStore,
     task: TaskId,
+    conformance_probe: bool,
 }
 impl Provider {
     fn intended(&self) -> bool {
@@ -64,7 +66,11 @@ impl GitHubReadTransport for Provider {
                 .clone()
                 .ok_or(IntegrationError::Unknown)?
         } else if path.contains("/labels?") {
-            json!(remote.labels)
+            if path.contains("/issues/") {
+                json!(remote.labels)
+            } else {
+                json!(remote.defined_labels.as_ref().unwrap_or(&remote.labels))
+            }
         } else if path.ends_with("/issues/2") {
             json!({"id":102,"number":2})
         } else if path.contains("/sub_issues?") || path.contains("/dependencies/blocked_by?") {
@@ -92,7 +98,7 @@ impl GitHubMutationTransport for Provider {
         _: usize,
     ) -> Result<Vec<u8>, EffectFailure> {
         assert!(
-            self.intended(),
+            self.conformance_probe || self.intended(),
             "intent must be on disk before provider submission"
         );
         let mut remote = self.remote.borrow_mut();
@@ -181,6 +187,7 @@ fn provider(fixture: &Fixture, task: &TaskId, remote: Rc<RefCell<Remote>>) -> Te
         remote,
         store: fixture.reopen()?,
         task: task.clone(),
+        conformance_probe: false,
     })
 }
 fn mutation(action: GitHubAction) -> TestResult<GitHubMutation> {
@@ -363,6 +370,130 @@ fn label_setup_noop_conflict_permission_denial_partial_failure_and_rerun() -> Te
     assert_eq!(state.labels[1]["color"], "000000");
     Ok(())
 }
+
+#[test]
+fn set_label_requires_existing_repository_definition() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::EditLabels], "github")?;
+    let remote = Rc::new(RefCell::new(Remote::default()));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let action = GitHubAction::SetLabel {
+        issue: IssueNumber::new(1)?,
+        label: "undefined".into(),
+        present: true,
+    };
+    let first = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(
+            &task,
+            fence,
+            "apply",
+            backend.effect(mutation(action.clone())?)?,
+        )?,
+        &ManualClock::starting_at(1),
+    )?;
+    assert!(matches!(
+        first.state(),
+        EffectState::NotApplied {
+            reason: NotAppliedReason::Rejected,
+            ..
+        }
+    ));
+    assert!(remote.borrow().calls.is_empty());
+    remote.borrow_mut().defined_labels = Some(vec![
+        json!({"name":"undefined","color":"aabbcc","description":"fixture"}),
+    ]);
+    let second = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "apply", backend.effect(mutation(action)?)?)?,
+        &ManualClock::starting_at(2),
+    )?;
+    assert!(matches!(second.state(), EffectState::Applied { .. }));
+    assert_eq!(remote.borrow().calls.len(), 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn gh_cli_provider_refusal_can_be_corrected_and_rerun() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::EditLabels], "github")?;
+    let directory = tempfile::tempdir()?;
+    let executable = directory.path().join("gh");
+    let mode = directory.path().join("mode");
+    let applied = directory.path().join("applied");
+    std::fs::write(&mode, "deny")?;
+    std::fs::write(
+        &executable,
+        format!(
+            r##"#!/bin/sh
+case " $* " in
+  *' user '*) printf '%s' '{{"login":"sample-bot"}}' ;;
+  *' --method GET '*'issues/1/labels'*) if [ -e '{}' ]; then printf '%s' '[{{"name":"defined"}}]'; else printf '%s' '[]'; fi ;;
+  *' --method GET '*'repos/sample/project/labels'*) printf '%s' '[{{"name":"defined","color":"aabbcc","description":"fixture"}}]' ;;
+  *' --method POST '*)
+    [ "$GH_TOKEN" = fixture-secret ] || exit 9
+    for arg in "$@"; do [ "$arg" != fixture-secret ] || exit 9; done
+    if [ "$(/bin/cat '{}')" = deny ]; then printf 'HTTP/2 403 Forbidden\r\n\r\n'; exit 1; fi
+    /usr/bin/touch '{}'; printf 'HTTP/2 200 OK\r\n\r\n{{}}' ;;
+  *) exit 9 ;;
+esac
+"##,
+            applied.display(),
+            mode.display(),
+            applied.display()
+        ),
+    )?;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+    let token = directory.path().join("token");
+    std::fs::write(&token, "fixture-secret")?;
+    let cli = GhCli::new(
+        executable,
+        CredentialFile::new(scope.credential().clone(), token)?,
+    )?;
+    let backend = GitHubExecutor::new(BackendId::new("github")?, scope, cli, ReadLimits::default());
+    let effect = backend.effect(mutation(GitHubAction::SetLabel {
+        issue: IssueNumber::new(1)?,
+        label: "defined".into(),
+        present: true,
+    })?)?;
+    let first = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "set", effect.clone())?,
+        &ManualClock::starting_at(1),
+    )?;
+    assert!(matches!(
+        first.state(),
+        EffectState::NotApplied {
+            reason: NotAppliedReason::Rejected,
+            ..
+        }
+    ));
+    assert!(!applied.exists());
+    std::fs::write(&mode, "allow")?;
+    let second = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "set", effect)?,
+        &ManualClock::starting_at(2),
+    )?;
+    assert!(matches!(second.state(), EffectState::Applied { .. }));
+    assert!(applied.exists());
+    Ok(())
+}
 #[test]
 fn persisted_budget_and_credential_mismatch_refuse_before_transport() -> TestResult {
     let fixture = Fixture::new()?;
@@ -427,7 +558,12 @@ fn issue_creation_labels_and_relationships_use_typed_requests() -> TestResult {
         ],
         "github",
     )?;
-    let remote = Rc::new(RefCell::new(Remote::default()));
+    let remote = Rc::new(RefCell::new(Remote {
+        defined_labels: Some(vec![
+            json!({"name":"ready / next","color":"aabbcc","description":"fixture"}),
+        ]),
+        ..Remote::default()
+    }));
     let backend = GitHubExecutor::new(
         BackendId::new("github")?,
         scope,
@@ -513,10 +649,11 @@ impl RogerMutationTransport for Provider {
         _: usize,
     ) -> Result<Vec<u8>, IntegrationError> {
         assert!(
-            self.store.task(&self.task).is_ok_and(|task| task
-                .effects()
-                .iter()
-                .any(|effect| effect.request().key() == key && effect.submissions() > 0)),
+            self.conformance_probe
+                || self.store.task(&self.task).is_ok_and(|task| task
+                    .effects()
+                    .iter()
+                    .any(|effect| effect.request().key() == key && effect.submissions() > 0)),
             "Roger must receive persisted intent and a recorded submission"
         );
         let mut remote = self.remote.borrow_mut();
@@ -585,6 +722,53 @@ fn question(task: &TaskId) -> TestResult<RogerAsk> {
         body: Text::new("Sanitized evidence and recommendation")?,
         supersedes: None,
     })
+}
+
+#[test]
+fn github_and_roger_executors_pass_shared_conformance() -> TestResult {
+    use kitchen::contracts::conformance::{ConformanceFixture, run};
+    for family in ["github", "roger"] {
+        let fixture = Fixture::new()?;
+        let permission = if family == "github" {
+            Permission::EditLabels
+        } else {
+            Permission::AskHuman
+        };
+        let (scope, _grants, task, _fence) = setup(&fixture, 3, &[permission], family)?;
+        let remote = Rc::new(RefCell::new(Remote::default()));
+        let mut transport = provider(&fixture, &task, remote)?;
+        transport.conformance_probe = true;
+        let contract = ConformanceFixture {
+            house: house()?,
+            foreign_house: HouseId::new("foreign")?,
+            foreign_backend: BackendId::new("foreign")?,
+            credential: scope.credential().name().clone(),
+            task: task.clone(),
+            repository: Repository::new("sample/project")?,
+            run_tag: ExternalRef::new("fixture")?,
+            brief: Text::new("fixture")?,
+        };
+        if family == "github" {
+            let executor = GitHubExecutor::new(
+                BackendId::new(family)?,
+                scope,
+                transport,
+                ReadLimits::default(),
+            );
+            let effect = Effect::GitHub(executor.effect(mutation(label("conformance-probe"))?)?);
+            run(&executor, &contract, &effect)?;
+        } else {
+            let executor = RogerExecutor::new(
+                BackendId::new(family)?,
+                scope,
+                transport,
+                ReadLimits::default(),
+            );
+            let effect = Effect::Roger(executor.effect(question(&task)?)?);
+            run(&executor, &contract, &effect)?;
+        }
+    }
+    Ok(())
 }
 #[test]
 fn roger_restart_native_idempotency_recovers_lost_response_and_preserves_one_ask() -> TestResult {

@@ -293,6 +293,8 @@ fn gh_cli_clears_environment_and_checks_requester_before_repository_read() -> Re
 [ "$GH_TOKEN" = sanitized-fixture-token ] || exit 2
 [ -z "$ROGER_TOKEN" ] || exit 2
 [ "$GH_HOST" = github.com ] || exit 2
+for arg in "$@"; do [ "$arg" != sanitized-fixture-token ] || exit 2; done
+[ "$HOME" = "$GH_CONFIG_DIR" ] || exit 2
 if [ "$4" = user ]; then
   printf '%s' '{"login":"sample-bot"}'
 else
@@ -368,7 +370,7 @@ fn exact_head_checks_reviews_dependencies_and_unknown_mergeability() -> Result {
             json!({"check_runs":[{"name":"ci","head_sha":head,"status":"completed","conclusion":"success"}]}),
         ),
         Ok(
-            json!([{"id":1,"user":{"login":"reviewer"},"commit_id":"b".repeat(40),"state":"APPROVED"}]),
+            json!([{"id":1,"user":{"login":"copilot"},"commit_id":"b".repeat(40),"state":"COMMENTED","body":"Unable to review this pull request because the quota has been reached.","submitted_at":"2026-09-28T15:00:00Z"}]),
         ),
         Ok(json!([issue(4)])),
     ])?;
@@ -390,6 +392,14 @@ fn exact_head_checks_reviews_dependencies_and_unknown_mergeability() -> Result {
         return Err("expected reviews".into());
     };
     assert_ne!(reviews[0].commit_id, pr.head.sha);
+    assert_eq!(
+        reviews[0].body.as_deref(),
+        Some("Unable to review this pull request because the quota has been reached.")
+    );
+    assert_eq!(
+        reviews[0].submitted_at.as_deref(),
+        Some("2026-09-28T15:00:00Z")
+    );
     let Observation::Known(deps) = client.dependencies(&house, &repo, number) else {
         return Err("expected dependencies".into());
     };

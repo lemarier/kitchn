@@ -121,16 +121,22 @@ impl<T: RogerMutationTransport> EffectExecutor for RogerExecutor<T> {
                 self.limits.timeout(),
                 self.limits.bytes().min(128 * 1024),
             )
-            .map_err(|_| EffectFailure::Uncertain(UncertainReason::Transport))?;
+            .map_err(|error| match error {
+                IntegrationError::InvalidInput | IntegrationError::ScopeMismatch => {
+                    EffectFailure::NotApplied(NotAppliedReason::Rejected)
+                }
+                IntegrationError::Timeout => EffectFailure::Uncertain(UncertainReason::Timeout),
+                _ => EffectFailure::Uncertain(UncertainReason::Transport),
+            })?;
         let reference = validate_receipt(self.scope.credential(), &effect.ask, &bytes)
             .map_err(|_| EffectFailure::Uncertain(UncertainReason::ResponseLost))?;
         Receipt::new(reference, vec![], vec![])
             .map_err(|_| EffectFailure::Uncertain(UncertainReason::ResponseLost))
     }
     fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
-        let effect = self
-            .payload(request, false)
-            .map_err(|_| BackendUnavailable::Transport)?;
+        let Ok(effect) = self.payload(request, false) else {
+            return Ok(Lookup::Unknown);
+        };
         match self
             .transport
             .find(

@@ -79,6 +79,7 @@ pub struct RogerCli {
     executable: PathBuf,
     credential: CredentialFile,
     probe: ExternalRef,
+    base_url: String,
 }
 impl RogerCli {
     /// Detect the optional local CLI without credentials, network calls, or installation.
@@ -138,6 +139,45 @@ impl RogerCli {
         credential: CredentialFile,
         probe: ExternalRef,
     ) -> Result<Self, IntegrationError> {
+        let _ = (executable, credential, probe);
+        // No implicit deployment may receive a house credential.
+        Err(IntegrationError::InvalidInput)
+    }
+    /// Configure a house-selected HTTPS deployment.
+    ///
+    /// # Errors
+    /// Refuses malformed endpoints and unsupported CLI installations.
+    pub fn new_with_url(
+        executable: PathBuf,
+        credential: CredentialFile,
+        probe: ExternalRef,
+        base_url: String,
+    ) -> Result<Self, IntegrationError> {
+        let host = base_url
+            .strip_prefix("https://")
+            .ok_or(IntegrationError::InvalidInput)?;
+        let (name, port) = host
+            .split_once(':')
+            .map_or((host, None), |(name, port)| (name, Some(port)));
+        if name.is_empty()
+            || name.split('.').any(|label| {
+                label.is_empty()
+                    || !label
+                        .bytes()
+                        .next()
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                    || !label
+                        .bytes()
+                        .last()
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+            || port.is_some_and(|port| port.parse::<u16>().map_or(true, |value| value == 0))
+        {
+            return Err(IntegrationError::InvalidInput);
+        }
         if !executable.is_absolute() {
             return Err(IntegrationError::InvalidInput);
         }
@@ -149,6 +189,7 @@ impl RogerCli {
             executable,
             credential,
             probe,
+            base_url,
         })
     }
     pub(crate) fn call(
@@ -163,7 +204,7 @@ impl RogerCli {
         let token = self.credential.load(reference)?;
         let env = [
             ("ROGER_TOKEN", token.as_str()),
-            ("ROGER_URL", "https://roger.origin89.com"),
+            ("ROGER_URL", self.base_url.as_str()),
         ];
         let output = run(
             &self.executable,

@@ -79,9 +79,11 @@ pub use backend::{
 pub use capability::{BackendDescriptor, Capability, CapabilitySet, Support};
 pub use effects::{
 
-    AskKind, AskRisk, DecisionBinding, DecisionOwner, Effect, EffectContext, ExecutorKind,
-    GitHubAction, GitHubEffect, GitHubMutation, IssueNumber, LabelDefinition, MAX_ASKS_PER_TASK,
-    MergeMethod, PostingBudget, RogerAsk, RogerEffect, ScheduleEffect, SubmittedEffects,
+    AskKind, AskRisk, CloseReason, DecisionBinding, DecisionOwner, Effect, EffectContext,
+    ExecutorKind, GitHubAction, GitHubEffect, GitHubMutation, IssueNumber, LabelDefinition,
+    MAX_ASKS_PER_TASK, MergeMethod, PostingBudget, RogerAsk, RogerEffect, ScheduleEffect,
+    SubmittedEffects,
+
 };
 pub use error::ContractError;
 pub use evidence::{Evidence, EvidenceKind, EvidenceRevision, EvidenceSubject, EvidenceVerdict};

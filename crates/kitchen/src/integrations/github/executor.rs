@@ -57,6 +57,13 @@ impl<T: GitHubMutationTransport> GitHubExecutor<T> {
         &self.transport
     }
     fn validate(&self, effect: &GitHubEffect) -> Result<(), IntegrationError> {
+        if matches!(
+            effect.mutation.action,
+            super::GitHubAction::CloseIssue { .. }
+        ) {
+            // #27 owns Permission::CloseIssue. Refuse until that grant exists.
+            return Err(IntegrationError::PermissionDenied);
+        }
         effect.mutation.validate()?;
         if effect.requester != *self.scope.requester()
             || effect.posting_budget.limit() > self.scope.budget().limit()
@@ -132,7 +139,8 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
             self.limits.bytes(),
         )?;
         // A successful exit alone is insufficient; read back the exact desired effect.
-        match provider
+        let mut readback = Provider::new(&self.scope, &self.transport, self.limits);
+        match readback
             .inspect(&effect.mutation, request.key())
             .map_err(uncertain)?
         {
@@ -143,9 +151,9 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
         }
     }
     fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
-        let effect = self
-            .payload(request, false)
-            .map_err(|_| BackendUnavailable::Transport)?;
+        let Ok(effect) = self.payload(request, false) else {
+            return Ok(Lookup::Unknown);
+        };
         let mut provider = Provider::new(&self.scope, &self.transport, self.limits);
         match provider.inspect(&effect.mutation, request.key()) {
             Ok(Inspection::Applied(receipt)) => Ok(Lookup::Applied(receipt)),

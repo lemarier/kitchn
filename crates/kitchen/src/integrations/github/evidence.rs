@@ -541,6 +541,10 @@ pub struct Review {
     pub commit_id: CommitId,
     /// Review outcome.
     pub state: ReviewState,
+    /// Review text is untrusted provider data; callers classify it without executing it.
+    pub body: Option<String>,
+    /// Provider submission timestamp, absent for pending reviews.
+    pub submitted_at: Option<String>,
 }
 
 /// A review outcome.

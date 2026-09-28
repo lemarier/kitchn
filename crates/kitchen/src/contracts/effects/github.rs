@@ -118,6 +118,13 @@ pub struct GitHubMutation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum GitHubAction {
+    /// Close one issue with an explicit provider reason.
+    CloseIssue {
+        /// Destination issue.
+        number: IssueNumber,
+        /// Reason recorded by GitHub.
+        reason: CloseReason,
+    },
     /// Merge only the named head using GitHub's squash method.
     MergePullRequest {
         /// Destination pull request.
@@ -170,6 +177,17 @@ pub enum GitHubAction {
         label: LabelDefinition,
     },
 }
+/// GitHub's issue closure reasons. Duplicate retains the referenced issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "of", rename_all = "kebab-case")]
+pub enum CloseReason {
+    /// Work completed.
+    Completed,
+    /// Work will not be planned.
+    NotPlanned,
+    /// Duplicate of an existing issue.
+    Duplicate(IssueNumber),
+}
 /// Merge strategy; this integration permits squash only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -184,6 +202,11 @@ impl GitHubMutation {
     /// Rejects self-links, malformed labels, and oversized titles/bodies.
     pub fn validate(&self) -> Result<(), ContractError> {
         match &self.action {
+            GitHubAction::CloseIssue {
+                number,
+                reason: CloseReason::Duplicate(of),
+            } if number == of => Err(invalid()),
+            GitHubAction::CloseIssue { .. } => Ok(()),
             GitHubAction::MergePullRequest { .. } => Ok(()),
             GitHubAction::PostComment { body, .. } if body.as_str().len() > 60 * 1024 => {
                 Err(invalid())
@@ -192,6 +215,7 @@ impl GitHubMutation {
             GitHubAction::SetLabel { label, .. } => validate_label_name(label),
             GitHubAction::CreateIssue { title, body } => {
                 if title.as_str().len() > 256
+                    || title.as_str().trim() != title.as_str()
                     || title.as_str().chars().any(char::is_control)
                     || body.as_str().len() > 60 * 1024
                 {
@@ -235,6 +259,7 @@ impl GitHubEffect {
     #[must_use]
     pub const fn required_permission(&self) -> Permission {
         match self.mutation.action {
+            GitHubAction::CloseIssue { .. } => close_issue_permission_placeholder(),
             GitHubAction::MergePullRequest { .. } => Permission::Merge,
             GitHubAction::PostComment { .. } => Permission::PostComment,
             GitHubAction::SetLabel { .. } | GitHubAction::CreateLabel { .. } => {
@@ -256,7 +281,13 @@ impl GitHubEffect {
     /// # Errors
     /// Refuses malformed action payloads.
     pub fn check(&self, _context: &EffectContext<'_>) -> Result<(), ContractError> {
-        self.mutation.validate()
+        self.mutation.validate()?;
+        if matches!(self.mutation.action, GitHubAction::CloseIssue { .. }) {
+            return Err(ContractError::PermissionDenied {
+                permission: close_issue_permission_placeholder(),
+            });
+        }
+        Ok(())
     }
     /// Validate input and atomically reserve one logical posting slot.
     ///
@@ -271,4 +302,8 @@ impl GitHubEffect {
         }
         Ok(())
     }
+}
+/// Replace this fail-closed placeholder with Permission::CloseIssue on rebase of #27.
+const fn close_issue_permission_placeholder() -> Permission {
+    Permission::EditIssueRelationships
 }

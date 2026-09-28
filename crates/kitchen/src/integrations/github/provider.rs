@@ -1,7 +1,7 @@
 //! Provider-side mutation and reconciliation. Durable ownership lives in core.
 use super::{
-    CredentialRef, GhCli, GitHubAction, GitHubMutation, GitHubReadTransport, HouseScope,
-    IntegrationError, Label, LabelSetup, ReadLimits, ReadRequest,
+    CloseReason, CredentialRef, GhCli, GitHubAction, GitHubMutation, GitHubReadTransport,
+    HouseScope, IntegrationError, Label, LabelSetup, ReadLimits, ReadRequest,
 };
 use crate::contracts::{
     EffectFailure, ExternalRef, IdempotencyKey, NotAppliedReason, Receipt, UncertainReason,
@@ -68,6 +68,7 @@ impl GitHubMutationTransport for GhCli {
     ) -> Result<Vec<u8>, EffectFailure> {
         let args = vec![
             "api".into(),
+            "--include".into(),
             "--hostname".into(),
             "github.com".into(),
             "--method".into(),
@@ -78,19 +79,38 @@ impl GitHubMutationTransport for GhCli {
         ];
         let input = serde_json::to_vec(&request.body)
             .map_err(|_| EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
+        let started = Instant::now();
+        let token = self
+            .verified_token(credential, timeout)
+            .map_err(|_| EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or(EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
         let output = self
-            .call(credential, &args, &input, timeout, max_bytes)
+            .run_with_token(&token, &args, &input, remaining, max_bytes)
             .map_err(|error| match error {
-                IntegrationError::ScopeMismatch | IntegrationError::InvalidInput => {
-                    EffectFailure::NotApplied(NotAppliedReason::Rejected)
-                }
                 IntegrationError::Timeout => EffectFailure::Uncertain(UncertainReason::Timeout),
                 _ => EffectFailure::Uncertain(UncertainReason::Transport),
             })?;
-        if output.code != Some(0) {
-            return Err(EffectFailure::Uncertain(UncertainReason::Transport));
+        if output.code == Some(4) {
+            return Err(EffectFailure::NotApplied(NotAppliedReason::Rejected));
         }
-        Ok(output.stdout)
+        let status = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .next()
+            .and_then(|line| std::str::from_utf8(line).ok())
+            .and_then(|line| line.strip_prefix("HTTP/"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok());
+        match (status, output.code) {
+            (Some(400 | 401 | 403 | 404 | 422), _) => {
+                Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+            }
+            (Some(200..=299), Some(0)) => Ok(output.stdout),
+            _ => Err(EffectFailure::Uncertain(UncertainReason::Transport)),
+        }
     }
 }
 
@@ -144,6 +164,59 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             .ok_or(IntegrationError::LimitExceeded)?;
         serde_json::from_slice(&bytes).map_err(|_| IntegrationError::Unknown)
     }
+    fn duplicate_target(
+        &mut self,
+        repository: &crate::contracts::Repository,
+        number: u64,
+    ) -> Result<Option<u64>, IntegrationError> {
+        let (owner, name) = repository
+            .as_str()
+            .split_once('/')
+            .ok_or(IntegrationError::InvalidInput)?;
+        let query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){duplicateOf{number repository{nameWithOwner}}}}}";
+        let number = i64::try_from(number).map_err(|_| IntegrationError::InvalidInput)?;
+        let bytes = self.transport.read(
+            self.scope.credential(),
+            &ReadRequest {
+                endpoint: "graphql".into(),
+                graphql: Some(
+                    json!({"query":query,"variables":{"owner":owner,"name":name,"number":number}}),
+                ),
+            },
+            self.remaining()?,
+            self.remaining,
+        )?;
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or(IntegrationError::LimitExceeded)?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| IntegrationError::Unknown)?;
+        if value.get("errors").is_some() {
+            return Err(IntegrationError::Unknown);
+        }
+        let issue = value
+            .pointer("/data/repository/issue")
+            .ok_or(IntegrationError::Unknown)?;
+        if issue.is_null() {
+            return Err(IntegrationError::Unknown);
+        }
+        let target = issue.get("duplicateOf").ok_or(IntegrationError::Unknown)?;
+        if target.is_null() {
+            return Ok(None);
+        }
+        if target
+            .pointer("/repository/nameWithOwner")
+            .and_then(Value::as_str)
+            != Some(repository.as_str())
+        {
+            return Ok(None);
+        }
+        target
+            .get("number")
+            .and_then(Value::as_u64)
+            .map(Some)
+            .ok_or(IntegrationError::Unknown)
+    }
     fn pages(&mut self, endpoint: &str) -> Result<Vec<Value>, IntegrationError> {
         let mut all = Vec::new();
         for page in 1..=self.limits.pages() {
@@ -171,6 +244,41 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
         let root = format!("repos/{}", mutation.repository);
         let reference = receipt(key)?;
         match &mutation.action {
+            GitHubAction::CloseIssue { number, reason } => {
+                let issue = self.read(format!("{root}/issues/{}", number.get()))?;
+                if issue.get("number").and_then(Value::as_u64) != Some(number.get())
+                    || issue.get("pull_request").is_some()
+                {
+                    return Err(IntegrationError::Unknown);
+                }
+                match issue.get("state").and_then(Value::as_str) {
+                    Some("open") => Ok(Inspection::Missing),
+                    Some("closed") => {
+                        let matches = match reason {
+                            CloseReason::Completed => {
+                                issue.get("state_reason").and_then(Value::as_str)
+                                    == Some("completed")
+                            }
+                            CloseReason::NotPlanned => {
+                                issue.get("state_reason").and_then(Value::as_str)
+                                    == Some("not_planned")
+                            }
+                            CloseReason::Duplicate(of) => {
+                                issue.get("state_reason").and_then(Value::as_str)
+                                    == Some("duplicate")
+                                    && self.duplicate_target(&mutation.repository, number.get())?
+                                        == Some(of.get())
+                            }
+                        };
+                        Ok(if matches {
+                            Inspection::Applied(reference)
+                        } else {
+                            Inspection::Conflict
+                        })
+                    }
+                    _ => Err(IntegrationError::Unknown),
+                }
+            }
             GitHubAction::MergePullRequest {
                 number,
                 expected_head,
@@ -312,6 +420,20 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
     ) -> Result<MutationRequest, IntegrationError> {
         let root = format!("repos/{}", mutation.repository);
         let (method, endpoint, body) = match &mutation.action {
+            GitHubAction::CloseIssue { number, reason } => {
+                let (state_reason, duplicate_issue_id) = match reason {
+                    CloseReason::Completed => ("completed", None),
+                    CloseReason::NotPlanned => ("not_planned", None),
+                    CloseReason::Duplicate(of) => {
+                        ("duplicate", Some(self.issue_id(&root, of.get())?))
+                    }
+                };
+                (
+                    "PATCH",
+                    format!("{root}/issues/{}", number.get()),
+                    json!({"state":"closed","state_reason":state_reason,"duplicate_issue_id":duplicate_issue_id}),
+                )
+            }
             GitHubAction::MergePullRequest {
                 number,
                 expected_head,
@@ -335,11 +457,22 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                 issue,
                 label,
                 present: true,
-            } => (
-                "POST",
-                format!("{root}/issues/{}/labels", issue.get()),
-                json!({"labels":[label]}),
-            ),
+            } => {
+                let labels = self.pages(&format!("{root}/labels"))?;
+                if !labels.iter().any(|entry| {
+                    entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(label))
+                }) {
+                    return Err(IntegrationError::InvalidInput);
+                }
+                (
+                    "POST",
+                    format!("{root}/issues/{}/labels", issue.get()),
+                    json!({"labels":[label]}),
+                )
+            }
             GitHubAction::SetLabel {
                 issue,
                 label,
@@ -452,6 +585,236 @@ fn inspect_markers(
         Some(receipt) => Inspection::Applied(receipt),
         None => Inspection::Missing,
     })
+}
+
+#[cfg(all(test, unix))]
+mod mutation_tests {
+    use super::*;
+    use crate::{CredentialId, HouseId, contracts::ExternalRef};
+    use std::os::unix::fs::PermissionsExt;
+    use std::{cell::RefCell, collections::VecDeque};
+
+    struct ReadFixture(RefCell<VecDeque<Value>>);
+    impl GitHubReadTransport for ReadFixture {
+        fn read(
+            &self,
+            _: &CredentialRef,
+            _: &ReadRequest,
+            _: Duration,
+            _: usize,
+        ) -> Result<Vec<u8>, IntegrationError> {
+            serde_json::to_vec(
+                &self
+                    .0
+                    .borrow_mut()
+                    .pop_front()
+                    .ok_or(IntegrationError::Unknown)?,
+            )
+            .map_err(|_| IntegrationError::Unknown)
+        }
+    }
+    impl GitHubMutationTransport for ReadFixture {
+        fn submit(
+            &self,
+            _: &CredentialRef,
+            _: &MutationRequest,
+            _: Duration,
+            _: usize,
+        ) -> Result<Vec<u8>, EffectFailure> {
+            Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+        }
+    }
+
+    #[test]
+    fn close_issue_reconciles_same_reason_and_refuses_unauthorized_effect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::contracts::{
+            GitHubEffect, IdempotencyKey, IssueNumber, Permission, PostingBudget, Repository,
+        };
+        let house = HouseId::new("sample")?;
+        let requester = ExternalRef::new("sample-bot")?;
+        let credential =
+            CredentialRef::new(house.clone(), CredentialId::new("gh")?, requester.clone());
+        let scope = HouseScope::new(
+            house,
+            [Repository::new("sample/project")?],
+            requester.clone(),
+            credential,
+            PostingBudget::new(2)?,
+            [Permission::EditIssueRelationships],
+        )?;
+        let mutation = GitHubMutation {
+            repository: Repository::new("sample/project")?,
+            action: GitHubAction::CloseIssue {
+                number: IssueNumber::new(1)?,
+                reason: CloseReason::Completed,
+            },
+        };
+        let key = IdempotencyKey::from_ref(ExternalRef::new("close-fixture")?);
+        let read = ReadFixture(RefCell::new(VecDeque::from([
+            json!({"number":1,"state":"closed","state_reason":"completed"}),
+        ])));
+        let mut provider = Provider::new(&scope, &read, ReadLimits::default());
+        assert!(matches!(
+            provider.inspect(&mutation, &key)?,
+            Inspection::Applied(_)
+        ));
+        let read = ReadFixture(RefCell::new(VecDeque::from([
+            json!({"number":1,"state":"closed","state_reason":"not_planned"}),
+        ])));
+        let mut provider = Provider::new(&scope, &read, ReadLimits::default());
+        assert!(matches!(
+            provider.inspect(&mutation, &key)?,
+            Inspection::Conflict
+        ));
+        let read = ReadFixture(RefCell::new(VecDeque::from([
+            json!({"number":1,"state":"open","state_reason":null}),
+        ])));
+        let mut provider = Provider::new(&scope, &read, ReadLimits::default());
+        assert!(matches!(
+            provider.inspect(&mutation, &key)?,
+            Inspection::Missing
+        ));
+        let effect = GitHubEffect {
+            requester,
+            mutation,
+            posting_budget: PostingBudget::new(2)?,
+        };
+        assert_eq!(
+            effect.required_permission(),
+            Permission::EditIssueRelationships
+        );
+        let encoded = serde_json::to_vec(&effect)?;
+        assert_eq!(serde_json::from_slice::<GitHubEffect>(&encoded)?, effect);
+        let executor = super::super::GitHubExecutor::new(
+            crate::BackendId::new("github")?,
+            scope,
+            read,
+            ReadLimits::default(),
+        );
+        assert!(matches!(
+            executor.effect(effect.mutation),
+            Err(IntegrationError::PermissionDenied)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_close_uses_canonical_issue_id_and_reconciles_exact_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::contracts::{
+            IdempotencyKey, IssueNumber, Permission, PostingBudget, Repository,
+        };
+        let house = HouseId::new("sample")?;
+        let requester = ExternalRef::new("sample-bot")?;
+        let credential =
+            CredentialRef::new(house.clone(), CredentialId::new("gh")?, requester.clone());
+        let scope = HouseScope::new(
+            house,
+            [Repository::new("sample/project")?],
+            requester,
+            credential,
+            PostingBudget::new(1)?,
+            [Permission::EditIssueRelationships],
+        )?;
+        let mutation = GitHubMutation {
+            repository: Repository::new("sample/project")?,
+            action: GitHubAction::CloseIssue {
+                number: IssueNumber::new(1)?,
+                reason: CloseReason::Duplicate(IssueNumber::new(2)?),
+            },
+        };
+        let key = IdempotencyKey::from_ref(ExternalRef::new("close-duplicate")?);
+        let canonical = json!({"number":2,"id":102});
+        let read = ReadFixture(RefCell::new(VecDeque::from([canonical.clone()])));
+        let mut provider = Provider::new(&scope, &read, ReadLimits::default());
+        let prepared = provider.prepare(&mutation, &key)?;
+        assert_eq!(prepared.body()["duplicate_issue_id"], 102);
+        assert_eq!(prepared.body()["state_reason"], "duplicate");
+        let read = ReadFixture(RefCell::new(VecDeque::from([
+            json!({"number":1,"state":"closed","state_reason":"duplicate","duplicate_issue_id":102}),
+            json!({"data":{"repository":{"issue":{"duplicateOf":{"number":2,"repository":{"nameWithOwner":"sample/project"}}}}}}),
+        ])));
+        let mut provider = Provider::new(&scope, &read, ReadLimits::default());
+        assert!(matches!(
+            provider.inspect(&mutation, &key)?,
+            Inspection::Applied(_)
+        ));
+        Ok(())
+    }
+
+    fn fake_cli(
+        script: &str,
+    ) -> Result<(tempfile::TempDir, GhCli, CredentialRef), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("gh");
+        std::fs::write(&executable, format!("#!/bin/sh\n{script}\n"))?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        let token_path = directory.path().join("token");
+        std::fs::write(&token_path, "fixture-secret")?;
+        let credential = CredentialRef::new(
+            HouseId::new("sample")?,
+            CredentialId::new("gh")?,
+            ExternalRef::new("sample-bot")?,
+        );
+        let cli = GhCli::new(
+            executable,
+            super::super::CredentialFile::new(credential.clone(), token_path)?,
+        )?;
+        Ok((directory, cli, credential))
+    }
+
+    #[test]
+    fn submit_classifies_provider_refusals_and_ambiguous_outcomes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = MutationRequest {
+            method: "POST",
+            endpoint: "repos/sample/project/issues/1/comments".into(),
+            body: json!({"body":"fixture"}),
+        };
+        for (response, expected) in [
+            (
+                "HTTP/2 403 Forbidden",
+                EffectFailure::NotApplied(NotAppliedReason::Rejected),
+            ),
+            (
+                "HTTP/2 404 Not Found",
+                EffectFailure::NotApplied(NotAppliedReason::Rejected),
+            ),
+            (
+                "HTTP/2 422 Unprocessable",
+                EffectFailure::NotApplied(NotAppliedReason::Rejected),
+            ),
+            (
+                "HTTP/2 502 Bad Gateway",
+                EffectFailure::Uncertain(UncertainReason::Transport),
+            ),
+        ] {
+            let script = format!(
+                "for arg in \"$@\"; do [ \"$arg\" != fixture-secret ] || exit 9; done\ncase \" $* \" in *' user '*) printf '%s' '{{\"login\":\"sample-bot\"}}';; *) printf '%s\\r\\n\\r\\n' '{response}'; exit 1;; esac"
+            );
+            let (_directory, cli, credential) = fake_cli(&script)?;
+            assert_eq!(
+                cli.submit(&credential, &request, Duration::from_secs(2), 4096),
+                Err(expected)
+            );
+        }
+        let (_directory, cli, credential) = fake_cli(
+            "case \" $* \" in *' user '*) printf '%s' '{\"login\":\"wrong\"}';; *) exit 9;; esac",
+        )?;
+        assert_eq!(
+            cli.submit(&credential, &request, Duration::from_secs(2), 4096),
+            Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+        );
+        let (_directory, cli, credential) = fake_cli(
+            "case \" $* \" in *' user '*) printf '%s' '{\"login\":\"sample-bot\"}';; *) while :; do :; done;; esac",
+        )?;
+        assert_eq!(
+            cli.submit(&credential, &request, Duration::from_millis(500), 4096),
+            Err(EffectFailure::Uncertain(UncertainReason::Timeout))
+        );
+        Ok(())
+    }
 }
 fn encode_segment(value: &str) -> String {
     let mut encoded = String::new();

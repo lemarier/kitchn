@@ -16,6 +16,44 @@ pub struct CredentialFile {
     reference: CredentialRef,
     path: PathBuf,
 }
+
+#[cfg(all(test, unix))]
+mod isolation_tests {
+    use super::*;
+
+    #[test]
+    fn child_receives_only_selected_environment_and_private_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let output = run(
+            Path::new("/usr/bin/env"),
+            &[],
+            &[],
+            &[("GH_TOKEN", "fixture-secret")],
+            Duration::from_secs(2),
+            65536,
+        )?;
+        assert_eq!(output.code, Some(0));
+        let vars = String::from_utf8(output.stdout)?;
+        let lines: Vec<_> = vars.lines().collect();
+        assert!(lines.contains(&"GH_TOKEN=fixture-secret"));
+        assert!(lines.contains(&"NO_COLOR=1"));
+        assert!(!lines.iter().any(|line| line.starts_with("PATH=")
+            || line.starts_with("ROGER_TOKEN=")
+            || line.starts_with("USER=")));
+        let home = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("HOME="))
+            .ok_or("missing HOME")?;
+        let config = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("GH_CONFIG_DIR="))
+            .ok_or("missing GH_CONFIG_DIR")?;
+        assert_eq!(home, config);
+        assert_ne!(Some(home), std::env::var("HOME").ok().as_deref());
+        assert!(!Path::new(home).exists());
+        Ok(())
+    }
+}
 impl std::fmt::Debug for CredentialFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CredentialFile([private])")
@@ -94,6 +132,18 @@ impl GhCli {
         max_bytes: usize,
     ) -> Result<ProcessOutput, IntegrationError> {
         let started = Instant::now();
+        let token = self.verified_token(reference, timeout)?;
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or(IntegrationError::Timeout)?;
+        self.run_with_token(&token, args, input, remaining, max_bytes)
+    }
+    pub(crate) fn verified_token(
+        &self,
+        reference: &CredentialRef,
+        timeout: Duration,
+    ) -> Result<String, IntegrationError> {
         let token = self.credential.load(reference)?;
         let env = [
             ("GH_TOKEN", token.as_str()),
@@ -124,11 +174,22 @@ impl GhCli {
         {
             return Err(IntegrationError::ScopeMismatch);
         }
-        let remaining = timeout
-            .checked_sub(started.elapsed())
-            .filter(|d| !d.is_zero())
-            .ok_or(IntegrationError::Timeout)?;
-        run(&self.executable, args, input, &env, remaining, max_bytes)
+        Ok(token)
+    }
+    pub(crate) fn run_with_token(
+        &self,
+        token: &str,
+        args: &[String],
+        input: &[u8],
+        timeout: Duration,
+        max_bytes: usize,
+    ) -> Result<ProcessOutput, IntegrationError> {
+        let env = [
+            ("GH_TOKEN", token),
+            ("GH_HOST", "github.com"),
+            ("GH_PROMPT_DISABLED", "1"),
+        ];
+        run(&self.executable, args, input, &env, timeout, max_bytes)
     }
 }
 impl GitHubReadTransport for GhCli {

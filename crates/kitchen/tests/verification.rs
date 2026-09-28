@@ -244,6 +244,7 @@ fn activation_fails_when_a_required_target_is_missing() -> TestResult {
     let firmware = repo("origin89hq/firmware")?;
     let policy = VerificationPolicy::new()
         .require_in_house(work("release")?, [target("host:linux")?])?
+        .require_in_house(work("audit")?, [target("host:linux")?])?
         .require_in_repository(
             firmware.clone(),
             work("release")?,
@@ -255,7 +256,7 @@ fn activation_fails_when_a_required_target_is_missing() -> TestResult {
     ])?;
 
     assert_eq!(
-        policy.check_activation(Some(&firmware), &work("release")?, &backend),
+        policy.check_activation(&firmware, &work("release")?, &backend),
         Err(VerificationError::UnsupportedTargets {
             missing: vec![target("device:km43-controller")?],
             partial: vec![],
@@ -263,12 +264,12 @@ fn activation_fails_when_a_required_target_is_missing() -> TestResult {
     );
     // Other repositories get only the house requirement.
     assert_eq!(
-        policy.check_activation(Some(&repo("origin89hq/km43")?), &work("release")?, &backend)?,
+        policy.check_activation(&repo("origin89hq/km43")?, &work("release")?, &backend)?,
         BTreeSet::from([target("host:linux")?])
     );
     // House-level work is checked against the house requirement alone.
     assert_eq!(
-        policy.check_activation(None, &work("release")?, &VerificationEnvironments::new()),
+        policy.check_house_activation(&work("audit")?, &VerificationEnvironments::new()),
         Err(VerificationError::UnsupportedTargets {
             missing: vec![target("host:linux")?],
             partial: vec![],
@@ -276,17 +277,13 @@ fn activation_fails_when_a_required_target_is_missing() -> TestResult {
     );
     // A work type without requirements activates on any backend.
     assert_eq!(
-        policy.check_activation(
-            Some(&firmware),
-            &work("docs")?,
-            &VerificationEnvironments::new()
-        )?,
+        policy.check_activation(&firmware, &work("docs")?, &VerificationEnvironments::new())?,
         BTreeSet::new()
     );
     let complete = backend.with(target("device:km43-controller")?, Support::Supported)?;
     assert_eq!(
         policy
-            .check_activation(Some(&firmware), &work("release")?, &complete)?
+            .check_activation(&firmware, &work("release")?, &complete)?
             .len(),
         3
     );
@@ -300,7 +297,7 @@ fn a_repository_entry_adds_to_but_never_removes_house_requirements() -> TestResu
         .require_in_house(work("ui")?, [target("host:macos")?])?
         .require_in_repository(app.clone(), work("ui")?, [target("vm:windows")?])?;
     assert_eq!(
-        policy.required_targets(Some(&app), &work("ui")?),
+        policy.required_targets(&app, &work("ui")?),
         BTreeSet::from([target("host:macos")?, target("vm:windows")?])
     );
     Ok(())
@@ -311,13 +308,13 @@ fn backends_declare_no_environments_by_default() -> TestResult {
     let policy = VerificationPolicy::new().require_in_house(work("ui")?, [target("vm:macos")?])?;
     let plain = FakeBackend::fully_capable(backend_id()?, house()?);
     assert!(matches!(
-        policy.check_activation(None, &work("ui")?, plain.verification_environments()),
+        policy.check_house_activation(&work("ui")?, plain.verification_environments()),
         Err(VerificationError::UnsupportedTargets { .. })
     ));
     let declaring = declaring(house()?, &[("vm:macos", Support::Supported)])?;
     assert!(
         policy
-            .check_activation(None, &work("ui")?, declaring.verification_environments())
+            .check_house_activation(&work("ui")?, declaring.verification_environments())
             .is_ok()
     );
     Ok(())
@@ -352,7 +349,7 @@ fn policies_deserialize_strictly() -> TestResult {
         r#"{"house":{"release":["host:linux"]},"repositories":{"origin89hq/firmware":{"release":["device:km43-controller"]}}}"#,
     )?;
     assert_eq!(
-        policy.required_targets(Some(&repo("origin89hq/firmware")?), &work("release")?),
+        policy.required_targets(&repo("origin89hq/firmware")?, &work("release")?),
         BTreeSet::from([target("host:linux")?, target("device:km43-controller")?])
     );
     assert_eq!(
@@ -613,6 +610,35 @@ fn host_access_needs_no_extra_grant_but_stays_in_the_house() -> TestResult {
             expected: house()?,
             found: other_house()?,
         }))
+    );
+    Ok(())
+}
+
+#[test]
+fn house_only_activation_refuses_when_a_repository_adds_requirements() -> TestResult {
+    let policy = VerificationPolicy::new()
+        .require_in_house(work("release")?, [target("host:linux")?])?
+        .require_in_repository(
+            repo("origin89hq/firmware")?,
+            work("release")?,
+            [target("device:km43-controller")?],
+        )?;
+    let backend = environments(&[("host:linux", Support::Supported)])?;
+
+    // Omitting the repository must not drop the repository's device target.
+    let refused = Err(VerificationError::RepositoryRequired {
+        work_type: work("release")?,
+    });
+    assert_eq!(policy.required_house_targets(&work("release")?), refused);
+    assert_eq!(
+        policy.check_house_activation(&work("release")?, &backend),
+        refused
+    );
+    // A work type no repository touches still activates house-only.
+    let policy = policy.require_in_house(work("docs")?, [target("host:linux")?])?;
+    assert_eq!(
+        policy.check_house_activation(&work("docs")?, &backend)?,
+        BTreeSet::from([target("host:linux")?])
     );
     Ok(())
 }

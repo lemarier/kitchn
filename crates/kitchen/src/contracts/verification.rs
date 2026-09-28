@@ -359,15 +359,16 @@ impl VerificationPolicy {
     }
 
     /// Every target `work_type` must be verified on: the house requirements
-    /// plus those of `repository`, when the work targets one.
+    /// plus those of `repository`.
     #[must_use]
     pub fn required_targets(
         &self,
-        repository: Option<&Repository>,
+        repository: &Repository,
         work_type: &Text,
     ) -> BTreeSet<VerificationTarget> {
-        let in_repository = repository
-            .and_then(|repository| self.repositories.get(repository))
+        let in_repository = self
+            .repositories
+            .get(repository)
             .and_then(|requirements| requirements.get(work_type));
         self.house
             .get(work_type)
@@ -378,19 +379,64 @@ impl VerificationPolicy {
             .collect()
     }
 
+    /// The house requirements for `work_type`, for work that targets no
+    /// repository. Callers choose this deliberately; work in a repository uses
+    /// [`Self::required_targets`].
+    ///
+    /// # Errors
+    /// Returns [`VerificationError::RepositoryRequired`] when any repository
+    /// adds requirements for `work_type`, because omitting the repository
+    /// could otherwise skip them.
+    pub fn required_house_targets(&self, work_type: &Text) -> Result<BTreeSet<VerificationTarget>> {
+        if self
+            .repositories
+            .values()
+            .any(|requirements| requirements.contains_key(work_type))
+        {
+            return Err(VerificationError::RepositoryRequired {
+                work_type: work_type.clone(),
+            });
+        }
+        Ok(self
+            .house
+            .get(work_type)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect())
+    }
+
     /// Check at activation that the backend's declared environments cover
-    /// every target the policy requires for `work_type`, and return them.
+    /// every target the policy requires for `work_type` in `repository`, and
+    /// return them.
     ///
     /// # Errors
     /// Returns [`VerificationError::UnsupportedTargets`] naming every missing
     /// and partially supported target.
     pub fn check_activation(
         &self,
-        repository: Option<&Repository>,
+        repository: &Repository,
         work_type: &Text,
         environments: &VerificationEnvironments,
     ) -> Result<BTreeSet<VerificationTarget>> {
         let required = self.required_targets(repository, work_type);
+        environments.require(&required)?;
+        Ok(required)
+    }
+
+    /// [`Self::check_activation`] for work that targets no repository.
+    ///
+    /// # Errors
+    /// Returns [`VerificationError::RepositoryRequired`] when a repository
+    /// adds requirements for `work_type`, and
+    /// [`VerificationError::UnsupportedTargets`] as for
+    /// [`Self::check_activation`].
+    pub fn check_house_activation(
+        &self,
+        work_type: &Text,
+        environments: &VerificationEnvironments,
+    ) -> Result<BTreeSet<VerificationTarget>> {
+        let required = self.required_house_targets(work_type)?;
         environments.require(&required)?;
         Ok(required)
     }
@@ -586,6 +632,13 @@ pub enum VerificationError {
         /// Required but only partially supported.
         partial: Vec<VerificationTarget>,
     },
+    /// Work with no repository was checked, but a repository adds requirements
+    /// for its type.
+    #[error("work type {} has repository requirements; name the repository", work_type.as_str())]
+    RepositoryRequired {
+        /// The work type.
+        work_type: Text,
+    },
     /// A policy entry names a work type with no targets.
     #[error("a verification requirement names no targets")]
     EmptyRequirement,
@@ -600,7 +653,9 @@ impl VerificationError {
     pub const fn class(&self) -> ErrorClass {
         match self {
             Self::Contract(error) => error.class(),
-            Self::UnsupportedTargets { .. } => ErrorClass::Refused,
+            Self::UnsupportedTargets { .. } | Self::RepositoryRequired { .. } => {
+                ErrorClass::Refused
+            }
             Self::EmptyRequirement | Self::TooMany => ErrorClass::InvalidInput,
         }
     }

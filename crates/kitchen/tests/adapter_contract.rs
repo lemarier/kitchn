@@ -179,6 +179,7 @@ impl EffectExecutor for OptimisticLookupBackend {
         let receipt = Receipt::new(
             ExternalRef::new("made-up").map_err(|_| BackendUnavailable::Transport)?,
             Vec::new(),
+            Vec::new(),
         )
         .map_err(|_| BackendUnavailable::Transport)?;
         Ok(Lookup::Applied(receipt))
@@ -305,7 +306,7 @@ fn launch_records_receipt_but_not_readiness() -> TestResult {
         return Err("launch was not applied".into());
     };
     let worker = receipt
-        .resources()
+        .created()
         .iter()
         .find(|resource| resource.kind == ResourceKind::Worker)
         .ok_or("receipt names no worker")?;
@@ -674,7 +675,7 @@ fn recovery_after_interruption_reconciles_before_relaunch() -> TestResult {
     };
     assert!(
         receipt
-            .resources()
+            .created()
             .iter()
             .any(|resource| resource.kind == ResourceKind::Worker)
     );
@@ -954,7 +955,7 @@ fn a_requested_cancellation_can_stop_the_task_worker() -> TestResult {
         return Err("launch was not applied".into());
     };
     let worker = receipt
-        .resources()
+        .created()
         .iter()
         .find(|resource| resource.kind == ResourceKind::Worker)
         .cloned()
@@ -1392,7 +1393,7 @@ fn a_new_owner_can_stop_the_worker_after_cancellation() -> TestResult {
             return Err("launch not applied".into());
         };
         let worker = receipt
-            .resources()
+            .created()
             .iter()
             .find(|resource| resource.kind == ResourceKind::Worker)
             .cloned()

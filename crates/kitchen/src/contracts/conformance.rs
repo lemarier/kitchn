@@ -189,7 +189,7 @@ pub fn run_worker(
     };
     let own = &backend.descriptor().backend;
     let worker = receipt
-        .resources()
+        .created()
         .iter()
         .find(|resource| resource.kind == ResourceKind::Worker && &resource.backend == own)
         .cloned();

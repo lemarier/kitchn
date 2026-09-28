@@ -27,7 +27,9 @@ pub use schedule::ScheduleEffect;
 
 use crate::{
     HouseId, TaskId,
-    contracts::{Capability, ContractError, EvidenceRevision, GrantScope, Operation, Permission},
+    contracts::{
+        Capability, ContractError, EvidenceRevision, GrantScope, Operation, Permission, ResourceRef,
+    },
 };
 
 /// The executor family that performs an effect.
@@ -105,6 +107,15 @@ impl Effect {
             Self::Worker(_) | Self::Roger(_) => task_scope.clone(),
             Self::GitHub(effect) => effect.scope(),
             Self::Schedule(effect) => effect.scope(),
+        }
+    }
+
+    /// The existing resource this effect acts on, if any.
+    #[must_use]
+    pub const fn target(&self) -> Option<&ResourceRef> {
+        match self {
+            Self::Worker(operation) => operation.target(),
+            Self::GitHub(_) | Self::Roger(_) | Self::Schedule(_) => None,
         }
     }
 

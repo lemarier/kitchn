@@ -785,12 +785,14 @@ impl TaskRecord {
         submitted
     }
 
-    /// Whether an applied effect of this task reported `resource`.
+    /// Whether the task was given `resource` or an applied effect of this
+    /// task created it. Touching a resource does not transfer it.
     fn owns_resource(&self, resource: &ResourceRef) -> bool {
-        self.effects.iter().any(|effect| {
-            matches!(&effect.state, EffectState::Applied { receipt, .. }
-                if receipt.resources().contains(resource))
-        })
+        self.spec.resources.contains(resource)
+            || self.effects.iter().any(|effect| {
+                matches!(&effect.state, EffectState::Applied { receipt, .. }
+                    if receipt.created().contains(resource))
+            })
     }
 
     fn attempt(&self, number: AttemptNumber) -> Option<&AttemptRecord> {
@@ -1428,16 +1430,17 @@ impl StoreState {
                 .chain([plan.effect.required_capability()]),
         )?;
         let trigger = task.owned_lease(plan.fence, now, true)?.trigger;
+        if let Some(target) = plan.effect.target()
+            && (target.backend != backend.backend || !task.owns_resource(target))
+        {
+            return fail(StateError::ResourceNotOwned);
+        }
         // After a cancellation request, only stopping a worker this task
         // launched may start; it may start while other effects are unresolved.
         let stopping = task.cancel.is_some();
         if stopping {
             match &plan.effect {
-                Effect::Worker(Operation::CancelWorker { worker })
-                    if task.owns_resource(worker) => {}
-                Effect::Worker(Operation::CancelWorker { .. }) => {
-                    return fail(StateError::ResourceNotOwned);
-                }
+                Effect::Worker(Operation::CancelWorker { .. }) => {}
                 Effect::Worker(
                     Operation::LaunchWorker { .. }
                     | Operation::MessageWorker { .. }

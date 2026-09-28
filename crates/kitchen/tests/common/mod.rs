@@ -109,6 +109,7 @@ pub fn spec_with(id: &str, retry: RetryPolicy, permissions: &[Permission]) -> Te
             house_guidance: commit('b')?,
             repository_instructions: None,
         },
+        resources: std::collections::BTreeSet::new(),
         requires: std::collections::BTreeSet::new(),
     })
 }

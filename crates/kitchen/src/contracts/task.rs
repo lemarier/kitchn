@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     TaskId,
     contracts::{
-        Capability, CommitId, ContractError, GrantScope, Repository, Role, TaskAuthority, ValueKind,
+        Capability, CommitId, ContractError, GrantScope, Repository, ResourceRef, Role,
+        TaskAuthority, ValueKind,
     },
 };
 
@@ -169,6 +170,12 @@ pub struct TaskSpec {
     pub retry: RetryPolicy,
     /// Pinned instruction revisions.
     pub provenance: Provenance,
+    /// Existing resources given to the task when it was created, such as a
+    /// worktree under repair. Targeted operations act only on these or on
+    /// resources the task's own applied effects created; the creator must
+    /// hold the authority to hand them over.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub resources: BTreeSet<ResourceRef>,
     /// Backend capabilities the task's workflow requires, such as launch
     /// readiness or a run timeout. Every effect is refused on a backend that
     /// does not fully support all of them, in addition to the capability the

@@ -50,7 +50,11 @@ fn claimed_attempt(fixture: &Fixture, id: &str, now: Timestamp) -> TestResult<Fe
 }
 
 fn receipt(reference: &str) -> TestResult<Receipt> {
-    Ok(Receipt::new(ExternalRef::new(reference)?, Vec::new())?)
+    Ok(Receipt::new(
+        ExternalRef::new(reference)?,
+        Vec::new(),
+        Vec::new(),
+    )?)
 }
 
 fn evidence(subject: char, source: &str) -> TestResult<Evidence> {

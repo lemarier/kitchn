@@ -130,22 +130,23 @@ impl FakeBackend {
         request: &EffectRequest,
     ) -> Result<Receipt, EffectFailure> {
         let rejected = EffectFailure::NotApplied(NotAppliedReason::Rejected);
-        let resources = match request.effect() {
+        let (created, touched) = match request.effect() {
             Effect::Worker(Operation::LaunchWorker { workspace, .. }) => {
                 let worker = self.handle(state, "worker")?;
-                let mut resources = vec![self.resource(ResourceKind::Worker, worker.clone())];
+                let mut created = vec![self.resource(ResourceKind::Worker, worker.clone())];
+                let mut touched = Vec::new();
                 match workspace {
                     Workspace::Isolated => {
                         let worktree = self.handle(state, "worktree")?;
-                        resources.push(self.resource(ResourceKind::Worktree, worktree));
+                        created.push(self.resource(ResourceKind::Worktree, worktree));
                     }
-                    Workspace::Existing(existing) => resources.push(existing.clone()),
+                    Workspace::Existing(existing) => touched.push(existing.clone()),
                 }
                 if let Ok(owner) = ExternalRef::new(request.key().as_str()) {
                     state.owners.insert(worker.clone(), owner);
                 }
                 state.workers.insert(worker, WorkerState::Starting);
-                resources
+                (created, touched)
             }
             Effect::Worker(
                 Operation::MessageWorker { worker, .. } | Operation::ReplyToWorker { worker, .. },
@@ -153,7 +154,7 @@ impl FakeBackend {
                 if !self.owns_live_worker(state, worker) {
                     return Err(rejected);
                 }
-                vec![worker.clone()]
+                (Vec::new(), vec![worker.clone()])
             }
             Effect::Worker(Operation::CancelWorker { worker }) => {
                 if !self.owns_live_worker(state, worker) {
@@ -163,7 +164,7 @@ impl FakeBackend {
                     worker.handle.clone(),
                     WorkerState::Settled(WorkerOutcome::Cancelled),
                 );
-                vec![worker.clone()]
+                (Vec::new(), vec![worker.clone()])
             }
             Effect::Worker(Operation::ReleaseResource { resource }) => {
                 if resource.backend != self.descriptor.backend {
@@ -171,17 +172,20 @@ impl FakeBackend {
                 }
                 state.workers.remove(&resource.handle);
                 state.owners.remove(&resource.handle);
-                vec![resource.clone()]
+                (Vec::new(), vec![resource.clone()])
             }
             Effect::GitHub(GitHubEffect::CreateLabel { .. })
-            | Effect::Roger(RogerEffect::Ask { .. }) => Vec::new(),
+            | Effect::Roger(RogerEffect::Ask { .. }) => (Vec::new(), Vec::new()),
             Effect::Schedule(ScheduleEffect::InstallDisabled { .. }) => {
                 let schedule = self.handle(state, "schedule")?;
-                vec![self.resource(ResourceKind::Schedule, schedule)]
+                (
+                    vec![self.resource(ResourceKind::Schedule, schedule)],
+                    Vec::new(),
+                )
             }
         };
         let reference = self.handle(state, "request")?;
-        let receipt = Receipt::new(reference, resources).map_err(|_| rejected)?;
+        let receipt = Receipt::new(reference, created, touched).map_err(|_| rejected)?;
         state.effects_performed = state.effects_performed.saturating_add(1);
         state.applied.insert(request.key().clone(), receipt.clone());
         Ok(receipt)

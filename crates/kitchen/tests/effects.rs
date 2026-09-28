@@ -318,7 +318,7 @@ fn effect_scope_must_stay_within_the_task() -> TestResult {
     let EffectState::Applied { receipt, .. } = installed.state() else {
         return Err("schedule not installed".into());
     };
-    assert!(matches!(receipt.resources(), [resource] if resource.kind == ResourceKind::Schedule));
+    assert!(matches!(receipt.created(), [resource] if resource.kind == ResourceKind::Schedule));
     Ok(())
 }
 
@@ -414,7 +414,7 @@ fn replies_go_to_a_live_worker_through_messaging() -> TestResult {
         return Err("launch not applied".into());
     };
     let worker = receipt
-        .resources()
+        .created()
         .iter()
         .find(|resource| resource.kind == ResourceKind::Worker)
         .cloned()
@@ -447,19 +447,16 @@ fn replies_go_to_a_live_worker_through_messaging() -> TestResult {
         handle: ExternalRef::new("no-such-worker")?,
         ..worker
     };
-    let refused = run_effect(
-        &fixture.store,
-        &workers,
-        &grants,
-        plan(&task, fence, "reply-2", reply(stranger)?)?,
-        &clock,
-    )?;
+    // Not a worker this task created: refused before any intent.
     assert!(matches!(
-        refused.state(),
-        EffectState::NotApplied {
-            reason: NotAppliedReason::Rejected,
-            ..
-        }
+        run_effect(
+            &fixture.store,
+            &workers,
+            &grants,
+            plan(&task, fence, "reply-2", reply(stranger)?)?,
+            &clock,
+        ),
+        Err(Error::State(kitchen::state::StateError::ResourceNotOwned))
     ));
 
     let silent = executor(ExecutorKind::Worker, Capability::WorkerLaunchIsolated)?;
@@ -528,5 +525,163 @@ fn inventory_reports_owner_and_liveness_within_its_bound() -> TestResult {
             .capabilities
             .supports(Capability::ResourceInventory)
     );
+    Ok(())
+}
+
+fn launched_worker(
+    fixture: &Fixture,
+    task: &TaskId,
+    fence: Fence,
+    backend: &FakeBackend,
+) -> TestResult<ResourceRef> {
+    let launched = run_effect(
+        &fixture.store,
+        backend,
+        &grants_everywhere()?,
+        plan(task, fence, "launch", launch()?)?,
+        &ManualClock::starting_at(1),
+    )?;
+    let EffectState::Applied { receipt, .. } = launched.state() else {
+        return Err("launch not applied".into());
+    };
+    receipt
+        .created()
+        .iter()
+        .find(|resource| resource.kind == ResourceKind::Worker)
+        .cloned()
+        .ok_or_else(|| "receipt names no worker".into())
+}
+
+#[test]
+fn targeted_operations_need_a_resource_the_task_owns() -> TestResult {
+    let fixture = Fixture::new()?;
+    let backend = FakeBackend::fully_capable(backend_id()?, house()?);
+    let (owner, owner_fence) = task_for(&fixture, "task-b", None)?;
+    let worker = launched_worker(&fixture, &owner, owner_fence, &backend)?;
+    let (other, fence) = task_for(&fixture, "task-a", None)?;
+    let targeted = [
+        Operation::CancelWorker {
+            worker: worker.clone(),
+        },
+        Operation::ReleaseResource {
+            resource: worker.clone(),
+        },
+        Operation::MessageWorker {
+            worker: worker.clone(),
+            body: Text::new("hi")?,
+        },
+        Operation::ReplyToWorker {
+            worker: worker.clone(),
+            question: ExternalRef::new("q-1")?,
+            body: Text::new("yes")?,
+        },
+        Operation::LaunchWorker {
+            role: kitchen::contracts::Role::StationCook,
+            workspace: kitchen::contracts::Workspace::Existing(worker.clone()),
+            brief: Text::new("reuse")?,
+        },
+    ];
+    for (index, operation) in targeted.into_iter().enumerate() {
+        let result = run_effect(
+            &fixture.store,
+            &backend,
+            &grants_everywhere()?,
+            plan(&other, fence, &format!("op-{index}"), operation)?,
+            &ManualClock::starting_at(2),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(Error::State(kitchen::state::StateError::ResourceNotOwned))
+            ),
+            "{index}: {result:?}"
+        );
+    }
+    assert!(fixture.store.task(&other)?.effects().is_empty());
+    assert_eq!(
+        backend.observe_worker(&worker)?,
+        kitchen::contracts::WorkerState::Starting
+    );
+
+    // A worker on another backend namespace is not this task's either.
+    let elsewhere = ResourceRef {
+        backend: BackendId::new("elsewhere")?,
+        ..worker.clone()
+    };
+    let mut given_elsewhere = spec("task-c")?;
+    given_elsewhere.authority =
+        TaskAuthority::delegate(&grants_everywhere()?, grants_everywhere_list()?)?;
+    given_elsewhere.resources = [elsewhere.clone()].into();
+    fixture
+        .store
+        .create_task(given_elsewhere, &creator()?, at(0))?;
+    let task_c = task_id("task-c")?;
+    let fence_c = fixture
+        .store
+        .claim(&task_c, &scheduled("coordinator-c")?, ttl(600)?, at(0))?
+        .fence();
+    fixture.store.start_attempt(&task_c, fence_c, at(0))?;
+    assert!(matches!(
+        run_effect(
+            &fixture.store,
+            &backend,
+            &grants_everywhere()?,
+            plan(
+                &task_c,
+                fence_c,
+                "cancel",
+                Operation::CancelWorker { worker: elsewhere }
+            )?,
+            &ManualClock::starting_at(2)
+        ),
+        Err(Error::State(kitchen::state::StateError::ResourceNotOwned))
+    ));
+
+    // A task given the worker at creation may act on it.
+    let mut adopting = spec("task-d")?;
+    adopting.authority = TaskAuthority::delegate(&grants_everywhere()?, grants_everywhere_list()?)?;
+    adopting.resources = [worker.clone()].into();
+    fixture.store.create_task(adopting, &creator()?, at(0))?;
+    let task_d = task_id("task-d")?;
+    let fence_d = fixture
+        .store
+        .claim(&task_d, &scheduled("coordinator-d")?, ttl(600)?, at(0))?
+        .fence();
+    fixture.store.start_attempt(&task_d, fence_d, at(0))?;
+    let message = run_effect(
+        &fixture.store,
+        &backend,
+        &grants_everywhere()?,
+        plan(
+            &task_d,
+            fence_d,
+            "message",
+            Operation::MessageWorker {
+                worker: worker.clone(),
+                body: Text::new("status?")?,
+            },
+        )?,
+        &ManualClock::starting_at(3),
+    )?;
+    let EffectState::Applied { receipt, .. } = message.state() else {
+        return Err("message not applied".into());
+    };
+    assert!(receipt.created().is_empty());
+    assert_eq!(receipt.touched(), std::slice::from_ref(&worker));
+    let stopped = run_effect(
+        &fixture.store,
+        &backend,
+        &grants_everywhere()?,
+        plan(
+            &task_d,
+            fence_d,
+            "cancel",
+            Operation::CancelWorker {
+                worker: worker.clone(),
+            },
+        )?,
+        &ManualClock::starting_at(4),
+    )?;
+    assert!(matches!(stopped.state(), EffectState::Applied { .. }));
     Ok(())
 }

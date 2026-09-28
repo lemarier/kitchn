@@ -72,6 +72,22 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// The existing resource this operation acts on, if any. The state store
+    /// accepts it only when the task created or was given that resource.
+    #[must_use]
+    pub const fn target(&self) -> Option<&ResourceRef> {
+        match self {
+            Self::LaunchWorker { workspace, .. } => match workspace {
+                Workspace::Isolated => None,
+                Workspace::Existing(resource) => Some(resource),
+            },
+            Self::MessageWorker { worker, .. }
+            | Self::ReplyToWorker { worker, .. }
+            | Self::CancelWorker { worker } => Some(worker),
+            Self::ReleaseResource { resource } => Some(resource),
+        }
+    }
+
     /// The backend capability this operation needs.
     #[must_use]
     pub const fn required_capability(&self) -> Capability {
@@ -208,27 +224,39 @@ impl EffectRequest {
 pub const MAX_RECEIPT_RESOURCES: usize = 16;
 
 /// A backend's positive confirmation that an effect was applied.
+///
+/// Resources the effect *created* belong to the task that requested it;
+/// resources it merely *touched* (a messaged worker, a reused workspace) do
+/// not change hands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawReceipt", into = "RawReceipt")]
 pub struct Receipt {
     reference: ExternalRef,
-    resources: Vec<ResourceRef>,
+    created: Vec<ResourceRef>,
+    touched: Vec<ResourceRef>,
 }
 
 impl Receipt {
-    /// Build a receipt for the backend's request reference and created resources.
+    /// Build a receipt for the backend's request reference, the resources the
+    /// effect created, and those it touched.
     ///
     /// # Errors
-    /// Returns [`ContractError::InvalidValue`] beyond [`MAX_RECEIPT_RESOURCES`].
-    pub fn new(reference: ExternalRef, resources: Vec<ResourceRef>) -> Result<Self, ContractError> {
-        if resources.len() > MAX_RECEIPT_RESOURCES {
+    /// Returns [`ContractError::InvalidValue`] beyond [`MAX_RECEIPT_RESOURCES`]
+    /// in total.
+    pub fn new(
+        reference: ExternalRef,
+        created: Vec<ResourceRef>,
+        touched: Vec<ResourceRef>,
+    ) -> Result<Self, ContractError> {
+        if created.len().saturating_add(touched.len()) > MAX_RECEIPT_RESOURCES {
             return Err(ContractError::InvalidValue {
                 kind: ValueKind::Receipt,
             });
         }
         Ok(Self {
             reference,
-            resources,
+            created,
+            touched,
         })
     }
 
@@ -238,10 +266,16 @@ impl Receipt {
         &self.reference
     }
 
-    /// Resources the effect created or touched.
+    /// Resources the effect created.
     #[must_use]
-    pub fn resources(&self) -> &[ResourceRef] {
-        &self.resources
+    pub fn created(&self) -> &[ResourceRef] {
+        &self.created
+    }
+
+    /// Existing resources the effect acted on.
+    #[must_use]
+    pub fn touched(&self) -> &[ResourceRef] {
+        &self.touched
     }
 }
 
@@ -249,14 +283,15 @@ impl Receipt {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawReceipt {
     reference: ExternalRef,
-    resources: Vec<ResourceRef>,
+    created: Vec<ResourceRef>,
+    touched: Vec<ResourceRef>,
 }
 
 impl TryFrom<RawReceipt> for Receipt {
     type Error = ContractError;
 
     fn try_from(raw: RawReceipt) -> Result<Self, Self::Error> {
-        Self::new(raw.reference, raw.resources)
+        Self::new(raw.reference, raw.created, raw.touched)
     }
 }
 
@@ -264,7 +299,8 @@ impl From<Receipt> for RawReceipt {
     fn from(receipt: Receipt) -> Self {
         Self {
             reference: receipt.reference,
-            resources: receipt.resources,
+            created: receipt.created,
+            touched: receipt.touched,
         }
     }
 }

@@ -1,0 +1,5 @@
+# {{ vars.project_name }}
+
+{{ vars.summary }}
+
+Contributor and agent instructions are in [AGENTS.md](AGENTS.md).

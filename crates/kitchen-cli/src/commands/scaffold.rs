@@ -110,7 +110,7 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
     let healthy = plan.conflicts().next().is_none();
     Ok((
         format!(
-            "{}\nNext: inspect the generated files{}; run kitchen house doctor --registry '{}' --repository-path '{}'.\nKitchen runs no template scripts; follow the generated instructions to load house guidance.",
+            "{}\nNext: inspect the generated files{}, then run:\n  kitchen house doctor --registry {} --repository-path {}\nKitchen runs no template scripts; follow the generated instructions to load house guidance.",
             if healthy {
                 "Repository files applied."
             } else {
@@ -121,11 +121,17 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
             } else {
                 " and reconcile template revisions"
             },
-            registry.root().display(),
-            target.display(),
+            shell_quote(registry.root()),
+            shell_quote(&target),
         ),
         healthy,
     ))
+}
+
+/// Quote a path as one POSIX shell word: wrap it in single quotes and write
+/// each embedded single quote as `'\''`. Non-UTF-8 bytes print lossily.
+fn shell_quote(path: &std::path::Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
 fn confirm() -> Result<bool, HouseError> {
@@ -216,6 +222,19 @@ fn installation_error(error: kitchen::Error) -> Result<(String, bool), kitchen::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_quote_keeps_each_path_one_literal_word() {
+        for (path, quoted) in [
+            ("/plain/path", "'/plain/path'"),
+            ("/with space", "'/with space'"),
+            ("/it's", r"'/it'\''s'"),
+            ("/$HOME `x` \"q\"", "'/$HOME `x` \"q\"'"),
+            ("", "''"),
+        ] {
+            assert_eq!(shell_quote(std::path::Path::new(path)), quoted);
+        }
+    }
 
     #[test]
     fn partial_installation_reports_every_remaining_path() -> Result<(), kitchen::Error> {

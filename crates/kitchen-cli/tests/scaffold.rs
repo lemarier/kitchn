@@ -200,7 +200,7 @@ fn changed_revision_distinguishes_and_preserves_local_edits() -> Result {
     f.revision(2)?;
     let output = f.selected("adopt").arg("--yes").output()?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(stdout(&output).contains("with local edits"));
+    assert!(stdout(&output).contains("content differs from its marker (local edits or damage)"));
     assert!(stdout(&output).contains("upstream content or provenance differs"));
     assert!(stdout(&output).contains("2 conflicts"));
     assert_eq!(
@@ -504,5 +504,129 @@ fn a_workflow_needing_a_conflicting_justfile_is_withheld_and_nothing_activates()
         "check:\n    echo local\n"
     );
     assert!(f.root.join("consumer/README.md").exists());
+    Ok(())
+}
+
+#[test]
+fn adopt_retains_existing_workflows_checks_and_reviewers() -> Result {
+    let f = Fixture::new()?;
+    assert!(f.selected("init").arg("--yes").output()?.status.success());
+    let path = f.root.join("consumer/.kitchen.json");
+    let mut binding: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    binding["workflows"] = serde_json::json!(["gate", "pickup"]);
+    binding["additionalChecks"] = serde_json::json!(["local-check"]);
+    binding["additionalReviewers"] = serde_json::json!(["local-reviewer"]);
+    let stricter = serde_json::to_string_pretty(&binding)?;
+    fs::write(&path, &stricter)?;
+    fs::remove_file(f.root.join("consumer/README.md"))?;
+    let output = f
+        .command("adopt", &f.root.join("consumer"))
+        .arg("--yes")
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(stdout(&output).contains("  unchanged  .kitchen.json"));
+    assert_eq!(fs::read_to_string(&path)?, stricter);
+    assert!(f.root.join("consumer/README.md").exists());
+    Ok(())
+}
+
+#[test]
+fn selection_mismatches_and_partial_selection_write_nothing() -> Result {
+    let f = Fixture::new()?;
+    // An unbound repository needs both house and repository.
+    let output = f
+        .command("init", &f.root.join("consumer"))
+        .args(["--house", "crabnebula", "--yes"])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!f.root.join("consumer").exists());
+    let output = f
+        .command("init", &f.root.join("consumer"))
+        .args(["--repository", "crabnebula/tauri-fixture", "--yes"])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!f.root.join("consumer").exists());
+    // A repository outside the house allowlist is refused.
+    let output = f
+        .command("init", &f.root.join("consumer"))
+        .args([
+            "--house",
+            "crabnebula",
+            "--repository",
+            "crabnebula/other",
+            "--yes",
+        ])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!f.root.join("consumer").exists());
+    // A bound repository refuses a different repository selection.
+    assert!(f.selected("init").arg("--yes").output()?.status.success());
+    let binding = fs::read(f.root.join("consumer/.kitchen.json"))?;
+    fs::remove_file(f.root.join("consumer/README.md"))?;
+    let output = f
+        .command("adopt", &f.root.join("consumer"))
+        .args(["--repository", "crabnebula/other", "--yes"])
+        .output()?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(fs::read(f.root.join("consumer/.kitchen.json"))?, binding);
+    assert!(!f.root.join("consumer/README.md").exists());
+    Ok(())
+}
+
+#[test]
+fn a_template_declaring_another_house_is_refused() -> Result {
+    let f = Fixture::new()?;
+    f.publish(
+        &manifest(1).replace("house = \"crabnebula\"", "house = \"origin89\""),
+        "content\n",
+    )?;
+    let output = f.selected("init").arg("--yes").output()?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        stderr(&output).contains("template belongs to house origin89"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!f.root.join("consumer").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn printed_doctor_command_survives_quotes_and_spaces_in_paths() -> Result {
+    let f = Fixture::new()?;
+    let target = f.root.join("it's a \"consumer\" $HOME");
+    let output = f
+        .command_for("init", &target, "test")
+        .args([
+            "--house",
+            "crabnebula",
+            "--repository",
+            "crabnebula/tauri-fixture",
+            "--yes",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let text = stdout(&output);
+    let command = text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("kitchen house doctor "))
+        .ok_or_else(|| format!("no doctor command in {text}"))?;
+    let echoed = Command::new("sh")
+        .arg("-c")
+        .arg(format!("printf '%s\\n' {command}"))
+        .env_remove("HOME")
+        .output()?;
+    assert!(echoed.status.success(), "{echoed:?}");
+    let registry = f.root.join("registry");
+    assert_eq!(
+        String::from_utf8(echoed.stdout)?,
+        format!(
+            "--registry\n{}\n--repository-path\n{}\n",
+            registry.display(),
+            target.display()
+        )
+    );
     Ok(())
 }

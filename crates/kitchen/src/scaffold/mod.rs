@@ -39,7 +39,8 @@
 //! let variables = BTreeMap::from([("project".parse()?, "demo".to_owned())]);
 //! let guidance = CommitId::new(&"a".repeat(40))?;
 //! let rendered = template.render(&HouseId::new("home")?, &guidance, &variables)?;
-//! let target = std::env::temp_dir().canonicalize()?.join("kitchen-doc-example-absent");
+//! let workspace = tempfile::tempdir()?;
+//! let target = workspace.path().canonicalize()?.join("absent");
 //! let plan = FilePlan::new(rendered, &target)?;
 //! assert_eq!(plan.files()[0].action, PlanAction::Add);
 //! assert_eq!(plan.files()[0].file.contents, "# demo\n");

@@ -26,14 +26,22 @@ pub enum PlanKind {
 }
 
 /// Why an existing path blocks a planned file. Conflicts are never applied.
+///
+/// New reasons may be added. Callers outside Kitchen should treat an unknown
+/// reason as a conflict that needs manual reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Conflict {
     /// A local file with different content and no provenance marker.
     Unmanaged,
     /// An earlier render that was not edited; a later update may replace it.
     ManagedPristine(Box<ManagedMarker>),
-    /// An earlier render with local edits, which must be preserved.
+    /// A marked file whose content no longer matches its marker's digest:
+    /// local edits or damage, which must be preserved.
     ManagedEdited(Box<ManagedMarker>),
+    /// The existing file is a strict prefix of the planned content, as an
+    /// interrupted write or a truncation leaves it. It is still preserved.
+    Incomplete,
     /// Identical content with a different permission class.
     ModeDiffers {
         /// The planned mode.
@@ -54,8 +62,11 @@ impl fmt::Display for Conflict {
             ),
             Self::ManagedEdited(marker) => write!(
                 formatter,
-                "managed by {} revision {} with local edits",
+                "managed by {} revision {}; content differs from its marker (local edits or damage)",
                 marker.provenance.template, marker.provenance.revision
+            ),
+            Self::Incomplete => formatter.write_str(
+                "existing file is the start of the planned content (an interrupted write or a truncation)",
             ),
             Self::ModeDiffers { planned } => write!(
                 formatter,
@@ -71,7 +82,11 @@ impl fmt::Display for Conflict {
 }
 
 /// What applying the plan would do with one file.
+///
+/// New actions may be added. Only [`PlanAction::Add`] writes; callers
+/// outside Kitchen should treat any other or unknown action as not written.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PlanAction {
     /// Create the file; nothing exists at its path.
     Add,
@@ -310,6 +325,7 @@ fn explain(target: &Path, file: &RenderedFile) -> crate::Result<Conflict> {
         Ok(existing) if existing == file.contents.as_bytes() => {
             Ok(Conflict::ModeDiffers { planned: file.mode })
         }
+        Ok(existing) if file.contents.as_bytes().starts_with(&existing) => Ok(Conflict::Incomplete),
         Ok(existing) => Ok(
             match String::from_utf8(existing).as_deref().map(inspect_managed) {
                 Ok(ManagedState::Pristine(marker)) => Conflict::ManagedPristine(Box::new(marker)),

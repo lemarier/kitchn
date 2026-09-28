@@ -528,3 +528,51 @@ fn closing_an_issue_needs_its_own_explicit_grant() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn standing_grants_can_be_extended_only_within_house_limits() -> TestResult {
+    let orca = backend_id()?;
+    let token = credential()?;
+    let limits = [
+        Grant::house(Permission::LaunchWorker, orca.clone(), token.clone()),
+        Grant::house(Permission::PostComment, orca.clone(), token.clone()),
+        Grant::house(Permission::Merge, orca.clone(), token.clone()),
+    ];
+    let original = HouseGrants::with_limits(house()?, limits, [grant(Permission::LaunchWorker)?])?;
+    let extended = original.with_added_standing([grant(Permission::PostComment)?])?;
+    assert!(extended.covers(&grant(Permission::PostComment)?));
+    assert!(extended.covers(&grant(Permission::LaunchWorker)?));
+    assert!(
+        !original.covers(&grant(Permission::PostComment)?),
+        "the original is unchanged"
+    );
+
+    // Outside the limits: refused, never silently dropped.
+    for outside in [
+        Permission::Publish,
+        Permission::OperateEquipment,
+        Permission::CloseIssue,
+    ] {
+        assert_eq!(
+            original.with_added_standing([grant(Permission::PostComment)?, grant(outside)?]),
+            Err(ContractError::AuthorityExpansion {
+                permission: outside,
+                scope: GrantScope::House
+            })
+        );
+    }
+    // Merge is added only because house policy already permits it.
+    assert!(
+        original
+            .with_added_standing([grant(Permission::Merge)?])?
+            .covers(&grant(Permission::Merge)?)
+    );
+    let narrow = HouseGrants::new(house()?, [grant(Permission::LaunchWorker)?]);
+    assert!(
+        narrow
+            .with_added_standing([grant(Permission::Merge)?])
+            .is_err()
+    );
+    assert_eq!(narrow.with_added_standing([])?, narrow);
+    Ok(())
+}

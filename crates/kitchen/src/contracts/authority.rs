@@ -204,6 +204,27 @@ impl HouseGrants {
         &self.house
     }
 
+    /// A copy whose standing grants also include `extra`. Every extra grant
+    /// must be covered by the house policy limits; none is dropped silently.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::AuthorityExpansion`] naming the first extra
+    /// grant (in sorted order) the limits do not cover.
+    pub fn with_added_standing(
+        &self,
+        extra: impl IntoIterator<Item = Grant>,
+    ) -> Result<Self, ContractError> {
+        let extra: BTreeSet<Grant> = extra.into_iter().collect();
+        ensure_covered(&self.limits, &extra)?;
+        let mut standing = self.standing.clone();
+        standing.extend(extra);
+        Ok(Self {
+            house: self.house.clone(),
+            limits: self.limits.clone(),
+            standing,
+        })
+    }
+
     /// Whether some standing grant covers `grant`.
     #[must_use]
     pub fn covers(&self, grant: &Grant) -> bool {

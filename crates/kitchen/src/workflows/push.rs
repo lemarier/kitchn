@@ -889,9 +889,9 @@ impl IsolatedGitConfig {
         settings: &[PushSetting],
         deadline: Duration,
     ) -> std::result::Result<Self, CoordinationError> {
-        let Some(text) = path.to_str().filter(|_| path.is_absolute()) else {
+        if path.to_str().is_none() || !path.is_absolute() {
             return Err(CoordinationError::InvalidGitConfig);
-        };
+        }
         let Some(dir) = path.parent() else {
             return Err(CoordinationError::InvalidGitConfig);
         };
@@ -902,13 +902,14 @@ impl IsolatedGitConfig {
         {
             return Err(CoordinationError::InvalidGitConfig);
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        options
-            .open(&path)
+        // Write a new file beside the old one and move it into place only
+        // once complete, so a failed write never leaves a partial file at
+        // `path`. The file is created readable by its owner only.
+        let staged = tempfile::NamedTempFile::new_in(dir)
             .map_err(|_| CoordinationError::GitConfigUnwritten)?;
+        let Some(staged_text) = staged.path().to_str() else {
+            return Err(CoordinationError::GitConfigUnwritten);
+        };
         for setting in settings {
             let key = setting.key();
             let written = run_bounded(
@@ -917,7 +918,7 @@ impl IsolatedGitConfig {
                 &[
                     "config",
                     "--file",
-                    text,
+                    staged_text,
                     "--add",
                     "--",
                     &key,
@@ -933,6 +934,9 @@ impl IsolatedGitConfig {
                 return Err(CoordinationError::GitConfigUnwritten);
             }
         }
+        staged
+            .persist(&path)
+            .map_err(|_| CoordinationError::GitConfigUnwritten)?;
         Ok(Self { path })
     }
 

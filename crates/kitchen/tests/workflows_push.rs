@@ -1790,6 +1790,10 @@ mod git_remote {
         )?;
         let written = fs::read_to_string(config.path())?;
         assert_eq!(
+            fs::metadata(config.path())?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
             written,
             "[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n\
              [user]\n\tname = Kitchen\n"
@@ -1865,6 +1869,20 @@ mod git_remote {
             dir.join("full"),
             &vec![helper("store"); IsolatedGitConfig::MAX_SETTINGS],
         )?;
+        // A write that fails leaves the previous file as it was.
+        let failing = dir.join("failing-git");
+        fs::write(&failing, "#!/bin/sh\nexit 1\n")?;
+        fs::set_permissions(&failing, fs::Permissions::from_mode(0o755))?;
+        assert_eq!(
+            IsolatedGitConfig::create(
+                &failing,
+                full.path().to_path_buf(),
+                &[helper("other")],
+                Duration::from_secs(10)
+            )
+            .err(),
+            Some(CoordinationError::GitConfigUnwritten)
+        );
         let written = fs::read_to_string(full.path())?;
         assert_eq!(
             written.matches("helper = store").count(),

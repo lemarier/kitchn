@@ -154,6 +154,114 @@ fn a_handled_stale_issue_keeps_later_daily_runs_idle() -> TestResult {
     Ok(())
 }
 
+/// The argument vector a gardener schedule installed before `--store`
+/// existed recorded, verbatim.
+fn pre_store_argv(root: &Path, gh: &Path) -> TestResult<Vec<String>> {
+    let token = root.join("token");
+    std::fs::write(&token, "sanitized-fixture-token")?;
+    let path = |path: &Path| path.to_str().map(str::to_owned).ok_or("non-UTF-8 path");
+    Ok(vec![
+        env!("CARGO_BIN_EXE_kitchen").into(),
+        "gardener".into(),
+        "precheck".into(),
+        "--house".into(),
+        "sample".into(),
+        "--repository".into(),
+        "sample/project".into(),
+        "--requester".into(),
+        "sample-bot".into(),
+        "--credential".into(),
+        "read".into(),
+        "--credential-file".into(),
+        path(&token)?,
+        "--gh".into(),
+        path(gh)?,
+        "--ready-label".into(),
+        "agent-ready".into(),
+        "--working-label".into(),
+        "agent-working".into(),
+        "--lookback-hours".into(),
+        "48".into(),
+        "--stale-days".into(),
+        "30".into(),
+    ])
+}
+
+#[test]
+fn a_schedule_installed_without_a_store_keeps_its_behavior() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let fresh = issue(1, "open", "2999-01-01T00:00:00Z", &[]);
+    let gh = fake_gh(root.path(), "[]", &format!("[{fresh}]"))?;
+    let idle = run(&pre_store_argv(root.path(), &gh)?)?;
+    assert_eq!(outcome(&idle), PrecheckOutcome::Idle);
+    assert_eq!(String::from_utf8(idle.stdout)?, "idle\n");
+
+    let residue = issue(2, "closed", "2999-01-01T00:00:00Z", &["agent-working"]);
+    let gh = fake_gh(root.path(), &format!("[{residue}]"), &format!("[{fresh}]"))?;
+    assert_eq!(
+        outcome(&run(&pre_store_argv(root.path(), &gh)?)?),
+        PrecheckOutcome::Actionable
+    );
+
+    // Without a store nothing is known to be handled, so every stale issue
+    // counts, as it did before handled markers existed.
+    let stale = issue(3, "open", "2000-01-01T00:00:00Z", &[]);
+    let gh = fake_gh(root.path(), "[]", &format!("[{stale}]"))?;
+    for _ in 0..2 {
+        assert_eq!(
+            outcome(&run(&pre_store_argv(root.path(), &gh)?)?),
+            PrecheckOutcome::Actionable
+        );
+    }
+    // The precheck only reads: it creates no store.
+    assert!(!root.path().join("house").exists());
+    Ok(())
+}
+
+#[test]
+fn the_gardener_report_does_not_wake_the_next_run() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let stale = issue(3, "open", "2000-01-01T00:00:00Z", &[]);
+    let gh = fake_gh(root.path(), "[]", &format!("[{stale}]"))?;
+    assert_eq!(
+        outcome(&run(&scheduled_argv(root.path(), gh)?)?),
+        PrecheckOutcome::Actionable
+    );
+
+    // The pass comments on the issue, which moves its last update into the
+    // next run's change window, then records the revision it read back.
+    let reported = issue(3, "open", "2999-01-01T00:00:00Z", &[]);
+    let store = house_store(root.path())?;
+    gardener::StaleMarkers::new(&store)?.record(
+        &Repository::new("sample/project")?,
+        IssueNumber::new(3)?,
+        Timestamp::from_unix_millis(32_472_144_000_000), // 2999-01-01
+        &Claimant::scheduled(HolderId::new("gardener-tick")?),
+        Timestamp::from_unix_millis(946_684_900_000),
+    )?;
+    let gh = fake_gh(
+        root.path(),
+        &format!("[{reported}]"),
+        &format!("[{reported}]"),
+    )?;
+    let next = run(&scheduled_argv(root.path(), gh)?)?;
+    assert_eq!(outcome(&next), PrecheckOutcome::Idle);
+    assert_eq!(String::from_utf8(next.stdout)?, "idle\n");
+
+    // Someone else comments afterwards: that is a change to look at.
+    let answered = issue(3, "open", "2999-01-02T00:00:00Z", &[]);
+    let gh = fake_gh(
+        root.path(),
+        &format!("[{answered}]"),
+        &format!("[{answered}]"),
+    )?;
+    assert_eq!(
+        outcome(&run(&scheduled_argv(root.path(), gh)?)?),
+        PrecheckOutcome::Actionable
+    );
+    Ok(())
+}
+
 #[test]
 fn precheck_failures_never_exit_as_idle() -> TestResult {
     let root = tempfile::tempdir()?;

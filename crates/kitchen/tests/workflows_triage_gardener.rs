@@ -1245,7 +1245,7 @@ fn gardener_precheck_reads_changed_and_open_inventory() -> common::TestResult {
             &project(),
             &agent_labels(),
             window,
-            &handled,
+            Some(&handled),
         );
         Ok((result, client))
     };
@@ -1308,7 +1308,7 @@ fn a_stale_issue_handled_at_its_revision_leaves_the_precheck_idle() -> common::T
             &project(),
             &agent_labels(),
             window,
-            markers,
+            Some(markers),
         )))
     };
     assert_eq!(
@@ -1349,10 +1349,7 @@ fn a_stale_issue_handled_at_its_revision_leaves_the_precheck_idle() -> common::T
                 repository: project(),
                 number: std::num::NonZeroU64::new(3).ok_or("issue")?,
             },
-            subject: MarkerSubject::Issue(IssueRevision {
-                updated_at: updated,
-                last_comment: None,
-            }),
+            subject: MarkerSubject::Observation(ExternalRef::new("stale-handled")?),
         },
         MarkerFact::workflow(
             MarkerSchema::new("gardener.other", std::num::NonZeroU32::MIN)?,
@@ -1364,6 +1361,196 @@ fn a_stale_issue_handled_at_its_revision_leaves_the_precheck_idle() -> common::T
     assert_eq!(
         precheck(&gardener::StaleMarkers::new(&other.store)?, json!([old]))?,
         Err(WorkflowError::IncompleteEvidence)
+    );
+    Ok(())
+}
+
+/// The gardener precheck over `changed` and `open` inventory pages.
+fn gardener_precheck(
+    markers: Option<&gardener::StaleMarkers<'_>>,
+    window: gardener::Window,
+    changed: serde_json::Value,
+    open: serde_json::Value,
+) -> common::TestResult<Result<Precheck, WorkflowError>> {
+    let client = github_client(vec![changed, open])?;
+    Ok(gardener::precheck(gardener::signal(
+        &client,
+        &HouseId::new("sample")?,
+        &project(),
+        &agent_labels(),
+        window,
+        markers,
+    )))
+}
+
+#[test]
+fn a_handled_issue_keeps_one_marker_at_its_newest_revision() -> common::TestResult {
+    use kitchen::state::MarkerRecording;
+    let fixture = common::Fixture::new()?;
+    let markers = gardener::StaleMarkers::new(&fixture.store)?;
+    let tick = common::scheduled("gardener-tick")?;
+    // 2025-12-01 and 2025-12-02.
+    let first = Timestamp::from_unix_millis(1_764_547_200_000);
+    let second = Timestamp::from_unix_millis(1_764_633_600_000);
+    let record = |at: Timestamp| markers.record(&project(), issue(3), at, &tick, common::at(9));
+    assert!(matches!(record(first), Ok(MarkerRecording::Recorded(_))));
+    assert!(matches!(record(second), Ok(MarkerRecording::Superseded(_))));
+    let workflow = WorkflowId::new(gardener::WORKFLOW)?;
+    assert_eq!(fixture.store.markers(&workflow)?.len(), 1);
+    assert!(markers.handled(&project(), issue(3), second)?);
+    assert!(!markers.handled(&project(), issue(3), first)?);
+    // An older revision never replaces the newer handled one.
+    assert!(matches!(
+        record(first),
+        Err(kitchen::Error::Workflow(WorkflowError::DecisionMismatch))
+    ));
+    assert!(markers.handled(&project(), issue(3), second)?);
+    assert_eq!(fixture.store.markers(&workflow)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_full_marker_table_still_moves_a_handled_issue_forward() -> common::TestResult {
+    use kitchen::state::{MAX_MARKERS, MarkerRecording};
+    use serde_json::json;
+    let fixture = common::Fixture::new()?;
+    let tick = common::scheduled("gardener-tick")?;
+    let first = Timestamp::from_unix_millis(1_764_547_200_000);
+    let second = Timestamp::from_unix_millis(1_764_633_600_000);
+    gardener::StaleMarkers::new(&fixture.store)?.record(
+        &project(),
+        issue(3),
+        first,
+        &tick,
+        common::at(1),
+    )?;
+    // Fill the house's shared marker table to its bound.
+    let path = fixture.state_path();
+    let mut state: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let template = state["markers"][0].clone();
+    if let Some(list) = state["markers"].as_array_mut() {
+        for number in 1_000..(1_000 + MAX_MARKERS - list.len()) {
+            let mut marker = template.clone();
+            marker["key"]["item"]["number"] = number.into();
+            list.push(marker);
+        }
+    }
+    fs::write(&path, serde_json::to_vec(&state)?)?;
+    let store = fixture.reopen()?;
+    let markers = gardener::StaleMarkers::new(&store)?;
+
+    // The handled issue moves to its new revision in place.
+    assert!(matches!(
+        markers.record(&project(), issue(3), second, &tick, common::at(2)),
+        Ok(MarkerRecording::Superseded(_))
+    ));
+    assert!(markers.handled(&project(), issue(3), second)?);
+    // A new issue cannot be recorded, and stays actionable, never idle.
+    assert!(matches!(
+        markers.record(&project(), issue(9), first, &tick, common::at(2)),
+        Err(kitchen::Error::State(
+            kitchen::state::StateError::CapacityExceeded {
+                limit: kitchen::state::Limit::Markers
+            }
+        ))
+    ));
+    let window = gardener::Window::new(
+        Timestamp::from_unix_millis(1_768_003_200_000),
+        Timestamp::from_unix_millis(1_767_225_600_000),
+    )?;
+    let unhandled = forge_issue(9, "open", "2025-12-01T00:00:00Z", &[]);
+    assert_eq!(
+        gardener_precheck(Some(&markers), window, json!([]), json!([unhandled]))?,
+        Ok(Precheck::Actionable)
+    );
+    Ok(())
+}
+
+#[test]
+fn the_gardener_report_does_not_wake_the_next_precheck() -> common::TestResult {
+    use kitchen::integrations::github::IssueState;
+    use serde_json::json;
+    let fixture = common::Fixture::new()?;
+    let markers = gardener::StaleMarkers::new(&fixture.store)?;
+    let tick = common::scheduled("gardener-tick")?;
+    // Day one: 2026-01-10 back to 2026-01-01.
+    let day_one = gardener::Window::new(
+        Timestamp::from_unix_millis(1_768_003_200_000),
+        Timestamp::from_unix_millis(1_767_225_600_000),
+    )?;
+    let old = forge_issue(3, "open", "2025-12-01T00:00:00Z", &[]);
+    assert_eq!(
+        gardener_precheck(Some(&markers), day_one, json!([]), json!([old]))?,
+        Ok(Precheck::Actionable)
+    );
+    let mut stale = hygiene_issue();
+    stale.number = issue(3);
+    stale.prose_blocker = None;
+    stale.stale = true;
+    assert_eq!(
+        gardener::plan(&project(), &[stale], &agent_labels(), None)?,
+        vec![gardener::Finding::Review {
+            issue: issue(3),
+            reason: gardener::ReviewReason::Stale,
+        }]
+    );
+
+    // The pass reports the finding as a comment, which moves the issue's
+    // last update, then reads the issue back and records that revision.
+    let reported = forge_issue(3, "open", "2026-01-10T12:00:00Z", &[]);
+    let readback = github_client(vec![json!([reported.clone()])])?;
+    let kitchen::integrations::github::Observation::Known(open) = readback.issues_filtered(
+        &HouseId::new("sample")?,
+        &project(),
+        Some(IssueState::Open),
+        None,
+    ) else {
+        return Err("readback failed".into());
+    };
+    let revision = open.first().ok_or("issue missing")?.updated_at;
+    markers.record(&project(), issue(3), revision, &tick, common::at(9))?;
+
+    // Day two sees the comment in its change window and stays idle.
+    assert_eq!(
+        gardener_precheck(
+            Some(&markers),
+            day_one,
+            json!([reported.clone()]),
+            json!([reported.clone()])
+        )?,
+        Ok(Precheck::Idle)
+    );
+    // Without the markers, as for a schedule installed before them, the
+    // report is a change like any other.
+    assert_eq!(
+        gardener_precheck(
+            None,
+            day_one,
+            json!([reported.clone()]),
+            json!([reported.clone()])
+        )?,
+        Ok(Precheck::Actionable)
+    );
+    // Once the reported issue is stale again, it is still handled:
+    // 2026-03-01 back to 2026-02-01.
+    let later = gardener::Window::new(
+        Timestamp::from_unix_millis(1_772_323_200_000),
+        Timestamp::from_unix_millis(1_769_904_000_000),
+    )?;
+    assert_eq!(
+        gardener_precheck(Some(&markers), later, json!([]), json!([reported]))?,
+        Ok(Precheck::Idle)
+    );
+    // An outside comment after the report is a change and wakes the schedule.
+    let answered = forge_issue(3, "open", "2026-01-11T00:00:00Z", &[]);
+    assert_eq!(
+        gardener_precheck(
+            Some(&markers),
+            day_one,
+            json!([answered.clone()]),
+            json!([answered])
+        )?,
+        Ok(Precheck::Actionable)
     );
     Ok(())
 }

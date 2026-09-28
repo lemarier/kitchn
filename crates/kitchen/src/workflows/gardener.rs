@@ -24,8 +24,7 @@ use crate::{
         WorkflowName,
     },
     state::{
-        HouseStore, IssueRevision, MarkerFact, MarkerKey, MarkerRecording, MarkerSchema,
-        MarkerSubject, StateError, WorkItem,
+        HouseStore, MarkerFact, MarkerKey, MarkerRecording, MarkerSchema, MarkerSubject, WorkItem,
     },
 };
 
@@ -239,7 +238,7 @@ pub struct Issue {
     pub merged_work: bool,
     /// Duplicate of.
     pub duplicate_of: Option<IssueNumber>,
-    /// Stale and not yet handled at its current revision
+    /// Stale and not handled since its last update
     /// ([`StaleMarkers::handled`]), matching what the precheck counts.
     pub stale: bool,
 }
@@ -274,9 +273,9 @@ fn labels_valid(labels: &AgentLabels) -> bool {
 /// Why the independent gardener should inspect a repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signal {
-    /// Daily changes.
+    /// An issue changed in the lookback and not handled since.
     pub daily_changes: bool,
-    /// A stale issue not yet handled at its current revision.
+    /// A stale issue not handled since its last update.
     pub stale_issue: bool,
     /// Closed agent label.
     pub closed_agent_label: bool,
@@ -307,18 +306,25 @@ impl Window {
     }
 }
 
-/// Read the changed and open issue inventory for the precheck. A stale issue
-/// counts only when `handled` has no marker for it at its current revision,
-/// so a handled issue does not wake the schedule every day. A partial or
-/// unrecognized read is an error, never an idle day.
+/// Read the changed and open issue inventory for the precheck. An issue the
+/// gardener handled and nobody updated since ([`StaleMarkers::handled`])
+/// counts neither as a change nor as stale, so its report does not wake the
+/// schedule every day. Without `handled` markers every issue counts. A
+/// partial or unrecognized read is an error, never an idle day.
 pub fn signal<T: GitHubReadTransport>(
     client: &GitHubClient<T>,
     house: &HouseId,
     repo: &Repository,
     labels: &AgentLabels,
     window: Window,
-    handled: &StaleMarkers<'_>,
+    handled: Option<&StaleMarkers<'_>>,
 ) -> Result<Signal, WorkflowError> {
+    let unhandled = |number: IssueNumber, updated_at: Timestamp| match handled {
+        Some(markers) => markers
+            .handled(repo, number, updated_at)
+            .map(|handled| !handled),
+        None => Ok(true),
+    };
     let changed = known(client.issues_filtered(house, repo, None, Some(window.since)))?;
     let open = known(client.issues_filtered(house, repo, Some(IssueState::Open), None))?;
     let mut closed_agent_label = false;
@@ -337,18 +343,25 @@ pub fn signal<T: GitHubReadTransport>(
     if open.iter().any(|issue| issue.state != IssueState::Open) {
         return Err(WorkflowError::IncompleteEvidence);
     }
+    let mut daily_changes = false;
+    for issue in &changed {
+        if unhandled(issue.number, issue.updated_at)? {
+            daily_changes = true;
+            break;
+        }
+    }
     let mut stale_issue = false;
     for issue in open
         .iter()
         .filter(|issue| issue.updated_at < window.stale_before)
     {
-        if !handled.handled(repo, issue.number, issue.updated_at)? {
+        if unhandled(issue.number, issue.updated_at)? {
             stale_issue = true;
             break;
         }
     }
     Ok(Signal {
-        daily_changes: !changed.is_empty(),
+        daily_changes,
         stale_issue,
         closed_agent_label,
     })
@@ -356,19 +369,37 @@ pub fn signal<T: GitHubReadTransport>(
 
 /// Schema of the gardener marker recording a handled stale issue.
 const STALE_SCHEMA: &str = "gardener.stale-handled";
+/// Subject of each issue's one handled-stale marker; the revision is in the
+/// fact, so handling the issue again replaces it instead of adding a marker.
+const STALE_SUBJECT: &str = "stale-handled";
 
-/// The handled-stale marker payload. The key carries the issue and revision.
+/// The handled-stale marker payload: the issue's last update as read after
+/// the pass reported it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StaleHandled {}
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StaleHandled {
+    revision: Timestamp,
+}
+
+impl StaleHandled {
+    fn fact(self) -> Result<MarkerFact, WorkflowError> {
+        MarkerFact::workflow(stale_schema()?, &self).map_err(|_| WorkflowError::IncompleteEvidence)
+    }
+
+    fn decode(fact: &MarkerFact) -> Result<Self, WorkflowError> {
+        fact.decode(&stale_schema()?)
+            .map_err(|_| WorkflowError::IncompleteEvidence)
+    }
+}
 
 fn stale_schema() -> Result<MarkerSchema, WorkflowError> {
     MarkerSchema::new(STALE_SCHEMA, NonZeroU32::MIN).map_err(|_| WorkflowError::IncompleteEvidence)
 }
 
-/// Handled-stale markers in the house store, keyed by the gardener workflow,
-/// the issue, and the issue's last update. Any update to the issue is a new
-/// revision, so an edited or commented issue is inspected again.
+/// Handled-stale markers in the house store: one per issue, holding the
+/// issue's revision after the gardener's report. The issue counts as handled
+/// only while its last update is still that revision, so the gardener's own
+/// report does not wake the schedule and any later update does.
 #[derive(Debug, Clone)]
 pub struct StaleMarkers<'a> {
     store: &'a HouseStore,
@@ -387,26 +418,21 @@ impl<'a> StaleMarkers<'a> {
         })
     }
 
-    fn key(
-        &self,
-        repository: &Repository,
-        issue: IssueNumber,
-        updated_at: Timestamp,
-    ) -> Result<MarkerKey, WorkflowError> {
+    fn key(&self, repository: &Repository, issue: IssueNumber) -> Result<MarkerKey, WorkflowError> {
         Ok(MarkerKey {
             workflow: self.workflow.clone(),
             item: WorkItem::Issue {
                 repository: repository.clone(),
                 number: NonZeroU64::new(issue.get()).ok_or(WorkflowError::IncompleteEvidence)?,
             },
-            subject: MarkerSubject::Issue(IssueRevision {
-                updated_at,
-                last_comment: None,
-            }),
+            subject: MarkerSubject::Observation(
+                ExternalRef::new(STALE_SUBJECT).map_err(|_| WorkflowError::IncompleteEvidence)?,
+            ),
         })
     }
 
-    /// Whether `issue` was handled as stale at `updated_at`.
+    /// Whether `issue` was handled and has not been updated since: its last
+    /// update is still the recorded revision.
     ///
     /// # Errors
     /// A failed read is [`WorkflowError::PrecheckFailed`]; a marker of another
@@ -418,7 +444,7 @@ impl<'a> StaleMarkers<'a> {
         issue: IssueNumber,
         updated_at: Timestamp,
     ) -> Result<bool, WorkflowError> {
-        let key = self.key(repository, issue, updated_at)?;
+        let key = self.key(repository, issue)?;
         let Some(marker) = self
             .store
             .marker(&key)
@@ -426,37 +452,39 @@ impl<'a> StaleMarkers<'a> {
         else {
             return Ok(false);
         };
-        marker
-            .fact()
-            .decode::<StaleHandled>(&stale_schema()?)
-            .map_err(|_| WorkflowError::IncompleteEvidence)?;
-        Ok(true)
+        Ok(StaleHandled::decode(marker.fact())?.revision == updated_at)
     }
 
-    /// Record that the pass handled stale `issue` at `updated_at`, after its
-    /// review finding was reported. Recording it again changes nothing.
+    /// Record that the pass handled stale `issue`. `revision` is the issue's
+    /// last update read back after the pass reported its finding, so the
+    /// report itself is covered; an update after that read is not. Recording
+    /// the same revision again changes nothing, and a newer revision replaces
+    /// the issue's marker in place, which a full marker table still allows.
     ///
     /// # Errors
-    /// Refuses a conflicting marker at the same key
-    /// ([`WorkflowError::DecisionMismatch`]); other store failures are
-    /// [`WorkflowError::PrecheckFailed`].
+    /// [`WorkflowError::DecisionMismatch`] for a revision older than the one
+    /// recorded, [`WorkflowError::IncompleteEvidence`] for a foreign fact at
+    /// the issue's key, [`crate::state::StateError::CapacityExceeded`] when
+    /// a first marker does not fit, [`crate::state::StateError::MarkerConflict`]
+    /// when a concurrent pass changed the marker, and other store errors.
     pub fn record(
         &self,
         repository: &Repository,
         issue: IssueNumber,
-        updated_at: Timestamp,
+        revision: Timestamp,
         recorded_by: &Claimant,
         now: Timestamp,
-    ) -> Result<MarkerRecording, WorkflowError> {
-        let key = self.key(repository, issue, updated_at)?;
-        let fact = MarkerFact::workflow(stale_schema()?, &StaleHandled {})
-            .map_err(|_| WorkflowError::IncompleteEvidence)?;
+    ) -> crate::Result<MarkerRecording> {
+        let key = self.key(repository, issue)?;
+        let fact = StaleHandled { revision }.fact()?;
+        let Some(current) = self.store.marker(&key)? else {
+            return self.store.record_marker(key, fact, recorded_by, now);
+        };
+        if StaleHandled::decode(current.fact())?.revision > revision {
+            return Err(WorkflowError::DecisionMismatch.into());
+        }
         self.store
-            .record_marker(key, fact, recorded_by, now)
-            .map_err(|error| match error {
-                crate::Error::State(StateError::MarkerConflict) => WorkflowError::DecisionMismatch,
-                _ => WorkflowError::PrecheckFailed,
-            })
+            .supersede_marker(&key, current.fact(), fact, recorded_by, now)
     }
 }
 

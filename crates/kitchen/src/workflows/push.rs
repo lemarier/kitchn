@@ -673,7 +673,8 @@ const GIT_POLL: Duration = Duration::from_millis(10);
 /// It never prompts. Every call has a deadline; an expired call reports
 /// unknown or uncertain, never success.
 ///
-/// Every call runs Git under one environment: no system configuration,
+/// Every call runs Git under one environment: no `GIT_*` variable Kitchen
+/// inherited, no system configuration,
 /// Kitchen's own [`IsolatedGitConfig`] in place of the user's global one,
 /// hooks disabled, and the SSH command, the remote's pack programs, and a
 /// push's tags, submodules, and mirroring pinned. What remains is the
@@ -1140,8 +1141,8 @@ pub(crate) fn git_environment(config: &IsolatedGitConfig, remote: &str) -> Vec<(
 /// captured to a file (never a terminal), and return its exit code and
 /// bounded stdout. `None` means the process did not complete: it could not
 /// start, ran past `deadline`, or produced too much output. Meant for Git
-/// and Git-driven tools: it sets `LC_ALL=C` and drops `GIT_DIR` and
-/// `GIT_WORK_TREE`.
+/// and Git-driven tools: it sets `LC_ALL=C` and drops every inherited `GIT_*`
+/// variable before `env` applies.
 pub(crate) fn run_bounded(
     program: &std::path::Path,
     dir: &std::path::Path,
@@ -1151,10 +1152,13 @@ pub(crate) fn run_bounded(
 ) -> Option<(Option<i32>, Vec<u8>)> {
     let mut output = tempfile::tempfile().ok()?;
     let mut command = Command::new(program);
-    // A caller inside a Git hook must not redirect Git to its own
-    // repository, and configuration Kitchen inherited must not reach Git.
-    for inherited in INHERITED_GIT_ENV {
-        command.env_remove(inherited);
+    // Kitchen's own environment must not choose Git's repository, object
+    // store, index, namespace, or configuration: a caller inside a Git hook
+    // sets several of them, and any could send a read or push elsewhere.
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(key);
+        }
     }
     let mut child = command
         .args(args)
@@ -1181,19 +1185,6 @@ pub(crate) fn run_bounded(
     };
     Some((status.code(), read_bounded(&mut output)?))
 }
-
-/// Git variables removed from every process [`run_bounded`] starts before
-/// its own `env` applies.
-const INHERITED_GIT_ENV: [&str; 8] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_CONFIG",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_NOSYSTEM",
-];
 
 /// Read `file` from the start, refusing more than [`MAX_GIT_OUTPUT`] bytes.
 fn read_bounded(file: &mut File) -> Option<Vec<u8>> {

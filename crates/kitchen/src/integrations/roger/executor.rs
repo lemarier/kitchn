@@ -124,7 +124,7 @@ impl<T: RogerMutationTransport> EffectExecutor for RogerExecutor<T> {
             .map_err(|_| EffectFailure::Uncertain(UncertainReason::Transport))?;
         let reference = validate_receipt(self.scope.credential(), &effect.ask, &bytes)
             .map_err(|_| EffectFailure::Uncertain(UncertainReason::ResponseLost))?;
-        Receipt::new(reference, vec![])
+        Receipt::new(reference, vec![], vec![])
             .map_err(|_| EffectFailure::Uncertain(UncertainReason::ResponseLost))
     }
     fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
@@ -142,7 +142,8 @@ impl<T: RogerMutationTransport> EffectExecutor for RogerExecutor<T> {
             .map_err(|_| BackendUnavailable::Transport)?
         {
             Some(reference) => Ok(Lookup::Applied(
-                Receipt::new(reference, vec![]).map_err(|_| BackendUnavailable::Transport)?,
+                Receipt::new(reference, vec![], vec![])
+                    .map_err(|_| BackendUnavailable::Transport)?,
             )),
             None => Ok(Lookup::Unknown),
         }

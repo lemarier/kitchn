@@ -358,6 +358,7 @@ pub(crate) fn receipt(key: &IdempotencyKey) -> Result<Receipt, IntegrationError>
     Receipt::new(
         ExternalRef::new(key.as_str()).map_err(|_| IntegrationError::InvalidInput)?,
         vec![],
+        vec![],
     )
     .map_err(|_| IntegrationError::InvalidInput)
 }
@@ -402,7 +403,7 @@ fn inspect_markers(
                 {
                     return Err(IntegrationError::Unknown);
                 }
-                found = Some(Receipt::new(ExternalRef::new(url)?, vec![])?);
+                found = Some(Receipt::new(ExternalRef::new(url)?, vec![], vec![])?);
             }
         }
     }

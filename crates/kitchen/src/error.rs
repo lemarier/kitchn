@@ -4,7 +4,9 @@
 //! `#[from]` variant. Callers such as the CLI branch on [`Error::class`], so a
 //! new variant in one area never forces edits to unrelated callers.
 
-use crate::{IdentifierError, contracts::ContractError, state::StateError};
+use crate::{
+    IdentifierError, contracts::ContractError, scaffold::ScaffoldError, state::StateError,
+};
 
 /// Broad handling class for an [`Error`], for exit codes and retry decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,6 +37,9 @@ pub enum Error {
     /// A durable state operation failed.
     #[error(transparent)]
     State(#[from] StateError),
+    /// A template, rendering, or scaffold planning operation failed.
+    #[error(transparent)]
+    Scaffold(#[from] ScaffoldError),
 }
 
 impl Error {
@@ -46,6 +51,7 @@ impl Error {
             Self::Contract(error) => error.class(),
             Self::State(error) => error.class(),
             Self::House(error) => error.class(),
+            Self::Scaffold(error) => error.class(),
         }
     }
 }

@@ -22,6 +22,7 @@ pub mod contracts;
 mod error;
 pub mod house;
 mod id;
+pub mod scaffold;
 pub mod state;
 
 pub use error::{Error, ErrorClass, Result};

@@ -115,7 +115,7 @@ fn task_creation_is_idempotent_and_scoped_to_the_house() -> TestResult {
     ));
 
     let dir = tempfile::tempdir()?;
-    let foreign = HouseStore::open(dir.path(), other_house()?, StoreOptions::default())?;
+    let foreign = HouseStore::initialize(dir.path(), other_house()?, StoreOptions::default())?;
     assert!(matches!(
         foreign.create_task(spec("task-1")?, at(0)),
         Err(Error::Contract(ContractError::CrossHouse { .. }))
@@ -781,7 +781,7 @@ fn storage_inside_a_git_checkout_is_refused() -> TestResult {
     let dir = tempfile::tempdir()?;
     fs::create_dir(dir.path().join(".git"))?;
     assert!(matches!(
-        HouseStore::open(
+        HouseStore::initialize(
             dir.path().join("state").join("origin89"),
             house()?,
             StoreOptions::default()
@@ -798,7 +798,7 @@ fn lock_wait_is_bounded() -> TestResult {
         lock_timeout: Duration::from_millis(50),
         ..StoreOptions::default()
     };
-    let store = HouseStore::open(dir.path(), house()?, options)?;
+    let store = HouseStore::initialize(dir.path(), house()?, options)?;
     let blocker = fs::File::open(dir.path().join("state.lock"))?;
     blocker.lock()?;
     assert!(matches!(
@@ -970,5 +970,121 @@ fn runtime_state_is_private_to_the_owner() -> TestResult {
         mode(fixture.dir.path().join("house").join("state.lock"))?,
         0o600
     );
+    Ok(())
+}
+
+#[test]
+fn reopening_an_established_store_without_its_snapshot_fails_closed() -> TestResult {
+    let fixture = Fixture::new()?;
+    claimed_attempt(&fixture, "task-1", at(0))?;
+    fs::remove_file(fixture.state_path())?;
+    assert!(matches!(
+        open_error(&fixture),
+        Some(Error::State(StateError::StateMissing))
+    ));
+    assert!(
+        !fixture.state_path().exists(),
+        "no empty snapshot was written"
+    );
+    Ok(())
+}
+
+#[test]
+fn initialize_and_open_are_separate() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("house");
+    assert!(matches!(
+        HouseStore::open(&path, house()?, StoreOptions::default()),
+        Err(Error::State(StateError::NotInitialized))
+    ));
+    assert!(!path.exists(), "open never creates a store");
+    fs::create_dir(&path)?;
+    assert!(matches!(
+        HouseStore::open(&path, house()?, StoreOptions::default()),
+        Err(Error::State(StateError::NotInitialized))
+    ));
+    let store = HouseStore::initialize(&path, house()?, StoreOptions::default())?;
+    store.create_task(spec("task-1")?, at(0))?;
+    assert!(matches!(
+        HouseStore::initialize(&path, house()?, StoreOptions::default()),
+        Err(Error::State(StateError::AlreadyInitialized))
+    ));
+    fs::remove_file(path.join("state.json"))?;
+    assert!(matches!(
+        HouseStore::initialize(&path, house()?, StoreOptions::default()),
+        Err(Error::State(StateError::AlreadyInitialized))
+    ));
+    assert!(!path.join("state.json").exists());
+    Ok(())
+}
+
+#[test]
+fn a_snapshot_without_its_marker_or_from_another_store_is_rejected() -> TestResult {
+    let first = Fixture::new()?;
+    first.store.create_task(spec("task-1")?, at(0))?;
+    let second = Fixture::new()?;
+    let foreign_snapshot = fs::read(second.state_path())?;
+
+    fs::copy(second.state_path(), first.state_path())?;
+    assert!(matches!(
+        open_error(&first),
+        Some(Error::State(StateError::CorruptState(
+            Corruption::StoreIdentity
+        )))
+    ));
+    assert!(matches!(
+        first.store.tasks(),
+        Err(Error::State(StateError::CorruptState(
+            Corruption::StoreIdentity
+        )))
+    ));
+    assert_eq!(fs::read(first.state_path())?, foreign_snapshot);
+
+    fs::remove_file(second.dir.path().join("house").join("store.json"))?;
+    assert!(matches!(
+        open_error(&second),
+        Some(Error::State(StateError::CorruptState(Corruption::Marker)))
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn redirected_store_paths_are_refused_without_touching_the_target() -> TestResult {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new()?;
+    fixture.store.create_task(spec("task-1")?, at(0))?;
+    let outside = tempfile::tempdir()?;
+    let target = outside.path().join("elsewhere.json");
+    fs::write(&target, "untouched")?;
+
+    let temp = fixture.dir.path().join("house").join("state.json.tmp");
+    symlink(&target, &temp)?;
+    assert!(matches!(
+        fixture.store.create_task(spec("task-2")?, at(1)),
+        Err(Error::State(StateError::RedirectedPath))
+    ));
+    assert!(matches!(
+        fixture.store.tasks(),
+        Err(Error::State(StateError::RedirectedPath))
+    ));
+    assert_eq!(fs::read_to_string(&target)?, "untouched");
+    fs::remove_file(&temp)?;
+    assert_eq!(fixture.store.tasks()?.len(), 1);
+
+    let linked = outside.path().join("linked-house");
+    symlink(fixture.dir.path().join("house"), &linked)?;
+    assert!(matches!(
+        HouseStore::open(&linked, house()?, StoreOptions::default()),
+        Err(Error::State(StateError::RedirectedPath))
+    ));
+    assert!(matches!(
+        HouseStore::initialize(
+            outside.path().join("linked-house"),
+            house()?,
+            StoreOptions::default()
+        ),
+        Err(Error::State(StateError::RedirectedPath))
+    ));
     Ok(())
 }

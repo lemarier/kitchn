@@ -643,6 +643,10 @@ impl StoreState {
         }
     }
 
+    pub(crate) const fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
     fn issue_fence(&mut self) -> Fence {
         let fence = Fence::new(self.next_fence);
         self.next_fence = self.next_fence.saturating_add(1);

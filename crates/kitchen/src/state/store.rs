@@ -2,6 +2,9 @@
 //!
 //! Layout inside the caller-supplied directory:
 //!
+//! - `store.json`: the initialization marker naming the house and the store's
+//!   random nonce. Written once by [`HouseStore::initialize`]; its presence
+//!   means the store is established, so a missing snapshot is an error.
 //! - `state.lock`: an advisory lock file. Writers take an exclusive lock and
 //!   readers a shared one, with a bounded wait.
 //! - `state.json`: the committed snapshot, replaced atomically by writing
@@ -13,6 +16,13 @@
 //! transition to a copy, write if it changed, unlock. The lock is never held
 //! across backend calls. On Unix, newly created directories and files are
 //! readable only by their owner because the state holds private briefs.
+//!
+//! Trust assumptions: the directory is private to the Kitchen user. The store
+//! refuses a symlinked store directory and managed files that are symlinks or
+//! other non-regular files, checked before every transaction; it cannot
+//! prevent a process running as the same user from racing those checks.
+//! Snapshot storage suits a house's working set (see [`crate::state::MAX_TASKS`]);
+//! every write rewrites the whole snapshot.
 
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
@@ -22,6 +32,8 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ConsumerId, Error, HolderId, HouseId, TaskId,
@@ -38,6 +50,7 @@ use crate::{
 
 type Result<T> = std::result::Result<T, Error>;
 
+const MARKER_FILE: &str = "store.json";
 const STATE_FILE: &str = "state.json";
 const TEMP_FILE: &str = "state.json.tmp";
 const LOCK_FILE: &str = "state.lock";
@@ -70,38 +83,126 @@ impl Default for StoreOptions {
 pub struct HouseStore {
     dir: PathBuf,
     house: HouseId,
+    nonce: u64,
     options: StoreOptions,
 }
 
+/// The initialization marker. It never changes after initialization.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoreMarker {
+    schema: u64,
+    house: HouseId,
+    nonce: u64,
+}
+
 impl HouseStore {
-    /// Open or initialize the store for `house` in `dir`, creating the directory.
+    /// Create a new, empty store for `house` in `dir`, creating the directory.
     ///
     /// # Errors
-    /// Returns [`StateError::StorageInsideRepository`] when `dir` is inside a
-    /// Git checkout, [`ContractError::CrossHouse`] when the directory belongs to
-    /// another house, and storage or corruption errors for unreadable state.
-    pub fn open(dir: impl AsRef<Path>, house: HouseId, options: StoreOptions) -> Result<Self> {
+    /// Returns [`StateError::AlreadyInitialized`] when `dir` already holds a
+    /// store or a snapshot, [`StateError::StorageInsideRepository`] inside a
+    /// Git checkout, [`StateError::RedirectedPath`] for a symlinked directory
+    /// or managed file, and storage errors.
+    pub fn initialize(
+        dir: impl AsRef<Path>,
+        house: HouseId,
+        options: StoreOptions,
+    ) -> Result<Self> {
         let dir = dir.as_ref();
+        refuse_symlink(dir)?;
         create_private_dir(dir)
             .map_err(|error| StateError::io(StorageOperation::Prepare, error))?;
-        let dir = fs::canonicalize(dir)
-            .map_err(|error| StateError::io(StorageOperation::Prepare, error))?;
+        let mut store = Self::at(dir, house, 0, options)?;
+        let _lock = store.lock(true)?;
+        if exists(&store.dir.join(MARKER_FILE))? || exists(&store.dir.join(STATE_FILE))? {
+            return Err(StateError::AlreadyInitialized.into());
+        }
+        store.nonce = fresh_nonce();
+        let marker = StoreMarker {
+            schema: SCHEMA_VERSION,
+            house: store.house.clone(),
+            nonce: store.nonce,
+        };
+        let marker = serde_json::to_vec_pretty(&marker)
+            .map_err(|error| StateError::io(StorageOperation::Write, error.into()))?;
+        // The marker goes first: if a crash follows, the store is
+        // established without a snapshot and fails closed on open.
+        store.write_file(MARKER_FILE, &marker)?;
+        store.write(&StoreState::new(store.house.clone(), store.nonce))?;
+        Ok(store)
+    }
+
+    /// Open the established store for `house` in `dir`.
+    ///
+    /// # Errors
+    /// Returns [`StateError::NotInitialized`] when `dir` holds no store,
+    /// [`StateError::StateMissing`] when an established store lost its
+    /// snapshot, [`ContractError::CrossHouse`] when it belongs to another
+    /// house, [`StateError::RedirectedPath`] for symlinked paths, and storage
+    /// or corruption errors. It never writes a replacement snapshot.
+    pub fn open(dir: impl AsRef<Path>, house: HouseId, options: StoreOptions) -> Result<Self> {
+        let dir = dir.as_ref();
+        refuse_symlink(dir)?;
+        let mut store = Self::at(dir, house, 0, options)?;
+        let _lock = store.lock(false)?;
+        let marker = store.read_marker()?;
+        store.nonce = marker.nonce;
+        store.load()?.ok_or(StateError::StateMissing)?;
+        Ok(store)
+    }
+
+    fn at(dir: &Path, house: HouseId, nonce: u64, options: StoreOptions) -> Result<Self> {
+        let dir = fs::canonicalize(dir).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::State(StateError::NotInitialized)
+            } else {
+                StateError::io(StorageOperation::Prepare, error).into()
+            }
+        })?;
         if dir
             .ancestors()
             .any(|ancestor| ancestor.join(".git").symlink_metadata().is_ok())
         {
             return Err(StateError::StorageInsideRepository.into());
         }
-        let store = Self {
+        Ok(Self {
             dir,
             house,
+            nonce,
             options,
+        })
+    }
+
+    fn read_marker(&self) -> Result<StoreMarker> {
+        let path = self.dir.join(MARKER_FILE);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(if exists(&self.dir.join(STATE_FILE))? {
+                    StateError::CorruptState(Corruption::Marker).into()
+                } else {
+                    StateError::NotInitialized.into()
+                });
+            }
+            Err(error) => return Err(StateError::io(StorageOperation::Read, error).into()),
         };
-        let _lock = store.lock(true)?;
-        if store.load()?.is_none() {
-            store.write(&StoreState::new(store.house.clone(), fresh_nonce()))?;
+        let marker: StoreMarker = serde_json::from_slice(&bytes)
+            .map_err(|_| StateError::CorruptState(Corruption::Marker))?;
+        if marker.schema != SCHEMA_VERSION {
+            return Err(StateError::UnsupportedSchema {
+                found: marker.schema,
+            }
+            .into());
         }
-        Ok(store)
+        if marker.house != self.house {
+            return Err(ContractError::CrossHouse {
+                expected: self.house.clone(),
+                found: marker.house,
+            }
+            .into());
+        }
+        Ok(marker)
     }
 
     /// The house this store serves.
@@ -382,6 +483,9 @@ impl HouseStore {
     }
 
     fn lock(&self, exclusive: bool) -> Result<File> {
+        for name in [MARKER_FILE, LOCK_FILE, STATE_FILE, TEMP_FILE] {
+            refuse_redirected(&self.dir.join(name))?;
+        }
         let file = open_lock_file(&self.dir.join(LOCK_FILE))
             .map_err(|error| StateError::io(StorageOperation::Lock, error))?;
         let started = Instant::now();
@@ -451,6 +555,9 @@ impl HouseStore {
         }
         let state: StoreState = serde_json::from_slice(bytes).map_err(syntax)?;
         state.validate().map_err(StateError::CorruptState)?;
+        if state.nonce() != self.nonce {
+            return Err(StateError::CorruptState(Corruption::StoreIdentity).into());
+        }
         Ok(state)
     }
 
@@ -463,13 +570,18 @@ impl HouseStore {
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
             return Err(StateError::StateTooLarge { limit_bytes: limit }.into());
         }
+        self.write_file(STATE_FILE, bytes)
+    }
+
+    /// Atomically replace `name` with `bytes` through the temporary file.
+    fn write_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
         let io = |error| StateError::io(StorageOperation::Write, error);
         let temp = self.dir.join(TEMP_FILE);
         let mut file = create_private_file(&temp).map_err(io)?;
         file.write_all(bytes).map_err(io)?;
         file.sync_all().map_err(io)?;
         drop(file);
-        fs::rename(&temp, self.dir.join(STATE_FILE)).map_err(io)?;
+        fs::rename(&temp, self.dir.join(name)).map_err(io)?;
         sync_dir(&self.dir).map_err(io)?;
         Ok(())
     }
@@ -551,6 +663,35 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     // Directory handles cannot be synced on this platform; rename is still atomic.
     Ok(())
+}
+
+fn exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StateError::io(StorageOperation::Prepare, error).into()),
+    }
+}
+
+/// Refuse a store directory that is itself a symlink.
+fn refuse_symlink(dir: &Path) -> Result<()> {
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(StateError::RedirectedPath.into()),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::io(StorageOperation::Prepare, error).into()),
+    }
+}
+
+/// Refuse a managed file that exists but is not a regular file, such as a
+/// symlink redirecting writes elsewhere.
+fn refuse_redirected(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(StateError::RedirectedPath.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::io(StorageOperation::Prepare, error).into()),
+    }
 }
 
 fn fresh_nonce() -> u64 {

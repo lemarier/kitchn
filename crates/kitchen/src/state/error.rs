@@ -90,6 +90,10 @@ pub enum Corruption {
     SettledWithWork,
     /// A stored collection exceeds its bound.
     LimitExceeded,
+    /// The initialization marker is missing beside a snapshot, or unreadable.
+    Marker,
+    /// The snapshot belongs to a different store than its marker names.
+    StoreIdentity,
 }
 
 impl fmt::Display for Corruption {
@@ -108,6 +112,10 @@ impl fmt::Display for Corruption {
             Self::EffectReference => formatter.write_str("effect references another scope"),
             Self::SettledWithWork => formatter.write_str("settled task has unfinished work"),
             Self::LimitExceeded => formatter.write_str("stored collection exceeds its bound"),
+            Self::Marker => formatter.write_str("store marker is missing or invalid"),
+            Self::StoreIdentity => {
+                formatter.write_str("snapshot belongs to a different store than its marker")
+            }
         }
     }
 }
@@ -224,10 +232,19 @@ pub enum StateError {
         /// The bound.
         limit_bytes: u64,
     },
-    /// The state file disappeared after the store was opened. The store never
+    /// The snapshot of an established store is missing. The store never
     /// recreates it implicitly, since that would silently forget ownership.
     #[error("state file is missing")]
     StateMissing,
+    /// The directory holds no initialized store.
+    #[error("no store is initialized in this directory")]
+    NotInitialized,
+    /// The directory already holds a store or a snapshot.
+    #[error("a store is already initialized in this directory")]
+    AlreadyInitialized,
+    /// The store directory or a managed file is a symlink or not a regular file.
+    #[error("store path is redirected or not a regular file")]
+    RedirectedPath,
     /// The state file uses an unknown schema version.
     #[error("unsupported state schema version {found}")]
     UnsupportedSchema {
@@ -259,10 +276,13 @@ impl StateError {
             | Self::EffectNameConflict(_)
             | Self::ConflictingOutcome(_)
             | Self::ConflictingAttemptOutcome
-            | Self::StaleDecision { .. } => ErrorClass::Conflict,
+            | Self::StaleDecision { .. }
+            | Self::NotInitialized
+            | Self::AlreadyInitialized => ErrorClass::Conflict,
             Self::UnsafeRetry(_)
             | Self::CapacityExceeded { .. }
-            | Self::StorageInsideRepository => ErrorClass::Refused,
+            | Self::StorageInsideRepository
+            | Self::RedirectedPath => ErrorClass::Refused,
             Self::LockTimeout { .. }
             | Self::Io { .. }
             | Self::StateTooLarge { .. }

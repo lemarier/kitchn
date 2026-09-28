@@ -130,7 +130,8 @@ pub struct Fixture {
 impl Fixture {
     pub fn new() -> TestResult<Self> {
         let dir = tempfile::tempdir()?;
-        let store = HouseStore::open(dir.path().join("house"), house()?, StoreOptions::default())?;
+        let store =
+            HouseStore::initialize(dir.path().join("house"), house()?, StoreOptions::default())?;
         Ok(Self { dir, store })
     }
 

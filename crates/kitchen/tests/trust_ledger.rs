@@ -2,7 +2,7 @@
 mod common;
 use common::{
     Fixture, ManualClock, TestResult, at, commit, creator, grants, holder, house, other_house,
-    scheduled, spec, task_id, ttl,
+    scheduled, task_id, ttl,
 };
 use kitchen::{
     contracts::{
@@ -10,6 +10,8 @@ use kitchen::{
         EvidenceVerdict, ExternalRef, Fence, Grant, HouseGrants, Permission, Repository, Role,
         TaskAuthority, TaskSpec, Text,
     },
+    scheduling::AgentFamily,
+    selection::{AgentModel, AgentSelection, ResolvedSelection},
     state::{Corruption, HouseStore, StateError, StoreOptions, TaskState},
     trust::{
         Attribution, AutonomyGrant, AutonomyProposal, BenchResult, EvidenceMode, Finding,
@@ -22,6 +24,23 @@ use kitchen::{
 };
 use std::{fs, num::NonZeroU32};
 
+/// The fixture model's name and the identity trust attributes it to.
+const MODEL: &str = "fixture-model-v1";
+const ATTRIBUTED_MODEL: &str = "claude:fixture-model-v1";
+/// An owner-chosen Claude selection of `model`.
+fn selected(model: &str) -> TestResult<Option<ResolvedSelection>> {
+    Ok(Some(ResolvedSelection::owner(AgentSelection {
+        agent: AgentFamily::Claude,
+        model: Some(AgentModel::new(model)?),
+        effort: None,
+    })))
+}
+/// The common worker spec, running the fixture model.
+fn spec(id: &str) -> TestResult<TaskSpec> {
+    let mut task = common::spec(id)?;
+    task.agent = selected(MODEL)?;
+    Ok(task)
+}
 fn source(value: &str) -> TestResult<ExternalRef> {
     Ok(ExternalRef::new(value)?)
 }
@@ -43,7 +62,7 @@ fn attribution() -> TestResult<Attribution> {
     Ok(Attribution {
         scope: scope()?,
         agent: measured(holder("worker")?)?,
-        model: measured(Text::new("fixture-model-v1")?)?,
+        model: measured(Text::new(ATTRIBUTED_MODEL)?)?,
         tokens: measured(120)?,
     })
 }
@@ -101,12 +120,7 @@ fn ledger(f: &Fixture) -> TestResult<Ledger> {
 }
 fn bind_evidence(l: &Ledger, f: &Fixture) -> TestResult {
     let task = f.store.task(&task_id("task")?)?;
-    l.bind_task(
-        task.spec(),
-        scope()?,
-        Text::new("fixture-model-v1")?,
-        source("fixture:task-binding")?,
-    )?;
+    l.bind_task(task.spec(), scope()?, source("fixture:task-binding")?)?;
     Ok(())
 }
 fn reopen(f: &Fixture) -> TestResult<Ledger> {
@@ -230,10 +244,10 @@ fn bound_acting(
     acting.repository = Some(scope()?.project);
     acting.authority = TaskAuthority::delegate(policy, [])?;
     edit(&mut acting);
+    acting.agent = selected(model)?;
     l.bind_task(
         &acting,
         scope()?,
-        Text::new(model)?,
         source(&format!("fixture:{name}-binding"))?,
     )?;
     Ok(acting)
@@ -242,12 +256,7 @@ fn bound_acting(
 fn try_bind_extra(l: &Ledger) -> TestResult<Result<bool, TrustError>> {
     let mut extra = spec("extra")?;
     extra.repository = Some(scope()?.project);
-    Ok(l.bind_task(
-        &extra,
-        scope()?,
-        Text::new("fixture-model-v1")?,
-        source("fixture:extra-binding")?,
-    ))
+    Ok(l.bind_task(&extra, scope()?, source("fixture:extra-binding")?))
 }
 fn try_approve(l: &Ledger, current: &HouseGrants) -> TestResult<Result<bool, TrustError>> {
     Ok(l.approve(
@@ -711,25 +720,19 @@ fn task_binding_is_write_once_and_rejects_role_confusion() -> TestResult {
     let l = ledger(&f)?;
     let mut task = spec("bound-task")?;
     task.repository = Some(scope()?.project);
-    let model = Text::new("fixture-model-v1")?;
     let origin = source("fixture:binding")?;
-    assert!(l.bind_task(&task, scope()?, model.clone(), origin.clone())?);
-    assert!(!l.bind_task(&task, scope()?, model.clone(), origin)?);
+    assert!(l.bind_task(&task, scope()?, origin.clone())?);
+    assert!(!l.bind_task(&task, scope()?, origin)?);
     let mut changed = task.clone();
     changed.provenance.house_guidance = commit('c')?;
     assert!(matches!(
-        l.bind_task(
-            &changed,
-            scope()?,
-            model.clone(),
-            source("fixture:binding")?
-        ),
+        l.bind_task(&changed, scope()?, source("fixture:binding")?),
         Err(TrustError::Conflict)
     ));
     let mut wrong_role = scope()?;
     wrong_role.station = Text::new("inspector")?;
     assert!(matches!(
-        l.bind_task(&task, wrong_role, model, source("fixture:other")?),
+        l.bind_task(&task, wrong_role, source("fixture:other")?),
         Err(TrustError::Refused)
     ));
     Ok(())
@@ -743,22 +746,12 @@ fn record_refuses_a_task_binding_that_differs_from_the_stored_task() -> TestResu
     // The adapter bound a prospective spec whose role is not the stored task's.
     let mut prospective = f.store.task(&task_id("task")?)?.spec().clone();
     prospective.role = Role::Commis;
-    l.bind_task(
-        &prospective,
-        scope()?,
-        Text::new("fixture-model-v1")?,
-        source("fixture:binding")?,
-    )?;
+    l.bind_task(&prospective, scope()?, source("fixture:binding")?)?;
     assert!(matches!(l.record(&f.store, o), Err(TrustError::Refused)));
     assert!(l.history()?.is_empty());
     let second = settled(&f, "second", "fixture:second", |_| {}, None)?;
     let exact = f.store.task(&task_id("second")?)?.spec().clone();
-    l.bind_task(
-        &exact,
-        scope()?,
-        Text::new("fixture-model-v1")?,
-        source("fixture:second-binding")?,
-    )?;
+    l.bind_task(&exact, scope()?, source("fixture:second-binding")?)?;
     assert!(l.record(&f.store, second)?);
     Ok(())
 }
@@ -825,12 +818,7 @@ fn core_store_faults_are_storage_errors_and_an_absent_task_is_a_refusal() -> Tes
     let l = ledger(&f)?;
     let o = observation(&f)?;
     let task_spec = f.store.task(&task_id("task")?)?.spec().clone();
-    l.bind_task(
-        &task_spec,
-        scope()?,
-        Text::new("fixture-model-v1")?,
-        source("fixture:binding")?,
-    )?;
+    l.bind_task(&task_spec, scope()?, source("fixture:binding")?)?;
     let quick = HouseStore::open(
         f.dir.path().join("house"),
         house()?,
@@ -1001,12 +989,7 @@ fn explicit_grant_uses_core_authority_and_revocation_survives_restart() -> TestR
     let mut acting = spec("acting")?;
     acting.repository = Some(scope()?.project);
     acting.authority = kitchen::contracts::TaskAuthority::delegate(&policy, [])?;
-    l.bind_task(
-        &acting,
-        scope()?,
-        Text::new("fixture-model-v1")?,
-        source("fixture:acting-binding")?,
-    )?;
+    l.bind_task(&acting, scope()?, source("fixture:acting-binding")?)?;
     assert!(
         !l.standing_for_task(&f.store, &acting, &policy)?
             .covers(&g.claim)
@@ -1041,12 +1024,7 @@ fn explicit_grant_uses_core_authority_and_revocation_survives_restart() -> TestR
     let mut other = spec("other-acting")?;
     other.repository = Some(scope()?.project);
     other.authority = kitchen::contracts::TaskAuthority::delegate(&policy, [])?;
-    l.bind_task(
-        &other,
-        other_scope,
-        Text::new("fixture-model-v1")?,
-        source("fixture:other-binding")?,
-    )?;
+    l.bind_task(&other, other_scope, source("fixture:other-binding")?)?;
     assert!(
         !l.standing_for_task(&f.store, &other, &policy)?
             .covers(&g.claim)
@@ -1693,7 +1671,8 @@ fn collection_preserves_uncertain_effect_and_exact_core_evidence() -> TestResult
         state::{EffectOutcome, EffectState},
     };
     let f = Fixture::new()?;
-    let mut task = spec("task")?;
+    // A launch must match the task's agent selection; this one has none.
+    let mut task = common::spec("task")?;
     task.repository = Some(scope()?.project);
     f.store.create_task(task, &creator()?, at(0))?;
     let lease = f
@@ -1899,7 +1878,7 @@ fn earned_standing_requires_the_evidence_tasks_role_pins_and_bound_model() -> Te
             .covers(&claim))
     };
 
-    let same = bound_acting(&l, &policy, "same", "fixture-model-v1", |_| {})?;
+    let same = bound_acting(&l, &policy, "same", MODEL, |_| {})?;
     assert!(
         earned(&same)?,
         "the evidence task's own pins earn the grant"
@@ -1907,13 +1886,13 @@ fn earned_standing_requires_the_evidence_tasks_role_pins_and_bound_model() -> Te
 
     let pin = commit('c')?;
     let repinned = [
-        bound_acting(&l, &policy, "kitchen-pin", "fixture-model-v1", |s| {
+        bound_acting(&l, &policy, "kitchen-pin", MODEL, |s| {
             s.provenance.kitchen = pin.clone();
         })?,
-        bound_acting(&l, &policy, "guidance-pin", "fixture-model-v1", |s| {
+        bound_acting(&l, &policy, "guidance-pin", MODEL, |s| {
             s.provenance.house_guidance = pin.clone();
         })?,
-        bound_acting(&l, &policy, "repository-pin", "fixture-model-v1", |s| {
+        bound_acting(&l, &policy, "repository-pin", MODEL, |s| {
             s.provenance.repository_instructions = Some(pin.clone());
         })?,
     ];
@@ -1922,7 +1901,7 @@ fn earned_standing_requires_the_evidence_tasks_role_pins_and_bound_model() -> Te
     }
     let remodelled = bound_acting(&l, &policy, "remodelled", "fixture-model-v2", |_| {})?;
     assert!(!earned(&remodelled)?);
-    let other_role = bound_acting(&l, &policy, "other-role", "fixture-model-v1", |s| {
+    let other_role = bound_acting(&l, &policy, "other-role", MODEL, |s| {
         s.role = Role::Commis;
     })?;
     assert!(!earned(&other_role)?);
@@ -2016,7 +1995,7 @@ fn a_revoked_proposal_never_becomes_authority() -> TestResult {
         try_approve(&l, &policy)?,
         Err(TrustError::Conflict)
     ));
-    let acting = bound_acting(&l, &policy, "acting", "fixture-model-v1", |_| {})?;
+    let acting = bound_acting(&l, &policy, "acting", MODEL, |_| {})?;
     assert!(
         !l.standing_for_task(&f.store, &acting, &policy)?
             .covers(&claim)
@@ -3164,12 +3143,7 @@ fn capacity_reports_entries_and_bytes_before_writes_stop() -> TestResult {
     let mut another = spec("another")?;
     another.repository = Some(scope()?.project);
     assert!(matches!(
-        l.bind_task(
-            &another,
-            scope()?,
-            Text::new("fixture-model-v1")?,
-            source("fixture:another-binding")?
-        ),
+        l.bind_task(&another, scope()?, source("fixture:another-binding")?),
         Err(TrustError::Exhausted)
     ));
     // Revocation still succeeds at the entry limit.
@@ -3215,5 +3189,44 @@ fn capacity_of_a_corrupt_ledger_is_an_error() -> TestResult {
         l.capacity(),
         Err(TrustError::Storage(StateError::StateMissing))
     ));
+    Ok(())
+}
+
+#[test]
+fn the_bound_model_comes_from_the_tasks_agent_selection() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    // Without a resolved selection there is no model to bind.
+    let mut unselected = spec("unselected")?;
+    unselected.repository = Some(scope()?.project);
+    unselected.agent = None;
+    assert!(matches!(
+        l.bind_task(&unselected, scope()?, source("fixture:unselected")?),
+        Err(TrustError::Refused)
+    ));
+    // An agent default binds the family alone, which no reported model matches.
+    let mut default = unselected.clone();
+    default.id = task_id("agent-default")?;
+    default.agent = Some(ResolvedSelection::owner(AgentSelection::agent_default(
+        AgentFamily::Claude,
+    )));
+    assert!(l.bind_task(&default, scope()?, source("fixture:default")?)?);
+    let persisted: serde_json::Value = serde_json::from_slice(&fs::read(ledger_path(&f))?)?;
+    assert_eq!(persisted["bindings"][0]["model"], "claude");
+
+    // The stored task runs another model than the bound spec: refused.
+    let o = observation(&f)?;
+    let mut prospective = f.store.task(&task_id("task")?)?.spec().clone();
+    prospective.agent = selected("fixture-model-v2")?;
+    l.bind_task(&prospective, scope()?, source("fixture:binding")?)?;
+    assert!(matches!(l.record(&f.store, o), Err(TrustError::Refused)));
+    assert!(l.history()?.is_empty());
+
+    // A persisted binding whose model disagrees with its spec is corrupt.
+    tamper(&f, |d| {
+        d["bindings"][0]["model"] = serde_json::json!(ATTRIBUTED_MODEL);
+        Ok(())
+    })?;
+    assert_corrupt(try_open(&f)?, "binding model differs from its selection");
     Ok(())
 }

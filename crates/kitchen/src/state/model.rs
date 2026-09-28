@@ -21,7 +21,9 @@ use crate::{
 
 /// The persisted schema version.
 pub(crate) const SCHEMA_VERSION: u64 = 1;
-/// Tasks per house store, settled ones included until pruned.
+/// Tasks per house store, settled ones included. Settled tasks are kept so
+/// their identities and idempotency keys are never reused; retention is not
+/// implemented yet.
 pub const MAX_TASKS: usize = 4096;
 /// Consumer leases per house store.
 pub const MAX_CONSUMERS: usize = 256;
@@ -1253,14 +1255,6 @@ impl StoreState {
                 expired_at: lease.expires_at,
             });
         tasks.chain(consumers).collect()
-    }
-
-    pub(crate) fn prune_settled(&mut self, settled_before: Timestamp) -> usize {
-        let before = self.tasks.len();
-        self.tasks.retain(
-            |_, task| !matches!(task.state, TaskState::Settled { at, .. } if at < settled_before),
-        );
-        before.saturating_sub(self.tasks.len())
     }
 
     /// Check invariants that the type system cannot express.

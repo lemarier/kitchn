@@ -364,14 +364,6 @@ impl HouseStore {
         self.read(|state| state.recovery_queue(now))
     }
 
-    /// Remove tasks settled before `settled_before`, returning how many were removed.
-    ///
-    /// # Errors
-    /// Returns a storage error.
-    pub fn prune_settled(&self, settled_before: Timestamp) -> Result<usize> {
-        self.transact(|state| Ok(state.prune_settled(settled_before)))
-    }
-
     fn transact<T>(&self, apply: impl FnOnce(&mut StoreState) -> Result<T>) -> Result<T> {
         let _lock = self.lock(true)?;
         let (mut state, before) = self.load()?.ok_or(StateError::StateMissing)?;

@@ -596,3 +596,39 @@ fn backend_refusals_are_recorded_as_not_applied() -> TestResult {
     assert!(HouseId::new(common::HOUSE).is_ok());
     Ok(())
 }
+
+#[test]
+fn settled_task_identity_is_never_reused() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = started(&fixture, "task-1")?;
+    let backend = FakeBackend::fully_capable(backend_id()?, house()?);
+    let clock = ManualClock::starting_at(1);
+    let first = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(&task, fence, "launch", launch()?)?,
+        &clock,
+    )?;
+    fixture
+        .store
+        .finish_attempt(&task, fence, AttemptOutcome::Succeeded, at(2))?;
+
+    // The settled record keeps its identity and keys; nothing deletes it.
+    assert_eq!(
+        fixture.store.create_task(spec("task-1")?, at(100))?,
+        kitchen::state::Creation::AlreadyExists
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .claim(&task, &holder("coordinator-b")?, ttl(60)?, at(101)),
+        Err(Error::State(StateError::TaskSettled { .. }))
+    ));
+    let record = fixture.store.task(&task)?;
+    assert!(
+        matches!(record.effects(), [effect] if effect.request().key() == first.request().key())
+    );
+    assert_eq!(backend.effects_performed(), 1);
+    Ok(())
+}

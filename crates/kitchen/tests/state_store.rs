@@ -777,26 +777,6 @@ fn pickup_duplicate_tick_single_consumer() -> TestResult {
 }
 
 #[test]
-fn prune_removes_only_old_settled_tasks() -> TestResult {
-    let fixture = Fixture::new()?;
-    let store = &fixture.store;
-    for id in ["old", "recent", "open"] {
-        store.create_task(spec(id)?, at(0))?;
-    }
-    store.request_cancel(&task_id("old")?, &holder("operator")?, at(10))?;
-    store.request_cancel(&task_id("recent")?, &holder("operator")?, at(100))?;
-    assert_eq!(store.prune_settled(at(50))?, 1);
-    let remaining: Vec<_> = store
-        .tasks()?
-        .iter()
-        .map(|task| task.spec().id.to_string())
-        .collect();
-    assert_eq!(remaining, ["open", "recent"]);
-    assert_eq!(store.prune_settled(at(50))?, 0);
-    Ok(())
-}
-
-#[test]
 fn storage_inside_a_git_checkout_is_refused() -> TestResult {
     let dir = tempfile::tempdir()?;
     fs::create_dir(dir.path().join(".git"))?;

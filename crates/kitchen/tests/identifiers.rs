@@ -13,7 +13,8 @@ fn identities_preserve_case_and_round_trip() -> Result<(), IdentifierError> {
 }
 
 #[test]
-fn leading_digits_and_trailing_or_repeated_separators_are_accepted() -> Result<(), IdentifierError> {
+fn leading_digits_and_trailing_or_repeated_separators_are_accepted() -> Result<(), IdentifierError>
+{
     for value in ["42", "9-task", "a-", "a_", "a--b"] {
         assert_eq!(HouseId::new(value)?.as_str(), value);
         assert_eq!(TaskId::new(value)?.as_str(), value);

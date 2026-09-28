@@ -16,6 +16,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 
 /// The working-tree binding file older Kitchen versions wrote. Kitchen no
@@ -26,6 +27,47 @@ pub const LEGACY_REPOSITORY_CONFIG: &str = ".kitchen.json";
 const BINDINGS: &str = "repositories";
 /// Longest wait for the registry lock before reporting it busy.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Serializes registry writers within this process. POSIX record locks are
+/// per-process, so they cannot exclude another thread of the same process.
+/// The guard protects no data, so a poisoned mutex is safe to reuse.
+static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+/// Held for the duration of one registry mutation.
+struct RegistryLock {
+    _file: File,
+    _process: MutexGuard<'static, ()>,
+}
+
+/// Outcome of one non-blocking attempt on the lock file.
+enum Attempt {
+    Locked,
+    Contended,
+}
+
+/// Take the file lock without blocking. Unix uses a POSIX record lock
+/// (`fcntl`), which a forked or spawned child does not inherit; an inherited
+/// `flock` lock would outlive its release until the child execs.
+fn try_lock_file(file: &File) -> Result<Attempt, HouseError> {
+    #[cfg(unix)]
+    {
+        use rustix::io::Errno;
+        match rustix::fs::fcntl_lock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Attempt::Locked),
+            // POSIX allows either errno for a conflicting lock.
+            Err(Errno::AGAIN | Errno::ACCESS) => Ok(Attempt::Contended),
+            Err(errno) => Err(std::io::Error::from(errno).into()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match file.try_lock() {
+            Ok(()) => Ok(Attempt::Locked),
+            Err(fs::TryLockError::WouldBlock) => Ok(Attempt::Contended),
+            Err(fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+}
 
 /// External registry containing house policy, immutable snapshots, and one
 /// binding per repository. It is the only place Kitchen records a repository's
@@ -385,7 +427,10 @@ impl HouseRegistry {
     fn config_path(&self, house: &HouseId) -> PathBuf {
         self.root.join("houses").join(format!("{house}.json"))
     }
-    fn lock(&self) -> Result<File, HouseError> {
+    fn lock(&self) -> Result<RegistryLock, HouseError> {
+        let process = REGISTRY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ensure_external(&self.root)?;
         if !self.root.is_dir() {
             return Err(HouseError::HouseSelection);
@@ -400,23 +445,92 @@ impl HouseRegistry {
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        // Wait briefly: a process forked by another thread can hold a copy of
-        // a just-released lock until it execs. A longer hold is a real writer.
+        // Wait briefly for a writer that is about to release; a longer hold
+        // is a real writer.
         let started = std::time::Instant::now();
         let mut backoff = std::time::Duration::from_millis(1);
         loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(file),
-                Err(fs::TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+            match try_lock_file(&file)? {
+                Attempt::Locked => {
+                    return Ok(RegistryLock {
+                        _file: file,
+                        _process: process,
+                    });
+                }
+                Attempt::Contended if started.elapsed() < LOCK_WAIT => {
                     std::thread::sleep(backoff);
                     backoff = backoff
                         .saturating_mul(2)
                         .min(std::time::Duration::from_millis(20));
                 }
-                Err(fs::TryLockError::WouldBlock) => return Err(HouseError::Busy),
-                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+                Attempt::Contended => return Err(HouseError::Busy),
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::*;
+    use std::{process::Command, sync::mpsc, time::Duration};
+
+    #[test]
+    fn spawned_child_does_not_extend_registry_lock() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let registry = HouseRegistry::new(directory.path().canonicalize()?)?;
+        let held = registry.lock()?;
+        let (sender, receiver) = mpsc::channel();
+        let spawn = std::thread::spawn(move || {
+            let child = Command::new("sleep").arg("2").spawn();
+            sender.send(child)
+        });
+        let mut child = receiver.recv_timeout(Duration::from_secs(5))??;
+        assert!(child.try_wait()?.is_none(), "child must still be alive");
+        drop(held);
+        let reacquired = registry.lock();
+        child.kill()?;
+        child.wait()?;
+        spawn.join().map_err(|_| "spawn thread panicked")??;
+        assert!(reacquired.is_ok(), "child retained the registry lock");
+        Ok(())
+    }
+
+    #[test]
+    fn poisoned_process_guard_does_not_report_busy() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let registry = HouseRegistry::new(directory.path().canonicalize()?)?;
+        let poisoner = std::thread::spawn(|| {
+            let _guard = REGISTRY_LOCK.lock();
+            panic!("poison the registry process guard");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(REGISTRY_LOCK.is_poisoned());
+        assert!(registry.lock().is_ok());
+        assert!(registry.lock().is_ok(), "poison must not persist as Busy");
+        Ok(())
+    }
+
+    #[test]
+    fn held_lock_file_reports_contention_not_error() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("held.lock");
+        let file = File::create(&path)?;
+        assert!(matches!(try_lock_file(&file)?, Attempt::Locked));
+        // A second process is needed to observe contention; the same
+        // process re-locking its own record succeeds.
+        assert!(matches!(try_lock_file(&file)?, Attempt::Locked));
+        Ok(())
+    }
+
+    #[test]
+    fn unlockable_descriptor_is_an_error_not_busy() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let read_only = File::open(directory.path())?;
+        assert!(matches!(
+            try_lock_file(&read_only),
+            Err(HouseError::Io(_))
+        ));
+        Ok(())
     }
 }
 

@@ -2022,9 +2022,37 @@ impl StoreState {
         now: Timestamp,
         guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
     ) -> Result<MarkerAttempt<R>> {
+        self.record_marker_guarded(key, fact, recorded_by, now, None, guard)
+    }
+
+    /// Like [`Self::record_marker_unless`], but a key that is already recorded
+    /// is guarded too while `pending` names a task that does not exist yet.
+    pub(crate) fn record_marker_unless_created<R>(
+        &mut self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+        pending: &TaskId,
+        guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
+    ) -> Result<MarkerAttempt<R>> {
+        self.record_marker_guarded(key, fact, recorded_by, now, Some(pending), guard)
+    }
+
+    fn record_marker_guarded<R>(
+        &mut self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+        pending: Option<&TaskId>,
+        guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
+    ) -> Result<MarkerAttempt<R>> {
         self.check_claimant(recorded_by, now)?;
-        // A key that is already recorded is settled by `record`, never blocked.
-        if self.markers.get(&key).is_none() {
+        // A recorded key is settled by `record`, never blocked, unless its
+        // task is still to be created.
+        let unfinished = pending.is_some_and(|task| !self.tasks.contains_key(task));
+        if self.markers.get(&key).is_none() || unfinished {
             let siblings: Vec<&WorkflowMarker> = self.markers.for_workflow(&key.workflow).collect();
             if let Some(blocked) = guard(&siblings)? {
                 return Ok(MarkerAttempt::Blocked(blocked));

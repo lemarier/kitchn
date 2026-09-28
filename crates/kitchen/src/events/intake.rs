@@ -317,19 +317,23 @@ impl<'a> EventIntake<'a> {
         // The stale scan and the write are one store transaction, so an older
         // event cannot record after a newer one under the same live fence.
         let fact = MarkerFact::workflow(self.schema.clone(), &record)?;
-        let recorded_now =
-            match self
-                .store
-                .record_marker_unless(key.clone(), fact, claimant, now, |markers| {
-                    self.newer_event(markers, &key, &record)
-                }) {
-                Ok(MarkerAttempt::Recorded(_)) => true,
-                Ok(MarkerAttempt::AlreadyRecorded(_)) => false,
-                Ok(MarkerAttempt::Blocked(newer)) => return Ok(Admission::Stale(newer)),
-                // Another admission of the same work recorded a different fact first.
-                Err(Error::State(StateError::MarkerConflict)) => false,
-                Err(error) => return Err(error),
-            };
+        // A redelivery that finishes an interrupted admission is checked too:
+        // a newer event may have been admitted since the key was recorded.
+        let recorded_now = match self.store.record_marker_unless_created(
+            key.clone(),
+            fact,
+            claimant,
+            now,
+            &order.task,
+            |markers| self.newer_event(markers, &key, &record),
+        ) {
+            Ok(MarkerAttempt::Recorded(_)) => true,
+            Ok(MarkerAttempt::AlreadyRecorded(_)) => false,
+            Ok(MarkerAttempt::Blocked(newer)) => return Ok(Admission::Stale(newer)),
+            // Another admission of the same work recorded a different fact first.
+            Err(Error::State(StateError::MarkerConflict)) => false,
+            Err(error) => return Err(error),
+        };
         match self.store.task(&order.task) {
             Ok(_) => return Ok(Admission::Duplicate(order.task)),
             Err(Error::State(StateError::TaskNotFound(_))) => {}

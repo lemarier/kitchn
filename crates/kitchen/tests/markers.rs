@@ -5,7 +5,7 @@ mod common;
 
 use std::{fs, num::NonZeroU64};
 
-use common::{Fixture, TestResult, at, commit, scheduled, ttl};
+use common::{Fixture, TestResult, at, commit, scheduled, spec, task_id, ttl};
 use kitchen::{
     ConsumerId, Error, WorkflowId,
     contracts::{
@@ -919,6 +919,57 @@ fn a_guarded_record_of_an_existing_key_is_never_blocked() -> TestResult {
         different,
         Err(Error::State(StateError::MarkerConflict))
     ));
+    Ok(())
+}
+
+#[test]
+fn a_guarded_record_checks_an_existing_key_only_until_its_task_exists() -> TestResult {
+    let fixture = Fixture::new()?;
+    let recorder = scheduled("guard-tick")?;
+    let gate = key("gate", pull_request(20)?, 'a', None)?;
+    let pending = task_id("gate-task")?;
+    fixture.store.record_marker(
+        gate.clone(),
+        verdict(EvidenceVerdict::Pass),
+        &recorder,
+        at(1),
+    )?;
+
+    // The task is missing: the guard runs for the recorded key and objects.
+    let blocked = fixture.store.record_marker_unless_created(
+        gate.clone(),
+        verdict(EvidenceVerdict::Pass),
+        &recorder,
+        at(2),
+        &pending,
+        |siblings| Ok(Some(siblings.len())),
+    )?;
+    assert_eq!(blocked, MarkerAttempt::Blocked(1));
+
+    // The guard's silence settles the key as usual.
+    let settled = fixture.store.record_marker_unless_created(
+        gate.clone(),
+        verdict(EvidenceVerdict::Pass),
+        &recorder,
+        at(3),
+        &pending,
+        |_| Ok(None::<()>),
+    )?;
+    assert!(matches!(settled, MarkerAttempt::AlreadyRecorded(_)));
+
+    // Once the task exists, the recorded key is never blocked again.
+    fixture
+        .store
+        .create_task(spec(pending.as_str())?, &recorder, at(4))?;
+    let unguarded = fixture.store.record_marker_unless_created(
+        gate,
+        verdict(EvidenceVerdict::Pass),
+        &recorder,
+        at(5),
+        &pending,
+        |_| Ok(Some(())),
+    )?;
+    assert!(matches!(unguarded, MarkerAttempt::AlreadyRecorded(_)));
     Ok(())
 }
 

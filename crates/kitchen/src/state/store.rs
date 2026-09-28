@@ -477,6 +477,27 @@ impl HouseStore {
         self.transact(|state| state.record_marker_unless(key, fact, recorded_by, now, guard))
     }
 
+    /// Like [`Self::record_marker_unless`], but a key that is already
+    /// recorded is guarded too while the task `pending` does not exist. This
+    /// lets a redelivery that finishes an interrupted admission be checked
+    /// against markers recorded since, in the same transaction.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::record_marker_unless`].
+    pub fn record_marker_unless_created<R>(
+        &self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+        pending: &TaskId,
+        guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
+    ) -> Result<MarkerAttempt<R>> {
+        self.transact(|state| {
+            state.record_marker_unless_created(key, fact, recorded_by, now, pending, guard)
+        })
+    }
+
     /// Replace the fact recorded under `key`, but only if it is still
     /// `expected` (compare-and-supersede), for example when a gate's verdict
     /// for the same head changes. The prior fact, its recorder, and times

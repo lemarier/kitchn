@@ -567,6 +567,36 @@ fn interrupted_admission_is_finished_by_the_next_delivery() -> TestResult {
 }
 
 #[test]
+fn recovery_of_an_older_event_is_stale_once_a_newer_event_was_admitted() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (config, source) = (house_config()?, delivering()?);
+    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let fence = receiver_fence(&fixture.store, 0)?;
+    let older = pushed("delivery-1", 'c', 10)?;
+    let newer = pushed("delivery-2", 'd', 20)?;
+
+    // The older event records its marker, then planning fails.
+    let failed = intake.admit_event(
+        &older,
+        &receiver(&older, fence)?,
+        |_| Err(Error::from(StateError::MarkerPayloadInvalid)),
+        at(11),
+    );
+    assert!(failed.is_err());
+    assert!(fixture.store.tasks()?.is_empty());
+
+    let newer_task = task_of(&admit(&intake, &newer, &receiver(&newer, fence)?, 21)?)?;
+
+    // Redelivering the older event must not finish its admission.
+    assert_eq!(
+        admit(&intake, &older, &receiver(&older, fence)?, 22)?,
+        Admission::Stale(newer_task)
+    );
+    assert_eq!(fixture.store.tasks()?.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn foreign_events_are_refused_before_any_state_changes() -> TestResult {
     let fixture = Fixture::new()?;
     let (config, source) = (house_config()?, delivering()?);

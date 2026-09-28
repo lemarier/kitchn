@@ -39,6 +39,7 @@ fn ready() -> TestResult<GateEvidence> {
         head_branch: Some("feature/gate".into()),
         base: commit('b')?,
         base_branch: Some(BranchName::new("main")?),
+        base_ref_unreadable: false,
         head_age: Some(Duration::from_secs(3600)),
         open: Some(true),
         draft: Some(false),
@@ -3142,6 +3143,63 @@ fn base_tip_comes_from_the_branch_ref_not_the_pr_object() -> TestResult {
     assert_eq!(
         gate::merge_request_from_forge(&recorded, &granted(&recorded)?, &unreadable, 0),
         Err(kitchen::integrations::github::IntegrationError::Unavailable)
+    );
+    Ok(())
+}
+#[test]
+fn unreadable_base_ref_hands_over_with_the_reason() -> TestResult {
+    use serde_json::json;
+    let e = ready()?;
+    let policy = ForgeGatePolicy {
+        authors: vec!["allowed".into()],
+        expected_reviewers: vec!["reviewer".into()],
+    };
+    let collect = |client| {
+        gate::collect_forge_evidence(
+            client,
+            &e.house,
+            &e.repository,
+            e.number,
+            &policy,
+            supplement(&e),
+            secs(1_790_607_600),
+        )
+    };
+    // A readable ref leaves no gap.
+    let client = forge_client(e.head.as_str(), false)?;
+    let readable = collect(&client)?;
+    assert!(!readable.base_ref_unreadable);
+    assert_eq!(
+        gate::evaluate(&readable, grants()?, GateHistory::default()).verdict,
+        Verdict::Merge
+    );
+    // The provider answers for another branch: the PR is handed over with
+    // the reason instead of never getting a verdict.
+    let ambiguous = forge_client(e.head.as_str(), false)?;
+    ambiguous.transport().responses.borrow_mut()[1] =
+        json!({"name":"release","commit":{"sha":commit('c')?.as_str()}});
+    let observed = collect(&ambiguous)?;
+    assert!(observed.base_ref_unreadable);
+    assert_eq!(
+        observed.base, e.base,
+        "the PR's recorded base names the subject"
+    );
+    let Verdict::HandOver { gaps } =
+        gate::evaluate(&observed, grants()?, GateHistory::default()).verdict
+    else {
+        return Err("an unreadable base must hand over".into());
+    };
+    assert!(gaps.contains(&Gap::BaseUnreadable), "{gaps:?}");
+    // A malformed ref answer is handled the same way.
+    let malformed = forge_client(e.head.as_str(), false)?;
+    malformed.transport().responses.borrow_mut()[1] = json!({"name":"main"});
+    assert!(collect(&malformed)?.base_ref_unreadable);
+    // A transport failure may clear, so the pass ends and retries later.
+    let offline = forge_client(e.head.as_str(), false)?;
+    offline.transport().responses.borrow_mut().truncate(1);
+    assert_eq!(
+        collect(&offline).err(),
+        Some(kitchen::integrations::github::IntegrationError::Unavailable)
     );
     Ok(())
 }

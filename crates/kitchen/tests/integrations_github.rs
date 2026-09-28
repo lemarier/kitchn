@@ -622,6 +622,61 @@ fn required_checks_presence_fails_closed_for_missing_and_app_bound_checks() -> R
 }
 
 #[test]
+fn branch_ref_reads_encode_the_branch_name() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let sha = "1111111111111111111111111111111111111111";
+    for (name, path) in [
+        ("main", "branches/main"),
+        ("release/v1.0", "branches/release/v1.0"),
+        ("feature#1", "branches/feature%231"),
+        ("a%b&c+d", "branches/a%25b%26c%2Bd"),
+    ] {
+        let branch = kitchen::contracts::BranchName::new(name)?;
+        let client = GitHubClient::new(
+            scope()?,
+            Fake::new(vec![Ok(json!({"name":name,"commit":{"sha":sha}}))])?,
+            ReadLimits::default(),
+        );
+        assert!(
+            matches!(client.branch_tip(&house, &repo, &branch), Observation::Known(tip) if tip.as_str() == sha),
+            "{name}"
+        );
+        assert_eq!(
+            client.transport().requests.borrow().as_slice(),
+            [format!("repos/sample/project/{path}")],
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn branch_ref_answer_for_another_branch_is_unknown() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![
+            Ok(
+                json!({"name":"feature","commit":{"sha":"1111111111111111111111111111111111111111"}}),
+            ),
+            Err(IntegrationError::Unavailable),
+        ])?,
+        ReadLimits::default(),
+    );
+    let branch = kitchen::contracts::BranchName::new("feature#1")?;
+    assert_eq!(
+        client.branch_tip(&house, &repo, &branch),
+        Observation::Unknown
+    );
+    assert_eq!(
+        client.branch_tip(&house, &repo, &branch),
+        Observation::Unavailable(IntegrationError::Unavailable)
+    );
+    Ok(())
+}
+
+#[test]
 fn graphql_merge_status_requires_same_head() -> Result {
     let house = HouseId::new("sample")?;
     let repo = Repository::new("sample/project")?;

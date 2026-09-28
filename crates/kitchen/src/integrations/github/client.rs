@@ -389,7 +389,8 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
         repo: &Repository,
         branch: &BranchName,
     ) -> Observation<CommitId> {
-        match self.single::<Branch>(house, repo, format!("branches/{branch}")) {
+        let path = format!("branches/{}", encode_branch_path(branch));
+        match self.single::<Branch>(house, repo, path) {
             Observation::Known(found) if found.name == branch.as_str() => {
                 Observation::Known(found.commit.sha)
             }
@@ -741,6 +742,21 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             .ok_or(IntegrationError::LimitExceeded)?;
         serde_json::from_slice(&bytes).map_err(|_| IntegrationError::Unknown)
     }
+}
+/// Percent-encode a branch name for a REST path. `/` separates the name's
+/// components and stays literal; `#`, `%`, `&`, and other reserved bytes
+/// would otherwise end or change the path.
+fn encode_branch_path(branch: &BranchName) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(branch.as_str().len());
+    for byte in branch.as_str().bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
 }
 fn observe<T>(result: Result<T, IntegrationError>) -> Observation<T> {
     match result {

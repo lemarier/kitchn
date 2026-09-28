@@ -41,6 +41,10 @@ pub struct GateEvidence {
     pub base: CommitId,
     /// Validated base branch the merge must still target; absent if unknown.
     pub base_branch: Option<BranchName>,
+    /// The provider answered the base branch ref read, but not with a usable
+    /// tip, so `base` is the PR's recorded base. Retrying will not help; the
+    /// PR is handed over with [`Gap::BaseUnreadable`].
+    pub base_ref_unreadable: bool,
     /// Time since the head was committed.
     pub head_age: Option<Duration>,
     /// PR is currently open.
@@ -579,6 +583,8 @@ pub enum Gap {
     /// The approved merge landed in a base other than the approved one, so a
     /// person must resolve it.
     MergedElsewhere,
+    /// The base branch's current tip cannot be read.
+    BaseUnreadable,
 }
 /// One bounded decision at a pinned head and base.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -646,6 +652,9 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     }
     if e.head_branch.is_none() {
         gaps.push(Gap::BranchTarget);
+    }
+    if e.base_ref_unreadable {
+        gaps.push(Gap::BaseUnreadable);
     }
     if e.head_age.is_none() {
         gaps.push(Gap::HeadAge);
@@ -1979,7 +1988,7 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
     supplement: GateSupplement,
     now: Timestamp,
 ) -> Result<GateEvidence, crate::integrations::github::IntegrationError> {
-    use crate::integrations::github::{HeadLocation, Observation};
+    use crate::integrations::github::{HeadLocation, IntegrationError, Observation};
     let pr = match client.pull_request(house, repository, number) {
         Observation::Known(pr) => pr,
         Observation::Unavailable(error) => return Err(error),
@@ -1990,15 +1999,31 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
     // The base tip comes from the branch ref; the PR object's `base.sha` can
     // lag it. An invalid base name is ineligible, so its recorded sha only
     // names the subject.
-    let base = match &base_branch {
+    let (base, base_ref_unreadable) = match &base_branch {
         Some(branch) => match client.branch_tip(house, repository, branch) {
-            Observation::Known(tip) => tip,
-            Observation::Unavailable(error) => return Err(error),
-            Observation::Unknown => {
-                return Err(crate::integrations::github::IntegrationError::Unknown);
-            }
+            Observation::Known(tip) => (tip, false),
+            // The provider answered with another branch or an unusable
+            // response; retrying cannot change that, so hand the PR over.
+            Observation::Unavailable(
+                IntegrationError::InvalidInput
+                | IntegrationError::LimitExceeded
+                | IntegrationError::Unknown,
+            )
+            | Observation::Unknown => (pr.base.sha.clone(), true),
+            // A timeout or transport failure may clear on the next pass, and
+            // the gate posts nothing outside its read or house scope. The
+            // transport cannot tell a missing ref from an outage, so both
+            // retry.
+            Observation::Unavailable(
+                error @ (IntegrationError::Timeout
+                | IntegrationError::Unavailable
+                | IntegrationError::ScopeMismatch
+                | IntegrationError::PermissionDenied
+                | IntegrationError::BudgetExhausted
+                | IntegrationError::StaleDecision),
+            ) => return Err(error),
         },
-        None => pr.base.sha.clone(),
+        None => (pr.base.sha.clone(), false),
     };
     let repository_info = known(client.repository(house, repository));
     let merge_status = known(client.merge_status(house, repository, number, &head));
@@ -2099,6 +2124,7 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
         head_branch: safe_branch(&pr.head.name),
         base,
         base_branch,
+        base_ref_unreadable,
         head_age,
         open: Some(pr.state == crate::integrations::github::IssueState::Open && !pr.merged),
         draft: Some(pr.draft),

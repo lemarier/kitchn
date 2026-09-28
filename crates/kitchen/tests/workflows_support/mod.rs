@@ -349,3 +349,17 @@ pub fn never_started(worker: &ResourceRef) -> kitchen::workflows::recovery::Reco
         ..signals(worker, None)
     }
 }
+
+/// Kitchen's own Git configuration for a test push, written to `dir` (a
+/// directory outside every checkout) with `settings`.
+pub fn isolated_config(
+    dir: &std::path::Path,
+    settings: &[kitchen::workflows::push::PushSetting],
+) -> TestResult<kitchen::workflows::push::IsolatedGitConfig> {
+    Ok(kitchen::workflows::push::IsolatedGitConfig::create(
+        std::path::Path::new("/usr/bin/git"),
+        dir.join("kitchen-gitconfig"),
+        settings,
+        Duration::from_secs(10),
+    )?)
+}

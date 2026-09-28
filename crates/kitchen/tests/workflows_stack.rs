@@ -26,8 +26,8 @@ use kitchen::{
         coordination::{LaunchOutcome, launch_worker},
         pickup::{ClaimOutcome, TaskTemplate, claim_issue, issue_task_id},
         push::{
-            PullRequests, PushIntent, PushPermit, PushRefusal, RefUpdater, RemoteBranches,
-            UpdateFailure,
+            GitConfigKey, GitRemote, PullRequests, PushIntent, PushPermit, PushRefusal,
+            PushSetting, RefUpdater, RemoteBranches, UpdateFailure,
         },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
         stack::{
@@ -175,6 +175,10 @@ impl RemoteBranches for Remote {
 impl RefUpdater for Remote {
     fn pushes_to(&self, _: &Repository) -> Observed<bool> {
         self.pushes
+    }
+
+    fn redirect(&self, _: &Repository) -> Observed<Option<GitConfigKey>> {
+        Observed::Known(None)
     }
 
     /// The stack path never updates a ref itself; the tool does.
@@ -701,6 +705,10 @@ impl RefUpdater for PushUrls<'_> {
         }
     }
 
+    fn redirect(&self, _: &Repository) -> Observed<Option<GitConfigKey>> {
+        Observed::Known(None)
+    }
+
     fn update(&self, _: &PushPermit, _: &BranchName, _: &CommitId) -> Result<(), UpdateFailure> {
         Err(UpdateFailure::Rejected)
     }
@@ -891,10 +899,13 @@ fn a_persons_branch_is_never_pushed_through_the_stack_tool() -> TestResult {
 
 #[test]
 fn gh_stack_commands_are_non_interactive_with_an_explicit_remote() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = workflows_support::isolated_config(temp.path(), &[])?;
     let gh = GhStack::new(
         "/usr/bin/gh".into(),
         "/tmp/checkout".into(),
         "upstream",
+        config.clone(),
         Duration::from_secs(5),
     )?;
     let cases = [
@@ -941,11 +952,26 @@ fn gh_stack_commands_are_non_interactive_with_an_explicit_remote() -> TestResult
                 git.into(),
                 checkout.into(),
                 remote,
+                config.clone(),
                 Duration::from_secs(deadline)
             )
             .is_err()
         );
     }
+    // Kitchen's configuration must not live in the checkout the worker
+    // controls.
+    let inside = workflows_support::isolated_config(temp.path(), &[])?;
+    assert_eq!(
+        GhStack::new(
+            "/usr/bin/gh".into(),
+            temp.path().to_path_buf(),
+            "origin",
+            inside,
+            Duration::from_secs(5),
+        )
+        .err(),
+        Some(kitchen::workflows::coordination::CoordinationError::InvalidGitConfig)
+    );
     Ok(())
 }
 
@@ -978,20 +1004,25 @@ mod gh_process {
         Ok(path)
     }
 
-    fn adapter(gh: std::path::PathBuf, dir: &Path) -> TestResult<GhStack> {
-        Ok(GhStack::new(
+    /// The adapter for the checkout `dir`, with Kitchen's configuration in
+    /// a directory of its own, which lives as long as the returned guard.
+    fn adapter(gh: std::path::PathBuf, dir: &Path) -> TestResult<(GhStack, tempfile::TempDir)> {
+        let kitchen = tempfile::tempdir()?;
+        let gh = GhStack::new(
             gh,
             dir.to_path_buf(),
             "origin",
+            workflows_support::isolated_config(kitchen.path(), &[])?,
             Duration::from_secs(5),
-        )?)
+        )?;
+        Ok((gh, kitchen))
     }
 
     #[test]
     fn the_adapter_never_gives_gh_a_terminal_or_a_prompt() -> TestResult {
         let temp = tempfile::tempdir()?;
         let dir = temp.path().canonicalize()?;
-        let gh = adapter(fake_gh(&dir, "", 0)?, &dir)?;
+        let (gh, _kitchen) = adapter(fake_gh(&dir, "", 0)?, &dir)?;
         assert_eq!(gh.run(&StackCommand::Push), StackResult::Done);
         let log = fs::read_to_string(dir.join("log"))?;
         assert_eq!(
@@ -1006,7 +1037,9 @@ mod gh_process {
         let temp = tempfile::tempdir()?;
         let dir = temp.path().canonicalize()?;
         let view = r#"{"trunk":"main","currentBranch":"lemarier/b","branches":[{"name":"lemarier/a","isMerged":true,"needsRebase":false,"pr":{"number":41,"state":"MERGED"}},{"name":"lemarier/b","isMerged":false,"needsRebase":true}]}"#;
-        let viewed = adapter(fake_gh(&dir, view, 0)?, &dir)?.run(&StackCommand::View);
+        let viewed = adapter(fake_gh(&dir, view, 0)?, &dir)?
+            .0
+            .run(&StackCommand::View);
         let StackResult::Viewed(stack) = viewed else {
             return Err(format!("view not parsed: {viewed:?}").into());
         };
@@ -1039,7 +1072,7 @@ mod gh_process {
         ] {
             let temp = tempfile::tempdir()?;
             let dir = temp.path().canonicalize()?;
-            let gh = adapter(fake_gh(&dir, "not json", code)?, &dir)?;
+            let (gh, _kitchen) = adapter(fake_gh(&dir, "not json", code)?, &dir)?;
             assert_eq!(gh.run(&command), expected, "exit {code}");
         }
         Ok(())
@@ -1132,7 +1165,7 @@ mod gh_process {
         fs::create_dir_all(&elsewhere)?;
         git(&elsewhere, &["init", "--bare"])?;
         let setup = stacking()?;
-        let gh = adapter(fake_gh(&root, "", 0)?, &worker)?;
+        let (gh, _kitchen) = adapter(fake_gh(&root, "", 0)?, &worker)?;
         let remote = gh
             .git_remote(GIT.into(), Duration::from_secs(30))?
             .with_url_bases(&[&format!("{}/", text(&root)?)])?;
@@ -1140,7 +1173,7 @@ mod gh_process {
         // passes; only the push URL, or its rewrite, leaves.
         let other = text(&elsewhere)?.to_owned();
         let granted = text(&bare)?.to_owned();
-        let redirects: [(&str, Vec<String>); 2] = [
+        let redirects: [(&str, Vec<String>, String); 2] = [
             (
                 "pushurl",
                 vec![
@@ -1148,6 +1181,7 @@ mod gh_process {
                     "remote.origin.pushurl".into(),
                     other.clone(),
                 ],
+                "remote.origin.pushurl".to_owned(),
             ),
             (
                 "pushInsteadOf",
@@ -1156,9 +1190,10 @@ mod gh_process {
                     format!("url.{other}.pushInsteadOf"),
                     granted.clone(),
                 ],
+                format!("url.{other}.pushinsteadof"),
             ),
         ];
-        for (name, args) in &redirects {
+        for (name, args, key) in &redirects {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             git(&worker, &args)?;
             assert_eq!(
@@ -1184,7 +1219,9 @@ mod gh_process {
                 .run(&setup.task, setup.fence, &command, &intent()?)?;
                 assert_eq!(
                     outcome,
-                    StackOutcome::Refused(StackRefusal::Push(PushRefusal::RemoteMismatch)),
+                    StackOutcome::Refused(StackRefusal::Push(PushRefusal::CheckoutRedirect(
+                        redirect_key(&remote, key)?
+                    ))),
                     "{name} {command:?}"
                 );
             }
@@ -1208,7 +1245,7 @@ mod gh_process {
         fs::create_dir_all(&elsewhere)?;
         git(&elsewhere, &["init", "--bare"])?;
         let setup = stacking()?;
-        let gh = adapter(fake_gh(&root, "", 0)?, &worker)?;
+        let (gh, _kitchen) = adapter(fake_gh(&root, "", 0)?, &worker)?;
         let remote = gh
             .git_remote(GIT.into(), Duration::from_secs(30))?
             .with_url_bases(&[&format!("{}/", text(&root)?)])?;
@@ -1239,11 +1276,133 @@ mod gh_process {
             .run(&setup.task, setup.fence, &command, &intent()?)?;
             assert_eq!(
                 outcome,
-                StackOutcome::Refused(StackRefusal::Push(PushRefusal::RemoteMismatch)),
+                StackOutcome::Refused(StackRefusal::Push(PushRefusal::CheckoutRedirect(
+                    redirect_key(&remote, "remote.origin.pushurl")?
+                ))),
                 "{command:?}"
             );
         }
         assert!(!root.join("log").exists(), "gh stack ran");
+        Ok(())
+    }
+
+    /// The key the remote reports as redirecting, checked against `expected`.
+    fn redirect_key(remote: &GitRemote, expected: &str) -> TestResult<GitConfigKey> {
+        let Observed::Known(Some(key)) = remote.redirect(&workflows_support::repo()?) else {
+            return Err("no redirecting key".into());
+        };
+        assert_eq!(key.as_str(), expected);
+        Ok(key)
+    }
+
+    /// The chained rewrite: origin is an alias rewritten to the granted URL,
+    /// and the granted URL is rewritten to another repository. `gh stack`
+    /// pushes by remote name through its own Git, so the boundary must
+    /// refuse before it runs.
+    #[test]
+    fn a_chained_rewrite_is_refused_before_gh_stack_runs() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (bare, worker) = granted_clone(&root)?;
+        let elsewhere = root.join("elsewhere").join("firmware.git");
+        fs::create_dir_all(&elsewhere)?;
+        git(&elsewhere, &["init", "--bare"])?;
+        let granted = text(&bare)?.to_owned();
+        git(&worker, &["remote", "set-url", "origin", "alias:"])?;
+        git(
+            &worker,
+            &["config", &format!("url.{granted}.insteadOf"), "alias:"],
+        )?;
+        git(
+            &worker,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", text(&elsewhere)?),
+                &granted,
+            ],
+        )?;
+        let setup = stacking()?;
+        let (gh, _kitchen) = adapter(fake_gh(&root, "", 0)?, &worker)?;
+        let remote = gh
+            .git_remote(GIT.into(), Duration::from_secs(30))?
+            .with_url_bases(&[&format!("{}/", text(&root)?)])?;
+        let outcome = StackBoundary {
+            store: &setup.world.fixture.store,
+            grants: &setup.world.grants,
+            destination: &setup.github,
+            clock: &setup.world.clock,
+            runner: &gh,
+            pull_requests: &Remote::open()?,
+            remote: &remote,
+            updater: &remote,
+        }
+        .run(&setup.task, setup.fence, &StackCommand::Push, &intent()?)?;
+        assert_eq!(
+            outcome,
+            StackOutcome::Refused(StackRefusal::Push(PushRefusal::CheckoutRedirect(
+                redirect_key(&remote, &format!("url.{granted}.insteadof"))?
+            )))
+        );
+        assert!(!root.join("log").exists(), "gh stack ran");
+        Ok(())
+    }
+
+    /// `gh stack` runs its Git under the environment every Kitchen push
+    /// uses: the Git it starts reads no system configuration, takes Kitchen's
+    /// file as its global configuration, and sees Kitchen's credential
+    /// helper and no other.
+    #[test]
+    fn gh_stack_runs_git_under_kitchens_configuration() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (_, worker) = granted_clone(&root)?;
+        let kitchen = tempfile::tempdir()?;
+        let config = workflows_support::isolated_config(
+            kitchen.path(),
+            &[PushSetting::CredentialHelper {
+                url: None,
+                helper: "kitchen-helper".to_owned(),
+            }],
+        )?;
+        let log = root.join("scopes");
+        let gh_path = root.join("gh");
+        fs::write(
+            &gh_path,
+            format!(
+                "#!/bin/sh
+                 {GIT} config --show-scope --show-origin --get-all credential.helper > '{log}'
+                 {GIT} config --show-scope --list | cut -f1 | sort -u >> '{log}'
+",
+                log = log.display()
+            ),
+        )?;
+        fs::set_permissions(&gh_path, fs::Permissions::from_mode(0o755))?;
+        let gh = GhStack::new(
+            gh_path,
+            worker,
+            "origin",
+            config.clone(),
+            Duration::from_secs(5),
+        )?;
+        let env = gh.env();
+        for (key, value) in [
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", text(config.path())?),
+        ] {
+            assert!(
+                env.iter().any(|(k, v)| k == key && v == value),
+                "{key} missing from {env:?}"
+            );
+        }
+        assert_eq!(gh.run(&StackCommand::Push), StackResult::Done);
+        assert_eq!(
+            fs::read_to_string(&log)?,
+            format!(
+                "global\tfile:{}\tkitchen-helper\ncommand\nglobal\nlocal\n",
+                text(config.path())?
+            ),
+            "only Kitchen's file, the checkout's own, and Kitchen's pins"
+        );
         Ok(())
     }
 
@@ -1275,7 +1434,7 @@ mod gh_process {
             ),
         )?;
         fs::set_permissions(&gh_path, fs::Permissions::from_mode(0o755))?;
-        let gh = adapter(gh_path, &worker)?;
+        let (gh, _kitchen) = adapter(gh_path, &worker)?;
         assert_eq!(gh.run(&StackCommand::Push), StackResult::Done);
         assert_eq!(
             fs::read_to_string(root.join("config-log"))?,

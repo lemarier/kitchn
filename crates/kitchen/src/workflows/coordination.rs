@@ -88,6 +88,14 @@ pub enum CoordinationError {
     /// The Git executable, checkout, remote name, or deadline is invalid.
     #[error("git remote is not configured with absolute paths, a plain name, and a deadline")]
     InvalidGitRemote,
+    /// A setting for Kitchen's own Git configuration file is not a plain
+    /// single-line value, or the file's path is not absolute UTF-8 outside
+    /// the checkout.
+    #[error("invalid setting or path for Kitchen's Git configuration")]
+    InvalidGitConfig,
+    /// Kitchen's own Git configuration file could not be written.
+    #[error("Kitchen's Git configuration could not be written")]
+    GitConfigUnwritten,
     /// Only a person present under an interactive claim releases a branch a
     /// person holds.
     #[error("releasing a held branch needs an interactive claim")]
@@ -103,8 +111,10 @@ impl CoordinationError {
             | Self::BriefMismatch
             | Self::MissingRepository
             | Self::InvalidBriefArgument
-            | Self::InvalidGitRemote => ErrorClass::InvalidInput,
+            | Self::InvalidGitRemote
+            | Self::InvalidGitConfig => ErrorClass::InvalidInput,
             Self::BranchMismatch => ErrorClass::Conflict,
+            Self::GitConfigUnwritten => ErrorClass::Execution,
             Self::ReleaseNeedsPerson => ErrorClass::Refused,
         }
     }

@@ -107,6 +107,9 @@ pub enum PushRefusal {
     /// The Git remote is not the repository the task's grant names, or it is
     /// redirected elsewhere.
     RemoteMismatch,
+    /// The checkout's own Git configuration rewrites URLs or points a remote
+    /// at another repository. The key names the first such entry.
+    CheckoutRedirect(GitConfigKey),
     /// State could not be read.
     Unknown,
 }
@@ -223,11 +226,14 @@ pub trait RemoteBranches {
 }
 
 /// Why a ref update did not apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateFailure {
     /// The remote refused, or the branch no longer held the permit's head.
     /// Nothing changed.
     Rejected,
+    /// The checkout's Git configuration gained this redirecting entry after
+    /// the check. Nothing was sent.
+    Redirected(GitConfigKey),
     /// The remote may or may not have applied the update.
     Uncertain,
 }
@@ -237,6 +243,12 @@ pub trait RefUpdater {
     /// Whether updates go to `repository` and nowhere else. `Unknown`
     /// refuses.
     fn pushes_to(&self, repository: &Repository) -> Observed<bool>;
+
+    /// The first entry of the checkout's own configuration that could send
+    /// an update anywhere but `repository`: any URL rewrite, or a remote URL
+    /// that is not `repository`. `Known(None)` when there is none; `Unknown`
+    /// refuses.
+    fn redirect(&self, repository: &Repository) -> Observed<Option<GitConfigKey>>;
 
     /// Point `branch` at `commit` only if it still holds
     /// [`PushPermit::replaces`] (or does not exist, for `None`). A branch
@@ -465,6 +477,13 @@ impl PushBoundary<'_> {
         {
             return Ok(PushOutcome::Refused(PushRefusal::StackToolRequired(tool)));
         }
+        match self.updater.redirect(&binding.repository) {
+            Observed::Known(None) => {}
+            Observed::Known(Some(key)) => {
+                return Ok(PushOutcome::Refused(PushRefusal::CheckoutRedirect(key)));
+            }
+            Observed::Unknown => return Ok(PushOutcome::Refused(PushRefusal::Unknown)),
+        }
         match (
             self.remote.reads_from(&binding.repository),
             self.updater.pushes_to(&binding.repository),
@@ -513,6 +532,9 @@ impl PushBoundary<'_> {
                     }
                 }
                 Err(UpdateFailure::Rejected) => PushOutcome::Stale,
+                Err(UpdateFailure::Redirected(key)) => {
+                    PushOutcome::Refused(PushRefusal::CheckoutRedirect(key))
+                }
                 Err(UpdateFailure::Uncertain) => PushOutcome::Uncertain,
             },
         )
@@ -558,34 +580,36 @@ const GIT_POLL: Duration = Duration::from_millis(10);
 /// A Git remote reached through the `git` executable in a worker's
 /// checkout: reads branch heads with `git ls-remote` and updates them with
 /// `git push --force-with-lease=<ref>:<expected>`, which the remote applies
-/// only if the ref still holds the expected value. It uses the credentials
-/// the checkout's Git already has and never prompts. Every call has a
-/// deadline; an expired call reports unknown or uncertain, never success.
+/// only if the ref still holds the expected value. It never prompts. Every
+/// call has a deadline; an expired call reports unknown or uncertain, never
+/// success.
 ///
-/// The checkout belongs to the worker, so its Git configuration is not
-/// trusted. Before any read or push, every fetch URL and every push URL of
-/// the remote (`git remote get-url --all`), with `insteadOf` and
-/// `pushInsteadOf` rewrites applied, must be the granted repository under
-/// one of the accepted URL bases (GitHub's HTTPS and SSH forms by default);
-/// a remote with a second `pushurl` is refused, since a push by remote name
-/// would send the ref to both. Every call disables hooks and pins the SSH
-/// command, the remote's pack programs, and a push's tags, submodules, and
-/// mirroring. Credential helpers configured in the checkout still run; a
-/// Kitchen-owned clone removes that limit.
+/// Every call runs Git under one environment: no system configuration,
+/// Kitchen's own [`IsolatedGitConfig`] in place of the user's global one,
+/// hooks disabled, and the SSH command, the remote's pack programs, and a
+/// push's tags, submodules, and mirroring pinned. What remains is the
+/// checkout's own configuration, which belongs to the worker and is not
+/// trusted: before any read or push, and again immediately before the push
+/// runs, it must hold no URL rewrite (`url.*.insteadOf`,
+/// `url.*.pushInsteadOf`) and no remote URL other than the granted
+/// repository ([`RefUpdater::redirect`]). Every fetch URL and every push URL
+/// of the remote (`git remote get-url --all`) must also be the granted
+/// repository under one of the accepted URL bases (GitHub's HTTPS and SSH
+/// forms by default). Credential helpers configured in the checkout still
+/// run; a Kitchen-owned clone removes that limit.
 ///
-/// An update does not push by remote name. It resolves the push URLs again,
-/// requires each to name the permit's repository, and pushes to that URL
-/// explicitly, so a change to `remote.<name>.url` or `.pushurl` after the
-/// check cannot redirect it. Git still applies `url.<base>.insteadOf` and
-/// `pushInsteadOf` rewrites to an explicit URL, and a checkout's config
-/// cannot be overridden from the command line; a rewrite of exactly the
-/// verified URL added in the instants between that last resolution and the
-/// push is the residual window (#92).
+/// An update does not push by remote name: it pushes to the verified URL,
+/// which no configuration Git reads may rewrite. The checks and the push
+/// are separate Git processes, so a worker still writing to its checkout's
+/// configuration while Kitchen pushes can add a rewrite after the last
+/// check; the two reads narrow that to the instants between the final check
+/// and Git's own read.
 #[derive(Debug, Clone)]
 pub struct GitRemote {
     git: PathBuf,
     worktree: PathBuf,
     remote: String,
+    config: IsolatedGitConfig,
     deadline: Duration,
     url_bases: Vec<String>,
 }
@@ -605,17 +629,21 @@ impl GitRemote {
     pub const MAX_REMOTE_BYTES: usize = 64;
 
     /// Bind the `git` executable, the checkout it runs in, the remote name
-    /// (such as `origin`), and the deadline for each call.
+    /// (such as `origin`), the Git configuration Kitchen gives every call,
+    /// and the deadline for each call.
     ///
     /// # Errors
     /// Returns [`CoordinationError::InvalidGitRemote`] for a relative
     /// executable or checkout path, a zero deadline, or a remote name that is
     /// empty, too long, starts with `-`, or has characters other than ASCII
-    /// letters, digits, and `._-`.
+    /// letters, digits, and `._-`, and
+    /// [`CoordinationError::InvalidGitConfig`] for a configuration file
+    /// inside the checkout.
     pub fn new(
         git: PathBuf,
         worktree: PathBuf,
         remote: &str,
+        config: IsolatedGitConfig,
         deadline: Duration,
     ) -> std::result::Result<Self, CoordinationError> {
         let plain = !remote.is_empty()
@@ -627,10 +655,14 @@ impl GitRemote {
         if !git.is_absolute() || !worktree.is_absolute() || deadline.is_zero() || !plain {
             return Err(CoordinationError::InvalidGitRemote);
         }
+        if config.inside(&worktree) {
+            return Err(CoordinationError::InvalidGitConfig);
+        }
         Ok(Self {
             git,
             worktree,
             remote: remote.to_owned(),
+            config,
             deadline,
             url_bases: GITHUB_URL_BASES
                 .iter()
@@ -667,26 +699,12 @@ impl GitRemote {
     }
 
     fn run(&self, args: &[&str]) -> Option<(Option<i32>, Vec<u8>)> {
-        let pins = pinned_git_config(&self.remote);
-        // The worker can edit the checkout's configuration: its hooks, SSH
-        // command, pack programs, and what a push carries along must not
-        // change under Kitchen.
-        let pairs: Vec<String> = pins
+        let env = git_environment(&self.config, &self.remote);
+        let env: Vec<(&str, &str)> = env
             .iter()
-            .map(|(key, value)| format!("{key}={value}"))
+            .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
-        let mut full: Vec<&str> = Vec::with_capacity(pairs.len() * 2 + args.len());
-        for pair in &pairs {
-            full.extend(["-c", pair]);
-        }
-        full.extend_from_slice(args);
-        run_bounded(
-            &self.git,
-            &self.worktree,
-            &full,
-            &[("GIT_TERMINAL_PROMPT", "0"), ("GIT_SSH_COMMAND", "ssh")],
-            self.deadline,
-        )
+        run_bounded(&self.git, &self.worktree, args, &env, self.deadline)
     }
 
     /// Whether `url` names `repository` under an accepted base.
@@ -721,13 +739,230 @@ impl GitRemote {
             Observed::Known(urls.iter().all(|url| self.names(url, repository)))
         })
     }
+
+    /// The first URL rewrite, or remote URL that does not name `repository`,
+    /// in the configuration Git reads under [`git_environment`]: the
+    /// checkout's local and worktree files and what they include, since the
+    /// system file is off and Kitchen's own file holds neither.
+    fn redirecting_entry(&self, repository: &Repository) -> Observed<Option<GitConfigKey>> {
+        let Some((code, stdout)) = self.run(&["config", "--null", "--get-regexp", REDIRECT_KEYS])
+        else {
+            return Observed::Unknown;
+        };
+        match code {
+            // `--get-regexp` exits 1 when no key matches.
+            Some(1) => Observed::Known(None),
+            Some(0) => {
+                let Ok(text) = String::from_utf8(stdout) else {
+                    return Observed::Unknown;
+                };
+                // `--null` ends each entry with NUL and puts a newline
+                // between its key and value.
+                let entries: Vec<(&str, &str)> = text
+                    .split_terminator('\0')
+                    .map(|entry| entry.split_once('\n').unwrap_or((entry, "")))
+                    .collect();
+                // A rewrite is named first: it redirects even a verified URL.
+                let offending = entries
+                    .iter()
+                    .find(|(key, _)| key.starts_with("url."))
+                    .or_else(|| {
+                        entries
+                            .iter()
+                            .find(|(_, value)| !self.names(value, repository))
+                    });
+                Observed::Known(offending.map(|(key, _)| GitConfigKey((*key).to_owned())))
+            }
+            _ => Observed::Unknown,
+        }
+    }
+}
+
+/// Keys that decide where Git sends a push: URL rewrites and remote URLs.
+/// Git matches this against keys with the section and variable in lowercase.
+const REDIRECT_KEYS: &str = r"^(url\..*\.(insteadof|pushinsteadof)|remote\..*\.(url|pushurl))$";
+
+/// A Git configuration key read from a checkout, such as
+/// `url.https://example.com/.insteadof`, with its section and variable in
+/// lowercase as Git prints them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitConfigKey(String);
+
+impl GitConfigKey {
+    /// The key as Git printed it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for GitConfigKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// One entry of Kitchen's own Git configuration: only what a push or a
+/// stack rebase needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PushSetting {
+    /// `credential.helper`, or `credential.<url>.helper` for one URL prefix.
+    CredentialHelper {
+        /// The URL prefix the helper serves; `None` for every URL.
+        url: Option<String>,
+        /// The helper, as Git's `credential.helper` takes it.
+        helper: String,
+    },
+    /// `user.name`, for commits a stack rebase rewrites.
+    UserName(String),
+    /// `user.email`, for commits a stack rebase rewrites.
+    UserEmail(String),
+}
+
+impl PushSetting {
+    fn key(&self) -> String {
+        match self {
+            Self::CredentialHelper { url: None, .. } => "credential.helper".to_owned(),
+            Self::CredentialHelper { url: Some(url), .. } => format!("credential.{url}.helper"),
+            Self::UserName(_) => "user.name".to_owned(),
+            Self::UserEmail(_) => "user.email".to_owned(),
+        }
+    }
+
+    fn value(&self) -> &str {
+        match self {
+            Self::CredentialHelper { helper, .. } => helper,
+            Self::UserName(value) | Self::UserEmail(value) => value,
+        }
+    }
+
+    /// A value on one line, and a URL prefix without whitespace.
+    fn is_plain(&self) -> bool {
+        let line = |text: &str| {
+            !text.is_empty()
+                && text.len() <= MAX_SETTING_BYTES
+                && !text.chars().any(char::is_control)
+        };
+        let url_ok = match self {
+            Self::CredentialHelper { url: Some(url), .. } => {
+                line(url) && !url.chars().any(char::is_whitespace)
+            }
+            Self::CredentialHelper { url: None, .. } | Self::UserName(_) | Self::UserEmail(_) => {
+                true
+            }
+        };
+        url_ok && line(self.value())
+    }
+}
+
+/// Longest [`PushSetting`] value or URL prefix, in bytes.
+const MAX_SETTING_BYTES: usize = 1024;
+
+/// The Git configuration file Kitchen writes and gives its Git commands as
+/// their global configuration (`GIT_CONFIG_GLOBAL`), with the system file
+/// off, so the user's and the system's configuration cannot rewrite where a
+/// push goes. It holds only the [`PushSetting`]s it was created with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolatedGitConfig {
+    path: PathBuf,
+}
+
+impl IsolatedGitConfig {
+    /// Most settings one file holds.
+    pub const MAX_SETTINGS: usize = 16;
+
+    /// Write `settings`, in order, to `path`, replacing whatever the file
+    /// held, with `git` and a deadline for each write. The file must live in
+    /// a directory Kitchen owns, outside every checkout it pushes from.
+    ///
+    /// # Errors
+    /// Returns [`CoordinationError::InvalidGitConfig`] for a relative or
+    /// non-UTF-8 path, a relative `git`, a zero deadline, more than
+    /// [`Self::MAX_SETTINGS`] settings, or a setting that is empty, longer
+    /// than 1024 bytes, or has control characters (and whitespace, in a URL
+    /// prefix), and [`CoordinationError::GitConfigUnwritten`] when the file
+    /// or a setting could not be written.
+    pub fn create(
+        git: &std::path::Path,
+        path: PathBuf,
+        settings: &[PushSetting],
+        deadline: Duration,
+    ) -> std::result::Result<Self, CoordinationError> {
+        let Some(text) = path.to_str().filter(|_| path.is_absolute()) else {
+            return Err(CoordinationError::InvalidGitConfig);
+        };
+        let Some(dir) = path.parent() else {
+            return Err(CoordinationError::InvalidGitConfig);
+        };
+        if !git.is_absolute()
+            || deadline.is_zero()
+            || settings.len() > Self::MAX_SETTINGS
+            || !settings.iter().all(PushSetting::is_plain)
+        {
+            return Err(CoordinationError::InvalidGitConfig);
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        options
+            .open(&path)
+            .map_err(|_| CoordinationError::GitConfigUnwritten)?;
+        for setting in settings {
+            let key = setting.key();
+            let written = run_bounded(
+                git,
+                dir,
+                &[
+                    "config",
+                    "--file",
+                    text,
+                    "--add",
+                    "--",
+                    &key,
+                    setting.value(),
+                ],
+                &[
+                    ("GIT_CONFIG_NOSYSTEM", "1"),
+                    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                ],
+                deadline,
+            );
+            if !matches!(written, Some((Some(0), _))) {
+                return Err(CoordinationError::GitConfigUnwritten);
+            }
+        }
+        Ok(Self { path })
+    }
+
+    /// The file's path.
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Whether the file lies inside `dir`, by its path as given or as the
+    /// file system resolves it.
+    pub(crate) fn inside(&self, dir: &std::path::Path) -> bool {
+        if self.path.starts_with(dir) {
+            return true;
+        }
+        match (self.path.canonicalize(), dir.canonicalize()) {
+            (Ok(path), Ok(dir)) => path.starts_with(dir),
+            // A missing checkout cannot contain it; an unresolvable file is
+            // not trusted.
+            (Err(_), Ok(_)) => true,
+            (_, Err(_)) => false,
+        }
+    }
 }
 
 /// The Git configuration every Kitchen-run Git command pins over the
 /// checkout's own: no hooks, a plain `ssh`, the standard pack programs, and a
 /// push that carries only the ref it names (no tags, no submodules, no
-/// mirroring). Kitchen's direct Git calls pass these as `-c`; the stack tool's
-/// Git reads them from [`git_config_env`].
+/// mirroring), passed to every Kitchen-run Git process through
+/// [`git_environment`].
 pub(crate) fn pinned_git_config(remote: &str) -> Vec<(String, String)> {
     [
         ("core.hooksPath".to_owned(), "/dev/null".to_owned()),
@@ -748,12 +983,25 @@ pub(crate) fn pinned_git_config(remote: &str) -> Vec<(String, String)> {
     .into()
 }
 
-/// [`pinned_git_config`] as `GIT_CONFIG_COUNT` environment entries, which
-/// Git ranks above every configuration file, for tools that run Git
-/// themselves.
-pub(crate) fn git_config_env(remote: &str) -> Vec<(String, String)> {
+/// The environment of every Git process Kitchen starts for a push, directly
+/// or through a stack tool: no system configuration
+/// (`GIT_CONFIG_NOSYSTEM`), `config` as the global configuration
+/// (`GIT_CONFIG_GLOBAL`), no prompts, a plain `ssh`, and
+/// [`pinned_git_config`] as `GIT_CONFIG_COUNT` entries, which Git ranks
+/// above every configuration file.
+pub(crate) fn git_environment(config: &IsolatedGitConfig, remote: &str) -> Vec<(String, String)> {
     let pins = pinned_git_config(remote);
-    let mut env = vec![("GIT_CONFIG_COUNT".to_owned(), pins.len().to_string())];
+    let mut env = Vec::with_capacity(pins.len() * 2 + 5);
+    env.extend([
+        ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
+        (
+            "GIT_CONFIG_GLOBAL".to_owned(),
+            config.path.to_string_lossy().into_owned(),
+        ),
+        ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
+        ("GIT_SSH_COMMAND".to_owned(), "ssh".to_owned()),
+        ("GIT_CONFIG_COUNT".to_owned(), pins.len().to_string()),
+    ]);
     for (index, (key, value)) in pins.into_iter().enumerate() {
         env.push((format!("GIT_CONFIG_KEY_{index}"), key));
         env.push((format!("GIT_CONFIG_VALUE_{index}"), value));
@@ -775,14 +1023,17 @@ pub(crate) fn run_bounded(
     deadline: Duration,
 ) -> Option<(Option<i32>, Vec<u8>)> {
     let mut output = tempfile::tempfile().ok()?;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    // A caller inside a Git hook must not redirect Git to its own
+    // repository, and configuration Kitchen inherited must not reach Git.
+    for inherited in INHERITED_GIT_ENV {
+        command.env_remove(inherited);
+    }
+    let mut child = command
         .args(args)
         .current_dir(dir)
         .envs(env.iter().copied())
         .env("LC_ALL", "C")
-        // A caller inside a Git hook must not redirect Git to its own repository.
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone().ok()?))
         .stderr(Stdio::null())
@@ -803,6 +1054,19 @@ pub(crate) fn run_bounded(
     };
     Some((status.code(), read_bounded(&mut output)?))
 }
+
+/// Git variables removed from every process [`run_bounded`] starts before
+/// its own `env` applies.
+const INHERITED_GIT_ENV: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+];
 
 /// Read `file` from the start, refusing more than [`MAX_GIT_OUTPUT`] bytes.
 fn read_bounded(file: &mut File) -> Option<Vec<u8>> {
@@ -848,14 +1112,24 @@ impl RefUpdater for GitRemote {
         self.bound_to(repository, true)
     }
 
+    fn redirect(&self, repository: &Repository) -> Observed<Option<GitConfigKey>> {
+        self.redirecting_entry(repository)
+    }
+
     fn update(
         &self,
         permit: &PushPermit,
         branch: &BranchName,
         commit: &CommitId,
     ) -> std::result::Result<(), UpdateFailure> {
-        // Resolve the destination once more and push to that URL, never to
+        // Check the checkout's configuration and resolve the destination
+        // once more, as late as possible, then push to that URL, never to
         // the remote's name, which the checkout's config can repoint.
+        match self.redirecting_entry(permit.repository()) {
+            Observed::Known(None) => {}
+            Observed::Known(Some(key)) => return Err(UpdateFailure::Redirected(key)),
+            Observed::Unknown => return Err(UpdateFailure::Uncertain),
+        }
         let Some(urls) = self.urls(true) else {
             return Err(UpdateFailure::Uncertain);
         };

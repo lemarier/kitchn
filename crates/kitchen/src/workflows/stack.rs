@@ -34,8 +34,9 @@ use crate::{
         coordination::{CoordinationError, held_branches, task_branch},
         pickup::is_shell_safe,
         push::{
-            Decision, GitRemote, PullRequests, PushIntent, PushRefusal, RefUpdater, RemoteBranches,
-            bind, decide, git_config_env, observe, record_landed, run_bounded,
+            Decision, GitRemote, IsolatedGitConfig, PullRequests, PushIntent, PushRefusal,
+            RefUpdater, RemoteBranches, bind, decide, git_environment, observe, record_landed,
+            run_bounded,
         },
         repair::Observed,
     },
@@ -247,12 +248,15 @@ pub trait StackRunner {
 }
 
 /// The `gh stack` extension of the GitHub CLI, run in one checkout against
-/// one explicit remote.
+/// one explicit remote, with its Git under the same environment as
+/// [`GitRemote`]'s: no system configuration and Kitchen's
+/// [`IsolatedGitConfig`] as the global one.
 #[derive(Debug, Clone)]
 pub struct GhStack {
     gh: PathBuf,
     checkout: PathBuf,
     remote: String,
+    config: IsolatedGitConfig,
     deadline: Duration,
 }
 
@@ -263,17 +267,21 @@ const MAX_REMOTE_BYTES: usize = 64;
 const MAX_VERSION_BYTES: usize = 64;
 
 impl GhStack {
-    /// Bind the `gh` executable, the checkout, the remote name, and the
-    /// deadline for each call.
+    /// Bind the `gh` executable, the checkout, the remote name, the Git
+    /// configuration Kitchen gives the tool's Git, and the deadline for each
+    /// call.
     ///
     /// # Errors
     /// Returns [`CoordinationError::InvalidGitRemote`] for a relative path, a
     /// zero deadline, or a remote name that is not 1–64 ASCII letters,
-    /// digits, or `._-` without a leading `-`.
+    /// digits, or `._-` without a leading `-`, and
+    /// [`CoordinationError::InvalidGitConfig`] for a configuration file
+    /// inside the checkout.
     pub fn new(
         gh: PathBuf,
         checkout: PathBuf,
         remote: &str,
+        config: IsolatedGitConfig,
         deadline: Duration,
     ) -> std::result::Result<Self, CoordinationError> {
         let plain = !remote.is_empty()
@@ -285,12 +293,28 @@ impl GhStack {
         if !gh.is_absolute() || !checkout.is_absolute() || deadline.is_zero() || !plain {
             return Err(CoordinationError::InvalidGitRemote);
         }
+        if config.inside(&checkout) {
+            return Err(CoordinationError::InvalidGitConfig);
+        }
         Ok(Self {
             gh,
             checkout,
             remote: remote.to_owned(),
+            config,
             deadline,
         })
+    }
+
+    /// The environment the tool runs under: no prompts or editors, and the
+    /// same Git environment every [`GitRemote`] call uses.
+    #[must_use]
+    pub fn env(&self) -> Vec<(String, String)> {
+        let mut env: Vec<(String, String)> = NO_PROMPTS
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        env.extend(git_environment(&self.config, &self.remote));
+        env
     }
 
     /// The exact arguments for `command`: always non-interactive, and with
@@ -331,9 +355,9 @@ impl GhStack {
         args
     }
 
-    /// A [`GitRemote`] for the same checkout and remote name this tool
-    /// pushes with, so the boundary's URL checks read the remote the tool
-    /// uses.
+    /// A [`GitRemote`] for the same checkout, remote name, and Git
+    /// configuration this tool pushes with, so the boundary's checks read
+    /// the configuration the tool's Git uses.
     ///
     /// # Errors
     /// Returns [`CoordinationError::InvalidGitRemote`] for a relative `git`
@@ -343,7 +367,13 @@ impl GhStack {
         git: PathBuf,
         deadline: Duration,
     ) -> std::result::Result<GitRemote, CoordinationError> {
-        GitRemote::new(git, self.checkout.clone(), &self.remote, deadline)
+        GitRemote::new(
+            git,
+            self.checkout.clone(),
+            &self.remote,
+            self.config.clone(),
+            deadline,
+        )
     }
 
     /// Probe whether `gh stack` is installed, for doctor. `None` means the
@@ -385,12 +415,7 @@ impl StackRunner for GhStack {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         // `gh stack` runs Git in the worker's checkout: pin what its
         // configuration may change about a push or rebase.
-        let mut env: Vec<(String, String)> = NO_PROMPTS
-            .iter()
-            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-            .collect();
-        env.push(("GIT_SSH_COMMAND".to_owned(), "ssh".to_owned()));
-        env.extend(git_config_env(&self.remote));
+        let env = self.env();
         let env: Vec<(&str, &str)> = env
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -505,7 +530,8 @@ pub struct StackBoundary<'a> {
     /// Remote head reads, through the remote the tool pushes to.
     pub remote: &'a dyn RemoteBranches,
     /// The push side of that same remote: only its
-    /// [`RefUpdater::pushes_to`] is used, to check the effective push URL.
+    /// [`RefUpdater::redirect`] and [`RefUpdater::pushes_to`] are used, to
+    /// check the checkout's configuration and the effective push URL.
     pub updater: &'a dyn RefUpdater,
 }
 
@@ -591,9 +617,11 @@ impl StackBoundary<'_> {
             }
         }
         // The tool takes the remote by name, so it resolves the URLs itself
-        // and this check cannot bind them: read them again as late as
-        // possible. What remains is the interval between this read and the
-        // tool's own (#92).
+        // and this check cannot bind them: check the checkout's
+        // configuration and read the URLs again as late as possible. The
+        // tool's Git reads no user or system configuration, so what remains
+        // is a worker writing its checkout's configuration between this
+        // read and the tool's own.
         if let Some(refusal) = self.remote_refusal(&binding.repository) {
             return Ok(refused(refusal));
         }
@@ -608,11 +636,16 @@ impl StackBoundary<'_> {
 }
 
 impl StackBoundary<'_> {
-    /// Why the remote is not the granted repository, if it is not. The tool
-    /// fetches from and pushes to the remote's own URLs, and a worker can set
-    /// the push URLs apart from the fetch URLs, so every one of each must
-    /// name it.
+    /// Why the remote is not the granted repository, if it is not. The
+    /// checkout's configuration may rewrite no URL. The tool fetches from and
+    /// pushes to the remote's own URLs, and a worker can set the push URLs
+    /// apart from the fetch URLs, so every one of each must name it.
     fn remote_refusal(&self, repository: &Repository) -> Option<PushRefusal> {
+        match self.updater.redirect(repository) {
+            Observed::Known(None) => {}
+            Observed::Known(Some(key)) => return Some(PushRefusal::CheckoutRedirect(key)),
+            Observed::Unknown => return Some(PushRefusal::Unknown),
+        }
         match (
             self.remote.reads_from(repository),
             self.updater.pushes_to(repository),

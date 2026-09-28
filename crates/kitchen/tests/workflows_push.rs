@@ -20,8 +20,8 @@ use kitchen::{
         coordination::{LaunchOutcome, launch_worker},
         pickup::{Base, ClaimOutcome, TaskTemplate, WorkerBrief, claim_issue, issue_task_id},
         push::{
-            PullRequests, PushBoundary, PushIntent, PushOutcome, PushPermit, PushRefusal,
-            RefUpdater, RemoteBranches, UpdateFailure,
+            GitConfigKey, PullRequests, PushBoundary, PushIntent, PushOutcome, PushPermit,
+            PushRefusal, RefUpdater, RemoteBranches, UpdateFailure,
         },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
     },
@@ -194,6 +194,10 @@ impl RefUpdater for Recorder {
         Observed::Known(true)
     }
 
+    fn redirect(&self, _: &Repository) -> Observed<Option<GitConfigKey>> {
+        Observed::Known(None)
+    }
+
     fn update(
         &self,
         permit: &PushPermit,
@@ -205,7 +209,7 @@ impl RefUpdater for Recorder {
             branch.as_str().to_owned(),
             commit.clone(),
         ));
-        self.result
+        self.result.clone()
     }
 }
 
@@ -793,7 +797,13 @@ mod git_remote {
         time::{Duration, Instant},
     };
 
-    use kitchen::{contracts::CommitId, workflows::push::GitRemote};
+    use kitchen::{
+        contracts::CommitId,
+        workflows::{
+            coordination::CoordinationError,
+            push::{GitRemote, IsolatedGitConfig, PushSetting},
+        },
+    };
     use tempfile::TempDir;
 
     use super::*;
@@ -898,11 +908,14 @@ mod git_remote {
         Ok(format!("{}/", text(repos.dir.path())?))
     }
 
+    /// The worker's remote, with Kitchen's configuration beside the
+    /// repositories, outside the worker's checkout.
     fn remote_for(repos: &Repos) -> TestResult<GitRemote> {
         Ok(GitRemote::new(
             PathBuf::from(GIT),
             repos.worker.clone(),
             "origin",
+            workflows_support::isolated_config(repos.dir.path(), &[])?,
             Duration::from_secs(30),
         )?
         .with_url_bases(&[&url_base(repos)?])?)
@@ -1096,13 +1109,18 @@ mod git_remote {
         let mine = commit_in(&repos.worker, "mine")?;
         let granted = text(&repos.remote)?.to_owned();
         let other = text(&elsewhere)?.to_owned();
-        let redirects: [(&str, [&str; 4]); 3] = [
+        let redirects: [(&str, [&str; 4], String); 3] = [
             // The checkout's origin points at another repository.
-            ("set-url", ["remote", "set-url", "origin", &other]),
+            (
+                "set-url",
+                ["remote", "set-url", "origin", &other],
+                "remote.origin.url".to_owned(),
+            ),
             // The URL is right, but a rewrite sends fetches elsewhere.
             (
                 "insteadOf",
                 ["config", &format!("url.{other}.insteadOf"), &granted, ""],
+                format!("url.{other}.insteadof"),
             ),
             // Or only pushes.
             (
@@ -1113,9 +1131,10 @@ mod git_remote {
                     &granted,
                     "",
                 ],
+                format!("url.{other}.pushinsteadof"),
             ),
         ];
-        for (name, args) in &redirects {
+        for (name, args, key) in &redirects {
             let args: Vec<&str> = args.iter().copied().filter(|arg| !arg.is_empty()).collect();
             git(&repos.worker, &args)?;
             let remote = remote_for(&repos)?;
@@ -1127,11 +1146,10 @@ mod git_remote {
                 &first_intent()?,
                 &mine,
             )?;
-            assert_eq!(
-                outcome,
-                PushOutcome::Refused(PushRefusal::RemoteMismatch),
-                "{name}"
-            );
+            let PushOutcome::Refused(PushRefusal::CheckoutRedirect(found)) = outcome else {
+                return Err(format!("{name} not refused: {outcome:?}").into());
+            };
+            assert_eq!(found.as_str(), key, "{name}");
             // Nothing reached either repository.
             assert_eq!(remote_head(&repos, BRANCH)?, None, "{name}");
             let landed = git(&elsewhere, &["for-each-ref", "--format=%(refname)"])?;
@@ -1179,7 +1197,13 @@ mod git_remote {
             &first_intent()?,
             &mine,
         )?;
-        assert_eq!(outcome, PushOutcome::Refused(PushRefusal::RemoteMismatch));
+        assert_eq!(
+            outcome,
+            PushOutcome::Refused(PushRefusal::CheckoutRedirect(key_named(
+                &remote,
+                "remote.origin.pushurl"
+            )?))
+        );
         assert_eq!(remote_head(&repos, BRANCH)?, None);
         assert!(git(&elsewhere, &["for-each-ref"])?.is_empty());
 
@@ -1210,6 +1234,10 @@ mod git_remote {
     impl RefUpdater for ChangesBeforeUpdate<'_> {
         fn pushes_to(&self, repository: &Repository) -> Observed<bool> {
             self.remote.pushes_to(repository)
+        }
+
+        fn redirect(&self, repository: &Repository) -> Observed<Option<GitConfigKey>> {
+            self.remote.redirect(repository)
         }
 
         fn update(
@@ -1476,6 +1504,10 @@ mod git_remote {
                 Observed::Known(true)
             }
 
+            fn redirect(&self, _: &Repository) -> Observed<Option<GitConfigKey>> {
+                Observed::Known(None)
+            }
+
             fn update(
                 &self,
                 permit: &PushPermit,
@@ -1500,11 +1532,14 @@ mod git_remote {
 
     #[test]
     fn a_git_remote_needs_absolute_paths_a_plain_name_and_a_deadline() -> TestResult {
+        let kitchen = tempfile::tempdir()?;
+        let config = workflows_support::isolated_config(kitchen.path(), &[])?;
         let good = |git: &str, worktree: &str, remote: &str, deadline: Duration| {
             GitRemote::new(
                 PathBuf::from(git),
                 PathBuf::from(worktree),
                 remote,
+                config.clone(),
                 deadline,
             )
         };
@@ -1553,6 +1588,288 @@ mod git_remote {
                 ErrorClass::InvalidInput
             );
         }
+        // Kitchen's configuration must not live in the checkout the worker
+        // controls, whether named directly or through a symbolic link.
+        let link = kitchen.path().join("link");
+        std::os::unix::fs::symlink(kitchen.path(), &link)?;
+        for worktree in [kitchen.path().to_path_buf(), link] {
+            assert_eq!(
+                GitRemote::new(
+                    PathBuf::from(GIT),
+                    worktree,
+                    "origin",
+                    config.clone(),
+                    Duration::from_secs(1),
+                )
+                .err(),
+                Some(CoordinationError::InvalidGitConfig)
+            );
+        }
+        Ok(())
+    }
+
+    /// A bare repository `name` beside the granted one, which nothing may
+    /// reach.
+    fn elsewhere(repos: &Repos, name: &str) -> TestResult<PathBuf> {
+        let path = repos.dir.path().join(name).join("firmware.git");
+        fs::create_dir_all(&path)?;
+        git(&path, &["init", "--bare"])?;
+        Ok(path)
+    }
+
+    /// The checkout's origin is an alias that one rewrite turns into the
+    /// granted URL, and a second rewrite turns the granted URL into another
+    /// repository. Resolving the remote yields the granted URL, but a push to
+    /// that URL would be rewritten again.
+    #[test]
+    fn git_refuses_a_chained_rewrite_of_the_granted_url() -> TestResult {
+        let repos = fresh_repos()?;
+        let setup = pushing()?;
+        let elsewhere = elsewhere(&repos, "elsewhere")?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        let granted = text(&repos.remote)?.to_owned();
+        let other = text(&elsewhere)?.to_owned();
+        git(&repos.worker, &["remote", "set-url", "origin", "alias:"])?;
+        git(
+            &repos.worker,
+            &["config", &format!("url.{granted}.insteadOf"), "alias:"],
+        )?;
+        git(
+            &repos.worker,
+            &["config", &format!("url.{other}.insteadOf"), &granted],
+        )?;
+        let remote = remote_for(&repos)?;
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        let PushOutcome::Refused(PushRefusal::CheckoutRedirect(key)) = outcome else {
+            return Err(format!("chained rewrite not refused: {outcome:?}").into());
+        };
+        assert_eq!(key.as_str(), format!("url.{granted}.insteadof"));
+        assert!(git(&elsewhere, &["for-each-ref"])?.is_empty());
+        assert_eq!(remote_head(&repos, BRANCH)?, None);
+        Ok(())
+    }
+
+    /// No rewrite is allowed in the checkout's configuration, not even a
+    /// `pushInsteadOf` that lands on the granted repository, and a remote URL
+    /// naming another repository is refused by its key even for a remote the
+    /// push does not use.
+    #[test]
+    fn git_refuses_any_rewrite_or_foreign_remote_in_the_checkouts_config() -> TestResult {
+        let repos = fresh_repos()?;
+        let setup = pushing()?;
+        let elsewhere = elsewhere(&repos, "elsewhere")?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        let granted = text(&repos.remote)?.to_owned();
+        let bare = granted
+            .strip_suffix(".git")
+            .ok_or("no .git suffix")?
+            .to_owned();
+        git(&repos.worker, &["remote", "set-url", "origin", &bare])?;
+        git(
+            &repos.worker,
+            &["config", &format!("url.{granted}.pushInsteadOf"), &bare],
+        )?;
+        let remote = remote_for(&repos)?;
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        let PushOutcome::Refused(PushRefusal::CheckoutRedirect(key)) = outcome else {
+            return Err(format!("pushInsteadOf not refused: {outcome:?}").into());
+        };
+        assert_eq!(key.as_str(), format!("url.{granted}.pushinsteadof"));
+        assert_eq!(remote_head(&repos, BRANCH)?, None);
+
+        git(
+            &repos.worker,
+            &["config", "--remove-section", &format!("url.{granted}")],
+        )?;
+        git(&repos.worker, &["remote", "set-url", "origin", &granted])?;
+        git(
+            &repos.worker,
+            &["remote", "add", "upstream", text(&elsewhere)?],
+        )?;
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert_eq!(
+            outcome,
+            PushOutcome::Refused(PushRefusal::CheckoutRedirect(key_named(
+                &remote,
+                "remote.upstream.url"
+            )?))
+        );
+        assert_eq!(remote_head(&repos, BRANCH)?, None);
+        Ok(())
+    }
+
+    /// The key [`RefUpdater::redirect`] reports, checked against `expected`.
+    fn key_named(remote: &GitRemote, expected: &str) -> TestResult<GitConfigKey> {
+        let Observed::Known(Some(key)) = remote.redirect(&Repository::new("origin89hq/firmware")?)
+        else {
+            return Err("no redirecting key".into());
+        };
+        assert_eq!(key.as_str(), expected);
+        Ok(key)
+    }
+
+    /// A rewrite added after the boundary's check and before the update is
+    /// caught by the update's own check: nothing is sent.
+    #[test]
+    fn git_refuses_a_rewrite_added_between_the_check_and_the_push() -> TestResult {
+        let repos = fresh_repos()?;
+        let setup = pushing()?;
+        let elsewhere = elsewhere(&repos, "elsewhere")?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        let granted = text(&repos.remote)?.to_owned();
+        let other = text(&elsewhere)?.to_owned();
+        let remote = remote_for(&repos)?;
+        let change = || -> TestResult {
+            git(
+                &repos.worker,
+                &["config", &format!("url.{other}.insteadOf"), &granted],
+            )?;
+            Ok(())
+        };
+        let racing = ChangesBeforeUpdate {
+            remote: &remote,
+            change: &change,
+            failure: RefCell::new(None),
+        };
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &racing,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert_eq!(racing.failure.borrow().as_deref(), None);
+        let PushOutcome::Refused(PushRefusal::CheckoutRedirect(key)) = outcome else {
+            return Err(format!("late rewrite not refused: {outcome:?}").into());
+        };
+        assert_eq!(key.as_str(), format!("url.{other}.insteadof"));
+        assert!(git(&elsewhere, &["for-each-ref"])?.is_empty());
+        Ok(())
+    }
+
+    /// A clean checkout pushes to a local bare remote with Kitchen's own
+    /// configuration carrying a credential helper, and the push's Git reads
+    /// no system configuration and no user configuration but Kitchen's file.
+    #[test]
+    fn git_pushes_from_a_clean_checkout_under_kitchens_configuration() -> TestResult {
+        let repos = fresh_repos()?;
+        let setup = pushing()?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        let kitchen = tempfile::tempdir()?;
+        let config = workflows_support::isolated_config(
+            kitchen.path(),
+            &[
+                PushSetting::CredentialHelper {
+                    url: Some("https://github.com".to_owned()),
+                    helper: "!gh auth git-credential".to_owned(),
+                },
+                PushSetting::UserName("Kitchen".to_owned()),
+            ],
+        )?;
+        let written = fs::read_to_string(config.path())?;
+        assert_eq!(
+            written,
+            "[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n\
+             [user]\n\tname = Kitchen\n"
+        );
+        let remote = GitRemote::new(
+            PathBuf::from(GIT),
+            repos.worker.clone(),
+            "origin",
+            config,
+            Duration::from_secs(30),
+        )?
+        .with_url_bases(&[&url_base(&repos)?])?;
+        assert_eq!(
+            remote.redirect(&Repository::new("origin89hq/firmware")?),
+            Observed::Known(None)
+        );
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert_eq!(outcome, PushOutcome::Pushed { replaced: None });
+        assert_eq!(remote_head(&repos, BRANCH)?.as_deref(), Some(mine.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn kitchens_git_configuration_takes_only_plain_settings() -> TestResult {
+        let kitchen = tempfile::tempdir()?;
+        let dir = kitchen.path();
+        let create = |path: PathBuf, settings: &[PushSetting]| {
+            IsolatedGitConfig::create(Path::new(GIT), path, settings, Duration::from_secs(10))
+        };
+        // No settings is an empty file; creating again replaces the file.
+        fs::write(dir.join("config"), "[url \"x\"]\n\tinsteadOf = y\n")?;
+        let empty = create(dir.join("config"), &[])?;
+        assert_eq!(fs::read_to_string(empty.path())?, "");
+        let helper = |helper: &str| PushSetting::CredentialHelper {
+            url: None,
+            helper: helper.to_owned(),
+        };
+        let too_many = vec![helper("store"); IsolatedGitConfig::MAX_SETTINGS + 1];
+        let cases: [(PathBuf, Vec<PushSetting>); 6] = [
+            (PathBuf::from("relative"), vec![]),
+            (dir.join("config"), vec![helper("")]),
+            (dir.join("config"), vec![helper("store\n[url \"x\"]")]),
+            (
+                dir.join("config"),
+                vec![PushSetting::CredentialHelper {
+                    url: Some("https://a b".to_owned()),
+                    helper: "store".to_owned(),
+                }],
+            ),
+            (dir.join("config"), vec![helper(&"a".repeat(1025))]),
+            (dir.join("config"), too_many),
+        ];
+        for (path, settings) in cases {
+            assert_eq!(
+                create(path, &settings).err(),
+                Some(CoordinationError::InvalidGitConfig)
+            );
+        }
+        // A directory that does not exist cannot hold the file.
+        assert_eq!(
+            create(dir.join("missing").join("config"), &[]).err(),
+            Some(CoordinationError::GitConfigUnwritten)
+        );
+        // At the limit, every setting is written in order.
+        let full = create(
+            dir.join("full"),
+            &vec![helper("store"); IsolatedGitConfig::MAX_SETTINGS],
+        )?;
+        let written = fs::read_to_string(full.path())?;
+        assert_eq!(
+            written.matches("helper = store").count(),
+            IsolatedGitConfig::MAX_SETTINGS
+        );
         Ok(())
     }
 
@@ -1562,10 +1879,12 @@ mod git_remote {
         let slow = dir.path().join("git");
         fs::write(&slow, "#!/bin/sh\nexec sleep 30\n")?;
         fs::set_permissions(&slow, fs::Permissions::from_mode(0o755))?;
+        let kitchen = tempfile::tempdir()?;
         let remote = GitRemote::new(
             slow,
             dir.path().to_path_buf(),
             "origin",
+            workflows_support::isolated_config(kitchen.path(), &[])?,
             Duration::from_millis(300),
         )?;
         let started = Instant::now();

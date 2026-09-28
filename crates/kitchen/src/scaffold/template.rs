@@ -13,8 +13,8 @@ use crate::{
     adoption::{FileMode, InstructionAsset, MAX_INSTALL_BYTES, MAX_INSTALL_FILES, RelativePath},
     contracts::CommitId,
     scaffold::{
-        Manifest, ScaffoldError, ScaffoldLimit, ScaffoldOperation, TemplateName, TemplateProblem,
-        TemplateProvenance, VariableName, provenance::mark,
+        Manifest, MissingVariable, ScaffoldError, ScaffoldLimit, ScaffoldOperation, TemplateName,
+        TemplateProblem, TemplateProvenance, VariableName, provenance::mark,
     },
 };
 
@@ -353,11 +353,15 @@ impl Template {
             });
         }
         let mut resolved = BTreeMap::new();
+        let mut missing = Vec::new();
         for (name, spec) in &self.manifest.variables {
-            let value = supplied
-                .get(name)
-                .or(spec.default.as_ref())
-                .ok_or_else(|| ScaffoldError::MissingVariable { name: name.clone() })?;
+            let Some(value) = supplied.get(name).or(spec.default.as_ref()) else {
+                missing.push(MissingVariable {
+                    name: name.clone(),
+                    description: spec.description.clone(),
+                });
+                continue;
+            };
             if value.len() > MAX_VARIABLE_BYTES {
                 return Err(ScaffoldError::Limit {
                     limit: ScaffoldLimit::VariableBytes,
@@ -367,6 +371,9 @@ impl Template {
                 return Err(ScaffoldError::InvalidVariableValue { name: name.clone() });
             }
             resolved.insert(name.as_str(), value.as_str());
+        }
+        if !missing.is_empty() {
+            return Err(ScaffoldError::MissingVariables { variables: missing });
         }
         Ok(resolved)
     }

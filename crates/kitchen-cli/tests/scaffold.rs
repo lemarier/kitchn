@@ -369,3 +369,83 @@ fn template_names_resolve_only_from_the_pinned_guidance() -> Result {
     );
     Ok(())
 }
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn assignments_report_specific_errors_without_echoing_values() -> Result {
+    let f = Fixture::new()?;
+    f.publish(
+        &format!(
+            "{}[variables.project]\ndescription = \"Project name\"\n[variables.owner]\ndescription = \"Owning team\"\n",
+            manifest(1)
+        ),
+        "content\n",
+    )?;
+    for (set, expected) in [
+        (&["project"][..], "name=value"),
+        (&["project=a", "project=b"][..], "assigned more than once"),
+        (&["Project=secret-value"][..], "variable names are"),
+        (&["project=a"][..], "owner (\"Owning team\")"),
+    ] {
+        let mut command = f.selected("init");
+        for assignment in set {
+            command.args(["--set", assignment]);
+        }
+        let output = command.arg("--yes").output()?;
+        assert_eq!(output.status.code(), Some(2), "{set:?}: {output:?}");
+        assert!(
+            stderr(&output).contains(expected),
+            "{set:?}: {}",
+            stderr(&output)
+        );
+        assert!(!stderr(&output).contains("secret-value"));
+        assert!(!stderr(&output).contains("house configuration"));
+        assert!(!f.root.join("consumer").exists());
+    }
+    let output = f.selected("init").arg("--yes").output()?;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("owner (\"Owning team\"), project (\"Project name\")"),
+        "{}",
+        stderr(&output)
+    );
+    let output = f
+        .selected("init")
+        .args(["--set", "project=p", "--set", "owner=o=x", "--yes"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    Ok(())
+}
+
+#[test]
+fn init_refuses_a_non_empty_root_and_adopt_accepts_it() -> Result {
+    let f = Fixture::new()?;
+    fs::create_dir(f.root.join("consumer"))?;
+    let output = f.selected("init").arg("--yes").output()?;
+    assert!(output.status.success(), "empty root: {output:?}");
+    assert!(f.root.join("consumer/.kitchen.json").exists());
+
+    fs::remove_dir_all(f.root.join("consumer"))?;
+    fs::create_dir(f.root.join("consumer"))?;
+    fs::write(f.root.join("consumer/local.txt"), "local")?;
+    let output = f.selected("init").arg("--yes").output()?;
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        stderr(&output).contains("kitchen adopt"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fs::read_dir(f.root.join("consumer"))?.count(), 1);
+
+    let output = f.selected("adopt").arg("--yes").output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(f.root.join("consumer/local.txt"))?,
+        "local"
+    );
+    assert!(f.root.join("consumer/.kitchen.json").exists());
+    Ok(())
+}

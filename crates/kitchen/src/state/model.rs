@@ -2001,12 +2001,21 @@ impl StoreState {
         self.check_claimant(recorded_by, now)?;
         self.markers
             .record(key, fact, recorded_by, now)
-            .or_else(|refusal| match refusal {
-                MarkerRefusal::Conflict => fail(StateError::MarkerConflict),
-                MarkerRefusal::Full => fail(StateError::CapacityExceeded {
-                    limit: Limit::Markers,
-                }),
-            })
+            .or_else(marker_refusal)
+    }
+
+    pub(crate) fn supersede_marker(
+        &mut self,
+        key: &MarkerKey,
+        expected: &MarkerFact,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<MarkerRecording> {
+        self.check_claimant(recorded_by, now)?;
+        self.markers
+            .supersede(key, expected, fact, recorded_by, now)
+            .or_else(marker_refusal)
     }
 
     pub(crate) fn marker(&self, key: &MarkerKey) -> Option<&WorkflowMarker> {
@@ -2176,6 +2185,17 @@ impl StoreState {
         }
         Ok(())
     }
+}
+
+fn marker_refusal<T>(refusal: MarkerRefusal) -> Result<T> {
+    fail(match refusal {
+        MarkerRefusal::Conflict => StateError::MarkerConflict,
+        MarkerRefusal::Full => StateError::CapacityExceeded {
+            limit: Limit::Markers,
+        },
+        MarkerRefusal::Missing => StateError::MarkerNotFound,
+        MarkerRefusal::NotSupersedable => StateError::MarkerNotSupersedable,
+    })
 }
 
 /// Replay the ownership history: each claim, adoption, or takeover gets a

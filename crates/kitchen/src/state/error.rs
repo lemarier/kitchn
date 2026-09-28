@@ -225,6 +225,12 @@ pub enum StateError {
         /// The backend namespace recorded with its intent.
         recorded: BackendId,
     },
+    /// No workflow marker is recorded under this key.
+    #[error("no workflow marker is recorded for this key")]
+    MarkerNotFound,
+    /// This kind of workflow marker fact is append-only.
+    #[error("this workflow marker fact cannot be superseded")]
+    MarkerNotSupersedable,
     /// A different fact is already recorded under this workflow marker key.
     #[error("a different fact is already recorded for this workflow marker")]
     MarkerConflict,
@@ -325,6 +331,8 @@ impl StateError {
             | Self::EffectNameConflict(_)
             | Self::BackendMismatch { .. }
             | Self::MarkerConflict
+            | Self::MarkerNotFound
+            | Self::MarkerNotSupersedable
             | Self::NotHandedOver(_)
             | Self::DecisionScope(_)
             | Self::ConflictingOutcome(_)

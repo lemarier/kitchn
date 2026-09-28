@@ -564,6 +564,30 @@ impl HouseStore {
         self.transact(|state| state.record_marker(key, fact, recorded_by, now))
     }
 
+    /// Replace the fact recorded under `key`, but only if it is still
+    /// `expected` (compare-and-supersede), for example when a gate's verdict
+    /// for the same head changes. The prior fact, its recorder, and times
+    /// move to the marker's history, which keeps the newest
+    /// [`crate::state::MAX_MARKER_HISTORY`] entries and counts dropped ones;
+    /// supersession is never refused for capacity. Superseding with the
+    /// current fact is a no-op. Asked questions are append-only.
+    ///
+    /// # Errors
+    /// Returns [`StateError::MarkerNotFound`] without a marker,
+    /// [`StateError::MarkerConflict`] when the current fact is not
+    /// `expected`, [`StateError::MarkerNotSupersedable`] for a question, and
+    /// consumer lease errors.
+    pub fn supersede_marker(
+        &self,
+        key: &MarkerKey,
+        expected: &MarkerFact,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<MarkerRecording> {
+        self.transact(|state| state.supersede_marker(key, expected, fact, recorded_by, now))
+    }
+
     /// Read the marker recorded under `key`.
     ///
     /// # Errors

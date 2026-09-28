@@ -300,3 +300,198 @@ fn corrupt_markers_are_rejected_without_reset() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn a_verdict_can_be_superseded_explicitly_for_the_same_head() -> TestResult {
+    let fixture = Fixture::new()?;
+    let gate = key("merge-gate", pull_request(20)?, 'a', Some('b'))?;
+    let fail = verdict(EvidenceVerdict::Fail);
+    let pass = verdict(EvidenceVerdict::Pass);
+    fixture
+        .store
+        .record_marker(gate.clone(), fail.clone(), &scheduled("tick-1")?, at(1))?;
+
+    // fail -> pass: the current fact is replaced and the old one kept.
+    let MarkerRecording::Superseded(marker) =
+        fixture
+            .store
+            .supersede_marker(&gate, &fail, pass.clone(), &scheduled("tick-2")?, at(2))?
+    else {
+        return Err("expected a supersession".into());
+    };
+    assert_eq!(marker.fact(), &pass);
+    assert_eq!(marker.recorded_by(), &scheduled("tick-2")?);
+    assert_eq!(marker.recorded_at(), at(2));
+    assert!(matches!(
+        marker.history(),
+        [prior] if prior.fact == fail && prior.recorded_at == at(1) && prior.superseded_at == at(2)
+            && prior.recorded_by == scheduled("tick-1")?
+    ));
+
+    // The same fact again is a no-op, even through supersede.
+    assert!(matches!(
+        fixture.store.supersede_marker(&gate, &pass, pass.clone(), &scheduled("tick-3")?, at(3))?,
+        MarkerRecording::AlreadyRecorded(unchanged) if unchanged == marker
+    ));
+    // A stale writer that still expects `fail` is refused.
+    assert!(matches!(
+        fixture.store.supersede_marker(
+            &gate,
+            &fail,
+            verdict(EvidenceVerdict::Unavailable),
+            &scheduled("stale")?,
+            at(4)
+        ),
+        Err(Error::State(StateError::MarkerConflict))
+    ));
+    // pass -> fail works the same way, and survives a reopen.
+    fixture
+        .store
+        .supersede_marker(&gate, &pass, fail.clone(), &scheduled("tick-5")?, at(5))?;
+    let reopened = fixture.reopen()?.marker(&gate)?.ok_or("marker lost")?;
+    assert_eq!(reopened.fact(), &fail);
+    assert_eq!(
+        reopened
+            .history()
+            .iter()
+            .map(|prior| prior.fact.clone())
+            .collect::<Vec<_>>(),
+        [fail.clone(), pass.clone()]
+    );
+    // Silent conflicting writes are still refused.
+    assert!(matches!(
+        fixture
+            .store
+            .record_marker(gate, pass, &scheduled("tick-6")?, at(6)),
+        Err(Error::State(StateError::MarkerConflict))
+    ));
+    Ok(())
+}
+
+#[test]
+fn supersession_keeps_a_bounded_history_and_never_refuses_for_capacity() -> TestResult {
+    let fixture = Fixture::new()?;
+    let gate = key("merge-gate", pull_request(20)?, 'a', None)?;
+    let facts = [EvidenceVerdict::Pass, EvidenceVerdict::Fail];
+    fixture
+        .store
+        .record_marker(gate.clone(), verdict(facts[0]), &scheduled("tick")?, at(0))?;
+    let rounds = kitchen::state::MAX_MARKER_HISTORY + 5;
+    for round in 1..=rounds {
+        let before = verdict(facts[(round - 1) % 2]);
+        let after = verdict(facts[round % 2]);
+        let seconds = u64::try_from(round)?;
+        assert!(matches!(
+            fixture.store.supersede_marker(
+                &gate,
+                &before,
+                after,
+                &scheduled("tick")?,
+                at(seconds)
+            )?,
+            MarkerRecording::Superseded(_)
+        ));
+    }
+    let marker = fixture.store.marker(&gate)?.ok_or("marker lost")?;
+    assert_eq!(marker.history().len(), kitchen::state::MAX_MARKER_HISTORY);
+    assert_eq!(marker.dropped_history(), 5);
+    // The oldest kept entry is the one replaced in round 6.
+    assert_eq!(
+        marker.history().first().map(|prior| prior.superseded_at),
+        Some(at(6))
+    );
+    Ok(())
+}
+
+#[test]
+fn questions_are_not_superseded_and_missing_markers_cannot_be() -> TestResult {
+    let fixture = Fixture::new()?;
+    let triage = key("triage", pull_request(7)?, 'a', None)?;
+    let asked = MarkerFact::QuestionAsked {
+        question: ExternalRef::new("roger-ask-1")?,
+    };
+    fixture
+        .store
+        .record_marker(triage.clone(), asked.clone(), &scheduled("tick")?, at(1))?;
+    let reasked = MarkerFact::QuestionAsked {
+        question: ExternalRef::new("roger-ask-2")?,
+    };
+    assert!(matches!(
+        fixture
+            .store
+            .supersede_marker(&triage, &asked, reasked, &scheduled("tick")?, at(2)),
+        Err(Error::State(StateError::MarkerNotSupersedable))
+    ));
+    let missing = key("merge-gate", pull_request(8)?, 'a', None)?;
+    assert!(matches!(
+        fixture.store.supersede_marker(
+            &missing,
+            &verdict(EvidenceVerdict::Fail),
+            verdict(EvidenceVerdict::Pass),
+            &scheduled("tick")?,
+            at(3)
+        ),
+        Err(Error::State(StateError::MarkerNotFound))
+    ));
+    assert_eq!(fixture.store.marker(&missing)?, None);
+    Ok(())
+}
+
+#[test]
+fn corrupt_marker_history_is_rejected_without_reset() -> TestResult {
+    let fixture = Fixture::new()?;
+    let gate = key("merge-gate", pull_request(20)?, 'a', None)?;
+    let fail = verdict(EvidenceVerdict::Fail);
+    fixture
+        .store
+        .record_marker(gate.clone(), fail.clone(), &scheduled("tick")?, at(1))?;
+    fixture.store.supersede_marker(
+        &gate,
+        &fail,
+        verdict(EvidenceVerdict::Pass),
+        &scheduled("tick")?,
+        at(2),
+    )?;
+    let path = fixture.state_path();
+    let valid: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let entry = valid["markers"][0]["history"][0].clone();
+    let mut over = valid.clone();
+    over["markers"][0]["history"] =
+        vec![entry.clone(); kitchen::state::MAX_MARKER_HISTORY + 1].into();
+    let mut malformed = valid.clone();
+    malformed["markers"][0]["history"][0]["supersededAt"] = "yesterday".into();
+    let cases: [(serde_json::Value, Expectation); 2] = [
+        (over, |error| {
+            matches!(
+                error,
+                Error::State(StateError::CorruptState(Corruption::LimitExceeded))
+            )
+        }),
+        (malformed, |error| {
+            matches!(
+                error,
+                Error::State(StateError::CorruptState(Corruption::Syntax { .. }))
+            )
+        }),
+    ];
+    for (corrupt, expected) in cases {
+        let bytes = serde_json::to_vec_pretty(&corrupt)?;
+        fs::write(&path, &bytes)?;
+        let error = fixture
+            .reopen()
+            .err()
+            .ok_or("corrupt history was accepted")?;
+        let error = error
+            .downcast::<Error>()
+            .map_err(|_| "unexpected error type")?;
+        assert!(expected(&error), "{error:?}");
+        assert_eq!(fs::read(&path)?, bytes, "rejected state is not rewritten");
+    }
+    // An exactly full history is valid.
+    let mut full = valid;
+    full["markers"][0]["history"] = vec![entry; kitchen::state::MAX_MARKER_HISTORY].into();
+    fs::write(&path, serde_json::to_vec_pretty(&full)?)?;
+    let marker = fixture.reopen()?.marker(&gate)?.ok_or("marker lost")?;
+    assert_eq!(marker.history().len(), kitchen::state::MAX_MARKER_HISTORY);
+    Ok(())
+}

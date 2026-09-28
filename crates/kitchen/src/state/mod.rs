@@ -47,7 +47,10 @@ mod store;
 pub use consumer::{ConsumerEvent, ConsumerRecord, ConsumerState, MAX_CONSUMER_HISTORY};
 pub use effects::{ReconcileReport, reconcile, run_effect};
 pub use error::{Corruption, Limit, StateError, StorageOperation};
-pub use marker::{MAX_MARKERS, MarkerFact, MarkerKey, MarkerRecording, WorkItem, WorkflowMarker};
+pub use marker::{
+    MAX_MARKER_HISTORY, MAX_MARKERS, MarkerFact, MarkerKey, MarkerRecording, SupersededFact,
+    WorkItem, WorkflowMarker,
+};
 pub use model::{
     AttemptRecord, AttemptState, CancelRequest, CancelStatus, Consumption, Creation, EffectOutcome,
     EffectPlan, EffectRecord, EffectStart, EffectState, EvidenceLog, Lease, MAX_CONSUMED_MESSAGES,

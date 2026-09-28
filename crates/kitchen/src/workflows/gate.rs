@@ -1,8 +1,11 @@
 //! Exact-revision merge gate policy. All observations are supplied by a scoped reader;
 //! this module performs no I/O and never runs code from a proposed change.
 use crate::{
-    HouseId,
-    contracts::{CommitId, ExternalRef, IssueNumber, Repository, Text},
+    BackendId, CredentialId, HouseId,
+    contracts::{
+        CommitId, ExternalRef, Grant, GrantScope, HouseGrants, IdempotencyKey, IssueNumber,
+        Permission, Repository, Text,
+    },
 };
 
 /// Evidence for one PR, collected completely at a single head and base.
@@ -213,24 +216,112 @@ pub struct GateGrants {
     pub fix_request: bool,
     /// Backend positively supports owned-branch delivery and readiness.
     pub fix_delivery_capable: bool,
-    /// Permit asking specifically configured reviewers for a fresh review.
-    pub reviewer_invocation: bool,
-    /// Exact reviewer triggers granted by house policy for this subject.
-    pub review_triggers: Vec<ReviewTrigger>,
+    /// Reviewer invocations Kitchen resolved from house configuration and the
+    /// house's standing request-review grant. Empty means no invocation grant.
+    pub review_triggers: ReviewTriggers,
 }
-/// One explicitly permitted reviewer invocation, carried as data to the worker.
+/// House-configured command that asks one reviewer for a fresh review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerCommand {
+    /// Reviewer identity, matched case-insensitively against expected reviewers.
+    pub reviewer: String,
+    /// Exact trigger text; the adapter must not invent a command.
+    pub command: Text,
+}
+/// One permitted reviewer invocation, carried as data to the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewTrigger {
     /// Selected house.
     pub house: HouseId,
     /// Reviewer identity.
     pub reviewer: String,
-    /// Exact granted trigger text; the adapter must not invent a command.
+    /// Exact granted trigger text.
     pub command: Text,
     /// Repository where the command may be posted.
     pub repository: Repository,
     /// Head for which the request is allowed.
     pub head: CommitId,
+    /// Backend namespace the standing grant names.
+    pub destination: BackendId,
+    /// House credential the standing grant names.
+    pub credential: CredentialId,
+}
+/// Reviewer triggers resolved by Kitchen policy for one exact subject. Only
+/// [`ReviewTriggers::resolve`] produces a non-empty list, so a caller cannot
+/// grant invocation by flipping a flag or listing commands itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewTriggers(Vec<ReviewTrigger>);
+impl ReviewTriggers {
+    /// No reviewer may be invoked.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(Vec::new())
+    }
+    /// Resolve house-configured reviewer commands against the house's
+    /// standing [`Permission::RequestReview`] grant for `repository` on
+    /// `destination`. Policy limits alone are not enough: scheduled gate runs
+    /// have no per-action consent. Without a standing grant the list is empty.
+    #[must_use]
+    pub fn resolve(
+        grants: &HouseGrants,
+        commands: &[ReviewerCommand],
+        repository: &Repository,
+        head: &CommitId,
+        destination: &BackendId,
+    ) -> Self {
+        let scope = GrantScope::Repository(repository.clone());
+        let Ok(credential) = grants.permitted(Permission::RequestReview, &scope, destination)
+        else {
+            return Self::none();
+        };
+        let standing = Grant::repository(
+            Permission::RequestReview,
+            repository.clone(),
+            destination.clone(),
+            credential.clone(),
+        );
+        if !grants.covers(&standing) {
+            return Self::none();
+        }
+        Self(
+            commands
+                .iter()
+                .map(|command| ReviewTrigger {
+                    house: grants.house().clone(),
+                    reviewer: command.reviewer.clone(),
+                    command: command.command.clone(),
+                    repository: repository.clone(),
+                    head: head.clone(),
+                    destination: destination.clone(),
+                    credential: credential.clone(),
+                })
+                .collect(),
+        )
+    }
+    /// The resolved triggers.
+    #[must_use]
+    pub fn as_slice(&self) -> &[ReviewTrigger] {
+        &self.0
+    }
+    /// Whether no reviewer may be invoked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    fn covers(
+        &self,
+        reviewer: &str,
+        house: &HouseId,
+        repository: &Repository,
+        head: &CommitId,
+    ) -> bool {
+        self.0.iter().any(|trigger| {
+            trigger.reviewer.eq_ignore_ascii_case(reviewer)
+                && &trigger.house == house
+                && &trigger.repository == repository
+                && &trigger.head == head
+        })
+    }
 }
 /// Persistent per-PR accounting supplied from a house-scoped store.
 #[derive(Debug, Clone, Default)]
@@ -291,6 +382,8 @@ pub enum Gap {
     MergeGrant,
     /// The two-request repair budget is exhausted.
     FixBudget,
+    /// The destination refused this subject's effect repeatedly.
+    EffectRefused,
 }
 /// One bounded decision at a pinned head and base.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -366,13 +459,15 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
         Checks::Passed => (),
         Checks::Pending | Checks::Failed | Checks::Missing => gaps.push(Gap::Checks),
     }
+    // Only a review of the current head counts, whatever its outcome; an
+    // older quota failure is stale, not this head's result.
     for reviewer in &e.reviewers {
-        if reviewer.outcome == ReviewerOutcome::Unavailable {
-            gaps.push(Gap::ReviewerUnavailable);
-        } else if reviewer.outcome == ReviewerOutcome::Pending {
+        if reviewer.outcome == ReviewerOutcome::Pending {
             gaps.push(Gap::ReviewerPending);
         } else if reviewer.reviewed_head.as_ref() != Some(&e.head) {
             gaps.push(Gap::ReviewerStale);
+        } else if reviewer.outcome == ReviewerOutcome::Unavailable {
+            gaps.push(Gap::ReviewerUnavailable);
         } else if reviewer.outcome == ReviewerOutcome::Findings {
             gaps.push(Gap::ChangeRequest);
         }
@@ -486,7 +581,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
 }
 
 fn can_invoke_missing(e: &GateEvidence, grants: &GateGrants) -> bool {
-    grants.reviewer_invocation
+    !grants.review_triggers.is_empty()
         && e.reviewers
             .iter()
             .filter(|reviewer| {
@@ -494,11 +589,9 @@ fn can_invoke_missing(e: &GateEvidence, grants: &GateGrants) -> bool {
                     || reviewer.outcome == ReviewerOutcome::Pending
             })
             .all(|reviewer| {
-                grants.review_triggers.iter().any(|trigger| {
-                    trigger.reviewer.eq_ignore_ascii_case(&reviewer.name)
-                        && trigger.repository == e.repository
-                        && trigger.head == e.head
-                })
+                grants
+                    .review_triggers
+                    .covers(&reviewer.name, &e.house, &e.repository, &e.head)
             })
 }
 
@@ -521,6 +614,8 @@ pub struct MergeRequest {
     pub match_head: CommitId,
     /// Base tip re-read just before submission.
     pub checked_base: CommitId,
+    /// Persisted intent key; the executor submits and records under it.
+    pub key: IdempotencyKey,
 }
 impl MergeRequest {
     /// Build the typed #7 effect; the state store must persist and authorize it
@@ -564,9 +659,7 @@ pub fn merge_request(
     current_base: &CommitId,
     merges_this_run: u8,
 ) -> Result<MergeRequest, RequestRefusal> {
-    if recorded.mode != GateMode::Active || !recorded.new_record {
-        return Err(RequestRefusal::EffectsDisabled);
-    }
+    let key = recorded.submit_key()?;
     let decision = &recorded.decision;
     if decision.verdict != Verdict::Merge {
         return Err(RequestRefusal::WrongVerdict);
@@ -583,6 +676,7 @@ pub fn merge_request(
         number: decision.number,
         match_head: decision.head.clone(),
         checked_base: decision.base.clone(),
+        key: key.clone(),
     })
 }
 
@@ -632,8 +726,10 @@ pub struct FixRequest {
     pub verified_findings: Vec<VerifiedFinding>,
     /// Findings to reply to with disproving evidence.
     pub disproved_findings: Vec<DisprovedFinding>,
-    /// The requested worker may invoke only the explicitly granted reviewers.
+    /// The requested worker may invoke only these policy-resolved reviewers.
     pub review_triggers: Vec<ReviewTrigger>,
+    /// Persisted intent key; delivery is recorded under it.
+    pub key: IdempotencyKey,
 }
 /// Construct a bounded repair request from a fix verdict.
 ///
@@ -643,9 +739,7 @@ pub fn fix_request(
     recorded: &RecordedDecision,
     grants: &GateGrants,
 ) -> Result<FixRequest, RequestRefusal> {
-    if recorded.mode != GateMode::Active || !recorded.new_record {
-        return Err(RequestRefusal::EffectsDisabled);
-    }
+    let key = recorded.submit_key()?;
     let decision = &recorded.decision;
     let Verdict::FixRequest { gaps } = &decision.verdict else {
         return Err(RequestRefusal::WrongVerdict);
@@ -653,10 +747,7 @@ pub fn fix_request(
     let Some(head_branch) = &decision.head_branch else {
         return Err(RequestRefusal::WrongVerdict);
     };
-    if !grants.reviewer_invocation && !grants.review_triggers.is_empty() {
-        return Err(RequestRefusal::EffectsDisabled);
-    }
-    if grants.review_triggers.iter().any(|trigger| {
+    if grants.review_triggers.as_slice().iter().any(|trigger| {
         trigger.house != decision.house
             || trigger.repository != decision.repository
             || trigger.head != decision.head
@@ -674,10 +765,11 @@ pub fn fix_request(
         verified_findings: decision.verified_findings.clone(),
         disproved_findings: decision.disproved_findings.clone(),
         review_triggers: if gaps.contains(&Gap::ReviewerStale) {
-            grants.review_triggers.clone()
+            grants.review_triggers.as_slice().to_vec()
         } else {
             Vec::new()
         },
+        key: key.clone(),
     })
 }
 
@@ -740,6 +832,8 @@ pub struct HandOverRequest {
     pub gaps: Vec<Gap>,
     /// Findings a person must inspect.
     pub findings: Vec<VerifiedFinding>,
+    /// Persisted intent key of the handover comment.
+    pub key: IdempotencyKey,
 }
 
 /// Prepare a handoff only from a newly recorded active verdict.
@@ -747,9 +841,7 @@ pub struct HandOverRequest {
 /// # Errors
 /// Report-only, duplicate, and other verdicts cannot post a handoff.
 pub fn handover_request(recorded: &RecordedDecision) -> Result<HandOverRequest, RequestRefusal> {
-    if recorded.mode != GateMode::Active || !recorded.new_record {
-        return Err(RequestRefusal::EffectsDisabled);
-    }
+    let key = recorded.submit_key()?;
     let decision = &recorded.decision;
     let Verdict::HandOver { gaps } = &decision.verdict else {
         return Err(RequestRefusal::WrongVerdict);
@@ -762,12 +854,15 @@ pub fn handover_request(recorded: &RecordedDecision) -> Result<HandOverRequest, 
         base: decision.base.clone(),
         gaps: gaps.clone(),
         findings: decision.verified_findings.clone(),
+        key: key.clone(),
     })
 }
 
 impl HandOverRequest {
-    /// Typed label and comment effects. The caller persists each through the
-    /// house-scoped effect store and reconciles uncertain outcomes before retry.
+    /// Typed label and comment effects. The comment is the primary effect
+    /// recorded under [`Self::key`]; setting the label is idempotent. The
+    /// caller persists each through the house-scoped effect store and
+    /// reconciles uncertain outcomes instead of resubmitting them.
     ///
     /// # Errors
     /// Refuses an oversized or invalid summary without producing effects.
@@ -827,8 +922,18 @@ pub enum GateMode {
     /// Allow separately authorized effects.
     Active,
 }
-/// Small typed payload for the generic house-scoped workflow marker store.
+/// Schema of the gate's workflow marker payload.
+pub const GATE_VERDICT_SCHEMA: &str = "gate.verdict";
+/// Current version of [`GATE_VERDICT_SCHEMA`].
+pub const GATE_VERDICT_VERSION: u32 = 1;
+/// Refused submissions at one subject before the gate stops proposing new
+/// effects there. The next refusal hands over; a refused handover stops.
+pub const MAX_REFUSED_EFFECTS: u8 = 2;
+/// Typed payload of the house-scoped `gate.verdict/1` workflow marker. One
+/// marker exists per workflow, PR, head, and base; a changed decision at the
+/// same subject supersedes it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GateVerdictRecord {
     /// Selected house.
     pub house: HouseId,
@@ -846,20 +951,57 @@ pub struct GateVerdictRecord {
     pub mode: GateMode,
     /// Zero-based request or handover round, preserving an explicit reopen.
     pub round: u8,
+    /// Earlier submissions at this subject that the destination refused.
+    pub refused: u8,
     /// Wall-clock second when the decision was recorded, for the fix timeout.
     pub recorded_unix_secs: u64,
+    /// Idempotency key of the persisted effect intent this verdict drives.
+    /// Absent for report-only verdicts, which are satisfied by the marker.
+    pub effect: Option<IdempotencyKey>,
 }
-/// Atomic marker boundary. The durable implementation belongs to the shared state store.
-/// It must key records by house, workflow, repository, PR, head, base, and
-/// verdict kind and round, so an expired fix request can become one handover at
-/// the same head and one explicit reopen can produce a second handover.
+impl GateVerdictRecord {
+    /// Whether `other` records the same decision, ignoring when it was made.
+    fn same_decision(&self, other: &Self) -> bool {
+        std::mem::discriminant(&self.verdict) == std::mem::discriminant(&other.verdict)
+            && self.mode == other.mode
+            && self.round == other.round
+            && self.refused == other.refused
+    }
+}
+/// What the effect store knows about a verdict's effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateEffectState {
+    /// Intent persisted; no outcome was recorded (in flight or interrupted).
+    Intended,
+    /// The destination could not establish the outcome.
+    Uncertain,
+    /// The owner could not establish the outcome and handed it over.
+    HandedOver,
+    /// Applied, with a receipt.
+    Applied,
+    /// Definitely not applied, for example a refused submission.
+    NotApplied,
+}
+/// Result of persisting a verdict's effect intent before its marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateIntent {
+    /// Intent is newly persisted under this key; submit exactly once.
+    Submit(IdempotencyKey),
+    /// The same logical effect already has intent. Its outcome is unknown or
+    /// known; the caller never submits it again from here.
+    Existing(IdempotencyKey, GateEffectState),
+}
+/// Atomic marker and effect-intent boundary. The durable implementation
+/// stores [`GateVerdictRecord`] as a `gate.verdict/1` workflow marker and
+/// persists effects through the house store before recording the marker.
 pub trait GateMarkerStore {
     /// Persistence failure; it must not be swallowed as an unrecorded verdict.
     type Error;
-    /// Read bounded history for a PR and its exact subject. A fix request sets
-    /// `requested_this_head`, not `reported_subject`; it must time out after two
-    /// hours if the writer is idle. Report-only and handover records set
-    /// `reported_subject` for deduplication.
+    /// Read bounded history for a PR and its exact subject. Fix requests count
+    /// when their effect is applied or unresolved; a refused one does not.
+    /// An applied or unresolved fix request at the subject sets
+    /// `requested_this_head`; report-only, merge, and handover records set
+    /// `reported_subject`.
     ///
     /// # Errors
     /// Fails when history cannot be read completely.
@@ -872,22 +1014,82 @@ pub trait GateMarkerStore {
         base: &CommitId,
         now_unix_secs: u64,
     ) -> Result<GateHistory, Self::Error>;
-    /// Atomically insert the record if absent. False means this verdict kind was
-    /// already recorded for the exact subject.
+    /// The current record for this exact subject.
+    ///
+    /// # Errors
+    /// Fails when the marker cannot be read or decoded.
+    fn current(
+        &self,
+        house: &HouseId,
+        repository: &Repository,
+        number: IssueNumber,
+        head: &CommitId,
+        base: &CommitId,
+    ) -> Result<Option<GateVerdictRecord>, Self::Error>;
+    /// Persist intent for the decision's primary effect: the merge, the fix
+    /// delivery, or the handover comment. Identity comes from the record's
+    /// subject, verdict kind, round, and refusal count, so repeating the call
+    /// after a crash finds the same intent.
+    ///
+    /// # Errors
+    /// Fails without claiming intent when persistence is uncertain.
+    fn begin_effect(
+        &mut self,
+        record: &GateVerdictRecord,
+        decision: &GateDecision,
+    ) -> Result<GateIntent, Self::Error>;
+    /// What is known about a persisted effect.
+    ///
+    /// # Errors
+    /// Fails when the effect cannot be read; an absent key is an error.
+    fn effect_state(&self, key: &IdempotencyKey) -> Result<GateEffectState, Self::Error>;
+    /// Record `record` for its subject if the current record is still
+    /// `expected` (compare and supersede). False means another writer changed
+    /// the marker first.
     ///
     /// # Errors
     /// Fails on uncertain or incomplete persistence.
-    fn record_if_absent(&mut self, record: GateVerdictRecord) -> Result<bool, Self::Error>;
+    fn record(
+        &mut self,
+        expected: Option<&GateVerdictRecord>,
+        record: GateVerdictRecord,
+    ) -> Result<bool, Self::Error>;
 }
-/// The newly recorded decision and its effect mode.
+/// What the caller may do with a recorded decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// No effect: a skip, a report-only record, or a lost marker race.
+    None,
+    /// Intent and marker are persisted; submit this effect exactly once and
+    /// record its outcome under the key.
+    Submit(IdempotencyKey),
+    /// A previous submission's outcome is unknown. Look it up by key and
+    /// record the result; never submit it again.
+    Reconcile(IdempotencyKey),
+    /// The recorded effect was applied, or a report-only marker exists.
+    Satisfied,
+}
+/// The recorded decision and its effect admission.
 #[derive(Debug, Clone)]
 pub struct RecordedDecision {
-    /// Pinned decision.
+    /// Pinned decision. Under [`Admission::Reconcile`] its verdict is the
+    /// recorded one whose effect is unresolved.
     pub decision: GateDecision,
     /// Controls all downstream effect submission.
     pub mode: GateMode,
-    /// Whether this call added the record; false means a duplicate tick.
-    pub new_record: bool,
+    /// Whether and how an effect may proceed.
+    pub admission: Admission,
+}
+impl RecordedDecision {
+    fn submit_key(&self) -> Result<&IdempotencyKey, RequestRefusal> {
+        match (&self.admission, self.mode) {
+            (Admission::Submit(key), GateMode::Active) => Ok(key),
+            (Admission::Submit(_), GateMode::ReportOnly)
+            | (Admission::None | Admission::Reconcile(_) | Admission::Satisfied, _) => {
+                Err(RequestRefusal::EffectsDisabled)
+            }
+        }
+    }
 }
 /// One scheduled pass; at most three PRs may be evaluated and merged.
 #[derive(Debug, Clone, Default)]
@@ -984,10 +1186,20 @@ impl GateRun {
         Ok(())
     }
 }
-/// Evaluate and record one exact subject before any external effect.
+/// Evaluate one exact subject and persist its decision before any external
+/// effect.
+///
+/// Order: an existing marker whose effect is intended, uncertain, or handed
+/// over is reconciled by key and never repeated. An applied effect or a
+/// report-only marker satisfies the subject until a new decision (a fix
+/// timeout or an explicit reopen) supersedes it. A refused effect is
+/// re-evaluated and superseded; after [`MAX_REFUSED_EFFECTS`] refusals the
+/// decision becomes a handover, and a refused handover stops at that subject.
+/// For a new active decision, effect intent is persisted first and the marker
+/// then references its key, so a crash between the two finds the same intent.
 ///
 /// # Errors
-/// Returns storage errors without attempting a handover or merge.
+/// Returns storage errors without admitting an effect.
 pub fn evaluate_and_record<S: GateMarkerStore>(
     store: &mut S,
     evidence: &GateEvidence,
@@ -995,17 +1207,36 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
     mode: GateMode,
     now_unix_secs: u64,
 ) -> Result<RecordedDecision, S::Error> {
-    let history = store.history(
-        &evidence.house,
-        &evidence.repository,
-        evidence.number,
+    let (house, repository, number) = (&evidence.house, &evidence.repository, evidence.number);
+    let current = store.current(house, repository, number, &evidence.head, &evidence.base)?;
+    let mut refused = 0;
+    if let Some(record) = &current
+        && let Some(key) = &record.effect
+    {
+        match store.effect_state(key)? {
+            GateEffectState::Intended
+            | GateEffectState::Uncertain
+            | GateEffectState::HandedOver => {
+                let mut decision = evaluate(evidence, grants, GateHistory::default());
+                decision.verdict = record.verdict.clone();
+                return Ok(RecordedDecision {
+                    decision,
+                    mode: record.mode,
+                    admission: Admission::Reconcile(key.clone()),
+                });
+            }
+            GateEffectState::NotApplied => refused = record.refused.saturating_add(1),
+            GateEffectState::Applied => refused = record.refused,
+        }
+    }
+    let mut history = store.history(
+        house,
+        repository,
+        number,
         &evidence.head,
         &evidence.base,
         now_unix_secs,
     )?;
-    let round = history.handovers;
-    let fix_round = history.fix_rounds;
-    let mut history = history;
     history.explicit_reopen = evidence.reopen_event.as_ref().is_some_and(|event| {
         event.head == evidence.head
             && event.base == evidence.base
@@ -1013,15 +1244,37 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
                 .last_handover_unix_secs
                 .is_some_and(|last| event.at_unix_secs > last)
     });
+    let (round, fix_round) = (history.handovers, history.fix_rounds);
     let mut decision = evaluate(evidence, grants, history);
-    if decision.verdict == Verdict::Skip {
-        return Ok(RecordedDecision {
-            decision,
-            mode,
-            new_record: false,
-        });
+    if refused >= MAX_REFUSED_EFFECTS {
+        let handover_refused = current
+            .as_ref()
+            .is_some_and(|record| matches!(record.verdict, Verdict::HandOver { .. }));
+        decision.verdict = match decision.verdict {
+            Verdict::Skip => Verdict::Skip,
+            Verdict::Merge | Verdict::FixRequest { .. } | Verdict::HandOver { .. }
+                if handover_refused =>
+            {
+                Verdict::Skip
+            }
+            Verdict::Merge => Verdict::HandOver {
+                gaps: vec![Gap::EffectRefused],
+            },
+            Verdict::FixRequest { mut gaps } | Verdict::HandOver { mut gaps } => {
+                gaps.push(Gap::EffectRefused);
+                Verdict::HandOver { gaps }
+            }
+        };
     }
-    let recorded = store.record_if_absent(GateVerdictRecord {
+    let skip = |decision: GateDecision| RecordedDecision {
+        decision,
+        mode,
+        admission: Admission::None,
+    };
+    if decision.verdict == Verdict::Skip {
+        return Ok(skip(decision));
+    }
+    let mut record = GateVerdictRecord {
         house: decision.house.clone(),
         repository: decision.repository.clone(),
         number: decision.number,
@@ -1034,15 +1287,50 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
         } else {
             round
         },
+        refused,
         recorded_unix_secs: now_unix_secs,
-    })?;
-    if !recorded {
+        effect: None,
+    };
+    if current
+        .as_ref()
+        .is_some_and(|existing| existing.same_decision(&record))
+    {
         decision.verdict = Verdict::Skip;
+        return Ok(RecordedDecision {
+            decision,
+            mode,
+            admission: Admission::Satisfied,
+        });
+    }
+    let admission = match mode {
+        GateMode::ReportOnly => Admission::Satisfied,
+        GateMode::Active => match store.begin_effect(&record, &decision)? {
+            GateIntent::Submit(key) => {
+                record.effect = Some(key.clone());
+                Admission::Submit(key)
+            }
+            GateIntent::Existing(key, state) => {
+                record.effect = Some(key.clone());
+                match state {
+                    GateEffectState::Applied => Admission::Satisfied,
+                    // A refused intent at this identity is recorded; the next
+                    // pass re-evaluates it with a higher refusal count.
+                    GateEffectState::NotApplied => Admission::None,
+                    GateEffectState::Intended
+                    | GateEffectState::Uncertain
+                    | GateEffectState::HandedOver => Admission::Reconcile(key),
+                }
+            }
+        },
+    };
+    if !store.record(current.as_ref(), record)? {
+        decision.verdict = Verdict::Skip;
+        return Ok(skip(decision));
     }
     Ok(RecordedDecision {
         decision,
         mode,
-        new_record: recorded,
+        admission,
     })
 }
 
@@ -1432,6 +1720,8 @@ fn review_unavailable(body: Option<&str>) -> bool {
         "quota exceeded",
         "unable to review",
         "could not review",
+        "wasn't able to review",
+        "was not able to review",
         "review was skipped",
         "review skipped",
     ]
@@ -1487,7 +1777,21 @@ fn parse_github_utc(value: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_github_utc;
+    use super::{parse_github_utc, review_unavailable};
+    #[test]
+    fn quota_and_skip_wording_is_unavailable_but_findings_are_not() {
+        assert!(review_unavailable(Some(
+            "Copilot has reached their quota limit and review was skipped"
+        )));
+        assert!(review_unavailable(Some(
+            "Copilot wasn't able to review any files in this pull request."
+        )));
+        assert!(!review_unavailable(Some(
+            "Found two issues in the retry loop."
+        )));
+        assert!(!review_unavailable(Some("")));
+        assert!(!review_unavailable(None));
+    }
     #[test]
     fn parses_github_utc_and_refuses_invalid_calendar_dates() {
         assert_eq!(parse_github_utc("1970-01-01T00:00:00Z"), Some(0));

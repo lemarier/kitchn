@@ -69,6 +69,7 @@ mod role;
 mod task;
 mod trigger;
 mod value;
+mod verification;
 
 pub use authority::{Grant, GrantScope, HouseGrants, Permission, TaskAuthority};
 pub use backend::{
@@ -95,4 +96,10 @@ pub use trigger::{Authorization, Claimant, Consent, ConsumerFence, EventOrigin, 
 pub use value::{
     BranchName, Clock, CommitId, ExternalRef, LeaseTtl, MAX_BRANCH_NAME_BYTES,
     MAX_EXTERNAL_REF_BYTES, MAX_TEXT_BYTES, Repository, SystemClock, Text, Timestamp, ValueKind,
+};
+pub use verification::{
+    DeviceClass, MAX_DEVICE_CLASS_BYTES, MAX_POLICY_REPOSITORIES, MAX_POLICY_WORK_TYPES,
+    MAX_TARGETS_PER_WORK_TYPE, MAX_VERIFICATION_ENVIRONMENTS, OperatingSystem, TargetStatus,
+    VerificationAccess, VerificationEnvironments, VerificationError, VerificationPolicy,
+    VerificationReport, VerificationTarget, authorize_access,
 };

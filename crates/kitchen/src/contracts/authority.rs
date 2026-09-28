@@ -64,6 +64,9 @@ closed_names! {
         Publish = "publish",
         /// Operate physical equipment.
         OperateEquipment = "operate-equipment",
+        /// Use a VM or device verification environment on a backend. Never
+        /// implies operating equipment; a device also needs that permission.
+        UseVerificationEnvironment = "use-verification-environment",
     }
 }
 

@@ -14,7 +14,7 @@ use crate::{
     BackendId, CredentialId, HouseId, TaskId,
     contracts::{
         AttemptNumber, BackendDescriptor, BranchName, Capability, ContractError, Effect,
-        ExternalRef, Permission, ResourceRef, Role, Text, ValueKind,
+        ExternalRef, Permission, ResourceRef, Role, Text, ValueKind, VerificationEnvironments,
     },
     selection::AgentSelection,
 };
@@ -520,7 +520,15 @@ pub trait EffectExecutor {
     /// # Errors
     /// Returns [`BackendUnavailable`] when the executor cannot be queried.
     fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable>;
+
+    /// The verification environments this backend offers. The default
+    /// declares none, so a policy that requires one fails at activation.
+    fn verification_environments(&self) -> &VerificationEnvironments {
+        &NO_VERIFICATION_ENVIRONMENTS
+    }
 }
+
+static NO_VERIFICATION_ENVIRONMENTS: VerificationEnvironments = VerificationEnvironments::new();
 
 /// An executor that runs and observes workers.
 ///

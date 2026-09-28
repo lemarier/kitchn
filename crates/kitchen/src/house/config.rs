@@ -83,7 +83,8 @@ impl HouseConfig {
                 | Permission::ManageSchedule
                 | Permission::ActivateSchedule
                 | Permission::TrialSchedule
-                | Permission::OperateEquipment => false,
+                | Permission::OperateEquipment
+                | Permission::UseVerificationEnvironment => false,
             };
             if repository_effect {
                 let GrantScope::Repository(repository) = &grant.scope else {

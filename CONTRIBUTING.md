@@ -66,6 +66,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #16 house repository templates and scaffold/adopt flow | `scaffold/` | Template assets in root `templates/`; template rendering and repository scaffolding through #5's installer |
 | #42 agent selection | `selection/` | House `agents` policy, the selection recorded on a task, and its launch check; backends map it to their own flags |
 | #41 event-started workflows | `events/`; the event trigger in `contracts/trigger.rs` | Event intake tests; webhook delivery stays with #6 and #7 |
+| #43 verification environments | `contracts/verification.rs` | Verification target, policy, evidence, and access tests in `crates/kitchen/tests/verification.rs` |
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.

@@ -1,7 +1,7 @@
 //! Evidence based needs-spec decisions. Callers collect complete, bounded
 //! issue history and code evidence; this module never reads an Orca session.
 
-use super::{Precheck, WorkflowError, valid_label};
+use super::{ClaimState, Precheck, WorkflowError, valid_label};
 use crate::{
     HouseId,
     contracts::{
@@ -171,8 +171,8 @@ pub struct Evidence {
     pub needs_spec: bool,
     /// Human only.
     pub human_only: bool,
-    /// Claimed by other.
-    pub claimed_by_other: bool,
+    /// Durable claim observation.
+    pub claim: ClaimState,
     /// Open dependencies.
     pub open_dependencies: bool,
     /// Factual resolution.
@@ -207,8 +207,11 @@ pub fn plan_with_markers(
     evidence: &Evidence,
     markers: &impl MarkerView,
 ) -> Result<Vec<Change>, WorkflowError> {
-    if !evidence.needs_spec || evidence.human_only || evidence.claimed_by_other {
+    if !evidence.needs_spec || evidence.human_only || evidence.claim == ClaimState::ClaimedByOther {
         return Ok(Vec::new());
+    }
+    if evidence.claim == ClaimState::Unknown {
+        return Err(WorkflowError::IncompleteEvidence);
     }
     let mut current = evidence.clone();
     current.resolution_already_posted =
@@ -266,7 +269,10 @@ pub fn precheck(evidence: &Evidence) -> Result<Precheck, WorkflowError> {
     {
         return Err(WorkflowError::IncompleteEvidence);
     }
-    if !evidence.needs_spec || evidence.human_only || evidence.claimed_by_other {
+    if evidence.claim == ClaimState::Unknown {
+        return Err(WorkflowError::IncompleteEvidence);
+    }
+    if !evidence.needs_spec || evidence.human_only || evidence.claim == ClaimState::ClaimedByOther {
         return Ok(Precheck::Idle);
     }
     let unresolved = evidence

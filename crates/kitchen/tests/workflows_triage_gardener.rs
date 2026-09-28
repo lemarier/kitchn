@@ -14,7 +14,7 @@ use kitchen::{
 };
 use kitchen::{
     contracts::{DecisionOwner, GitHubAction, IssueNumber},
-    workflows::{Precheck, WorkflowError, gardener, triage},
+    workflows::{ClaimState, Precheck, WorkflowError, gardener, triage},
 };
 use std::{cell::RefCell, collections::VecDeque, time::Duration};
 
@@ -186,7 +186,7 @@ fn triage_input() -> triage::Evidence {
         changed_since_last_pass: true,
         needs_spec: true,
         human_only: false,
-        claimed_by_other: false,
+        claim: ClaimState::Unclaimed,
         open_dependencies: false,
         factual_resolution: Some("Resolved from code".into()),
         resolution_already_posted: false,
@@ -257,8 +257,10 @@ fn triage_keeps_unanswered_and_expired_decisions() {
     input.existing_decisions[0].issue = issue(11);
     assert_eq!(triage::plan(&input), Err(WorkflowError::DecisionMismatch));
     input.existing_decisions.clear();
-    input.claimed_by_other = true;
+    input.claim = ClaimState::ClaimedByOther;
     assert!(triage::plan(&input).unwrap().is_empty());
+    input.claim = ClaimState::Unknown;
+    assert_eq!(triage::plan(&input), Err(WorkflowError::IncompleteEvidence));
 }
 #[test]
 #[expect(
@@ -302,7 +304,7 @@ fn unresolved_issue_requests_one_bounded_gardener_worker() {
     assert!(
         matches!(request, Ok(Some(op)) if op.required_capability() == Capability::WorkerLaunchIsolated)
     );
-    input.claimed_by_other = true;
+    input.claim = ClaimState::ClaimedByOther;
     assert_eq!(triage::judgment_request(&input), Ok(None));
 }
 
@@ -362,9 +364,9 @@ fn marker_read_controls_repetition_and_propagates_failure() {
 fn hygiene_issue() -> gardener::Issue {
     gardener::Issue {
         number: issue(20),
-        closed: false,
+        state: kitchen::integrations::github::IssueState::Open,
         human_only: false,
-        claimed_by_other: false,
+        claim: ClaimState::Unclaimed,
         labels: vec![],
         prose_blocker: Some(issue(19)),
         linked_blocker: false,
@@ -450,7 +452,7 @@ fn gardener_previews_dependency_once_and_preserves_claims() {
     input.linked_blocker = true;
     assert!(hygiene_plan(&[input.clone()]).is_empty());
     input.linked_blocker = false;
-    input.claimed_by_other = true;
+    input.claim = ClaimState::ClaimedByOther;
     assert!(hygiene_plan(&[input]).is_empty());
 }
 
@@ -465,13 +467,33 @@ fn gardener_refuses_ambiguous_house_labels() {
         Err(WorkflowError::IncompleteEvidence)
     );
 }
+
+#[test]
+fn gardener_rejects_unknown_issue_lifecycle() {
+    let mut input = hygiene_issue();
+    input.state = kitchen::integrations::github::IssueState::Unknown;
+    let labels = gardener::AgentLabels {
+        ready: "agent-ready".into(),
+        working: "agent-working".into(),
+    };
+    assert_eq!(
+        gardener::plan(&[input], &labels),
+        Err(WorkflowError::IncompleteEvidence)
+    );
+    let mut uncertain = hygiene_issue();
+    uncertain.claim = ClaimState::Unknown;
+    assert_eq!(
+        gardener::plan(&[uncertain], &labels),
+        Err(WorkflowError::IncompleteEvidence)
+    );
+}
 #[test]
 fn gardener_reports_closed_residue_and_review_only_work() {
     let mut closed = hygiene_issue();
-    closed.closed = true;
+    closed.state = kitchen::integrations::github::IssueState::Closed;
     closed.labels = vec!["agent-working".into(), "user-label".into()];
     assert_eq!(hygiene_plan(&[closed.clone()]).len(), 1);
-    closed.claimed_by_other = true;
+    closed.claim = ClaimState::ClaimedByOther;
     assert!(hygiene_plan(&[closed]).is_empty());
     let mut open = hygiene_issue();
     open.prose_blocker = None;

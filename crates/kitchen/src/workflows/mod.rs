@@ -48,3 +48,14 @@ pub enum Precheck {
     /// At least one item needs inspection.
     Actionable,
 }
+
+/// Durable ownership observation. An unknown claim cannot be treated as free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimState {
+    /// The house store confirms no active claim.
+    Unclaimed,
+    /// Another worker owns the item.
+    ClaimedByOther,
+    /// The store could not establish ownership.
+    Unknown,
+}

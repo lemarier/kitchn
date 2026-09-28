@@ -1,8 +1,9 @@
 //! Independent daily issue hygiene policy. The schedule owner supplies an
 //! inventory; this workflow only previews changes under separate house grants.
 
-use super::{Precheck, WorkflowError, valid_label};
+use super::{ClaimState, Precheck, WorkflowError, valid_label};
 use crate::contracts::{Capability, GitHubAction, IssueNumber};
+use crate::integrations::github::IssueState;
 
 /// Portable declaration until #6's schedule payload accepts a workflow owner
 /// and typed precheck binding. This declaration cannot activate a live job.
@@ -36,12 +37,12 @@ pub const REQUIRED_CAPABILITIES: [Capability; 4] = [
 pub struct Issue {
     /// Number.
     pub number: IssueNumber,
-    /// Closed.
-    pub closed: bool,
+    /// Provider lifecycle; unknown is never treated as open or closed.
+    pub state: IssueState,
     /// Human only.
     pub human_only: bool,
-    /// Claimed by other.
-    pub claimed_by_other: bool,
+    /// Durable claim observation.
+    pub claim: ClaimState,
     /// Labels.
     pub labels: Vec<String>,
     /// Prose blocker.
@@ -128,10 +129,16 @@ pub fn plan(issues: &[Issue], labels: &AgentLabels) -> Result<Vec<Finding>, Work
     }
     let mut findings = Vec::new();
     for issue in issues {
-        if issue.human_only || issue.claimed_by_other {
+        if issue.state == IssueState::Unknown {
+            return Err(WorkflowError::IncompleteEvidence);
+        }
+        if issue.claim == ClaimState::Unknown {
+            return Err(WorkflowError::IncompleteEvidence);
+        }
+        if issue.human_only || issue.claim == ClaimState::ClaimedByOther {
             continue;
         }
-        if issue.closed {
+        if issue.state == IssueState::Closed {
             for label in &issue.labels {
                 if label == &labels.ready || label == &labels.working {
                     findings.push(Finding::Mutation(GitHubAction::SetLabel {

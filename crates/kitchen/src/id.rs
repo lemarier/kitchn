@@ -2,7 +2,22 @@
 
 use std::{fmt, str::FromStr};
 
-use crate::Error;
+/// A rejected identifier. Input text is deliberately excluded.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum IdentifierError {
+    /// Identifiers must contain between one and 64 ASCII bytes.
+    #[error("identifier must contain 1 to 64 bytes (received {actual})")]
+    Length {
+        /// Length of the rejected input in bytes.
+        actual: usize,
+    },
+    /// Identifiers start with an ASCII letter or digit and contain only safe characters.
+    #[error(
+        "identifier must start with an ASCII letter or digit and contain only ASCII letters, digits, '-' or '_'"
+    )]
+    Characters,
+}
 
 /// Check the common identifier syntax without allocating or normalizing input.
 ///
@@ -13,9 +28,9 @@ use crate::Error;
 ///
 /// # Errors
 /// Returns a structured length or character error, without echoing the input.
-pub fn validate_identifier(value: &str) -> Result<(), Error> {
+pub(crate) fn validate_identifier(value: &str) -> Result<(), IdentifierError> {
     if value.is_empty() || value.len() > 64 {
-        return Err(Error::IdentifierLength {
+        return Err(IdentifierError::Length {
             actual: value.len(),
         });
     }
@@ -27,7 +42,7 @@ pub fn validate_identifier(value: &str) -> Result<(), Error> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
-        return Err(Error::IdentifierCharacters);
+        return Err(IdentifierError::Characters);
     }
     Ok(())
 }
@@ -42,8 +57,8 @@ macro_rules! identifier {
             /// Validate and own an identifier without normalization.
             ///
             /// # Errors
-            /// Returns an error when [`validate_identifier`] rejects the input.
-            pub fn new(value: &str) -> Result<Self, Error> {
+            /// Returns an [`IdentifierError`] without echoing the input.
+            pub fn new(value: &str) -> Result<Self, IdentifierError> {
                 validate_identifier(value)?;
                 Ok(Self(value.to_owned()))
             }
@@ -55,7 +70,7 @@ macro_rules! identifier {
         }
 
         impl FromStr for $name {
-            type Err = Error;
+            type Err = IdentifierError;
 
             fn from_str(value: &str) -> Result<Self, Self::Err> {
                 Self::new(value)
@@ -65,6 +80,21 @@ macro_rules! identifier {
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str(self.as_str())
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let value = String::deserialize(deserializer)?;
+                validate_identifier(&value)
+                    .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+                Ok(Self(value))
             }
         }
     };
@@ -77,4 +107,20 @@ identifier!(
 identifier!(
     TaskId,
     "A Kitchen task identity, independent of backend task handles."
+);
+identifier!(
+    HolderId,
+    "A claimant instance (for example one coordinator session), distinct from a backend handle."
+);
+identifier!(
+    BackendId,
+    "An execution backend identity. Backend-native handles stay in adapter mappings."
+);
+identifier!(
+    ConsumerId,
+    "A workflow consumer scope that must have at most one live owner, such as a pickup loop."
+);
+identifier!(
+    EffectName,
+    "The caller's name for one logical external effect within a task attempt."
 );

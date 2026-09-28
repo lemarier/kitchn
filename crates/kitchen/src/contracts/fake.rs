@@ -14,12 +14,14 @@ use std::{
 use crate::{
     BackendId, HouseId,
     contracts::{
-        BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, Effect, EffectExecutor,
-        EffectFailure, EffectRequest, ExternalRef, IdempotencyKey, Liveness, Lookup,
-        MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation, Receipt, ResourceKind,
+        BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, ContractError, Effect,
+        EffectExecutor, EffectFailure, EffectRequest, ExternalRef, IdempotencyKey, Liveness,
+        Lookup, MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation, Receipt, ResourceKind,
         ResourceObservation, ResourceRef, ScheduleEffect, UncertainReason, WorkerBackend,
         WorkerOutcome, WorkerState, Workspace,
     },
+    scheduling::AgentFamily,
+    selection::{AgentSelection, EffortSupport, SelectionSupport},
 };
 
 /// A fault applied to the next `execute` call.
@@ -41,6 +43,7 @@ struct FakeState {
     execute_faults: VecDeque<ExecuteFault>,
     lookup_outages: usize,
     effects_performed: usize,
+    launched_agents: Vec<Option<AgentSelection>>,
     execute_calls: usize,
     next_id: u64,
 }
@@ -60,16 +63,40 @@ impl FakeBackend {
             descriptor: BackendDescriptor {
                 backend,
                 house,
+                worker_selection: None,
                 capabilities,
             },
             state: Mutex::new(FakeState::default()),
         }
     }
 
-    /// A fake declaring every capability as fully supported.
+    /// A fake declaring every capability as fully supported and worker
+    /// launches that honor either family and a model, with an effort only
+    /// alongside a model, so conformance exercises the selection refusal.
     #[must_use]
     pub fn fully_capable(backend: BackendId, house: HouseId) -> Self {
-        Self::new(backend, house, CapabilitySet::supporting(Capability::ALL))
+        Self::new(backend, house, CapabilitySet::supporting(Capability::ALL)).with_worker_selection(
+            SelectionSupport {
+                families: &[AgentFamily::Claude, AgentFamily::Codex],
+                model: true,
+                effort: EffortSupport::WithModel,
+            },
+        )
+    }
+
+    /// Declare what this fake's worker launches honor of an agent selection.
+    /// Without it the fake refuses any launch that names a selection.
+    #[must_use]
+    pub fn with_worker_selection(mut self, support: SelectionSupport) -> Self {
+        self.descriptor = self.descriptor.with_worker_selection(support);
+        self
+    }
+
+    /// The agent selection each performed launch used, in order; `None` for
+    /// a launch that named none.
+    #[must_use]
+    pub fn launched_agents(&self) -> Vec<Option<AgentSelection>> {
+        self.lock().launched_agents.clone()
     }
 
     /// Queue a fault for a later `execute` call (first in, first out).
@@ -132,8 +159,26 @@ impl FakeBackend {
         let rejected = EffectFailure::NotApplied(NotAppliedReason::Rejected);
         let (created, touched) = match request.effect() {
             Effect::Worker(Operation::LaunchWorker {
-                workspace, branch, ..
+                workspace,
+                branch,
+                agent,
+                ..
             }) => {
+                // A selection the fake cannot honor is refused, never
+                // replaced by a default agent.
+                if let Some(agent) = agent
+                    && let Err(ContractError::UnsupportedCapabilities { missing, .. }) =
+                        self.descriptor.check_worker_selection(agent)
+                {
+                    return Err(EffectFailure::NotApplied(
+                        missing
+                            .first()
+                            .map_or(NotAppliedReason::Rejected, |capability| {
+                                NotAppliedReason::Unsupported(*capability)
+                            }),
+                    ));
+                }
+                state.launched_agents.push(agent.clone());
                 let worker = self.handle(state, "worker")?;
                 let mut created = vec![self.resource(ResourceKind::Worker, worker.clone())];
                 if let Some(branch) = branch {

@@ -21,6 +21,7 @@ use crate::{
         LinkedPullRequest, TimelineEvent,
     },
     integrations::roger::{DecisionStatus, RogerClient, RogerReadTransport},
+    selection::AgentSelection,
     state::{
         HouseStore, IssueRevision, MarkerFact, MarkerKey, MarkerRecording, MarkerSchema,
         MarkerSubject, StateError, WorkItem,
@@ -214,6 +215,11 @@ pub struct Evidence {
     pub ready_label: String,
     /// House-configured specification label.
     pub needs_spec_label: String,
+    /// The agent selection recorded on the gardener task
+    /// ([`TaskSpec::agent`](crate::contracts::TaskSpec::agent)). The judgment
+    /// launch carries exactly this, because the store refuses a launch that
+    /// differs from the task's selection.
+    pub agent: Option<AgentSelection>,
 }
 
 /// Reads durable no-repeat state for one issue. A missing or failed read is
@@ -505,6 +511,7 @@ pub fn judgment_request(
         workspace: Workspace::Isolated,
         brief: Text::new(&brief).map_err(|_| WorkflowError::IncompleteEvidence)?,
         branch: None,
+        agent: evidence.agent.clone(),
     }))
 }
 

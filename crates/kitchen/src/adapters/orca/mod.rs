@@ -109,7 +109,7 @@ mod wire;
 
 pub use backend::{
     DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, MAX_RUN_TASKS,
-    OrcaBackend, OrcaConfig, launch_marker, verify_branch,
+    OrcaBackend, OrcaConfig, WORKER_SELECTION, launch_marker, verify_branch,
 };
 pub use error::OrcaError;
 pub use inspect::{

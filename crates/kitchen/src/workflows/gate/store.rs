@@ -36,6 +36,7 @@ use crate::{
         ResourceKind, ResourceRef, Role, Timestamp, ValueKind, WorkerBackend, WorkerState,
         Workspace,
     },
+    selection::AgentSelection,
     state::{
         EffectPlan, EffectRecord, EffectStart, EffectState, HouseStore, MarkerFact, MarkerKey,
         MarkerRecording, MarkerSchema, MarkerSubject, StateError, TaskRecord, WorkItem,
@@ -177,6 +178,7 @@ impl HouseGateStore<'_> {
     fn effect(
         &self,
         tasks: &[TaskRecord],
+        agent: Option<AgentSelection>,
         record: &GateVerdictRecord,
         decision: &GateDecision,
     ) -> Result<Effect, GateStoreError> {
@@ -200,7 +202,9 @@ impl HouseGateStore<'_> {
                 &decision.verified_findings,
             )?,
             Verdict::FixRequest { gaps } => {
-                return self.fix_effect(tasks, decision, gaps).map(Effect::Worker);
+                return self
+                    .fix_effect(tasks, agent, decision, gaps)
+                    .map(Effect::Worker);
             }
             Verdict::Skip => return Err(GateStoreError::NoHouseStoreEffect),
         };
@@ -218,6 +222,7 @@ impl HouseGateStore<'_> {
     fn fix_effect(
         &self,
         tasks: &[TaskRecord],
+        agent: Option<AgentSelection>,
         decision: &GateDecision,
         gaps: &[Gap],
     ) -> Result<Operation, GateStoreError> {
@@ -250,6 +255,7 @@ impl HouseGateStore<'_> {
                 workspace: Workspace::Isolated,
                 brief,
                 branch: Some(branch),
+                agent,
             },
         })
     }
@@ -519,7 +525,16 @@ impl GateMarkerStore for HouseGateStore<'_> {
                 &self.backend.backend,
             )?;
         }
-        let effect = self.effect(&tasks, record, decision)?;
+        let effect = self.effect(
+            &tasks,
+            owner
+                .spec()
+                .agent
+                .as_ref()
+                .map(|resolved| resolved.selection.clone()),
+            record,
+            decision,
+        )?;
         let subject = EvidenceSubject {
             head: record.head.clone(),
             base: Some(record.base.clone()),

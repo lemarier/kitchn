@@ -90,6 +90,7 @@ fn launch_op(brief: &str) -> TestResult<Operation> {
         workspace: Workspace::Isolated,
         brief: Text::new(brief)?,
         branch: None,
+        agent: None,
     })
 }
 
@@ -126,6 +127,7 @@ fn assert_shared_suite_passed(report: &conformance::ConformanceReport) {
         Check::LookupMatchesReceipt,
         Check::IdempotentResubmission,
         Check::LaunchReceipt,
+        Check::SelectionRefused,
         Check::LaunchObservable,
         Check::InventoryListsLaunch,
         Check::MessageRecovery,
@@ -827,6 +829,7 @@ fn store_spec(id: &str) -> TestResult<TaskSpec> {
         },
         requires: CapabilityRequirements::new(),
         resources: BTreeSet::new(),
+        agent: None,
     })
 }
 
@@ -1940,6 +1943,7 @@ fn launch_on(requested: &str, workspace: Workspace) -> TestResult<Operation> {
         workspace,
         brief: Text::new("Implement it.")?,
         branch: Some(branch(requested)?),
+        agent: None,
     })
 }
 

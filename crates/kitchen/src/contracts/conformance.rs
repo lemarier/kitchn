@@ -26,6 +26,7 @@ use crate::{
         RogerEffect, Role, ScheduleEffect, Text, WorkerBackend, WorkerState, Workspace,
     },
     scheduling::{AgentFamily, Recurrence, ScheduleSpec, Timezone, WorkflowName},
+    selection::AgentSelection,
 };
 
 /// One contract check.
@@ -53,6 +54,9 @@ pub enum Check {
     /// A launch receipt names a worker on this backend and exactly the
     /// requested branch.
     LaunchReceipt,
+    /// A launch naming an agent selection the descriptor does not declare
+    /// support for is refused without effect, never run on a default agent.
+    SelectionRefused,
     /// The launched worker is observable and not reported as settled.
     LaunchObservable,
     /// The inventory lists the launched worker as live, within its bound.
@@ -77,6 +81,7 @@ impl fmt::Display for Check {
             Self::LookupMatchesReceipt => "lookup matches receipt",
             Self::IdempotentResubmission => "idempotent resubmission",
             Self::LaunchReceipt => "launch receipt",
+            Self::SelectionRefused => "undeclared agent selection refused",
             Self::LaunchObservable => "launch observable",
             Self::InventoryListsLaunch => "inventory lists launch",
             Self::MessageRecovery => "message recovery as declared",
@@ -220,6 +225,7 @@ fn worker_checks(
     let Some(receipt) = runner.executor_checks(&launch)? else {
         for check in [
             Check::LaunchReceipt,
+            Check::SelectionRefused,
             Check::LaunchObservable,
             Check::InventoryListsLaunch,
             Check::MessageRecovery,
@@ -267,6 +273,7 @@ fn worker_checks(
         );
     }
     runner.record(Check::LaunchReceipt, CheckResult::Passed);
+    runner.selection_refused()?;
     runner.observable(backend, &worker)?;
     runner.inventory(backend, &worker)?;
     runner.message_recovery(backend, &worker)?;
@@ -348,7 +355,50 @@ impl<'a> Runner<'a> {
             workspace: Workspace::Isolated,
             brief: self.fixture.brief.clone(),
             branch: Some(self.branch()?),
+            agent: None,
         }))
+    }
+
+    /// A launch naming a selection the descriptor does not declare it can
+    /// provide must be refused without effect: the executor may not start
+    /// its default agent in its place.
+    fn selection_refused(&mut self) -> Result<(), ConformanceFailure> {
+        let descriptor = self.executor.descriptor();
+        let example = match &descriptor.worker_selection {
+            None => Some(AgentSelection::agent_default(AgentFamily::Claude)),
+            Some(support) => support.undeclared_example(),
+        };
+        let Some(agent) = example else {
+            // The descriptor claims every selection; nothing to refuse.
+            self.record(
+                Check::SelectionRefused,
+                CheckResult::NotApplicable {
+                    requires: Capability::AgentSelectFamily,
+                },
+            );
+            return Ok(());
+        };
+        let effect = Effect::Worker(Operation::LaunchWorker {
+            role: Role::StationCook,
+            workspace: Workspace::Isolated,
+            brief: self.fixture.brief.clone(),
+            branch: Some(self.branch()?),
+            agent: Some(agent),
+        });
+        let request = self.own_request("selection-refused", effect)?;
+        match self.executor.execute(&request) {
+            Err(EffectFailure::NotApplied(_)) => {}
+            Ok(_) => return fail(Check::SelectionRefused, "an undeclared selection launched"),
+            Err(_) => {
+                return fail(
+                    Check::SelectionRefused,
+                    "an undeclared selection was not refused cleanly",
+                );
+            }
+        }
+        self.assert_not_applied(Check::SelectionRefused, &request)?;
+        self.record(Check::SelectionRefused, CheckResult::Passed);
+        Ok(())
     }
 
     /// One sample of every effect, for refusal checks.

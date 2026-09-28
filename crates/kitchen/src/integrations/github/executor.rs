@@ -28,6 +28,7 @@ impl<T: GitHubMutationTransport> GitHubExecutor<T> {
             descriptor: BackendDescriptor {
                 backend,
                 house: scope.house().clone(),
+                worker_selection: None,
                 capabilities: CapabilitySet::supporting([
                     Capability::ForgeMutation,
                     Capability::EffectLookup,

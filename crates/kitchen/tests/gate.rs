@@ -17,6 +17,12 @@ use kitchen::{
         MarkerSubject, StateError, WorkItem,
     },
 };
+use kitchen::{
+    scheduling::AgentFamily,
+    selection::{
+        AgentModel, AgentSelection, EffortLevel, EffortSupport, ResolvedSelection, SelectionSupport,
+    },
+};
 use std::{num::NonZeroU64, time::Duration};
 
 const fn secs(seconds: u64) -> Timestamp {
@@ -1632,6 +1638,10 @@ fn durable() -> TestResult<Durable> {
 /// The durable fixture. The house always grants push on the repository;
 /// `delegate_push` controls whether the gate task holds it.
 fn durable_with(delegate_push: bool) -> TestResult<Durable> {
+    durable_selecting(delegate_push, None)
+}
+/// [`durable_with`] for a gate task that recorded `agent`.
+fn durable_selecting(delegate_push: bool, agent: Option<ResolvedSelection>) -> TestResult<Durable> {
     let repository = Repository::new("lemarier/kitchen")?;
     let backend = BackendId::new("github")?;
     let credential = CredentialId::new("gate-credential")?;
@@ -1655,7 +1665,7 @@ fn durable_with(delegate_push: bool) -> TestResult<Durable> {
     }
     let grants = HouseGrants::new(common::house()?, standing);
     let fixture = common::Fixture::new()?;
-    let (task, fence) = start_task(&fixture, &grants, &delegated, "gate-9", [])?;
+    let (task, fence) = start_task_selecting(&fixture, &grants, &delegated, "gate-9", [], agent)?;
     Ok(Durable {
         fixture,
         grants,
@@ -1664,6 +1674,7 @@ fn durable_with(delegate_push: bool) -> TestResult<Durable> {
             backend,
             house: common::house()?,
             capabilities: CapabilitySet::supporting(Capability::ALL),
+            worker_selection: None,
         },
         workers: FakeBackend::fully_capable(common::backend_id()?, common::house()?),
         task,
@@ -1678,7 +1689,19 @@ fn start_task(
     id: &str,
     given: impl IntoIterator<Item = ResourceRef>,
 ) -> TestResult<(TaskId, Fence)> {
+    start_task_selecting(fixture, grants, delegated, id, given, None)
+}
+/// [`start_task`] for a task that recorded `agent` when it was created.
+fn start_task_selecting(
+    fixture: &common::Fixture,
+    grants: &HouseGrants,
+    delegated: &[Grant],
+    id: &str,
+    given: impl IntoIterator<Item = ResourceRef>,
+    agent: Option<ResolvedSelection>,
+) -> TestResult<(TaskId, Fence)> {
     let mut work = common::spec(id)?;
+    work.agent = agent;
     work.repository = Some(Repository::new("lemarier/kitchen")?);
     work.authority = TaskAuthority::delegate(grants, delegated.to_vec())?;
     work.resources = given.into_iter().collect();
@@ -1760,6 +1783,7 @@ impl Durable {
                 workspace: Workspace::Isolated,
                 brief: Text::new("Implement issue 9.")?,
                 branch: Some(BranchName::new(branch)?),
+                agent: None,
             },
         )?;
         let EffectStart::Execute(started) =
@@ -2367,10 +2391,13 @@ fn durable_fix_launches_on_the_exact_branch_then_messages_that_worker_within_two
         workspace,
         brief,
         branch,
+        agent,
     } = d.operation(&launch)?
     else {
         return Err("expected a launch".into());
     };
+    // A legacy gate task records no selection, so the launch names none.
+    assert_eq!(agent, None);
     assert_eq!(role, Role::StationCook);
     assert_eq!(workspace, Workspace::Isolated);
     assert_eq!(branch, Some(BranchName::new("feature/gate")?));
@@ -3098,5 +3125,59 @@ fn trial_verdicts_consume_no_budget_and_do_not_block_active_mode() -> TestResult
         Verdict::HandOver { .. }
     ));
     assert!(matches!(handover.admission, Admission::Submit(_)));
+    Ok(())
+}
+
+fn gate_selection() -> TestResult<ResolvedSelection> {
+    Ok(ResolvedSelection::owner(AgentSelection {
+        agent: AgentFamily::Codex,
+        model: Some(AgentModel::new("gpt-6-mini")?),
+        effort: Some(EffortLevel::new("high")?),
+    }))
+}
+#[test]
+fn durable_fix_launch_carries_the_gate_tasks_selection() -> TestResult {
+    let selection = gate_selection()?;
+    let d = durable_selecting(true, Some(selection.clone()))?;
+    let first = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &behind_at('a')?,
+        dgrants()?,
+        GateMode::Active,
+        secs(100),
+    )?;
+    let Admission::Submit(launch) = first.admission else {
+        return Err("expected a launch".into());
+    };
+    let Operation::LaunchWorker { agent, .. } = d.operation(&launch)? else {
+        return Err("expected a launch".into());
+    };
+    assert_eq!(agent, Some(selection.selection.clone()));
+    d.execute(&launch)?;
+    assert_eq!(d.workers.launched_agents(), vec![Some(selection.selection)]);
+    Ok(())
+}
+#[test]
+fn durable_fix_launch_is_refused_when_the_executor_cannot_honor_the_selection() -> TestResult {
+    let mut d = durable_selecting(true, Some(gate_selection()?))?;
+    // The worker backend launches only Claude, so the recorded Codex
+    // selection cannot be honored.
+    d.workers = FakeBackend::fully_capable(common::backend_id()?, common::house()?)
+        .with_worker_selection(SelectionSupport {
+            families: &[AgentFamily::Claude],
+            model: true,
+            effort: EffortSupport::WithModel,
+        });
+    let refused = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &behind_at('a')?,
+        dgrants()?,
+        GateMode::Active,
+        secs(100),
+    );
+    let error = refused.err().ok_or("expected a refusal")?.to_string();
+    assert!(error.contains("agent.select"), "{error}");
+    assert!(d.effects()?.is_empty(), "nothing is reserved on refusal");
+    assert_eq!(d.workers.effects_performed(), 0);
     Ok(())
 }

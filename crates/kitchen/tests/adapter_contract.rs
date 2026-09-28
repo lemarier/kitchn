@@ -77,6 +77,7 @@ fn fake_backend_passes_the_shared_contract() -> TestResult {
         Check::LookupMatchesReceipt,
         Check::IdempotentResubmission,
         Check::LaunchReceipt,
+        Check::SelectionRefused,
         Check::LaunchObservable,
         Check::InventoryListsLaunch,
         Check::MessageRecovery,
@@ -197,6 +198,49 @@ impl WorkerBackend for OptimisticLookupBackend {
     }
 }
 
+/// Declares no agent selection support but launches whatever selection it is
+/// given, the way an adapter that forgot its own check would.
+struct SelectionBlindBackend {
+    inner: FakeBackend,
+    declared: BackendDescriptor,
+}
+
+impl EffectExecutor for SelectionBlindBackend {
+    fn descriptor(&self) -> &BackendDescriptor {
+        &self.declared
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        self.inner.execute(request)
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.inner.lookup(request)
+    }
+}
+
+impl WorkerBackend for SelectionBlindBackend {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.inner.observe_worker(worker)
+    }
+}
+
+#[test]
+fn contract_detects_an_adapter_that_launches_an_undeclared_selection() -> TestResult {
+    let blind = SelectionBlindBackend {
+        inner: FakeBackend::fully_capable(backend_id()?, house()?),
+        declared: BackendDescriptor {
+            backend: backend_id()?,
+            house: house()?,
+            worker_selection: None,
+            capabilities: CapabilitySet::supporting(Capability::ALL),
+        },
+    };
+    let failure = conformance::run_worker(&blind, &conformance_fixture()?)
+        .err()
+        .ok_or("a selection-blind adapter passed")?;
+    assert_eq!(failure.check, Check::SelectionRefused);
+    Ok(())
+}
+
 #[test]
 fn contract_detects_misbehaving_backends() -> TestResult {
     let fixture = conformance_fixture()?;
@@ -205,6 +249,7 @@ fn contract_detects_misbehaving_backends() -> TestResult {
         declared: BackendDescriptor {
             backend: backend_id()?,
             house: house()?,
+            worker_selection: None,
             capabilities: CapabilitySet::supporting([Capability::EffectLookup]),
         },
     };
@@ -1532,6 +1577,7 @@ fn an_overclaimed_message_declaration_fails_the_contract() -> TestResult {
             declared: BackendDescriptor {
                 backend: backend_id()?,
                 house: house()?,
+                worker_selection: None,
                 capabilities: orca_like_capabilities()
                     .with(claim, kitchen::contracts::Support::Supported),
             },

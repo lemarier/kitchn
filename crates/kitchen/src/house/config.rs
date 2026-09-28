@@ -6,6 +6,7 @@ use super::{HouseError, Workflow};
 use crate::{
     HouseId,
     contracts::{CommitId, Grant, HouseGrants, Repository},
+    selection::{AgentPolicy, SelectionError},
 };
 
 /// Strict house policy. Stored outside all repository checkouts.
@@ -32,6 +33,10 @@ pub struct HouseConfig {
     pub policy_limits: BTreeSet<Grant>,
     /// Standing scheduled grants, separate from interactive consent.
     pub grants: BTreeSet<Grant>,
+    /// Agent family, model, and effort per role and work type. Absent means
+    /// launches use the backend's default agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<AgentPolicy>,
 }
 
 impl HouseConfig {
@@ -48,6 +53,15 @@ impl HouseConfig {
         }
         validate_names(&self.required_reviewers)?;
         validate_names(&self.required_checks)?;
+        if let Some(agents) = &self.agents {
+            agents.validate(&self.repositories).map_err(|error| {
+                if error == SelectionError::RepositoryNotServed {
+                    HouseError::PolicyRelaxation
+                } else {
+                    HouseError::InvalidInput
+                }
+            })?;
+        }
         for grant in self.grants.iter().chain(&self.policy_limits) {
             use crate::contracts::{GrantScope, Permission};
             let repository_effect = match grant.permission {
@@ -110,7 +124,8 @@ impl HouseConfig {
 }
 
 /// Public repository settings contain no credential, private context, or grants.
-/// Unknown keys (including attempted house-policy overrides) are rejected.
+/// Unknown keys (including attempted house-policy overrides such as `agents`)
+/// are rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RepositoryConfig {

@@ -408,6 +408,7 @@ fn a_dispatch_stops_being_active_when_the_worker_is_stopped() -> TestResult {
             workspace: Workspace::Isolated,
             brief: Text::new("do the task")?,
             branch: None,
+            agent: None,
         }),
     );
     let receipt = backend.execute(&launch)?;

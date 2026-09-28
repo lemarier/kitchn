@@ -6,6 +6,7 @@ use crate::{
     HouseId,
     adoption::{HouseRegistry, ResolvedInstructions, resolve_instructions},
     contracts::{Capability, CapabilitySet, Repository},
+    selection::OfferedModels,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +37,9 @@ pub struct DoctorEvidence {
     pub labels: Option<Vec<RepositoryLabel>>,
     /// Access result, independent of granted authority.
     pub access: AccessStatus,
+    /// Models each installed agent reports offering; `None` means not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_models: Option<Vec<OfferedModels>>,
 }
 /// A precise remaining setup action. No command here is executed automatically.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +64,8 @@ pub enum DoctorCode {
     Labels,
     /// Scheduler/backend capability is absent or partial.
     Capability,
+    /// A configured model is not offered by the installed agent, or was not checked.
+    AgentModel,
 }
 /// Read-only setup report. Healthy means configuration evidence is complete,
 /// never that an external effect is authorized or a workflow was activated.
@@ -191,6 +197,27 @@ pub fn doctor(
     let missing_capabilities = missing_capabilities(&repository.workflows, &capabilities);
     for (workflow, missing) in &missing_capabilities {
         findings.push(DoctorFinding { code: DoctorCode::Capability, message: format!("Scheduled {} requires: {}.", workflow.as_str(), missing.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")), next_step: "Configure a backend that positively supports each named capability and rerun doctor with its scoped observation; keep scheduling disabled until then. Interactive single-agent work remains separate.".into() });
+    }
+    if let Some(agents) = &house.agents {
+        let offered = evidence.and_then(|evidence| evidence.agent_models.as_deref());
+        let (message, missing) = match offered {
+            None => (
+                "Configured agent models were not checked against the installed agents",
+                agents.configured_models(),
+            ),
+            Some(offered) => (
+                "Configured agent models the installed agents do not offer",
+                agents.unoffered_models(offered),
+            ),
+        };
+        if !missing.is_empty() {
+            let names = missing
+                .iter()
+                .map(|(agent, model)| format!("{}:{model}", agent.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            findings.push(DoctorFinding { code: DoctorCode::AgentModel, message: format!("{message}: {names}."), next_step: "List the models each installed agent offers and rerun doctor with that observation. Correct the house agents policy for any model that is not offered; Kitchen refuses launches it cannot provide and never substitutes another model.".into() });
+        }
     }
     let access = evidence.map_or(AccessStatus::Unobserved, |evidence| evidence.access);
     if access != AccessStatus::Available {

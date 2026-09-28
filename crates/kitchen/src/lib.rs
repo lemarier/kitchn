@@ -26,6 +26,7 @@ mod id;
 pub mod integrations;
 pub mod scaffold;
 pub mod scheduling;
+pub mod selection;
 pub mod state;
 pub mod trust;
 pub mod workflows;

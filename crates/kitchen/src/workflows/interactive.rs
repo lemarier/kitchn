@@ -42,7 +42,7 @@ use crate::{
     state::{HouseStore, Lease, OwnershipEvent, StateError, TaskState},
     workflows::{
         coordination::REQUIRED_WORKER_CAPABILITIES,
-        pickup::{IssueRef, TaskTemplate},
+        pickup::{DEFAULT_FIX_ROUNDS, IssueRef, TaskTemplate},
         repair::{Mergeability, PullRequestState, PullRequestView, repair_task_id},
     },
 };
@@ -88,6 +88,15 @@ pub enum InteractiveError {
     /// The pull request's writer round counter is exhausted.
     #[error("pull request round counter is exhausted")]
     RoundOverflow,
+    /// A session asked for more review-fix rounds than the house allows. A
+    /// session may only lower the house budget.
+    #[error("{requested} fix rounds exceed the house budget of {house}")]
+    BudgetAboveHouse {
+        /// Rounds the session asked for.
+        requested: u8,
+        /// The house budget.
+        house: u8,
+    },
 }
 
 impl InteractiveError {
@@ -95,9 +104,10 @@ impl InteractiveError {
     #[must_use]
     pub const fn class(self) -> ErrorClass {
         match self {
-            Self::NeedsPerson | Self::HouseMismatch | Self::DecompositionUnavailable => {
-                ErrorClass::Refused
-            }
+            Self::NeedsPerson
+            | Self::HouseMismatch
+            | Self::DecompositionUnavailable
+            | Self::BudgetAboveHouse { .. } => ErrorClass::Refused,
             Self::InvalidDraft(_) | Self::RoundOverflow => ErrorClass::InvalidInput,
             Self::UnreadableReceipt | Self::Encoding => ErrorClass::Execution,
         }
@@ -875,15 +885,15 @@ pub enum ReviewState {
     Reviewed,
 }
 
-/// What `pr` needs to know about the pull request.
+/// What `pr` needs to know about the pull request, read from the forge.
+/// Rounds already spent are not a fact the session supplies: [`pull_request`]
+/// reads them from the house store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrFacts {
     /// The forge's view of the pull request.
     pub view: PullRequestView,
     /// Review state at `view.head`.
     pub review: ReviewState,
-    /// Repair and review-fix rounds already spent.
-    pub rounds_used: u8,
 }
 
 /// What `pr` does next. Every plan names the exact head it applies to; a
@@ -910,9 +920,10 @@ pub enum PrPlan {
         /// Why.
         refusal: ClaimRefusal,
     },
-    /// The house's fix-round budget is spent; the person decides.
+    /// The house's fix-round budget, or the lower one the person asked for,
+    /// is spent; the person decides.
     BudgetExhausted {
-        /// Rounds spent.
+        /// Rounds spent, from the house store.
         rounds_used: u8,
     },
     /// Review the head. Read-only: findings are posted only with consent.
@@ -958,8 +969,9 @@ pub struct PrRequest<'a> {
     pub facts: &'a PrFacts,
     /// What the person asked for, or `None` to route from the facts.
     pub intent: Option<PrIntent>,
-    /// The house's review-fix round budget.
-    pub fix_rounds: u8,
+    /// A lower review-fix round budget the person asked for, or `None` for
+    /// the house budget, [`DEFAULT_FIX_ROUNDS`]. It can never raise it.
+    pub fix_rounds: Option<u8>,
     /// The person's session; must be interactive.
     pub claimant: &'a Claimant,
     /// Claim lease for writer rounds.
@@ -984,16 +996,54 @@ fn route(facts: &PrFacts) -> Option<PrIntent> {
     })
 }
 
+/// The pull request's current writer round, from the durable repair tasks
+/// both triggers claim: the first round whose task has not settled, which
+/// is either held or relinquished by its writer, or not yet created. Every
+/// earlier round is spent. Rounds are created in order, so the scan stops at
+/// the first round without a task.
+fn current_round(store: &HouseStore, repository: &Repository, number: IssueNumber) -> Result<u8> {
+    let mut round: u8 = 1;
+    loop {
+        match store.task(&repair_task_id(repository, number, round)?) {
+            Ok(record) => match record.state() {
+                TaskState::Settled { .. } => {
+                    round = round
+                        .checked_add(1)
+                        .ok_or(InteractiveError::RoundOverflow)?;
+                }
+                TaskState::Open | TaskState::Claimed { .. } => return Ok(round),
+            },
+            Err(crate::Error::State(StateError::TaskNotFound(_))) => return Ok(round),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// `pr <number>`: review, follow up, repair, or judge one pull request at
-/// its exact head. Writer rounds claim the task scheduled repair derives for
-/// the next round, so the two never write to the same pull request at once.
+/// its exact head. A writer round claims the current round's task, the one
+/// scheduled repair derives and claims, so a round scheduled repair holds is
+/// skipped and the two never write to the same pull request at once. Rounds
+/// spent and the budget come from the house store and
+/// [`DEFAULT_FIX_ROUNDS`], never from the session.
 ///
 /// # Errors
 /// [`InteractiveError::NeedsPerson`] for a non-interactive claimant,
-/// [`InteractiveError::RoundOverflow`] at the round counter's limit, and
-/// store errors.
+/// [`InteractiveError::BudgetAboveHouse`] when `fix_rounds` exceeds the
+/// house budget, [`InteractiveError::RoundOverflow`] at the round counter's
+/// limit, and store errors.
 pub fn pull_request(request: &PrRequest<'_>) -> Result<(PrPlan, Option<Lease>)> {
     require_person(request.claimant)?;
+    let budget = match request.fix_rounds {
+        None => DEFAULT_FIX_ROUNDS,
+        Some(requested) if requested <= DEFAULT_FIX_ROUNDS => requested,
+        Some(requested) => {
+            return Err(InteractiveError::BudgetAboveHouse {
+                requested,
+                house: DEFAULT_FIX_ROUNDS,
+            }
+            .into());
+        }
+    };
     let facts = request.facts;
     let head = facts.view.head.clone();
     match facts.view.state {
@@ -1036,18 +1086,11 @@ pub fn pull_request(request: &PrRequest<'_>) -> Result<(PrPlan, Option<Lease>)> 
         },
         PrIntent::FollowUp => false,
     };
-    if facts.rounds_used >= request.fix_rounds {
-        return Ok((
-            PrPlan::BudgetExhausted {
-                rounds_used: facts.rounds_used,
-            },
-            None,
-        ));
+    let round = current_round(request.store, request.repository, facts.view.number)?;
+    let rounds_used = round.saturating_sub(1);
+    if rounds_used >= budget {
+        return Ok((PrPlan::BudgetExhausted { rounds_used }, None));
     }
-    let round = facts
-        .rounds_used
-        .checked_add(1)
-        .ok_or(InteractiveError::RoundOverflow)?;
     let task = repair_task_id(request.repository, facts.view.number, round)?;
     let template = request.template;
     let spec = TaskSpec {

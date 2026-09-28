@@ -31,7 +31,7 @@ use kitchen::{
             WorkPlan, WorkRequest, apply_draft, draft_preview, draft_task_id, execution_mode,
             hand_back, pull_request, resolve_house, work,
         },
-        pickup::{ClaimOutcome, claim_issue, issue_task_id},
+        pickup::{ClaimOutcome, DEFAULT_FIX_ROUNDS, claim_issue, issue_task_id},
         repair::{Mergeability, PullRequestState, PullRequestView, repair_task_id},
     },
 };
@@ -669,7 +669,6 @@ fn pr_facts(
             mergeability,
         },
         review,
-        rounds_used: 0,
     })
 }
 
@@ -679,18 +678,60 @@ fn run_pr(
     intent: Option<PrIntent>,
     claimant: &kitchen::contracts::Claimant,
 ) -> TestResult<(PrPlan, Option<kitchen::state::Lease>)> {
+    run_pr_within(world, facts, intent, claimant, None)
+}
+
+fn run_pr_within(
+    world: &World,
+    facts: &PrFacts,
+    intent: Option<PrIntent>,
+    claimant: &kitchen::contracts::Claimant,
+    fix_rounds: Option<u8>,
+) -> TestResult<(PrPlan, Option<kitchen::state::Lease>)> {
     Ok(pull_request(&PrRequest {
         store: &world.fixture.store,
         template: &template()?,
         repository: &repo()?,
         facts,
         intent,
-        fix_rounds: 2,
+        fix_rounds,
         claimant,
         ttl: ttl(600)?,
         now: world.now(),
         take_over: false,
     })?)
+}
+
+/// Record writer round `round` of pull request #5 as scheduled repair would:
+/// claimed by a scheduled claimant and, when `settle` is set, settled.
+fn scheduled_round(world: &World, round: u8, settle: bool) -> TestResult<kitchen::TaskId> {
+    let id = repair_task_id(&repo()?, IssueNumber::new(5)?, round)?;
+    let store = &world.fixture.store;
+    let claimant = scheduled("repair-tick")?;
+    store.create_task(
+        kitchen::contracts::TaskSpec {
+            id: id.clone(),
+            ..common::spec("placeholder")?
+        },
+        &claimant,
+        world.now(),
+    )?;
+    let lease = store.claim(&id, &claimant, ttl(600)?, world.now())?;
+    if settle {
+        let kitchen::contracts::AttemptStart::Started(attempt) =
+            store.start_attempt(&id, lease.fence(), world.now())?
+        else {
+            return Err("the round must start an attempt".into());
+        };
+        store.finish_attempt(
+            &id,
+            lease.fence(),
+            attempt,
+            kitchen::contracts::AttemptOutcome::Succeeded,
+            world.now(),
+        )?;
+    }
+    Ok(id)
 }
 
 #[test]
@@ -800,29 +841,135 @@ fn pr_idle_budget_and_refusal_paths() -> TestResult {
             reason: Idle::NothingToRepair
         }
     );
-    let mut spent = pr_facts(
-        PullRequestState::Open,
-        Mergeability::Clean,
-        ReviewState::ChangesRequested,
-    )?;
-    spent.rounds_used = 2;
-    let (plan, lease) = run_pr(&world, &spent, None, &person)?;
-    assert_eq!(plan, PrPlan::BudgetExhausted { rounds_used: 2 });
-    assert!(lease.is_none());
-    assert!(world.fixture.store.tasks()?.is_empty());
     let refused = pull_request(&PrRequest {
         store: &world.fixture.store,
         template: &template()?,
         repository: &repo()?,
         facts: &clean,
         intent: None,
-        fix_rounds: 2,
+        fix_rounds: None,
         claimant: &scheduled("repair-tick")?,
         ttl: ttl(600)?,
         now: world.now(),
         take_over: false,
     });
     assert!(refused.is_err_and(|error| error.class() == ErrorClass::Refused));
+    Ok(())
+}
+
+#[test]
+fn pr_takes_the_round_from_durable_history_not_the_session() -> TestResult {
+    let world = World::new()?;
+    let person = interactive("person")?;
+    let facts = pr_facts(
+        PullRequestState::Open,
+        Mergeability::Clean,
+        ReviewState::ChangesRequested,
+    )?;
+    // Scheduled repair already spent round 1. The facts carry no round
+    // count, so nothing the session read can send the person back to it.
+    let spent = scheduled_round(&world, 1, true)?;
+    let (plan, lease) = run_pr(&world, &facts, None, &person)?;
+    let next = repair_task_id(&repo()?, IssueNumber::new(5)?, 2)?;
+    assert_eq!(
+        plan,
+        PrPlan::FollowUp {
+            head: facts.view.head.clone(),
+            task: next.clone(),
+            round: 2
+        }
+    );
+    assert!(lease.is_some());
+    assert!(matches!(
+        world.fixture.store.task(&spent)?.state(),
+        TaskState::Settled { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn pr_skips_a_round_scheduled_repair_is_writing() -> TestResult {
+    let world = World::new()?;
+    let person = interactive("person")?;
+    let facts = pr_facts(
+        PullRequestState::Open,
+        Mergeability::Conflicting,
+        ReviewState::Reviewed,
+    )?;
+    scheduled_round(&world, 1, true)?;
+    let writing = scheduled_round(&world, 2, false)?;
+    let (plan, lease) = run_pr(&world, &facts, Some(PrIntent::Repair), &person)?;
+    assert_eq!(
+        plan,
+        PrPlan::Skipped {
+            refusal: ClaimRefusal::Held {
+                trigger: Trigger::Scheduled
+            }
+        }
+    );
+    assert!(lease.is_none());
+    // No second writer round was opened beside the scheduled one.
+    assert_eq!(world.fixture.store.tasks()?.len(), 2);
+    let record = world.fixture.store.task(&writing)?;
+    let TaskState::Claimed { lease } = record.state() else {
+        return Err("scheduled repair must keep its claim".into());
+    };
+    assert_eq!(*lease.trigger(), Trigger::Scheduled);
+    Ok(())
+}
+
+#[test]
+fn pr_fix_rounds_can_only_lower_the_house_budget() -> TestResult {
+    let world = World::new()?;
+    let person = interactive("person")?;
+    let facts = pr_facts(
+        PullRequestState::Open,
+        Mergeability::Clean,
+        ReviewState::ChangesRequested,
+    )?;
+    // Asking for more rounds than the house allows is refused outright.
+    let raised = run_pr_within(
+        &world,
+        &facts,
+        None,
+        &person,
+        Some(DEFAULT_FIX_ROUNDS.saturating_add(1)),
+    );
+    let Err(error) = raised else {
+        return Err("a raised budget must be refused".into());
+    };
+    assert_eq!(
+        error.downcast_ref::<Error>().map(Error::class),
+        Some(ErrorClass::Refused)
+    );
+    assert!(world.fixture.store.tasks()?.is_empty());
+
+    // A zero budget is spent before any round.
+    let (plan, lease) = run_pr_within(&world, &facts, None, &person, Some(0))?;
+    assert_eq!(plan, PrPlan::BudgetExhausted { rounds_used: 0 });
+    assert!(lease.is_none());
+
+    // A lowered budget counts the rounds already in the store.
+    scheduled_round(&world, 1, true)?;
+    let (plan, _) = run_pr_within(&world, &facts, None, &person, Some(1))?;
+    assert_eq!(plan, PrPlan::BudgetExhausted { rounds_used: 1 });
+
+    // The house budget is the ceiling without the flag.
+    for round in 2..=DEFAULT_FIX_ROUNDS {
+        scheduled_round(&world, round, true)?;
+    }
+    let (plan, lease) = run_pr(&world, &facts, None, &person)?;
+    assert_eq!(
+        plan,
+        PrPlan::BudgetExhausted {
+            rounds_used: DEFAULT_FIX_ROUNDS
+        }
+    );
+    assert!(lease.is_none());
+    assert_eq!(
+        world.fixture.store.tasks()?.len(),
+        usize::from(DEFAULT_FIX_ROUNDS)
+    );
     Ok(())
 }
 
@@ -1340,6 +1487,76 @@ fn a_revised_draft_waits_for_the_unfinished_one_on_the_same_issue() -> TestResul
 
     // Once the first draft completes, a revision may proceed.
     desk.apply(&draft, Some(&approval(&draft)?))?;
+    let after = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert_eq!(after.outcome, DraftOutcome::Completed);
+    Ok(())
+}
+
+#[test]
+fn a_draft_that_settled_after_writing_keeps_its_subject() -> TestResult {
+    let desk = Desk::new(10)?;
+    let draft = refine_draft()?;
+    let approved = approval(&draft)?;
+    // The comment lands, then the forge refuses the first label on every
+    // attempt until the task exhausts its attempts and settles.
+    desk.forge.plan_faults(vec![None, Some(Fault::Reject)]);
+    desk.apply(&draft, Some(&approved))?;
+    let settled = loop {
+        desk.world.clock.advance(1);
+        desk.forge.plan_faults(vec![Some(Fault::Reject)]);
+        let rerun = desk.apply(&draft, Some(&approved))?;
+        if let DraftOutcome::Settled { settlement } = rerun.outcome {
+            break settlement;
+        }
+        if desk.forge.calls() > 10 {
+            return Err("the draft never settled".into());
+        }
+    };
+    assert_eq!(settled, Settlement::Exhausted);
+    let posted = desk.forge.actions().len();
+    assert_eq!(posted, 1, "only the comment reached the forge");
+    desk.forge.plan_faults(Vec::new());
+
+    // A revision would post the same comment again; it is refused and names
+    // the settled task and its applied write, never the refused label.
+    let mut revised = refine_draft()?;
+    revised.add_labels = vec!["ready".to_owned(), "firmware".to_owned()];
+    let blocked = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert_eq!(
+        blocked.outcome,
+        DraftOutcome::EarlierSettledWithWrites {
+            task: draft_task_id(&draft_preview(&draft)?)?,
+            settlement: Settlement::Exhausted,
+            writes: vec![kitchen::EffectName::new("comment")?],
+        }
+    );
+    assert_eq!(desk.forge.actions().len(), posted);
+    Ok(())
+}
+
+#[test]
+fn a_draft_that_settled_without_writing_frees_its_subject() -> TestResult {
+    let desk = Desk::new(10)?;
+    let draft = refine_draft()?;
+    let approved = approval(&draft)?;
+    // The forge refuses the comment on every attempt: nothing was posted.
+    let settled = loop {
+        desk.forge.plan_faults(vec![Some(Fault::Reject)]);
+        let run = desk.apply(&draft, Some(&approved))?;
+        if let DraftOutcome::Settled { settlement } = run.outcome {
+            break settlement;
+        }
+        if desk.forge.calls() > 10 {
+            return Err("the draft never settled".into());
+        }
+        desk.world.clock.advance(1);
+    };
+    assert_eq!(settled, Settlement::Exhausted);
+    assert!(desk.forge.actions().is_empty());
+    desk.forge.plan_faults(Vec::new());
+
+    let mut revised = refine_draft()?;
+    revised.add_labels = vec!["ready".to_owned(), "firmware".to_owned()];
     let after = desk.apply(&revised, Some(&approval(&revised)?))?;
     assert_eq!(after.outcome, DraftOutcome::Completed);
     Ok(())

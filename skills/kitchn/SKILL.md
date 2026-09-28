@@ -81,10 +81,13 @@ Write the issue facts you read from the forge to a temporary file:
 Facts at one head:
 
 ```json
-{ "state": "open", "head": "<40-hex sha>", "headBranch": "…", "baseBranch": "main", "mergeability": "clean", "review": "unreviewed", "roundsUsed": 0 }
+{ "state": "open", "head": "<40-hex sha>", "headBranch": "…", "baseBranch": "main", "mergeability": "clean", "review": "unreviewed" }
 ```
 
 `kitchen pr <number> --facts <file> [--as review|follow-up|repair|gate] --revision <rev> --registry <dir> --store <dir> --holder <you> [orca flags] --json`
+
+Kitchen reads the rounds already spent from the house store and applies the
+house's fix-round budget. `--fix-rounds <n>` can only lower that budget.
 
 The plan names the exact head. If the head moves, the plan is void: read the
 facts again and rerun. `review` and `gate` are read-only; merging is always

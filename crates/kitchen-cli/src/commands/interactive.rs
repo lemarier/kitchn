@@ -138,9 +138,11 @@ pub struct PrArgs {
     /// What to do; routed from the facts when omitted.
     #[arg(long = "as", value_enum)]
     intent: Option<IntentArg>,
-    /// Review-fix and repair rounds the house allows per pull request.
-    #[arg(long, default_value_t = 3)]
-    fix_rounds: u8,
+    /// Lower the house's review-fix and repair round budget for this
+    /// session. It can never raise it; rounds already spent are read from
+    /// the house store.
+    #[arg(long)]
+    fix_rounds: Option<u8>,
     #[command(flatten)]
     session: Session,
     #[command(flatten)]
@@ -486,7 +488,8 @@ fn refused(refusal: &kitchen::workflows::interactive::ClaimRefusal) -> String {
     }
 }
 
-/// Pull request facts as the session reads them at one head.
+/// Pull request facts as the session reads them at one head. Rounds spent
+/// are not among them: a file that names them is refused.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PrFactsFile {
@@ -496,8 +499,6 @@ struct PrFactsFile {
     base_branch: String,
     mergeability: MergeabilityArg,
     review: ReviewState,
-    #[serde(default)]
-    rounds_used: u8,
 }
 
 #[derive(Deserialize)]
@@ -539,7 +540,6 @@ fn run_pr(args: PrArgs) -> Result<(String, bool), kitchen::Error> {
             },
         },
         review: file.review,
-        rounds_used: file.rounds_used,
     };
     let opened = match open(args.session)? {
         Ok(opened) => opened,

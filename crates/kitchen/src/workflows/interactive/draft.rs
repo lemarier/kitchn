@@ -21,6 +21,10 @@
 //! most one unfinished draft at a time. A per-subject slot task, claimed for
 //! the duration of the call, serializes the check for an earlier unfinished
 //! draft with the creation of this one, so two sessions cannot both pass.
+//! A draft that settles without success after a write that reached, or may
+//! have reached, the forge keeps its subject
+//! ([`DraftOutcome::EarlierSettledWithWrites`]): a revision could otherwise
+//! post the same issue or comment again.
 
 use std::{
     fmt::{self, Write as _},
@@ -537,6 +541,19 @@ pub enum DraftOutcome {
         /// The unfinished task.
         task: TaskId,
     },
+    /// An earlier draft for the same subject settled without success after
+    /// writing, or possibly writing, to the forge. It keeps the subject until
+    /// its owner reconciles those writes and decides how to proceed: a
+    /// revision could post the same issue or comment again. Nothing was
+    /// written.
+    EarlierSettledWithWrites {
+        /// The settled task.
+        task: TaskId,
+        /// How it settled.
+        settlement: Settlement,
+        /// Its writes that were applied or whose outcome is unknown.
+        writes: Vec<EffectName>,
+    },
     /// Another session is writing this subject now.
     HeldElsewhere,
     /// A write's outcome is unknown; nothing after it was submitted.
@@ -640,12 +657,15 @@ fn action(
 }
 
 /// The issue number in a receipt of the form
-/// `https://github.com/<repository>/issues/<number>`.
+/// `https://github.com/<repository>/issues/<number>`. GitHub repository
+/// names are case-insensitive, so the repository segment is too.
 fn issue_number(repository: &Repository, reference: &ExternalRef) -> Result<IssueNumber> {
     let prefix = format!("https://github.com/{}/issues/", repository.as_str());
-    reference
-        .as_str()
-        .strip_prefix(&prefix)
+    let value = reference.as_str();
+    value
+        .get(..prefix.len())
+        .filter(|actual| actual.eq_ignore_ascii_case(&prefix))
+        .and_then(|_| value.get(prefix.len()..))
         .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
         .and_then(|digits| digits.parse::<u64>().ok())
         .and_then(|number| IssueNumber::new(number).ok())
@@ -708,30 +728,46 @@ fn collect_applied(
     Ok(())
 }
 
-/// An earlier draft of the same subject that is not settled and is being
-/// run or has a write that may have reached the forge.
-fn earlier_unfinished(
-    tasks: &[TaskRecord],
+/// The draft of the same subject other than `own` that still holds it, if
+/// any. One holds it while it has not settled and either holds a live claim
+/// or has a write that may have reached the forge, and after it settles
+/// without success if it has such a write: only its owner's reconciliation
+/// may release it, since a revision could post the same issue or comment
+/// again. A draft that only recorded refused or unsent writes and is not
+/// being run wrote nothing and frees the subject, as does one that settled
+/// successfully.
+fn earlier_unfinished<'a>(
+    tasks: &'a [TaskRecord],
     own: &TaskId,
     subject: &str,
     now: crate::contracts::Timestamp,
-) -> Option<TaskId> {
+) -> Option<&'a TaskRecord> {
     let prefix = format!("{DRAFT_TASK_PREFIX}{subject}-");
-    tasks
-        .iter()
-        .find(|task| {
-            task.spec().id != *own
-                && task.spec().id.as_str().starts_with(&prefix)
-                && match task.state() {
-                    TaskState::Settled { .. } => false,
-                    TaskState::Claimed { lease } if lease.is_live(now) => true,
-                    TaskState::Open | TaskState::Claimed { .. } => task
-                        .effects()
-                        .iter()
-                        .any(|effect| !matches!(effect.state(), EffectState::NotApplied { .. })),
+    tasks.iter().find(|task| {
+        task.spec().id != *own
+            && task.spec().id.as_str().starts_with(&prefix)
+            && match task.state() {
+                TaskState::Settled { settlement, .. } => {
+                    *settlement != Settlement::Succeeded && !forge_writes(task).is_empty()
                 }
-        })
-        .map(|task| task.spec().id.clone())
+                TaskState::Claimed { lease } if lease.is_live(now) => true,
+                TaskState::Open | TaskState::Claimed { .. } => !forge_writes(task).is_empty(),
+            }
+    })
+}
+
+/// The logical names of `task`'s writes that were applied or may have reached
+/// the forge: everything not recorded as definitely not applied.
+fn forge_writes(task: &TaskRecord) -> Vec<EffectName> {
+    let mut names = Vec::new();
+    for effect in task.effects() {
+        if !matches!(effect.state(), EffectState::NotApplied { .. })
+            && !names.contains(effect.name())
+        {
+            names.push(effect.name().clone());
+        }
+    }
+    names
 }
 
 /// Give a claim back unless the task settled.
@@ -869,8 +905,17 @@ fn apply_in_slot(
     let clock = writer.clock;
     let id = draft_task_id(preview)?;
     let now = clock.now();
-    if let Some(task) = earlier_unfinished(&store.tasks()?, &id, &subject_hash(preview), now) {
-        return Ok(Applied::Early(DraftOutcome::EarlierUnfinished { task }));
+    let tasks = store.tasks()?;
+    if let Some(earlier) = earlier_unfinished(&tasks, &id, &subject_hash(preview), now) {
+        let task = earlier.spec().id.clone();
+        return Ok(Applied::Early(match earlier.state() {
+            TaskState::Settled { settlement, .. } => DraftOutcome::EarlierSettledWithWrites {
+                task,
+                settlement: *settlement,
+                writes: forge_writes(earlier),
+            },
+            TaskState::Open | TaskState::Claimed { .. } => DraftOutcome::EarlierUnfinished { task },
+        }));
     }
     let mut run = DraftReport {
         preview: preview.clone(),
@@ -1045,6 +1090,9 @@ mod tests {
         let repo = Repository::new("sample/project")?;
         let good = ExternalRef::new("https://github.com/sample/project/issues/42")?;
         assert_eq!(issue_number(&repo, &good)?.get(), 42);
+        // GitHub reports the repository's own casing in `html_url`.
+        let cased = ExternalRef::new("https://github.com/Sample/Project/issues/43")?;
+        assert_eq!(issue_number(&repo, &cased)?.get(), 43);
         for bad in [
             "https://github.com/other/project/issues/42",
             "https://github.com/sample/project/pull/42",

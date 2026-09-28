@@ -271,7 +271,7 @@ fn pr_routes_a_conflict_to_repair_at_the_exact_head() -> TestResult {
     let setup = setup(true)?;
     let facts = setup.file(
         "pr.json",
-        r#"{"state":"open","head":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","headBranch":"feature","baseBranch":"main","mergeability":"conflicting","review":"reviewed","roundsUsed":0}"#,
+        r#"{"state":"open","head":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","headBranch":"feature","baseBranch":"main","mergeability":"conflicting","review":"reviewed"}"#,
     )?;
     let facts = facts.to_str().ok_or("path")?;
     let repair = setup.run(&["pr", "61", "--facts", facts, "--json"], Some("person"))?;
@@ -300,6 +300,48 @@ fn pr_routes_a_conflict_to_repair_at_the_exact_head() -> TestResult {
         Some("person"),
     )?;
     assert_eq!(invalid.status.code(), Some(2));
+    Ok(())
+}
+
+#[test]
+fn pr_refuses_session_round_counts_and_raised_budgets() -> TestResult {
+    let setup = setup(true)?;
+    // A facts file that still carries a round count is refused: rounds come
+    // from the house store, never from what the session read.
+    let stale = setup.file(
+        "stale.json",
+        r#"{"state":"open","head":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","headBranch":"feature","baseBranch":"main","mergeability":"conflicting","review":"reviewed","roundsUsed":0}"#,
+    )?;
+    let refused = setup.run(
+        &["pr", "61", "--facts", stale.to_str().ok_or("path")?],
+        Some("person"),
+    )?;
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+
+    let facts = setup.file(
+        "pr.json",
+        r#"{"state":"open","head":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","headBranch":"feature","baseBranch":"main","mergeability":"conflicting","review":"reviewed"}"#,
+    )?;
+    let facts = facts.to_str().ok_or("path")?;
+    let raised = setup.run(
+        &["pr", "61", "--facts", facts, "--fix-rounds", "3", "--json"],
+        Some("person"),
+    )?;
+    assert_eq!(raised.status.code(), Some(1), "{raised:?}");
+    assert!(String::from_utf8(raised.stderr)?.contains("exceed the house budget"));
+    let store = HouseStore::open(&setup.store, "crabnebula".parse()?, StoreOptions::default())?;
+    assert!(store.tasks()?.is_empty(), "a refused budget claims nothing");
+
+    // Within the house budget the round is claimed, and the next session
+    // for the same pull request is skipped rather than opening round 2.
+    let first = setup.run(
+        &["pr", "61", "--facts", facts, "--fix-rounds", "2", "--json"],
+        Some("person"),
+    )?;
+    assert_eq!(json(&first)?["plan"]["round"], 1);
+    let second = setup.run(&["pr", "61", "--facts", facts, "--json"], Some("other"))?;
+    assert_eq!(second.status.code(), Some(1));
+    assert_eq!(json(&second)?["plan"]["type"], "skipped");
     Ok(())
 }
 

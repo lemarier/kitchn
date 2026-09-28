@@ -636,6 +636,11 @@ pub struct PinnedInstructions {
     pub entrypoint: Text,
 }
 
+/// Review-fix and repair rounds a house allows per pull request. The merge
+/// gate hands over at this count, and an interactive `pr` session may only
+/// lower it.
+pub const DEFAULT_FIX_ROUNDS: u8 = 2;
+
 /// Review and fix budgets carried into the brief and enforced by repair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FollowUpBudget {

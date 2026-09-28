@@ -9,9 +9,11 @@ use std::time::Duration;
 use kitchen::{
     BackendId, ConsumerId, TaskId,
     contracts::{
-        Capability, CapabilitySet, Claimant, Consent, Effect, EvidenceRevision, ExternalRef,
-        HouseGrants, IssueNumber, Permission, Provenance, Repository, RetryPolicy, TaskAuthority,
-        Text, Timestamp, fake::FakeBackend,
+        BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, Claimant, Consent,
+        Effect, EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef,
+        HouseGrants, IssueNumber, Lookup, Operation, Permission, Provenance, Receipt, Repository,
+        ResourceKind, ResourceRef, RetryPolicy, TaskAuthority, Text, Timestamp, WorkerBackend,
+        WorkerState, fake::FakeBackend,
     },
     workflows::{
         coordination::{ConsentSource, Context, Standing, SupervisionPolicy},
@@ -241,4 +243,66 @@ pub fn under_consumer(
             .store
             .acquire_consumer(&consumer()?, &claimant, ttl(600)?, world.now())?;
     Ok((claimant.under(consumer()?, lease.fence()), lease))
+}
+
+/// The fake orchestrator behind an adapter that reports the branch its
+/// worktree really got in the launch receipt, as the Orca adapter does. Orca
+/// prefixes requested names, so an adapter may report a branch other than the
+/// one asked for.
+pub struct ReportsBranch<'a> {
+    pub inner: &'a FakeBackend,
+    pub branch: &'a str,
+    /// Refuse every stop request, as a backend that cannot reach the worker.
+    pub refuse_stop: bool,
+}
+
+impl EffectExecutor for ReportsBranch<'_> {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        if self.refuse_stop
+            && matches!(
+                request.effect(),
+                Effect::Worker(Operation::CancelWorker { .. })
+            )
+        {
+            return Err(EffectFailure::NotApplied(
+                kitchen::contracts::NotAppliedReason::Rejected,
+            ));
+        }
+        let receipt = self.inner.execute(request)?;
+        if !matches!(
+            request.effect(),
+            Effect::Worker(Operation::LaunchWorker { .. })
+        ) {
+            return Ok(receipt);
+        }
+        let branch = ExternalRef::new(self.branch).map_err(|_| {
+            EffectFailure::NotApplied(kitchen::contracts::NotAppliedReason::Rejected)
+        })?;
+        let mut created = receipt.created().to_vec();
+        created.push(ResourceRef {
+            kind: ResourceKind::Branch,
+            backend: self.inner.descriptor().backend.clone(),
+            handle: branch,
+        });
+        Receipt::new(
+            receipt.reference().clone(),
+            created,
+            receipt.touched().to_vec(),
+        )
+        .map_err(|_| EffectFailure::NotApplied(kitchen::contracts::NotAppliedReason::Rejected))
+    }
+
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.inner.lookup(request)
+    }
+}
+
+impl WorkerBackend for ReportsBranch<'_> {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.inner.observe_worker(worker)
+    }
 }

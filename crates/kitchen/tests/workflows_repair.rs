@@ -617,7 +617,6 @@ fn a_repair_writer_works_only_in_the_worktree_it_was_given() -> TestResult {
     let lease = store.claim(&id, &tick, ttl(300)?, world.now())?;
     let mut repair_brief = brief(5)?;
     repair_brief.branch = branch("lemarier/issue-5")?;
-    let text = repair_brief.render(&spec)?;
 
     let other = ResourceRef {
         handle: ExternalRef::new("worktree-someone-else")?,
@@ -628,7 +627,7 @@ fn a_repair_writer_works_only_in_the_worktree_it_was_given() -> TestResult {
         &id,
         lease.fence(),
         Workspace::Existing(other),
-        text.clone(),
+        &repair_brief,
     )
     .err()
     .ok_or("repair launched into a foreign worktree")?;
@@ -643,7 +642,7 @@ fn a_repair_writer_works_only_in_the_worktree_it_was_given() -> TestResult {
         &id,
         lease.fence(),
         Workspace::Existing(worktree),
-        text,
+        &repair_brief,
     )?;
     assert!(matches!(outcome, LaunchOutcome::Accepted { .. }));
     Ok(())

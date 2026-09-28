@@ -7,11 +7,17 @@
 //! [`crate::state::run_effect`], so intent is persisted first, an uncertain
 //! launch is never repeated, and a superseded coordinator cannot act.
 //!
+//! A worker is never left running unaccounted for: a stalled launch counts
+//! as stopped only when the backend confirms the stop, and a new attempt
+//! launches only after every earlier attempt's worker is shown stopped, so an
+//! adopted worker is supervised rather than duplicated.
+//!
 //! Two inputs are interim seams until #4's follow-up contract lands:
 //! [`TerminalControl`] (user takeover) is supplied by the caller rather than
-//! observed through [`WorkerBackend`], and the exact branch travels in the
-//! brief and is verified after the fact with
-//! [`crate::workflows::pickup::BranchName::verify_observed`].
+//! observed through [`WorkerBackend`], and [`Operation::LaunchWorker`] cannot
+//! carry the requested branch yet. Until it can, [`launch_worker`] renders the
+//! typed [`BranchName`] into the brief and checks the branch a backend
+//! reports in its launch receipt; a different branch stops the worker.
 
 use std::time::Duration;
 
@@ -27,10 +33,11 @@ use crate::{
         WorkerState, Workspace,
     },
     state::{
-        AttemptState, ConsumerState, EffectPlan, EffectRecord, EffectState, HouseStore, Lease,
-        OwnershipEvent, StateError, TaskRecord, TaskState, reconcile, run_effect,
+        AttemptRecord, AttemptState, ConsumerState, EffectPlan, EffectRecord, EffectState,
+        HouseStore, Lease, OwnershipEvent, StateError, TaskRecord, TaskState, reconcile,
+        run_effect,
     },
-    workflows::pickup::{BranchName, stable_hash},
+    workflows::pickup::{BranchName, WorkerBrief, stable_hash},
 };
 
 type Result<T> = std::result::Result<T, crate::Error>;
@@ -52,6 +59,10 @@ pub enum CoordinationError {
     /// A human decision needs a repository-scoped task.
     #[error("task has no repository for a decision binding")]
     MissingRepository,
+    /// An operational brief argument, such as the instruction entry point or
+    /// the report path, is not a plain single-line value.
+    #[error("brief argument is not a plain single-line value")]
+    InvalidBriefArgument,
 }
 
 impl CoordinationError {
@@ -59,9 +70,10 @@ impl CoordinationError {
     #[must_use]
     pub const fn class(self) -> ErrorClass {
         match self {
-            Self::InvalidBranchName | Self::BriefMismatch | Self::MissingRepository => {
-                ErrorClass::InvalidInput
-            }
+            Self::InvalidBranchName
+            | Self::BriefMismatch
+            | Self::MissingRepository
+            | Self::InvalidBriefArgument => ErrorClass::InvalidInput,
             Self::BranchMismatch => ErrorClass::Conflict,
         }
     }
@@ -176,20 +188,120 @@ pub enum LaunchOutcome {
     ReconcileFirst,
     /// The retry budget is spent; the task settled as exhausted.
     Exhausted,
+    /// An earlier attempt's worker is not shown to have stopped, or
+    /// succeeded without being settled; nothing was launched. Supervise the
+    /// task instead.
+    SuperviseFirst {
+        /// The earlier worker that may still be running.
+        worker: ResourceRef,
+    },
+    /// The backend put the worker on another branch than the requested one.
+    /// The worker was stopped and the attempt failed permanently.
+    BranchMismatch {
+        /// The stopped worker.
+        worker: ResourceRef,
+        /// The task's disposition after the failed attempt.
+        disposition: Disposition,
+    },
+    /// The backend put the worker on another branch and refused to stop it.
+    /// The attempt stays open and the claim is kept; a person decides.
+    StopRefused {
+        /// The worker that may still be running.
+        worker: ResourceRef,
+    },
+}
+
+/// Whether `record` ended an attempt at or after `attempt` with a recorded
+/// outcome. Supervision records an outcome only from positive evidence about
+/// the worker (it settled, or a stop was confirmed), and a new attempt only
+/// launches once earlier workers were accounted for, so a later ended attempt
+/// accounts for every worker launched before it.
+fn ended_since(record: &TaskRecord, attempt: AttemptNumber) -> bool {
+    record.attempts().iter().any(|later| {
+        later.number() >= attempt
+            && matches!(
+                later.state(),
+                AttemptState::Finished { .. } | AttemptState::Cancelled { .. }
+            )
+    })
+}
+
+/// Whether an applied stop of `worker` is on record.
+fn stop_confirmed(record: &TaskRecord, worker: &ResourceRef) -> bool {
+    record.effects().iter().any(|effect| {
+        matches!(
+            (effect.request().effect(), effect.state()),
+            (
+                Effect::Worker(Operation::CancelWorker { worker: stopped }),
+                EffectState::Applied { .. },
+            ) if stopped == worker
+        )
+    })
+}
+
+/// The first worker launched by an attempt other than the running one that
+/// is not accounted for: its attempt did not end with a recorded outcome, no
+/// confirmed stop is on record, and the backend does not report it failed or
+/// cancelled. A worker that is running, missing, unobservable, or settled as
+/// succeeded keeps its branch reserved: launching another writer beside it,
+/// or over finished work, is never safe. This is the adopted worker's case.
+fn unstopped_worker(ctx: &Context<'_>, record: &TaskRecord, fence: Fence) -> Option<ResourceRef> {
+    let running = record
+        .attempts()
+        .last()
+        .filter(|attempt| attempt.fence() == fence && attempt.state() == AttemptState::Running)
+        .map(AttemptRecord::number);
+    record
+        .effects()
+        .iter()
+        .filter_map(|effect| match (effect.request().effect(), effect.state()) {
+            (
+                Effect::Worker(Operation::LaunchWorker { .. }),
+                EffectState::Applied { receipt, .. },
+            ) if Some(effect.request().attempt()) != running => receipt
+                .created()
+                .iter()
+                .find(|resource| resource.kind == ResourceKind::Worker)
+                .map(|worker| (effect.request().attempt(), worker)),
+            _ => None,
+        })
+        .find(|(attempt, worker)| {
+            !ended_since(record, *attempt)
+                && !stop_confirmed(record, worker)
+                && !matches!(
+                    ctx.backend.observe_worker(worker),
+                    Ok(WorkerState::Settled(
+                        WorkerOutcome::Failed | WorkerOutcome::Cancelled
+                    ))
+                )
+        })
+        .map(|(_, worker)| worker.clone())
 }
 
 /// Start (or continue) an attempt and launch its worker. A repeated call for
-/// the same attempt never launches a second worker.
+/// the same attempt never launches a second worker, and no attempt launches
+/// while an earlier attempt's worker may still be running: that is the
+/// adopting coordinator's case, and it must supervise first.
+///
+/// The brief is rendered here from the typed `brief`, so the branch the
+/// worker is told to create is the one this function checks the backend
+/// reported.
 ///
 /// # Errors
-/// Returns store and authority failures, such as a superseded consumer.
+/// Returns brief, store, and authority failures, such as a brief that does
+/// not match the task or a superseded consumer.
 pub fn launch_worker(
     ctx: &Context<'_>,
     task: &TaskId,
     fence: Fence,
     workspace: Workspace,
-    brief: Text,
+    brief: &WorkerBrief,
 ) -> Result<LaunchOutcome> {
+    let record = ctx.store.task(task)?;
+    let text = brief.render(record.spec())?;
+    if let Some(worker) = unstopped_worker(ctx, &record, fence) {
+        return Ok(LaunchOutcome::SuperviseFirst { worker });
+    }
     let attempt = match ctx.store.start_attempt(task, fence, ctx.clock.now()) {
         Ok(AttemptStart::Started(attempt) | AttemptStart::AlreadyRunning(attempt)) => attempt,
         Ok(AttemptStart::Exhausted) => return Ok(LaunchOutcome::Exhausted),
@@ -201,10 +313,13 @@ pub fn launch_worker(
     let record = ctx.store.task(task)?;
     let role = record.spec().role;
     let revision = record.evidence().revision();
+    // Interim seam: once `Operation::LaunchWorker` carries the requested
+    // branch (#4 follow-up), set it here from `brief.branch` so the backend
+    // creates exactly that branch. The receipt check below stays.
     let effect = Effect::Worker(Operation::LaunchWorker {
         role,
         workspace,
-        brief,
+        brief: text,
         branch: None,
     });
     let record = match ctx.run(
@@ -225,18 +340,28 @@ pub fn launch_worker(
     };
     match record.state() {
         EffectState::Applied { receipt, .. } => {
-            match receipt
+            let Some(worker) = receipt
                 .created()
                 .iter()
                 .find(|resource| resource.kind == ResourceKind::Worker)
-            {
-                Some(worker) => Ok(LaunchOutcome::Accepted {
-                    attempt,
-                    worker: worker.clone(),
-                }),
+            else {
                 // Accepted without a worker handle: nothing to supervise.
-                None => Ok(LaunchOutcome::Uncertain),
+                return Ok(LaunchOutcome::Uncertain);
+            };
+            let wrong_branch = receipt.created().iter().any(|resource| {
+                resource.kind == ResourceKind::Branch
+                    && brief
+                        .branch
+                        .verify_observed(resource.handle.as_str())
+                        .is_err()
+            });
+            if wrong_branch {
+                return stop_misplaced(ctx, task, fence, attempt, worker);
             }
+            Ok(LaunchOutcome::Accepted {
+                attempt,
+                worker: worker.clone(),
+            })
         }
         EffectState::NotApplied { reason, .. } => {
             let class = match reason {
@@ -264,6 +389,82 @@ pub fn launch_worker(
         | EffectState::Unresolvable { .. }
         | EffectState::Waived { .. } => Ok(LaunchOutcome::Uncertain),
     }
+}
+
+/// What a request to stop a worker established.
+enum Stop {
+    /// The backend confirmed the stop.
+    Stopped,
+    /// The backend refused: the worker may still be running.
+    Refused,
+    /// The outcome is unknown; reconcile before anything else.
+    Unresolved,
+}
+
+/// Ask the backend to stop `worker` as effect `name`. Repeating the call
+/// reports a recorded refusal without asking again, so a refusal stays a
+/// refusal until a person or the worker's own settlement changes it.
+fn stop_worker(
+    ctx: &Context<'_>,
+    task: &TaskId,
+    fence: Fence,
+    name: &str,
+    worker: &ResourceRef,
+) -> Result<Stop> {
+    let record = ctx.store.task(task)?;
+    if matches!(
+        named_effect(&record, name).map(EffectRecord::state),
+        Some(EffectState::NotApplied { .. })
+    ) {
+        return Ok(Stop::Refused);
+    }
+    let revision = record.evidence().revision();
+    let record = ctx.run(
+        ctx.backend,
+        task,
+        fence,
+        name,
+        Effect::Worker(Operation::CancelWorker {
+            worker: worker.clone(),
+        }),
+        revision,
+    )?;
+    Ok(match record.state() {
+        EffectState::Applied { .. } => Stop::Stopped,
+        EffectState::NotApplied { .. } => Stop::Refused,
+        EffectState::Intended
+        | EffectState::Uncertain { .. }
+        | EffectState::Unresolvable { .. }
+        | EffectState::Waived { .. } => Stop::Unresolved,
+    })
+}
+
+/// Stop a worker the backend put on the wrong branch. The attempt fails
+/// permanently only once the stop is confirmed.
+fn stop_misplaced(
+    ctx: &Context<'_>,
+    task: &TaskId,
+    fence: Fence,
+    attempt: AttemptNumber,
+    worker: &ResourceRef,
+) -> Result<LaunchOutcome> {
+    let name = format!("stop-branch-{}", attempt.get());
+    Ok(match stop_worker(ctx, task, fence, &name, worker)? {
+        Stop::Stopped => LaunchOutcome::BranchMismatch {
+            worker: worker.clone(),
+            disposition: ctx.store.finish_attempt(
+                task,
+                fence,
+                attempt,
+                AttemptOutcome::Failed(FailureClass::Permanent),
+                ctx.clock.now(),
+            )?,
+        },
+        Stop::Refused => LaunchOutcome::StopRefused {
+            worker: worker.clone(),
+        },
+        Stop::Unresolved => LaunchOutcome::ReconcileFirst,
+    })
 }
 
 /// The worker a task's latest applied launch created.
@@ -327,6 +528,11 @@ pub enum Escalation {
     MissingEvidence,
     /// The worker's branch is not the requested one.
     BranchMismatch,
+    /// The backend refused to stop a worker that never became ready. It may
+    /// still be running, so the attempt stays open, the claim is kept, and
+    /// its slot stays used until a person or the worker's own settlement
+    /// resolves it.
+    StopRefused,
 }
 
 /// The result of one supervision step.
@@ -496,28 +702,21 @@ fn stop_stalled(
     let Some(attempt) = running_attempt(ctx, task, fence)? else {
         return Ok(Supervision::Settled(Settlement::Exhausted));
     };
-    let revision = ctx.store.task(task)?.evidence().revision();
-    let record = ctx.run(
-        ctx.backend,
-        task,
-        fence,
-        &format!("stop-stalled-{}", attempt.get()),
-        Effect::Worker(Operation::CancelWorker {
-            worker: worker.clone(),
-        }),
-        revision,
-    )?;
-    if !record.state().is_resolved() {
-        return Ok(Supervision::Reconciling { unresolved: 1 });
+    let name = format!("stop-stalled-{}", attempt.get());
+    match stop_worker(ctx, task, fence, &name, worker)? {
+        Stop::Stopped => {
+            let disposition = ctx.store.finish_attempt(
+                task,
+                fence,
+                attempt,
+                AttemptOutcome::Failed(FailureClass::Retryable),
+                ctx.clock.now(),
+            )?;
+            Ok(Supervision::LaunchStalled { disposition })
+        }
+        Stop::Refused => Ok(Supervision::Escalate(Escalation::StopRefused)),
+        Stop::Unresolved => Ok(Supervision::Reconciling { unresolved: 1 }),
     }
-    let disposition = ctx.store.finish_attempt(
-        task,
-        fence,
-        attempt,
-        AttemptOutcome::Failed(FailureClass::Retryable),
-        ctx.clock.now(),
-    )?;
-    Ok(Supervision::LaunchStalled { disposition })
 }
 
 /// A question a worker asked, as read by the backend adapter.

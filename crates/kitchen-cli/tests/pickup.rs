@@ -43,7 +43,15 @@ fn check_branch_accepts_exact_names_and_rejects_invalid_ones() -> Result<(), Box
         String::from_utf8(output.stdout)?,
         "lemarier/pickup-coordination\n"
     );
-    for name in ["lemarier/../x", "lemarier/x.lock", "-x", "a b"] {
+    for name in [
+        "lemarier/../x",
+        "lemarier/x.lock",
+        "-x",
+        "a b",
+        "a$(id)",
+        "a`id`",
+        "a;b",
+    ] {
         let output = kitchen(&["pickup", "check-branch", name])?;
         assert_eq!(output.status.code(), Some(2));
         let stderr = String::from_utf8(output.stderr)?;

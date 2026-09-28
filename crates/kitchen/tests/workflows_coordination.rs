@@ -47,13 +47,12 @@ fn claim(world: &World, holder: &str, number: u64, attempts: u32) -> TestResult<
 }
 
 fn launch(world: &World, task: &TaskId, fence: Fence, number: u64) -> TestResult<LaunchOutcome> {
-    let spec = world.fixture.store.task(task)?.spec().clone();
     Ok(launch_worker(
         &world.ctx(),
         task,
         fence,
         Workspace::Isolated,
-        brief(number)?.render(&spec)?,
+        &brief(number)?,
     )?)
 }
 
@@ -634,14 +633,13 @@ fn interactive_work_needs_consent_for_each_effect() -> TestResult {
         return Err("claim failed".into());
     };
     let task = issue_task_id(&issue(1)?)?;
-    let spec = store.task(&task)?.spec().clone();
-    let text = brief(1)?.render(&spec)?;
+    let requested = brief(1)?;
     let refused = launch_worker(
         &world.ctx(),
         &task,
         lease.fence(),
         Workspace::Isolated,
-        text.clone(),
+        &requested,
     )
     .err()
     .ok_or("launch without consent")?;
@@ -659,7 +657,7 @@ fn interactive_work_needs_consent_for_each_effect() -> TestResult {
         &task,
         lease.fence(),
         Workspace::Isolated,
-        text,
+        &requested,
     )?;
     assert!(matches!(launched, LaunchOutcome::Accepted { .. }));
     let record = store.task(&task)?;
@@ -674,14 +672,13 @@ fn interactive_work_needs_consent_for_each_effect() -> TestResult {
 fn scheduled_work_refuses_a_persons_consent() -> TestResult {
     let world = World::new()?;
     let (task, fence) = claim(&world, "coordinator", 1, 3)?;
-    let spec = world.fixture.store.task(&task)?.spec().clone();
     let approves = Approves::new("david")?;
     let error = launch_worker(
         &world.ctx_with(&approves),
         &task,
         fence,
         Workspace::Isolated,
-        brief(1)?.render(&spec)?,
+        &brief(1)?,
     )
     .err()
     .ok_or("scheduled work accepted consent")?;
@@ -756,5 +753,417 @@ fn a_refused_human_ask_stays_escalated_and_is_not_retried_silently() -> TestResu
     }
     assert_eq!(roger.execute_calls(), 1);
     assert_eq!(roger.effects_performed(), 0);
+    Ok(())
+}
+
+fn ticks(world: &World, task: &TaskId) -> TestResult<Vec<kitchen::workflows::pickup::Exclusion>> {
+    let tasks = world.fixture.store.tasks()?;
+    let selection = kitchen::workflows::pickup::select(
+        &workflows_support::policy(1)?,
+        &[workflows_support::ready(2)?],
+        &tasks,
+        world.now(),
+    )?;
+    assert!(
+        tasks.iter().any(|record| &record.spec().id == task),
+        "the task under test exists"
+    );
+    Ok(selection
+        .excluded
+        .into_iter()
+        .map(|(_, exclusion)| exclusion)
+        .collect())
+}
+
+#[test]
+fn a_refused_stop_keeps_the_claim_and_the_slot_while_the_worker_may_still_run() -> TestResult {
+    use kitchen::contracts::WorkerBackend;
+    use kitchen::state::AttemptState;
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    let worker = launched(&world, &task, fence, 1)?;
+    world.clock.advance(121);
+    // The backend refuses to stop the worker that never became ready.
+    world.backend.inject(ExecuteFault::Reject);
+    let refused = step(&world, &task, fence)?;
+    assert_eq!(
+        refused,
+        Supervision::Escalate(Escalation::StopRefused),
+        "a refused stop is escalated, not counted as a stopped worker"
+    );
+
+    // The worker may still be running: the attempt stays open, the claim is
+    // kept, and its slot is not free for a second writer.
+    assert_eq!(
+        world.backend.observe_worker(&worker)?,
+        WorkerState::Starting
+    );
+    let record = world.fixture.store.task(&task)?;
+    assert!(matches!(record.state(), TaskState::Claimed { .. }));
+    let [attempt] = record.attempts() else {
+        return Err("expected exactly one attempt".into());
+    };
+    assert_eq!(attempt.state(), AttemptState::Running);
+    assert_eq!(
+        ticks(&world, &task)?,
+        vec![kitchen::workflows::pickup::Exclusion::CapacityFull]
+    );
+
+    // Ticks repeat the escalation without asking the backend again, and a
+    // repeated launch returns the same worker instead of starting another.
+    let calls = world.backend.execute_calls();
+    assert_eq!(step(&world, &task, fence)?, refused);
+    assert_eq!(world.backend.execute_calls(), calls);
+    assert_eq!(
+        launch(&world, &task, fence, 1)?,
+        LaunchOutcome::Accepted {
+            attempt: attempt.number(),
+            worker: worker.clone()
+        }
+    );
+    assert_eq!(world.backend.effects_performed(), 1);
+
+    // Once the backend positively reports the worker stopped, the attempt
+    // fails and a replacement may launch.
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Cancelled));
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Retry { remaining: 2 }
+    );
+    let replacement = launched(&world, &task, fence, 1)?;
+    assert_ne!(replacement, worker);
+    Ok(())
+}
+
+#[test]
+fn an_uncertain_stop_blocks_until_reconciled_and_then_frees_the_attempt() -> TestResult {
+    use kitchen::state::AttemptState;
+    let capabilities = CapabilitySet::supporting(
+        Capability::ALL
+            .into_iter()
+            .filter(|capability| *capability != Capability::EffectIdempotentRequests),
+    );
+    let world = World::with_capabilities(capabilities)?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    let worker = launched(&world, &task, fence, 1)?;
+    world.clock.advance(121);
+    world.backend.inject(ExecuteFault::ApplyThenLoseResponse);
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Reconciling { unresolved: 1 }
+    );
+    let record = world.fixture.store.task(&task)?;
+    assert_eq!(
+        record
+            .attempts()
+            .last()
+            .map(kitchen::state::AttemptRecord::state),
+        Some(AttemptState::Running)
+    );
+    assert_eq!(world.backend.effects_performed(), 2);
+    // Reconciliation establishes that the stop applied; only then does the
+    // observed cancelled worker fail the attempt.
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Retry { remaining: 2 }
+    );
+    assert_eq!(world.backend.effects_performed(), 2);
+    let replacement = launched(&world, &task, fence, 1)?;
+    assert_ne!(replacement, worker);
+    Ok(())
+}
+
+/// A coordinator launched a worker and handed the scope over; a second
+/// coordinator adopted the task and holds the returned fence.
+fn adopted_with_live_worker(world: &World) -> TestResult<(TaskId, Fence, ResourceRef)> {
+    let store = &world.fixture.store;
+    let old = common::scheduled("coordinator-a")?;
+    let CoordinatorStart::Fresh(lease) = start_coordinator(
+        store,
+        world.backend.descriptor(),
+        &consumer()?,
+        &old,
+        ttl(600)?,
+        world.now(),
+    )?
+    else {
+        return Err("first coordinator did not start".into());
+    };
+    let claimant = old.under(consumer()?, lease.fence());
+    let ClaimOutcome::Claimed(task_lease) = claim_issue(
+        store,
+        &template()?,
+        &issue(1)?,
+        &claimant,
+        ttl(300)?,
+        world.now(),
+    )?
+    else {
+        return Err("claim failed".into());
+    };
+    let task = issue_task_id(&issue(1)?)?;
+    let worker = launched(world, &task, task_lease.fence(), 1)?;
+    relinquish_coordinator(store, &consumer()?, lease.fence(), world.now())?;
+    let CoordinatorStart::Adopted { tasks, .. } = start_coordinator(
+        store,
+        world.backend.descriptor(),
+        &consumer()?,
+        &common::scheduled("coordinator-b")?,
+        ttl(600)?,
+        world.now(),
+    )?
+    else {
+        return Err("scope was not adopted".into());
+    };
+    let [(adopted, adopted_lease)] = tasks.as_slice() else {
+        return Err("expected one adopted task".into());
+    };
+    assert_eq!(adopted, &task);
+    Ok((task, adopted_lease.fence(), worker))
+}
+
+#[test]
+fn an_adopted_worker_is_never_duplicated_by_a_launch_before_supervision() -> TestResult {
+    // Every state that is not a positive failure or cancellation keeps the
+    // earlier worker's branch reserved: launching again could run two writers.
+    let reserved = [
+        WorkerState::Starting,
+        WorkerState::Ready,
+        WorkerState::AwaitingReply,
+        WorkerState::Missing,
+        WorkerState::Unknown,
+        WorkerState::Settled(WorkerOutcome::Succeeded),
+    ];
+    for state in reserved {
+        let world = World::new()?;
+        let (task, fence, worker) = adopted_with_live_worker(&world)?;
+        world.backend.set_worker_state(&worker, state);
+        let attempts = world.fixture.store.task(&task)?.attempts().len();
+        let outcome = launch(&world, &task, fence, 1)?;
+        assert!(
+            matches!(&outcome, LaunchOutcome::SuperviseFirst { worker: earlier } if earlier == &worker),
+            "worker {state:?} must be supervised before any launch: {outcome:?}"
+        );
+        assert_eq!(world.backend.effects_performed(), 1, "{state:?}");
+        // The refused launch did not even start an attempt.
+        assert_eq!(
+            world.fixture.store.task(&task)?.attempts().len(),
+            attempts,
+            "{state:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_replacement_launches_only_after_the_adopted_worker_is_shown_stopped() -> TestResult {
+    for stopped in [WorkerOutcome::Failed, WorkerOutcome::Cancelled] {
+        let world = World::new()?;
+        let (task, fence, worker) = adopted_with_live_worker(&world)?;
+        world.backend.set_worker_state(&worker, WorkerState::Ready);
+        assert_eq!(
+            step(&world, &task, fence)?,
+            Supervision::Running(WorkerState::Ready)
+        );
+        assert!(matches!(
+            launch(&world, &task, fence, 1)?,
+            LaunchOutcome::SuperviseFirst { .. }
+        ));
+
+        world
+            .backend
+            .set_worker_state(&worker, WorkerState::Settled(stopped));
+        assert!(matches!(
+            launch(&world, &task, fence, 1)?,
+            LaunchOutcome::Accepted { .. }
+        ));
+        assert_eq!(world.backend.effects_performed(), 2);
+    }
+    Ok(())
+}
+
+fn launch_on(
+    world: &World,
+    reported: &str,
+    refuse_stop: bool,
+    task: &TaskId,
+    fence: Fence,
+) -> TestResult<LaunchOutcome> {
+    let backend = workflows_support::ReportsBranch {
+        inner: &world.backend,
+        branch: reported,
+        refuse_stop,
+    };
+    let ctx = kitchen::workflows::coordination::Context {
+        backend: &backend,
+        ..world.ctx()
+    };
+    Ok(launch_worker(
+        &ctx,
+        task,
+        fence,
+        Workspace::Isolated,
+        &brief(1)?,
+    )?)
+}
+
+#[test]
+fn a_worker_placed_on_another_branch_is_stopped_before_it_works() -> TestResult {
+    use kitchen::contracts::WorkerBackend;
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    // Orca prefixes the requested name.
+    let outcome = launch_on(&world, "orca/lemarier/issue-1", false, &task, fence)?;
+    let LaunchOutcome::BranchMismatch {
+        worker,
+        disposition,
+    } = outcome
+    else {
+        return Err(format!("wrong branch was accepted: {outcome:?}").into());
+    };
+    // The worker was stopped, and the task needs a person: a retry would
+    // put another worker on the same wrong branch.
+    assert_eq!(disposition, Disposition::Settled(Settlement::Failed));
+    assert_eq!(
+        world.backend.observe_worker(&worker)?,
+        WorkerState::Settled(WorkerOutcome::Cancelled)
+    );
+    assert!(matches!(
+        world.fixture.store.task(&task)?.state(),
+        TaskState::Settled {
+            settlement: Settlement::Failed,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_refused_stop_of_a_misplaced_worker_keeps_the_attempt_open() -> TestResult {
+    use kitchen::contracts::WorkerBackend;
+    use kitchen::state::AttemptState;
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    let outcome = launch_on(&world, "orca/lemarier/issue-1", true, &task, fence)?;
+    let LaunchOutcome::StopRefused { worker } = outcome else {
+        return Err(format!("unexpected outcome {outcome:?}").into());
+    };
+    assert_eq!(
+        world.backend.observe_worker(&worker)?,
+        WorkerState::Starting
+    );
+    let record = world.fixture.store.task(&task)?;
+    assert!(matches!(record.state(), TaskState::Claimed { .. }));
+    assert_eq!(
+        record
+            .attempts()
+            .last()
+            .map(kitchen::state::AttemptRecord::state),
+        Some(AttemptState::Running)
+    );
+    // A repeat reports the same refusal and asks nothing new of the backend.
+    let calls = world.backend.execute_calls();
+    assert_eq!(
+        launch_on(&world, "orca/lemarier/issue-1", true, &task, fence)?,
+        LaunchOutcome::StopRefused { worker }
+    );
+    assert_eq!(world.backend.execute_calls(), calls);
+    Ok(())
+}
+
+#[test]
+fn a_launch_is_accepted_when_the_backend_reports_the_exact_branch_or_none() -> TestResult {
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    assert!(matches!(
+        launch_on(&world, "lemarier/issue-1", false, &task, fence)?,
+        LaunchOutcome::Accepted { .. }
+    ));
+    // Until the contract carries the requested branch, a backend that
+    // reports none is not refused; settlement still checks the branch.
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    assert!(matches!(
+        launch(&world, &task, fence, 1)?,
+        LaunchOutcome::Accepted { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn supervising_an_adopted_worker_to_its_end_allows_the_replacement() -> TestResult {
+    let world = World::new()?;
+    let (task, fence, worker) = adopted_with_live_worker(&world)?;
+    // The adopting coordinator supervises first: the worker still runs, so
+    // nothing new launches.
+    assert!(matches!(
+        launch(&world, &task, fence, 1)?,
+        LaunchOutcome::SuperviseFirst { .. }
+    ));
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Running(WorkerState::Starting)
+    );
+    assert!(matches!(
+        launch(&world, &task, fence, 1)?,
+        LaunchOutcome::SuperviseFirst { .. }
+    ));
+
+    // It then fails; supervision accounts for the failure, and only after
+    // that does a replacement start.
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Failed));
+    assert!(matches!(
+        step(&world, &task, fence)?,
+        Supervision::Retry { .. }
+    ));
+    let replacement = launched(&world, &task, fence, 1)?;
+    assert_ne!(replacement, worker);
+    assert_eq!(world.backend.effects_performed(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_retry_does_not_depend_on_a_finished_workers_record_surviving_cleanup() -> TestResult {
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    let first = launched(&world, &task, fence, 1)?;
+    world
+        .backend
+        .set_worker_state(&first, WorkerState::Settled(WorkerOutcome::Failed));
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Retry { remaining: 2 }
+    );
+    // The failed attempt was accounted for; the backend has since forgotten
+    // its worker (a cleanup released it).
+    world.backend.set_worker_state(&first, WorkerState::Missing);
+    let second = launched(&world, &task, fence, 1)?;
+    assert_ne!(first, second);
+    Ok(())
+}
+
+#[test]
+fn a_refused_stop_of_an_adopted_worker_still_reserves_its_branch() -> TestResult {
+    let world = World::new()?;
+    let (task, fence, worker) = adopted_with_live_worker(&world)?;
+    world.clock.advance(130);
+    // Supervision starts an attempt to account for the adopted worker, and
+    // the backend refuses to stop it. That attempt has no launch of its own.
+    world.backend.inject(ExecuteFault::Reject);
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Escalate(Escalation::StopRefused)
+    );
+    let effects = world.backend.effects_performed();
+    // The worker may still run, so no other writer launches beside it.
+    assert_eq!(
+        launch(&world, &task, fence, 1)?,
+        LaunchOutcome::SuperviseFirst { worker }
+    );
+    assert_eq!(world.backend.effects_performed(), effects);
     Ok(())
 }

@@ -48,7 +48,7 @@ impl fmt::Display for Conflict {
             Self::Unmanaged => formatter.write_str("existing file differs"),
             Self::ManagedPristine(marker) => write!(
                 formatter,
-                "managed by {} revision {} and unedited; an update can replace it",
+                "managed by {} revision {} and unedited; upstream content or provenance differs; reconcile manually",
                 marker.provenance.template, marker.provenance.revision
             ),
             Self::ManagedEdited(marker) => write!(
@@ -217,6 +217,22 @@ impl FilePlan {
     /// [`HouseError::PartialInstallation`] when rollback could not remove
     /// everything it created.
     pub fn apply(&self) -> crate::Result<InstallReport> {
+        // Recheck files classified as unchanged before applying additions. This
+        // includes the repository binding, so stale house selection is refused.
+        let unchanged: Vec<_> = self
+            .files
+            .iter()
+            .filter(|planned| planned.action == PlanAction::Unchanged)
+            .map(|planned| &planned.file)
+            .collect();
+        let preview = SafeInstaller::preview(&self.target, &new_files(unchanged.into_iter()))?;
+        if preview
+            .files
+            .iter()
+            .any(|file| file.status != FileStatus::AlreadyIdentical)
+        {
+            return Err(HouseError::Conflict.into());
+        }
         Ok(adoption::install_new_files(
             &self.target,
             &new_files(self.additions()),

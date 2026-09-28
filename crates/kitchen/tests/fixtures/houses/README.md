@@ -9,3 +9,8 @@ tests. They are not Kitchen defaults and are never installed by Kitchen.
 - `crabnebula/tauri-app`: a synthetic second house with its own Tauri and specta
   conventions. It proves that one house's rules and names do not leak into
   another house's repository. It is not CrabNebula's real policy.
+
+The Origin89 fixture omits the upstream `.origin89/` bootstrap assets. Before
+using its `skills-sync` recipe, supply the script and all three notices/licenses
+listed in [the template guide](../../../../../templates/README.md#house-guidance-and-bootstrap-assets)
+from a reviewed export. Offline `just check` does not validate guidance loading.

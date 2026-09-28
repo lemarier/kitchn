@@ -903,3 +903,31 @@ fn kitchen_layout_matches_the_origin89_template() -> TestResult {
     assert!(undocumented.is_empty(), "{undocumented:#?}");
     Ok(())
 }
+
+#[test]
+fn changed_or_removed_unchanged_files_refuse_additions() -> TestResult {
+    for remove in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let target = real(&temp)?.join("consumer");
+        FilePlan::new(render_example('a')?, &target)?.apply()?;
+        fs::remove_file(target.join("README.md"))?;
+        let plan = FilePlan::new(render_example('a')?, &target)?;
+        if remove {
+            fs::remove_file(target.join("AGENTS.md"))?;
+        } else {
+            fs::write(target.join("AGENTS.md"), "new local instructions")?;
+        }
+        assert!(matches!(
+            plan.apply(),
+            Err(Error::House(HouseError::Conflict))
+        ));
+        assert!(!target.join("README.md").exists());
+        if !remove {
+            assert_eq!(
+                fs::read_to_string(target.join("AGENTS.md"))?,
+                "new local instructions"
+            );
+        }
+    }
+    Ok(())
+}

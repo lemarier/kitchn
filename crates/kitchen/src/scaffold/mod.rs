@@ -67,3 +67,6 @@ pub use template::{
     MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_FILES, MAX_VARIABLE_BYTES, RenderedFile, RenderedTemplate,
     Template,
 };
+
+mod repository;
+pub use repository::plan_repository;

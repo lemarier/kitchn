@@ -1,7 +1,7 @@
 //! Sanitized offline GitHub boundary regression tests.
 use kitchen::{
     HouseId,
-    contracts::{ExternalRef, Permission, Repository},
+    contracts::{ExternalRef, Permission, Repository, Text},
     integrations::github::*,
 };
 use serde_json::{Value, json};
@@ -432,6 +432,11 @@ fn bounded_mutation_payloads_reject_self_links_and_bad_labels() -> Result {
                 description: String::new(),
             },
         },
+        // Read-back matches titles exactly, so padding could never reconcile.
+        GitHubAction::CreateIssue {
+            title: Text::new(" padded ")?,
+            body: Text::new("body")?,
+        },
     ] {
         assert_eq!(
             GitHubMutation {
@@ -785,5 +790,47 @@ fn inventory_filters_and_timestamps_are_typed() -> Result {
         matches!(found, Observation::Known(v) if v[0].updated_at.as_unix_millis() > 0 && v[0].closed_at.is_none())
     );
     assert!(client.transport().requests.borrow()[0].contains("state=open&since=1970-01-01T"));
+
+    // Offsets normalize to one instant; malformed and pre-epoch values are not guessed.
+    let mut offset = issue(1);
+    offset["updated_at"] = json!("2026-01-02T02:00:00+02:00");
+    offset["closed_at"] = json!("2026-01-02T00:00:01Z");
+    let mut malformed = issue(2);
+    malformed["updated_at"] = json!("2026-01-02 00:00:00");
+    let mut pre_epoch = issue(3);
+    pre_epoch["updated_at"] = json!("1969-12-31T23:59:59Z");
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![
+            Ok(json!([offset])),
+            Ok(json!([malformed])),
+            Ok(json!([pre_epoch])),
+        ])?,
+        ReadLimits::default(),
+    );
+    let (house, repo) = (HouseId::new("sample")?, Repository::new("sample/project")?);
+    let Observation::Known(found) = client.issues(&house, &repo) else {
+        return Err("expected offset timestamp to parse".into());
+    };
+    assert_eq!(found[0].updated_at.as_unix_millis(), 1_767_312_000_000);
+    assert_eq!(
+        found[0].closed_at.map(|date| date.as_unix_millis()),
+        Some(1_767_312_001_000)
+    );
+    assert!(!matches!(
+        client.issues(&house, &repo),
+        Observation::Known(_)
+    ));
+    assert!(!matches!(
+        client.issues(&house, &repo),
+        Observation::Known(_)
+    ));
+    // An unknown state filter is refused before any request.
+    let before = client.transport().requests.borrow().len();
+    assert_eq!(
+        client.issues_filtered(&house, &repo, Some(IssueState::Unknown), None),
+        Observation::Unavailable(IntegrationError::InvalidInput)
+    );
+    assert_eq!(client.transport().requests.borrow().len(), before);
     Ok(())
 }

@@ -1,30 +1,26 @@
 //! Typed provider responses. Missing or unrecognized facts remain unknown.
 
 use crate::contracts::{CommitId, IssueNumber, Repository, Text, Timestamp};
-use serde::{Deserializer, de::Error as _};
+use serde::{Deserialize, Deserializer};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-fn timestamp<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
-    let value = String::deserialize(deserializer)?;
-    let date = OffsetDateTime::parse(&value, &Rfc3339).map_err(D::Error::custom)?;
-    let millis = date.unix_timestamp_nanos() / 1_000_000;
-    let millis = u64::try_from(millis).map_err(D::Error::custom)?;
+/// Parse a provider RFC 3339 timestamp once, at the response boundary.
+/// Instants before the Unix epoch are refused.
+fn parse_timestamp<E: serde::de::Error>(value: &str) -> Result<Timestamp, E> {
+    let date = OffsetDateTime::parse(value, &Rfc3339).map_err(E::custom)?;
+    let millis = u64::try_from(date.unix_timestamp_nanos() / 1_000_000).map_err(E::custom)?;
     Ok(Timestamp::from_unix_millis(millis))
+}
+fn timestamp<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
+    parse_timestamp(&String::deserialize(deserializer)?)
 }
 fn optional_timestamp<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Timestamp>, D::Error> {
     Option::<String>::deserialize(deserializer)?
-        .map(|value| {
-            let date = OffsetDateTime::parse(&value, &Rfc3339).map_err(D::Error::custom)?;
-            let millis =
-                u64::try_from(date.unix_timestamp_nanos() / 1_000_000).map_err(D::Error::custom)?;
-            Ok(Timestamp::from_unix_millis(millis))
-        })
+        .map(|value| parse_timestamp(&value))
         .transpose()
 }
-
-use serde::Deserialize;
 
 /// Whether a complete observation was obtained.
 #[derive(Debug, Clone, PartialEq, Eq)]

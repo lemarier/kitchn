@@ -1,7 +1,7 @@
 //! Sanitized Roger answer fixtures; no live Roger calls.
 use kitchen::{
     HouseId, TaskId,
-    contracts::{CommitId, ExternalRef, Permission, Repository, Text},
+    contracts::{CommitId, EvidenceSubject, ExternalRef, Permission, Repository, Text},
     integrations::{
         github::{CredentialRef, HouseScope, IntegrationError, PostingBudget},
         roger::*,
@@ -33,7 +33,10 @@ fn fixture() -> Result<(HouseScope, DecisionBinding, Value)> {
         action: Permission::Merge,
         target: ExternalRef::new("pr:sample/project#1")?,
         revision: kitchen::contracts::EvidenceRevision::INITIAL,
-        subject: CommitId::new(&"a".repeat(40))?,
+        subject: Some(EvidenceSubject {
+            head: CommitId::new(&"a".repeat(40))?,
+            base: None,
+        }),
         limits: Text::new("squash into main")?,
     };
     let action = json!({"verb":"merge","target":"pr:sample/project#1","rev":"a".repeat(40),"limits":"squash into main"});
@@ -114,6 +117,13 @@ fn cross_house_requester_task_target_and_revision_are_rejected() -> Result {
             .ok_or("invalid fixture pointer")? = value;
         assert_eq!(status(&scope, &binding, &changed)?, Err(error), "{pointer}");
     }
+    // Roger resumes at a head; a binding without an evidence subject has none.
+    let mut unbound = binding;
+    unbound.subject = None;
+    assert_eq!(
+        status(&scope, &unbound, &ask)?,
+        Err(IntegrationError::InvalidInput)
+    );
     Ok(())
 }
 #[test]

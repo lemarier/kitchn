@@ -75,12 +75,12 @@ impl RogerMutationTransport for RogerCli {
             "--action-target".into(),
             binding.target.as_str().into(),
             "--action-rev".into(),
-            binding.subject.as_str().into(),
+            binding.head()?.as_str().into(),
             format!("--action-limits={}", binding.limits.as_str()),
             "--resume-task".into(),
             binding.task.as_str().into(),
             "--resume-rev".into(),
-            binding.subject.as_str().into(),
+            binding.head()?.as_str().into(),
             "--body-file".into(),
             "-".into(),
         ];
@@ -161,7 +161,7 @@ impl RogerMutationTransport for RogerCli {
                 if candidate.get("decisionKey").and_then(Value::as_str)
                     == Some(ask.binding.decision_key()?.as_str())
                     && candidate.pointer("/action/rev").and_then(Value::as_str)
-                        == Some(ask.binding.subject.as_str())
+                        == Some(ask.binding.head()?.as_str())
                 {
                     let id = validate_receipt(
                         credential,
@@ -197,10 +197,10 @@ pub(crate) fn validate_receipt(
         ("/requester", credential.requester().as_str()),
         ("/repo", binding.repository.as_str()),
         ("/resume/task", binding.task.as_str()),
-        ("/resume/rev", binding.subject.as_str()),
+        ("/resume/rev", binding.head()?.as_str()),
         ("/action/verb", binding.action.as_str()),
         ("/action/target", binding.target.as_str()),
-        ("/action/rev", binding.subject.as_str()),
+        ("/action/rev", binding.head()?.as_str()),
         ("/action/limits", binding.limits.as_str()),
         ("/kind", kind),
         ("/title", ask.title.as_str()),

@@ -2,9 +2,9 @@
 use crate::{
     HouseId, TaskId,
     contracts::{
-
-        Capability, CommitId, ContractError, EffectContext, EvidenceRevision, ExecutorKind,
-        ExternalRef, GrantScope, Permission, PostingBudget, Repository, Text, ValueKind,
+        Capability, CommitId, ContractError, EffectContext, EvidenceRevision, EvidenceSubject,
+        ExecutorKind, ExternalRef, GrantScope, Permission, PostingBudget, Repository, Text,
+        ValueKind,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -67,13 +67,25 @@ pub struct DecisionBinding {
     pub target: ExternalRef,
     /// Exact revision of the subject.
     pub revision: EvidenceRevision,
-
-    /// Exact Git subject the human sees.
-    pub subject: CommitId,
+    /// The exact subject (head and base) the question is about; `None` when
+    /// the task had no evidence subject yet. Roger requests require one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<EvidenceSubject>,
     /// Human-visible action constraints.
     pub limits: Text,
 }
 impl DecisionBinding {
+    /// The head commit the human sees and a decision resumes at.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::DecisionBindingMismatch`] without a subject.
+    pub fn head(&self) -> Result<&CommitId, ContractError> {
+        self.subject
+            .as_ref()
+            .map(|subject| &subject.head)
+            .ok_or(ContractError::DecisionBindingMismatch)
+    }
+
     /// Stable name for this house/task/action, independent of process lifetime.
     ///
     /// # Errors
@@ -193,7 +205,9 @@ impl RogerEffect {
     pub const fn required_permission(&self) -> Permission {
         Permission::AskHuman
     }
-    /// Recheck the exact decision binding on every submission.
+    /// Recheck the exact decision binding on every submission: house, task,
+    /// evidence revision, exact evidence subject (head and base), and
+    /// repository scope.
     ///
     /// # Errors
     /// Refuses foreign or stale decisions and invalid payloads.
@@ -203,6 +217,7 @@ impl RogerEffect {
         if &binding.house != context.house
             || &binding.task != context.task
             || binding.revision != context.revision
+            || binding.subject.as_ref() != context.subject
             || !context
                 .task_scope
                 .covers(&GrantScope::Repository(binding.repository.clone()))

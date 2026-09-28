@@ -13,13 +13,12 @@ use std::fmt;
 use crate::{
     BackendId, ConsumerId, CredentialId, HouseId, TaskId,
     contracts::{
-
-        AskKind, AskRisk, AttemptNumber, BackendUnavailable, Capability, CommitId, DecisionBinding,
-        DecisionOwner, Effect, EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision,
-        ExternalRef, GitHubAction, GitHubEffect, GitHubMutation, IdempotencyKey, LabelDefinition,
-        Liveness, Lookup, MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation, Permission,
-        PostingBudget, Receipt, Repository, ResourceKind, ResourceRef, RogerAsk, RogerEffect, Role,
-        ScheduleEffect, Text, WorkerBackend, WorkerState, Workspace,
+        AskKind, AskRisk, AttemptNumber, BackendUnavailable, BranchName, Capability,
+        DecisionBinding, DecisionOwner, Effect, EffectExecutor, EffectFailure, EffectRequest,
+        EvidenceRevision, ExternalRef, GitHubAction, GitHubEffect, GitHubMutation, IdempotencyKey,
+        LabelDefinition, Liveness, Lookup, MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation,
+        Permission, PostingBudget, Receipt, Repository, ResourceKind, ResourceRef, RogerAsk,
+        RogerEffect, Role, ScheduleEffect, Text, WorkerBackend, WorkerState, Workspace,
     },
 };
 
@@ -360,7 +359,6 @@ impl<'a> Runner<'a> {
             ),
             (
                 "unsupported-ask",
-
                 Effect::Roger(RogerEffect {
                     requester: ExternalRef::new("fixture")
                         .or_else(|_| fail(Check::Fixture, "invalid requester"))?,
@@ -370,8 +368,7 @@ impl<'a> Runner<'a> {
                             task: self.fixture.task.clone(),
                             action: Permission::Merge,
                             revision: EvidenceRevision::INITIAL,
-                            subject: CommitId::new(&"a".repeat(40))
-                                .or_else(|_| fail(Check::Fixture, "invalid subject"))?,
+                            subject: None,
                             owner: DecisionOwner::Merge,
                             repository: self.fixture.repository.clone(),
                             target: ExternalRef::new(&format!("pr:{}#1", self.fixture.repository))

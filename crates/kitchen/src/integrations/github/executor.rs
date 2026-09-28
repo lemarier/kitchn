@@ -57,13 +57,6 @@ impl<T: GitHubMutationTransport> GitHubExecutor<T> {
         &self.transport
     }
     fn validate(&self, effect: &GitHubEffect) -> Result<(), IntegrationError> {
-        if matches!(
-            effect.mutation.action,
-            super::GitHubAction::CloseIssue { .. }
-        ) {
-            // #27 owns Permission::CloseIssue. Refuse until that grant exists.
-            return Err(IntegrationError::PermissionDenied);
-        }
         effect.mutation.validate()?;
         if effect.requester != *self.scope.requester()
             || effect.posting_budget.limit() > self.scope.budget().limit()

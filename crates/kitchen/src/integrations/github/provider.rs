@@ -435,18 +435,23 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
         let root = format!("repos/{}", mutation.repository);
         let (method, endpoint, body) = match &mutation.action {
             GitHubAction::CloseIssue { number, reason, .. } => {
-                let (state_reason, duplicate_issue_id) = match reason {
-                    CloseReason::Completed => ("completed", None),
-                    CloseReason::NotPlanned => ("not_planned", None),
-                    CloseReason::Duplicate(of) => {
-                        ("duplicate", Some(self.issue_id(&root, of.get())?))
+                // Unverified against the live API: the REST PATCH accepts
+                // `duplicate_issue_id` (the canonical issue's database ID) with
+                // `state_reason: duplicate`; the key is omitted otherwise.
+                let body = match reason {
+                    CloseReason::Completed => {
+                        json!({"state":"closed","state_reason":"completed"})
                     }
+                    CloseReason::NotPlanned => {
+                        json!({"state":"closed","state_reason":"not_planned"})
+                    }
+                    CloseReason::Duplicate(of) => json!({
+                        "state":"closed",
+                        "state_reason":"duplicate",
+                        "duplicate_issue_id": self.issue_id(&root, of.get())?,
+                    }),
                 };
-                (
-                    "PATCH",
-                    format!("{root}/issues/{}", number.get()),
-                    json!({"state":"closed","state_reason":state_reason,"duplicate_issue_id":duplicate_issue_id}),
-                )
+                ("PATCH", format!("{root}/issues/{}", number.get()), body)
             }
             GitHubAction::MergePullRequest {
                 number,
@@ -700,12 +705,10 @@ mod mutation_tests {
             mutation,
             posting_budget: PostingBudget::new(2)?,
         };
-        assert_eq!(
-            effect.required_permission(),
-            Permission::EditIssueRelationships
-        );
+        assert_eq!(effect.required_permission(), Permission::CloseIssue);
         let encoded = serde_json::to_vec(&effect)?;
         assert_eq!(serde_json::from_slice::<GitHubEffect>(&encoded)?, effect);
+        // Relationship edits do not imply closing an issue.
         let executor = super::super::GitHubExecutor::new(
             crate::BackendId::new("github")?,
             scope,
@@ -713,9 +716,28 @@ mod mutation_tests {
             ReadLimits::default(),
         );
         assert!(matches!(
-            executor.effect(effect.mutation),
+            executor.effect(effect.mutation.clone()),
             Err(IntegrationError::PermissionDenied)
         ));
+        let granted = HouseScope::new(
+            HouseId::new("sample")?,
+            [Repository::new("sample/project")?],
+            effect.requester.clone(),
+            CredentialRef::new(
+                HouseId::new("sample")?,
+                CredentialId::new("gh")?,
+                effect.requester.clone(),
+            ),
+            PostingBudget::new(2)?,
+            [Permission::CloseIssue],
+        )?;
+        let executor = super::super::GitHubExecutor::new(
+            crate::BackendId::new("github")?,
+            granted,
+            ReadFixture(RefCell::new(VecDeque::new())),
+            ReadLimits::default(),
+        );
+        assert_eq!(executor.effect(effect.mutation.clone())?, effect);
         Ok(())
     }
 
@@ -752,6 +774,21 @@ mod mutation_tests {
         let prepared = provider.prepare(&mutation, &key)?;
         assert_eq!(prepared.body()["duplicate_issue_id"], 102);
         assert_eq!(prepared.body()["state_reason"], "duplicate");
+        let read = ReadFixture(RefCell::new(VecDeque::new()));
+        let mut provider = Provider::new(&scope, &read, ReadLimits::default());
+        let completed = GitHubMutation {
+            repository: mutation.repository.clone(),
+            action: GitHubAction::CloseIssue {
+                repository: mutation.repository.clone(),
+                number: IssueNumber::new(1)?,
+                reason: CloseReason::Completed,
+            },
+        };
+        let prepared = provider.prepare(&completed, &key)?;
+        assert_eq!(
+            prepared.body(),
+            &json!({"state":"closed","state_reason":"completed"})
+        );
         let read = ReadFixture(RefCell::new(VecDeque::from([
             json!({"number":1,"state":"closed","state_reason":"duplicate","duplicate_issue_id":102}),
             json!({"data":{"repository":{"issue":{"duplicateOf":{"number":2,"repository":{"nameWithOwner":"sample/project"}}}}}}),
@@ -817,6 +854,14 @@ mod mutation_tests {
                 }),
             ),
             (
+                "HTTP/2 429 Too Many Requests\r\nRetry-After: Wed, 21 Oct 2026 07:28:00 GMT",
+                EffectFailure::NotApplied(NotAppliedReason::RateLimited { retry_after: None }),
+            ),
+            (
+                "HTTP/2 200 OK",
+                EffectFailure::Uncertain(UncertainReason::Transport),
+            ),
+            (
                 "HTTP/2 404 Not Found",
                 EffectFailure::NotApplied(NotAppliedReason::Rejected),
             ),
@@ -830,7 +875,7 @@ mod mutation_tests {
             ),
         ] {
             let script = format!(
-                "for arg in \"$@\"; do case \"$arg\" in *fixture-secret*) exit 9;; esac; done\ncase \" $* \" in *' user '*) printf '%s' '{{\"login\":\"sample-bot\"}}';; *) printf '%s\\r\\n\\r\\n' '{response}'; exit 1;; esac"
+                "for arg in \"$@\"; do case \"$arg\" in *fixture-secret*) exit 9;; esac; done\ncase \" $* \" in *' user '*) printf '%s' '{{\"login\":\"sample-bot\"}}';; *' --include '*) printf '%s\\r\\n\\r\\n' '{response}'; exit 1;; *) exit 1;; esac"
             );
             let (_directory, cli, credential) = fake_cli(&script)?;
             assert_eq!(
@@ -838,6 +883,14 @@ mod mutation_tests {
                 Err(expected)
             );
         }
+        // gh exits 4 for authentication refusals without printing a status line.
+        let (_directory, cli, credential) = fake_cli(
+            "case \" $* \" in *' user '*) printf '%s' '{\"login\":\"sample-bot\"}';; *) exit 4;; esac",
+        )?;
+        assert_eq!(
+            cli.submit(&credential, &request, Duration::from_secs(2), 4096),
+            Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+        );
         let (_directory, cli, credential) = fake_cli(
             "case \" $* \" in *' user '*) printf '%s' '{\"login\":\"wrong\"}';; *) exit 9;; esac",
         )?;

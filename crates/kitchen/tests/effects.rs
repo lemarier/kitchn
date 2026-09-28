@@ -11,12 +11,12 @@ use common::{
 use kitchen::{
     BackendId, ConsumerId, Error, TaskId,
     contracts::{
-        AskKind, AskRisk, Capability, CapabilitySet, CommitId, ContractError, DecisionBinding,
-        DecisionOwner, Effect, EffectExecutor, EvidenceRevision, ExecutorKind, ExternalRef, Fence,
-        GitHubAction, GitHubEffect, GitHubMutation, Grant, GrantScope, HouseGrants,
-        LabelDefinition, Liveness, MAX_ASKS_PER_TASK, NotAppliedReason, Operation, Permission,
-        PostingBudget, Repository, ResourceKind, ResourceRef, RogerAsk, RogerEffect,
-        ScheduleEffect, TaskAuthority, Text, WorkerBackend,
+        AskKind, AskRisk, Capability, CapabilitySet, ContractError, DecisionBinding, DecisionOwner,
+        Effect, EffectExecutor, EvidenceRevision, ExecutorKind, ExternalRef, Fence, GitHubAction,
+        GitHubEffect, GitHubMutation, Grant, GrantScope, HouseGrants, LabelDefinition, Liveness,
+        MAX_ASKS_PER_TASK, NotAppliedReason, Operation, Permission, PostingBudget, Repository,
+        ResourceKind, ResourceRef, RogerAsk, RogerEffect, ScheduleEffect, TaskAuthority, Text,
+        WorkerBackend,
         conformance::{self, Check, CheckResult, ConformanceFixture},
         fake::{ExecuteFault, FakeBackend},
     },
@@ -68,7 +68,14 @@ fn label(repository: Repository, name: &str) -> TestResult<Effect> {
 }
 
 fn ask(task: &TaskId, revision: EvidenceRevision) -> TestResult<Effect> {
+    ask_about(task, revision, None)
+}
 
+fn ask_about(
+    task: &TaskId,
+    revision: EvidenceRevision,
+    subject: Option<kitchen::contracts::EvidenceSubject>,
+) -> TestResult<Effect> {
     Ok(RogerEffect {
         requester: ExternalRef::new("fixture")?,
         ask: RogerAsk {
@@ -77,7 +84,7 @@ fn ask(task: &TaskId, revision: EvidenceRevision) -> TestResult<Effect> {
                 task: task.clone(),
                 action: Permission::Merge,
                 revision,
-                subject: CommitId::new(&"a".repeat(40))?,
+                subject,
                 owner: DecisionOwner::Merge,
                 repository: km43()?,
                 target: ExternalRef::new("pr:origin89hq/km43#1")?,

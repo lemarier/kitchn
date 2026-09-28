@@ -70,6 +70,20 @@ closed_names! {
         ReleaseResource = "release_resource",
         /// The `create_label` effect.
         CreateLabel = "create_label",
+        /// The `post_comment` effect.
+        PostComment = "post_comment",
+        /// The `set_label` effect.
+        SetLabel = "set_label",
+        /// The `create_issue` effect.
+        CreateIssue = "create_issue",
+        /// The `link_sub_issue` effect.
+        LinkSubIssue = "link_sub_issue",
+        /// The `link_dependency` effect.
+        LinkDependency = "link_dependency",
+        /// The `merge_pull_request` effect.
+        MergePullRequest = "merge_pull_request",
+        /// The `close_issue` effect.
+        CloseIssue = "close_issue",
         /// The `ask` effect.
         Ask = "ask",
         /// The `install_disabled_schedule` effect.
@@ -88,6 +102,13 @@ impl EffectKind {
             Self::CancelWorker => Capability::LookupCancelWorker,
             Self::ReleaseResource => Capability::LookupReleaseResource,
             Self::CreateLabel => Capability::LookupCreateLabel,
+            Self::PostComment => Capability::LookupPostComment,
+            Self::SetLabel => Capability::LookupSetLabel,
+            Self::CreateIssue => Capability::LookupCreateIssue,
+            Self::LinkSubIssue => Capability::LookupLinkSubIssue,
+            Self::LinkDependency => Capability::LookupLinkDependency,
+            Self::MergePullRequest => Capability::LookupMergePullRequest,
+            Self::CloseIssue => Capability::LookupCloseIssue,
             Self::Ask => Capability::LookupAsk,
             Self::InstallDisabledSchedule => Capability::LookupInstallDisabledSchedule,
         }
@@ -103,6 +124,13 @@ impl EffectKind {
             Self::CancelWorker => Capability::IdempotentCancelWorker,
             Self::ReleaseResource => Capability::IdempotentReleaseResource,
             Self::CreateLabel => Capability::IdempotentCreateLabel,
+            Self::PostComment => Capability::IdempotentPostComment,
+            Self::SetLabel => Capability::IdempotentSetLabel,
+            Self::CreateIssue => Capability::IdempotentCreateIssue,
+            Self::LinkSubIssue => Capability::IdempotentLinkSubIssue,
+            Self::LinkDependency => Capability::IdempotentLinkDependency,
+            Self::MergePullRequest => Capability::IdempotentMergePullRequest,
+            Self::CloseIssue => Capability::IdempotentCloseIssue,
             Self::Ask => Capability::IdempotentAsk,
             Self::InstallDisabledSchedule => Capability::IdempotentInstallDisabledSchedule,
         }
@@ -148,8 +176,17 @@ impl Effect {
                 Operation::CancelWorker { .. } => EffectKind::CancelWorker,
                 Operation::ReleaseResource { .. } => EffectKind::ReleaseResource,
             },
-            Self::GitHub(GitHubEffect::CreateLabel { .. }) => EffectKind::CreateLabel,
-            Self::Roger(RogerEffect::Ask { .. }) => EffectKind::Ask,
+            Self::GitHub(effect) => match effect.mutation.action {
+                GitHubAction::CreateLabel { .. } => EffectKind::CreateLabel,
+                GitHubAction::PostComment { .. } => EffectKind::PostComment,
+                GitHubAction::SetLabel { .. } => EffectKind::SetLabel,
+                GitHubAction::CreateIssue { .. } => EffectKind::CreateIssue,
+                GitHubAction::LinkSubIssue { .. } => EffectKind::LinkSubIssue,
+                GitHubAction::LinkDependency { .. } => EffectKind::LinkDependency,
+                GitHubAction::MergePullRequest { .. } => EffectKind::MergePullRequest,
+                GitHubAction::CloseIssue { .. } => EffectKind::CloseIssue,
+            },
+            Self::Roger(_) => EffectKind::Ask,
             Self::Schedule(ScheduleEffect::InstallDisabled { .. }) => {
                 EffectKind::InstallDisabledSchedule
             }

@@ -9,9 +9,13 @@ impl DecisionBinding {
     /// Validate the selected house before reading an answer or submitting an Ask.
     ///
     /// # Errors
-    /// Refuses cross-house/repository decisions and invalid bounded content.
+    /// Refuses cross-house/repository decisions, invalid bounded content, and
+    /// a binding without the evidence subject Roger resumes at.
     pub fn validate(&self, scope: &HouseScope) -> Result<(), IntegrationError> {
         scope.authorize_read(&self.house, &self.repository)?;
+        if self.subject.is_none() {
+            return Err(IntegrationError::InvalidInput);
+        }
         self.decision_key()?;
         Ok(())
     }
@@ -94,17 +98,17 @@ pub fn validate_answer(
     {
         return Err(IntegrationError::ScopeMismatch);
     }
-    if ask.resume.rev != binding.subject {
+    if ask.resume.rev != *binding.head()? {
         return Err(IntegrationError::StaleDecision);
     }
     let action = Action {
         verb: binding.action.as_str().into(),
         target: binding.target.clone(),
-        rev: binding.subject.clone(),
+        rev: binding.head()?.clone(),
         limits: Some(binding.limits.clone()),
     };
     if let Some(received) = &ask.action {
-        if received.rev != binding.subject {
+        if received.rev != *binding.head()? {
             return Err(IntegrationError::StaleDecision);
         }
         if received != &action {

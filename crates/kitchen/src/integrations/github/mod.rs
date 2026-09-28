@@ -22,10 +22,14 @@
 //! effects, rather than promising a wall-clock posting rate limit.
 //! Provider 4xx refusals are definitely not applied; rate-limit responses carry
 //! a typed retry delay when one is supplied. Transport and 5xx outcomes require
-//! reconciliation. Merge requires the approved head and base branch.
-//! `CloseIssue` is disabled until its distinct grant lands; its PATCH field
-//! `duplicate_issue_id` and GraphQL `duplicateOf` read-back still require live
-//! API verification before activation.
+//! reconciliation. Merge requires the approved head and base branch; a
+//! retargeted or moved pull request is refused before submission, and a merge
+//! at the approved head by another actor or method reads back as applied.
+//! `SetLabel` refuses a label the repository does not define. `CloseIssue`
+//! requires the distinct [`Permission::CloseIssue`](crate::contracts::Permission)
+//! grant; its PATCH field `duplicate_issue_id` and GraphQL `duplicateOf`
+//! read-back are not yet verified against the live API, and a wrong shape
+//! reads back as unknown or conflicting, never as applied.
 
 mod mutation;
 pub(crate) mod process;

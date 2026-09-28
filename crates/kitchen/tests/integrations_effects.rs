@@ -23,6 +23,7 @@ struct Remote {
     defined_labels: Option<Vec<Value>>,
     comments: Vec<Value>,
     issues: Vec<Value>,
+    issue_one: Option<Value>,
     relations: BTreeMap<String, Vec<Value>>,
     calls: Vec<(String, Value)>,
     fault: Option<Fault>,
@@ -71,6 +72,8 @@ impl GitHubReadTransport for Provider {
             } else {
                 json!(remote.defined_labels.as_ref().unwrap_or(&remote.labels))
             }
+        } else if path.ends_with("/issues/1") {
+            remote.issue_one.clone().ok_or(IntegrationError::Unknown)?
         } else if path.ends_with("/issues/2") {
             json!({"id":102,"number":2})
         } else if path.contains("/sub_issues?") || path.contains("/dependencies/blocked_by?") {
@@ -126,6 +129,13 @@ impl GitHubMutationTransport for Provider {
             }
             pr["merged"] = json!(true);
             pr["merge_commit_sha"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        } else if path.ends_with("/issues/1") && request.method() == "PATCH" {
+            let issue = remote
+                .issue_one
+                .as_mut()
+                .ok_or(EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
+            issue["state"] = body["state"].clone();
+            issue["state_reason"] = body["state_reason"].clone();
         } else if path.ends_with("/issues") {
             remote.issues.push(json!({"id":103,"number":3,"title":body["title"],"body":body["body"],"user":{"login":"sample-bot"},"html_url":"https://github.com/sample/project/issues/3"}));
         } else if path.contains("/sub_issues") || path.contains("/dependencies/blocked_by") {
@@ -262,6 +272,89 @@ fn github_lost_response_reconciles_after_restart_without_duplicate_comment() -> 
     );
     assert_eq!(remote.borrow().calls.len(), 1);
     assert_eq!(remote.borrow().comments.len(), 1);
+    Ok(())
+}
+#[test]
+fn close_issue_requires_its_grant_and_reconciles_lost_response() -> TestResult {
+    let close = || -> TestResult<GitHubMutation> {
+        mutation(GitHubAction::CloseIssue {
+            repository: Repository::new("sample/project")?,
+            number: IssueNumber::new(1)?,
+            reason: CloseReason::NotPlanned,
+        })
+    };
+    // Relationship edits do not imply closing an issue.
+    let fixture = Fixture::new()?;
+    let (scope, _, task, _) = setup(&fixture, 3, &[Permission::EditIssueRelationships], "github")?;
+    let remote = Rc::new(RefCell::new(Remote::default()));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote)?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        backend.effect(close()?),
+        Err(IntegrationError::PermissionDenied)
+    );
+
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) = setup(&fixture, 3, &[Permission::CloseIssue], "github")?;
+    let remote = Rc::new(RefCell::new(Remote {
+        issue_one: Some(json!({"number":1,"state":"open","state_reason":null})),
+        fault: Some(Fault::LoseAfterApply),
+        ..Remote::default()
+    }));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope.clone(),
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let effect = backend.effect(close()?)?;
+    let first = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "close", effect.clone())?,
+        &ManualClock::starting_at(1),
+    )?;
+    assert!(matches!(first.state(), EffectState::Uncertain { .. }));
+    let restarted = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let reconciled = kitchen::state::reconcile(
+        &fixture.reopen()?,
+        &restarted,
+        &task,
+        fence,
+        &ManualClock::starting_at(2),
+    )?;
+    assert_eq!(reconciled.resolved.len(), 1);
+    let second = run_effect(
+        &fixture.reopen()?,
+        &restarted,
+        &grants,
+        plan(&task, fence, "close", effect)?,
+        &ManualClock::starting_at(3),
+    )?;
+    assert!(matches!(second.state(), EffectState::Applied { .. }));
+    let remote = remote.borrow();
+    assert_eq!(remote.calls.len(), 1);
+    assert_eq!(
+        remote.calls[0],
+        (
+            "repos/sample/project/issues/1".into(),
+            json!({"state":"closed","state_reason":"not_planned"})
+        )
+    );
+    assert_eq!(
+        remote.issue_one,
+        Some(json!({"number":1,"state":"closed","state_reason":"not_planned"}))
+    );
     Ok(())
 }
 #[test]
@@ -666,7 +759,7 @@ impl RogerMutationTransport for Provider {
             return Err(IntegrationError::Unavailable);
         }
         let binding = &ask.binding;
-        let value = json!({"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","requester":credential.requester().as_str(),"repo":binding.repository.as_str(),"decisionKey":binding.decision_key()?,"resume":{"task":binding.task.as_str(),"rev":binding.subject.as_str()},"action":{"verb":binding.action.as_str(),"target":binding.target.as_str(),"rev":binding.subject.as_str(),"limits":binding.limits.as_str()},"kind":"approval","title":ask.title.as_str(),"body":ask.body.as_str(),"state":"open","answer":null,"supersededBy":null});
+        let value = json!({"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","requester":credential.requester().as_str(),"repo":binding.repository.as_str(),"decisionKey":binding.decision_key()?,"resume":{"task":binding.task.as_str(),"rev":binding.head()?.as_str()},"action":{"verb":binding.action.as_str(),"target":binding.target.as_str(),"rev":binding.head()?.as_str(),"limits":binding.limits.as_str()},"kind":"approval","title":ask.title.as_str(),"body":ask.body.as_str(),"state":"open","answer":null,"supersededBy":null});
         let value = remote
             .asks
             .entry(key.as_str().into())
@@ -713,7 +806,10 @@ fn question(task: &TaskId) -> TestResult<RogerAsk> {
             action: Permission::Merge,
             target: ExternalRef::new("pr:sample/project#1")?,
             revision: EvidenceRevision::INITIAL,
-            subject: CommitId::new(&"a".repeat(40))?,
+            subject: Some(EvidenceSubject {
+                head: CommitId::new(&"a".repeat(40))?,
+                base: None,
+            }),
             limits: Text::new("squash into main")?,
         },
         kind: AskKind::Approval,
@@ -722,6 +818,48 @@ fn question(task: &TaskId) -> TestResult<RogerAsk> {
         body: Text::new("Sanitized evidence and recommendation")?,
         supersedes: None,
     })
+}
+
+/// Records the evidence subject `question` names and returns its revision:
+/// core refuses an ask whose subject differs from the task's current one.
+fn record_question_subject(
+    fixture: &Fixture,
+    task: &TaskId,
+    fence: Fence,
+) -> TestResult<EvidenceRevision> {
+    Ok(fixture.store.record_evidence(
+        task,
+        fence,
+        Evidence {
+            kind: EvidenceKind::Check,
+            verdict: EvidenceVerdict::Pass,
+            subject: EvidenceSubject {
+                head: CommitId::new(&"a".repeat(40))?,
+                base: None,
+            },
+            source: ExternalRef::new("ci-1")?,
+            observed_at: at(1),
+        },
+        at(1),
+    )?)
+}
+fn evidenced_question(fixture: &Fixture, task: &TaskId, fence: Fence) -> TestResult<RogerAsk> {
+    let mut ask = question(task)?;
+    ask.binding.revision = record_question_subject(fixture, task, fence)?;
+    Ok(ask)
+}
+
+/// A plan decided at the task's current evidence revision.
+fn plan_at(
+    task: &TaskId,
+    fence: Fence,
+    name: &str,
+    effect: impl Into<Effect>,
+    revision: EvidenceRevision,
+) -> TestResult<kitchen::state::EffectPlan> {
+    let mut plan = plan(task, fence, name, effect)?;
+    plan.decided_at = revision;
+    Ok(plan)
 }
 
 #[test]
@@ -785,12 +923,14 @@ fn roger_restart_native_idempotency_recovers_lost_response_and_preserves_one_ask
         provider(&fixture, &task, remote.clone())?,
         ReadLimits::default(),
     );
-    let effect = backend.effect(question(&task)?)?;
+    let asked = evidenced_question(&fixture, &task, fence)?;
+    let revision = asked.binding.revision;
+    let effect = backend.effect(asked)?;
     let first = run_effect(
         &fixture.store,
         &backend,
         &grants,
-        plan(&task, fence, "ask", effect.clone())?,
+        plan_at(&task, fence, "ask", effect.clone(), revision)?,
         &ManualClock::starting_at(1),
     )?;
     assert!(matches!(first.state(), EffectState::Uncertain { .. }));
@@ -804,7 +944,7 @@ fn roger_restart_native_idempotency_recovers_lost_response_and_preserves_one_ask
         &fixture.reopen()?,
         &restarted,
         &grants,
-        plan(&task, fence, "ask", effect.clone())?,
+        plan_at(&task, fence, "ask", effect.clone(), revision)?,
         &ManualClock::starting_at(2),
     )?;
     let EffectState::Applied { receipt, .. } = second.state() else {
@@ -841,37 +981,59 @@ fn roger_stale_counter_wrong_task_and_budget_fail_before_submission() -> TestRes
         provider(&fixture, &task, remote.clone())?,
         ReadLimits::default(),
     );
-    let wrong = backend.effect(question(&TaskId::new("wrong-task")?)?)?;
+    let current = record_question_subject(&fixture, &task, fence)?;
+    let mut wrong = question(&TaskId::new("wrong-task")?)?;
+    wrong.binding.revision = current;
+    let wrong = backend.effect(wrong)?;
     assert!(matches!(
         run_effect(
             &fixture.store,
             &backend,
             &grants,
-            plan(&task, fence, "wrong", wrong)?,
+            plan_at(&task, fence, "wrong", wrong, current)?,
             &ManualClock::starting_at(1)
         ),
         Err(Error::Contract(ContractError::DecisionBindingMismatch))
     ));
     let mut stale = question(&task)?;
-    stale.binding.revision = serde_json::from_str("1")?;
+    stale.binding.revision = EvidenceRevision::INITIAL;
+    assert_ne!(stale.binding.revision, current);
     assert!(matches!(
         run_effect(
             &fixture.store,
             &backend,
             &grants,
-            plan(&task, fence, "stale", backend.effect(stale)?)?,
+            plan_at(&task, fence, "stale", backend.effect(stale)?, current)?,
+            &ManualClock::starting_at(1)
+        ),
+        Err(Error::Contract(ContractError::DecisionBindingMismatch))
+    ));
+    let mut moved = question(&task)?;
+    moved.binding.revision = current;
+    moved.binding.subject = Some(EvidenceSubject {
+        head: CommitId::new(&"b".repeat(40))?,
+        base: None,
+    });
+    assert!(matches!(
+        run_effect(
+            &fixture.store,
+            &backend,
+            &grants,
+            plan_at(&task, fence, "moved", backend.effect(moved)?, current)?,
             &ManualClock::starting_at(1)
         ),
         Err(Error::Contract(ContractError::DecisionBindingMismatch))
     ));
     assert!(remote.borrow().calls.is_empty());
-    let effect = backend.effect(question(&task)?)?;
+    let mut effect = question(&task)?;
+    effect.binding.revision = current;
+    let effect = backend.effect(effect)?;
     assert!(matches!(
         run_effect(
             &fixture.store,
             &backend,
             &grants,
-            plan(&task, fence, "first", effect.clone())?,
+            plan_at(&task, fence, "first", effect.clone(), current)?,
             &ManualClock::starting_at(1)
         )?
         .state(),
@@ -882,7 +1044,7 @@ fn roger_stale_counter_wrong_task_and_budget_fail_before_submission() -> TestRes
             &fixture.store,
             &backend,
             &grants,
-            plan(&task, fence, "second", effect)?,
+            plan_at(&task, fence, "second", effect, current)?,
             &ManualClock::starting_at(2)
         ),
         Err(Error::Contract(ContractError::EffectBudgetExhausted { .. }))
@@ -961,7 +1123,7 @@ fn squash_merge_is_exact_head_and_reconciles_lost_response() -> TestResult {
     let effect = backend.effect(mutation(GitHubAction::MergePullRequest {
         number: IssueNumber::new(1)?,
         expected_head: head.clone(),
-        expected_base: "main".into(),
+        expected_base: BranchName::new("main")?,
         method: MergeMethod::Squash,
     })?)?;
     assert_eq!(effect.required_permission(), Permission::Merge);
@@ -1012,7 +1174,7 @@ fn squash_merge_rejects_moved_base_before_submission() -> TestResult {
     let effect = backend.effect(mutation(GitHubAction::MergePullRequest {
         number: IssueNumber::new(1)?,
         expected_head: head,
-        expected_base: "main".into(),
+        expected_base: BranchName::new("main")?,
         method: MergeMethod::Squash,
     })?)?;
     let record = run_effect(
@@ -1047,7 +1209,7 @@ fn squash_merge_rejects_moved_head_before_submission() -> TestResult {
     let effect = backend.effect(mutation(GitHubAction::MergePullRequest {
         number: IssueNumber::new(1)?,
         expected_head: expected,
-        expected_base: "main".into(),
+        expected_base: BranchName::new("main")?,
         method: MergeMethod::Squash,
     })?)?;
     let record = run_effect(

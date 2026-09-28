@@ -18,8 +18,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    HolderId, HouseId, TaskId,
-    contracts::{ContractError, Effect, EvidenceRevision, ExternalRef},
+    ConsumerId, HolderId, HouseId, TaskId,
+    contracts::{ContractError, Effect, EvidenceRevision, ExternalRef, Fence},
 };
 
 /// What started a piece of work.
@@ -41,6 +41,16 @@ impl fmt::Display for Trigger {
     }
 }
 
+/// A workflow consumer lease a claimant acts under.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConsumerFence {
+    /// The consumer scope.
+    pub consumer: ConsumerId,
+    /// The consumer lease's fence.
+    pub fence: Fence,
+}
+
 /// Who claims work, and under which trigger.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -49,6 +59,11 @@ pub struct Claimant {
     pub holder: HolderId,
     /// The trigger it acts under.
     pub trigger: Trigger,
+    /// The workflow consumer lease the claimant acts under, if any. When set,
+    /// task creation, claims, and every effect of the claim require that
+    /// lease to be current and live, so a superseded consumer cannot act.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<ConsumerFence>,
 }
 
 impl Claimant {
@@ -58,6 +73,7 @@ impl Claimant {
         Self {
             holder,
             trigger: Trigger::Scheduled,
+            consumer: None,
         }
     }
 
@@ -67,7 +83,15 @@ impl Claimant {
         Self {
             holder,
             trigger: Trigger::Interactive,
+            consumer: None,
         }
+    }
+
+    /// Act under the consumer lease `fence` for `consumer`.
+    #[must_use]
+    pub fn under(mut self, consumer: ConsumerId, fence: Fence) -> Self {
+        self.consumer = Some(ConsumerFence { consumer, fence });
+        self
     }
 }
 

@@ -14,6 +14,10 @@
 //!   the task's standing authority; effects under an interactive claim need
 //!   a [`crate::contracts::Consent`] for exactly that effect, within house
 //!   policy limits.
+//! - A claimant may act under a workflow consumer lease
+//!   ([`crate::contracts::Claimant::under`]). Creating a task, claiming it,
+//!   and every effect of that claim then require the consumer lease to be
+//!   current and live, so a superseded or expired consumer cannot act.
 //! - Starting work (attempts, effects, message consumption) needs a live
 //!   lease. Recording facts (outcomes, evidence, finishing) needs only the
 //!   current fence.

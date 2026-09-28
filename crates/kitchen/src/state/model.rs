@@ -15,10 +15,11 @@ use crate::{
     ConsumerId, CredentialId, EffectName, Error, HolderId, HouseId, TaskId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Capability,
-        Claimant, Consent, ContractError, Disposition, Effect, EffectContext, EffectRequest,
-        EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef, FailureClass, Fence,
-        HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef,
-        RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Timestamp, Trigger, UncertainReason,
+        Claimant, Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext,
+        EffectRequest, EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef,
+        FailureClass, Fence, HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation,
+        Receipt, ResourceRef, RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Timestamp,
+        Trigger, UncertainReason,
     },
     state::{ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, StateError},
 };
@@ -54,6 +55,8 @@ fn fail<T>(error: StateError) -> Result<T> {
 pub struct Lease {
     holder: HolderId,
     trigger: Trigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consumer: Option<ConsumerFence>,
     fence: Fence,
     acquired_at: Timestamp,
     expires_at: Timestamp,
@@ -71,6 +74,12 @@ impl Lease {
     #[must_use]
     pub const fn trigger(&self) -> Trigger {
         self.trigger
+    }
+
+    /// The workflow consumer lease the owner acts under, if any.
+    #[must_use]
+    pub const fn consumer(&self) -> Option<&ConsumerFence> {
+        self.consumer.as_ref()
     }
 
     /// The fence presented by the owner for every change.
@@ -1053,6 +1062,7 @@ impl StoreState {
         Lease {
             holder: claimant.holder.clone(),
             trigger: claimant.trigger,
+            consumer: claimant.consumer.clone(),
             fence: self.issue_fence(),
             acquired_at: now,
             expires_at: now.saturating_add(ttl.duration()),
@@ -1079,12 +1089,47 @@ impl StoreState {
         self.consumers.get(id)
     }
 
+    /// Require that `fence` is the current, live lease of its consumer.
+    fn check_consumer(&self, fence: &ConsumerFence, now: Timestamp) -> Result<()> {
+        match self
+            .consumers
+            .get(&fence.consumer)
+            .map(ConsumerRecord::state)
+        {
+            None => fail(StateError::ConsumerNotFound(fence.consumer.clone())),
+            Some(ConsumerState::Held { lease }) if lease.fence == fence.fence => {
+                if lease.is_live(now) {
+                    Ok(())
+                } else {
+                    fail(StateError::LeaseExpired {
+                        expired_at: lease.expires_at,
+                    })
+                }
+            }
+            Some(
+                ConsumerState::Held { .. }
+                | ConsumerState::Relinquished { .. }
+                | ConsumerState::Idle,
+            ) => fail(StateError::StaleFence {
+                presented: fence.fence,
+            }),
+        }
+    }
+
+    fn check_claimant(&self, claimant: &Claimant, now: Timestamp) -> Result<()> {
+        match &claimant.consumer {
+            Some(fence) => self.check_consumer(fence, now),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn create_task(
         &mut self,
         spec: TaskSpec,
         created_by: &Claimant,
         now: Timestamp,
     ) -> Result<Creation> {
+        self.check_claimant(created_by, now)?;
         if spec.authority.house() != &self.house {
             return Err(ContractError::CrossHouse {
                 expected: self.house.clone(),
@@ -1127,6 +1172,7 @@ impl StoreState {
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
+        self.check_claimant(claimant, now)?;
         match &self.task(id)?.state {
             TaskState::Open => {}
             TaskState::Claimed { lease } if lease.is_live(now) => {
@@ -1215,6 +1261,7 @@ impl StoreState {
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<Lease> {
+        self.check_claimant(claimant, now)?;
         let previous = match &self.task(id)?.state {
             TaskState::Open => return self.claim(id, claimant, ttl, now),
             TaskState::Claimed { lease } if lease.is_live(now) => {
@@ -1421,6 +1468,15 @@ impl StoreState {
         };
         let house = self.house.clone();
         let nonce = self.nonce;
+        // Work claimed under a workflow consumer stops when that consumer is
+        // superseded, even while the task lease itself is live.
+        if let Some(TaskState::Claimed { lease }) =
+            self.tasks.get(&plan.task).map(|task| &task.state)
+            && lease.fence == plan.fence
+            && let Some(consumer) = &lease.consumer
+        {
+            self.check_consumer(consumer, now)?;
+        }
         let task = self.task_mut(&plan.task)?;
         backend.capabilities.require(
             task.spec

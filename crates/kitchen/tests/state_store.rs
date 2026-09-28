@@ -1722,3 +1722,64 @@ fn a_waiver_expires_when_the_evidence_moves() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn a_superseded_consumer_cannot_create_claim_or_act() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let pickup = ConsumerId::new("pickup-origin89")?;
+    let first = store.acquire_consumer(&pickup, &scheduled("tick-1")?, ttl(60)?, at(0))?;
+    let tick1 = scheduled("tick-1")?.under(pickup.clone(), first.fence());
+    store.create_task(spec("task-1")?, &tick1, at(1))?;
+    let task = task_id("task-1")?;
+    let lease = store.claim(&task, &tick1, ttl(600)?, at(1))?;
+    assert_eq!(
+        lease.consumer().map(|consumer| consumer.fence),
+        Some(first.fence())
+    );
+    store.start_attempt(&task, lease.fence(), at(1))?;
+    assert!(matches!(
+        store.begin_effect(
+            plan(&task, lease.fence(), "launch", launch()?)?,
+            &grants()?,
+            &common::refusing()?,
+            at(2)
+        )?,
+        EffectStart::Execute(_)
+    ));
+
+    // The consumer lease expires and tick 2 takes the scope over. Tick 1's
+    // task lease is still live, but its consumer is superseded.
+    let second = store.take_over_consumer(&pickup, &scheduled("tick-2")?, ttl(60)?, at(61))?;
+    assert!(matches!(
+        store.begin_effect(plan(&task, lease.fence(), "message", launch()?)?, &grants()?, &common::refusing()?, at(62)),
+        Err(Error::State(StateError::StaleFence { presented })) if presented == first.fence()
+    ));
+    assert!(matches!(
+        store.create_task(spec("task-2")?, &tick1, at(62)),
+        Err(Error::State(StateError::StaleFence { .. }))
+    ));
+    assert!(
+        store.task(&task_id("task-2")?).is_err(),
+        "no task was created"
+    );
+    let tick2 = scheduled("tick-2")?.under(pickup.clone(), second.fence());
+    store.create_task(spec("task-2")?, &tick2, at(62))?;
+    assert!(matches!(
+        store.claim(&task_id("task-2")?, &tick1, ttl(60)?, at(62)),
+        Err(Error::State(StateError::StaleFence { .. }))
+    ));
+    store.claim(&task_id("task-2")?, &tick2, ttl(60)?, at(62))?;
+
+    // An expired consumer lease stops its work too.
+    assert!(matches!(
+        store.create_task(spec("task-3")?, &tick2, at(200)),
+        Err(Error::State(StateError::LeaseExpired { .. }))
+    ));
+    let unknown = scheduled("tick-3")?.under(ConsumerId::new("unknown")?, second.fence());
+    assert!(matches!(
+        store.create_task(spec("task-3")?, &unknown, at(62)),
+        Err(Error::State(StateError::ConsumerNotFound(_)))
+    ));
+    Ok(())
+}

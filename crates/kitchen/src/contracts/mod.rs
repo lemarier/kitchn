@@ -89,7 +89,7 @@ pub use task::{
     AttemptNumber, AttemptOutcome, AttemptStart, Disposition, EffectSeq, FailureClass, Fence,
     Provenance, RetryPolicy, Settlement, TaskSpec,
 };
-pub use trigger::{Authorization, Claimant, Consent, Trigger};
+pub use trigger::{Authorization, Claimant, Consent, ConsumerFence, Trigger};
 pub use value::{
     Clock, CommitId, ExternalRef, LeaseTtl, MAX_EXTERNAL_REF_BYTES, MAX_TEXT_BYTES, Repository,
     SystemClock, Text, Timestamp, ValueKind,

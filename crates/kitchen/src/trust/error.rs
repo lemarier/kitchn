@@ -22,21 +22,16 @@ pub enum TrustError {
     /// The requested grant identity has never been proposed or issued.
     #[error("trust grant not found")]
     NotFound,
-    /// Storage or inspection bound exhausted.
+    /// History, snapshot, or inspection bound exhausted.
     #[error("trust budget exhausted")]
     Exhausted,
-    /// Runtime path is redirected, public, or within a repository.
-    #[error("unsafe trust storage path")]
-    UnsafePath,
-    /// Persisted data is invalid or absent; never reset automatically.
+    /// Persisted history violates a ledger invariant; never reset automatically.
     #[error("invalid trust storage")]
     Corrupt,
-    /// Bounded lock acquisition failed.
-    #[error("trust storage is busy")]
-    Busy,
-    /// Storage failed, without exposing file contents or paths.
-    #[error("trust storage I/O failed: {0}")]
-    Io(std::io::ErrorKind),
+    /// The shared snapshot store failed: lock deadline, unsafe path, missing
+    /// or corrupted files, size bound, or I/O.
+    #[error(transparent)]
+    Storage(#[from] crate::state::StateError),
 }
 impl TrustError {
     /// Handling class shared by CLI callers.
@@ -45,16 +40,10 @@ impl TrustError {
         match self {
             Self::Authority(error) => error.class(),
             Self::Invalid => ErrorClass::InvalidInput,
-            Self::Refused | Self::NotFound | Self::Exhausted | Self::UnsafePath => {
-                ErrorClass::Refused
-            }
+            Self::Refused | Self::NotFound | Self::Exhausted => ErrorClass::Refused,
             Self::Conflict | Self::Incomplete => ErrorClass::Conflict,
-            Self::Corrupt | Self::Busy | Self::Io(_) => ErrorClass::Execution,
+            Self::Corrupt => ErrorClass::Execution,
+            Self::Storage(error) => error.class(),
         }
-    }
-}
-impl From<std::io::Error> for TrustError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error.kind())
     }
 }

@@ -1052,12 +1052,6 @@ where
     deserializer.deserialize_map(UniqueMap(std::marker::PhantomData))
 }
 
-#[derive(Deserialize)]
-pub(crate) struct SchemaProbe {
-    pub(crate) schema: u64,
-    pub(crate) house: HouseId,
-}
-
 impl StoreState {
     pub(crate) const fn new(house: HouseId, nonce: u64) -> Self {
         Self {
@@ -2331,4 +2325,22 @@ fn replayed_finish(
             remaining: task.remaining_after(number),
         },
     })
+}
+
+impl crate::state::snapshot::Snapshot for StoreState {
+    const SCHEMA: u64 = SCHEMA_VERSION;
+    type Error = crate::Error;
+
+    fn empty(house: HouseId, nonce: u64) -> Self {
+        Self::new(house, nonce)
+    }
+
+    fn nonce(&self) -> u64 {
+        StoreState::nonce(self)
+    }
+
+    fn validate(&self, _house: &HouseId) -> Result<()> {
+        StoreState::validate(self).map_err(StateError::CorruptState)?;
+        Ok(())
+    }
 }

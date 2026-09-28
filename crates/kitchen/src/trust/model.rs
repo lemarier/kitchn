@@ -340,7 +340,9 @@ pub struct TaskBinding {
     pub spec: TaskSpec,
     /// Station and work category declared by the house adapter.
     pub scope: StationScope,
-    /// Exact selected model.
+    /// The model identity the adapter resolved, compared verbatim with the
+    /// observed model. Trust only matches it; choosing a model per role and
+    /// work type belongs to house agent-selection policy (issue #42).
     pub model: Text,
     /// Auditable source for the adapter decision.
     pub source: ExternalRef,

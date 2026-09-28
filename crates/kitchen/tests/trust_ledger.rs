@@ -9,6 +9,7 @@ use kitchen::{
         AttemptNumber, AttemptOutcome, EvidenceSubject, ExternalRef, Grant, Permission, Repository,
         Text,
     },
+    state::{Corruption, StateError},
     trust::{
         Attribution, AutonomyGrant, AutonomyProposal, EvidenceMode, Ledger, Measurement,
         Observation, PullRequestEvidence, StationScope, TrustError,
@@ -793,12 +794,80 @@ fn storage_corruption_and_partial_initialization_never_reset_history() -> TestRe
     l.record(&f.store, observation(&f)?)?;
     let path = f.dir.path().join("trust/ledger.json");
     fs::write(&path, b"{bad")?;
-    assert!(reopen(&f).is_err());
+    assert!(matches!(
+        Ledger::open(f.dir.path().join("trust"), house()?),
+        Err(TrustError::Storage(StateError::CorruptState(
+            Corruption::Syntax { .. }
+        )))
+    ));
     assert_eq!(fs::read(&path)?, b"{bad");
-    assert!(Ledger::initialize(f.dir.path().join("trust"), house()?).is_err());
+    assert!(matches!(
+        Ledger::initialize(f.dir.path().join("trust"), house()?),
+        Err(TrustError::Storage(StateError::AlreadyInitialized))
+    ));
+    assert_eq!(fs::read(&path)?, b"{bad");
+    // A crash after the marker leaves a store without a snapshot: it is
+    // neither reinitialized nor opened as empty history.
     let partial = f.dir.path().join("partial");
-    fs::create_dir(&partial)?;
-    assert!(Ledger::initialize(partial, house()?).is_err());
+    Ledger::initialize(&partial, house()?)?;
+    fs::remove_file(partial.join("ledger.json"))?;
+    assert!(matches!(
+        Ledger::initialize(&partial, house()?),
+        Err(TrustError::Storage(StateError::AlreadyInitialized))
+    ));
+    assert!(matches!(
+        Ledger::open(&partial, house()?),
+        Err(TrustError::Storage(StateError::StateMissing))
+    ));
+    assert!(!partial.join("ledger.json").exists());
+    // An existing empty directory holds no store and may be initialized.
+    let empty = f.dir.path().join("empty");
+    fs::create_dir(&empty)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&empty, fs::Permissions::from_mode(0o755))?;
+        assert!(matches!(
+            Ledger::initialize(&empty, house()?),
+            Err(TrustError::Storage(StateError::PublicPath))
+        ));
+        fs::set_permissions(&empty, fs::Permissions::from_mode(0o700))?;
+    }
+    assert!(matches!(
+        Ledger::open(&empty, house()?),
+        Err(TrustError::Storage(StateError::NotInitialized))
+    ));
+    Ledger::initialize(&empty, house()?)?;
+    assert!(Ledger::open(&empty, house()?)?.history()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn ledger_marker_binds_snapshot_to_one_store_identity() -> TestResult {
+    let f = Fixture::new()?;
+    let first = ledger(&f)?;
+    let second = Ledger::initialize(f.dir.path().join("second-trust"), house()?)?;
+    first.record(&f.store, observation(&f)?)?;
+    fs::copy(
+        f.dir.path().join("trust/ledger.json"),
+        f.dir.path().join("second-trust/ledger.json"),
+    )?;
+    let identity = |result: Result<_, TrustError>| {
+        matches!(
+            result,
+            Err(TrustError::Storage(StateError::CorruptState(
+                Corruption::StoreIdentity
+            )))
+        )
+    };
+    assert!(identity(
+        Ledger::open(f.dir.path().join("second-trust"), house()?).map(|_| ())
+    ));
+    assert!(identity(second.history().map(|_| ())));
+    assert!(matches!(
+        Ledger::open(f.dir.path().join("trust"), other_house()?),
+        Err(TrustError::Authority(_))
+    ));
     Ok(())
 }
 
@@ -811,24 +880,40 @@ fn storage_rejects_symlinks_public_permissions_and_repository_paths() -> TestRes
     l.record(&f.store, observation(&f)?)?;
     let link = f.dir.path().join("link");
     symlink(f.dir.path().join("trust"), &link)?;
-    assert!(Ledger::open(link, house()?).is_err());
+    assert!(matches!(
+        Ledger::open(link, house()?),
+        Err(TrustError::Storage(StateError::RedirectedPath))
+    ));
     let snapshot = f.dir.path().join("trust/ledger.json");
     fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o644))?;
-    assert!(l.history().is_err());
+    assert!(matches!(
+        l.history(),
+        Err(TrustError::Storage(StateError::PublicPath))
+    ));
     fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o600))?;
+    let dir = f.dir.path().join("trust");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+    assert!(matches!(
+        Ledger::open(f.dir.path().join("trust"), house()?),
+        Err(TrustError::Storage(StateError::PublicPath))
+    ));
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     let repo = f.dir.path().join("repo");
     fs::create_dir(&repo)?;
     fs::write(repo.join(".git"), b"gitdir: elsewhere")?;
     assert!(matches!(
         Ledger::initialize(repo.join("private"), house()?),
-        Err(TrustError::UnsafePath)
+        Err(TrustError::Storage(StateError::StorageInsideRepository))
     ));
     let original = fs::read(&snapshot)?;
     fs::remove_file(&snapshot)?;
     let elsewhere = f.dir.path().join("outside");
     fs::write(&elsewhere, &original)?;
     symlink(&elsewhere, &snapshot)?;
-    assert!(l.history().is_err());
+    assert!(matches!(
+        l.history(),
+        Err(TrustError::Storage(StateError::RedirectedPath))
+    ));
     assert_eq!(fs::read(elsewhere)?, original);
     Ok(())
 }
@@ -918,7 +1003,10 @@ fn lock_contention_is_bounded_and_interrupted_temp_write_preserves_snapshot() ->
         .write(true)
         .open(f.dir.path().join("trust/ledger.lock"))?;
     lock.lock()?;
-    assert!(matches!(l.history(), Err(TrustError::Busy)));
+    assert!(matches!(
+        l.history(),
+        Err(TrustError::Storage(StateError::LockTimeout { .. }))
+    ));
     drop(lock);
     let temp = f.dir.path().join("trust/ledger.tmp");
     fs::write(&temp, b"partial write")?;
@@ -934,6 +1022,21 @@ fn lock_contention_is_bounded_and_interrupted_temp_write_preserves_snapshot() ->
     l.record(&f.store, next.clone())?;
     assert_eq!(reopen(&f)?.latest(&o.id)?, next);
     assert!(!temp.exists());
+    Ok(())
+}
+
+#[test]
+fn independent_ledger_readers_share_the_snapshot_lock() -> TestResult {
+    use std::fs::OpenOptions;
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, observation(&f)?)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.dir.path().join("trust/ledger.lock"))?;
+    lock.lock_shared()?;
+    assert_eq!(l.history()?.len(), 1);
     Ok(())
 }
 

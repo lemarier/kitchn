@@ -422,7 +422,9 @@ impl GitRemote {
 /// Run `program` in `dir` with `args` and `env`, stdin closed and stdout
 /// captured to a file (never a terminal), and return its exit code and
 /// bounded stdout. `None` means the process did not complete: it could not
-/// start, ran past `deadline`, or produced too much output.
+/// start, ran past `deadline`, or produced too much output. Meant for Git
+/// and Git-driven tools: it sets `LC_ALL=C` and drops `GIT_DIR` and
+/// `GIT_WORK_TREE`.
 pub(crate) fn run_bounded(
     program: &std::path::Path,
     dir: &std::path::Path,

@@ -505,6 +505,14 @@ fn validation_output_is_classified_by_the_operating_system_error() {
         ValidationFailure::classify("fatal: Cannot allocate memory"),
         ValidationFailure::Environment(EnvironmentFault::OutOfMemory)
     );
+    assert_eq!(
+        ValidationFailure::classify("error: ENFILE: file table overflow"),
+        ValidationFailure::Environment(EnvironmentFault::TooManyOpenFiles)
+    );
+    assert_eq!(
+        ValidationFailure::classify("write failed: EROFS"),
+        ValidationFailure::Environment(EnvironmentFault::ReadOnlyFileSystem)
+    );
     // A failing test is a test failure, even when it mentions disks.
     assert_eq!(
         ValidationFailure::classify("test disk_usage_report ... FAILED\nassertion failed"),

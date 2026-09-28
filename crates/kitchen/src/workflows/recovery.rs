@@ -157,7 +157,7 @@ impl EnvironmentFault {
             start = start.saturating_add(1);
         }
         let tail = output.get(start..).unwrap_or_default();
-        const PATTERNS: [(&str, EnvironmentFault); 9] = [
+        const PATTERNS: [(&str, EnvironmentFault); 11] = [
             ("ENOSPC", EnvironmentFault::NoSpace),
             ("No space left on device", EnvironmentFault::NoSpace),
             ("EDQUOT", EnvironmentFault::NoSpace),
@@ -165,7 +165,9 @@ impl EnvironmentFault {
             ("ENOMEM", EnvironmentFault::OutOfMemory),
             ("Cannot allocate memory", EnvironmentFault::OutOfMemory),
             ("EMFILE", EnvironmentFault::TooManyOpenFiles),
+            ("ENFILE", EnvironmentFault::TooManyOpenFiles),
             ("Too many open files", EnvironmentFault::TooManyOpenFiles),
+            ("EROFS", EnvironmentFault::ReadOnlyFileSystem),
             (
                 "Read-only file system",
                 EnvironmentFault::ReadOnlyFileSystem,

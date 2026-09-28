@@ -27,7 +27,8 @@ pub struct ScaffoldArgs {
     /// Required for an unbound repository; never inferred from available houses.
     #[arg(long)]
     house: Option<HouseId>,
-    /// Forge owner/name; required for an unbound repository.
+    /// GitHub owner/name; defaults to the one the target checkout's remotes name.
+    /// The binding is stored in the registry, never in the target.
     #[arg(long)]
     repository: Option<Repository>,
     /// Template variable, repeatable as --set name=value.
@@ -85,7 +86,7 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
     if !apply {
         return Ok((
             "Preview only; no files changed.\nNext: review conflicts, then repeat with --confirm or --yes to add missing files.".into(),
-            plan.conflicts().next().is_none(),
+            plan.files().conflicts().next().is_none(),
         ));
     }
     match plan.apply() {
@@ -107,7 +108,7 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
         }
         Err(error) => return installation_error(error),
     }
-    let healthy = plan.conflicts().next().is_none();
+    let healthy = plan.files().conflicts().next().is_none();
     Ok((
         format!(
             "{}\nNext: inspect the generated files{}, then run:\n  kitchen house doctor --registry {} --repository-path {}\nKitchen runs no template scripts; follow the generated instructions to load house guidance.",

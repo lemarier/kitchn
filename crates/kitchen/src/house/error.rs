@@ -39,6 +39,30 @@ pub enum HouseError {
         /// Files or directories requiring inspection; never removed without ownership proof.
         remaining: Vec<std::path::PathBuf>,
     },
+    /// The path is not inside a checkout, or none of its Git remotes names a
+    /// GitHub `owner/name` repository.
+    #[error("no Git remote of this checkout names a GitHub owner/name repository")]
+    RepositoryUnidentified,
+    /// More than one house claims the checkout and no choice is stored in the
+    /// registry. Choosing a house with setup stores the choice.
+    #[error("more than one house claims this repository ({}); choose one with house setup", list(.houses))]
+    AmbiguousHouse {
+        /// Every house that claims the checkout's repository.
+        houses: Vec<crate::HouseId>,
+    },
+    /// Another remote belongs to a house, and the remote that identifies the
+    /// checkout does not belong to that same house.
+    #[error("remotes of this checkout do not agree on one house ({}); the first names the checkout, the others belong to another house or none", list(.remotes))]
+    RemotesDisagree {
+        /// The identifying remote first, then each remote that disagrees.
+        remotes: Vec<crate::adoption::RemoteName>,
+    },
+    /// The legacy binding no longer matches the previewed one.
+    #[error("the legacy binding differs from the one that was approved; preview it again")]
+    LegacyChanged,
+    /// A bounded Git read failed; nothing was decided from it.
+    #[error("git could not be read: {0}")]
+    Git(crate::git::GitReadError),
     /// Bounded filesystem I/O failed.
     #[error("house storage operation failed ({0:?})")]
     Io(std::io::ErrorKind),
@@ -54,13 +78,27 @@ impl HouseError {
             | Self::PolicyRelaxation
             | Self::InsideRepository
             | Self::RedirectedPath
-            | Self::PinMismatch => ErrorClass::Refused,
-            Self::Conflict | Self::Conflicts(_) | Self::Busy => ErrorClass::Conflict,
-            Self::UnverifiedSnapshot | Self::PartialInstallation { .. } | Self::Io(_) => {
-                ErrorClass::Execution
+            | Self::PinMismatch
+            | Self::RepositoryUnidentified
+            | Self::AmbiguousHouse { .. }
+            | Self::RemotesDisagree { .. } => ErrorClass::Refused,
+            Self::Conflict | Self::Conflicts(_) | Self::LegacyChanged | Self::Busy => {
+                ErrorClass::Conflict
             }
+            Self::UnverifiedSnapshot
+            | Self::PartialInstallation { .. }
+            | Self::Git(_)
+            | Self::Io(_) => ErrorClass::Execution,
         }
     }
+}
+
+fn list(values: &[impl std::fmt::Display]) -> String {
+    values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl From<std::io::Error> for HouseError {

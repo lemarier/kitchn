@@ -1377,7 +1377,7 @@ fn verbatim_template(contents: &[String]) -> TestResult<Result<Template, Scaffol
     Ok(Template::from_parts(Manifest::parse(&manifest)?, sources))
 }
 
-/// A binding-sized file, as `plan_repository` appends to every plan.
+/// An extra file filling the installer headroom the template limits keep.
 fn binding(bytes: usize) -> TestResult<RenderedFile> {
     Ok(RenderedFile {
         path: RelativePath::new(".kitchen.json")?,

@@ -61,8 +61,9 @@ impl Reservation {
     ///
     /// # Errors
     /// [`OrcaError::ReservationBusy`] when another holder keeps it for the
-    /// whole wait, [`OrcaError::ReservationRedirected`] for a symlinked
-    /// directory or lock file, and [`OrcaError::ReservationUnavailable`] for
+    /// whole wait, [`OrcaError::ReservationInsideRepository`] for a directory
+    /// inside a Git checkout, [`OrcaError::ReservationRedirected`] for a
+    /// symlinked directory or lock file, and [`OrcaError::ReservationUnavailable`] for
     /// other I/O failures. Nothing reached Orca in any of these cases.
     pub(crate) fn acquire(
         runtime_dir: &Path,
@@ -70,6 +71,9 @@ impl Reservation {
         wait: Duration,
     ) -> Result<Self, OrcaError> {
         let directory = runtime_dir.join(DIRECTORY);
+        if crate::state::snapshot::inside_repository(&directory).map_err(unavailable)? {
+            return Err(OrcaError::ReservationInsideRepository);
+        }
         prepare_directory(&directory)?;
         let path = directory.join(format!("{stem}.lock"));
         let started = Instant::now();
@@ -209,6 +213,39 @@ mod tests {
         Reservation::acquire(root.path(), "other", Duration::from_millis(50))?;
         drop(first);
         Reservation::acquire(root.path(), "k", Duration::from_millis(50))?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_runtime_directory_inside_a_checkout_is_refused_before_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = dir()?;
+        let checkout = root.path().join("checkout");
+        fs::create_dir_all(checkout.join(".git"))?;
+        assert!(matches!(
+            Reservation::acquire(&checkout.join("runtime"), "k", Duration::ZERO),
+            Err(OrcaError::ReservationInsideRepository)
+        ));
+        assert!(!checkout.join("runtime").exists());
+        // A worktree marks its checkout with a `.git` file.
+        let worktree = root.path().join("worktree");
+        fs::create_dir(&worktree)?;
+        fs::write(worktree.join(".git"), "gitdir: elsewhere")?;
+        assert!(matches!(
+            Reservation::acquire(&worktree, "k", Duration::ZERO),
+            Err(OrcaError::ReservationInsideRepository)
+        ));
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&checkout, &link)?;
+            assert!(matches!(
+                Reservation::acquire(&link.join("runtime"), "k", Duration::ZERO),
+                Err(OrcaError::ReservationInsideRepository)
+            ));
+        }
+        // A sibling outside the checkout is accepted.
+        Reservation::acquire(&root.path().join("runtime"), "k", Duration::ZERO)?;
         Ok(())
     }
 

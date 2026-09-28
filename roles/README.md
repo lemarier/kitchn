@@ -14,14 +14,21 @@ are examples to replace, not commands that activate a real house.
 ```sh
 kitchen house init --registry /absolute/external/kitchen --config /path/house.json
 kitchen house sync --registry /absolute/external/kitchen --house example --bundle /path/verified-bundle.json
-kitchen house setup --registry /absolute/external/kitchen --repository owner/project
+kitchen house setup --registry /absolute/external/kitchen
 ```
 
 Setup asks for the house and workflows. Choose `none` for interactive-only work.
-It finds the nearest Git root, writes only `.kitchen.json` there, and finishes
-with a doctor report and next steps. An explicit `--repository-path` can adopt
-a directory before Git initialization; implicit setup outside Git is refused.
-The binding contains the house and repository identities, selected workflows,
+It writes nothing into the repository: the binding is stored in the registry,
+keyed by the repository, and setup finishes with a doctor report and next steps.
+The repository is identified from the checkout's Git remotes: the push
+destination of the branch's tracked upstream, else `origin`. A checkout with
+neither, or outside Git, is refused; `--repository owner/name` names the
+repository explicitly instead, and the house allowlist still gates it. If
+another remote belongs to a different house than the identifying one, Kitchen
+stops and names the remotes rather than choosing. A `.kitchen.json` written by
+an older Kitchen is not read; `kitchen house import` previews it in full and
+`--yes --digest <digest>` stores exactly what was previewed, refusing if the
+file changed since. The binding contains the house and repository identities, selected workflows,
 and additional reviewer/check requirements. It cannot contain credentials,
 grants, private context, or house-policy overrides. External house policy keeps
 `policyLimits` separate from standing `grants`; interactive permission is never

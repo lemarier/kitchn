@@ -877,6 +877,8 @@ fn storage_inside_a_git_checkout_is_refused() -> TestResult {
         ),
         Err(Error::State(StateError::StorageInsideRepository))
     ));
+    // The refusal creates nothing inside the checkout.
+    assert!(!dir.path().join("state").exists());
     Ok(())
 }
 

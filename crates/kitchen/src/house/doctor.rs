@@ -66,6 +66,22 @@ pub enum DoctorCode {
     Capability,
     /// A configured model is not offered by the installed agent, or was not checked.
     AgentModel,
+    /// A legacy `.kitchen.json` remains in the working tree.
+    LegacyBinding,
+}
+impl DoctorFinding {
+    /// Report a leftover legacy binding file. Kitchen never deletes it.
+    #[must_use]
+    pub fn legacy_binding(path: &std::path::Path) -> Self {
+        Self {
+            code: DoctorCode::LegacyBinding,
+            message: format!(
+                "Legacy repository binding {} is still in the working tree; Kitchen no longer reads it.",
+                path.display()
+            ),
+            next_step: "Import it with kitchen house import if the registry lacks this binding, then delete the file yourself; Kitchen does not delete repository files.".into(),
+        }
+    }
 }
 /// Read-only setup report. Healthy means configuration evidence is complete,
 /// never that an external effect is authorized or a workflow was activated.
@@ -221,7 +237,7 @@ pub fn doctor(
     }
     let access = evidence.map_or(AccessStatus::Unobserved, |evidence| evidence.access);
     if access != AccessStatus::Available {
-        findings.push(DoctorFinding { code: DoctorCode::Access, message: format!("House-scoped repository access: {access:?}."), next_step: format!("Configure {} access in the external credential provider, then probe {} through the house-scoped integration and rerun doctor; never put credential values in .kitchen.json.", house.house, repository.repository) });
+        findings.push(DoctorFinding { code: DoctorCode::Access, message: format!("House-scoped repository access: {access:?}."), next_step: format!("Configure {} access in the external credential provider, then probe {} through the house-scoped integration and rerun doctor; never put credential values in repository files.", house.house, repository.repository) });
     }
     Ok(DoctorReport {
         house: house.house,

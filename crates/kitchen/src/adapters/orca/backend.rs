@@ -132,8 +132,8 @@ pub struct OrcaConfig {
     pub call_timeout: Duration,
     /// How long Orca waits for a launched worker to become ready.
     pub launch_timeout: Duration,
-    /// House-scoped runtime storage, outside any Git checkout and private to
-    /// the Kitchen user, where reservation files serialize launches and
+    /// House-scoped runtime storage, outside any Git checkout (a directory
+    /// inside one is refused) and private to the Kitchen user, where reservation files serialize launches and
     /// schedule installs across callers and processes. Every caller acting on
     /// one house and Orca host must use the same directory.
     pub runtime_dir: PathBuf,
@@ -476,6 +476,7 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
         }
         OrcaError::Io(_) => EffectFailure::Uncertain(UncertainReason::Transport),
         OrcaError::ReservationRedirected
+        | OrcaError::ReservationInsideRepository
         | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::ScheduleActive
@@ -504,6 +505,7 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
 pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
     match error {
         OrcaError::Timeout => BackendUnavailable::Timeout,
+        OrcaError::ReservationInsideRepository => BackendUnavailable::LocalConfiguration,
         OrcaError::Spawn(_)
         | OrcaError::OutputLimit { .. }
         | OrcaError::Io(_)
@@ -1404,6 +1406,23 @@ mod tests {
             launch_marker(&home, &key)
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_local_reservation_refusal_is_local_configuration() {
+        assert_eq!(
+            read_failure(&OrcaError::ReservationInsideRepository),
+            BackendUnavailable::LocalConfiguration,
+            "the guard runs before any Orca request"
+        );
+        assert_eq!(
+            read_failure(&OrcaError::Io(std::io::ErrorKind::BrokenPipe)),
+            BackendUnavailable::Transport
+        );
+        assert_eq!(
+            read_failure(&OrcaError::Timeout),
+            BackendUnavailable::Timeout
+        );
     }
 
     #[test]

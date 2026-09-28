@@ -390,7 +390,7 @@ fn doctor_reports_configured_models_the_agents_do_not_offer() -> TestResult {
     let house = house_config(policy_json())?;
     registry.initialize(&house)?;
     let repository: RepositoryConfig = serde_json::from_value(json!({
-        "schema": 1, "house": "origin89", "repository": "origin89hq/firmware",
+        "schema": 2, "house": "origin89", "repository": "origin89hq/firmware",
         "workflows": [], "additionalReviewers": [], "additionalChecks": [],
     }))?;
     let model_findings = |evidence: Option<&DoctorEvidence>| -> TestResult<Vec<String>> {

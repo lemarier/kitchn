@@ -1,24 +1,19 @@
 //! Repository plans that resolve templates from a house's verified instruction
 //! snapshot, using a disposable external registry and consumer directory.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, fs, path::PathBuf, process::Command};
 
 use kitchen::{
     Error, HouseId,
     adoption::{
-        HouseRegistry, InstructionAsset, InstructionBundle, MAX_INSTALL_BYTES, MAX_INSTALL_FILES,
-        RelativePath, encode, role_cards_digest,
+        HouseRegistry, InstructionAsset, InstructionBundle, RelativePath, role_cards_digest,
     },
     contracts::{CommitId, Repository},
-    house::{HouseConfig, HouseError, RepositoryConfig, Workflow},
+    house::{HouseConfig, HouseError, Workflow},
     scaffold::{
-        FilePlan, MAX_BINDING_BYTES, MAX_MANIFEST_BYTES, MAX_TEMPLATE_DEPTH, MAX_TEMPLATE_FILES,
-        MAX_TEMPLATE_OUTPUT_BYTES, ManagedState, PlanAction, ScaffoldError, ScaffoldLimit,
-        Template, TemplateName, TemplateProblem, VariableName, inspect_managed, plan_repository,
+        MAX_MANIFEST_BYTES, MAX_TEMPLATE_DEPTH, ManagedState, PlanAction, RepositoryPlan,
+        ScaffoldError, ScaffoldLimit, Template, TemplateName, TemplateProblem, VariableName,
+        inspect_managed, plan_repository,
     },
 };
 use tempfile::TempDir;
@@ -110,7 +105,7 @@ impl Fixture {
         Ok(self.registry.load(&HouseId::new(HOUSE)?)?)
     }
 
-    fn plan(&self, template: &str) -> Result<FilePlan, Error> {
+    fn plan(&self, template: &str) -> Result<RepositoryPlan, Error> {
         plan_repository(
             &self.registry,
             &self.root.join("consumer"),
@@ -130,14 +125,15 @@ impl Fixture {
     }
 }
 
-fn readme(plan: &FilePlan) -> Option<&str> {
+fn readme(plan: &RepositoryPlan) -> Option<&str> {
     plan.files()
+        .files()
         .iter()
         .find(|planned| planned.file.path.as_str() == "README.md")
         .map(|planned| planned.file.contents.as_str())
 }
 
-fn marked_guidance(plan: &FilePlan) -> TestResult<CommitId> {
+fn marked_guidance(plan: &RepositoryPlan) -> TestResult<CommitId> {
     match inspect_managed(readme(plan).ok_or("README.md is planned")?) {
         ManagedState::Pristine(marker) => Ok(marker.provenance.guidance),
         other => Err(format!("unexpected marker state {other:?}").into()),
@@ -148,16 +144,20 @@ fn marked_guidance(plan: &FilePlan) -> TestResult<CommitId> {
 fn template_resolves_from_the_pinned_snapshot_and_records_its_revision() -> TestResult {
     let f = Fixture::with(template_assets("app", "pinned content")?)?;
     let plan = f.plan("app")?;
-    assert_eq!(plan.provenance().guidance, commit('b')?);
+    assert_eq!(plan.files().provenance().guidance, commit('b')?);
     assert_eq!(marked_guidance(&plan)?, commit('b')?);
     assert!(readme(&plan).is_some_and(|text| text.ends_with("\npinned content\n")));
     assert!(
         plan.files()
+            .files()
             .iter()
             .all(|planned| planned.action == PlanAction::Add)
     );
+    assert!(plan.adds_binding());
     plan.apply()?;
-    assert_eq!(f.plan("app")?.additions().count(), 0);
+    let rerun = f.plan("app")?;
+    assert_eq!(rerun.files().additions().count(), 0);
+    assert!(!rerun.adds_binding());
     Ok(())
 }
 
@@ -287,46 +287,8 @@ fn guidance_templates_keep_the_directory_bounds() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn the_largest_valid_binding_fits_its_installer_reserve() -> TestResult {
-    let house: HouseConfig = serde_json::from_str(include_str!("fixtures/house/crabnebula.json"))?;
-    // Quotes double when encoded, so these are the longest encodable names.
-    let names = |kind: &str| -> BTreeSet<String> {
-        (0..64)
-            .map(|index| {
-                let prefix = format!("{kind}{index}");
-                format!("{prefix}{}", "\"".repeat(128 - prefix.len()))
-            })
-            .collect()
-    };
-    let config = RepositoryConfig {
-        schema: 1,
-        house: house.house.clone(),
-        repository: REPOSITORY.parse()?,
-        workflows: Workflow::ALL.into(),
-        additional_reviewers: names("r"),
-        additional_checks: names("c"),
-    };
-    config.validate(&house)?;
-    let encoded = encode(&config)?.len();
-    assert!(encoded <= MAX_BINDING_BYTES, "{encoded}");
-    assert_eq!(
-        MAX_TEMPLATE_OUTPUT_BYTES + MAX_BINDING_BYTES,
-        MAX_INSTALL_BYTES
-    );
-    assert_eq!(MAX_TEMPLATE_FILES + 1, MAX_INSTALL_FILES);
-    Ok(())
-}
-
-fn binding_path(f: &Fixture) -> PathBuf {
-    f.root.join("consumer/.kitchen.json")
-}
-
-fn binding_action(plan: &FilePlan) -> Option<&PlanAction> {
-    plan.files()
-        .iter()
-        .find(|planned| planned.file.path.as_str() == ".kitchen.json")
-        .map(|planned| &planned.action)
+fn stored(f: &Fixture) -> TestResult<Option<kitchen::house::RepositoryConfig>> {
+    Ok(f.registry.binding(&REPOSITORY.parse()?)?)
 }
 
 /// Adopt with the `app` template, then remove README.md so reruns have work.
@@ -338,47 +300,60 @@ fn adopted() -> TestResult<Fixture> {
 }
 
 #[test]
-fn a_reformatted_binding_is_unchanged_and_kept_byte_for_byte() -> TestResult {
-    let f = adopted()?;
-    let value: serde_json::Value = serde_json::from_slice(&fs::read(binding_path(&f))?)?;
-    for reformatted in [
-        serde_json::to_string(&value)?,
-        format!("{}\n", serde_json::to_string_pretty(&value)?),
-    ] {
-        fs::write(binding_path(&f), &reformatted)?;
-        let plan = f.plan("app")?;
-        assert_eq!(binding_action(&plan), Some(&PlanAction::Unchanged));
-        assert!(plan.conflicts().next().is_none());
-        plan.apply()?;
-        assert_eq!(fs::read_to_string(binding_path(&f))?, reformatted);
-        assert!(f.root.join("consumer/README.md").exists());
-        fs::remove_file(f.root.join("consumer/README.md"))?;
-    }
+fn adoption_stores_the_binding_in_the_registry_not_the_tree() -> TestResult {
+    let f = Fixture::with(template_assets("app", "pinned")?)?;
+    let plan = f.plan("app")?;
+    assert!(
+        plan.files()
+            .files()
+            .iter()
+            .all(|planned| planned.file.path.as_str() == "README.md")
+    );
+    assert!(
+        plan.to_string()
+            .contains("Registry binding crabnebula/tauri-fixture -> house crabnebula: add")
+    );
+    assert_eq!(stored(&f)?, None, "planning writes nothing");
+    plan.apply()?;
+    assert_eq!(stored(&f)?.as_ref(), Some(plan.binding()));
+    let names: Vec<_> = fs::read_dir(f.root.join("consumer"))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(names, ["README.md"]);
     Ok(())
 }
 
 #[test]
-fn a_meaningful_binding_change_is_used_or_refused_not_ignored() -> TestResult {
+fn a_stored_binding_is_used_and_a_different_house_is_refused() -> TestResult {
     let f = adopted()?;
-    let original = fs::read_to_string(binding_path(&f))?;
+    let original = stored(&f)?.ok_or("binding stored")?;
     // A retained stricter setting is used as the plan's binding.
-    let mut config: RepositoryConfig = serde_json::from_str(&original)?;
-    config.workflows.insert(Workflow::Gate);
-    let stricter = serde_json::to_string(&config)?;
-    fs::write(binding_path(&f), &stricter)?;
+    let mut stricter = original.clone();
+    stricter.workflows.insert(Workflow::Gate);
+    f.registry.configure_repository(&original, &stricter)?;
     let plan = f.plan("app")?;
-    assert_eq!(binding_action(&plan), Some(&PlanAction::Unchanged));
-    assert_eq!(fs::read_to_string(binding_path(&f))?, stricter);
-    // Identity changes still fail closed.
-    fs::write(
-        binding_path(&f),
-        original.replace(REPOSITORY, "crabnebula/other"),
-    )?;
+    assert_eq!(plan.binding(), &stricter);
+    assert!(!plan.adds_binding());
+    plan.apply()?;
+    assert_eq!(stored(&f)?, Some(stricter));
+    // Another house than the stored choice fails closed.
     assert!(matches!(
-        f.plan("app"),
+        plan_repository(
+            &f.registry,
+            &f.root.join("consumer"),
+            HouseId::new("origin89").ok(),
+            REPOSITORY.parse::<Repository>().ok(),
+            &"app".parse()?,
+            &BTreeMap::new(),
+        ),
         Err(Error::House(HouseError::HouseSelection))
     ));
-    fs::write(binding_path(&f), "{ not json")?;
+    fs::write(
+        f.registry
+            .root()
+            .join("repositories/crabnebula/tauri-fixture.json"),
+        "{ not json",
+    )?;
     assert!(matches!(
         f.plan("app"),
         Err(Error::House(HouseError::InvalidInput))
@@ -389,14 +364,104 @@ fn a_meaningful_binding_change_is_used_or_refused_not_ignored() -> TestResult {
 #[test]
 fn a_binding_changed_between_preview_and_apply_blocks_apply() -> TestResult {
     let f = adopted()?;
-    let value: serde_json::Value = serde_json::from_slice(&fs::read(binding_path(&f))?)?;
     let plan = f.plan("app")?;
-    // Even a formatting-only rewrite after preview invalidates the consent.
-    fs::write(binding_path(&f), serde_json::to_string(&value)?)?;
+    let original = stored(&f)?.ok_or("binding stored")?;
+    let mut changed = original.clone();
+    changed.workflows.insert(Workflow::Gate);
+    f.registry.configure_repository(&original, &changed)?;
     assert!(matches!(
         plan.apply(),
         Err(Error::House(HouseError::Conflict))
     ));
     assert!(!f.root.join("consumer/README.md").exists());
+    // A binding created by someone else after a fresh preview blocks it too.
+    let fresh = Fixture::with(template_assets("app", "pinned")?)?;
+    let plan = fresh.plan("app")?;
+    fresh.registry.bind_repository(plan.binding())?;
+    assert!(matches!(
+        plan.apply(),
+        Err(Error::House(HouseError::Conflict))
+    ));
+    assert!(!fresh.root.join("consumer").exists());
+    Ok(())
+}
+
+#[test]
+fn without_a_repository_the_target_checkout_remotes_decide() -> TestResult {
+    let f = Fixture::with(template_assets("app", "pinned")?)?;
+    let consumer = f.root.join("consumer");
+    fs::create_dir(&consumer)?;
+    for args in [
+        vec!["init", "--quiet"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:crabnebula/tauri-fixture.git",
+        ],
+    ] {
+        let status = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env_remove("GIT_COMMON_DIR")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .arg("-C")
+            .arg(&consumer)
+            .args(&args)
+            .status()?;
+        assert!(status.success());
+    }
+    let plan = |house: Option<HouseId>| {
+        plan_repository(
+            &f.registry,
+            &consumer,
+            house,
+            None,
+            &"app".parse()?,
+            &BTreeMap::new(),
+        )
+    };
+    // An unbound repository still needs an explicit house.
+    assert!(matches!(
+        plan(None),
+        Err(Error::House(HouseError::HouseSelection))
+    ));
+    let plan = plan(HouseId::new(HOUSE).ok())?;
+    assert_eq!(plan.binding().repository.as_str(), REPOSITORY);
+    plan.apply()?;
+    assert!(stored(&f)?.is_some());
+    assert!(!consumer.join(".kitchen.json").exists());
+    // A target that is not a checkout cannot name its repository.
+    let other = f.root.join("other");
+    fs::create_dir(&other)?;
+    assert!(matches!(
+        plan_repository(
+            &f.registry,
+            &other,
+            None,
+            None,
+            &"app".parse()?,
+            &BTreeMap::new()
+        ),
+        Err(Error::House(HouseError::RepositoryUnidentified))
+    ));
+    Ok(())
+}
+
+#[test]
+fn files_added_without_their_binding_are_completed_by_a_rerun() -> TestResult {
+    let f = Fixture::with(template_assets("app", "pinned")?)?;
+    // As if storing the binding failed after the files were added.
+    f.plan("app")?.files().apply()?;
+    assert_eq!(stored(&f)?, None);
+    let rerun = f.plan("app")?;
+    assert_eq!(rerun.files().additions().count(), 0);
+    assert!(rerun.adds_binding());
+    rerun.apply()?;
+    assert_eq!(stored(&f)?.as_ref(), Some(rerun.binding()));
     Ok(())
 }

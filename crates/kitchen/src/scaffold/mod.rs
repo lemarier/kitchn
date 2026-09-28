@@ -74,4 +74,4 @@ pub use template::{
 };
 
 mod repository;
-pub use repository::plan_repository;
+pub use repository::{RepositoryPlan, plan_repository};

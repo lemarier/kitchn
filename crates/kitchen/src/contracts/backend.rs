@@ -434,6 +434,12 @@ pub enum BackendUnavailable {
     /// The connection or subprocess failed.
     #[error("backend transport failed")]
     Transport,
+    /// Kitchen's own local configuration refused the call before anything
+    /// reached the backend, such as a runtime directory inside a Git
+    /// checkout. Retrying cannot help until the configuration changes, so
+    /// report it once rather than treating it as a remote failure.
+    #[error("local configuration refused the backend call")]
+    LocalConfiguration,
     /// The backend does not declare the capability the call needs.
     #[error("backend does not support {0}")]
     Unsupported(Capability),

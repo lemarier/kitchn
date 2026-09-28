@@ -121,6 +121,13 @@ impl<S: Snapshot> SnapshotStore<S> {
     ) -> Result<Self, S::Error> {
         let dir = dir.as_ref();
         refuse_symlink(dir)?;
+        // Refuse before creating anything, so a refusal leaves no directory
+        // behind in a working tree; `at` rechecks the created directory.
+        if inside_repository(dir)
+            .map_err(|error| StateError::io(StorageOperation::Prepare, error))?
+        {
+            return Err(StateError::StorageInsideRepository.into());
+        }
         create_private_dir(dir)
             .map_err(|error| StateError::io(StorageOperation::Prepare, error))?;
         let mut store = Self::at(dir, house, 0, options, layout)?;
@@ -176,9 +183,8 @@ impl<S: Snapshot> SnapshotStore<S> {
                 StateError::io(StorageOperation::Prepare, error)
             }
         })?;
-        if dir
-            .ancestors()
-            .any(|ancestor| ancestor.join(".git").symlink_metadata().is_ok())
+        if inside_repository(&dir)
+            .map_err(|error| StateError::io(StorageOperation::Prepare, error))?
         {
             return Err(StateError::StorageInsideRepository);
         }
@@ -675,6 +681,29 @@ fn fresh_nonce() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     RandomState::new().hash_one((std::process::id(), now))
+}
+
+/// Whether `path`, or the directory it would be created in, is inside a Git
+/// checkout. Symbolic links in the existing part of `path` are resolved first,
+/// so a link cannot hide a checkout. Runtime storage refuses such locations.
+///
+/// # Errors
+/// Returns an I/O error when no ancestor of `path` can be resolved.
+pub(crate) fn inside_repository(path: &Path) -> std::io::Result<bool> {
+    let absolute = std::path::absolute(path)?;
+    let mut existing = absolute.as_path();
+    let canonical = loop {
+        match fs::canonicalize(existing) {
+            Ok(canonical) => break canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    Ok(canonical
+        .ancestors()
+        .any(|ancestor| ancestor.join(".git").symlink_metadata().is_ok()))
 }
 
 #[cfg(test)]

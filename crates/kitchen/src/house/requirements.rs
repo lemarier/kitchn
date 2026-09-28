@@ -45,6 +45,11 @@ impl Workflow {
         }
     }
 }
+impl std::fmt::Display for Workflow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 impl FromStr for Workflow {
     type Err = HouseError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {

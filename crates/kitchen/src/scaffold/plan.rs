@@ -249,8 +249,7 @@ impl FilePlan {
     /// [`HouseError::PartialInstallation`] when rollback could not remove
     /// everything it created.
     pub fn apply(&self) -> crate::Result<InstallReport> {
-        // Recheck files classified as unchanged before applying additions. This
-        // includes the repository binding, so stale house selection is refused.
+        // Recheck files classified as unchanged before applying additions.
         let unchanged: Vec<_> = self
             .files
             .iter()

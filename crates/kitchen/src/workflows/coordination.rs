@@ -358,8 +358,11 @@ pub fn release_held_branch(
                 }
                 .into());
             }
-            if lease.trigger() != Trigger::Interactive {
-                return Err(CoordinationError::ReleaseNeedsPerson.into());
+            match lease.trigger() {
+                Trigger::Interactive => {}
+                Trigger::Scheduled | Trigger::Event(_) => {
+                    return Err(CoordinationError::ReleaseNeedsPerson.into());
+                }
             }
         }
         TaskState::Open | TaskState::Claimed { .. } | TaskState::Settled { .. } => {

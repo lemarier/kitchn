@@ -299,15 +299,15 @@ pub struct Selection {
 
 /// The durable status of one issue task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Durable {
+enum Durable<'a> {
     Unclaimed,
-    Claimed(Trigger),
+    Claimed(&'a Trigger),
     Uncertain,
     AwaitingAdoption,
     Settled(Settlement),
 }
 
-fn durable_status(record: &TaskRecord, now: Timestamp) -> Durable {
+fn durable_status(record: &TaskRecord, now: Timestamp) -> Durable<'_> {
     match record.state() {
         TaskState::Claimed { lease } if lease.is_live(now) => Durable::Claimed(lease.trigger()),
         TaskState::Claimed { .. } => Durable::Uncertain,
@@ -329,11 +329,11 @@ fn durable_status(record: &TaskRecord, now: Timestamp) -> Durable {
 /// person holds interactively is their focused work, not a slot; waiting,
 /// relinquished, and uncertain tasks keep theirs because their workers may
 /// still run.
-fn uses_slot(status: Durable) -> bool {
+fn uses_slot(status: Durable<'_>) -> bool {
     match status {
-        Durable::Claimed(Trigger::Scheduled) | Durable::Uncertain | Durable::AwaitingAdoption => {
-            true
-        }
+        Durable::Claimed(Trigger::Scheduled | Trigger::Event(_))
+        | Durable::Uncertain
+        | Durable::AwaitingAdoption => true,
         Durable::Claimed(Trigger::Interactive) | Durable::Unclaimed | Durable::Settled(_) => false,
     }
 }
@@ -359,7 +359,7 @@ pub fn select(
     tasks: &[TaskRecord],
     now: Timestamp,
 ) -> Result<Selection> {
-    let durable: BTreeMap<&TaskId, Durable> = tasks
+    let durable: BTreeMap<&TaskId, Durable<'_>> = tasks
         .iter()
         .filter(|record| is_pickup_task(record, policy))
         .map(|record| (&record.spec().id, durable_status(record, now)))
@@ -425,14 +425,18 @@ pub fn select(
 fn eligibility(
     policy: &PickupPolicy,
     candidate: &Candidate,
-    status: Durable,
+    status: Durable<'_>,
 ) -> std::result::Result<Base, Exclusion> {
     if !policy.repositories.contains(&candidate.issue.repository) {
         return Err(Exclusion::OutsideScope);
     }
     match status {
         Durable::Unclaimed => {}
-        Durable::Claimed(trigger) => return Err(Exclusion::Claimed { trigger }),
+        Durable::Claimed(trigger) => {
+            return Err(Exclusion::Claimed {
+                trigger: trigger.clone(),
+            });
+        }
         Durable::Uncertain => return Err(Exclusion::OwnerUncertain),
         Durable::AwaitingAdoption => return Err(Exclusion::AwaitingAdoption),
         Durable::Settled(settlement) => return Err(Exclusion::Settled(settlement)),
@@ -602,8 +606,8 @@ pub fn claim_issue(
         Ok(lease) => Ok(ClaimOutcome::Claimed(lease)),
         Err(crate::Error::State(StateError::ClaimHeld { .. })) => {
             let trigger = match store.task(&id)?.state() {
-                TaskState::Claimed { lease } => lease.trigger(),
-                TaskState::Open | TaskState::Settled { .. } => claimant.trigger,
+                TaskState::Claimed { lease } => lease.trigger().clone(),
+                TaskState::Open | TaskState::Settled { .. } => claimant.trigger.clone(),
             };
             Ok(ClaimOutcome::Held { trigger })
         }

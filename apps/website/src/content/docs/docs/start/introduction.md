@@ -30,7 +30,8 @@ kitchn is early. The CLI can:
 
 - register a house from a reviewed policy file,
 - import and pin house guidance from a verified bundle,
-- adopt a repository and write its `.kitchen.json` binding,
+- adopt a repository by recording its binding in your registry, without writing
+  anything into the repository,
 - diagnose what is still missing with `doctor`,
 - scaffold or adopt repositories from house templates without overwriting
   local files.

@@ -284,6 +284,10 @@ const menu = [
         "House isolation",
         "Credentials, repositories, posting limits and history never cross houses.",
       ],
+      [
+        "Invisible in your repos",
+        "No kitchn files in working trees; teammates keep working their own way.",
+      ],
     ],
   },
 ] as const;
@@ -667,7 +671,8 @@ const menu = [
             where it may post, and which reviewers and checks every change needs.
           </p>
           <p>
-            Installing kitchn grants nothing. Standing grants live outside the repository, and doctor
+            kitchn writes nothing into your repositories. Bindings, grants and state live in your
+            private registry, so teammates running their own agents never find a kitchn file. Doctor
             treats anything it can't observe as unknown, never as fine.
           </p>
           <a class="button" href="/docs/concepts/houses/">How houses work</a>
@@ -735,7 +740,6 @@ const menu = [
               <li class="good"><span>AGENTS.md</span><span>Add</span></li>
               <li class="good"><span>CLAUDE.md</span><span>Add</span></li>
               <li class="good"><span>.gitignore</span><span>Add</span></li>
-              <li class="good"><span>.kitchen.json</span><span>Add</span></li>
             </ul>
           </div>
         </div>

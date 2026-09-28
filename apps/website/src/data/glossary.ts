@@ -69,9 +69,8 @@ export const glossary: Term[] = [
   },
   {
     term: "Binding",
-    kitchen: ".kitchen.json",
     meaning:
-      "The file that ties a repository to its house and the workflows it opts into. It can add reviewers or checks, never remove them.",
+      "The registry record that ties a repository to its house and the workflows it opts into. It can add reviewers or checks, never remove them, and it never lives in the repository.",
   },
   {
     term: "Workflow",

@@ -10,7 +10,7 @@ kitchn is early. The full automation release is tracked in
 
 - House registration from a reviewed policy
 - Verified guidance import and revision pins, with recovery from interrupted updates
-- Repository adoption and `.kitchen.json` bindings
+- Repository adoption, with bindings kept in the registry instead of the repository ([#93](https://github.com/lemarier/kitchen/issues/93))
 - `doctor` reports for pins, access, labels and backend capabilities
 - Repository templates with previews, provenance and conflict detection
 - Eight role cards with responsibilities, evidence and boundaries

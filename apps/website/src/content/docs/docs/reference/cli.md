@@ -37,15 +37,17 @@ kitchn house update --registry <dir> --house <id> --bundle <bundle.json>
 
 ## `kitchn house setup`
 
-Adopt a repository and write `.kitchen.json`.
+Adopt a repository by recording its binding in the registry. Writes nothing into
+the repository.
 
 ```sh
-kitchn house setup --registry <dir> --repository <owner/name> [options]
+kitchn house setup --registry <dir> [options]
 ```
 
 | Option | Description |
 | --- | --- |
-| `--house <id>` | House to use. Prompted when omitted. |
+| `--repository <owner/name>` | Repository identity. Read from the git remote when omitted. |
+| `--house <id>` | House to use. Needed only when more than one house claims the repository; the choice is remembered in the registry. |
 | `--workflows <list>` | Comma-separated workflows, or `none`. Prompted when omitted. |
 | `--repository-path <dir>` | Adopt another directory, including one without Git yet. |
 | `--preview` | Report the proposed setup without writing. |

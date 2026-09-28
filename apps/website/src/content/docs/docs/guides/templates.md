@@ -24,8 +24,7 @@ Target ./my-project (new repository)
   add        AGENTS.md
   add        CLAUDE.md
   add        .gitignore
-  add        .kitchen.json
-5 to add, 0 unchanged, 0 conflicts. Nothing is written until the plan is applied; existing files are never overwritten or deleted.
+4 to add, 0 unchanged, 0 conflicts. Nothing is written until the plan is applied; existing files are never overwritten or deleted.
 Preview only; no files changed.
 ```
 
@@ -44,8 +43,11 @@ kitchn adopt . --registry ~/.kitchn \
 ```
 
 Files that already exist and differ are reported as conflicts and left alone,
-even with `--yes`. Once `.kitchen.json` exists, omit `--house` and
-`--repository`; kitchn uses the binding.
+even with `--yes`. Once the repository is bound in your registry, omit
+`--house` and `--repository`; kitchn resolves them from the git remote.
+
+`init` and `adopt` are the only commands that write into a repository, and only
+the template files you asked for. The binding itself stays in your registry.
 
 ## Where templates come from
 

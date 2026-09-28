@@ -48,15 +48,17 @@ bundle came from is your step, before `sync`.
 Run this inside the repository:
 
 ```sh
-kitchn house setup --registry ~/.kitchn --repository acme/app
+kitchn house setup --registry ~/.kitchn
 ```
 
-Setup asks which house and which workflows to use (`none` is fine for
-interactive-only work), writes `.kitchen.json` at the Git root and prints a
-doctor report.
+Setup reads the repository's identity from its git remote and finds the house
+whose allowlist includes it. It asks which workflows to use (`none` is fine for
+interactive-only work), records the binding in your registry and prints a
+doctor report. Nothing is written into the repository, so teammates who run
+their own agents never see a kitchn file.
 
 ```text
-Adopted .kitchen.json for acme/app.
+Bound acme/app in the house registry. Nothing was written to this repository.
 House: acme
 Repository: acme/app
 Doctor: setup incomplete

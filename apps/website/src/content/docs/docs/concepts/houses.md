@@ -36,7 +36,8 @@ created with mode 0600 and directories with 0700.
 
 ## The repository binding
 
-`kitchn house setup` writes `.kitchen.json` at the repository's Git root:
+kitchn never writes a file into your repository to remember its house. The
+binding lives in your registry, keyed by the repository's identity:
 
 ```json
 {
@@ -54,8 +55,25 @@ extra reviewers or checks. It cannot contain credentials, grants, private
 context or overrides of house policy. A repository can ask for more review,
 never less.
 
+## How a repository finds its house
+
+kitchn reads the repository's `owner/name` from its git remote and matches it
+against every house's allowlist. Every worktree and subdirectory of the same
+repository resolves the same way.
+
+- One house claims it: that house is used.
+- No house claims it: kitchn stops and says so.
+- More than one house claims it: kitchn stops and asks you to choose once. Your
+  choice is stored in the registry, never in the repository.
+
 Rerunning setup keeps existing reviewer and check additions. A different house
 or repository is reported as a conflict, not migrated silently.
+
+## Older `.kitchen.json` files
+
+Earlier versions wrote `.kitchen.json` into the repository. An explicit,
+previewed import moves it into your registry. Doctor reports any leftover file
+and suggests deleting it; kitchn never deletes files in your repository itself.
 
 ## Workflows
 

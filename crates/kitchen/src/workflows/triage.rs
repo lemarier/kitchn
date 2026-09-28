@@ -1,13 +1,9 @@
 //! Evidence based needs-spec decisions. Callers collect complete, bounded
 //! issue history and code evidence; this module never reads an Orca session.
 
-use std::{
-    fmt::Write as _,
-    num::{NonZeroU32, NonZeroU64},
-};
+use std::num::{NonZeroU32, NonZeroU64};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use super::{ClaimState, Precheck, WorkflowError, known, valid_label};
 use crate::{
@@ -204,7 +200,7 @@ pub struct Evidence {
     /// Open dependencies.
     pub open_dependencies: bool,
     /// Factual resolution.
-    pub factual_resolution: Option<String>,
+    pub factual_resolution: Option<Resolution>,
     /// Pending product questions.
     pub pending_product_questions: u32,
     /// Existing decisions.
@@ -232,14 +228,15 @@ pub trait MarkerView {
         issue: IssueNumber,
     ) -> Result<Vec<IssueRevision>, WorkflowError>;
 
-    /// Whether this exact `resolution` was already posted on `issue`, at any
-    /// revision. Posting a comment moves the revision, so the lookup cannot
-    /// be keyed by the current one.
+    /// Whether a resolution with `resolution`'s identity (decision and kind)
+    /// was already posted on `issue`, at any revision and in any wording.
+    /// Posting a comment moves the revision, so the lookup cannot be keyed
+    /// by the current one.
     fn resolution_posted(
         &self,
         repository: &Repository,
         issue: IssueNumber,
-        resolution: &str,
+        resolution: &Resolution,
     ) -> Result<bool, WorkflowError>;
 }
 
@@ -258,7 +255,9 @@ impl History {
     /// Returns the view's error; a failed read never becomes empty history.
     pub fn read(markers: &impl MarkerView, evidence: &Evidence) -> Result<Self, WorkflowError> {
         let resolution_posted = match &evidence.factual_resolution {
-            Some(body) => markers.resolution_posted(&evidence.repository, evidence.issue, body)?,
+            Some(resolution) => {
+                markers.resolution_posted(&evidence.repository, evidence.issue, resolution)?
+            }
             None => false,
         };
         Ok(Self {
@@ -268,31 +267,55 @@ impl History {
     }
 }
 
+/// How a resolution settles its needs-spec decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResolutionKind {
+    /// Settled from issue history, code, or requirements evidence.
+    Evidence,
+    /// Settled by a human answer to a recorded question.
+    Answer,
+}
+
+/// A resolution to post on an issue. Its identity is the question or
+/// decision it settles and its kind, never its wording, so a reworded
+/// resolution for the same decision is not posted again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    /// The question or decision this resolution settles.
+    pub decision: ExternalRef,
+    /// How it was settled.
+    pub kind: ResolutionKind,
+    /// The comment to post.
+    pub body: String,
+}
+
 /// Schema of the triage marker recording a posted resolution.
 const RESOLUTION_SCHEMA: &str = "triage.resolution";
 
-/// The posted resolution, identified by its SHA-256 digest so issue text is
-/// not copied into the store.
+/// Version 2 keys the marker by decision identity; version 1 held a digest
+/// of the text and is not read.
+const RESOLUTION_SCHEMA_VERSION: NonZeroU32 = NonZeroU32::MIN.saturating_add(1);
+
+/// The posted resolution's identity. Issue text is not copied into the store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ResolutionPosted {
-    digest: String,
+    decision: ExternalRef,
+    kind: ResolutionKind,
 }
 
 impl ResolutionPosted {
-    fn of(body: &str) -> Self {
-        let digest = Sha256::digest(body.trim().as_bytes());
-        let mut hex = String::with_capacity(64);
-        for byte in digest {
-            // Writing to a String cannot fail.
-            let _ = write!(hex, "{byte:02x}");
+    fn of(resolution: &Resolution) -> Self {
+        Self {
+            decision: resolution.decision.clone(),
+            kind: resolution.kind,
         }
-        Self { digest: hex }
     }
 }
 
 fn resolution_schema() -> Result<MarkerSchema, WorkflowError> {
-    MarkerSchema::new(RESOLUTION_SCHEMA, NonZeroU32::MIN)
+    MarkerSchema::new(RESOLUTION_SCHEMA, RESOLUTION_SCHEMA_VERSION)
         .map_err(|_| WorkflowError::IncompleteEvidence)
 }
 
@@ -347,7 +370,7 @@ impl MarkerView for IssueMarkers<'_> {
         &self,
         repository: &Repository,
         issue: IssueNumber,
-        resolution: &str,
+        resolution: &Resolution,
     ) -> Result<bool, WorkflowError> {
         let item = work_item(repository, issue)?;
         let schema = resolution_schema()?;
@@ -408,8 +431,9 @@ pub fn record_question(
 /// Record that `resolution` was posted on `issue` after being judged at
 /// `revision`. Record it before submitting the comment effect, which owns
 /// delivery and reconciliation; the marker then outlives the revision change
-/// the comment causes. Recording the same text again changes nothing; other
-/// text at the same judged revision is refused.
+/// the comment causes. Recording the same decision and kind again, in any
+/// wording, changes nothing; another decision or kind at the same judged
+/// revision is refused.
 #[expect(
     clippy::too_many_arguments,
     reason = "each value is part of the durable marker key or its provenance"
@@ -420,11 +444,11 @@ pub fn record_resolution(
     repository: &Repository,
     issue: IssueNumber,
     revision: &IssueRevision,
-    resolution: &str,
+    resolution: &Resolution,
     recorded_by: &Claimant,
     now: Timestamp,
 ) -> Result<MarkerRecording, WorkflowError> {
-    if resolution.trim().is_empty() {
+    if resolution.body.trim().is_empty() {
         return Err(WorkflowError::IncompleteEvidence);
     }
     let key = MarkerKey {
@@ -570,14 +594,14 @@ pub fn plan(evidence: &Evidence, history: &History) -> Result<Vec<Change>, Workf
     if let Some(operation) = judgment_request(evidence, history)? {
         changes.push(Change::Judgment(operation));
     }
-    if let Some(body) = &evidence.factual_resolution {
-        if body.trim().is_empty() {
+    if let Some(resolution) = &evidence.factual_resolution {
+        if resolution.body.trim().is_empty() {
             return Err(WorkflowError::IncompleteEvidence);
         }
         if !history.resolution_posted {
             changes.push(Change::Mutation(GitHubAction::PostComment {
                 issue: evidence.issue,
-                body: crate::contracts::Text::new(body)
+                body: crate::contracts::Text::new(&resolution.body)
                     .map_err(|_| WorkflowError::IncompleteEvidence)?,
             }));
         }

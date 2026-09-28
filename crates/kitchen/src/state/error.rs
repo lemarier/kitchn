@@ -5,6 +5,7 @@ use std::{fmt, io};
 use crate::{
     BackendId, ConsumerId, ErrorClass, HolderId, TaskId,
     contracts::{AttemptNumber, EffectSeq, EvidenceRevision, Fence, Settlement, Timestamp},
+    state::MarkerSchema,
 };
 
 /// A bounded collection that reached its limit.
@@ -25,6 +26,8 @@ pub enum Limit {
     ConsumedMessages,
     /// Risk decisions per effect.
     Decisions,
+    /// Workflow markers per house store.
+    Markers,
 }
 
 impl fmt::Display for Limit {
@@ -37,6 +40,7 @@ impl fmt::Display for Limit {
             Self::OwnershipHistory => "ownership history per task",
             Self::ConsumedMessages => "consumed messages per task",
             Self::Decisions => "risk decisions per effect",
+            Self::Markers => "workflow markers per house",
         })
     }
 }
@@ -101,6 +105,8 @@ pub enum Corruption {
     Ownership,
     /// An effect's idempotency key differs from its canonical derivation.
     EffectKey,
+    /// Two workflow markers share a key.
+    DuplicateWorkflowMarker,
 }
 
 impl fmt::Display for Corruption {
@@ -122,6 +128,7 @@ impl fmt::Display for Corruption {
             Self::Marker => formatter.write_str("store marker is missing or invalid"),
             Self::Ownership => formatter.write_str("ownership history contradicts the claim"),
             Self::EffectKey => formatter.write_str("effect key differs from its derivation"),
+            Self::DuplicateWorkflowMarker => formatter.write_str("workflow markers share a key"),
             Self::StoreIdentity => {
                 formatter.write_str("snapshot belongs to a different store than its marker")
             }
@@ -219,6 +226,29 @@ pub enum StateError {
         /// The backend namespace recorded with its intent.
         recorded: BackendId,
     },
+    /// A workflow marker schema id is not `name/version` with a valid name.
+    #[error("invalid workflow marker schema")]
+    MarkerSchemaInvalid,
+    /// A workflow-owned marker payload is too large or does not decode.
+    #[error("workflow marker payload is too large or does not decode")]
+    MarkerPayloadInvalid,
+    /// A workflow marker uses another schema or version than expected.
+    #[error("workflow marker uses schema {found:?}, expected {expected}")]
+    MarkerSchemaMismatch {
+        /// The schema the caller expected.
+        expected: MarkerSchema,
+        /// The recorded schema; `None` for a core fact kind.
+        found: Option<MarkerSchema>,
+    },
+    /// No workflow marker is recorded under this key.
+    #[error("no workflow marker is recorded for this key")]
+    MarkerNotFound,
+    /// This kind of workflow marker fact is append-only.
+    #[error("this workflow marker fact cannot be superseded")]
+    MarkerNotSupersedable,
+    /// A different fact is already recorded under this workflow marker key.
+    #[error("a different fact is already recorded for this workflow marker")]
+    MarkerConflict,
     /// A risk decision needs a handed-over effect without another decision.
     #[error("effect {0} is not handed over for a decision")]
     NotHandedOver(EffectSeq),
@@ -299,6 +329,7 @@ impl StateError {
     pub const fn class(&self) -> ErrorClass {
         match self {
             Self::SubmissionBudgetExhausted(_) | Self::ConsentReused => ErrorClass::Refused,
+            Self::MarkerSchemaInvalid | Self::MarkerPayloadInvalid => ErrorClass::InvalidInput,
             Self::TaskNotFound(_)
             | Self::TaskConflict(_)
             | Self::TaskSettled { .. }
@@ -315,6 +346,10 @@ impl StateError {
             | Self::EffectNotFound(_)
             | Self::EffectNameConflict(_)
             | Self::BackendMismatch { .. }
+            | Self::MarkerConflict
+            | Self::MarkerNotFound
+            | Self::MarkerSchemaMismatch { .. }
+            | Self::MarkerNotSupersedable
             | Self::NotHandedOver(_)
             | Self::DecisionScope(_)
             | Self::ConflictingOutcome(_)

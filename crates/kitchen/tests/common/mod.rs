@@ -110,7 +110,7 @@ pub fn spec_with(id: &str, retry: RetryPolicy, permissions: &[Permission]) -> Te
             repository_instructions: None,
         },
         resources: std::collections::BTreeSet::new(),
-        requires: std::collections::BTreeSet::new(),
+        requires: kitchen::contracts::CapabilityRequirements::new(),
     })
 }
 
@@ -135,6 +135,7 @@ pub fn launch() -> TestResult<Operation> {
         role: Role::StationCook,
         workspace: Workspace::Isolated,
         brief: Text::new("Implement the task described in the issue.")?,
+        branch: None,
     })
 }
 

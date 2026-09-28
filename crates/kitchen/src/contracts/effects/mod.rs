@@ -29,7 +29,8 @@ pub use schedule::ScheduleEffect;
 use crate::{
     HouseId, TaskId,
     contracts::{
-        Capability, ContractError, EvidenceRevision, GrantScope, Operation, Permission, ResourceRef,
+        Capability, ContractError, EvidenceRevision, EvidenceSubject, GrantScope, Operation,
+        Permission, ResourceRef, ValueKind,
     },
 };
 
@@ -46,6 +47,61 @@ pub enum ExecutorKind {
     Roger,
     /// A scheduler.
     Schedule,
+}
+
+closed_names! {
+    /// The kind of an effect, one per payload variant. Executors declare
+    /// lookup and idempotency per kind.
+    pub enum EffectKind(ValueKind::EffectKind) {
+        /// The `launch_worker` effect.
+        LaunchWorker = "launch_worker",
+        /// The `message_worker` effect.
+        MessageWorker = "message_worker",
+        /// The `reply_to_worker` effect.
+        ReplyToWorker = "reply_to_worker",
+        /// The `cancel_worker` effect.
+        CancelWorker = "cancel_worker",
+        /// The `release_resource` effect.
+        ReleaseResource = "release_resource",
+        /// The `create_label` effect.
+        CreateLabel = "create_label",
+        /// The `ask` effect.
+        Ask = "ask",
+        /// The `install_disabled_schedule` effect.
+        InstallDisabledSchedule = "install_disabled_schedule",
+    }
+}
+
+impl EffectKind {
+    /// The capability that declares lookup for this kind.
+    #[must_use]
+    pub const fn lookup_capability(self) -> Capability {
+        match self {
+            Self::LaunchWorker => Capability::LookupLaunchWorker,
+            Self::MessageWorker => Capability::LookupMessageWorker,
+            Self::ReplyToWorker => Capability::LookupReplyToWorker,
+            Self::CancelWorker => Capability::LookupCancelWorker,
+            Self::ReleaseResource => Capability::LookupReleaseResource,
+            Self::CreateLabel => Capability::LookupCreateLabel,
+            Self::Ask => Capability::LookupAsk,
+            Self::InstallDisabledSchedule => Capability::LookupInstallDisabledSchedule,
+        }
+    }
+
+    /// The capability that declares same-key idempotency for this kind.
+    #[must_use]
+    pub const fn idempotency_capability(self) -> Capability {
+        match self {
+            Self::LaunchWorker => Capability::IdempotentLaunchWorker,
+            Self::MessageWorker => Capability::IdempotentMessageWorker,
+            Self::ReplyToWorker => Capability::IdempotentReplyToWorker,
+            Self::CancelWorker => Capability::IdempotentCancelWorker,
+            Self::ReleaseResource => Capability::IdempotentReleaseResource,
+            Self::CreateLabel => Capability::IdempotentCreateLabel,
+            Self::Ask => Capability::IdempotentAsk,
+            Self::InstallDisabledSchedule => Capability::IdempotentInstallDisabledSchedule,
+        }
+    }
 }
 
 /// One external effect, persisted with its intent.
@@ -73,6 +129,25 @@ impl Effect {
             Self::GitHub(_) => ExecutorKind::GitHub,
             Self::Roger(_) => ExecutorKind::Roger,
             Self::Schedule(_) => ExecutorKind::Schedule,
+        }
+    }
+
+    /// The effect's kind.
+    #[must_use]
+    pub const fn kind(&self) -> EffectKind {
+        match self {
+            Self::Worker(operation) => match operation {
+                Operation::LaunchWorker { .. } => EffectKind::LaunchWorker,
+                Operation::MessageWorker { .. } => EffectKind::MessageWorker,
+                Operation::ReplyToWorker { .. } => EffectKind::ReplyToWorker,
+                Operation::CancelWorker { .. } => EffectKind::CancelWorker,
+                Operation::ReleaseResource { .. } => EffectKind::ReleaseResource,
+            },
+            Self::GitHub(GitHubEffect::CreateLabel { .. }) => EffectKind::CreateLabel,
+            Self::Roger(RogerEffect::Ask { .. }) => EffectKind::Ask,
+            Self::Schedule(ScheduleEffect::InstallDisabled { .. }) => {
+                EffectKind::InstallDisabledSchedule
+            }
         }
     }
 
@@ -219,6 +294,9 @@ pub struct EffectContext<'a> {
     pub task_scope: &'a GrantScope,
     /// The task's current evidence revision.
     pub revision: EvidenceRevision,
+    /// The exact subject (head and base) the current evidence is about;
+    /// `None` before any evidence was recorded.
+    pub subject: Option<&'a EvidenceSubject>,
     /// The task's effects already submitted, before this one.
     pub submitted: &'a SubmittedEffects,
 }

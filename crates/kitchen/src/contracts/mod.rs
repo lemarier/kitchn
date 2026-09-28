@@ -78,19 +78,19 @@ pub use backend::{
 };
 pub use capability::{BackendDescriptor, Capability, CapabilitySet, Support};
 pub use effects::{
-    DecisionBinding, Effect, EffectContext, ExecutorKind, GitHubEffect, MAX_ASKS_PER_TASK,
-    RogerEffect, ScheduleEffect, SubmittedEffects,
+    DecisionBinding, Effect, EffectContext, EffectKind, ExecutorKind, GitHubEffect,
+    MAX_ASKS_PER_TASK, RogerEffect, ScheduleEffect, SubmittedEffects,
 };
 pub use error::ContractError;
 pub use evidence::{Evidence, EvidenceKind, EvidenceRevision, EvidenceSubject, EvidenceVerdict};
 pub use resource::{ResourceKind, ResourceRef};
 pub use role::Role;
 pub use task::{
-    AttemptNumber, AttemptOutcome, AttemptStart, Disposition, EffectSeq, FailureClass, Fence,
-    Provenance, RetryPolicy, Settlement, TaskSpec,
+    AttemptNumber, AttemptOutcome, AttemptStart, CapabilityRequirements, Disposition, EffectSeq,
+    FailureClass, Fence, Provenance, RetryPolicy, Settlement, TaskSpec,
 };
 pub use trigger::{Authorization, Claimant, Consent, ConsumerFence, Trigger};
 pub use value::{
-    Clock, CommitId, ExternalRef, LeaseTtl, MAX_EXTERNAL_REF_BYTES, MAX_TEXT_BYTES, Repository,
-    SystemClock, Text, Timestamp, ValueKind,
+    BranchName, Clock, CommitId, ExternalRef, LeaseTtl, MAX_BRANCH_NAME_BYTES,
+    MAX_EXTERNAL_REF_BYTES, MAX_TEXT_BYTES, Repository, SystemClock, Text, Timestamp, ValueKind,
 };

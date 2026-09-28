@@ -12,16 +12,19 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ConsumerId, CredentialId, EffectName, Error, HolderId, HouseId, TaskId,
+    ConsumerId, CredentialId, EffectName, Error, HolderId, HouseId, TaskId, WorkflowId,
     contracts::{
-        AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Capability,
-        Claimant, Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext,
-        EffectRequest, EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef,
-        FailureClass, Fence, HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation,
-        Receipt, ResourceRef, RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Timestamp,
-        Trigger, UncertainReason,
+        AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Claimant,
+        Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext, EffectRequest,
+        EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef, FailureClass, Fence,
+        HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef,
+        RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Timestamp, Trigger, UncertainReason,
     },
-    state::{ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, StateError},
+    state::{
+        ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerFact, MarkerKey,
+        MarkerRecording, StateError, WorkflowMarker,
+        marker::{MarkerRefusal, Markers},
+    },
 };
 
 /// The persisted schema version.
@@ -678,7 +681,7 @@ impl TaskRecord {
         current: std::result::Result<(), ContractError>,
         now: Timestamp,
     ) -> Result<EffectStart> {
-        let resubmission = Resubmission::for_backend(backend);
+        let resubmission = Resubmission::for_effect(backend, &plan.effect);
         let Some(existing) = self.effects.get(index) else {
             return fail(StateError::CorruptState(Corruption::EffectSequence));
         };
@@ -903,11 +906,10 @@ enum Resubmission {
 }
 
 impl Resubmission {
-    fn for_backend(backend: &BackendDescriptor) -> Self {
-        if backend
-            .capabilities
-            .supports(Capability::EffectIdempotentRequests)
-        {
+    /// Same-key resubmission only where the executor declares `effect`'s
+    /// kind idempotent.
+    fn for_effect(backend: &BackendDescriptor, effect: &Effect) -> Self {
+        if backend.idempotent(effect) {
             Self::SameKey
         } else {
             Self::Refuse
@@ -1010,6 +1012,8 @@ pub(crate) struct StoreState {
     tasks: BTreeMap<TaskId, TaskRecord>,
     #[serde(deserialize_with = "unique_map")]
     consumers: BTreeMap<ConsumerId, ConsumerRecord>,
+    #[serde(default)]
+    markers: Markers,
 }
 
 /// Deserialize a map, rejecting a repeated key instead of letting a later
@@ -1063,6 +1067,7 @@ impl StoreState {
             next_fence: 1,
             tasks: BTreeMap::new(),
             consumers: BTreeMap::new(),
+            markers: Markers::new(),
         }
     }
 
@@ -1499,8 +1504,7 @@ impl StoreState {
         backend.capabilities.require(
             task.spec
                 .requires
-                .iter()
-                .copied()
+                .for_executor(plan.effect.executor())
                 .chain([plan.effect.required_capability()]),
         )?;
         let trigger = task.owned_lease(plan.fence, now, true)?.trigger;
@@ -1582,6 +1586,7 @@ impl StoreState {
             task: &plan.task,
             task_scope: &task_scope,
             revision: task.evidence.revision,
+            subject: task.evidence.subject.as_ref(),
             submitted: &submitted,
         };
         // Checks every submission must pass, including a same-key retry of
@@ -1985,6 +1990,44 @@ impl StoreState {
         Ok(lease)
     }
 
+    pub(crate) fn record_marker(
+        &mut self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<MarkerRecording> {
+        self.check_claimant(recorded_by, now)?;
+        self.markers
+            .record(key, fact, recorded_by, now)
+            .or_else(marker_refusal)
+    }
+
+    pub(crate) fn supersede_marker(
+        &mut self,
+        key: &MarkerKey,
+        expected: &MarkerFact,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<MarkerRecording> {
+        self.check_claimant(recorded_by, now)?;
+        self.markers
+            .supersede(key, expected, fact, recorded_by, now)
+            .or_else(marker_refusal)
+    }
+
+    pub(crate) fn marker(&self, key: &MarkerKey) -> Option<&WorkflowMarker> {
+        self.markers.get(key)
+    }
+
+    pub(crate) fn markers<'a>(
+        &'a self,
+        workflow: &'a WorkflowId,
+    ) -> impl Iterator<Item = &'a WorkflowMarker> {
+        self.markers.for_workflow(workflow)
+    }
+
     pub(crate) fn recovery_queue(&self, now: Timestamp) -> Vec<RecoveryItem> {
         let handed_over = self.tasks.values().flat_map(|task| {
             let open = task.settlement().is_none();
@@ -2044,6 +2087,7 @@ impl StoreState {
         if self.tasks.len() > MAX_TASKS || self.consumers.len() > MAX_CONSUMERS {
             return Err(Corruption::LimitExceeded);
         }
+        self.markers.validate()?;
         for record in self.consumers.values() {
             record.validate(self.next_fence)?;
         }
@@ -2140,6 +2184,17 @@ impl StoreState {
         }
         Ok(())
     }
+}
+
+fn marker_refusal<T>(refusal: MarkerRefusal) -> Result<T> {
+    fail(match refusal {
+        MarkerRefusal::Conflict => StateError::MarkerConflict,
+        MarkerRefusal::Full => StateError::CapacityExceeded {
+            limit: Limit::Markers,
+        },
+        MarkerRefusal::Missing => StateError::MarkerNotFound,
+        MarkerRefusal::NotSupersedable => StateError::MarkerNotSupersedable,
+    })
 }
 
 /// Replay the ownership history: each claim, adoption, or takeover gets a

@@ -30,6 +30,9 @@
 //!   new owner to reconcile.
 //! - Intent is persisted before every effect. While any effect is unresolved,
 //!   no new effect or attempt starts; the owner reconciles first.
+//! - Workflow markers record facts (a verdict for one head, a question
+//!   already asked) keyed by workflow, work item, and exact evidence subject.
+//!   They grant nothing and are separate from effects.
 //! - An effect whose outcome cannot be established is handed over, not
 //!   resolved: the task keeps its reservation until positive evidence or a
 //!   scoped [`RiskDecision`] allows one specific action.
@@ -37,12 +40,18 @@
 mod consumer;
 mod effects;
 mod error;
+mod marker;
 mod model;
 mod store;
 
 pub use consumer::{ConsumerEvent, ConsumerRecord, ConsumerState, MAX_CONSUMER_HISTORY};
 pub use effects::{ReconcileReport, reconcile, run_effect};
 pub use error::{Corruption, Limit, StateError, StorageOperation};
+pub use marker::{
+    IssueRevision, MAX_MARKER_HISTORY, MAX_MARKER_PAYLOAD_BYTES, MAX_MARKERS, MarkerFact,
+    MarkerKey, MarkerPayload, MarkerRecording, MarkerSchema, MarkerSubject, SupersededFact,
+    WorkItem, WorkflowMarker,
+};
 pub use model::{
     AttemptRecord, AttemptState, CancelRequest, CancelStatus, Consumption, Creation, EffectOutcome,
     EffectPlan, EffectRecord, EffectStart, EffectState, EvidenceLog, Lease, MAX_CONSUMED_MESSAGES,

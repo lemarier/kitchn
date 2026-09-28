@@ -42,6 +42,8 @@ closed_names! {
         EditLabels = "edit-labels",
         /// Open an issue.
         CreateIssue = "create-issue",
+        /// Close an issue. Granted only explicitly; no other permission implies it.
+        CloseIssue = "close-issue",
         /// Change issue relationships such as blocked-by links and sub-issues.
         EditIssueRelationships = "edit-issue-relationships",
         /// Push commits to a branch.
@@ -200,6 +202,27 @@ impl HouseGrants {
     #[must_use]
     pub const fn house(&self) -> &HouseId {
         &self.house
+    }
+
+    /// A copy whose standing grants also include `extra`. Every extra grant
+    /// must be covered by the house policy limits; none is dropped silently.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::AuthorityExpansion`] naming the first extra
+    /// grant (in sorted order) the limits do not cover.
+    pub fn with_added_standing(
+        &self,
+        extra: impl IntoIterator<Item = Grant>,
+    ) -> Result<Self, ContractError> {
+        let extra: BTreeSet<Grant> = extra.into_iter().collect();
+        ensure_covered(&self.limits, &extra)?;
+        let mut standing = self.standing.clone();
+        standing.extend(extra);
+        Ok(Self {
+            house: self.house.clone(),
+            limits: self.limits.clone(),
+            standing,
+        })
     }
 
     /// Whether some standing grant covers `grant`.

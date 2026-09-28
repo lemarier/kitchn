@@ -3,7 +3,7 @@
 use super::{CredentialRef, HouseScope, IntegrationError, IssueNumber, evidence::*};
 use crate::{
     HouseId,
-    contracts::{CommitId, Repository, Timestamp},
+    contracts::{BranchName, CommitId, Repository, Timestamp},
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -379,6 +379,23 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
         match self.single::<PullRequest>(house, repo, format!("pulls/{}", number.get())) {
             Observation::Known(pr) if pr.number != number => Observation::Unknown,
             result => result,
+        }
+    }
+    /// Read a branch's current tip from its ref. A pull request's `base.sha`
+    /// is the base recorded on the PR object and can lag the branch.
+    pub fn branch_tip(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        branch: &BranchName,
+    ) -> Observation<CommitId> {
+        match self.single::<Branch>(house, repo, format!("branches/{branch}")) {
+            Observation::Known(found) if found.name == branch.as_str() => {
+                Observation::Known(found.commit.sha)
+            }
+            Observation::Known(_) => Observation::Unknown,
+            Observation::Unknown => Observation::Unknown,
+            Observation::Unavailable(error) => Observation::Unavailable(error),
         }
     }
     /// Read GraphQL mergeStateStatus and bind it to the exact selected head.

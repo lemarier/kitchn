@@ -262,6 +262,20 @@ pub struct GitRef {
     #[serde(default)]
     pub repo: Option<GitRepository>,
 }
+/// A branch and the commit its ref points at now.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Branch {
+    /// Branch name.
+    pub name: String,
+    /// Current tip.
+    pub commit: BranchCommit,
+}
+/// The commit a branch ref points at.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BranchCommit {
+    /// Full object id.
+    pub sha: CommitId,
+}
 /// REST mergeability detail; unknown provider values never grant readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]

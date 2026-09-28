@@ -2,6 +2,7 @@
 //! roots. Standard input is piped, so these cover the non-interactive path;
 //! the prompts are covered through the library's prompter in
 //! `crates/kitchen/tests/house_init.rs`.
+use kitchen::contracts::CommitId;
 use std::{
     fs,
     path::Path,
@@ -41,6 +42,15 @@ fn fixture(root: &Path) -> TestResult<(std::path::PathBuf, std::path::PathBuf)> 
     Ok((checkout, home))
 }
 
+/// A verified default-guidance bundle for `house`, pinned at [`KITCHEN`]. The
+/// test binary records no build commit, so a script must supply one.
+fn bundle(root: &Path, house: &str) -> TestResult<String> {
+    let bundle = kitchen::house::default_guidance(&house.parse()?, &CommitId::new(KITCHEN)?)?;
+    let path = root.join(format!("{house}-bundle.json"));
+    fs::write(&path, serde_json::to_vec(&bundle)?)?;
+    Ok(path.display().to_string())
+}
+
 fn init(checkout: &Path, home: &Path, args: &[&str]) -> TestResult<Output> {
     Ok(Command::new(env!("CARGO_BIN_EXE_kitchen"))
         .current_dir(checkout)
@@ -54,8 +64,10 @@ fn init(checkout: &Path, home: &Path, args: &[&str]) -> TestResult<Output> {
 #[test]
 fn piped_input_fails_with_the_missing_flags_instead_of_blocking() -> TestResult {
     let temp = tempfile::tempdir()?;
-    let (checkout, home) = fixture(&temp.path().canonicalize()?)?;
-    let output = init(&checkout, &home, &[])?;
+    let root = temp.path().canonicalize()?;
+    let (checkout, home) = fixture(&root)?;
+    let acme = bundle(&root, "acme")?;
+    let output = init(&checkout, &home, &["--bundle", &acme])?;
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
@@ -77,6 +89,7 @@ fn flags_register_the_same_house_as_the_config_path() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let (checkout, home) = fixture(&root)?;
+    let acme = bundle(&root, "acme")?;
     let output = init(
         &checkout,
         &home,
@@ -85,8 +98,8 @@ fn flags_register_the_same_house_as_the_config_path() -> TestResult {
             "acme",
             "--required-checks",
             "test,lint",
-            "--kitchen",
-            KITCHEN,
+            "--bundle",
+            &acme,
             "--yes",
         ],
     )?;
@@ -98,9 +111,13 @@ fn flags_register_the_same_house_as_the_config_path() -> TestResult {
     );
     let stdout = String::from_utf8(output.stdout)?;
     assert!(
-        stdout.contains("and pinned the default guidance at 4f2a9c1."),
+        stdout.contains("and pinned the bundle's guidance at 4f2a9c1."),
         "{stdout}"
     );
+    // --yes still prints the exact config before registering it.
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains(r#""house": "acme""#), "{stderr}");
+    assert!(stderr.contains(r#""test""#), "{stderr}");
     assert!(stdout.contains("No authority or workflows activated."));
     let guided = home.join(".kitchn/houses/acme.json");
     assert!(stdout.contains(&format!("Saved your answers as {}.", guided.display())));
@@ -137,8 +154,8 @@ fn flags_register_the_same_house_as_the_config_path() -> TestResult {
             "acme",
             "--required-checks",
             "test,lint",
-            "--kitchen",
-            KITCHEN,
+            "--bundle",
+            &acme,
             "--yes",
         ],
     )?;
@@ -217,6 +234,7 @@ fn house_scoped_github_access_offers_the_branch_required_checks() -> TestResult 
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let (checkout, home) = fixture(&root)?;
+    let (acme, other) = (bundle(&root, "acme")?, bundle(&root, "other")?);
     let (gh, token) = fake_gh(
         &root,
         r#"{"contexts":["test"],"checks":[{"context":"lint","app_id":null}]}"#,
@@ -232,7 +250,7 @@ fn house_scoped_github_access_offers_the_branch_required_checks() -> TestResult 
         "--gh",
         &gh,
     ];
-    let mut args = vec!["--house", "acme", "--kitchen", KITCHEN, "--yes"];
+    let mut args = vec!["--house", "acme", "--bundle", &acme, "--yes"];
     args.extend(access);
     let output = init(&checkout, &home, &args)?;
     assert_eq!(
@@ -248,7 +266,7 @@ fn house_scoped_github_access_offers_the_branch_required_checks() -> TestResult 
     // Unreadable protection is not "no checks": a script must answer.
     let (gh, _) = fake_gh(&root, "")?;
     let gh = gh.display().to_string();
-    let mut args = vec!["--house", "other", "--kitchen", KITCHEN, "--yes"];
+    let mut args = vec!["--house", "other", "--bundle", &other, "--yes"];
     args.extend(access);
     // The last value is --gh.
     args.pop();
@@ -257,5 +275,28 @@ fn house_scoped_github_access_offers_the_branch_required_checks() -> TestResult 
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8(output.stderr)?.contains("pass --required-checks"));
     assert!(!home.join(".kitchn/houses/other.json").exists());
+    Ok(())
+}
+
+#[test]
+fn the_built_in_guidance_is_refused_without_a_recorded_build_commit() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let (checkout, home) = fixture(&root)?;
+    // This test binary is built without KITCHEN_COMMIT, so no commit can be
+    // claimed for the embedded guidance, whatever --kitchen says.
+    for extra in [&[][..], &["--kitchen", KITCHEN][..]] {
+        let mut args = vec!["--house", "acme", "--required-checks", "none", "--yes"];
+        args.extend(extra);
+        let output = init(&checkout, &home, &args)?;
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("did not record the commit it was built from")
+                && stderr.contains("--bundle"),
+            "{stderr}"
+        );
+        assert!(!home.join(".kitchn").exists());
+    }
     Ok(())
 }

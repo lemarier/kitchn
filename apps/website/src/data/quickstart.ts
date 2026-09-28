@@ -146,7 +146,6 @@ export const steps: Step[] = [
           warn("No house-scoped GitHub access to read required checks (see --github-requester)."),
           you("Required checks: test, lint"),
           out("Required reviewers [expediter]:"),
-          out("Kitchen commit this binary was built from [ed7da17, this binary]:"),
           dim('{ "house": "acme", "repositories": ["acme/app"], "grants": [], … }'),
           you("Register house acme in ~/.kitchn? [y/N]: y"),
           ok("Registered house acme in ~/.kitchn and pinned the default guidance at ed7da17."),

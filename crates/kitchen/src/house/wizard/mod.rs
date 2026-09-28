@@ -293,7 +293,10 @@ pub enum InitDecision {
 /// [`HouseInitError::MissingAnswers`] without a prompter,
 /// [`HouseInitError::InvalidAnswer`] for an invalid flag or repeated invalid
 /// answers, [`HouseError::PinMismatch`] when `--kitchen` or the house
-/// disagrees with the bundle, and configuration validation failures.
+/// disagrees with the bundle, [`HouseInitError::BuildCommitUnknown`] or
+/// [`HouseInitError::KitchenNotThisBuild`] when no bundle is given and the
+/// build commit is unrecorded or differs from `--kitchen`, and configuration
+/// validation failures.
 pub fn plan_house_init(
     answers: &InitAnswers,
     facts: &InitFacts,
@@ -430,8 +433,7 @@ pub fn plan_house_init(
     let Some(prompter) = session.prompter else {
         return Err(HouseInitError::MissingAnswers(vec![InitQuestion::Confirm]));
     };
-    let text = String::from_utf8(encode(&plan.config)?).map_err(|_| HouseError::InvalidInput)?;
-    prompter.show(&text)?;
+    prompter.show(&plan.config_text()?)?;
     let answer = prompter.ask(&format!(
         "Register house {} in {}? [y/N]: ",
         plan.config.house,
@@ -444,6 +446,16 @@ pub fn plan_house_init(
             InitDecision::Declined(plan)
         },
     )
+}
+
+impl HouseInitPlan {
+    /// The exact JSON [`register_house`] will save as the house config.
+    ///
+    /// # Errors
+    /// [`HouseError::InvalidInput`] when the config cannot be encoded.
+    pub fn config_text(&self) -> Result<String, HouseError> {
+        String::from_utf8(encode(&self.config)?).map_err(|_| HouseError::InvalidInput)
+    }
 }
 
 /// What [`register_house`] stored.
@@ -702,16 +714,16 @@ impl Session<'_> {
             }
             return Ok(Some(bundle.kitchen.clone()));
         }
-        self.answer(
-            InitQuestion::Kitchen,
-            answers.kitchen.as_deref(),
-            "Kitchen commit this binary was built from",
-            built_from.map(|commit| Offer {
-                value: commit.to_string(),
-                note: Some("this binary"),
-            }),
-            parse,
-        )
+        // The embedded guidance came from this build's revision only.
+        let built_from = built_from.ok_or(HouseInitError::BuildCommitUnknown)?;
+        if let Some(flag) = &answers.kitchen
+            && parse(flag.trim())
+                .map_err(|()| HouseInitError::InvalidAnswer(InitQuestion::Kitchen))?
+                != *built_from
+        {
+            return Err(HouseInitError::KitchenNotThisBuild);
+        }
+        Ok(Some(built_from.clone()))
     }
 }
 

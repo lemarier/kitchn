@@ -135,8 +135,8 @@ fn blank_answers_take_the_checkout_remote_and_station_defaults() -> TestResult {
     let temp = tempfile::tempdir()?;
     let home = temp.path().canonicalize()?;
     // Registry, house, repositories, destinations, three stations, checks,
-    // reviewers, kitchen, confirmation.
-    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test, lint", "", "", "y"]);
+    // reviewers, confirmation. The commit is this build's, so it is not asked.
+    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test, lint", "", "y"]);
     let plan = confirmed(plan_house_init(
         &InitAnswers::default(),
         &facts(&home)?,
@@ -191,6 +191,45 @@ fn a_declined_confirmation_writes_nothing() -> TestResult {
         Err(HouseInitError::Io(std::io::ErrorKind::UnexpectedEof))
     ));
     assert!(!home.join("registry").exists());
+    Ok(())
+}
+
+#[test]
+fn a_config_output_failure_aborts_before_confirmation() -> TestResult {
+    struct Broken;
+    impl Prompter for Broken {
+        fn show(&mut self, _: &str) -> Result<(), HouseInitError> {
+            Err(HouseInitError::Io(std::io::ErrorKind::BrokenPipe))
+        }
+        fn ask(&mut self, _: &str) -> Result<String, HouseInitError> {
+            Ok("y".to_owned())
+        }
+    }
+    let temp = tempfile::tempdir()?;
+    let home = temp.path().canonicalize()?;
+    let answers = InitAnswers {
+        yes: false,
+        ..flags(&home.join("registry"))
+    };
+    let result = plan_house_init(&answers, &facts(&home)?, &NoGitHubAccess, Some(&mut Broken));
+    assert!(matches!(
+        result,
+        Err(HouseInitError::Io(std::io::ErrorKind::BrokenPipe))
+    ));
+    assert!(!home.join("registry").exists());
+
+    // The text shown is exactly what registration saves.
+    let plan = confirmed(plan_house_init(
+        &flags(&home.join("registry")),
+        &facts(&home)?,
+        &NoGitHubAccess,
+        None,
+    )?)?;
+    let report = register_house(&plan)?;
+    assert_eq!(
+        plan.config_text()?.as_bytes(),
+        fs::read(report.config_path)?
+    );
     Ok(())
 }
 
@@ -251,26 +290,26 @@ fn unknown_agents_are_asked_without_claiming_any_available() -> TestResult {
 fn non_interactive_input_names_every_missing_answer() -> TestResult {
     let temp = tempfile::tempdir()?;
     let home = temp.path().canonicalize()?;
-    let no_commit = InitFacts {
-        kitchen: None,
-        ..facts(&home)?
-    };
-    let error = plan_house_init(&InitAnswers::default(), &no_commit, &NoGitHubAccess, None)
-        .err()
-        .ok_or("planned without answers")?;
+    let error = plan_house_init(
+        &InitAnswers::default(),
+        &facts(&home)?,
+        &NoGitHubAccess,
+        None,
+    )
+    .err()
+    .ok_or("planned without answers")?;
     assert!(matches!(
         &error,
         HouseInitError::MissingAnswers(missing) if *missing == [
             InitQuestion::House,
             InitQuestion::RequiredChecks,
-            InitQuestion::Kitchen,
             InitQuestion::Confirm,
         ]
     ));
     assert_eq!(error.class(), ErrorClass::InvalidInput);
     assert_eq!(
         error.to_string(),
-        "standard input is not a terminal, so kitchen cannot ask; pass --house, --required-checks, --kitchen, --yes (or register a reviewed file with --config)"
+        "standard input is not a terminal, so kitchen cannot ask; pass --house, --required-checks, --yes (or register a reviewed file with --config)"
     );
     assert!(!home.join(".kitchn").exists());
 
@@ -493,6 +532,74 @@ fn a_supplied_bundle_supplies_the_pins_and_must_match() -> TestResult {
         plan_house_init(&other_house, &facts(&root)?, &NoGitHubAccess, None),
         Err(HouseInitError::House(HouseError::PinMismatch))
     ));
+    Ok(())
+}
+
+#[test]
+fn embedded_guidance_needs_this_builds_commit() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let registry = root.join("registry");
+
+    // Matching --kitchen, and no --kitchen at all, pin the build's commit.
+    for kitchen in [Some(KITCHEN.to_owned()), None] {
+        let answers = InitAnswers {
+            kitchen,
+            ..flags(&registry)
+        };
+        let plan = confirmed(plan_house_init(
+            &answers,
+            &facts(&root)?,
+            &NoGitHubAccess,
+            None,
+        )?)?;
+        assert_eq!(plan.config.kitchen, CommitId::new(KITCHEN)?);
+        assert_eq!(plan.bundle.guidance, CommitId::new(KITCHEN)?);
+    }
+
+    // A different commit would label bytes it never supplied.
+    let other = InitAnswers {
+        kitchen: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+        ..flags(&registry)
+    };
+    let error = plan_house_init(&other, &facts(&root)?, &NoGitHubAccess, None)
+        .err()
+        .ok_or("mismatched commit planned")?;
+    assert!(matches!(error, HouseInitError::KitchenNotThisBuild));
+    assert_eq!(error.class(), ErrorClass::InvalidInput);
+    assert!(error.to_string().contains("--bundle"));
+
+    // An unrecorded build commit cannot label the embedded guidance, even
+    // when --kitchen is given; a supplied bundle still works.
+    let unknown = InitFacts {
+        kitchen: None,
+        ..facts(&root)?
+    };
+    let error = plan_house_init(&flags(&registry), &unknown, &NoGitHubAccess, None)
+        .err()
+        .ok_or("planned without a build commit")?;
+    assert!(matches!(error, HouseInitError::BuildCommitUnknown));
+    assert!(error.to_string().contains("--bundle"));
+    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test", ""]);
+    let prompted = plan_house_init(
+        &InitAnswers::default(),
+        &unknown,
+        &NoGitHubAccess,
+        Some(&mut script),
+    );
+    assert!(matches!(prompted, Err(HouseInitError::BuildCommitUnknown)));
+    let bundle: InstructionBundle =
+        serde_json::from_str(include_str!("fixtures/house/crabnebula-bundle.json"))?;
+    let answers = InitAnswers {
+        house: Some("crabnebula".to_owned()),
+        repositories: Some("crabnebula/tauri-fixture".to_owned()),
+        posting_destinations: None,
+        kitchen: None,
+        bundle: Some(bundle),
+        ..flags(&registry)
+    };
+    confirmed(plan_house_init(&answers, &unknown, &NoGitHubAccess, None)?)?;
+    assert!(!registry.exists());
     Ok(())
 }
 

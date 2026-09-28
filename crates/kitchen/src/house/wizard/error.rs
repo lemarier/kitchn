@@ -16,6 +16,18 @@ pub enum HouseInitError {
     /// written.
     #[error("invalid answer for {0}: expected {hint}", hint = .0.hint())]
     InvalidAnswer(InitQuestion),
+    /// The build recorded no Kitchen commit, so the embedded guidance cannot
+    /// be labelled with one. Nothing was written.
+    #[error(
+        "this kitchen binary did not record the commit it was built from, so it cannot label its built-in guidance; pass --bundle with a verified instruction bundle"
+    )]
+    BuildCommitUnknown,
+    /// `--kitchen` names a commit other than this build's. Nothing was
+    /// written.
+    #[error(
+        "--kitchen is not the commit this binary was built from, so its built-in guidance cannot be pinned there; drop --kitchen or pass --bundle with a verified instruction bundle"
+    )]
+    KitchenNotThisBuild,
     /// The house was registered, but pinning its guidance failed. Rerunning
     /// `house init` with the same answers resumes: identical content is kept.
     #[error(
@@ -38,7 +50,10 @@ impl HouseInitError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
-            Self::MissingAnswers(_) | Self::InvalidAnswer(_) => ErrorClass::InvalidInput,
+            Self::MissingAnswers(_)
+            | Self::InvalidAnswer(_)
+            | Self::BuildCommitUnknown
+            | Self::KitchenNotThisBuild => ErrorClass::InvalidInput,
             Self::GuidanceNotPinned { source } | Self::House(source) => source.class(),
             Self::Io(_) => ErrorClass::Execution,
         }

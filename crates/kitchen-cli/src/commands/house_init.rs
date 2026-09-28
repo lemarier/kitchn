@@ -159,6 +159,10 @@ pub fn run(
             return Ok(("Declined; nothing was registered.".to_owned(), false));
         }
     };
+    if answers.yes {
+        // The interactive path already showed the config when asking.
+        announce(&plan.config_text()?, &mut io::stderr().lock())?;
+    }
     let report = register_house(&plan)?;
     let guidance = plan.config.guidance.as_str();
     Ok((
@@ -177,6 +181,13 @@ pub fn run(
         ),
         true,
     ))
+}
+
+/// Writes the config about to be registered. A failure aborts before any write.
+fn announce(text: &str, out: &mut impl Write) -> Result<(), HouseError> {
+    writeln!(out, "{text}")?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Prompts on standard error; answers from standard input.
@@ -358,5 +369,27 @@ mod guided_ids {
         let mut guided = GUIDED.to_vec();
         guided.sort_unstable();
         assert_eq!(ids, guided);
+    }
+
+    struct Broken;
+    impl std::io::Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn announce_writes_the_config_with_a_newline() {
+        let mut out = Vec::new();
+        assert!(announce("{}", &mut out).is_ok());
+        assert_eq!(out, b"{}\n");
+    }
+
+    #[test]
+    fn announce_reports_an_output_failure() {
+        assert!(announce("{}", &mut Broken).is_err());
     }
 }

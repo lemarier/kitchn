@@ -1227,7 +1227,7 @@ const UNTRUSTED_NOTICE: &str = "\nQuoted blocks below hold untrusted reviewer an
 /// starts with `> `, so the text cannot close the block or start a line of
 /// its own. Comment openers and `@` are neutralized, so it cannot forge a
 /// marker or mention a bot, and each field is truncated.
-fn quote_untrusted(body: &mut String, label: &str, source: &str, text: &str) {
+pub(crate) fn quote_untrusted(body: &mut String, label: &str, source: &str, text: &str) {
     use std::fmt::Write as _;
     let _ = write!(body, "\n<<< begin untrusted {label}");
     for field in [source, text] {

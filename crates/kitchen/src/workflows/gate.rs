@@ -19,7 +19,7 @@ pub struct GateEvidence {
     /// Exact base tip.
     pub base: CommitId,
     /// Seconds since the head was pushed.
-    pub head_age_secs: u64,
+    pub head_age_secs: Option<u64>,
     /// PR is currently open.
     pub open: Option<bool>,
     /// PR is a draft.
@@ -46,6 +46,8 @@ pub struct GateEvidence {
     pub no_change_request: Option<bool>,
     /// Gate semantic inspection, read-only and based on committed diff content.
     pub semantic_review: SemanticReview,
+    /// Link to the actual independent review record.
+    pub semantic_source: Option<ExternalRef>,
     /// Demonstrated findings worth fixing on this branch.
     pub verified_findings: Vec<VerifiedFinding>,
     /// Findings the gate disproved with linked evidence.
@@ -68,6 +70,8 @@ pub struct GateEvidence {
     pub risk_approval: Option<RiskApproval>,
     /// Branch writer is still working.
     pub writer_working: bool,
+    /// Revision to which acceptance, hardware, and risk observations apply.
+    pub supporting_subject: Option<(CommitId, CommitId)>,
 }
 
 /// Check conclusion for the full set at the head.
@@ -225,8 +229,12 @@ pub enum Gap {
     Eligibility,
     /// Clean protected mergeability is unproven.
     Mergeability,
+    /// Head timestamp is unavailable or malformed.
+    HeadAge,
     /// The head does not contain the current base.
     BaseBehind,
+    /// Supporting evidence belongs to another head or base.
+    SupportingSubject,
     /// Required checks are pending, failed, or missing.
     Checks,
     /// A required current-head review is missing.
@@ -307,6 +315,9 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     {
         gaps.push(Gap::Eligibility);
     }
+    if e.head_age_secs.is_none() {
+        gaps.push(Gap::HeadAge);
+    }
     if e.merge_clean != Some(true) || e.protection_satisfied != Some(true) {
         gaps.push(Gap::Mergeability);
     }
@@ -336,6 +347,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     }
     if e.semantic_head.as_ref() != Some(&e.head)
         || e.semantic_base.as_ref() != Some(&e.base)
+        || e.semantic_source.is_none()
         || !e.semantic_read_only
         || !e.semantic_independent
     {
@@ -356,6 +368,9 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     if e.hardware_complete != Some(true) {
         gaps.push(Gap::Hardware);
     }
+    if e.supporting_subject.as_ref() != Some(&(e.head.clone(), e.base.clone())) {
+        gaps.push(Gap::SupportingSubject);
+    }
     if e.risk_classes.is_none()
         || (e
             .risk_classes
@@ -367,14 +382,15 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     }
     gaps.sort_by_key(|gap| *gap as u8);
     gaps.dedup();
+    let age = e.head_age_secs.unwrap_or(86400);
     let verdict = if history.handovers >= 2
         || (history.reported_subject.as_ref() == Some(&(e.head.clone(), e.base.clone()))
             && !history.explicit_reopen)
-        || e.head_age_secs < 1800
+        || age < 1800
         || e.writer_working
-        || (e.checks == Checks::Pending && e.head_age_secs < 86400)
-        || (gaps.contains(&Gap::ReviewerPending) && e.head_age_secs < 86400)
-        || (e.merge_clean == Some(false) && e.head_age_secs < 86400)
+        || (e.checks == Checks::Pending && age < 86400)
+        || (gaps.contains(&Gap::ReviewerPending) && age < 86400)
+        || (e.merge_clean == Some(false) && age < 86400)
     {
         Verdict::Skip
     } else if gaps.is_empty() {
@@ -385,8 +401,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
                 gaps: vec![Gap::MergeGrant],
             }
         }
-    } else if e.head_age_secs >= 86400
-        && (e.checks == Checks::Pending || gaps.contains(&Gap::ReviewerPending))
+    } else if age >= 86400 && (e.checks == Checks::Pending || gaps.contains(&Gap::ReviewerPending))
     {
         Verdict::HandOver { gaps }
     } else if gaps.iter().all(|gap| {
@@ -465,6 +480,21 @@ pub struct MergeRequest {
     /// Base tip re-read just before submission.
     pub checked_base: CommitId,
 }
+impl MergeRequest {
+    /// Build the typed #7 effect; the state store must persist and authorize it
+    /// before execution. The provider checks `expected_head` and uses squash.
+    #[must_use]
+    pub fn mutation(&self) -> crate::contracts::GitHubMutation {
+        crate::contracts::GitHubMutation {
+            repository: self.repository.clone(),
+            action: crate::contracts::GitHubAction::MergePullRequest {
+                number: self.number,
+                expected_head: self.match_head.clone(),
+                method: crate::contracts::MergeMethod::Squash,
+            },
+        }
+    }
+}
 /// Why an effect request could not be prepared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RequestRefusal {
@@ -512,6 +542,31 @@ pub fn merge_request(
         match_head: decision.head.clone(),
         checked_base: decision.base.clone(),
     })
+}
+
+/// Re-read the provider's head and base immediately before preparing the
+/// persisted merge effect. A moved ref is refused; the provider still enforces
+/// the head match when it receives the squash request.
+///
+/// # Errors
+/// Refuses incomplete reads, a moved revision, or a non-merge verdict.
+pub fn merge_request_from_forge<T: crate::integrations::github::GitHubReadTransport>(
+    recorded: &RecordedDecision,
+    client: &crate::integrations::github::GitHubClient<T>,
+    merges_this_run: u8,
+) -> Result<MergeRequest, crate::integrations::github::IntegrationError> {
+    use crate::integrations::github::{IntegrationError, Observation};
+    let decision = &recorded.decision;
+    let pr = match client.pull_request(&decision.house, &decision.repository, decision.number) {
+        Observation::Known(pr) => pr,
+        Observation::Unknown => return Err(IntegrationError::Unknown),
+        Observation::Unavailable(error) => return Err(error),
+    };
+    if pr.state != crate::integrations::github::IssueState::Open || pr.draft || pr.merged {
+        return Err(IntegrationError::StaleDecision);
+    }
+    merge_request(recorded, &pr.head.sha, &pr.base.sha, merges_this_run)
+        .map_err(|_| IntegrationError::StaleDecision)
 }
 
 /// Narrow work request sent through a capable worker backend, never a shell command.
@@ -578,6 +633,102 @@ pub fn fix_request(
     })
 }
 
+/// Bounded person handoff at an exact revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandOverRequest {
+    /// Selected house.
+    pub house: HouseId,
+    /// Destination repository.
+    pub repository: Repository,
+    /// PR to hand over.
+    pub number: IssueNumber,
+    /// Judged head.
+    pub head: CommitId,
+    /// Judged base.
+    pub base: CommitId,
+    /// Failed conditions.
+    pub gaps: Vec<Gap>,
+    /// Findings a person must inspect.
+    pub findings: Vec<VerifiedFinding>,
+}
+
+/// Prepare a handoff only from a newly recorded active verdict.
+///
+/// # Errors
+/// Report-only, duplicate, and other verdicts cannot post a handoff.
+pub fn handover_request(recorded: &RecordedDecision) -> Result<HandOverRequest, RequestRefusal> {
+    if recorded.mode != GateMode::Active || !recorded.new_record {
+        return Err(RequestRefusal::EffectsDisabled);
+    }
+    let decision = &recorded.decision;
+    let Verdict::HandOver { gaps } = &decision.verdict else {
+        return Err(RequestRefusal::WrongVerdict);
+    };
+    Ok(HandOverRequest {
+        house: decision.house.clone(),
+        repository: decision.repository.clone(),
+        number: decision.number,
+        head: decision.head.clone(),
+        base: decision.base.clone(),
+        gaps: gaps.clone(),
+        findings: decision.verified_findings.clone(),
+    })
+}
+
+impl HandOverRequest {
+    /// Typed label and comment effects. The caller persists each through the
+    /// house-scoped effect store and reconciles uncertain outcomes before retry.
+    ///
+    /// # Errors
+    /// Refuses an oversized or invalid summary without producing effects.
+    pub fn mutations(
+        &self,
+    ) -> Result<Vec<crate::contracts::GitHubMutation>, crate::contracts::ContractError> {
+        use crate::contracts::{GitHubAction, GitHubMutation};
+        let mut body = format!(
+            "Gate handover for head {} against base {}.\nFailed conditions: {:?}.",
+            self.head, self.base, self.gaps
+        );
+        for finding in &self.findings {
+            use std::fmt::Write as _;
+            let _ = write!(
+                body,
+                "\nFinding: {} — {}",
+                finding.source,
+                finding.reason.as_str()
+            );
+        }
+        use std::fmt::Write as _;
+        let _ = write!(
+            body,
+            "\n<!-- kitchen-gate handover head={} base={} -->",
+            self.head, self.base
+        );
+        let text = Text::new(&body)?;
+        let mutations = vec![
+            GitHubMutation {
+                repository: self.repository.clone(),
+                action: GitHubAction::SetLabel {
+                    issue: self.number,
+                    label: "needs-human-review".into(),
+                    present: true,
+                },
+            },
+            GitHubMutation {
+                repository: self.repository.clone(),
+                action: GitHubAction::PostComment {
+                    issue: self.number,
+                    body: text,
+                },
+            },
+        ];
+        for mutation in &mutations {
+            mutation.validate()?;
+        }
+        Ok(mutations)
+    }
+}
+
 /// Trial mode records a verdict while forbidding every external effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GateMode {
@@ -603,13 +754,22 @@ pub struct GateVerdictRecord {
     pub verdict: Verdict,
     /// Whether effects were disabled for this evaluation.
     pub mode: GateMode,
+    /// Zero-based request or handover round, preserving an explicit reopen.
+    pub round: u8,
+    /// Wall-clock second when the decision was recorded, for the fix timeout.
+    pub recorded_unix_secs: u64,
 }
 /// Atomic marker boundary. The durable implementation belongs to the shared state store.
-/// It must key records by house, workflow, repository, PR, head, and base.
+/// It must key records by house, workflow, repository, PR, head, base, and
+/// verdict kind and round, so an expired fix request can become one handover at
+/// the same head and one explicit reopen can produce a second handover.
 pub trait GateMarkerStore {
     /// Persistence failure; it must not be swallowed as an unrecorded verdict.
     type Error;
-    /// Read bounded history for a PR and its exact subject.
+    /// Read bounded history for a PR and its exact subject. A fix request sets
+    /// `requested_this_head`, not `reported_subject`; it must time out after two
+    /// hours if the writer is idle. Report-only and handover records set
+    /// `reported_subject` for deduplication.
     ///
     /// # Errors
     /// Fails when history cannot be read completely.
@@ -620,8 +780,10 @@ pub trait GateMarkerStore {
         number: IssueNumber,
         head: &CommitId,
         base: &CommitId,
+        now_unix_secs: u64,
     ) -> Result<GateHistory, Self::Error>;
-    /// Atomically insert the record if absent. False means the exact subject was already handled.
+    /// Atomically insert the record if absent. False means this verdict kind was
+    /// already recorded for the exact subject.
     ///
     /// # Errors
     /// Fails on uncertain or incomplete persistence.
@@ -646,6 +808,7 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
     evidence: &GateEvidence,
     grants: GateGrants,
     mode: GateMode,
+    now_unix_secs: u64,
 ) -> Result<RecordedDecision, S::Error> {
     let history = store.history(
         &evidence.house,
@@ -653,7 +816,10 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
         evidence.number,
         &evidence.head,
         &evidence.base,
+        now_unix_secs,
     )?;
+    let round = history.handovers;
+    let fix_round = history.fix_rounds;
     let mut decision = evaluate(evidence, grants, history);
     if decision.verdict == Verdict::Skip {
         return Ok(RecordedDecision {
@@ -670,6 +836,12 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
         base: decision.base.clone(),
         verdict: decision.verdict.clone(),
         mode,
+        round: if matches!(decision.verdict, Verdict::FixRequest { .. }) {
+            fix_round
+        } else {
+            round
+        },
+        recorded_unix_secs: now_unix_secs,
     })?;
     if !recorded {
         decision.verdict = Verdict::Skip;
@@ -679,4 +851,316 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
         mode,
         new_record: recorded,
     })
+}
+
+/// House-defined forge expectations. The list is complete for this workflow run.
+#[derive(Debug, Clone)]
+pub struct ForgeGatePolicy {
+    /// PR authors eligible for unattended merge.
+    pub authors: Vec<String>,
+    /// Reviewer logins required at the current head.
+    pub expected_reviewers: Vec<String>,
+}
+/// Non-forge evidence supplied by independent house-scoped reviewers and workers.
+#[derive(Debug, Clone)]
+pub struct GateSupplement {
+    /// Gate semantic review result.
+    pub semantic_review: SemanticReview,
+    /// Link to the independent review record.
+    pub semantic_source: Option<ExternalRef>,
+    /// Verified actionable findings.
+    pub verified_findings: Vec<VerifiedFinding>,
+    /// Findings disproved with evidence.
+    pub disproved_findings: Vec<DisprovedFinding>,
+    /// Head actually reviewed.
+    pub semantic_head: Option<CommitId>,
+    /// Base actually reviewed.
+    pub semantic_base: Option<CommitId>,
+    /// Review read committed content without running PR code with credentials.
+    pub semantic_read_only: bool,
+    /// Independent review was observed; model family alone is insufficient.
+    pub semantic_independent: bool,
+    /// Linked issue acceptance evidence.
+    pub acceptance_met: Option<bool>,
+    /// Hardware verification completion.
+    pub hardware_complete: Option<bool>,
+    /// Complete diff risk classification.
+    pub risk_classes: Option<Vec<RiskClass>>,
+    /// Exact-revision human decision, if one exists.
+    pub risk_approval: Option<RiskApproval>,
+    /// Branch writer status.
+    pub writer_working: bool,
+    /// Exact revision of this supporting evidence.
+    pub subject: Option<(CommitId, CommitId)>,
+}
+
+/// Collect forge facts through #7's scoped read side. Missing secondary observations
+/// remain unknown and cannot produce a merge decision. The caller supplies a Unix
+/// seconds clock value and separately attested non-forge evidence.
+///
+/// # Errors
+/// Returns an integration error if the PR itself cannot be identified.
+pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTransport>(
+    client: &crate::integrations::github::GitHubClient<T>,
+    house: &HouseId,
+    repository: &Repository,
+    number: IssueNumber,
+    policy: &ForgeGatePolicy,
+    supplement: GateSupplement,
+    now_unix_secs: u64,
+) -> Result<GateEvidence, crate::integrations::github::IntegrationError> {
+    use crate::integrations::github::{HeadLocation, MergeStatusValue, Observation};
+    let pr = match client.pull_request(house, repository, number) {
+        Observation::Known(pr) => pr,
+        Observation::Unavailable(error) => return Err(error),
+        Observation::Unknown => return Err(crate::integrations::github::IntegrationError::Unknown),
+    };
+    let head = pr.head.sha.clone();
+    let base = pr.base.sha.clone();
+    let repository_info = known(client.repository(house, repository));
+    let merge_status = known(client.merge_status(house, repository, number, &head));
+    let comparison = known(client.compare(house, repository, &base, &head));
+    let runs = known(client.checks(house, repository, &head));
+    let statuses = known(client.statuses(house, repository, &head));
+    let required = known(client.required_checks(house, repository, &pr.base.name));
+    let reviews = known(client.reviews(house, repository, number));
+    let threads = known(client.threads(house, repository, number));
+    let commit = known(client.commit(house, repository, &head));
+    let head_age_secs = commit
+        .as_ref()
+        .and_then(|commit| parse_github_utc(&commit.commit.committer.date))
+        .and_then(|committed| now_unix_secs.checked_sub(committed));
+    let reviewers = expected_reviews(&policy.expected_reviewers, reviews.as_deref(), &head);
+    let no_change_request = reviews.as_deref().and_then(|reviews| {
+        use crate::integrations::github::ReviewState;
+        let mut ordered: Vec<_> = reviews.iter().collect();
+        ordered.sort_by_key(|review| review.id);
+        let mut outstanding = std::collections::BTreeMap::new();
+        for review in ordered {
+            let entry = outstanding
+                .entry(review.user.login.to_ascii_lowercase())
+                .or_insert(false);
+            match review.state {
+                ReviewState::ChangesRequested => *entry = true,
+                ReviewState::Approved | ReviewState::Dismissed => *entry = false,
+                ReviewState::Commented | ReviewState::Pending => (),
+                ReviewState::Unknown => return None,
+            }
+        }
+        Some(outstanding.values().all(|requested| !requested))
+    });
+    let checks = classify_checks(
+        runs.as_deref(),
+        statuses.as_deref(),
+        required.as_ref(),
+        &head,
+    );
+    Ok(GateEvidence {
+        house: house.clone(),
+        repository: repository.clone(),
+        number,
+        head,
+        base,
+        head_age_secs,
+        open: Some(pr.state == crate::integrations::github::IssueState::Open && !pr.merged),
+        draft: Some(pr.draft),
+        same_repository: match pr.head_location(repository) {
+            HeadLocation::SameRepository => Some(true),
+            HeadLocation::Fork => Some(false),
+            HeadLocation::Unknown => None,
+        },
+        targets_default: repository_info.map(|info| info.default_branch == pr.base.name),
+        author_allowed: pr.user.map(|user| {
+            policy
+                .authors
+                .iter()
+                .any(|author| author.eq_ignore_ascii_case(&user.login))
+        }),
+        merge_clean: merge_status
+            .as_ref()
+            .map(|status| status.status == MergeStatusValue::Clean),
+        protection_satisfied: merge_status.map(|status| status.status == MergeStatusValue::Clean),
+        contains_base: comparison.map(|comparison| comparison.behind_by == 0),
+        checks,
+        reviewers,
+        threads_resolved: threads.map(|threads| threads.iter().all(|thread| thread.is_resolved)),
+        no_change_request,
+        semantic_review: supplement.semantic_review,
+        semantic_source: supplement.semantic_source,
+        verified_findings: supplement.verified_findings,
+        disproved_findings: supplement.disproved_findings,
+        semantic_head: supplement.semantic_head,
+        semantic_base: supplement.semantic_base,
+        semantic_read_only: supplement.semantic_read_only,
+        semantic_independent: supplement.semantic_independent,
+        acceptance_met: supplement.acceptance_met,
+        hardware_complete: supplement.hardware_complete,
+        risk_classes: supplement.risk_classes,
+        risk_approval: supplement.risk_approval,
+        writer_working: supplement.writer_working,
+        supporting_subject: supplement.subject,
+    })
+}
+fn known<T>(observation: crate::integrations::github::Observation<T>) -> Option<T> {
+    match observation {
+        crate::integrations::github::Observation::Known(value) => Some(value),
+        crate::integrations::github::Observation::Unavailable(_)
+        | crate::integrations::github::Observation::Unknown => None,
+    }
+}
+fn classify_checks(
+    runs: Option<&[crate::integrations::github::CheckRun]>,
+    statuses: Option<&[crate::integrations::github::CommitStatus]>,
+    required: Option<&crate::integrations::github::RequiredChecks>,
+    head: &CommitId,
+) -> Checks {
+    use crate::integrations::github::{
+        CheckConclusion, CheckStatus, RequiredCheckPresence, StatusState,
+    };
+    let (Some(runs), Some(statuses), Some(required)) = (runs, statuses, required) else {
+        return Checks::Missing;
+    };
+    match required.presence(runs, statuses, head) {
+        RequiredCheckPresence::Present => (),
+        RequiredCheckPresence::Missing | RequiredCheckPresence::Unknown => return Checks::Missing,
+    }
+    if runs.iter().any(|run| {
+        run.status == CheckStatus::Unknown
+            || (run.status == CheckStatus::Completed
+                && !matches!(
+                    run.conclusion,
+                    Some(
+                        CheckConclusion::Success
+                            | CheckConclusion::Neutral
+                            | CheckConclusion::Skipped
+                    )
+                ))
+    }) || statuses.iter().any(|status| {
+        matches!(
+            status.state,
+            StatusState::Failure | StatusState::Error | StatusState::Unknown
+        )
+    }) {
+        return Checks::Failed;
+    }
+    if runs.iter().any(|run| run.status != CheckStatus::Completed)
+        || statuses
+            .iter()
+            .any(|status| status.state == StatusState::Pending)
+    {
+        return Checks::Pending;
+    }
+    Checks::Passed
+}
+fn expected_reviews(
+    names: &[String],
+    reviews: Option<&[crate::integrations::github::Review]>,
+    head: &CommitId,
+) -> Vec<ExpectedReviewer> {
+    names
+        .iter()
+        .map(|name| {
+            let matching = reviews.and_then(|reviews| {
+                reviews
+                    .iter()
+                    .filter(|review| {
+                        review.user.login.eq_ignore_ascii_case(name) && &review.commit_id == head
+                    })
+                    .max_by_key(|review| review.id)
+                    .or_else(|| {
+                        reviews
+                            .iter()
+                            .filter(|review| review.user.login.eq_ignore_ascii_case(name))
+                            .max_by_key(|review| review.id)
+                    })
+            });
+            let (reviewed_head, outcome) = match matching {
+                None => (None, ReviewerOutcome::Pending),
+                Some(review) => {
+                    let outcome = match review.state {
+                        crate::integrations::github::ReviewState::Approved
+                        | crate::integrations::github::ReviewState::Commented => {
+                            ReviewerOutcome::Clean
+                        }
+                        crate::integrations::github::ReviewState::ChangesRequested => {
+                            ReviewerOutcome::Findings
+                        }
+                        crate::integrations::github::ReviewState::Dismissed
+                        | crate::integrations::github::ReviewState::Pending
+                        | crate::integrations::github::ReviewState::Unknown => {
+                            ReviewerOutcome::Pending
+                        }
+                    };
+                    (Some(review.commit_id.clone()), outcome)
+                }
+            };
+            ExpectedReviewer {
+                name: name.clone(),
+                reviewed_head,
+                outcome,
+            }
+        })
+        .collect()
+}
+fn parse_github_utc(value: &str) -> Option<u64> {
+    let b = value.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let part = |start: usize, end: usize| -> Option<u64> {
+        b[start..end].iter().try_fold(0_u64, |acc, digit| {
+            if digit.is_ascii_digit() {
+                Some(acc * 10 + u64::from(digit - b'0'))
+            } else {
+                None
+            }
+        })
+    };
+    let year = part(0, 4)?;
+    let month = part(5, 7)?;
+    let day = part(8, 10)?;
+    let hour = part(11, 13)?;
+    let minute = part(14, 16)?;
+    let second = part(17, 19)?;
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let leap = |y: u64| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let index = usize::try_from(month - 1).ok()?;
+    let max_day = month_days[index] + u64::from(index == 1 && leap(year));
+    if day == 0 || day > max_day {
+        return None;
+    }
+    let years = (1970..year).map(|y| 365 + u64::from(leap(y))).sum::<u64>();
+    let months = month_days[..index].iter().sum::<u64>() + u64::from(month > 2 && leap(year));
+    Some(((years + months + day - 1) * 24 + hour) * 3600 + minute * 60 + second)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_github_utc;
+    #[test]
+    fn parses_github_utc_and_refuses_invalid_calendar_dates() {
+        assert_eq!(parse_github_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_github_utc("2026-09-28T14:00:00Z"),
+            Some(1_790_604_000)
+        );
+        assert!(parse_github_utc("2025-02-29T00:00:00Z").is_none());
+        assert!(parse_github_utc("2024-02-29T23:59:59Z").is_some());
+        assert!(parse_github_utc("2026-09-28T14:00:00+02:00").is_none());
+    }
 }

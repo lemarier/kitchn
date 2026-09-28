@@ -51,7 +51,7 @@ pub enum EvidenceKind {
 /// The exact revision evidence is about: a head commit and, for a change
 /// proposed against a base, that base. Moving either makes earlier evidence
 /// stale.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EvidenceSubject {
     /// The head commit.

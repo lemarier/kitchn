@@ -34,6 +34,10 @@ pub enum ValueKind {
     Permission,
     /// A backend receipt.
     Receipt,
+    /// An effect kind name.
+    EffectKind,
+    /// A Git branch name.
+    BranchName,
 }
 
 impl fmt::Display for ValueKind {
@@ -49,6 +53,8 @@ impl fmt::Display for ValueKind {
             Self::Role => "role",
             Self::Permission => "permission",
             Self::Receipt => "receipt",
+            Self::EffectKind => "effect kind",
+            Self::BranchName => "branch name",
         })
     }
 }
@@ -164,6 +170,33 @@ fn validate_repository(value: &str) -> Result<(), ContractError> {
     }
 }
 
+/// Maximum length of a [`BranchName`] in bytes.
+pub const MAX_BRANCH_NAME_BYTES: usize = 255;
+
+/// A branch name Git accepts (`git check-ref-format --branch`), restricted
+/// to printable ASCII without spaces.
+fn validate_branch_name(value: &str) -> Result<(), ContractError> {
+    let forbidden = |byte: u8| {
+        !byte.is_ascii_graphic() || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+    };
+    let valid = !value.is_empty()
+        && value.len() <= MAX_BRANCH_NAME_BYTES
+        && !value.bytes().any(forbidden)
+        && !value.starts_with('-')
+        && value != "@"
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value.ends_with('.')
+        && value.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid(ValueKind::BranchName))
+    }
+}
+
 fn validate_text(value: &str) -> Result<(), ContractError> {
     if value.is_empty() || value.len() > MAX_TEXT_BYTES || value.contains('\0') {
         return Err(invalid(ValueKind::Text));
@@ -250,6 +283,13 @@ validated_string!(
     "A full lowercase hexadecimal Git object id (SHA-1 or SHA-256)."
 );
 display_value!(CommitId);
+
+validated_string!(
+    BranchName,
+    validate_branch_name,
+    "A Git branch name, such as `lemarier/core-contracts`, validated like `git check-ref-format --branch` and limited to printable ASCII."
+);
+display_value!(BranchName);
 
 validated_string!(
     Repository,

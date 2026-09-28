@@ -124,6 +124,10 @@ identifier!(
     "A workflow consumer scope that must have at most one live owner, such as a pickup loop."
 );
 identifier!(
+    WorkflowId,
+    "A workflow identity, such as a merge gate or a triage pass, that records markers."
+);
+identifier!(
     EffectName,
     "The caller's name for one logical external effect within a task attempt."
 );

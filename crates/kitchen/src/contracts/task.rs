@@ -1,14 +1,19 @@
 //! Task definitions, attempts, retry bounds, and settlement.
 
-use std::{collections::BTreeSet, fmt, num::NonZeroU32, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    num::NonZeroU32,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     TaskId,
     contracts::{
-        Capability, CommitId, ContractError, GrantScope, Repository, ResourceRef, Role,
-        TaskAuthority, ValueKind,
+        Capability, CommitId, ContractError, ExecutorKind, GrantScope, Repository, ResourceRef,
+        Role, TaskAuthority, ValueKind,
     },
 };
 
@@ -176,11 +181,80 @@ pub struct TaskSpec {
     /// hold the authority to hand them over.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub resources: BTreeSet<ResourceRef>,
-    /// Backend capabilities the task's workflow requires, such as launch
-    /// readiness or a run timeout. Every effect is refused on a backend that
-    /// does not fully support all of them, in addition to the capability the
-    /// effect's own operation needs.
-    pub requires: BTreeSet<Capability>,
+    /// Capabilities the task's workflow requires from each executor family,
+    /// such as launch readiness from the worker backend. An effect is refused
+    /// on an executor that does not fully support the requirements for its
+    /// own family, in addition to the capability the effect itself needs;
+    /// other families' requirements do not apply to it.
+    pub requires: CapabilityRequirements,
+}
+
+/// Capability requirements per executor family. Persisted as a map keyed by
+/// executor kind; a repeated key is rejected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct CapabilityRequirements(BTreeMap<ExecutorKind, BTreeSet<Capability>>);
+
+impl CapabilityRequirements {
+    /// No requirements.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    /// Also require `capabilities` from executors of `executor`'s family.
+    #[must_use]
+    pub fn with(
+        mut self,
+        executor: ExecutorKind,
+        capabilities: impl IntoIterator<Item = Capability>,
+    ) -> Self {
+        self.0.entry(executor).or_default().extend(capabilities);
+        self
+    }
+
+    /// The capabilities required from an executor of `executor`'s family.
+    pub fn for_executor(&self, executor: ExecutorKind) -> impl Iterator<Item = Capability> + '_ {
+        self.0.get(&executor).into_iter().flatten().copied()
+    }
+
+    /// Every executor family with requirements, and its capabilities.
+    pub fn iter(&self) -> impl Iterator<Item = (ExecutorKind, &BTreeSet<Capability>)> {
+        self.0
+            .iter()
+            .map(|(executor, capabilities)| (*executor, capabilities))
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityRequirements {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Requirements;
+
+        impl<'de> serde::de::Visitor<'de> for Requirements {
+            type Value = CapabilityRequirements;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a map from executor kind to capabilities")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut map = BTreeMap::new();
+                while let Some((executor, capabilities)) =
+                    access.next_entry::<ExecutorKind, BTreeSet<Capability>>()?
+                {
+                    if map.insert(executor, capabilities).is_some() {
+                        return Err(serde::de::Error::custom("duplicate executor kind"));
+                    }
+                }
+                Ok(CapabilityRequirements(map))
+            }
+        }
+
+        deserializer.deserialize_map(Requirements)
+    }
 }
 
 impl TaskSpec {

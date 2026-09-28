@@ -79,11 +79,16 @@ fn fake_backend_passes_the_shared_contract() -> TestResult {
         Check::LaunchReceipt,
         Check::LaunchObservable,
         Check::InventoryListsLaunch,
+        Check::MessageRecovery,
         Check::CancelObserved,
     ] {
         assert_eq!(report.result(check), Some(CheckResult::Passed), "{check}");
     }
-    assert_eq!(backend.effects_performed(), 2, "one launch and one cancel");
+    assert_eq!(
+        backend.effects_performed(),
+        3,
+        "one launch, one message, and one cancel"
+    );
     Ok(())
 }
 
@@ -104,7 +109,7 @@ fn minimal_backend_passes_with_checks_marked_not_applicable() -> TestResult {
     assert_eq!(
         report.result(Check::UnknownKeyNotApplied),
         Some(CheckResult::NotApplicable {
-            requires: Capability::EffectLookup
+            requires: Capability::LookupLaunchWorker
         })
     );
     assert_eq!(backend.effects_performed(), 0);
@@ -848,11 +853,13 @@ fn workflow_capability_requirements_are_checked_at_execution() -> TestResult {
     let fixture = Fixture::new()?;
     let task = task_id("task-1")?;
     let mut workflow = spec("task-1")?;
-    workflow.requires = [
-        Capability::WorkerLaunchReadiness,
-        Capability::ScheduleRunTimeout,
-    ]
-    .into();
+    workflow.requires = kitchen::contracts::CapabilityRequirements::new().with(
+        kitchen::contracts::ExecutorKind::Worker,
+        [
+            Capability::WorkerLaunchReadiness,
+            Capability::ScheduleRunTimeout,
+        ],
+    );
     fixture.store.create_task(workflow, &creator()?, at(0))?;
     let fence = fixture
         .store
@@ -898,7 +905,11 @@ fn workflow_capability_requirements_are_checked_at_execution() -> TestResult {
     assert!(matches!(launched.state(), EffectState::Applied { .. }));
     let stored = fixture.store.task(&task)?;
     assert_eq!(
-        stored.spec().requires.iter().copied().collect::<Vec<_>>(),
+        stored
+            .spec()
+            .requires
+            .for_executor(kitchen::contracts::ExecutorKind::Worker)
+            .collect::<Vec<_>>(),
         [
             Capability::ScheduleRunTimeout,
             Capability::WorkerLaunchReadiness
@@ -1449,6 +1460,251 @@ fn a_new_owner_can_stop_the_worker_after_cancellation() -> TestResult {
             .store
             .settle_cancelled(&task, owner.fence(), at(63))?;
         assert_eq!(fixture.store.task(&task)?.attempts().len(), 1);
+    }
+    Ok(())
+}
+
+/// Like Orca: launches, cancels, and releases can be looked up and deduplicated; messages cannot.
+fn orca_like_capabilities() -> CapabilitySet {
+    CapabilitySet::supporting([
+        Capability::WorkerLaunchIsolated,
+        Capability::WorkerMessaging,
+        Capability::WorkerCancel,
+        Capability::WorkerStatusAndOutcome,
+        Capability::ResourceRelease,
+        Capability::LookupLaunchWorker,
+        Capability::IdempotentLaunchWorker,
+        Capability::LookupCancelWorker,
+        Capability::IdempotentCancelWorker,
+        Capability::LookupReleaseResource,
+        Capability::IdempotentReleaseResource,
+    ])
+}
+
+#[test]
+fn per_kind_declarations_pass_the_shared_contract() -> TestResult {
+    let backend = FakeBackend::new(backend_id()?, house()?, orca_like_capabilities());
+    let report = conformance::run_worker(&backend, &conformance_fixture()?)?;
+    for check in [
+        Check::UnknownKeyNotApplied,
+        Check::LookupMatchesReceipt,
+        Check::IdempotentResubmission,
+        Check::MessageRecovery,
+        Check::CancelObserved,
+    ] {
+        assert_eq!(report.result(check), Some(CheckResult::Passed), "{check}");
+    }
+    Ok(())
+}
+
+/// Declares lookup and idempotency for messages that it cannot honor.
+struct OverclaimingMessages {
+    inner: FakeBackend,
+    declared: BackendDescriptor,
+}
+
+impl EffectExecutor for OverclaimingMessages {
+    fn descriptor(&self) -> &BackendDescriptor {
+        &self.declared
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        self.inner.execute(request)
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.inner.lookup(request)
+    }
+}
+
+impl WorkerBackend for OverclaimingMessages {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.inner.observe_worker(worker)
+    }
+}
+
+#[test]
+fn an_overclaimed_message_declaration_fails_the_contract() -> TestResult {
+    for claim in [
+        Capability::LookupMessageWorker,
+        Capability::IdempotentMessageWorker,
+    ] {
+        let backend = OverclaimingMessages {
+            inner: FakeBackend::new(backend_id()?, house()?, orca_like_capabilities()),
+            declared: BackendDescriptor {
+                backend: backend_id()?,
+                house: house()?,
+                capabilities: orca_like_capabilities()
+                    .with(claim, kitchen::contracts::Support::Supported),
+            },
+        };
+        let failure = conformance::run_worker(&backend, &conformance_fixture()?)
+            .err()
+            .ok_or("an overclaimed message declaration passed")?;
+        assert_eq!(failure.check, Check::MessageRecovery, "{claim}");
+    }
+    Ok(())
+}
+
+/// Hands the worker to a person instead of stopping it.
+struct TakeoverOnCancel(FakeBackend);
+
+impl EffectExecutor for TakeoverOnCancel {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.0.descriptor()
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        match request.effect() {
+            kitchen::contracts::Effect::Worker(Operation::CancelWorker { worker }) => {
+                self.0.set_worker_state(worker, WorkerState::UserTakeover);
+                Err(EffectFailure::Uncertain(UncertainReason::Timeout))
+            }
+            _ => self.0.execute(request),
+        }
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.0.lookup(request)
+    }
+}
+
+impl WorkerBackend for TakeoverOnCancel {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.0.observe_worker(worker)
+    }
+    fn inventory(
+        &self,
+    ) -> Result<Vec<kitchen::contracts::ResourceObservation>, BackendUnavailable> {
+        self.0.inventory()
+    }
+}
+
+#[test]
+fn a_user_takeover_is_not_evidence_of_cancellation() -> TestResult {
+    let backend = TakeoverOnCancel(FakeBackend::fully_capable(backend_id()?, house()?));
+    let failure = conformance::run_worker(&backend, &conformance_fixture()?)
+        .err()
+        .ok_or("a taken-over worker passed as cancelled")?;
+    assert_eq!(failure.check, Check::CancelObserved);
+    Ok(())
+}
+
+/// Creates the worker on a branch other than the one requested.
+struct WrongBranch(FakeBackend);
+
+impl EffectExecutor for WrongBranch {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.0.descriptor()
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        let receipt = self.0.execute(request)?;
+        let created = receipt
+            .created()
+            .iter()
+            .map(|resource| {
+                if resource.kind == ResourceKind::Branch {
+                    ExternalRef::new("some-other-branch").map(|handle| ResourceRef {
+                        handle,
+                        ..resource.clone()
+                    })
+                } else {
+                    Ok(resource.clone())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| EffectFailure::Uncertain(UncertainReason::ResponseLost))?;
+        Receipt::new(
+            receipt.reference().clone(),
+            created,
+            receipt.touched().to_vec(),
+        )
+        .map_err(|_| EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.0.lookup(request)
+    }
+}
+
+impl WorkerBackend for WrongBranch {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.0.observe_worker(worker)
+    }
+}
+
+#[test]
+fn a_backend_reporting_another_branch_fails_the_contract() -> TestResult {
+    // Without lookup or idempotency, only the receipt itself is checked.
+    let backend = WrongBranch(fake([
+        Capability::WorkerLaunchIsolated,
+        Capability::WorkerStatusAndOutcome,
+    ])?);
+    let failure = conformance::run_worker(&backend, &conformance_fixture()?)
+        .err()
+        .ok_or("a launch on another branch passed")?;
+    assert_eq!(failure.check, Check::LaunchReceipt);
+    assert_eq!(
+        failure.problem,
+        "receipt does not name exactly the requested branch"
+    );
+    Ok(())
+}
+
+/// Reports the requested branch plus another one it created or touched.
+struct ExtraBranch {
+    inner: FakeBackend,
+    created: bool,
+}
+
+impl EffectExecutor for ExtraBranch {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.inner.descriptor()
+    }
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        let receipt = self.inner.execute(request)?;
+        let lost = || EffectFailure::Uncertain(UncertainReason::ResponseLost);
+        let has_branch = receipt
+            .created()
+            .iter()
+            .any(|resource| resource.kind == ResourceKind::Branch);
+        if !has_branch {
+            return Ok(receipt);
+        }
+        let extra = ResourceRef {
+            kind: ResourceKind::Branch,
+            backend: self.inner.descriptor().backend.clone(),
+            handle: ExternalRef::new("kitchen/unrequested").map_err(|_| lost())?,
+        };
+        let mut created = receipt.created().to_vec();
+        let mut touched = receipt.touched().to_vec();
+        if self.created {
+            created.push(extra);
+        } else {
+            touched.push(extra);
+        }
+        Receipt::new(receipt.reference().clone(), created, touched).map_err(|_| lost())
+    }
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.inner.lookup(request)
+    }
+}
+
+impl WorkerBackend for ExtraBranch {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        self.inner.observe_worker(worker)
+    }
+}
+
+#[test]
+fn a_backend_reporting_an_extra_branch_fails_the_contract() -> TestResult {
+    for created in [true, false] {
+        let backend = ExtraBranch {
+            inner: fake([
+                Capability::WorkerLaunchIsolated,
+                Capability::WorkerStatusAndOutcome,
+            ])?,
+            created,
+        };
+        let failure = conformance::run_worker(&backend, &conformance_fixture()?)
+            .err()
+            .ok_or("a launch with an extra branch passed")?;
+        assert_eq!(failure.check, Check::LaunchReceipt, "created: {created}");
     }
     Ok(())
 }

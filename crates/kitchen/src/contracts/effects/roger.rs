@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     HouseId, TaskId,
     contracts::{
-        Capability, ContractError, EffectContext, EvidenceRevision, ExecutorKind, Permission, Text,
+        Capability, ContractError, EffectContext, EvidenceRevision, EvidenceSubject, ExecutorKind,
+        Permission, Text,
     },
 };
 
@@ -26,6 +27,10 @@ pub struct DecisionBinding {
     pub action: Permission,
     /// The evidence revision the question was asked at.
     pub revision: EvidenceRevision,
+    /// The exact subject (head and base) the question is about; `None` when
+    /// the task had no evidence subject yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<EvidenceSubject>,
 }
 
 /// A human decision request.
@@ -60,8 +65,9 @@ impl RogerEffect {
         }
     }
 
-    /// Per-submission check: the binding must name this house, task, and
-    /// current evidence revision, for a first submission and every retry.
+    /// Per-submission check: the binding must name this house, task, current
+    /// evidence revision, and exact evidence subject (head and base), for a
+    /// first submission and every retry.
     ///
     /// # Errors
     /// Returns [`ContractError::DecisionBindingMismatch`].
@@ -71,6 +77,7 @@ impl RogerEffect {
                 if &binding.house != context.house
                     || &binding.task != context.task
                     || binding.revision != context.revision
+                    || binding.subject.as_ref() != context.subject
                 {
                     return Err(ContractError::DecisionBindingMismatch);
                 }

@@ -57,12 +57,21 @@ fn label(repository: Repository, name: &str) -> TestResult<Effect> {
 }
 
 fn ask(task: &TaskId, revision: EvidenceRevision) -> TestResult<Effect> {
+    ask_about(task, revision, None)
+}
+
+fn ask_about(
+    task: &TaskId,
+    revision: EvidenceRevision,
+    subject: Option<kitchen::contracts::EvidenceSubject>,
+) -> TestResult<Effect> {
     Ok(RogerEffect::Ask {
         binding: DecisionBinding {
             house: house()?,
             task: task.clone(),
             action: Permission::Merge,
             revision,
+            subject,
         },
         question: Text::new("Merge the PR at this head?")?,
     }
@@ -489,6 +498,38 @@ fn inventory_reports_owner_and_liveness_within_its_bound() -> TestResult {
         Some(Liveness::Exited)
     );
 
+    // A person holding the worker keeps it live, and nothing is dispatched into it.
+    workers.set_worker_state(
+        &observation.resource,
+        kitchen::contracts::WorkerState::UserTakeover,
+    );
+    assert_eq!(
+        workers.inventory()?.first().map(|found| found.liveness),
+        Some(Liveness::Live)
+    );
+    let held = run_effect(
+        &fixture.store,
+        &workers,
+        &grants,
+        plan(
+            &task,
+            fence,
+            "message-held",
+            Operation::MessageWorker {
+                worker: observation.resource.clone(),
+                body: Text::new("still there?")?,
+            },
+        )?,
+        &clock,
+    )?;
+    assert!(matches!(
+        held.state(),
+        EffectState::NotApplied {
+            reason: NotAppliedReason::Rejected,
+            ..
+        }
+    ));
+
     // A lost record or an unknown state is not evidence of exit.
     for state in [
         kitchen::contracts::WorkerState::Missing,
@@ -570,6 +611,7 @@ fn targeted_operations_need_a_resource_the_task_owns() -> TestResult {
             role: kitchen::contracts::Role::StationCook,
             workspace: kitchen::contracts::Workspace::Existing(worker.clone()),
             brief: Text::new("reuse")?,
+            branch: None,
         },
     ];
     for (index, operation) in targeted.into_iter().enumerate() {
@@ -699,7 +741,12 @@ fn a_same_key_ask_retry_is_checked_against_the_current_revision() -> TestResult 
         let asked_at = fixture
             .store
             .record_evidence(&task, fence, subject('a', 'b')?, at(1))?;
-        let mut first = plan(&task, fence, "ask", ask(&task, asked_at)?)?;
+        let mut first = plan(
+            &task,
+            fence,
+            "ask",
+            ask_about(&task, asked_at, Some(subject('a', 'b')?.subject))?,
+        )?;
         first.decided_at = asked_at;
         roger.inject(ExecuteFault::TimeoutWithoutApplying);
         let lost = run_effect(
@@ -721,7 +768,12 @@ fn a_same_key_ask_retry_is_checked_against_the_current_revision() -> TestResult 
                 .record_evidence(&task, fence, subject('d', 'b')?, at(3))?
         };
         roger.fail_lookups(100);
-        let mut retry = plan(&task, fence, "ask", ask(&task, asked_at)?)?;
+        let mut retry = plan(
+            &task,
+            fence,
+            "ask",
+            ask_about(&task, asked_at, Some(subject('a', 'b')?.subject))?,
+        )?;
         retry.decided_at = moved;
         let result = run_effect(
             &fixture.store,
@@ -818,5 +870,234 @@ fn a_same_key_ask_retry_does_not_count_against_its_own_budget() -> TestResult {
         ),
         Err(Error::Contract(ContractError::EffectBudgetExhausted { .. }))
     ));
+    Ok(())
+}
+
+#[test]
+fn an_ask_must_name_the_exact_evidence_subject() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = task_for(&fixture, "task-1", None)?;
+    let roger = executor(ExecutorKind::Roger, Capability::AskHuman)?;
+    let grants = grants_everywhere()?;
+    let clock = ManualClock::starting_at(1);
+    let at_head =
+        |head: char, base: Option<char>| -> TestResult<kitchen::contracts::EvidenceSubject> {
+            Ok(kitchen::contracts::EvidenceSubject {
+                head: common::commit(head)?,
+                base: base.map(common::commit).transpose()?,
+            })
+        };
+    let revision = fixture.store.record_evidence(
+        &task,
+        fence,
+        kitchen::contracts::Evidence {
+            kind: kitchen::contracts::EvidenceKind::Check,
+            verdict: kitchen::contracts::EvidenceVerdict::Pass,
+            subject: at_head('a', Some('b'))?,
+            source: ExternalRef::new("ci-1")?,
+            observed_at: at(1),
+        },
+        at(1),
+    )?;
+    // The counter matches, but the question names another head, another
+    // base, or no subject at all.
+    for (name, wrong) in [
+        ("other-head", Some(at_head('c', Some('b'))?)),
+        ("other-base", Some(at_head('a', Some('d'))?)),
+        ("no-base", Some(at_head('a', None)?)),
+        ("no-subject", None),
+    ] {
+        let mut attempt = plan(&task, fence, name, ask_about(&task, revision, wrong)?)?;
+        attempt.decided_at = revision;
+        let result = run_effect(&fixture.store, &roger, &grants, attempt, &clock);
+        assert!(
+            matches!(
+                result,
+                Err(Error::Contract(ContractError::DecisionBindingMismatch))
+            ),
+            "{name}: {result:?}"
+        );
+    }
+    assert_eq!(roger.execute_calls(), 0);
+    let mut exact = plan(
+        &task,
+        fence,
+        "exact",
+        ask_about(&task, revision, Some(at_head('a', Some('b'))?))?,
+    )?;
+    exact.decided_at = revision;
+    let asked = run_effect(&fixture.store, &roger, &grants, exact, &clock)?;
+    assert!(matches!(asked.state(), EffectState::Applied { .. }));
+    Ok(())
+}
+
+/// Like Orca: launches, cancels, and releases can be looked up and deduplicated; messages cannot.
+fn orca_like() -> TestResult<FakeBackend> {
+    Ok(FakeBackend::new(
+        backend_id()?,
+        house()?,
+        CapabilitySet::supporting([
+            Capability::WorkerLaunchIsolated,
+            Capability::WorkerMessaging,
+            Capability::WorkerCancel,
+            Capability::WorkerStatusAndOutcome,
+            Capability::ResourceRelease,
+            Capability::LookupLaunchWorker,
+            Capability::IdempotentLaunchWorker,
+            Capability::LookupCancelWorker,
+            Capability::IdempotentCancelWorker,
+            Capability::LookupReleaseResource,
+            Capability::IdempotentReleaseResource,
+        ]),
+    ))
+}
+
+#[test]
+fn recovery_follows_the_per_kind_declaration() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = task_for(&fixture, "task-1", None)?;
+    let orca = orca_like()?;
+    let grants = grants_everywhere()?;
+    let clock = ManualClock::starting_at(1);
+    let message = |worker: &ResourceRef| -> TestResult<Operation> {
+        Ok(Operation::MessageWorker {
+            worker: worker.clone(),
+            body: Text::new("status?")?,
+        })
+    };
+    assert!(orca.descriptor().supports_lookup(&launch()?.into()));
+    assert!(orca.descriptor().idempotent(&launch()?.into()));
+
+    // A lost launch is looked up and resolved without a second launch.
+    orca.inject(ExecuteFault::ApplyThenLoseResponse);
+    let lost = run_effect(
+        &fixture.store,
+        &orca,
+        &grants,
+        plan(&task, fence, "launch", launch()?)?,
+        &clock,
+    )?;
+    assert!(matches!(lost.state(), EffectState::Uncertain { .. }));
+    let found = run_effect(
+        &fixture.store,
+        &orca,
+        &grants,
+        plan(&task, fence, "launch", launch()?)?,
+        &clock,
+    )?;
+    let EffectState::Applied { receipt, .. } = found.state() else {
+        return Err(format!("launch not recovered: {:?}", found.state()).into());
+    };
+    assert_eq!(orca.execute_calls(), 1);
+    let worker = receipt
+        .created()
+        .iter()
+        .find(|resource| resource.kind == ResourceKind::Worker)
+        .cloned()
+        .ok_or("receipt names no worker")?;
+
+    // A lost message can be neither looked up nor resubmitted.
+    let body: Effect = message(&worker)?.into();
+    assert!(!orca.descriptor().supports_lookup(&body));
+    assert!(!orca.descriptor().idempotent(&body));
+    orca.inject(ExecuteFault::TimeoutWithoutApplying);
+    let unsent = run_effect(
+        &fixture.store,
+        &orca,
+        &grants,
+        plan(&task, fence, "message", message(&worker)?)?,
+        &clock,
+    )?;
+    assert!(matches!(unsent.state(), EffectState::Uncertain { .. }));
+    assert!(matches!(
+        run_effect(&fixture.store, &orca, &grants, plan(&task, fence, "message", message(&worker)?)?, &clock),
+        Err(Error::State(kitchen::state::StateError::UnsafeRetry(seq))) if seq == unsent.seq()
+    ));
+    assert_eq!(orca.execute_calls(), 2);
+    let report = reconcile(&fixture.store, &orca, &task, fence, &clock)?;
+    assert!(matches!(
+        report.unresolved.as_slice(),
+        [effect] if matches!(effect.state(), EffectState::Uncertain { reason: kitchen::contracts::UncertainReason::LookupUnsupported, .. })
+    ));
+    // The fake refuses the lookup it did not declare.
+    assert_eq!(
+        orca.lookup(unsent.request()),
+        Err(kitchen::contracts::BackendUnavailable::Unsupported(
+            Capability::LookupMessageWorker
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn capability_requirements_apply_only_to_their_executor() -> TestResult {
+    let fixture = Fixture::new()?;
+    let grants = grants_everywhere()?;
+    let mut work = spec("task-1")?;
+    work.repository = Some(km43()?);
+    work.authority = TaskAuthority::delegate(&grants, grants_everywhere_list()?)?;
+    work.requires = kitchen::contracts::CapabilityRequirements::new()
+        .with(ExecutorKind::Worker, [Capability::WorkerLaunchReadiness]);
+    let task = task_id("task-1")?;
+    fixture.store.create_task(work, &creator()?, at(0))?;
+    let fence = fixture
+        .store
+        .claim(&task, &scheduled("coordinator-a")?, ttl(600)?, at(0))?
+        .fence();
+    fixture.store.start_attempt(&task, fence, at(0))?;
+    let clock = ManualClock::starting_at(1);
+
+    // A forge executor does not need worker capabilities.
+    let forge = executor(ExecutorKind::GitHub, Capability::ForgeMutation)?;
+    let labelled = run_effect(
+        &fixture.store,
+        &forge,
+        &grants,
+        plan(&task, fence, "label", label(km43()?, "agent-ready")?)?,
+        &clock,
+    )?;
+    assert!(matches!(labelled.state(), EffectState::Applied { .. }));
+
+    // A worker backend without the required worker capability is refused.
+    let workers = executor(ExecutorKind::Worker, Capability::WorkerLaunchIsolated)?;
+    assert!(matches!(
+        run_effect(&fixture.store, &workers, &grants, plan(&task, fence, "launch", launch()?)?, &clock),
+        Err(Error::Contract(ContractError::UnsupportedCapabilities { ref missing, .. }))
+            if missing == &[Capability::WorkerLaunchReadiness]
+    ));
+    Ok(())
+}
+
+#[test]
+fn persisted_capability_requirements_reject_a_repeated_executor() -> TestResult {
+    let requirements = kitchen::contracts::CapabilityRequirements::new()
+        .with(ExecutorKind::Worker, [Capability::WorkerLaunchReadiness])
+        .with(ExecutorKind::GitHub, [Capability::ForgeMutation]);
+    let json = serde_json::to_string(&requirements)?;
+    assert_eq!(
+        json,
+        r#"{"worker":["worker.launch_readiness"],"github":["forge.mutation"]}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<kitchen::contracts::CapabilityRequirements>(&json)?,
+        requirements
+    );
+    let repeated = r#"{"worker":["worker.launch_readiness"],"worker":[]}"#;
+    assert!(serde_json::from_str::<kitchen::contracts::CapabilityRequirements>(repeated).is_err());
+    let unknown = r#"{"mainframe":["worker.launch_readiness"]}"#;
+    assert!(serde_json::from_str::<kitchen::contracts::CapabilityRequirements>(unknown).is_err());
+
+    // A stored task with a repeated executor is rejected on load, bytes kept.
+    let fixture = Fixture::new()?;
+    let mut work = spec("task-1")?;
+    work.requires = requirements;
+    fixture.store.create_task(work, &creator()?, at(0))?;
+    let path = fixture.state_path();
+    let text = std::fs::read_to_string(&path)?;
+    let corrupt = text.replacen("\"github\": [", "\"worker\": [", 1);
+    assert_ne!(corrupt, text);
+    std::fs::write(&path, &corrupt)?;
+    assert!(fixture.reopen().is_err());
+    assert_eq!(std::fs::read_to_string(&path)?, corrupt);
     Ok(())
 }

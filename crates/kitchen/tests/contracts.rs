@@ -167,6 +167,22 @@ fn closed_names_round_trip_and_reject_unknown_text() -> TestResult {
         Capability::ForgeMutation
     );
     assert_eq!("human.ask".parse::<Capability>()?, Capability::AskHuman);
+    // Every effect kind has its own lookup and idempotency capability.
+    let lookups: std::collections::BTreeSet<_> = kitchen::contracts::EffectKind::ALL
+        .iter()
+        .map(|kind| kind.lookup_capability())
+        .collect();
+    let idempotency: std::collections::BTreeSet<_> = kitchen::contracts::EffectKind::ALL
+        .iter()
+        .map(|kind| kind.idempotency_capability())
+        .collect();
+    assert_eq!(lookups.len(), kitchen::contracts::EffectKind::ALL.len());
+    assert_eq!(idempotency.len(), kitchen::contracts::EffectKind::ALL.len());
+    assert!(lookups.is_disjoint(&idempotency));
+    assert_eq!(
+        "effect.lookup.message_worker".parse::<Capability>()?,
+        Capability::LookupMessageWorker
+    );
     for (name, permission) in [
         ("manage-schedule", Permission::ManageSchedule),
         ("activate-schedule", Permission::ActivateSchedule),
@@ -481,4 +497,134 @@ fn errors_expose_a_handling_class() -> TestResult {
         ErrorClass::InvalidInput
     );
     Ok(())
+}
+
+#[test]
+fn closing_an_issue_needs_its_own_explicit_grant() -> TestResult {
+    let close: Permission = "close-issue".parse()?;
+    assert_eq!(close.as_str(), "close-issue");
+    let orca = backend_id()?;
+    // Every other issue permission is granted, closing is not.
+    let token = credential()?;
+    let others: Vec<_> = Permission::ALL
+        .into_iter()
+        .filter(|permission| permission.as_str() != "close-issue")
+        .map(|permission| Grant::house(permission, orca.clone(), token.clone()))
+        .collect();
+    let house_grants = HouseGrants::new(house()?, others.clone());
+    let authority = TaskAuthority::delegate(&house_grants, others)?;
+    assert_eq!(
+        authority.authorize(&house_grants, close, &GrantScope::House, &orca),
+        Err(ContractError::PermissionDenied { permission: close })
+    );
+    let explicit = HouseGrants::new(house()?, [Grant::house(close, orca.clone(), credential()?)]);
+    let granted = TaskAuthority::delegate(
+        &explicit,
+        [Grant::house(close, orca.clone(), credential()?)],
+    )?;
+    assert_eq!(
+        granted.authorize(&explicit, close, &GrantScope::House, &orca)?,
+        credential()?
+    );
+    Ok(())
+}
+
+#[test]
+fn standing_grants_can_be_extended_only_within_house_limits() -> TestResult {
+    let orca = backend_id()?;
+    let token = credential()?;
+    let limits = [
+        Grant::house(Permission::LaunchWorker, orca.clone(), token.clone()),
+        Grant::house(Permission::PostComment, orca.clone(), token.clone()),
+        Grant::house(Permission::Merge, orca.clone(), token.clone()),
+    ];
+    let original = HouseGrants::with_limits(house()?, limits, [grant(Permission::LaunchWorker)?])?;
+    let extended = original.with_added_standing([grant(Permission::PostComment)?])?;
+    assert!(extended.covers(&grant(Permission::PostComment)?));
+    assert!(extended.covers(&grant(Permission::LaunchWorker)?));
+    assert!(
+        !original.covers(&grant(Permission::PostComment)?),
+        "the original is unchanged"
+    );
+
+    // Outside the limits: refused, never silently dropped.
+    for outside in [
+        Permission::Publish,
+        Permission::OperateEquipment,
+        Permission::CloseIssue,
+    ] {
+        assert_eq!(
+            original.with_added_standing([grant(Permission::PostComment)?, grant(outside)?]),
+            Err(ContractError::AuthorityExpansion {
+                permission: outside,
+                scope: GrantScope::House
+            })
+        );
+    }
+    // Merge is added only because house policy already permits it.
+    assert!(
+        original
+            .with_added_standing([grant(Permission::Merge)?])?
+            .covers(&grant(Permission::Merge)?)
+    );
+    let narrow = HouseGrants::new(house()?, [grant(Permission::LaunchWorker)?]);
+    assert!(
+        narrow
+            .with_added_standing([grant(Permission::Merge)?])
+            .is_err()
+    );
+    assert_eq!(narrow.with_added_standing([])?, narrow);
+    Ok(())
+}
+
+#[test]
+fn branch_names_follow_git_ref_rules() -> TestResult {
+    for valid in [
+        "main",
+        "lemarier/core-contracts",
+        "fix-42",
+        "a.b",
+        "release/v1.2",
+    ] {
+        assert_eq!(kitchen::contracts::BranchName::new(valid)?.as_str(), valid);
+    }
+    let too_long = "b".repeat(kitchen::contracts::MAX_BRANCH_NAME_BYTES + 1);
+    for invalid in [
+        "",
+        "-leading",
+        "@",
+        "a..b",
+        "a@{1}",
+        "trailing.",
+        "trailing/",
+        "/leading",
+        "a//b",
+        ".hidden",
+        "a/.hidden",
+        "x.lock",
+        "a/x.lock/b",
+        "has space",
+        "tilde~",
+        "caret^",
+        "colon:",
+        "q?",
+        "star*",
+        "bracket[",
+        "back\\slash",
+        "tab\t",
+        too_long.as_str(),
+    ] {
+        assert_eq!(
+            kitchen::contracts::BranchName::new(invalid),
+            Err(invalid_kind(ValueKind::BranchName)),
+            "{invalid:?}"
+        );
+    }
+    let longest = "b".repeat(kitchen::contracts::MAX_BRANCH_NAME_BYTES);
+    assert!(kitchen::contracts::BranchName::new(&longest).is_ok());
+    Ok(())
+}
+
+fn invalid_kind(kind: ValueKind) -> ContractError {
+    ContractError::InvalidValue { kind }
 }

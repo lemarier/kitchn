@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BackendId, CredentialId, HouseId, TaskId,
     contracts::{
-        AttemptNumber, BackendDescriptor, Capability, ContractError, Effect, ExternalRef,
-        Permission, ResourceRef, Role, Text, ValueKind,
+        AttemptNumber, BackendDescriptor, BranchName, Capability, ContractError, Effect,
+        ExternalRef, Permission, ResourceRef, Role, Text, ValueKind,
     },
 };
 
@@ -42,6 +42,13 @@ pub enum Operation {
         workspace: Workspace,
         /// The standalone brief given to the worker.
         brief: Text,
+        /// The branch the worker must work on. When set, the executor creates
+        /// exactly this branch and reports it as a created
+        /// [`crate::contracts::ResourceKind::Branch`] resource whose handle is
+        /// the branch name; if it cannot, it refuses or holds the worker
+        /// rather than let it run on another branch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<BranchName>,
     },
     /// Deliver a message to a worker.
     MessageWorker {
@@ -392,6 +399,10 @@ pub enum WorkerState {
     Ready,
     /// Waiting for a reply to a question.
     AwaitingReply,
+    /// A person took over the worker's session and retains it. Do not
+    /// dispatch into it; this is neither a failure nor a settlement, and it
+    /// is never evidence that the worker stopped.
+    UserTakeover,
     /// The worker settled with an outcome.
     Settled(WorkerOutcome),
     /// The backend has no record of the worker.
@@ -459,9 +470,13 @@ pub struct ResourceObservation {
 ///   [`NotAppliedReason::Unsupported`], in each case without acting.
 /// - `execute` returns [`EffectFailure::NotApplied`] only when the effect
 ///   definitely did not happen.
-/// - With [`Capability::EffectIdempotentRequests`], resubmitting a key returns
+/// - Lookup and idempotency are declared per effect kind
+///   ([`BackendDescriptor::supports_lookup`], [`BackendDescriptor::idempotent`]);
+///   the global [`Capability::EffectLookup`] and
+///   [`Capability::EffectIdempotentRequests`] declare them for every kind.
+/// - Where declared idempotent, resubmitting a key returns
 ///   the original receipt without repeating the effect.
-/// - With [`Capability::EffectLookup`], `lookup` reports an applied request's
+/// - Where lookup is declared, `lookup` reports an applied request's
 ///   receipt and returns [`Lookup::Absent`] only with proof that the key was
 ///   not applied and cannot be applied later, including by an earlier
 ///   invocation that is still in flight; otherwise [`Lookup::Unknown`].

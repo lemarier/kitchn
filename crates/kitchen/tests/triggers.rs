@@ -124,6 +124,7 @@ fn consent_for_a_different_effect_is_rejected() -> TestResult {
         role: Role::StationCook,
         workspace: Workspace::Isolated,
         brief: Text::new("A different brief.")?,
+        branch: None,
     };
     let other_task = consent("c-task", &task_id("task-2")?, launch()?)?;
     let mut other_house_consent = consent("c-house", &task, launch()?)?;

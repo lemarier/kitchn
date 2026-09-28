@@ -131,9 +131,15 @@ impl FakeBackend {
     ) -> Result<Receipt, EffectFailure> {
         let rejected = EffectFailure::NotApplied(NotAppliedReason::Rejected);
         let (created, touched) = match request.effect() {
-            Effect::Worker(Operation::LaunchWorker { workspace, .. }) => {
+            Effect::Worker(Operation::LaunchWorker {
+                workspace, branch, ..
+            }) => {
                 let worker = self.handle(state, "worker")?;
                 let mut created = vec![self.resource(ResourceKind::Worker, worker.clone())];
+                if let Some(branch) = branch {
+                    let handle = ExternalRef::new(branch.as_str()).map_err(|_| rejected)?;
+                    created.push(self.resource(ResourceKind::Branch, handle));
+                }
                 let mut touched = Vec::new();
                 match workspace {
                     Workspace::Isolated => {
@@ -223,10 +229,7 @@ impl EffectExecutor for FakeBackend {
             )));
         }
         let mut state = self.lock();
-        if self
-            .descriptor
-            .capabilities
-            .supports(Capability::EffectIdempotentRequests)
+        if self.descriptor.idempotent(request.effect())
             && let Some(receipt) = state.applied.get(request.key())
         {
             return Ok(receipt.clone());
@@ -247,12 +250,10 @@ impl EffectExecutor for FakeBackend {
     }
 
     fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
-        if !self
-            .descriptor
-            .capabilities
-            .supports(Capability::EffectLookup)
-        {
-            return Err(BackendUnavailable::Unsupported(Capability::EffectLookup));
+        if !self.descriptor.supports_lookup(request.effect()) {
+            return Err(BackendUnavailable::Unsupported(
+                request.effect().kind().lookup_capability(),
+            ));
         }
         let mut state = self.lock();
         if state.lookup_outages > 0 {
@@ -309,9 +310,10 @@ impl WorkerBackend for FakeBackend {
                 resource: self.resource(ResourceKind::Worker, handle.clone()),
                 owner: state.owners.get(handle).cloned(),
                 liveness: match worker {
-                    WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply => {
-                        Liveness::Live
-                    }
+                    WorkerState::Starting
+                    | WorkerState::Ready
+                    | WorkerState::AwaitingReply
+                    | WorkerState::UserTakeover => Liveness::Live,
                     WorkerState::Settled(_) => Liveness::Exited,
                     // A lost record is not evidence that the process ended.
                     WorkerState::Missing | WorkerState::Unknown => Liveness::Unverifiable,

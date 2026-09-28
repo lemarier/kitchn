@@ -36,7 +36,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ConsumerId, Error, HolderId, HouseId, TaskId,
+    ConsumerId, Error, HolderId, HouseId, TaskId, WorkflowId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Claimant, ContractError,
         Disposition, EffectSeq, Evidence, EvidenceRevision, ExternalRef, Fence, HouseGrants,
@@ -44,8 +44,8 @@ use crate::{
     },
     state::{
         CancelStatus, ConsumerRecord, Consumption, Corruption, Creation, EffectOutcome, EffectPlan,
-        EffectRecord, EffectStart, Lease, RecoveryItem, RiskDecision, StateError, StorageOperation,
-        TaskRecord,
+        EffectRecord, EffectStart, Lease, MarkerFact, MarkerKey, MarkerRecording, RecoveryItem,
+        RiskDecision, StateError, StorageOperation, TaskRecord, WorkflowMarker,
         model::{SCHEMA_VERSION, SchemaProbe, StoreState},
     },
 };
@@ -361,7 +361,8 @@ impl HouseStore {
     /// unresolved. The intent records the backend namespace; a repeated
     /// request for the same logical effect must come from that backend.
     /// An uncertain effect is resubmitted with its key only when the backend
-    /// declares [`crate::contracts::Capability::EffectIdempotentRequests`].
+    /// declares the effect's kind idempotent
+    /// ([`crate::contracts::BackendDescriptor::idempotent`]).
     ///
     /// # Errors
     /// Returns the first failed check.
@@ -541,6 +542,66 @@ impl HouseStore {
     /// Returns a storage error.
     pub fn consumer(&self, consumer: &ConsumerId) -> Result<Option<ConsumerRecord>> {
         self.read(|state| state.consumer(consumer).cloned())
+    }
+
+    /// Record a workflow marker: a fact about one work item at one exact
+    /// evidence subject. Recording the same fact again returns the original
+    /// marker; a different fact under the same key is refused. Markers grant
+    /// nothing and are separate from effects. When `recorded_by` acts under a
+    /// consumer lease, that lease must be current and live.
+    ///
+    /// # Errors
+    /// Returns [`StateError::MarkerConflict`] for a different fact,
+    /// [`StateError::CapacityExceeded`] at [`crate::state::MAX_MARKERS`], and
+    /// consumer lease errors.
+    pub fn record_marker(
+        &self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<MarkerRecording> {
+        self.transact(|state| state.record_marker(key, fact, recorded_by, now))
+    }
+
+    /// Replace the fact recorded under `key`, but only if it is still
+    /// `expected` (compare-and-supersede), for example when a gate's verdict
+    /// for the same head changes. The prior fact, its recorder, and times
+    /// move to the marker's history, which keeps the newest
+    /// [`crate::state::MAX_MARKER_HISTORY`] entries and counts dropped ones;
+    /// supersession is never refused for capacity. Superseding with the
+    /// current fact is a no-op. Asked questions are append-only.
+    ///
+    /// # Errors
+    /// Returns [`StateError::MarkerNotFound`] without a marker,
+    /// [`StateError::MarkerConflict`] when the current fact is not
+    /// `expected`, [`StateError::MarkerNotSupersedable`] for a question, and
+    /// consumer lease errors.
+    pub fn supersede_marker(
+        &self,
+        key: &MarkerKey,
+        expected: &MarkerFact,
+        fact: MarkerFact,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<MarkerRecording> {
+        self.transact(|state| state.supersede_marker(key, expected, fact, recorded_by, now))
+    }
+
+    /// Read the marker recorded under `key`.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub fn marker(&self, key: &MarkerKey) -> Result<Option<WorkflowMarker>> {
+        self.read(|state| state.marker(key).cloned())
+    }
+
+    /// Read every marker a workflow recorded, oldest first.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub fn markers(&self, workflow: &WorkflowId) -> Result<Vec<WorkflowMarker>> {
+        self.read(|state| state.markers(workflow).cloned().collect())
     }
 
     /// Work that needs an explicit recovery decision: expired owners,

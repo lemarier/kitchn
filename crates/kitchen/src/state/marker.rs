@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     WorkflowId,
-    contracts::{Claimant, EvidenceSubject, EvidenceVerdict, ExternalRef, Repository, Timestamp},
+    contracts::{
+        Claimant, EvidenceSubject, EvidenceVerdict, ExternalRef, Repository, ResourceRef, Timestamp,
+    },
     state::{Corruption, StateError},
 };
 
@@ -43,6 +45,11 @@ pub enum WorkItem {
         /// The pull-request number.
         number: NonZeroU64,
     },
+    /// A backend resource, such as a worktree the dishwasher inspected.
+    Resource {
+        /// The resource.
+        resource: ResourceRef,
+    },
 }
 
 /// The provider's revision of an issue: when it was last updated and the
@@ -66,6 +73,10 @@ pub enum MarkerSubject {
     Git(EvidenceSubject),
     /// An issue's provider revision, such as an issue under triage.
     Issue(IssueRevision),
+    /// An opaque digest of observed evidence, such as a resource's owner,
+    /// liveness, and worktree state. Any change to the evidence is a new
+    /// digest and therefore a different key.
+    Observation(ExternalRef),
 }
 
 /// What a marker is keyed by: the workflow, the work item, and the exact

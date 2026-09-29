@@ -277,7 +277,7 @@ The schedule budget tick: pause schedules that exhausted their usage budget and
 report them to the owner.
 
 ```sh
-kitchn budget precheck --registry <dir> --house <id> [--store <dir>] --orca <path> --runtime-dir <dir> [--backend <id> --credential <name>]
+kitchn budget precheck --registry <dir> --house <id> [--store <dir>] --orca <path> --runtime-dir <dir> [--backend <id>] [--credential <name>]
 kitchn budget run      [same options] [report options]
 kitchn budget install  [same options] [report options] --kitchen <path> --cron "15 * * * *" --timezone <tz> --agent claude|codex
 ```

@@ -274,10 +274,15 @@ pub fn run_mailbox(
         );
     }
     let declared = |capability| descriptor.capabilities.support(capability).is_some();
-    if !declared(Capability::WorkerDeliveries) {
+    // Partial support has known gaps and does not satisfy the requirement,
+    // exactly as coordinator start refuses it.
+    if !descriptor
+        .capabilities
+        .supports(Capability::WorkerDeliveries)
+    {
         return fail(
             Check::DeliveriesDeclared,
-            "coordination requires worker deliveries, which the backend does not declare",
+            "coordination requires full worker deliveries, which the backend does not declare",
         );
     }
     report

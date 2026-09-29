@@ -137,6 +137,28 @@ fn a_backend_without_deliveries_fails_the_mailbox_suite() -> TestResult {
 }
 
 #[test]
+fn partial_deliveries_fail_the_mailbox_suite() -> TestResult {
+    let declared = Capability::ALL
+        .into_iter()
+        .filter(|capability| *capability != Capability::WorkerDeliveries);
+    let partial = FakeBackend::new(
+        backend_id()?,
+        house()?,
+        CapabilitySet::supporting(declared).with(
+            Capability::WorkerDeliveries,
+            kitchen::contracts::Support::Partial,
+        ),
+    );
+    let sent = seed(&partial)?;
+    // Partial support has known gaps, as coordinator start treats it.
+    let failure = conformance::run_mailbox(&partial, &partial.restarted(), &sent)
+        .err()
+        .ok_or("a backend with partial deliveries passed")?;
+    assert_eq!(failure.check, Check::DeliveriesDeclared);
+    Ok(())
+}
+
+#[test]
 fn undeclared_adoption_is_refused() -> TestResult {
     // Deliveries without run transfer: one coordinator drains the mailbox.
     let fixed = without(&[Capability::RunTransfer])?;

@@ -181,12 +181,13 @@ fn archive_text(output: &ArchiveOutput, archivals: &[Archival]) -> String {
     let kept = archive.kept;
     let _ = writeln!(
         text,
-        "Kept: {} grant audit(s), {} stream(s) a grant cites, {} stream(s) under inspection, {} binding(s) without a recorded stream, {} open inspection(s).",
+        "Kept: {} grant audit(s), {} stream(s) a grant cites, {} stream(s) under inspection, {} binding(s) without a recorded stream, {} open inspection(s), {} finished inspection(s) of kept streams.",
         kept.grant_audits,
         kept.streams_cited_by_grants,
         kept.streams_under_inspection,
         kept.unobserved_bindings,
         kept.open_inspections,
+        kept.inspections_of_kept_streams,
     );
     if let Some(archival) = &archive.archival {
         let _ = writeln!(text, "Archive digest: {}", archival.digest);

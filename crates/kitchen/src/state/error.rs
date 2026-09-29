@@ -116,6 +116,10 @@ pub enum Corruption {
     /// The committed bytes of an append-only file differ from the records
     /// the snapshot keeps for them.
     AppendMismatch,
+    /// An append-only file holds complete records past the length the
+    /// snapshot records as committed, and the snapshot does not hold them,
+    /// as when the snapshot was restored from an older copy.
+    UnreconciledAppend,
 }
 
 impl fmt::Display for Corruption {
@@ -144,6 +148,9 @@ impl fmt::Display for Corruption {
             Self::AppendMismatch => {
                 formatter.write_str("append-only file differs from its committed records")
             }
+            Self::UnreconciledAppend => formatter.write_str(
+                "append-only file holds records past its committed length that the snapshot lacks; restore the snapshot that committed them, or have an operator reconcile the file",
+            ),
             Self::StoreIdentity => {
                 formatter.write_str("snapshot belongs to a different store than its marker")
             }

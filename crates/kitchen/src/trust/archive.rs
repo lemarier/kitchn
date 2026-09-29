@@ -16,10 +16,14 @@
 //! - The binding of a task whose stream leaves. A stream is recorded only for
 //!   a settled task, so the stream is the proof the task settled; a binding
 //!   without a recorded stream stays.
-//! - An inspection whose deadline has passed and whose every reserved sample
-//!   has a result. Before the deadline an identical plan could restart it
-//!   with a fresh budget, and an unanswered sample can still receive a late
-//!   result, so those stay.
+//! - An inspection whose deadline has passed, whose every reserved sample
+//!   has a result, and whose stream leaves with it or is no longer recorded.
+//!   Before the deadline an identical plan could restart it with a fresh
+//!   budget, and an unanswered sample can still receive a late result, so
+//!   those stay. While its stream stays live, for example because a grant
+//!   cites it, the inspection stays too: the live record is what makes a
+//!   repeated [`start_inspection`](Ledger::start_inspection) return it
+//!   instead of starting over with fresh samples and budgets.
 //!
 //! Grant audits and archival summaries never leave, so revocation never
 //! needs the archive.
@@ -27,20 +31,31 @@
 //! The batch is appended and synced before the ledger commits, under the
 //! ledger's exclusive lock. Each summary records its line's length, so the
 //! ledger knows how long the committed file is. Bytes past that length were
-//! written by an archival whose append or ledger write failed: it was never
-//! applied, and its records are still live. The next archival cuts them off
-//! before appending, so every line in the file is one committed batch. Before
-//! cutting or appending anything, it reads the committed part once and checks
-//! every line's length, final newline, and digest against its summary; a file
-//! shorter than its committed length, or any mismatch, is refused as corrupt
-//! and changes nothing. Recording an archived stream
+//! usually written by an archival whose append or ledger write failed: it
+//! was never applied, and its records are still live. The next archival cuts
+//! them off before appending, so every line in the file is one committed
+//! batch. Before cutting or appending anything, it reads the committed part
+//! once and checks every line's length, final newline, and digest against its
+//! summary; a file shorter than its committed length, or any mismatch, is
+//! refused as corrupt and changes nothing. It cuts off a tail only when doing
+//! so loses no record: a partial line, or a line that is not a batch, or a
+//! batch whose every record is still live and identical. A ledger restored
+//! from an older copy records fewer batches than the file holds, and the
+//! records of those batches may exist nowhere else, so a batch holding any
+//! record the ledger lacks is refused as
+//! [`Corruption::UnreconciledAppend`] and changes nothing. Recovery is to
+//! restore the ledger that committed it, or for an operator to reconcile the
+//! file. Recording an archived stream
 //! again adds it back to the live ledger; a correction to an archived stream
 //! leaves a revision gap, so it reads as incomplete and supports no grant.
 use crate::{
     HouseId, TaskId,
     contracts::{ExternalRef, Timestamp},
     state::{Corruption, StateError, StorageOperation},
-    trust::{GrantAudit, Ledger, Observation, TaskBinding, TrustError, store::Document},
+    trust::{
+        GrantAudit, Ledger, Observation, TaskBinding, TrustError,
+        store::{Document, MAX_STATE_BYTES},
+    },
     workflows::inspector::Inspection,
 };
 use serde::{Deserialize, Serialize};
@@ -190,6 +205,8 @@ pub struct KeptRecords {
     pub unobserved_bindings: usize,
     /// Inspections before their deadline or with an unanswered sample.
     pub open_inspections: usize,
+    /// Finished inspections whose stream stays live.
+    pub inspections_of_kept_streams: usize,
     /// Grant audits, which never leave.
     pub grant_audits: usize,
 }
@@ -232,20 +249,24 @@ impl Ledger {
     /// - each observation stream, with all its revisions, that no grant audit
     ///   (proposed, issued, or revoked) cites and that has no inspection
     ///   which must stay, together with its task's binding;
-    /// - each inspection past its deadline whose every sample has a result.
+    /// - each inspection past its deadline whose every sample has a result,
+    ///   once its stream leaves too or is no longer recorded.
     ///
     /// Grant audits, bindings of tasks without a recorded stream, and
-    /// archival summaries stay, so revocation never needs the archive. Nothing to move writes nothing. Works on a full ledger:
-    /// it removes at least one entry for the one it adds, and never grows
-    /// the snapshot by more than a summary.
+    /// archival summaries stay, so revocation never needs the archive.
+    /// Nothing to move writes nothing. Works on a full ledger: it removes at
+    /// least one entry for the one it adds, and never grows the snapshot by
+    /// more than a summary.
     ///
     /// # Errors
     /// A redirected, hard-linked, or nonprivate archive file, an archive
     /// shorter than its committed batches
     /// ([`Corruption::TruncatedAppend`]), committed lines that differ from
     /// their summaries in length, framing, or digest
-    /// ([`Corruption::AppendMismatch`]), and I/O failures are `Storage`;
-    /// the live ledger and the archive are then unchanged.
+    /// ([`Corruption::AppendMismatch`]), an uncommitted batch holding a
+    /// record the live ledger lacks ([`Corruption::UnreconciledAppend`]), and
+    /// I/O failures are `Storage`; the live ledger and the archive are then
+    /// unchanged.
     pub fn archive(&self, now: Timestamp) -> Result<ArchiveReport, TrustError> {
         let house = self.house();
         self.transact(|doc| {
@@ -303,6 +324,7 @@ impl Ledger {
                 ARCHIVE_FILE,
                 committed,
                 |file| verify_committed(prior, file),
+                |tail| check_tail(house, doc, &batch, tail),
                 &line,
             )?;
             report.archival = Some(archival);
@@ -359,6 +381,56 @@ fn verify_committed(archivals: &[Archival], file: &mut dyn Read) -> Result<(), S
     Ok(())
 }
 
+/// Longest uncommitted tail read back: one batch holds records taken from
+/// one ledger snapshot. A longer tail is refused rather than read.
+const MAX_TAIL_BYTES: u64 = MAX_STATE_BYTES;
+
+/// Check that `tail`, the bytes of [`ARCHIVE_FILE`] past its committed
+/// length, can be cut off without losing a record. A line without its
+/// newline is a write that stopped partway, and a line that is not an
+/// [`ArchiveBatch`] holds no record. A batch may go only when it belongs to
+/// `house` and every record in it is still live and identical: in `doc`, or
+/// in `moving`, the batch this archival takes out of it.
+fn check_tail(
+    house: &HouseId,
+    doc: &Document,
+    moving: &ArchiveBatch,
+    tail: &mut dyn Read,
+) -> Result<(), StateError> {
+    let unreconciled = || StateError::CorruptState(Corruption::UnreconciledAppend);
+    let mut bytes = Vec::new();
+    tail.take(MAX_TAIL_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| StateError::io(StorageOperation::Read, error))?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_TAIL_BYTES) {
+        return Err(unreconciled());
+    }
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let Some(content) = line.strip_suffix(b"\n") else {
+            continue;
+        };
+        let Ok(batch) = serde_json::from_slice::<ArchiveBatch>(content) else {
+            continue;
+        };
+        let live = batch.schema == ARCHIVE_SCHEMA
+            && &batch.house == house
+            && batch.observations.iter().all(|record| {
+                doc.observations.contains(record) || moving.observations.contains(record)
+            })
+            && batch
+                .bindings
+                .iter()
+                .all(|record| doc.bindings.contains(record) || moving.bindings.contains(record))
+            && batch.inspections.iter().all(|record| {
+                doc.inspections.contains(record) || moving.inspections.contains(record)
+            });
+        if !live {
+            return Err(unreconciled());
+        }
+    }
+    Ok(())
+}
+
 fn select(doc: &Document, now: Timestamp) -> Selection {
     let cited: HashSet<&ExternalRef> = doc
         .grants
@@ -378,12 +450,6 @@ fn select(doc: &Document, now: Timestamp) -> Selection {
                 .iter()
                 .all(|sample| sample.result.is_some())
     };
-    let inspections: HashSet<ExternalRef> = doc
-        .inspections
-        .iter()
-        .filter(|i| finished(i))
-        .map(|i| i.id().clone())
-        .collect();
     let inspected: HashSet<&ExternalRef> = doc
         .inspections
         .iter()
@@ -392,7 +458,7 @@ fn select(doc: &Document, now: Timestamp) -> Selection {
         .collect();
 
     let mut kept = KeptRecords {
-        open_inspections: doc.inspections.len().saturating_sub(inspections.len()),
+        open_inspections: doc.inspections.iter().filter(|i| !finished(i)).count(),
         grant_audits: doc.grants.len(),
         ..KeptRecords::default()
     };
@@ -419,6 +485,17 @@ fn select(doc: &Document, now: Timestamp) -> Selection {
                 revisions: revisions.get(&observation.id).copied().unwrap_or_default(),
                 binding: doc.bindings.iter().any(|b| b.spec.id == observation.task),
             });
+        }
+    }
+    // A finished inspection leaves only with its stream, or once the stream
+    // is gone; while the stream is live, the record blocks a restart.
+    let mut inspections = HashSet::new();
+    for inspection in doc.inspections.iter().filter(|i| finished(i)) {
+        let stream = &inspection.plan().observation;
+        if streams.contains(stream) || !seen.contains(stream) {
+            inspections.insert(inspection.id().clone());
+        } else {
+            kept.inspections_of_kept_streams += 1;
         }
     }
     let observed: HashSet<&TaskId> = doc.observations.iter().map(|o| &o.task).collect();

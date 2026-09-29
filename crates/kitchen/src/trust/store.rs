@@ -41,9 +41,11 @@ const MAX_BYTES: u64 = 8 * 1024 * 1024;
 // measures the worst case). This reserve is unavailable to ordinary writers.
 // `usize` widens to `u64` on every supported target; `TryFrom` is not const.
 const REVOCATION_RESERVE: u64 = MAX_HISTORY as u64 * 1024;
+/// Largest snapshot any write, revocation included, may produce.
+pub(super) const MAX_STATE_BYTES: u64 = MAX_BYTES + REVOCATION_RESERVE;
 const OPTIONS: StoreOptions = StoreOptions {
     lock_timeout: Duration::from_secs(2),
-    max_state_bytes: MAX_BYTES + REVOCATION_RESERVE,
+    max_state_bytes: MAX_STATE_BYTES,
 };
 const LAYOUT: StoreLayout = StoreLayout {
     marker: "store.json",

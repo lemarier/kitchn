@@ -473,6 +473,62 @@ fn inspections_leave_only_after_their_deadline_with_every_sample_answered() -> T
     Ok(())
 }
 
+/// A grant keeps the stream live, so its finished inspection stays too.
+/// Archived, the inspection's record would be gone while its evidence is
+/// still live, and an archival clock ahead of the inspector's would let the
+/// same plan start over with no samples and a fresh budget.
+#[test]
+fn a_finished_inspection_of_a_grant_cited_stream_stays_live() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    delivered(&f, &l, "inspected")?;
+    let p = plan("inspected")?;
+    l.start_inspection(
+        &f.store,
+        p.clone(),
+        fence(&f)?,
+        &ManualClock::starting_at(5),
+    )?;
+    l.reserve_sample(
+        &f.store,
+        &p.id,
+        fence(&f)?,
+        1,
+        10,
+        &ManualClock::starting_at(6),
+    )?;
+    l.finish_sample(
+        &f.store,
+        &p.id,
+        fence(&f)?,
+        1,
+        SampleResult::NoFinding {
+            source: source("fixture:check")?,
+        },
+        &ManualClock::starting_at(7),
+    )?;
+    grant_on(&l, "fixture:grant", "inspected", false)?;
+    let before = fs::read(ledger_path(&f))?;
+
+    let report = l.archive(at(60))?;
+    assert!(report.is_empty());
+    assert_eq!(
+        (
+            report.kept.streams_cited_by_grants,
+            report.kept.inspections_of_kept_streams,
+            report.kept.open_inspections,
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(fs::read(ledger_path(&f))?, before);
+    assert!(!archive_path(&f).exists());
+    // Before the deadline by the inspector's clock, the same plan returns the
+    // recorded inspection with its spent budget.
+    let again = l.start_inspection(&f.store, p, fence(&f)?, &ManualClock::starting_at(59))?;
+    assert_eq!(again.samples().len(), 1);
+    Ok(())
+}
+
 #[test]
 fn a_ledger_full_by_entries_accepts_new_records_after_archival() -> TestResult {
     let f = Fixture::new()?;
@@ -652,15 +708,13 @@ fn a_hard_linked_archive_file_is_refused_without_writing_either_file() -> TestRe
 }
 
 /// A failed append leaves either part of a batch (the write stopped) or a
-/// whole batch whose ledger commit failed. Neither was committed, so the next
-/// archival drops it and every line stays one committed batch.
+/// whole batch whose ledger commit failed. Neither was committed, and neither
+/// holds a record the ledger lacks, so the next archival drops it and every
+/// line stays one committed batch.
 #[test]
 fn an_uncommitted_tail_is_dropped_before_the_next_batch() -> TestResult {
-    let tails: [&[u8]; 3] = [
-        b"{\"schema\":1,\"house\":\"exa",
-        b"{\"schema\":1,\"house\":\"example\",\"at\":1,\"observations\":[],\"bindings\":[],\"inspections\":[]}\n",
-        b"\n",
-    ];
+    let empty = empty_batch(&house()?.to_string());
+    let tails: [&[u8]; 3] = [b"{\"schema\":1,\"house\":\"exa", empty.as_bytes(), b"\n"];
     for (index, tail) in tails.into_iter().enumerate() {
         let f = Fixture::new()?;
         let l = ledger(&f)?;
@@ -694,6 +748,111 @@ fn an_uncommitted_tail_is_dropped_before_the_next_batch() -> TestResult {
             .collect();
         assert_eq!(tasks, vec![task_id("first")?, task_id("second")?]);
     }
+    Ok(())
+}
+
+/// The archive append synced but the ledger write did not: the ledger still
+/// holds every record of that batch, so the next archival drops it and
+/// writes the batch again.
+#[test]
+fn a_batch_whose_ledger_commit_failed_is_replaced() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    delivered(&f, &l, "first")?;
+    let uncommitted = fs::read(ledger_path(&f))?;
+    l.archive(at(100))?;
+    // The ledger as it was before the failed commit.
+    fs::write(ledger_path(&f), &uncommitted)?;
+
+    let reopened = reopen(&f)?;
+    let report = reopened.archive(at(200))?;
+    assert_eq!(report.streams.len(), 1);
+    let [(digest, batch)] = archived(&f)?.try_into().map_err(|_| "one batch")?;
+    assert_eq!(batch.at, at(200));
+    let committed = reopened.archivals()?;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|a| a.digest.as_str())
+            .collect::<Vec<_>>(),
+        vec![digest.as_str()]
+    );
+    Ok(())
+}
+
+/// A ledger restored from a copy older than an archival records fewer
+/// batches than the file holds. A batch with a record the ledger lacks is
+/// its only copy, so the next archival refuses rather than cut it off.
+#[test]
+fn a_restored_older_ledger_is_refused_unchanged() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    delivered(&f, &l, "first")?;
+    let older = fs::read(ledger_path(&f))?;
+    delivered(&f, &l, "second")?;
+    l.archive(at(100))?;
+    let archive = fs::read(archive_path(&f))?;
+    let newer = fs::read(ledger_path(&f))?;
+
+    // The backup still holds "first", but not "second".
+    fs::write(ledger_path(&f), &older)?;
+    let restored = reopen(&f)?;
+    assert_eq!(restored.preview_archive(at(200))?.streams.len(), 1);
+    let refused = restored.archive(at(200));
+    assert!(matches!(
+        refused,
+        Err(TrustError::Storage(StateError::CorruptState(
+            Corruption::UnreconciledAppend
+        )))
+    ));
+    assert_eq!(fs::read(archive_path(&f))?, archive);
+    assert_eq!(fs::read(ledger_path(&f))?, older);
+
+    // Restoring the ledger that committed the batch recovers.
+    fs::write(ledger_path(&f), &newer)?;
+    let recovered = reopen(&f)?;
+    delivered(&f, &recovered, "third")?;
+    recovered.archive(at(300))?;
+    let tasks: Vec<_> = archived(&f)?
+        .iter()
+        .flat_map(|(_, b)| b.observations.iter().map(|o| o.task.clone()))
+        .collect();
+    assert_eq!(
+        tasks,
+        vec![task_id("first")?, task_id("second")?, task_id("third")?]
+    );
+    Ok(())
+}
+
+/// An archive line holding no records, as the given house.
+fn empty_batch(house: &str) -> String {
+    format!(
+        "{{\"schema\":1,\"house\":\"{house}\",\"at\":1,\"observations\":[],\"bindings\":[],\"inspections\":[]}}\n"
+    )
+}
+
+/// A whole batch of another house is not this ledger's to drop, even empty.
+#[test]
+fn an_uncommitted_batch_of_another_house_is_refused_unchanged() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let foreign = empty_batch("other-house");
+    fs::write(archive_path(&f), &foreign)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(archive_path(&f), fs::Permissions::from_mode(0o600))?;
+    }
+    delivered(&f, &l, "first")?;
+    let before = fs::read(ledger_path(&f))?;
+    assert!(matches!(
+        l.archive(at(100)),
+        Err(TrustError::Storage(StateError::CorruptState(
+            Corruption::UnreconciledAppend
+        )))
+    ));
+    assert_eq!(fs::read(archive_path(&f))?, foreign.as_bytes());
+    assert_eq!(fs::read(ledger_path(&f))?, before);
     Ok(())
 }
 

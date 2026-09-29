@@ -13,7 +13,7 @@
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
     hash::{BuildHasher, RandomState},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
     thread,
@@ -449,10 +449,13 @@ impl<S: Snapshot> SnapshotStore<S> {
 
     /// Append `bytes` to the append-only file `name` beside the snapshot and
     /// sync it, creating it owner-only. `committed` is the length the
-    /// snapshot records for the file: bytes past it are the remains of an
-    /// append whose snapshot commit never happened, and are cut off first.
-    /// Before that, `verify` reads exactly the `committed` bytes once and
-    /// checks them against the snapshot's records. Call inside
+    /// snapshot records for the file. Before anything changes, `verify` reads
+    /// exactly the `committed` bytes once and checks them against the
+    /// snapshot's records. Bytes past `committed` are an uncommitted tail:
+    /// usually the remains of an append whose snapshot commit never happened,
+    /// but also what a snapshot restored from an older copy no longer
+    /// records. `tail` reads them and returns an error, which refuses the
+    /// append, unless cutting them off loses nothing. Call inside
     /// [`Self::transact`], so appends are serialized by the store lock and
     /// `committed` cannot change underneath.
     ///
@@ -464,17 +467,18 @@ impl<S: Snapshot> SnapshotStore<S> {
     /// A symlink, non-regular, or hard-linked file is
     /// [`StateError::RedirectedPath`]; a nonprivate one in a private store is
     /// [`StateError::PublicPath`]; a file shorter than `committed` is
-    /// [`Corruption::TruncatedAppend`]; `verify`'s error is returned as is.
-    /// Nothing is cut off or appended in those cases, though a missing file
-    /// is created empty.
+    /// [`Corruption::TruncatedAppend`]; `verify`'s and `tail`'s errors are
+    /// returned as is. Nothing is cut off or appended in those cases, though
+    /// a missing file is created empty.
     pub(crate) fn append_private(
         &self,
         name: &str,
         committed: u64,
         verify: impl FnOnce(&mut dyn Read) -> Result<(), StateError>,
+        tail: impl FnOnce(&mut dyn Read) -> Result<(), StateError>,
         bytes: &[u8],
     ) -> Result<(), StateError> {
-        self.append_with(name, committed, verify, bytes, |file, bytes| {
+        self.append_with(name, committed, verify, tail, bytes, |file, bytes| {
             file.write_all(bytes)
         })
     }
@@ -486,6 +490,7 @@ impl<S: Snapshot> SnapshotStore<S> {
         name: &str,
         committed: u64,
         verify: impl FnOnce(&mut dyn Read) -> Result<(), StateError>,
+        tail: impl FnOnce(&mut dyn Read) -> Result<(), StateError>,
         bytes: &[u8],
         write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
     ) -> Result<(), StateError> {
@@ -504,6 +509,10 @@ impl<S: Snapshot> SnapshotStore<S> {
         // A fresh descriptor reads from the start; appends ignore the offset.
         verify(&mut (&file).take(committed))?;
         if metadata.len() > committed {
+            (&file)
+                .seek(SeekFrom::Start(committed))
+                .map_err(|error| StateError::io(StorageOperation::Read, error))?;
+            tail(&mut (&file).take(metadata.len() - committed))?;
             file.set_len(committed).map_err(io)?;
         }
         write(&mut file, bytes).map_err(io)?;
@@ -995,9 +1004,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("store");
         let store = bounded(&path, &[])?;
-        store.append_private("log", 0, unchecked, b"one\n")?;
+        store.append_private("log", 0, unchecked, unchecked, b"one\n")?;
         // The write stops partway, as a full disk or a crash would leave it.
-        let failed = store.append_with("log", 4, unchecked, b"two\n", |file, bytes| {
+        let failed = store.append_with("log", 4, unchecked, unchecked, b"two\n", |file, bytes| {
             file.write_all(bytes.get(..2).unwrap_or_default())?;
             Err(std::io::Error::other("injected write failure"))
         });
@@ -1009,10 +1018,10 @@ mod tests {
             })
         ));
         assert_eq!(fs::read(path.join("log"))?, b"one\ntw");
-        store.append_private("log", 4, unchecked, b"two\n")?;
+        store.append_private("log", 4, unchecked, unchecked, b"two\n")?;
         assert_eq!(fs::read(path.join("log"))?, b"one\ntwo\n");
         // A whole line the snapshot never committed is cut off the same way.
-        store.append_private("log", 4, unchecked, b"three\n")?;
+        store.append_private("log", 4, unchecked, unchecked, b"three\n")?;
         assert_eq!(fs::read(path.join("log"))?, b"one\nthree\n");
         Ok(())
     }
@@ -1022,9 +1031,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("store");
         let store = bounded(&path, &[])?;
-        store.append_private("log", 0, unchecked, b"one\n")?;
+        store.append_private("log", 0, unchecked, unchecked, b"one\n")?;
         assert!(matches!(
-            store.append_private("log", 5, unchecked, b"two\n"),
+            store.append_private("log", 5, unchecked, unchecked, b"two\n"),
             Err(StateError::CorruptState(Corruption::TruncatedAppend))
         ));
         assert_eq!(fs::read(path.join("log"))?, b"one\n");
@@ -1036,7 +1045,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("store");
         let store = bounded(&path, &[])?;
-        store.append_private("log", 0, unchecked, b"one\n")?;
+        store.append_private("log", 0, unchecked, unchecked, b"one\n")?;
         // An uncommitted tail after the committed line.
         fs::write(path.join("log"), b"one\ntw")?;
         let mut seen = Vec::new();
@@ -1048,6 +1057,7 @@ mod tests {
                     .map_err(|error| StateError::io(StorageOperation::Read, error))?;
                 Err(StateError::CorruptState(Corruption::AppendMismatch))
             },
+            unchecked,
             b"two\n",
         );
         assert_eq!(seen, b"one\n");
@@ -1057,8 +1067,46 @@ mod tests {
         ));
         // Neither the tail was cut nor the new line appended.
         assert_eq!(fs::read(path.join("log"))?, b"one\ntw");
-        store.append_private("log", 4, unchecked, b"two\n")?;
+        store.append_private("log", 4, unchecked, unchecked, b"two\n")?;
         assert_eq!(fs::read(path.join("log"))?, b"one\ntwo\n");
+        Ok(())
+    }
+
+    #[test]
+    fn the_tail_check_reads_only_the_uncommitted_tail_and_can_keep_it() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        store.append_private("log", 0, unchecked, unchecked, b"one\n")?;
+        fs::write(path.join("log"), b"one\ntwo\n")?;
+        let mut seen = Vec::new();
+        // The verifier reads nothing, yet the tail check starts at the tail.
+        let refused = store.append_private(
+            "log",
+            4,
+            unchecked,
+            |file| {
+                file.read_to_end(&mut seen)
+                    .map_err(|error| StateError::io(StorageOperation::Read, error))?;
+                Err(StateError::CorruptState(Corruption::UnreconciledAppend))
+            },
+            b"three\n",
+        );
+        assert_eq!(seen, b"two\n");
+        assert!(matches!(
+            refused,
+            Err(StateError::CorruptState(Corruption::UnreconciledAppend))
+        ));
+        assert_eq!(fs::read(path.join("log"))?, b"one\ntwo\n");
+        // With nothing past the committed length, the tail check never runs.
+        store.append_private(
+            "log",
+            8,
+            unchecked,
+            |_| Err(StateError::CorruptState(Corruption::UnreconciledAppend)),
+            b"three\n",
+        )?;
+        assert_eq!(fs::read(path.join("log"))?, b"one\ntwo\nthree\n");
         Ok(())
     }
 
@@ -1073,7 +1121,7 @@ mod tests {
         let other = dir.path().join("other");
         fs::write(&other, b"other\n")?;
         let log = path.join("log");
-        store.append_with("log", 0, unchecked, b"one\n", |file, bytes| {
+        store.append_with("log", 0, unchecked, unchecked, b"one\n", |file, bytes| {
             fs::remove_file(&log)?;
             fs::hard_link(&other, &log)?;
             file.write_all(bytes)
@@ -1081,7 +1129,7 @@ mod tests {
         assert_eq!(fs::read(&other)?, b"other\n");
         // The swapped-in file now has two links, so the next append refuses it.
         assert!(matches!(
-            store.append_private("log", 0, unchecked, b"two\n"),
+            store.append_private("log", 0, unchecked, unchecked, b"two\n"),
             Err(StateError::RedirectedPath)
         ));
         assert_eq!(fs::read(&other)?, b"other\n");
@@ -1099,7 +1147,7 @@ mod tests {
             .status()?;
         assert!(made.success());
         assert!(matches!(
-            store.append_private("log", 0, unchecked, b"one\n"),
+            store.append_private("log", 0, unchecked, unchecked, b"one\n"),
             Err(StateError::RedirectedPath)
         ));
         Ok(())

@@ -323,15 +323,20 @@ either limit and lists every past archival with its digest.
 stream, with every revision and its task's binding, when no grant decision
 cites it (proposed, issued, or revoked) and no inspection of it must stay. It
 also moves inspections whose deadline has passed and whose samples all have a
-result. Grants, the evidence they cite, and bindings of tasks with no recorded
+result, once their stream leaves too; an inspection of a stream that stays
+live, such as one a grant cites, stays with it. Grants, the evidence they cite, and bindings of tasks with no recorded
 observation stay, so revoking a grant never needs the archive. The records go
 to `archive.jsonl` in the ledger directory, owner-only like the ledger, and the
 ledger keeps the batch's SHA-256 digest, counts, and length as one entry.
 Bytes past the committed length, left by an archival that failed partway, are
-cut off before the next batch. First, every committed line is checked against
-its entry's length and digest. A symlinked, hard-linked, or shortened archive
-file, or a committed line that does not match, is refused without changing
-either file. An archived stream no longer supports new grant proposals.
+cut off before the next batch, but only when that loses no record: a partial
+line, or a batch whose records are all still in the ledger. First, every
+committed line is checked against its entry's length and digest. A symlinked,
+hard-linked, or shortened archive file, a committed line that does not match,
+or an uncommitted batch holding records the ledger lacks is refused without
+changing either file. The last happens when `ledger.json` was restored from an
+older copy; restore the ledger that committed those batches, or reconcile the
+archive file by hand. An archived stream no longer supports new grant proposals.
 
 ## `kitchn pickup`
 

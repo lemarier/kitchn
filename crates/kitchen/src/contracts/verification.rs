@@ -5,10 +5,15 @@
 //! repository policy names the targets a work type must be verified on;
 //! [`VerificationPolicy::check_activation`] fails, naming every gap, when the
 //! backend lacks one. Verification evidence records the [`VerificationAccess`]
-//! that produced it through [`EvidenceKind::AuthorizedVerification`], and
-//! counts only when that access matches one the evaluating task holds and
-//! only for the exact subject it was observed on. Check, worker-report, and
-//! unbound [`EvidenceKind::Verification`] evidence never satisfies it.
+//! that produced it through [`EvidenceKind::AuthorizedVerification`]. Only
+//! [`crate::state::run_verification`] records that kind: it runs the target
+//! through the backend's [`VerificationExecutor`] and stores the backend's
+//! verdict in the task's evidence. The house store refuses the kind from any
+//! other producer, and [`VerificationReport::evaluate`] reads only
+//! [`RecordedEvidence`] the store returns. Evidence counts only when its
+//! access matches one the evaluating task holds and only for the exact
+//! subject it was observed on. Check, worker-report, and unbound
+//! [`EvidenceKind::Verification`] evidence never satisfies it.
 //!
 //! A declared environment grants nothing. Using a VM or device needs
 //! [`Permission::UseVerificationEnvironment`] from the task's authority, and a
@@ -26,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BackendId, CredentialId, ErrorClass, HouseId,
     contracts::{
-        ContractError, EffectExecutor, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
-        GrantScope, HouseGrants, Permission, Repository, Support, TaskAuthority, Text, ValueKind,
+        BackendUnavailable, ContractError, EffectExecutor, Evidence, EvidenceKind, EvidenceSubject,
+        EvidenceVerdict, ExternalRef, GrantScope, HouseGrants, Permission, Repository, Support,
+        TaskAuthority, Text, ValueKind,
     },
 };
 
@@ -471,9 +477,10 @@ fn add_requirement(
 ///
 /// [`authorize_access`] builds one; deserializing reads a stored record.
 /// Verification evidence records it in
-/// [`EvidenceKind::AuthorizedVerification`]. A recorded copy authorizes
-/// nothing by itself: [`VerificationReport::evaluate`] counts it only when it
-/// equals an access the evaluating task obtained.
+/// [`EvidenceKind::AuthorizedVerification`]. A copy authorizes nothing by
+/// itself: the store accepts that evidence only from
+/// [`crate::state::run_verification`], and [`VerificationReport::evaluate`]
+/// counts it only when it equals an access the evaluating task obtained.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[must_use]
@@ -564,6 +571,60 @@ pub fn authorize_access(
     })
 }
 
+/// What a verification environment reported for one run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationResult {
+    /// The outcome of running the changed software on the target.
+    pub verdict: EvidenceVerdict,
+    /// The backend's reference for the run, where its output can be read.
+    pub source: ExternalRef,
+}
+
+/// A backend that can run changed software in the verification environments
+/// it declares.
+///
+/// Contract: `verify` runs the software at `subject` on the access's target,
+/// through the access's backend namespace and credentials, and reports that
+/// run's own result. It never reports a pass it did not observe, and it
+/// returns [`EvidenceVerdict::Unavailable`] or an error when it cannot
+/// establish one. The backend bounds every call with its own deadline and
+/// reports an expired one as [`BackendUnavailable::Timeout`], never a pass.
+pub trait VerificationExecutor: EffectExecutor {
+    /// Run the software at `subject` under `access`.
+    ///
+    /// # Errors
+    /// Returns [`BackendUnavailable`] when the environment cannot be reached
+    /// or the run exceeds its deadline.
+    fn verify(
+        &self,
+        access: &VerificationAccess,
+        subject: &EvidenceSubject,
+    ) -> Result<VerificationResult, BackendUnavailable>;
+}
+
+/// One task's evidence as the house store holds it.
+///
+/// Only the store builds one ([`crate::state::HouseStore::recorded_evidence`]),
+/// so [`EvidenceKind::AuthorizedVerification`] items in it were recorded by
+/// [`crate::state::run_verification`] from a backend's own result, never
+/// supplied by a producer. It cannot be deserialized or assembled from
+/// caller-built evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct RecordedEvidence(Vec<Evidence>);
+
+impl RecordedEvidence {
+    pub(crate) const fn new(items: Vec<Evidence>) -> Self {
+        Self(items)
+    }
+
+    /// The recorded items.
+    #[must_use]
+    pub fn items(&self) -> &[Evidence] {
+        &self.0
+    }
+}
+
 /// The verification state of one required target at the current subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -584,13 +645,14 @@ pub enum TargetStatus {
 }
 
 /// Per-target verification state for one subject.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 #[must_use]
 pub struct VerificationReport(BTreeMap<VerificationTarget, TargetStatus>);
 
 impl VerificationReport {
-    /// Evaluate `evidence` against the `required` targets for `subject`.
+    /// Evaluate a task's recorded `evidence` against the `required` targets
+    /// for `subject`.
     ///
     /// `authorized` holds the task's current [`authorize_access`] results.
     /// Only [`EvidenceKind::AuthorizedVerification`] evidence whose access
@@ -603,7 +665,7 @@ impl VerificationReport {
     pub fn evaluate(
         required: &BTreeSet<VerificationTarget>,
         subject: &EvidenceSubject,
-        evidence: &[Evidence],
+        evidence: &RecordedEvidence,
         authorized: &[VerificationAccess],
     ) -> Self {
         Self(
@@ -611,7 +673,7 @@ impl VerificationReport {
                 .iter()
                 .map(|target| {
                     let mut status = TargetStatus::Missing;
-                    for item in evidence {
+                    for item in evidence.items() {
                         let (observed, authenticated) = match &item.kind {
                             EvidenceKind::AuthorizedVerification(access) => {
                                 (&access.target, authorized.contains(access))
@@ -709,6 +771,13 @@ pub enum VerificationError {
     /// A declaration or policy exceeds its bound.
     #[error("verification declaration or policy exceeds its bound")]
     TooMany,
+    /// Authorized verification evidence was offered by a producer instead of
+    /// a verification run.
+    #[error("authorized verification evidence is recorded only by a verification run")]
+    NotRun,
+    /// The verification environment could not run the software.
+    #[error("verification environment unavailable: {0}")]
+    Unavailable(BackendUnavailable),
 }
 
 impl VerificationError {
@@ -717,10 +786,11 @@ impl VerificationError {
     pub const fn class(&self) -> ErrorClass {
         match self {
             Self::Contract(error) => error.class(),
-            Self::UnsupportedTargets { .. } | Self::RepositoryRequired { .. } => {
+            Self::UnsupportedTargets { .. } | Self::RepositoryRequired { .. } | Self::NotRun => {
                 ErrorClass::Refused
             }
             Self::EmptyRequirement | Self::TooMany => ErrorClass::InvalidInput,
+            Self::Unavailable(_) => ErrorClass::Execution,
         }
     }
 }

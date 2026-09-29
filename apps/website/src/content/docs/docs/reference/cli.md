@@ -267,9 +267,11 @@ at least 31 days.
 
 The same pass compacts intake. Each repository's settled intake reservations
 fold into at most 32 counted-report markers; a reservation whose outcome is not
-yet known stays. When the markers are full, the oldest is evicted, and intake
-from then on drops any report received at or before the newest evicted one, so
-no report is counted twice.
+yet known stays. When the markers are full, the oldest is evicted. Intake then
+posts nothing for an uncounted report received at or before the newest evicted
+one; it lists the report as late for a person to review. Source times are
+capped at the house time a report was reserved, so a source clock running ahead
+cannot move that cutoff.
 
 ## `kitchn pickup`
 

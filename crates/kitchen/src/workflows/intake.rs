@@ -32,11 +32,16 @@
 //! on batch sizes and problem keys; 32 full batches of [`MAX_PER_PROPOSAL`]
 //! fill it exactly. When the markers are full, compaction evicts the oldest
 //! chunk and raises the repository's forgotten-through time to the newest
-//! `received_at` among the evicted reports. [`plan`] never proposes a report
-//! received at or before that time. So a report is proposed only when it is
-//! newer than every forgotten report, and every counted report that new is
-//! still in the window: dedupe is exact, and a report older than the window
-//! is dropped rather than counted twice.
+//! received time among the evicted reports. That time is each reservation's
+//! newest `received_at`, capped at the house time the reservation was
+//! recorded, so a source clock running ahead cannot move it past the house
+//! clock. [`plan`] posts nothing for an uncounted report received at or
+//! before it: the report may have been counted before the window moved on,
+//! so it is returned as [`Proposal::LateReports`] for a person to review,
+//! never dropped. Later reports are planned against the window. A report
+//! whose source time was ahead of the house clock when it was counted can
+//! outlive its eviction and be proposed again; that is a possible duplicate,
+//! never a lost report.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -682,9 +687,10 @@ impl Counted {
         self.problems.get(problem).map_or(0, BTreeSet::len)
     }
 
-    /// The newest `received_at` among reports evicted from the dedupe
-    /// window, if any were. [`plan`] proposes no report received at or
-    /// before it.
+    /// The newest received time among reports evicted from the dedupe
+    /// window, if any were, capped at the house time each was reserved.
+    /// [`plan`] returns uncounted reports received at or before it as
+    /// [`Proposal::LateReports`].
     #[must_use]
     pub const fn forgotten_through(&self) -> Option<Timestamp> {
         self.forgotten
@@ -749,7 +755,8 @@ impl PostingAuthority {
     }
 }
 
-/// One planned intake result per problem.
+/// One planned intake result per problem, plus [`Proposal::LateReports`]
+/// when some of the problem's reports predate the dedupe window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Proposal {
     /// Add a count and source links to the open issue tracking the problem.
@@ -789,6 +796,18 @@ pub enum Proposal {
         /// New reports.
         reports: Vec<ReportKey>,
     },
+    /// Uncounted reports received at or before
+    /// [`Counted::forgotten_through`]. They may have been counted before
+    /// the dedupe window moved past them, so nothing is posted; a person
+    /// decides whether they are new. They are never dropped silently.
+    LateReports {
+        /// Problem.
+        problem: ProblemKey,
+        /// The late reports.
+        reports: Vec<ReportKey>,
+        /// The forgotten-through time they were received at or before.
+        forgotten_through: Timestamp,
+    },
     /// The task lacks the posting permission this proposal needs. Nothing is
     /// posted.
     MissingGrant {
@@ -807,7 +826,7 @@ impl Proposal {
     pub const fn mutation(&self) -> Option<&GitHubMutation> {
         match self {
             Self::AddReports { mutation, .. } | Self::DraftIssue { mutation, .. } => Some(mutation),
-            Self::ClosedMatch { .. } | Self::MissingGrant { .. } => None,
+            Self::ClosedMatch { .. } | Self::LateReports { .. } | Self::MissingGrant { .. } => None,
         }
     }
 
@@ -825,7 +844,9 @@ impl Proposal {
             Self::AddReports {
                 reports, mutation, ..
             } => ("comment", reports, mutation),
-            Self::ClosedMatch { .. } | Self::MissingGrant { .. } => return None,
+            Self::ClosedMatch { .. } | Self::LateReports { .. } | Self::MissingGrant { .. } => {
+                return None;
+            }
         };
         let mut hasher = Sha256::new();
         hasher.update(b"kitchen-intake-effect/1\0");
@@ -852,7 +873,9 @@ impl Proposal {
                 received,
                 ..
             } => (problem, reports, *received),
-            Self::ClosedMatch { .. } | Self::MissingGrant { .. } => return None,
+            Self::ClosedMatch { .. } | Self::LateReports { .. } | Self::MissingGrant { .. } => {
+                return None;
+            }
         };
         let digests: BTreeSet<ReportDigest> = reports.iter().map(ReportKey::digest).collect();
         Some(Reservation {
@@ -867,10 +890,11 @@ impl Proposal {
 
 /// Group `reports` by problem and propose one result per problem with new
 /// reports. Reports in `counted`, and redelivered copies of one report,
-/// count once. Reports received at or before
-/// [`Counted::forgotten_through`] are dropped, since they may have been
-/// counted before the window moved past them. Problems with nothing new
-/// produce nothing. A posting proposal
+/// count once. Uncounted reports received at or before
+/// [`Counted::forgotten_through`] may have been counted before the window
+/// moved past them, so they are returned as [`Proposal::LateReports`]
+/// instead of being posted. Problems with nothing new produce nothing. A
+/// posting proposal
 /// carries at most [`MAX_PER_PROPOSAL`] reports; the rest wait for a later
 /// plan.
 ///
@@ -921,7 +945,18 @@ pub fn plan(
 
     let mut proposals = Vec::new();
     for (problem, mut grouped) in problems {
-        grouped.retain(|key, report| !counted.contains(key) && !counted.forgets(report));
+        grouped.retain(|key, _| !counted.contains(key));
+        let late: Vec<ReportKey> = grouped
+            .extract_if(.., |_, report| counted.forgets(report))
+            .map(|(key, _)| key)
+            .collect();
+        if let (Some(forgotten_through), false) = (counted.forgotten, late.is_empty()) {
+            proposals.push(Proposal::LateReports {
+                problem: problem.clone(),
+                reports: late,
+                forgotten_through,
+            });
+        }
         if grouped.is_empty() {
             continue;
         }
@@ -1017,10 +1052,9 @@ struct Reservation {
     effect: EffectName,
     problem: ProblemKey,
     reports: Vec<ReportDigest>,
-    /// The newest `received_at` among the reports. Reservations recorded
-    /// before this field existed use their marker's recorded time instead,
-    /// which matches only while the source's clock is not ahead of the
-    /// house's.
+    /// The newest `received_at` among the reports, as the source reported
+    /// it. Compaction caps it at the marker's recorded time, and uses that
+    /// time alone for reservations recorded before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     received: Option<Timestamp>,
 }
@@ -1067,7 +1101,8 @@ impl CountedChunk {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Forgotten {
-    /// The newest `received_at` among reports evicted from the window.
+    /// The newest received time among reports evicted from the window,
+    /// capped at the house time each was reserved.
     through: Timestamp,
 }
 
@@ -1423,7 +1458,12 @@ fn plan_compaction(
             let reservation: Reservation = fact
                 .decode(&reservation_schema)
                 .map_err(|_| IntakeError::IncompleteEvidence)?;
-            let received = reservation.received.unwrap_or_else(|| marker.recorded_at());
+            // The source's time, capped at the house time the reservation
+            // was recorded, so a clock running ahead cannot move the window.
+            let recorded = marker.recorded_at();
+            let received = reservation
+                .received
+                .map_or(recorded, |received| received.min(recorded));
             reservations.push((*marker, reservation, received));
         }
     }

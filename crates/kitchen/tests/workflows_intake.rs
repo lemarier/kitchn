@@ -28,7 +28,7 @@ use kitchen::{
         Classified, ConnectorFailure, Counted, FetchRequest, IntakeError, IntakeLedger,
         IntakeSource, IntakeSources, KnownIssue, MAX_COUNTED_CHUNKS, MAX_LISTED, MAX_PER_PROPOSAL,
         PostingAuthority, PrivacyClass, ProblemKey, Proposal, RawReport, ReadScope, Report,
-        ReportConnector, ReportLink, SourceId, marker, plan, problem_marker,
+        ReportConnector, ReportKey, ReportLink, SourceId, marker, plan, problem_marker,
     },
 };
 
@@ -964,12 +964,25 @@ impl Kitchen {
         task: &TaskId,
         fence: Fence,
     ) -> Result<EffectRecord, Box<dyn std::error::Error>> {
+        self.submit_at(forge, counted, proposal, task, fence, common::at(1))
+    }
+
+    /// Like [`Self::submit`], reserving at house time `reserved`.
+    fn submit_at(
+        &self,
+        forge: &Forge,
+        counted: &Counted,
+        proposal: &Proposal,
+        task: &TaskId,
+        fence: Fence,
+        reserved: Timestamp,
+    ) -> Result<EffectRecord, Box<dyn std::error::Error>> {
         let name = self.ledger(self.store())?.reserve(
             counted,
             proposal,
             task,
             &common::scheduled("intake")?,
-            common::at(1),
+            reserved,
         )?;
         let mutation = proposal.mutation().ok_or("no mutation")?.clone();
         let effect = GitHubEffect {
@@ -1519,10 +1532,11 @@ fn apply_reports(
     fence: Fence,
     ids: &[&str],
 ) -> TestResult {
-    apply_reports_at(kitchen, forge, task, fence, ids, 1_000)
+    apply_reports_at(kitchen, forge, task, fence, ids, 1_000, common::at(1))
 }
 
-/// Like [`apply_reports`], for reports received at `received`.
+/// Like [`apply_reports`], for reports received at `received` Unix
+/// milliseconds and reserved at house time `reserved`.
 fn apply_reports_at(
     kitchen: &Kitchen,
     forge: &Forge,
@@ -1530,6 +1544,7 @@ fn apply_reports_at(
     fence: Fence,
     ids: &[&str],
     received: u64,
+    reserved: Timestamp,
 ) -> TestResult {
     let counted = kitchen.ledger(kitchen.store())?.counted(task)?;
     let proposals = plan(
@@ -1544,7 +1559,7 @@ fn apply_reports_at(
         return Err(format!("unexpected proposals: {proposals:?}").into());
     };
     assert!(applied(
-        &kitchen.submit(forge, &counted, proposal, task, fence)?
+        &kitchen.submit_at(forge, &counted, proposal, task, fence, reserved)?
     ));
     Ok(())
 }
@@ -1776,19 +1791,37 @@ fn compaction_refuses_a_reservation_whose_task_is_gone() -> TestResult {
 }
 
 /// Apply one settled batch of `MAX_PER_PROPOSAL` new reports, received at
-/// `received`, from task `intake-batch-{batch}`, and compact.
+/// `received` and reserved at the same house time, from task
+/// `intake-batch-{batch}`, and compact.
 fn apply_batch(
     kitchen: &Kitchen,
     forge: &Forge,
     batch: u64,
     received: u64,
 ) -> Result<kitchen::workflows::intake::Compaction, Box<dyn std::error::Error>> {
+    apply_batch_at(
+        kitchen,
+        forge,
+        batch,
+        received,
+        Timestamp::from_unix_millis(received),
+    )
+}
+
+/// Like [`apply_batch`], reserved at house time `reserved`.
+fn apply_batch_at(
+    kitchen: &Kitchen,
+    forge: &Forge,
+    batch: u64,
+    received: u64,
+    reserved: Timestamp,
+) -> Result<kitchen::workflows::intake::Compaction, Box<dyn std::error::Error>> {
     let (task, fence) = kitchen.start(&format!("intake-batch-{batch}"))?;
     let ids: Vec<String> = (0..MAX_PER_PROPOSAL)
         .map(|index| format!("b{batch}-{index}"))
         .collect();
     let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-    apply_reports_at(kitchen, forge, &task, fence, &ids, received)?;
+    apply_reports_at(kitchen, forge, &task, fence, &ids, received, reserved)?;
     settle(
         kitchen,
         &task,
@@ -1801,15 +1834,22 @@ fn apply_batch(
 }
 
 #[test]
-fn a_full_dedupe_window_evicts_its_oldest_chunk_and_still_dedupes() -> TestResult {
+fn a_full_dedupe_window_evicts_its_oldest_chunk_and_keeps_late_reports_visible() -> TestResult {
     let kitchen = Kitchen::new()?;
     let forge = Forge::new()?;
     let workflow = WorkflowId::new("intake")?;
     let chunks = u64::try_from(MAX_COUNTED_CHUNKS)?;
+    // Batch 0's source claims a time in 2096, far ahead of the house clock
+    // that reserved it at 1s.
+    let far_future = 4_000_000_000_000;
     // One full batch fills one counted marker, so the window holds this
     // many batches before anything is evicted.
     for batch in 0..chunks {
-        let compaction = apply_batch(&kitchen, &forge, batch, (batch + 1) * 1_000)?;
+        let compaction = if batch == 0 {
+            apply_batch_at(&kitchen, &forge, batch, far_future, common::at(1))?
+        } else {
+            apply_batch(&kitchen, &forge, batch, (batch + 1) * 1_000)?
+        };
         assert_eq!((compaction.folded, compaction.evicted), (1, 0));
         assert_eq!(compaction.forgotten_through, None);
     }
@@ -1819,7 +1859,8 @@ fn a_full_dedupe_window_evicts_its_oldest_chunk_and_still_dedupes() -> TestResul
     );
 
     // Saturated: the next settled reservation is still reclaimed, and the
-    // oldest chunk (batch 0, received at 1s) leaves the window.
+    // oldest chunk (batch 0) leaves the window. The cutoff is the house
+    // time batch 0 was reserved, not its source's future time.
     let compaction = apply_batch(&kitchen, &forge, chunks, 100_000)?;
     assert_eq!(
         (compaction.folded, compaction.kept, compaction.evicted),
@@ -1848,10 +1889,27 @@ fn a_full_dedupe_window_evicts_its_oldest_chunk_and_still_dedupes() -> TestResul
         MAX_COUNTED_CHUNKS * MAX_PER_PROPOSAL
     );
     let sources = sources()?;
+    let keys =
+        |ids: &[&str], received: u64| -> Result<Vec<ReportKey>, Box<dyn std::error::Error>> {
+            let mut keys: Vec<ReportKey> = login_at(&sources, ids, received)?
+                .into_iter()
+                .map(|entry| entry.report.key())
+                .collect();
+            keys.sort();
+            Ok(keys)
+        };
+    let newest = format!("b{chunks}-7");
+    // Evicted (b0-0) and never-counted (unseen-old) reports at the cutoff.
     let mut replay = login_at(&sources, &["b0-0", "unseen-old"], 1_000)?;
-    replay.extend(login_at(&sources, &["b1-0"], 2_000)?);
-    replay.extend(login_at(&sources, &[&format!("b{chunks}-7")], 100_000)?);
+    // Still in the window, even with a source time before the cutoff.
+    replay.extend(login_at(&sources, &["b1-0"], 500)?);
+    replay.extend(login_at(&sources, &["b1-1"], 2_000)?);
+    replay.extend(login_at(&sources, &[&newest], 100_000)?);
+    // Just after the cutoff, and well before batch 0's future time.
+    replay.extend(login_at(&sources, &["edge"], 1_001)?);
     replay.extend(login_at(&sources, &["fresh"], 200_000)?);
+    // Evicted, but its source time is after the cutoff: proposed again.
+    replay.extend(login_at(&sources, &["b0-1"], far_future)?);
     let proposals = plan(
         &house()?,
         &repo()?,
@@ -1860,26 +1918,51 @@ fn a_full_dedupe_window_evicts_its_oldest_chunk_and_still_dedupes() -> TestResul
         &counted,
         &full_authority()?,
     )?;
-    // Evicted (b0-0) and older-than-window (unseen-old) reports are dropped,
-    // reports still in the window are deduped, and only the new one is
-    // proposed, with a total that says earlier reports may be missing.
-    let [comment @ Proposal::AddReports { reports, total, .. }] = proposals.as_slice() else {
+    let [
+        Proposal::LateReports {
+            problem: late_problem,
+            reports: late,
+            forgotten_through,
+        },
+        comment @ Proposal::AddReports { reports, total, .. },
+    ] = proposals.as_slice()
+    else {
         return Err(format!("unexpected proposals: {proposals:?}").into());
     };
-    assert_eq!(
-        reports,
-        &login_at(&sources, &["fresh"], 200_000)?
-            .into_iter()
-            .map(|entry| entry.report.key())
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(*total, MAX_COUNTED_CHUNKS * MAX_PER_PROPOSAL + 1);
+    // The late reports stay visible for review; nothing is posted for them.
+    assert_eq!(late_problem, &problem);
+    assert_eq!(late, &keys(&["b0-0", "unseen-old"], 1_000)?);
+    assert_eq!(*forgotten_through, Timestamp::from_unix_millis(1_000));
+    let mut expected = keys(&["edge"], 1_001)?;
+    expected.extend(keys(&["fresh"], 200_000)?);
+    expected.extend(keys(&["b0-1"], far_future)?);
+    expected.sort();
+    assert_eq!(reports, &expected);
+    assert_eq!(*total, MAX_COUNTED_CHUNKS * MAX_PER_PROPOSAL + 3);
     assert!(
         body(comment)
             .ok_or("no body")?
-            .contains("at least 3201 counted in total"),
+            .contains("at least 3203 counted in total"),
         "{comment:?}"
     );
+    let late_proposal = proposals.first().ok_or("no late proposal")?;
+    assert_eq!(late_proposal.mutation(), None);
+    assert_eq!(late_proposal.effect_name(), None);
+    let refused = kitchen
+        .ledger(kitchen.store())?
+        .reserve(
+            &counted,
+            late_proposal,
+            &next,
+            &common::scheduled("intake")?,
+            common::at(4),
+        )
+        .err()
+        .ok_or("a late-report proposal was reserved")?;
+    assert!(matches!(
+        refused,
+        kitchen::Error::Intake(IntakeError::InvalidReport)
+    ));
 
     // Another saturated pass keeps the window bounded and moves it on.
     let compaction = apply_batch(&kitchen, &forge, chunks + 1, 300_000)?;

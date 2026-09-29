@@ -557,6 +557,7 @@ impl TaskTemplate {
             resources: std::collections::BTreeSet::new(),
             requires: self.requires.clone(),
             agent,
+            work_type: None,
         })
     }
 }

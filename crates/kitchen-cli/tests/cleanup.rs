@@ -121,6 +121,7 @@ fn settled_task(store: &HouseStore) -> TestResult<(String, String, String)> {
             resources: BTreeSet::new(),
             requires: CapabilityRequirements::new(),
             agent: None,
+            work_type: None,
         },
         &pickup,
         now,

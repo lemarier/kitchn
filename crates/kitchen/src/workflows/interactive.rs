@@ -1119,6 +1119,7 @@ pub fn pull_request(request: &PrRequest<'_>) -> Result<(PrPlan, Option<Lease>)> 
             crate::contracts::Role::StationCook,
             request.repository,
         ),
+        work_type: None,
     };
     let lease = match claim_task(
         request.store,

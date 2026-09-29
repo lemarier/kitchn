@@ -81,6 +81,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #161 open pull request effect | `GitHubAction::OpenPullRequest` in `contracts/effects/github.rs` and its provider arms in `integrations/github/`; layer opening in `workflows/stack.rs` | Effect tests in `crates/kitchen/tests/integrations_effects.rs`; opening tests in `crates/kitchen/tests/workflows_stack.rs` |
 | #148 house follow-up policy | `house/config.rs` (`FollowUpPolicy`, `HouseConfig::follow_up_budget`) | `FollowUpBudget` can only come from the house config: `RepairPolicy::for_house` and `ForgeGatePolicy::for_house` (no scheduled repair or gate runner exists yet) and the interactive `pr` request in `workflows/interactive.rs` read it; the fix-round and review-request questions in `house/wizard/`; `tests/house_adoption.rs` |
 | #130 agent inventory for house init | `adapters/orca/accounts.rs` | `AgentInventory` in `house/wizard/`; `PATH` and `orca account list` probes in `crates/kitchen-cli/src/commands/house_init.rs`; `tests/house_init.rs` |
+| #119 task work type and derived trust scope | `TaskSpec::work_type` in `contracts/task.rs` (with #4); `StationScope::of_task` and binding checks in `trust/` (with #12) | Scope tests in `crates/kitchen/tests/trust_ledger.rs` |
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.

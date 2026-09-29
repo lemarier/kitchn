@@ -591,6 +591,7 @@ fn spec(id: &str, agent: Option<ResolvedSelection>) -> TestResult<TaskSpec> {
         resources: BTreeSet::new(),
         requires: CapabilityRequirements::new(),
         agent,
+        work_type: None,
     })
 }
 

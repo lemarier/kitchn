@@ -1155,6 +1155,7 @@ pub fn apply<T: GitHubMutationTransport>(
         resources: BTreeSet::new(),
         requires: CapabilityRequirements::new(),
         agent: None,
+        work_type: None,
     };
     // The repository's decomposition slot is the task itself: the check
     // for an earlier unfinished task and the creation and claim of this one

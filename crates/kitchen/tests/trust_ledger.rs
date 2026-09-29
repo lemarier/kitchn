@@ -11,7 +11,7 @@ use kitchen::{
         TaskAuthority, TaskSpec, Text,
     },
     scheduling::AgentFamily,
-    selection::{AgentModel, AgentSelection, ResolvedSelection},
+    selection::{AgentModel, AgentSelection, ResolvedSelection, WorkType},
     state::{Corruption, HouseStore, StateError, StoreOptions, TaskState},
     trust::{
         Attribution, AutonomyGrant, AutonomyProposal, BenchResult, EvidenceMode, Finding,
@@ -35,10 +35,11 @@ fn selected(model: &str) -> TestResult<Option<ResolvedSelection>> {
         effort: None,
     })))
 }
-/// The common worker spec, running the fixture model.
+/// The common worker spec, running the fixture model on implementation work.
 fn spec(id: &str) -> TestResult<TaskSpec> {
     let mut task = common::spec(id)?;
     task.agent = selected(MODEL)?;
+    task.work_type = Some(WorkType::new("implementation")?);
     Ok(task)
 }
 fn source(value: &str) -> TestResult<ExternalRef> {
@@ -53,9 +54,9 @@ fn measured<T>(value: T) -> TestResult<Measurement<T>> {
 }
 fn scope() -> TestResult<StationScope> {
     Ok(StationScope {
-        station: Text::new("rust")?,
+        station: Role::StationCook,
         project: Repository::new("example/project")?,
-        work_type: Text::new("implementation")?,
+        work_type: WorkType::new("implementation")?,
     })
 }
 fn attribution() -> TestResult<Attribution> {
@@ -120,7 +121,7 @@ fn ledger(f: &Fixture) -> TestResult<Ledger> {
 }
 fn bind_evidence(l: &Ledger, f: &Fixture) -> TestResult {
     let task = f.store.task(&task_id("task")?)?;
-    l.bind_task(task.spec(), scope()?, source("fixture:task-binding")?)?;
+    l.bind_task(task.spec(), source("fixture:task-binding")?)?;
     Ok(())
 }
 fn reopen(f: &Fixture) -> TestResult<Ledger> {
@@ -245,18 +246,14 @@ fn bound_acting(
     acting.authority = TaskAuthority::delegate(policy, [])?;
     edit(&mut acting);
     acting.agent = selected(model)?;
-    l.bind_task(
-        &acting,
-        scope()?,
-        source(&format!("fixture:{name}-binding"))?,
-    )?;
+    l.bind_task(&acting, source(&format!("fixture:{name}-binding"))?)?;
     Ok(acting)
 }
 /// An ordinary (non-priority) write: bind one more prospective task.
 fn try_bind_extra(l: &Ledger) -> TestResult<Result<bool, TrustError>> {
     let mut extra = spec("extra")?;
     extra.repository = Some(scope()?.project);
-    Ok(l.bind_task(&extra, scope()?, source("fixture:extra-binding")?))
+    Ok(l.bind_task(&extra, source("fixture:extra-binding")?))
 }
 fn try_approve(l: &Ledger, current: &HouseGrants) -> TestResult<Result<bool, TrustError>> {
     Ok(l.approve(
@@ -678,7 +675,7 @@ fn fabricated_core_outcome_and_scope_correction_are_refused() -> TestResult {
     let mut corrected = original;
     corrected.revision = NonZeroU32::new(2).ok_or("revision")?;
     corrected.correction = Some(source("fixture:scope-correction")?);
-    corrected.attribution.scope.station = Text::new("other-station")?;
+    corrected.attribution.scope.station = Role::Inspector;
     assert!(matches!(
         l.record(&f.store, corrected),
         Err(TrustError::Refused)
@@ -715,26 +712,30 @@ fn nonterminal_task_cannot_be_recorded_as_completed_evidence() -> TestResult {
 }
 
 #[test]
-fn task_binding_is_write_once_and_rejects_role_confusion() -> TestResult {
+fn task_binding_is_write_once_and_scoped_by_the_task() -> TestResult {
     let f = Fixture::new()?;
     let l = ledger(&f)?;
     let mut task = spec("bound-task")?;
     task.repository = Some(scope()?.project);
     let origin = source("fixture:binding")?;
-    assert!(l.bind_task(&task, scope()?, origin.clone())?);
-    assert!(!l.bind_task(&task, scope()?, origin)?);
+    assert!(l.bind_task(&task, origin.clone())?);
+    assert!(!l.bind_task(&task, origin)?);
     let mut changed = task.clone();
     changed.provenance.house_guidance = commit('c')?;
     assert!(matches!(
-        l.bind_task(&changed, scope()?, source("fixture:binding")?),
+        l.bind_task(&changed, source("fixture:binding")?),
         Err(TrustError::Conflict)
     ));
-    let mut wrong_role = scope()?;
-    wrong_role.station = Text::new("inspector")?;
-    assert!(matches!(
-        l.bind_task(&task, wrong_role, source("fixture:other")?),
-        Err(TrustError::Refused)
-    ));
+    // The scope comes from the task, so a caller cannot bind another station.
+    let persisted: serde_json::Value = serde_json::from_slice(&fs::read(ledger_path(&f))?)?;
+    assert_eq!(
+        persisted["bindings"][0]["scope"],
+        serde_json::json!({
+            "station": "station-cook",
+            "project": "example/project",
+            "workType": "implementation"
+        })
+    );
     Ok(())
 }
 
@@ -746,12 +747,12 @@ fn record_refuses_a_task_binding_that_differs_from_the_stored_task() -> TestResu
     // The adapter bound a prospective spec whose role is not the stored task's.
     let mut prospective = f.store.task(&task_id("task")?)?.spec().clone();
     prospective.role = Role::Commis;
-    l.bind_task(&prospective, scope()?, source("fixture:binding")?)?;
+    l.bind_task(&prospective, source("fixture:binding")?)?;
     assert!(matches!(l.record(&f.store, o), Err(TrustError::Refused)));
     assert!(l.history()?.is_empty());
     let second = settled(&f, "second", "fixture:second", |_| {}, None)?;
     let exact = f.store.task(&task_id("second")?)?.spec().clone();
-    l.bind_task(&exact, scope()?, source("fixture:second-binding")?)?;
+    l.bind_task(&exact, source("fixture:second-binding")?)?;
     assert!(l.record(&f.store, second)?);
     Ok(())
 }
@@ -818,7 +819,7 @@ fn core_store_faults_are_storage_errors_and_an_absent_task_is_a_refusal() -> Tes
     let l = ledger(&f)?;
     let o = observation(&f)?;
     let task_spec = f.store.task(&task_id("task")?)?.spec().clone();
-    l.bind_task(&task_spec, scope()?, source("fixture:binding")?)?;
+    l.bind_task(&task_spec, source("fixture:binding")?)?;
     let quick = HouseStore::open(
         f.dir.path().join("house"),
         house()?,
@@ -989,7 +990,7 @@ fn explicit_grant_uses_core_authority_and_revocation_survives_restart() -> TestR
     let mut acting = spec("acting")?;
     acting.repository = Some(scope()?.project);
     acting.authority = kitchen::contracts::TaskAuthority::delegate(&policy, [])?;
-    l.bind_task(&acting, scope()?, source("fixture:acting-binding")?)?;
+    l.bind_task(&acting, source("fixture:acting-binding")?)?;
     assert!(
         !l.standing_for_task(&f.store, &acting, &policy)?
             .covers(&g.claim)
@@ -1019,12 +1020,11 @@ fn explicit_grant_uses_core_authority_and_revocation_survives_restart() -> TestR
         )?,
         g.claim.credential
     );
-    let mut other_scope = scope()?;
-    other_scope.work_type = Text::new("release")?;
     let mut other = spec("other-acting")?;
     other.repository = Some(scope()?.project);
+    other.work_type = Some(WorkType::new("release")?);
     other.authority = kitchen::contracts::TaskAuthority::delegate(&policy, [])?;
-    l.bind_task(&other, other_scope, source("fixture:other-binding")?)?;
+    l.bind_task(&other, source("fixture:other-binding")?)?;
     assert!(
         !l.standing_for_task(&f.store, &other, &policy)?
             .covers(&g.claim)
@@ -1676,6 +1676,7 @@ fn collection_preserves_uncertain_effect_and_exact_core_evidence() -> TestResult
     // A launch must match the task's agent selection; this one has none.
     let mut task = common::spec("task")?;
     task.repository = Some(scope()?.project);
+    task.work_type = Some(scope()?.work_type);
     f.store.create_task(task, &creator()?, at(0))?;
     let lease = f
         .store
@@ -1848,9 +1849,9 @@ fn record_refuses_a_model_or_scope_that_differs_from_the_task_binding() -> TestR
     let mut wrong_model = o.clone();
     wrong_model.attribution.model = measured(Text::new("other-model-v2")?)?;
     let mut wrong_station = o.clone();
-    wrong_station.attribution.scope.station = Text::new("python")?;
+    wrong_station.attribution.scope.station = Role::Commis;
     let mut wrong_work_type = o.clone();
-    wrong_work_type.attribution.scope.work_type = Text::new("review")?;
+    wrong_work_type.attribution.scope.work_type = WorkType::new("review")?;
     for (label, bad) in [
         ("model", wrong_model),
         ("station", wrong_station),
@@ -3145,7 +3146,7 @@ fn capacity_reports_entries_and_bytes_before_writes_stop() -> TestResult {
     let mut another = spec("another")?;
     another.repository = Some(scope()?.project);
     assert!(matches!(
-        l.bind_task(&another, scope()?, source("fixture:another-binding")?),
+        l.bind_task(&another, source("fixture:another-binding")?),
         Err(TrustError::Exhausted)
     ));
     // Revocation still succeeds at the entry limit.
@@ -3203,7 +3204,7 @@ fn the_bound_model_comes_from_the_tasks_agent_selection() -> TestResult {
     unselected.repository = Some(scope()?.project);
     unselected.agent = None;
     assert!(matches!(
-        l.bind_task(&unselected, scope()?, source("fixture:unselected")?),
+        l.bind_task(&unselected, source("fixture:unselected")?),
         Err(TrustError::Refused)
     ));
     // An agent default binds the family alone, which no reported model matches.
@@ -3212,7 +3213,7 @@ fn the_bound_model_comes_from_the_tasks_agent_selection() -> TestResult {
     default.agent = Some(ResolvedSelection::owner(AgentSelection::agent_default(
         AgentFamily::Claude,
     )));
-    assert!(l.bind_task(&default, scope()?, source("fixture:default")?)?);
+    assert!(l.bind_task(&default, source("fixture:default")?)?);
     let persisted: serde_json::Value = serde_json::from_slice(&fs::read(ledger_path(&f))?)?;
     assert_eq!(persisted["bindings"][0]["model"], "claude");
 
@@ -3220,7 +3221,7 @@ fn the_bound_model_comes_from_the_tasks_agent_selection() -> TestResult {
     let o = observation(&f)?;
     let mut prospective = f.store.task(&task_id("task")?)?.spec().clone();
     prospective.agent = selected("fixture-model-v2")?;
-    l.bind_task(&prospective, scope()?, source("fixture:binding")?)?;
+    l.bind_task(&prospective, source("fixture:binding")?)?;
     assert!(matches!(l.record(&f.store, o), Err(TrustError::Refused)));
     assert!(l.history()?.is_empty());
 
@@ -3274,7 +3275,163 @@ fn a_schema_two_ledger_with_an_unselected_binding_reports_its_version() -> TestR
     ));
     assert_eq!(fs::read(ledger_path(&f))?, before);
     // The same binding in a current ledger breaks its invariant.
-    legacy(3)?;
+    legacy(4)?;
     assert_corrupt(try_open(&f)?, "current binding without a selection");
+    Ok(())
+}
+
+#[test]
+fn a_schema_three_ledger_with_a_declared_station_reports_its_version() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    // Before version 4, the caller declared the station and work type, and
+    // the bound spec recorded no work type.
+    tamper(&f, |d| {
+        d["schema"] = serde_json::json!(3);
+        let binding = &mut d["bindings"][0];
+        binding["scope"]["station"] = serde_json::json!("rust");
+        if let Some(spec) = binding["spec"].as_object_mut() {
+            spec.remove("workType");
+        }
+        Ok(())
+    })?;
+    let marker = f.dir.path().join("trust/store.json");
+    let mut stored: serde_json::Value = serde_json::from_slice(&fs::read(&marker)?)?;
+    stored["schema"] = serde_json::json!(3);
+    fs::write(&marker, serde_json::to_vec(&stored)?)?;
+    let before = fs::read(ledger_path(&f))?;
+    let error = try_open(&f)?.err();
+    assert!(
+        matches!(
+            error,
+            Some(TrustError::Storage(StateError::UnsupportedSchema {
+                found: 3
+            }))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(fs::read(ledger_path(&f))?, before);
+    Ok(())
+}
+
+#[test]
+fn binding_derives_the_scope_and_refuses_a_task_without_one() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let mut task = spec("scoped")?;
+    task.repository = Some(scope()?.project);
+    task.role = Role::Inspector;
+    task.work_type = Some(WorkType::new("review")?);
+    assert_eq!(
+        StationScope::of_task(&task)?,
+        StationScope {
+            station: Role::Inspector,
+            project: scope()?.project,
+            work_type: WorkType::new("review")?,
+        }
+    );
+    assert!(l.bind_task(&task, source("fixture:scoped")?)?);
+    // A task stored before work types were recorded has none: it cannot bind.
+    let mut legacy = spec("legacy")?;
+    legacy.repository = Some(scope()?.project);
+    legacy.work_type = None;
+    // House-level work has no project to scope evidence to.
+    let mut house_level = spec("house-level")?;
+    house_level.repository = None;
+    for (label, bad) in [("no work type", legacy), ("no project", house_level)] {
+        assert!(
+            matches!(StationScope::of_task(&bad), Err(TrustError::Refused)),
+            "{label}"
+        );
+        assert!(
+            matches!(
+                l.bind_task(&bad, source("fixture:bad")?),
+                Err(TrustError::Refused)
+            ),
+            "{label}"
+        );
+    }
+    assert_eq!(l.capacity()?.entries, 1);
+    Ok(())
+}
+
+#[test]
+fn a_stored_binding_whose_scope_differs_from_its_task_is_corrupt() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    type Edit = fn(&mut serde_json::Value);
+    let edits: [(&str, Edit); 4] = [
+        ("station", |b| {
+            b["scope"]["station"] = serde_json::json!("inspector")
+        }),
+        ("work type", |b| {
+            b["scope"]["workType"] = serde_json::json!("review")
+        }),
+        ("spec work type", |b| {
+            b["spec"]["workType"] = serde_json::json!("review");
+        }),
+        ("missing spec work type", |b| {
+            if let Some(spec) = b["spec"].as_object_mut() {
+                spec.remove("workType");
+            }
+        }),
+    ];
+    for (label, edit) in edits {
+        let original = tamper(&f, |d| {
+            edit(&mut d["bindings"][0]);
+            Ok(())
+        })?;
+        assert_corrupt(try_open(&f)?, label);
+        fs::write(ledger_path(&f), &original)?;
+    }
+    // Restoring the original bytes recovers the ledger.
+    assert_eq!(reopen(&f)?.history()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn collection_refuses_attribution_scoped_other_than_the_task() -> TestResult {
+    let f = Fixture::new()?;
+    settled(&f, "task", "fixture:task", |_| {}, None)?;
+    let mut other = attribution()?;
+    other.scope.work_type = WorkType::new("review")?;
+    let collected = Observation::collect(
+        &f.store,
+        &task_id("task")?,
+        source("fixture:task")?,
+        other,
+        EvidenceMode::Simulated,
+        at(4),
+    );
+    assert!(matches!(
+        collected,
+        Err(kitchen::Error::Trust(TrustError::Refused))
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_task_spec_without_a_work_type_stays_readable() -> TestResult {
+    let mut task = spec("serde")?;
+    let current = serde_json::to_value(&task)?;
+    assert_eq!(current["workType"], "implementation");
+    assert_eq!(serde_json::from_value::<TaskSpec>(current.clone())?, task);
+    // Specs stored before the field existed decode with no work type, and
+    // such a spec is written back without the field.
+    let mut legacy = current.clone();
+    if let Some(fields) = legacy.as_object_mut() {
+        fields.remove("workType");
+    }
+    let decoded: TaskSpec = serde_json::from_value(legacy.clone())?;
+    task.work_type = None;
+    assert_eq!(decoded, task);
+    assert_eq!(serde_json::to_value(&decoded)?, legacy);
+    let mut invalid = current;
+    invalid["workType"] = serde_json::json!("Not A Name");
+    assert!(serde_json::from_value::<TaskSpec>(invalid).is_err());
     Ok(())
 }

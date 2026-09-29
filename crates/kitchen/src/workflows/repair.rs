@@ -449,5 +449,6 @@ pub fn repair_spec(
         resources: BTreeSet::from([worktree]),
         requires: CapabilityRequirements::new(),
         agent,
+        work_type: None,
     }
 }

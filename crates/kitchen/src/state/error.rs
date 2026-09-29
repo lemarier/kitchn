@@ -254,6 +254,10 @@ pub enum StateError {
     /// can be retired.
     #[error("task {0} is not settled with every effect resolved")]
     TaskNotRetirable(TaskId),
+    /// A retention policy would remove settled tasks before
+    /// [`crate::state::MIN_TASK_WINDOW`].
+    #[error("the settled-task retention window is shorter than the minimum")]
+    RetentionWindowTooShort,
     /// No workflow marker is recorded under this key.
     #[error("no workflow marker is recorded for this key")]
     MarkerNotFound,
@@ -393,6 +397,7 @@ impl StateError {
             | Self::StaleDecision { .. }
             | Self::NotInitialized
             | Self::AlreadyInitialized => ErrorClass::Conflict,
+            Self::RetentionWindowTooShort => ErrorClass::InvalidInput,
             Self::UnsafeRetry(_)
             | Self::CapacityExceeded { .. }
             | Self::StorageInsideRepository

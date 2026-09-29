@@ -1491,3 +1491,255 @@ fn a_waived_effect_does_not_count_its_reports() -> TestResult {
     assert_eq!(reports.len(), 1);
     Ok(())
 }
+
+/// Submit and apply one comment adding `ids` to issue 3 from `task`.
+fn apply_reports(
+    kitchen: &Kitchen,
+    forge: &Forge,
+    task: &TaskId,
+    fence: Fence,
+    ids: &[&str],
+) -> TestResult {
+    let counted = kitchen.ledger(kitchen.store())?.counted(task)?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &login(&sources()?, ids)?,
+        &open_issue(3)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let [proposal] = proposals.as_slice() else {
+        return Err(format!("unexpected proposals: {proposals:?}").into());
+    };
+    assert!(applied(
+        &kitchen.submit(forge, &counted, proposal, task, fence)?
+    ));
+    Ok(())
+}
+
+fn settle(
+    kitchen: &Kitchen,
+    task: &TaskId,
+    fence: Fence,
+    outcome: kitchen::contracts::AttemptOutcome,
+) -> TestResult {
+    kitchen.store().finish_attempt(
+        task,
+        fence,
+        kitchen::contracts::AttemptNumber::FIRST,
+        outcome,
+        common::at(2),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn compaction_keeps_counted_reports_without_their_reservations_or_tasks() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let forge = Forge::new()?;
+    let (first, fence) = kitchen.start("intake-1")?;
+    apply_reports(&kitchen, &forge, &first, fence, &["m1", "m2"])?;
+    apply_reports(&kitchen, &forge, &first, fence, &["m1", "m2", "m3"])?;
+    settle(
+        &kitchen,
+        &first,
+        fence,
+        kitchen::contracts::AttemptOutcome::Succeeded,
+    )?;
+    // A reservation of a task still running stays as it is.
+    let (running, running_fence) = kitchen.start("intake-2")?;
+    apply_reports(
+        &kitchen,
+        &forge,
+        &running,
+        running_fence,
+        &["m1", "m2", "m3", "m4"],
+    )?;
+    let ledger = kitchen.ledger(kitchen.store())?;
+    let workflow = WorkflowId::new("intake")?;
+    assert_eq!(kitchen.store().markers(&workflow)?.len(), 3);
+
+    let compaction = ledger.compact(&common::scheduled("intake")?, common::at(3))?;
+    assert_eq!(
+        (compaction.folded, compaction.dropped, compaction.kept),
+        (2, 0, 1)
+    );
+    // Two reservations became one counted marker; the running one stays.
+    assert_eq!(kitchen.store().markers(&workflow)?.len(), 2);
+    // The settled reserving task can go, and counting no longer needs it.
+    kitchen.store().retire_tasks(std::slice::from_ref(&first))?;
+    let (next, _) = kitchen.start("intake-3")?;
+    let counted = ledger.counted(&next)?;
+    let problem = ProblemKey::new("login-timeout")?;
+    assert_eq!(counted.total(&problem), 4);
+    // Dedupe after compaction: replaying counted reports proposes nothing.
+    assert!(
+        plan(
+            &house()?,
+            &repo()?,
+            &login(&sources()?, &["m1", "m2", "m3", "m4"])?,
+            &open_issue(3)?,
+            &counted,
+            &full_authority()?
+        )?
+        .is_empty()
+    );
+    // A second pass has nothing more to fold and changes nothing.
+    let again = ledger.compact(&common::scheduled("intake")?, common::at(4))?;
+    assert_eq!((again.folded, again.dropped, again.kept), (0, 0, 1));
+    assert_eq!(kitchen.store().markers(&workflow)?.len(), 2);
+    // Folding into an existing counted marker supersedes it.
+    settle(
+        &kitchen,
+        &running,
+        running_fence,
+        kitchen::contracts::AttemptOutcome::Succeeded,
+    )?;
+    let last = ledger.compact(&common::scheduled("intake")?, common::at(5))?;
+    assert_eq!((last.folded, last.kept), (1, 0));
+    assert_eq!(kitchen.store().markers(&workflow)?.len(), 1);
+    assert_eq!(ledger.counted(&next)?.total(&problem), 4);
+    Ok(())
+}
+
+#[test]
+fn compaction_keeps_a_reservation_whose_outcome_is_not_established() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let forge = Forge::new()?;
+    let (task, fence) = kitchen.start("intake-1")?;
+    let ledger = kitchen.ledger(kitchen.store())?;
+    let counted = ledger.counted(&task)?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &login(&sources()?, &["m1"])?,
+        &open_issue(12)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let proposal = proposals.first().ok_or("no proposal")?;
+    forge.lose_next_response.set(true);
+    let uncertain = kitchen.submit(&forge, &counted, proposal, &task, fence)?;
+    kitchen.store().record_effect_outcome(
+        &task,
+        fence,
+        uncertain.seq(),
+        kitchen::state::EffectOutcome::Unresolvable,
+        common::at(2),
+    )?;
+    kitchen.store().accept_risk(
+        &task,
+        fence,
+        uncertain.seq(),
+        kitchen::state::RiskDecision {
+            effect: uncertain.request().key().clone(),
+            decided_by: common::holder("operator")?,
+            revision: EvidenceRevision::INITIAL,
+            action: kitchen::state::RiskAction::SettleUnsuccessfully,
+        },
+        common::at(3),
+    )?;
+    settle(
+        &kitchen,
+        &task,
+        fence,
+        kitchen::contracts::AttemptOutcome::Failed(kitchen::contracts::FailureClass::Permanent),
+    )?;
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        kitchen::state::TaskState::Settled { .. }
+    ));
+    // A later lookup may still find the waived comment applied, so its
+    // reservation is neither folded nor dropped.
+    let compaction = ledger.compact(&common::scheduled("intake")?, common::at(4))?;
+    assert_eq!(
+        (compaction.folded, compaction.dropped, compaction.kept),
+        (0, 0, 1)
+    );
+    assert_eq!(
+        kitchen.store().markers(&WorkflowId::new("intake")?)?.len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn compaction_drops_a_reservation_that_definitely_did_not_apply() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let (task, fence) = kitchen.start("intake-1")?;
+    let ledger = kitchen.ledger(kitchen.store())?;
+    let counted = ledger.counted(&task)?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &login(&sources()?, &["m1"])?,
+        &open_issue(12)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    let proposal = proposals.first().ok_or("no proposal")?;
+    // Reserved, then the task settled before submitting anything.
+    ledger.reserve(
+        &counted,
+        proposal,
+        &task,
+        &common::scheduled("intake")?,
+        common::at(1),
+    )?;
+    settle(
+        &kitchen,
+        &task,
+        fence,
+        kitchen::contracts::AttemptOutcome::Failed(kitchen::contracts::FailureClass::Permanent),
+    )?;
+    let compaction = ledger.compact(&common::scheduled("intake")?, common::at(3))?;
+    assert_eq!(
+        (compaction.folded, compaction.dropped, compaction.kept),
+        (0, 1, 0)
+    );
+    assert!(
+        kitchen
+            .store()
+            .markers(&WorkflowId::new("intake")?)?
+            .is_empty()
+    );
+    let (next, _) = kitchen.start("intake-2")?;
+    assert_eq!(
+        ledger
+            .counted(&next)?
+            .total(&ProblemKey::new("login-timeout")?),
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn compaction_refuses_a_reservation_whose_task_is_gone() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let forge = Forge::new()?;
+    let (task, fence) = kitchen.start("intake-1")?;
+    apply_reports(&kitchen, &forge, &task, fence, &["m1"])?;
+    settle(
+        &kitchen,
+        &task,
+        fence,
+        kitchen::contracts::AttemptOutcome::Succeeded,
+    )?;
+    // Retired before compaction: the ledger cannot tell whether it applied.
+    kitchen.store().retire_tasks(std::slice::from_ref(&task))?;
+    let ledger = kitchen.ledger(kitchen.store())?;
+    let error = ledger
+        .compact(&common::scheduled("intake")?, common::at(3))
+        .err()
+        .ok_or("expected a refusal")?;
+    assert!(matches!(
+        error,
+        kitchen::Error::Intake(IntakeError::IncompleteEvidence)
+    ));
+    assert_eq!(
+        kitchen.store().markers(&WorkflowId::new("intake")?)?.len(),
+        1
+    );
+    Ok(())
+}

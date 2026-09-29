@@ -42,7 +42,7 @@ use crate::{
     integrations::github::IssueState,
     state::{
         EffectState, HouseStore, MarkerAttempt, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject,
-        TaskRecord, TaskState, WorkItem,
+        MarkerWrite, TaskRecord, TaskState, WorkItem,
     },
 };
 
@@ -66,6 +66,10 @@ pub const MAX_KEY_BYTES: usize = 48;
 pub const MAX_PER_PROPOSAL: usize = 100;
 
 const RESERVATION_SCHEMA: &str = "intake.reservation";
+const COUNTED_SCHEMA: &str = "intake.counted";
+/// Compacted counted-digest markers per repository. Compaction stops, and
+/// leaves the remaining reservations in place, once they are full.
+pub const MAX_COUNTED_CHUNKS: usize = 32;
 /// Digest bytes kept in report digests and effect names (128 bits).
 const DIGEST_BYTES: usize = 16;
 
@@ -960,6 +964,47 @@ struct Reservation {
     reports: Vec<ReportDigest>,
 }
 
+/// Counted digests folded from applied reservations whose tasks settled,
+/// keyed by problem. One marker holds at most
+/// [`crate::state::MAX_MARKER_PAYLOAD_BYTES`] of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CountedChunk {
+    problems: BTreeMap<ProblemKey, BTreeSet<ReportDigest>>,
+}
+
+impl CountedChunk {
+    /// Add `reservation`'s digests if the encoded chunk stays within one
+    /// marker payload; otherwise leave the chunk unchanged.
+    fn fold(&mut self, reservation: &Reservation) -> bool {
+        let mut next = self.clone();
+        next.problems
+            .entry(reservation.problem.clone())
+            .or_default()
+            .extend(reservation.reports.iter().cloned());
+        let fits = serde_json::to_string(&next)
+            .is_ok_and(|text| text.len() <= crate::state::MAX_MARKER_PAYLOAD_BYTES);
+        if fits {
+            *self = next;
+        }
+        fits
+    }
+}
+
+/// What [`IntakeLedger::compact`] changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Compaction {
+    /// Applied reservations whose digests were folded into counted markers.
+    pub folded: usize,
+    /// Reservations removed because every attempt at their effect
+    /// definitely did not apply, so they count nothing.
+    pub dropped: usize,
+    /// Reservations kept: unsettled, not yet established, or beyond
+    /// [`MAX_COUNTED_CHUNKS`].
+    pub kept: usize,
+}
+
 /// Durable, house-scoped intake accounting for one repository, kept as
 /// workflow markers in the [`HouseStore`].
 ///
@@ -969,7 +1014,8 @@ struct Reservation {
 /// workflow id for a repository's intake: ledgers under different ids do not
 /// see each other's reservations. Marker capacity
 /// ([`crate::state::MAX_MARKERS`], shared by the house) bounds how many
-/// intake effects one store records.
+/// intake effects one store records; [`Self::compact`] folds settled
+/// reservations into at most [`MAX_COUNTED_CHUNKS`] markers per repository.
 #[derive(Debug, Clone)]
 pub struct IntakeLedger<'a> {
     store: &'a HouseStore,
@@ -1027,8 +1073,19 @@ impl<'a> IntakeLedger<'a> {
             .into_iter()
             .map(|record| (record.spec().id.clone(), record))
             .collect();
+        let chunk_schema = counted_schema()?;
         for marker in markers {
             counted.observed.insert(marker.key().clone());
+            if is_schema(marker.fact(), &chunk_schema) {
+                let chunk: CountedChunk = marker
+                    .fact()
+                    .decode(&chunk_schema)
+                    .map_err(|_| IntakeError::IncompleteEvidence)?;
+                for (problem, reports) in chunk.problems {
+                    counted.add(problem, reports.into_iter().collect());
+                }
+                continue;
+            }
             let reservation: Reservation = marker
                 .fact()
                 .decode(&schema)
@@ -1045,6 +1102,111 @@ impl<'a> IntakeLedger<'a> {
             }
         }
         Ok(counted)
+    }
+
+    /// Fold the reservations whose tasks settled with their effect applied
+    /// into this repository's counted-digest markers, and remove those whose
+    /// effect definitely did not apply, in one store transaction. The
+    /// counted digests stay, so [`Self::counted`] reports the same reports
+    /// afterwards, and the reserving tasks are no longer needed to read them.
+    /// A reservation stays while its task is unsettled or any attempt at its
+    /// effect has no established outcome, since a later lookup may still
+    /// find it applied, and once [`MAX_COUNTED_CHUNKS`] markers are full.
+    ///
+    /// # Errors
+    /// [`IntakeError::IncompleteEvidence`] for a malformed marker or a
+    /// reservation whose task is missing; store errors, including a marker
+    /// conflict when intake state changed during the call, in which case
+    /// nothing changed.
+    pub fn compact(
+        &self,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<Compaction, crate::Error> {
+        let reservation_schema = reservation_schema()?;
+        let chunk_schema = counted_schema()?;
+        let item = self.item();
+        let markers: Vec<_> = self
+            .store
+            .markers(&self.workflow)?
+            .into_iter()
+            .filter(|marker| marker.key().item == item)
+            .collect();
+        let tasks: BTreeMap<TaskId, TaskRecord> = self
+            .store
+            .tasks()?
+            .into_iter()
+            .map(|record| (record.spec().id.clone(), record))
+            .collect();
+        let mut chunks: BTreeMap<usize, (Option<MarkerFact>, CountedChunk)> = BTreeMap::new();
+        let mut reservations = Vec::new();
+        for marker in &markers {
+            if is_schema(marker.fact(), &chunk_schema) {
+                let index = (0..MAX_COUNTED_CHUNKS)
+                    .find(|index| {
+                        chunk_key(&self.workflow, &item, *index)
+                            .is_ok_and(|key| &key == marker.key())
+                    })
+                    .ok_or(IntakeError::IncompleteEvidence)?;
+                let chunk = marker
+                    .fact()
+                    .decode(&chunk_schema)
+                    .map_err(|_| IntakeError::IncompleteEvidence)?;
+                chunks.insert(index, (Some(marker.fact().clone()), chunk));
+            } else {
+                let reservation: Reservation = marker
+                    .fact()
+                    .decode(&reservation_schema)
+                    .map_err(|_| IntakeError::IncompleteEvidence)?;
+                reservations.push((marker, reservation));
+            }
+        }
+        let mut compaction = Compaction::default();
+        let mut retire = Vec::new();
+        for (marker, reservation) in reservations {
+            let record = tasks
+                .get(&reservation.task)
+                .ok_or(IntakeError::IncompleteEvidence)?;
+            let outcome = if matches!(record.state(), TaskState::Settled { .. }) {
+                settled_outcome(record, &reservation.effect)
+            } else {
+                None
+            };
+            let keep = match outcome {
+                None => true,
+                Some(false) => false,
+                Some(true) => !fold(&mut chunks, &reservation),
+            };
+            if keep {
+                compaction.kept += 1;
+                continue;
+            }
+            match outcome {
+                Some(true) => compaction.folded += 1,
+                Some(false) | None => compaction.dropped += 1,
+            }
+            retire.push((marker.key().clone(), marker.fact().clone()));
+        }
+        if retire.is_empty() {
+            return Ok(compaction);
+        }
+        let mut writes = Vec::with_capacity(chunks.len());
+        for (index, (expected, chunk)) in chunks {
+            let key = chunk_key(&self.workflow, &item, index)?;
+            let fact = MarkerFact::workflow(chunk_schema.clone(), &chunk)?;
+            writes.push(match expected {
+                Some(expected) if expected == fact => continue,
+                Some(expected) => MarkerWrite::Supersede {
+                    key,
+                    expected,
+                    fact,
+                },
+                None => MarkerWrite::Record(key, fact),
+            });
+        }
+        self.store
+            .compact_markers(&retire, writes, recorded_by, now)?;
+        Ok(compaction)
     }
 
     /// Record the reservation for `proposal` in `task` before its mutation is
@@ -1107,6 +1269,70 @@ impl<'a> IntakeLedger<'a> {
 
 fn reservation_schema() -> Result<MarkerSchema, crate::Error> {
     Ok(MarkerSchema::new(RESERVATION_SCHEMA, NonZeroU32::MIN)?)
+}
+
+fn counted_schema() -> Result<MarkerSchema, crate::Error> {
+    Ok(MarkerSchema::new(COUNTED_SCHEMA, NonZeroU32::MIN)?)
+}
+
+fn is_schema(fact: &MarkerFact, expected: &MarkerSchema) -> bool {
+    matches!(fact, MarkerFact::Workflow { schema, .. } if schema == expected)
+}
+
+fn chunk_key(
+    workflow: &WorkflowId,
+    item: &WorkItem,
+    index: usize,
+) -> Result<MarkerKey, crate::Error> {
+    Ok(MarkerKey {
+        workflow: workflow.clone(),
+        item: item.clone(),
+        subject: MarkerSubject::Observation(ExternalRef::new(&format!("counted-{index}"))?),
+    })
+}
+
+/// Fold `reservation` into the last chunk, or a new one when it does not
+/// fit, unless every chunk is used.
+fn fold(
+    chunks: &mut BTreeMap<usize, (Option<MarkerFact>, CountedChunk)>,
+    reservation: &Reservation,
+) -> bool {
+    if let Some((_, (_, last))) = chunks.iter_mut().next_back()
+        && last.fold(reservation)
+    {
+        return true;
+    }
+    let index = chunks.keys().next_back().map_or(0, |last| last + 1);
+    if index >= MAX_COUNTED_CHUNKS {
+        return false;
+    }
+    let mut chunk = CountedChunk::default();
+    if !chunk.fold(reservation) {
+        return false;
+    }
+    chunks.insert(index, (None, chunk));
+    true
+}
+
+/// Whether a settled task's effect named `name` applied (`Some(true)`),
+/// definitely did not in every attempt (`Some(false)`), or is not yet
+/// established (`None`).
+fn settled_outcome(task: &TaskRecord, name: &EffectName) -> Option<bool> {
+    if applied(task, name) {
+        return Some(true);
+    }
+    task.effects()
+        .iter()
+        .filter(|effect| effect.name() == name)
+        .all(|effect| match effect.state() {
+            EffectState::NotApplied { .. } => true,
+            EffectState::Applied { .. }
+            | EffectState::Intended
+            | EffectState::Waived { .. }
+            | EffectState::Uncertain { .. }
+            | EffectState::Unresolvable { .. } => false,
+        })
+        .then_some(false)
 }
 
 /// Whether `task` applied an effect named `name`. A waived effect is a risk

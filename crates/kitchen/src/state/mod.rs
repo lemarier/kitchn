@@ -36,24 +36,27 @@
 //! - An effect whose outcome cannot be established is handed over, not
 //!   resolved: the task keeps its reservation until positive evidence or a
 //!   scoped [`RiskDecision`] allows one specific action.
+//! - One retention policy ([`RetentionPolicy`]) removes markers and settled
+//!   tasks no workflow still needs, only on positive outside evidence.
 
 mod consumer;
 mod effects;
 mod error;
 mod marker;
 mod model;
+mod retention;
 pub(crate) mod snapshot;
 mod store;
 
 pub use consumer::{ConsumerEvent, ConsumerRecord, ConsumerState, MAX_CONSUMER_HISTORY};
 pub use effects::{ReconcileReport, reconcile, reread_settled, run_effect};
 pub use error::{Corruption, Limit, StateError, StorageOperation};
-pub(crate) use marker::PairPlan;
 pub use marker::{
     IssueRevision, MAX_MARKER_HISTORY, MAX_MARKER_PAYLOAD_BYTES, MAX_MARKERS, MarkerAttempt,
     MarkerFact, MarkerKey, MarkerPayload, MarkerRecording, MarkerSchema, MarkerSubject,
     SupersededFact, WorkItem, WorkflowMarker,
 };
+pub(crate) use marker::{MarkerWrite, PairPlan};
 pub(crate) use model::StoreState;
 pub use model::{
     AttemptRecord, AttemptState, CancelRequest, CancelStatus, Consumption, Creation, EffectOutcome,
@@ -62,6 +65,11 @@ pub use model::{
     MAX_DECISIONS_PER_EFFECT, MAX_EFFECTS_PER_TASK, MAX_EVIDENCE_PER_REVISION,
     MAX_OWNERSHIP_HISTORY, MAX_TASKS, OwnershipEvent, RecoveryItem, Reservation, RiskAction,
     RiskDecision, TaskRecord, TaskState, WriteAcknowledgement,
+};
+pub use retention::{
+    CAPACITY_WARNING_PERCENT, Inventory, MIN_TASK_WINDOW, MarkerRetirement, MarkerRule, Presence,
+    RetentionPolicy, RetentionReport, RetentionSubjects, RetiredMarker, RetiredTask, StoreCapacity,
+    TableUsage, TaskRetirement, marker_rule,
 };
 pub use snapshot::StoreOptions;
 pub use store::HouseStore;

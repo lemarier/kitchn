@@ -1150,6 +1150,7 @@ fn registry_with(
         schedules: None,
         readiness: None,
         undelivered_budget_reports: Vec::new(),
+        store_capacity: None,
     };
     Ok((temp, registry, repository, evidence))
 }

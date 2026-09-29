@@ -9,3 +9,4 @@ pub mod house_init;
 pub mod interactive;
 pub mod pickup;
 pub mod scaffold;
+pub mod store;

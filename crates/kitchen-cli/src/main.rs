@@ -46,6 +46,8 @@ enum Command {
     Pickup(commands::pickup::PickupArgs),
     /// Bind a house to the forge account it writes as, or show its binding.
     Forge(commands::forge::ForgeArgs),
+    /// Report how full the house store is and preview or apply its retention.
+    Store(commands::store::StoreArgs),
     #[command(flatten)]
     Interactive(commands::interactive::InteractiveCommand),
 }
@@ -87,6 +89,7 @@ fn main() -> ExitCode {
         },
         Some(Command::Pickup(args)) => commands::pickup::run(args).map(|output| (output, true)),
         Some(Command::Forge(args)) => commands::forge::run(args),
+        Some(Command::Store(args)) => commands::store::run(args),
         Some(Command::Interactive(command)) => commands::interactive::run(command),
         None => return output_status(Cli::command().print_help()),
     };

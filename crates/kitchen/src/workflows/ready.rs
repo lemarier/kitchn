@@ -50,6 +50,28 @@ pub struct MergeReadiness {
     pub checks: HeadEvidence,
 }
 
+impl MergeReadiness {
+    /// Every reason the pull request is not ready at its current head and
+    /// base; empty when it is.
+    #[must_use]
+    pub fn not_ready(&self) -> Vec<NotReady> {
+        let mut reasons = Vec::new();
+        if self.review.verdict != EvidenceVerdict::Pass {
+            reasons.push(NotReady::ReviewNotClean);
+        }
+        if self.review.subject != self.subject {
+            reasons.push(NotReady::ReviewStale);
+        }
+        if self.checks.verdict != EvidenceVerdict::Pass {
+            reasons.push(NotReady::ChecksNotGreen);
+        }
+        if self.checks.subject != self.subject {
+            reasons.push(NotReady::ChecksStale);
+        }
+        reasons
+    }
+}
+
 /// Why a pull request is not ready.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotReady {
@@ -154,19 +176,7 @@ pub fn ready_to_merge(
     readiness: &MergeReadiness,
     now: Timestamp,
 ) -> Result<ReadyDecision> {
-    let mut reasons = Vec::new();
-    if readiness.review.verdict != EvidenceVerdict::Pass {
-        reasons.push(NotReady::ReviewNotClean);
-    }
-    if readiness.review.subject != readiness.subject {
-        reasons.push(NotReady::ReviewStale);
-    }
-    if readiness.checks.verdict != EvidenceVerdict::Pass {
-        reasons.push(NotReady::ChecksNotGreen);
-    }
-    if readiness.checks.subject != readiness.subject {
-        reasons.push(NotReady::ChecksStale);
-    }
+    let reasons = readiness.not_ready();
     if !reasons.is_empty() {
         return Ok(ReadyDecision::NotReady(reasons));
     }

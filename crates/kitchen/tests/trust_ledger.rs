@@ -1,22 +1,24 @@
 //! Offline fixtures: no live usage, GitHub, model, or equipment is exercised.
 mod common;
 use common::{
-    Fixture, TestResult, at, commit, creator, grants, holder, house, other_house, scheduled, spec,
-    task_id, ttl,
+    Fixture, ManualClock, TestResult, at, commit, creator, grants, holder, house, other_house,
+    scheduled, spec, task_id, ttl,
 };
 use kitchen::{
     contracts::{
         AttemptNumber, AttemptOutcome, ContractError, Evidence, EvidenceKind, EvidenceSubject,
-        EvidenceVerdict, ExternalRef, Grant, HouseGrants, Permission, Repository, Role,
+        EvidenceVerdict, ExternalRef, Fence, Grant, HouseGrants, Permission, Repository, Role,
         TaskAuthority, TaskSpec, Text,
     },
-    state::{Corruption, HouseStore, StateError, StoreOptions},
+    state::{Corruption, HouseStore, StateError, StoreOptions, TaskState},
     trust::{
         Attribution, AutonomyGrant, AutonomyProposal, BenchResult, EvidenceMode, Finding,
         GrantAudit, Ledger, Measurement, Observation, PullRequestEvidence, StationScope,
         TrustError,
     },
-    workflows::inspector::{FollowUpRoute, InspectionPlan, SampleReservation, SampleResult},
+    workflows::inspector::{
+        FollowUpRoute, InspectionPlan, SampleReservation, SampleResult, test_hooks,
+    },
 };
 use std::{fs, num::NonZeroU32};
 
@@ -348,6 +350,27 @@ fn fill_ledger(l: &Ledger, f: &Fixture, target: u64) -> TestResult {
     assert_eq!(fs::metadata(&path)?.len(), target);
     Ok(())
 }
+/// Fence of the fixture's core inspector task, claimed by the plan's
+/// inspector on first use.
+fn fence(f: &Fixture) -> TestResult<Fence> {
+    let id = task_id("inspector")?;
+    if let Ok(task) = f.store.task(&id)
+        && let TaskState::Claimed { lease } = task.state()
+    {
+        return Ok(lease.fence());
+    }
+    let mut task = spec("inspector")?;
+    task.role = Role::Inspector;
+    task.repository = Some(scope()?.project);
+    f.store.create_task(task, &creator()?, at(0))?;
+    Ok(f.store
+        .claim(&id, &scheduled("independent-reviewer")?, ttl(600)?, at(0))?
+        .fence())
+}
+/// A clock stopped at `seconds`.
+fn clock(seconds: u64) -> ManualClock {
+    ManualClock::starting_at(seconds)
+}
 fn plan() -> TestResult<InspectionPlan> {
     Ok(InspectionPlan {
         id: source("fixture:inspection")?,
@@ -355,6 +378,7 @@ fn plan() -> TestResult<InspectionPlan> {
         observation: source("fixture:task")?,
         question: Text::new("Does the changed parser reject duplicate keys?")?,
         inspector: holder("independent-reviewer")?,
+        task: task_id("inspector")?,
         independent: true,
         max_samples: 2,
         max_tokens: 100,
@@ -1193,37 +1217,52 @@ fn inspection_reserves_before_execution_and_restarts_without_budget_reset() -> T
     let f = Fixture::new()?;
     let l = ledger(&f)?;
     l.record(&f.store, with_pr(observation(&f)?)?)?;
-    l.start_inspection(plan()?, at(5))?;
-    let sample = l.reserve_sample(&plan()?.id, 1, 60, at(6))?;
+    l.start_inspection(&f.store, plan()?, fence(&f)?, &clock(5))?;
+    let sample = l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 1, 60, &clock(6))?;
     let SampleReservation::Reserved(sample) = sample else {
         return Err("new reservation expected".into());
     };
     assert_eq!(
         SampleReservation::Existing(sample),
-        reopen(&f)?.reserve_sample(&plan()?.id, 1, 60, at(7))?
+        reopen(&f)?.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 1, 60, &clock(7))?
     );
     assert!(matches!(
-        l.reserve_sample(&plan()?.id, 2, 40, at(7)),
+        l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 2, 40, &clock(7)),
         Err(TrustError::Incomplete)
     ));
-    l.finish_sample(&plan()?.id, 1, SampleResult::Unavailable)?;
+    l.finish_sample(
+        &f.store,
+        &plan()?.id,
+        fence(&f)?,
+        1,
+        SampleResult::Unavailable,
+        &clock(10),
+    )?;
     assert!(matches!(
-        l.reserve_sample(&plan()?.id, 2, 41, at(8)),
+        l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 2, 41, &clock(8)),
         Err(TrustError::Exhausted)
     ));
-    l.reserve_sample(&plan()?.id, 2, 40, at(8))?;
+    l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 2, 40, &clock(8))?;
     l.finish_sample(
+        &f.store,
         &plan()?.id,
+        fence(&f)?,
         2,
         SampleResult::NoFinding {
             source: source("fixture:check")?,
         },
+        &clock(10),
     )?;
     assert!(matches!(
-        l.reserve_sample(&plan()?.id, 3, 1, at(9)),
+        l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 3, 1, &clock(9)),
         Err(TrustError::Exhausted)
     ));
-    assert_eq!(l.start_inspection(plan()?, at(10))?.samples().len(), 2);
+    assert_eq!(
+        l.start_inspection(&f.store, plan()?, fence(&f)?, &clock(10))?
+            .samples()
+            .len(),
+        2
+    );
     Ok(())
 }
 
@@ -1235,7 +1274,7 @@ fn inspection_independence_missing_evidence_and_deadline_fail_closed() -> TestRe
     o.attribution.agent = Measurement::Unavailable;
     l.record(&f.store, o.clone())?;
     assert!(matches!(
-        l.start_inspection(plan()?, at(5)),
+        l.start_inspection(&f.store, plan()?, fence(&f)?, &clock(5)),
         Err(TrustError::Refused)
     ));
     o.revision = NonZeroU32::new(2).ok_or("revision")?;
@@ -1243,27 +1282,27 @@ fn inspection_independence_missing_evidence_and_deadline_fail_closed() -> TestRe
     o.attribution.agent = measured(holder("independent-reviewer")?)?;
     l.record(&f.store, o)?;
     assert!(matches!(
-        l.start_inspection(plan()?, at(5)),
+        l.start_inspection(&f.store, plan()?, fence(&f)?, &clock(5)),
         Err(TrustError::Refused)
     ));
     let mut p = plan()?;
     p.independent = false;
-    l.start_inspection(p.clone(), at(5))?;
+    l.start_inspection(&f.store, p.clone(), fence(&f)?, &clock(5))?;
     assert!(matches!(
-        l.reserve_sample(&p.id, 1, 1, at(60)),
+        l.reserve_sample(&f.store, &p.id, fence(&f)?, 1, 1, &clock(60)),
         Err(TrustError::Exhausted)
     ));
     assert!(matches!(
-        l.reserve_sample(&p.id, 0, 1, at(6)),
+        l.reserve_sample(&f.store, &p.id, fence(&f)?, 0, 1, &clock(6)),
         Err(TrustError::Invalid)
     ));
     assert!(matches!(
-        l.reserve_sample(&p.id, 1, 1, at(4)),
+        l.reserve_sample(&f.store, &p.id, fence(&f)?, 1, 1, &clock(4)),
         Err(TrustError::Invalid)
     ));
-    l.cancel_inspection(&p.id)?;
+    l.cancel_inspection(&f.store, &p.id, fence(&f)?, &clock(10))?;
     assert!(matches!(
-        l.reserve_sample(&p.id, 1, 1, at(6)),
+        l.reserve_sample(&f.store, &p.id, fence(&f)?, 1, 1, &clock(6)),
         Err(TrustError::Refused)
     ));
     Ok(())
@@ -1274,8 +1313,8 @@ fn confirmed_inspector_findings_route_once_with_exact_revision() -> TestResult {
     let f = Fixture::new()?;
     let l = ledger(&f)?;
     l.record(&f.store, with_pr(observation(&f)?)?)?;
-    l.start_inspection(plan()?, at(5))?;
-    l.reserve_sample(&plan()?.id, 1, 20, at(6))?;
+    l.start_inspection(&f.store, plan()?, fence(&f)?, &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 1, 20, &clock(6))?;
     let result = SampleResult::Confirmed {
         finding: kitchen::trust::Finding {
             source: source("fixture:finding")?,
@@ -1289,13 +1328,27 @@ fn confirmed_inspector_findings_route_once_with_exact_revision() -> TestResult {
         finding.subject.head = commit('c')?;
     }
     assert!(matches!(
-        l.finish_sample(&plan()?.id, 1, stale),
+        l.finish_sample(&f.store, &plan()?.id, fence(&f)?, 1, stale, &clock(10)),
         Err(TrustError::Refused)
     ));
-    assert!(l.finish_sample(&plan()?.id, 1, result.clone())?);
-    assert!(!l.finish_sample(&plan()?.id, 1, result)?);
+    assert!(l.finish_sample(
+        &f.store,
+        &plan()?.id,
+        fence(&f)?,
+        1,
+        result.clone(),
+        &clock(10)
+    )?);
+    assert!(!l.finish_sample(&f.store, &plan()?.id, fence(&f)?, 1, result, &clock(10))?);
     assert!(matches!(
-        l.finish_sample(&plan()?.id, 1, SampleResult::Unavailable),
+        l.finish_sample(
+            &f.store,
+            &plan()?.id,
+            fence(&f)?,
+            1,
+            SampleResult::Unavailable,
+            &clock(10)
+        ),
         Err(TrustError::Conflict)
     ));
     let inspection = reopen(&f)?.inspection(&plan()?.id)?;
@@ -1574,7 +1627,7 @@ fn invalid_history_budget_and_inspector_inputs_do_not_commit() -> TestResult {
     assert!(l.history()?.is_empty());
     l.record(&f.store, o.clone())?;
     assert!(matches!(
-        l.start_inspection(plan()?, at(5)),
+        l.start_inspection(&f.store, plan()?, fence(&f)?, &clock(5)),
         Err(TrustError::Incomplete)
     ));
     let mut o = with_pr(o)?;
@@ -1594,7 +1647,10 @@ fn invalid_history_budget_and_inspector_inputs_do_not_commit() -> TestResult {
         p.max_tokens = tokens;
         p.deadline = at(deadline);
         assert!(
-            matches!(l.start_inspection(p, at(5)), Err(TrustError::Invalid)),
+            matches!(
+                l.start_inspection(&f.store, p, fence(&f)?, &clock(5)),
+                Err(TrustError::Invalid)
+            ),
             "bounds {samples}/{tokens}/{deadline} must be invalid"
         );
     }
@@ -1605,21 +1661,28 @@ fn invalid_history_budget_and_inspector_inputs_do_not_commit() -> TestResult {
     let mut fractional = plan()?;
     fractional.deadline = kitchen::contracts::Timestamp::from_unix_millis(3_605_001);
     assert!(matches!(
-        l.start_inspection(fractional, at(5)),
+        l.start_inspection(&f.store, fractional, fence(&f)?, &clock(5)),
         Err(TrustError::Invalid)
     ));
     let mut p = plan()?;
     p.house = other_house()?;
     assert!(matches!(
-        l.start_inspection(p, at(5)),
+        l.start_inspection(&f.store, p, fence(&f)?, &clock(5)),
         Err(TrustError::Refused)
     ));
-    l.start_inspection(plan()?, at(5))?;
-    l.reserve_sample(&plan()?.id, 1, 1, at(6))?;
-    l.cancel_inspection(&plan()?.id)?;
-    l.finish_sample(&plan()?.id, 1, SampleResult::Unavailable)?;
+    l.start_inspection(&f.store, plan()?, fence(&f)?, &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 1, 1, &clock(6))?;
+    l.cancel_inspection(&f.store, &plan()?.id, fence(&f)?, &clock(10))?;
+    l.finish_sample(
+        &f.store,
+        &plan()?.id,
+        fence(&f)?,
+        1,
+        SampleResult::Unavailable,
+        &clock(10),
+    )?;
     assert!(matches!(
-        l.reserve_sample(&plan()?.id, 2, 1, at(7)),
+        l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 2, 1, &clock(7)),
         Err(TrustError::Refused)
     ));
     Ok(())
@@ -1725,8 +1788,8 @@ fn moved_observation_stops_inspection_and_duplicate_findings_do_not_route_twice(
     l.record(&f.store, o.clone())?;
     let mut inspection_plan = plan()?;
     inspection_plan.max_samples = 4;
-    l.start_inspection(inspection_plan, at(5))?;
-    l.reserve_sample(&plan()?.id, 1, 10, at(6))?;
+    l.start_inspection(&f.store, inspection_plan, fence(&f)?, &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 1, 10, &clock(6))?;
     let result = SampleResult::Confirmed {
         finding: kitchen::trust::Finding {
             source: source("fixture:single-finding")?,
@@ -1735,42 +1798,63 @@ fn moved_observation_stops_inspection_and_duplicate_findings_do_not_route_twice(
         },
         route: FollowUpRoute::Issue,
     };
-    l.finish_sample(&plan()?.id, 1, result.clone())?;
-    l.reserve_sample(&plan()?.id, 2, 10, at(7))?;
+    l.finish_sample(
+        &f.store,
+        &plan()?.id,
+        fence(&f)?,
+        1,
+        result.clone(),
+        &clock(10),
+    )?;
+    l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 2, 10, &clock(7))?;
     assert!(matches!(
-        l.finish_sample(&plan()?.id, 2, result),
+        l.finish_sample(&f.store, &plan()?.id, fence(&f)?, 2, result, &clock(10)),
         Err(TrustError::Refused)
     ));
     assert_eq!(l.inspection(&plan()?.id)?.follow_ups().count(), 1);
     o.revision = NonZeroU32::new(2).ok_or("revision")?;
     o.correction = Some(source("fixture:attribution-correction")?);
     l.record(&f.store, o.clone())?;
-    assert!(l.finish_sample(&plan()?.id, 2, SampleResult::Unavailable)?);
+    assert!(l.finish_sample(
+        &f.store,
+        &plan()?.id,
+        fence(&f)?,
+        2,
+        SampleResult::Unavailable,
+        &clock(10)
+    )?);
     assert!(matches!(
-        l.reserve_sample(&plan()?.id, 2, 10, at(8))?,
+        l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 2, 10, &clock(8))?,
         SampleReservation::Existing(_)
     ));
     assert!(matches!(
-        l.reserve_sample(&plan()?.id, 3, 10, at(8)),
+        l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 3, 10, &clock(8)),
         Err(TrustError::Refused)
     ));
     let mut next_inspection = plan()?;
     next_inspection.id = source("fixture:inspection-after-correction")?;
-    l.start_inspection(next_inspection.clone(), at(8))?;
-    l.reserve_sample(&next_inspection.id, 1, 10, at(9))?;
+    l.start_inspection(&f.store, next_inspection.clone(), fence(&f)?, &clock(8))?;
+    l.reserve_sample(&f.store, &next_inspection.id, fence(&f)?, 1, 10, &clock(9))?;
     o.revision = NonZeroU32::new(3).ok_or("revision")?;
     o.correction = Some(source("fixture:new-head")?);
     if let Measurement::Observed { value, .. } = &mut o.pull_request {
         value.subject.head = commit('c')?;
     }
     l.record(&f.store, o)?;
-    assert!(l.finish_sample(&next_inspection.id, 1, SampleResult::Unavailable)?);
+    assert!(l.finish_sample(
+        &f.store,
+        &next_inspection.id,
+        fence(&f)?,
+        1,
+        SampleResult::Unavailable,
+        &clock(10)
+    )?);
     assert!(matches!(
-        l.reserve_sample(&next_inspection.id, 2, 10, at(10)),
+        l.reserve_sample(&f.store, &next_inspection.id, fence(&f)?, 2, 10, &clock(10)),
         Err(TrustError::Refused)
     ));
     assert!(matches!(
-        l.reserve_sample(&plan()?.id, 4, 10, at(9)),
+        l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 4, 10, &clock(9)),
         Err(TrustError::Refused)
     ));
     Ok(())
@@ -2122,32 +2206,46 @@ fn sample_count_and_token_budgets_bound_independently() -> TestResult {
     let mut by_count = plan()?;
     by_count.max_samples = 1;
     by_count.max_tokens = 100;
-    l.start_inspection(by_count.clone(), at(5))?;
-    l.reserve_sample(&by_count.id, 1, 10, at(6))?;
-    l.finish_sample(&by_count.id, 1, SampleResult::Unavailable)?;
+    l.start_inspection(&f.store, by_count.clone(), fence(&f)?, &clock(5))?;
+    l.reserve_sample(&f.store, &by_count.id, fence(&f)?, 1, 10, &clock(6))?;
+    l.finish_sample(
+        &f.store,
+        &by_count.id,
+        fence(&f)?,
+        1,
+        SampleResult::Unavailable,
+        &clock(10),
+    )?;
     assert!(matches!(
-        l.reserve_sample(&by_count.id, 2, 10, at(7)),
+        l.reserve_sample(&f.store, &by_count.id, fence(&f)?, 2, 10, &clock(7)),
         Err(TrustError::Exhausted)
     ));
     let mut by_tokens = plan()?;
     by_tokens.id = source("fixture:token-bound")?;
     by_tokens.max_samples = 4;
     by_tokens.max_tokens = 25;
-    l.start_inspection(by_tokens.clone(), at(5))?;
+    l.start_inspection(&f.store, by_tokens.clone(), fence(&f)?, &clock(5))?;
     for number in 1..=2 {
-        l.reserve_sample(&by_tokens.id, number, 10, at(6))?;
-        l.finish_sample(&by_tokens.id, number, SampleResult::Unavailable)?;
+        l.reserve_sample(&f.store, &by_tokens.id, fence(&f)?, number, 10, &clock(6))?;
+        l.finish_sample(
+            &f.store,
+            &by_tokens.id,
+            fence(&f)?,
+            number,
+            SampleResult::Unavailable,
+            &clock(10),
+        )?;
     }
     assert!(matches!(
-        l.reserve_sample(&by_tokens.id, 3, 10, at(7)),
+        l.reserve_sample(&f.store, &by_tokens.id, fence(&f)?, 3, 10, &clock(7)),
         Err(TrustError::Exhausted)
     ));
     assert!(matches!(
-        l.reserve_sample(&by_tokens.id, 4, 5, at(7)),
+        l.reserve_sample(&f.store, &by_tokens.id, fence(&f)?, 4, 5, &clock(7)),
         Err(TrustError::Invalid)
     ));
     assert!(matches!(
-        l.reserve_sample(&by_tokens.id, 3, 5, at(7))?,
+        l.reserve_sample(&f.store, &by_tokens.id, fence(&f)?, 3, 5, &clock(7))?,
         SampleReservation::Reserved(_)
     ));
     Ok(())
@@ -2158,8 +2256,8 @@ fn persisted_inspections_with_broken_sample_sequences_are_invalid() -> TestResul
     let f = Fixture::new()?;
     let l = ledger(&f)?;
     l.record(&f.store, with_pr(observation(&f)?)?)?;
-    l.start_inspection(plan()?, at(5))?;
-    l.reserve_sample(&plan()?.id, 1, 1, at(6))?;
+    l.start_inspection(&f.store, plan()?, fence(&f)?, &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 1, 1, &clock(6))?;
     let path = ledger_path(&f);
     let original = fs::read(&path)?;
     let owner = house()?;
@@ -2227,8 +2325,8 @@ fn populated(f: &Fixture) -> TestResult<(Ledger, Observation)> {
     l.record(&f.store, o.clone())?;
     bind_evidence(&l, f)?;
     l.propose(proposal()?, &grants()?)?;
-    l.start_inspection(plan()?, at(5))?;
-    l.reserve_sample(&plan()?.id, 1, 1, at(6))?;
+    l.start_inspection(&f.store, plan()?, fence(f)?, &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, fence(f)?, 1, 1, &clock(6))?;
     Ok((l, o))
 }
 type Edit = fn(&mut serde_json::Value) -> TestResult;
@@ -2446,5 +2544,586 @@ fn a_full_ledger_with_heavy_grant_evidence_validates_well_inside_the_lock_timeou
         elapsed < bound,
         "full-ledger open and write took {elapsed:?}"
     );
+    Ok(())
+}
+
+/// A delivered, recorded observation and a ledger, with the inspector task
+/// created but not yet claimed.
+fn inspectable(f: &Fixture) -> TestResult<Ledger> {
+    let l = ledger(f)?;
+    l.record(&f.store, eligible(observation(f)?)?)?;
+    let mut task = spec("inspector")?;
+    task.role = Role::Inspector;
+    task.repository = Some(scope()?.project);
+    f.store.create_task(task, &creator()?, at(0))?;
+    Ok(l)
+}
+
+#[test]
+fn only_the_plans_inspector_with_a_live_claim_can_act() -> TestResult {
+    let f = Fixture::new()?;
+    let l = inspectable(&f)?;
+    let inspector = task_id("inspector")?;
+    // Another holder's claim cannot start the plan's inspection.
+    let foreign = f
+        .store
+        .claim(&inspector, &scheduled("someone-else")?, ttl(600)?, at(0))?;
+    assert!(matches!(
+        l.start_inspection(&f.store, plan()?, foreign.fence(), &clock(5)),
+        Err(TrustError::Refused)
+    ));
+    f.store.relinquish(&inspector, foreign.fence(), at(1))?;
+    let own = f.store.claim(
+        &inspector,
+        &scheduled("independent-reviewer")?,
+        ttl(600)?,
+        at(2),
+    )?;
+    // A live claim by the same inspector on a task of another role cannot
+    // run the inspection.
+    let mut worker = spec("worker")?;
+    worker.role = Role::Commis;
+    worker.repository = Some(scope()?.project);
+    f.store.create_task(worker, &creator()?, at(0))?;
+    let worker_claim = f.store.claim(
+        &task_id("worker")?,
+        &scheduled("independent-reviewer")?,
+        ttl(600)?,
+        at(2),
+    )?;
+    let mut worker_plan = plan()?;
+    worker_plan.task = task_id("worker")?;
+    assert!(matches!(
+        l.start_inspection(&f.store, worker_plan, worker_claim.fence(), &clock(5)),
+        Err(TrustError::Refused)
+    ));
+    l.start_inspection(&f.store, plan()?, own.fence(), &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, own.fence(), 1, 1, &clock(6))?;
+    // The inspector gives the claim back; its fence no longer reports.
+    f.store.relinquish(&inspector, own.fence(), at(7))?;
+    assert!(matches!(
+        l.finish_sample(
+            &f.store,
+            &plan()?.id,
+            own.fence(),
+            1,
+            SampleResult::Unavailable,
+            &clock(8)
+        ),
+        Err(TrustError::Refused)
+    ));
+    assert!(matches!(
+        l.cancel_inspection(&f.store, &plan()?.id, own.fence(), &clock(8)),
+        Err(TrustError::Refused)
+    ));
+    let inspection = l.inspection(&plan()?.id)?;
+    assert_eq!(
+        inspection.samples().first().and_then(|s| s.result.as_ref()),
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn a_taken_over_inspection_refuses_the_previous_fence() -> TestResult {
+    let f = Fixture::new()?;
+    let l = inspectable(&f)?;
+    let inspector = task_id("inspector")?;
+    let reviewer = scheduled("independent-reviewer")?;
+    let first = f.store.claim(&inspector, &reviewer, ttl(10)?, at(0))?;
+    l.start_inspection(&f.store, plan()?, first.fence(), &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, first.fence(), 1, 1, &clock(6))?;
+    // The first run's lease expires; a restarted run takes over.
+    assert!(matches!(
+        l.finish_sample(
+            &f.store,
+            &plan()?.id,
+            first.fence(),
+            1,
+            SampleResult::Unavailable,
+            &clock(11)
+        ),
+        Err(TrustError::Refused)
+    ));
+    let second = f
+        .store
+        .take_over(&inspector, &reviewer, ttl(600)?, at(12))?;
+    assert!(second.fence() > first.fence());
+    assert!(l.finish_sample(
+        &f.store,
+        &plan()?.id,
+        second.fence(),
+        1,
+        SampleResult::Unavailable,
+        &clock(13)
+    )?);
+    assert!(matches!(
+        l.reserve_sample(&f.store, &plan()?.id, first.fence(), 2, 1, &clock(13)),
+        Err(TrustError::Refused)
+    ));
+    // The ledger keeps the newest fence that acted: an older live fence
+    // that slipped past the core check between reads cannot write.
+    tamper(&f, |d| {
+        *d.pointer_mut("/inspections/0/fence").ok_or("fence")? =
+            serde_json::json!(second.fence().get() + 1);
+        Ok(())
+    })?;
+    assert!(matches!(
+        l.reserve_sample(&f.store, &plan()?.id, second.fence(), 2, 1, &clock(14)),
+        Err(TrustError::Refused)
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_takeover_cannot_commit_between_the_claim_check_and_the_ledger_write() -> TestResult {
+    use std::{cell::RefCell, rc::Rc, thread, time::Duration};
+    let f = Fixture::new()?;
+    let l = inspectable(&f)?;
+    let inspector = task_id("inspector")?;
+    let reviewer = scheduled("independent-reviewer")?;
+    let first = f.store.claim(&inspector, &reviewer, ttl(10)?, at(0))?;
+    l.start_inspection(&f.store, plan()?, first.fence(), &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, first.fence(), 1, 1, &clock(6))?;
+    let quick = HouseStore::open(
+        f.dir.path().join("house"),
+        house()?,
+        StoreOptions {
+            lock_timeout: Duration::from_millis(30),
+            ..StoreOptions::default()
+        },
+    )?;
+    let waiting = f.reopen()?;
+    let long = ttl(600)?;
+    let blocked = Rc::new(RefCell::new(None));
+    let background = Rc::new(RefCell::new(None));
+    let finding = SampleResult::Confirmed {
+        finding: confirmed("fixture:finding")?,
+        route: FollowUpRoute::Issue,
+    };
+    // The first owner's lease has expired in core by 12, but its operation
+    // has read the claim at 9 and has not written yet. The hook runs right
+    // after the claim check accepts the claim.
+    test_hooks::on_next_claim_check({
+        let (inspector, reviewer) = (inspector.clone(), reviewer.clone());
+        let (blocked, background) = (Rc::clone(&blocked), Rc::clone(&background));
+        move || {
+            blocked.replace(Some(quick.take_over(&inspector, &reviewer, long, at(12))));
+            background.replace(Some(thread::spawn(move || {
+                waiting.take_over(&inspector, &reviewer, long, at(12))
+            })));
+        }
+    });
+    let written = l.finish_sample(
+        &f.store,
+        &plan()?.id,
+        first.fence(),
+        1,
+        finding.clone(),
+        &clock(9),
+    );
+    // No takeover committed while the claim was held.
+    let blocked = blocked.take().ok_or("hook did not run")?;
+    // No takeover committed while the claim was held.
+    assert!(
+        matches!(
+            blocked,
+            Err(kitchen::Error::State(StateError::LockTimeout { .. }))
+        ),
+        "{blocked:?}"
+    );
+    // The write committed under the claim it checked; the waiting takeover
+    // then completed after it instead of deadlocking.
+    assert!(written?);
+    let second = background
+        .take()
+        .ok_or("hook did not run")?
+        .join()
+        .map_err(|_| "takeover panicked")??;
+    assert!(second.fence() > first.fence());
+    assert_eq!(
+        l.inspection(&plan()?.id)?
+            .samples()
+            .first()
+            .and_then(|s| s.result.as_ref()),
+        Some(&finding)
+    );
+    // Once the takeover commits, the previous owner is refused even while its
+    // own clock still reads inside its lease, and nothing is written.
+    let before = fs::read(ledger_path(&f))?;
+    assert!(matches!(
+        l.reserve_sample(&f.store, &plan()?.id, first.fence(), 2, 1, &clock(9)),
+        Err(TrustError::Refused)
+    ));
+    assert!(matches!(
+        l.cancel_inspection(&f.store, &plan()?.id, first.fence(), &clock(9)),
+        Err(TrustError::Refused)
+    ));
+    assert_eq!(fs::read(ledger_path(&f))?, before);
+    Ok(())
+}
+
+/// A clock stopped at `millis`.
+struct AtMillis(u64);
+
+impl kitchen::contracts::Clock for AtMillis {
+    fn now(&self) -> kitchen::contracts::Timestamp {
+        kitchen::contracts::Timestamp::from_unix_millis(self.0)
+    }
+}
+
+#[test]
+fn a_lease_that_expires_while_waiting_for_the_core_lock_is_refused() -> TestResult {
+    use kitchen::{
+        WorkflowId,
+        state::{MarkerFact, MarkerKey, MarkerSubject, WorkItem},
+    };
+    use std::{
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+    let operations: [(&str, Operation); 4] = [
+        ("start", |l, s, fence, clock| {
+            Ok(matches!(
+                l.start_inspection(s, plan()?, fence, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("reserve", |l, s, fence, clock| {
+            Ok(matches!(
+                l.reserve_sample(s, &plan()?.id, fence, 2, 1, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("finish", |l, s, fence, clock| {
+            Ok(matches!(
+                l.finish_sample(s, &plan()?.id, fence, 1, SampleResult::Unavailable, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("cancel", |l, s, fence, clock| {
+            Ok(matches!(
+                l.cancel_inspection(s, &plan()?.id, fence, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+    ];
+    for (name, operation) in operations {
+        let f = Fixture::new()?;
+        let l = inspectable(&f)?;
+        let inspector = task_id("inspector")?;
+        let reviewer = scheduled("independent-reviewer")?;
+        let first = f.store.claim(&inspector, &reviewer, ttl(10)?, at(0))?;
+        if name != "start" {
+            l.start_inspection(&f.store, plan()?, first.fence(), &clock(5))?;
+            l.reserve_sample(&f.store, &plan()?.id, first.fence(), 1, 1, &clock(6))?;
+        }
+        let holder = f.reopen()?;
+        let recorder = scheduled("guard-tick")?;
+        let marker = MarkerKey {
+            workflow: WorkflowId::new("gate")?,
+            item: WorkItem::PullRequest {
+                repository: Repository::new("origin89hq/km43")?,
+                number: std::num::NonZeroU64::new(20).ok_or("zero")?,
+            },
+            subject: MarkerSubject::Git(EvidenceSubject {
+                head: commit('a')?,
+                base: None,
+            }),
+        };
+        let (held, is_held) = mpsc::channel();
+        // Another writer holds the core write lock for 300 ms of real time.
+        let writer = thread::spawn(move || {
+            holder.record_marker_unless(
+                marker,
+                MarkerFact::Verdict {
+                    verdict: EvidenceVerdict::Pass,
+                },
+                &recorder,
+                at(1),
+                |_| {
+                    let _ = held.send(());
+                    thread::sleep(Duration::from_millis(300));
+                    Ok(None::<()>)
+                },
+            )
+        });
+        is_held.recv_timeout(Duration::from_secs(10))?;
+        // The clock reads 9.95 s and the lease expires at 10 s: live when the
+        // clock is read, expired by the time the lock is released.
+        let before = fs::read(ledger_path(&f))?;
+        let started = Instant::now();
+        let refused = operation(&l, &f.store, first.fence(), &AtMillis(9_950))?;
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "{name}: did not wait for the lock"
+        );
+        writer.join().map_err(|_| "writer panicked")??;
+        assert!(refused, "{name}: an expired lease was accepted");
+        assert_eq!(fs::read(ledger_path(&f))?, before, "{name}");
+    }
+    Ok(())
+}
+
+/// A clock that runs `on_read` whenever it is read.
+struct ReadHook<F: Fn()>(ManualClock, F);
+
+impl<F: Fn()> kitchen::contracts::Clock for ReadHook<F> {
+    fn now(&self) -> kitchen::contracts::Timestamp {
+        (self.1)();
+        self.0.now()
+    }
+}
+
+type Operation =
+    fn(&Ledger, &HouseStore, Fence, &dyn kitchen::contracts::Clock) -> TestResult<bool>;
+
+#[test]
+fn every_inspector_operation_reads_the_clock_before_taking_a_lock() -> TestResult {
+    use std::{cell::RefCell, time::Duration};
+    let operations: [(&str, Operation); 4] = [
+        ("start", |l, s, fence, clock| {
+            let other = InspectionPlan {
+                id: source("fixture:other")?,
+                ..plan()?
+            };
+            Ok(matches!(
+                l.start_inspection(s, other, fence, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("reserve", |l, s, fence, clock| {
+            Ok(matches!(
+                l.reserve_sample(s, &plan()?.id, fence, 1, 1, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("finish", |l, s, fence, clock| {
+            Ok(matches!(
+                l.finish_sample(s, &plan()?.id, fence, 1, SampleResult::Unavailable, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("cancel", |l, s, fence, clock| {
+            Ok(matches!(
+                l.cancel_inspection(s, &plan()?.id, fence, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+    ];
+    for (name, operation) in operations {
+        let f = Fixture::new()?;
+        let l = inspectable(&f)?;
+        let inspector = task_id("inspector")?;
+        let reviewer = scheduled("independent-reviewer")?;
+        let first = f.store.claim(&inspector, &reviewer, ttl(10)?, at(0))?;
+        l.start_inspection(&f.store, plan()?, first.fence(), &clock(5))?;
+        l.reserve_sample(&f.store, &plan()?.id, first.fence(), 1, 1, &clock(6))?;
+        let quick = HouseStore::open(
+            f.dir.path().join("house"),
+            house()?,
+            StoreOptions {
+                lock_timeout: Duration::from_millis(30),
+                ..StoreOptions::default()
+            },
+        )?;
+        // The clock takes the task over with a 30 ms lock timeout. That only
+        // succeeds if the operation holds no core lock while reading it.
+        let long = ttl(600)?;
+        let taken = RefCell::new(None);
+        let reading = ReadHook(clock(9), || {
+            taken.replace(Some(quick.take_over(&inspector, &reviewer, long, at(12))));
+        });
+        let before = fs::read(ledger_path(&f))?;
+        let refused = operation(&l, &f.store, first.fence(), &reading)?;
+        let taken = taken.take().ok_or("the clock was not read")?;
+        assert!(
+            taken.is_ok(),
+            "{name}: takeover blocked by the clock read: {taken:?}"
+        );
+        assert!(refused, "{name}: the taken-over claim was not refused");
+        assert_eq!(fs::read(ledger_path(&f))?, before, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn concurrent_takeovers_and_inspector_writes_finish_without_deadlock() -> TestResult {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+    let f = Fixture::new()?;
+    let l = inspectable(&f)?;
+    let inspector = task_id("inspector")?;
+    let reviewer = scheduled("independent-reviewer")?;
+    let first = f.store.claim(&inspector, &reviewer, ttl(10)?, at(0))?;
+    l.start_inspection(&f.store, plan()?, first.fence(), &clock(5))?;
+    let short = ttl(10)?;
+    let mut fence = first.fence();
+    for round in 1..=16u64 {
+        // The previous lease runs from 20 * (round - 1) for 10 seconds: the
+        // writer's clock reads inside it, and the takeover comes after it.
+        let base = 20 * round;
+        let barrier = Arc::new(Barrier::new(2));
+        let (store, gate, (id, holder)) = (
+            f.reopen()?,
+            barrier.clone(),
+            (inspector.clone(), reviewer.clone()),
+        );
+        let takeover = thread::spawn(move || {
+            gate.wait();
+            store.take_over(&id, &holder, short, at(base))
+        });
+        let (store, ledger, gate, stale_plan) = (f.reopen()?, l.clone(), barrier, plan()?);
+        let write = thread::spawn(move || {
+            gate.wait();
+            ledger.start_inspection(&store, stale_plan, fence, &clock(base - 15))
+        });
+        let taken = takeover.join().map_err(|_| "takeover panicked")??;
+        // A lock wait that ran out would surface as a storage error here.
+        match write.join().map_err(|_| "write panicked")? {
+            Ok(_) | Err(TrustError::Refused) => {}
+            Err(error) => return Err(format!("round {round}: {error:?}").into()),
+        }
+        assert!(taken.fence() > fence);
+        fence = taken.fence();
+    }
+    // The first owner cannot act; the newest can.
+    assert!(matches!(
+        l.cancel_inspection(&f.store, &plan()?.id, first.fence(), &clock(5)),
+        Err(TrustError::Refused)
+    ));
+    l.cancel_inspection(&f.store, &plan()?.id, fence, &clock(20 * 16 + 1))?;
+    Ok(())
+}
+
+#[test]
+fn a_schema_one_ledger_with_an_inspection_reports_its_version() -> TestResult {
+    let f = Fixture::new()?;
+    let l = inspectable(&f)?;
+    l.start_inspection(&f.store, plan()?, fence(&f)?, &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 1, 1, &clock(6))?;
+    // Rewrite the store in the schema-1 shape: inspections had no task or fence.
+    tamper(&f, |d| {
+        *d.pointer_mut("/schema").ok_or("schema")? = serde_json::json!(1);
+        let inspection = d
+            .pointer_mut("/inspections/0")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("inspection")?;
+        inspection.remove("fence").ok_or("fence")?;
+        inspection
+            .get_mut("plan")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|p| p.remove("task"))
+            .ok_or("task")?;
+        Ok(())
+    })?;
+    let marker = f.dir.path().join("trust/store.json");
+    let mut stored: serde_json::Value = serde_json::from_slice(&fs::read(&marker)?)?;
+    *stored.pointer_mut("/schema").ok_or("marker schema")? = serde_json::json!(1);
+    fs::write(&marker, serde_json::to_vec(&stored)?)?;
+    let before = fs::read(ledger_path(&f))?;
+    let error = try_open(&f)?.err();
+    assert!(
+        matches!(
+            error,
+            Some(TrustError::Storage(StateError::UnsupportedSchema {
+                found: 1
+            }))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.map(|e| e.class()),
+        Some(kitchen::ErrorClass::Execution)
+    );
+    // An existing handle reports the same version and rewrites nothing.
+    assert!(matches!(
+        l.cancel_inspection(&f.store, &plan()?.id, fence(&f)?, &clock(7)),
+        Err(TrustError::Storage(StateError::UnsupportedSchema {
+            found: 1
+        }))
+    ));
+    assert_eq!(fs::read(ledger_path(&f))?, before);
+    Ok(())
+}
+
+#[test]
+fn open_inspections_are_capped_until_cancelled_or_past_deadline() -> TestResult {
+    use kitchen::workflows::inspector::MAX_OPEN_INSPECTIONS;
+    let f = Fixture::new()?;
+    let l = inspectable(&f)?;
+    let inspector_fence = f
+        .store
+        .claim(
+            &task_id("inspector")?,
+            &scheduled("independent-reviewer")?,
+            ttl(600)?,
+            at(0),
+        )?
+        .fence();
+    let numbered = |index: usize| -> TestResult<InspectionPlan> {
+        let mut p = plan()?;
+        p.id = source(&format!("fixture:inspection-{index}"))?;
+        Ok(p)
+    };
+    for index in 0..MAX_OPEN_INSPECTIONS {
+        l.start_inspection(&f.store, numbered(index)?, inspector_fence, &clock(5))?;
+    }
+    let extra = numbered(MAX_OPEN_INSPECTIONS)?;
+    assert!(matches!(
+        l.start_inspection(&f.store, extra.clone(), inspector_fence, &clock(5)),
+        Err(TrustError::Exhausted)
+    ));
+    // Replaying an existing plan is not a new inspection.
+    l.start_inspection(&f.store, numbered(0)?, inspector_fence, &clock(6))?;
+    l.cancel_inspection(&f.store, &numbered(0)?.id, inspector_fence, &clock(6))?;
+    l.start_inspection(&f.store, extra, inspector_fence, &clock(6))?;
+    let late = numbered(MAX_OPEN_INSPECTIONS + 1)?;
+    assert!(matches!(
+        l.start_inspection(&f.store, late.clone(), inspector_fence, &clock(7)),
+        Err(TrustError::Exhausted)
+    ));
+    // Every earlier plan's deadline is at 60 s; after it they stop counting.
+    let mut later = late;
+    later.deadline = at(120);
+    l.start_inspection(&f.store, later, inspector_fence, &clock(60))?;
+    Ok(())
+}
+
+#[test]
+fn a_clock_running_backwards_cannot_reserve() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    l.start_inspection(&f.store, plan()?, fence(&f)?, &clock(5))?;
+    l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 1, 1, &clock(20))?;
+    l.finish_sample(
+        &f.store,
+        &plan()?.id,
+        fence(&f)?,
+        1,
+        SampleResult::Unavailable,
+        &clock(21),
+    )?;
+    assert!(matches!(
+        l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 2, 1, &clock(19)),
+        Err(TrustError::Invalid)
+    ));
+    // A persisted reservation earlier than its predecessor is invalid too.
+    tamper(&f, |d| {
+        *d.pointer_mut("/inspections/0/samples/0/reservedAt")
+            .ok_or("reservedAt")? = serde_json::to_value(at(6))?;
+        Ok(())
+    })?;
+    l.reserve_sample(&f.store, &plan()?.id, fence(&f)?, 2, 1, &clock(8))?;
+    tamper(&f, |d| {
+        *d.pointer_mut("/inspections/0/samples/1/reservedAt")
+            .ok_or("reservedAt")? = serde_json::to_value(at(5))?;
+        Ok(())
+    })?;
+    assert_corrupt(try_open(&f)?, "reservation before its predecessor");
     Ok(())
 }

@@ -572,4 +572,12 @@ impl HouseStore {
     fn read<T>(&self, view: impl FnOnce(&StoreState) -> T) -> Result<T> {
         self.engine.read(view)
     }
+
+    /// Run `view` while holding the shared lock, so no transaction on this
+    /// store, a takeover included, commits until it returns. `view` may take
+    /// another store's lock; that store must never take this lock while
+    /// holding its own, or the two could wait on each other until timeout.
+    pub(crate) fn read_holding<T>(&self, view: impl FnOnce(&StoreState) -> T) -> Result<T> {
+        self.read(view)
+    }
 }

@@ -20,5 +20,12 @@ toml.workspace = true
 tempfile.workspace = true
 time.workspace = true
 
+[features]
+# Pause points for concurrency tests; enabled for this crate's own tests only.
+test-hooks = []
+
+[dev-dependencies]
+kitchen = { path = ".", features = ["test-hooks"] }
+
 [lints]
 workspace = true

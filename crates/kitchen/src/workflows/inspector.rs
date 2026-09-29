@@ -5,20 +5,34 @@
 //! that reservation spent. Confirmed findings become scoped issue/test/guidance
 //! follow-ups for existing workflows, which still need their own authority.
 //!
-//! The ledger records inspections; it does not run or fence them. Reserving,
-//! finishing, and cancelling take no claim, so the identity that reports a
-//! result is not compared with [`InspectionPlan::inspector`]. Independence is
-//! checked once, when the inspection starts, against the delivering agent the
-//! adapter attested. Deadlines use the caller's clock, and only the ledger's
-//! history limit bounds how many inspections start. A recorded result is a
-//! routing intent, never authority.
+//! An inspection runs as a core [`Role::Inspector`] task. Starting,
+//! reserving, finishing, and cancelling each present that task's fence; the
+//! ledger accepts them only while [`InspectionPlan::inspector`] holds a live
+//! claim with that fence, and never after a newer fence has acted. Every
+//! operation reads the time from the supplied clock once, before taking any
+//! lock, and a clock that runs backwards is refused. At most
+//! [`MAX_OPEN_INSPECTIONS`] inspections are open at once. A recorded result is
+//! a routing intent, never authority.
+//!
+//! Each operation takes the core store's shared lock, then the ledger lock,
+//! and checks the claim and commits the ledger write before releasing either.
+//! A takeover needs the core exclusive lock, so it commits either before the
+//! claim check, which then refuses, or after the ledger write. Only this
+//! module holds both locks, always in that order; no ledger operation takes
+//! the core lock while holding the ledger lock.
 use crate::{
-    HolderId, HouseId,
-    contracts::{EvidenceSubject, ExternalRef, Settlement, Text, Timestamp},
-    state::TaskState,
-    trust::{Finding, Ledger, Measurement, TrustError},
+    HolderId, HouseId, TaskId,
+    contracts::{Clock, EvidenceSubject, ExternalRef, Fence, Role, Settlement, Text, Timestamp},
+    state::{HouseStore, StoreState, TaskState},
+    trust::{Document, Finding, Ledger, Measurement, TrustError, store_error},
 };
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
+
+/// Inspections that may be open at once in one ledger. An inspection is open
+/// until it is cancelled, passes its deadline, or has every sample reserved
+/// and finished.
+pub const MAX_OPEN_INSPECTIONS: usize = 32;
 
 /// Bounds accepted by the inspector, independent of backend capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,8 +47,10 @@ pub struct InspectionPlan {
     /// Concrete question to answer about the delivered revision.
     pub question: Text,
     /// Inspector identity, distinct from the delivering worker when required.
-    /// The ledger does not verify who runs the samples.
+    /// It must hold the claim on [`Self::task`] for every operation.
     pub inspector: HolderId,
+    /// The core [`Role::Inspector`] task that runs the samples.
+    pub task: TaskId,
     /// Require positive evidence of a different delivering agent. Checked when
     /// the inspection starts, against the attested agent of the observation.
     pub independent: bool,
@@ -113,6 +129,8 @@ pub struct Inspection {
     started_at: Timestamp,
     samples: Vec<Sample>,
     cancelled: bool,
+    /// Newest inspector-task fence that acted; older fences are refused.
+    fence: Fence,
 }
 impl Inspection {
     /// Inspection idempotency identity.
@@ -168,6 +186,23 @@ impl Inspection {
         Ok(())
     }
 
+    /// Whether this inspection still counts against [`MAX_OPEN_INSPECTIONS`].
+    fn is_open(&self, now: Timestamp) -> bool {
+        !self.cancelled
+            && now < self.plan.deadline
+            && !(u32::try_from(self.samples.len()).is_ok_and(|len| len >= self.plan.max_samples)
+                && self.samples.iter().all(|sample| sample.result.is_some()))
+    }
+
+    /// Accept `fence` if it is not older than the newest fence that acted.
+    fn advance_fence(&mut self, fence: Fence) -> Result<(), TrustError> {
+        if fence < self.fence {
+            return Err(TrustError::Refused);
+        }
+        self.fence = fence;
+        Ok(())
+    }
+
     pub(crate) fn validate(&self, house: &HouseId) -> Result<(), TrustError> {
         if &self.plan.house != house {
             return Err(TrustError::Refused);
@@ -186,9 +221,13 @@ impl Inspection {
             spent = spent
                 .checked_add(sample.tokens)
                 .ok_or(TrustError::Exhausted)?;
+            let earliest = index
+                .checked_sub(1)
+                .and_then(|previous| self.samples.get(previous))
+                .map_or(self.started_at, |previous| previous.reserved_at);
             if sample.tokens == 0
                 || u32::try_from(index + 1).ok() != Some(sample.number)
-                || sample.reserved_at < self.started_at
+                || sample.reserved_at < earliest
                 || sample.reserved_at >= self.plan.deadline
             {
                 return Err(TrustError::Invalid);
@@ -210,23 +249,62 @@ impl Inspection {
 }
 
 impl Ledger {
-    /// Start an inspection only for positively delivered work and an exact PR head.
-    /// Repeating an identical plan returns its existing state without resetting budgets.
+    /// Read `clock` once, then run `apply` in one ledger transaction while
+    /// holding the core store's shared lock, so the claim `apply` checks with
+    /// [`check_inspector`] stays current until the ledger write commits. The
+    /// clock is read before either lock is taken: caller code never runs while
+    /// a takeover is blocked.
+    ///
+    /// `apply` gets two instants. `now` is the clock reading, for what the
+    /// ledger records. `live` is `now` plus the monotonic time spent waiting
+    /// for the locks, saturating, so a lease that expired during the wait is
+    /// not accepted on the stale reading; use it for every liveness and
+    /// deadline check.
+    fn fenced<T>(
+        &self,
+        store: &HouseStore,
+        clock: &dyn Clock,
+        apply: impl FnOnce(&StoreState, &mut Document, Timestamp, Timestamp) -> Result<T, TrustError>,
+    ) -> Result<T, TrustError> {
+        if store.house() != self.house() {
+            return Err(TrustError::Refused);
+        }
+        let now = clock.now();
+        let read_at = Instant::now();
+        store
+            .read_holding(|core| {
+                self.transact(|doc| {
+                    let live = now.saturating_add(read_at.elapsed());
+                    apply(core, doc, now, live)
+                })
+            })
+            .map_err(store_error)?
+    }
+
+    /// Start an inspection only for positively delivered work and an exact PR
+    /// head, under the inspector task's live claim. Repeating an identical plan
+    /// returns its existing state without resetting budgets.
     ///
     /// # Errors
-    /// Refuses non-delivery, missing PR/agent evidence, failed independence, and bounds.
+    /// Refuses non-delivery, missing PR/agent evidence, failed independence,
+    /// an inspector task that is not claimed by the plan's inspector with
+    /// `fence`, and bounds. More than [`MAX_OPEN_INSPECTIONS`] open is
+    /// `Exhausted`. A failure reading the core store is `Storage`.
     pub fn start_inspection(
         &self,
+        store: &HouseStore,
         plan: InspectionPlan,
-        now: Timestamp,
+        fence: Fence,
+        clock: &dyn Clock,
     ) -> Result<Inspection, TrustError> {
-        self.transact(|doc| {
-            if let Some(old) = doc.inspections.iter().find(|i| i.id() == &plan.id) {
-                return if old.plan == plan {
-                    Ok(old.clone())
-                } else {
-                    Err(TrustError::Conflict)
-                };
+        self.fenced(store, clock, |core, doc, now, live| {
+            check_inspector(core, &plan, fence, live)?;
+            if let Some(old) = doc.inspections.iter_mut().find(|i| i.id() == &plan.id) {
+                if old.plan != plan {
+                    return Err(TrustError::Conflict);
+                }
+                old.advance_fence(fence)?;
+                return Ok(old.clone());
             }
             let observation = doc.latest(&plan.observation)?;
             if !matches!(
@@ -235,7 +313,8 @@ impl Ledger {
                     settlement: Settlement::Succeeded,
                     ..
                 }
-            ) {
+            ) || observation.task == plan.task
+            {
                 return Err(TrustError::Refused);
             }
             if plan.independent {
@@ -248,6 +327,9 @@ impl Ledger {
                 Measurement::Observed { value, .. } => value.subject.clone(),
                 _ => return Err(TrustError::Incomplete),
             };
+            if doc.inspections.iter().filter(|i| i.is_open(now)).count() >= MAX_OPEN_INSPECTIONS {
+                return Err(TrustError::Exhausted);
+            }
             let inspection = Inspection {
                 plan,
                 revision: observation.revision,
@@ -255,6 +337,7 @@ impl Ledger {
                 started_at: now,
                 samples: Vec::new(),
                 cancelled: false,
+                fence,
             };
             inspection.validate(self.house())?;
             doc.inspections.push(inspection.clone());
@@ -266,20 +349,26 @@ impl Ledger {
     /// makes retries idempotent; a pending sample must be reconciled before another.
     ///
     /// # Errors
-    /// Refuses exhausted/deadline/cancelled/stale inspections and uncertain samples.
+    /// Refuses exhausted/deadline/cancelled/stale inspections, uncertain
+    /// samples, a stale or foreign inspector claim, and a clock earlier than
+    /// the last reservation.
     pub fn reserve_sample(
         &self,
+        store: &HouseStore,
         id: &ExternalRef,
+        fence: Fence,
         number: u32,
         tokens: u64,
-        now: Timestamp,
+        clock: &dyn Clock,
     ) -> Result<SampleReservation, TrustError> {
-        self.transact(|doc| {
+        self.fenced(store, clock, |core, doc, now, live| {
             let index = doc
                 .inspections
                 .iter()
                 .position(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
+            check_inspector(core, &doc.inspections[index].plan, fence, live)?;
+            doc.inspections[index].advance_fence(fence)?;
             let inspection = &doc.inspections[index];
             if let Some(old) = inspection.samples.iter().find(|s| s.number == number) {
                 return if old.tokens == tokens {
@@ -291,10 +380,14 @@ impl Ledger {
             if inspection.cancelled {
                 return Err(TrustError::Refused);
             }
-            if now < inspection.started_at {
+            let earliest = inspection
+                .samples
+                .last()
+                .map_or(inspection.started_at, |last| last.reserved_at);
+            if now < earliest {
                 return Err(TrustError::Invalid);
             }
-            if now >= inspection.plan.deadline {
+            if live >= inspection.plan.deadline {
                 return Err(TrustError::Exhausted);
             }
             let current = doc.latest(&inspection.plan.observation)?;
@@ -335,20 +428,26 @@ impl Ledger {
     /// they grant no new execution. A changed observation requires a new inspection.
     ///
     /// # Errors
-    /// Rejects conflicting outcomes, stale subjects, and nonexistent reservations.
+    /// Rejects conflicting outcomes, stale subjects, nonexistent reservations,
+    /// and a stale or foreign inspector claim.
     pub fn finish_sample(
         &self,
+        store: &HouseStore,
         id: &ExternalRef,
+        fence: Fence,
         number: u32,
         result: SampleResult,
+        clock: &dyn Clock,
     ) -> Result<bool, TrustError> {
-        self.transact(|doc| {
-            let index = doc
+        self.fenced(store, clock, |core, doc, _, live| {
+            let inspection = doc
                 .inspections
-                .iter()
-                .position(|i| i.id() == id)
+                .iter_mut()
+                .find(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
-            let sample = doc.inspections[index]
+            check_inspector(core, &inspection.plan, fence, live)?;
+            inspection.advance_fence(fence)?;
+            let sample = inspection
                 .samples
                 .iter_mut()
                 .find(|s| s.number == number)
@@ -368,14 +467,23 @@ impl Ledger {
     /// Prevent new samples while retaining uncertain reservations and all findings.
     ///
     /// # Errors
-    /// Returns missing inspection or storage errors.
-    pub fn cancel_inspection(&self, id: &ExternalRef) -> Result<(), TrustError> {
-        self.transact(|doc| {
+    /// Returns missing inspection, a stale or foreign inspector claim, or
+    /// storage errors.
+    pub fn cancel_inspection(
+        &self,
+        store: &HouseStore,
+        id: &ExternalRef,
+        fence: Fence,
+        clock: &dyn Clock,
+    ) -> Result<(), TrustError> {
+        self.fenced(store, clock, |core, doc, _, live| {
             let inspection = doc
                 .inspections
                 .iter_mut()
                 .find(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
+            check_inspector(core, &inspection.plan, fence, live)?;
+            inspection.advance_fence(fence)?;
             inspection.cancelled = true;
             Ok(())
         })
@@ -393,5 +501,58 @@ impl Ledger {
                 .cloned()
                 .ok_or(TrustError::Incomplete)
         })
+    }
+}
+
+/// Refuse unless `plan.inspector` holds a live claim on the inspector task
+/// with `fence` at `live` in `core`, as held by [`Ledger::fenced`].
+fn check_inspector(
+    core: &StoreState,
+    plan: &InspectionPlan,
+    fence: Fence,
+    live: Timestamp,
+) -> Result<(), TrustError> {
+    let task = core.task(&plan.task).map_err(store_error)?;
+    match task.state() {
+        TaskState::Claimed { lease }
+            if task.spec().role == Role::Inspector
+                && lease.fence() == fence
+                && lease.holder() == &plan.inspector
+                && lease.is_live(live) =>
+        {
+            #[cfg(feature = "test-hooks")]
+            test_hooks::after_claim_check();
+            Ok(())
+        }
+        TaskState::Open | TaskState::Claimed { .. } | TaskState::Settled { .. } => {
+            Err(TrustError::Refused)
+        }
+    }
+}
+
+/// Pause points for tests that need to act between reading the claim and
+/// committing the ledger write. Enabled only by the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static AFTER_CLAIM_CHECK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once on this thread, right after the next inspector claim
+    /// check accepts the claim and before the ledger write commits.
+    pub fn on_next_claim_check(hook: impl FnOnce() + 'static) {
+        AFTER_CLAIM_CHECK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn after_claim_check() {
+        let hook = AFTER_CLAIM_CHECK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }

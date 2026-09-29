@@ -219,7 +219,7 @@ impl Reread {
             Self::Forge(_) => None,
             Self::Declined => Some("The forge was not re-read (--without-forge).".to_owned()),
             Self::Unbound => Some(format!(
-                "The forge was not re-read: house {house} has no forge binding (`kitchen forge bind`)."
+                "The forge was not re-read: house {house} has no forge binding (`kitchn forge bind`)."
             )),
             Self::NoRegistry => Some(
                 "The forge was not re-read: pass --registry to use the house's forge binding."

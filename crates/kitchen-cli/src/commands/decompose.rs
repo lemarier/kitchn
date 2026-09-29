@@ -4,7 +4,7 @@
 //! binds the approval. Reads only the proposal file; writes nothing and
 //! contacts no forge.
 //!
-//! `kitchen decompose apply --approve <digest>` writes that exact preview
+//! `kitchn decompose apply --approve <digest>` writes that exact preview
 //! with the house's forge binding, as the person present. A rerun resumes an
 //! interrupted write without duplicating issues or links; a changed proposal
 //! needs a new approval.
@@ -268,7 +268,7 @@ fn render_apply(report: &ApplyReport) -> String {
             writes,
         } => write!(
             text,
-            "Decomposition task {task} settled ({settlement}) after writing {}. Check those writes on the forge, then run `kitchen decompose acknowledge --task {task}`. Nothing was written.",
+            "Decomposition task {task} settled ({settlement}) after writing {}. Check those writes on the forge, then run `kitchn decompose acknowledge --task {task}`. Nothing was written.",
             names(writes)
         ),
         ApplyOutcome::HeldElsewhere => write!(

@@ -416,7 +416,7 @@ mod apply {
         }
 
         fn kitchen(&self, args: &[&str]) -> TestResult<Output> {
-            Ok(Command::new(env!("CARGO_BIN_EXE_kitchen"))
+            Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
                 .current_dir(&self.checkout)
                 .env("PATH", &self.path)
                 .args(args)
@@ -481,7 +481,7 @@ mod apply {
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(
             text(&output.stderr),
-            "error: house acme has no forge binding, so kitchen cannot write to its forge; bind one with `kitchen forge bind --house acme` or `kitchen house init`\n"
+            "error: house acme has no forge binding, so kitchn cannot write to its forge; bind one with `kitchn forge bind --house acme` or `kitchn house init`\n"
         );
         assert_eq!(text(&output.stdout), "");
         assert!(desk.gh_calls()?.is_empty());
@@ -563,7 +563,7 @@ mod apply {
         assert_eq!(desk.tasks()?, 2);
 
         // Without gh, nothing runs and the reason is named.
-        let no_gh = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        let no_gh = Command::new(env!("CARGO_BIN_EXE_kitchn"))
             .current_dir(&desk.checkout)
             .env("PATH", "/usr/bin:/bin")
             .args(["issue", "apply", "--draft", &draft, "--approve", &digest])

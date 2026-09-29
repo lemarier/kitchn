@@ -106,7 +106,7 @@ fn acknowledge(store: &str, task: &str, reason: &str) -> TestResult<Run> {
 }
 
 fn acknowledge_with(store: &str, task: &str, reason: &str, extra: &[&str]) -> TestResult<Run> {
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .args([
             "decompose",
             "acknowledge",

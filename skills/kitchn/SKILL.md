@@ -116,13 +116,13 @@ dependency, and the digest. A preview with open questions is not ready.
 Nothing is posted by these commands. Once the person approves that digest,
 post it with the same draft file:
 
-`kitchen issue apply --draft <file> --approve <digest> --registry <dir> --store <dir> --holder <you>`
+`kitchn issue apply --draft <file> --approve <digest> --registry <dir> --store <dir> --holder <you>`
 
 It writes through the house's forge binding, and only the exact preview the
 digest names; a changed draft is refused until the person approves its new
 digest. When it stops early (a refused or unknown write), rerun the same
 command: it resumes without duplicates. A house without a forge binding is
-refused; tell the person to run `kitchen forge bind`. Post nothing yourself.
+refused; tell the person to run `kitchn forge bind`. Post nothing yourself.
 
 A draft refused because an earlier draft settled after writing
 (`EarlierSettledWithWrites`) stays refused until the person releases it.

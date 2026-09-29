@@ -818,7 +818,7 @@ fn render_apply(report: &DraftReport) -> String {
             writes,
         } => write!(
             text,
-            "Draft task {task} for the same issue settled ({settlement}) after writing {}. Check those writes on the forge, then run `kitchen issue acknowledge {task}`. Nothing was written.",
+            "Draft task {task} for the same issue settled ({settlement}) after writing {}. Check those writes on the forge, then run `kitchn issue acknowledge {task}`. Nothing was written.",
             writes
                 .iter()
                 .map(kitchen::EffectName::as_str)

@@ -3305,6 +3305,30 @@ fn unreadable_base_ref_hands_over_with_the_reason() -> TestResult {
     Ok(())
 }
 #[test]
+fn pending_work_does_not_defer_an_unreadable_base_handover() -> TestResult {
+    let mut e = ready()?;
+    e.head_age = Some(gate::SETTLE_TIME + std::time::Duration::from_secs(60));
+    e.checks = Checks::Pending;
+    // With a readable base, pending checks wait for the next pass.
+    assert_eq!(
+        gate::evaluate(&e, grants()?, GateHistory::default()).verdict,
+        Verdict::Skip
+    );
+    // Waiting cannot make the base readable, so the handover is not deferred.
+    e.base_tip = BaseTipRead::Unreadable;
+    assert!(matches!(
+        gate::evaluate(&e, grants()?, GateHistory::default()).verdict,
+        Verdict::HandOver { gaps } if gaps.contains(&Gap::BaseUnreadable)
+    ));
+    // A head that has not settled still waits: it may be replaced.
+    e.head_age = Some(std::time::Duration::from_secs(60));
+    assert_eq!(
+        gate::evaluate(&e, grants()?, GateHistory::default()).verdict,
+        Verdict::Skip
+    );
+    Ok(())
+}
+#[test]
 fn transient_base_ref_failures_retry_then_hand_over() -> TestResult {
     let mut store = FakeMarkers::default();
     let mut e = ready()?;

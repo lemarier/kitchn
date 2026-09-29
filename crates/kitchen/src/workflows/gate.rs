@@ -761,6 +761,9 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     gaps.sort_unstable();
     gaps.dedup();
     let age = e.head_age.unwrap_or(STALL_TIME);
+    // Pending checks, reviews, or mergeability are worth waiting for only
+    // while a merge is still possible; an unreadable base rules it out.
+    let pending = age < STALL_TIME && !gaps.contains(&Gap::BaseUnreadable);
     let verdict = if e.open == Some(false)
         || e.draft == Some(true)
         || history.handovers >= 2
@@ -768,9 +771,9 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
             && !history.explicit_reopen)
         || age < SETTLE_TIME
         || e.writer_working
-        || (e.checks == Checks::Pending && age < STALL_TIME)
-        || (gaps.contains(&Gap::ReviewerPending) && age < STALL_TIME)
-        || (gaps.contains(&Gap::Mergeability) && e.merge_state.is_some() && age < STALL_TIME)
+        || (pending && e.checks == Checks::Pending)
+        || (pending && gaps.contains(&Gap::ReviewerPending))
+        || (pending && gaps.contains(&Gap::Mergeability) && e.merge_state.is_some())
     {
         Verdict::Skip
     } else if gaps.is_empty() {

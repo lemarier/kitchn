@@ -119,6 +119,34 @@ impl HouseRegistry {
         )?;
         Ok(())
     }
+    /// Write `binding` into a house registered without a worker backend.
+    /// `expected` must be the stored configuration, still unbound; nothing
+    /// else changes.
+    ///
+    /// # Errors
+    /// [`HouseError::Conflict`] when the stored configuration differs from
+    /// `expected` or already has a binding.
+    pub fn bind_backend(
+        &self,
+        expected: &HouseConfig,
+        binding: &crate::house::BackendBinding,
+    ) -> Result<(), HouseError> {
+        let _lock = self.lock()?;
+        let current = self.load(&expected.house)?;
+        if current != *expected || current.backend.is_some() {
+            return Err(HouseError::Conflict);
+        }
+        let next = HouseConfig {
+            backend: Some(binding.clone()),
+            ..current.clone()
+        };
+        atomic_config(
+            &self.config_path(&next.house),
+            &current,
+            &next,
+            super::installer::Visibility::Private,
+        )
+    }
     /// Read and validate one exact house. No fallback to another house.
     pub fn load(&self, house: &HouseId) -> Result<HouseConfig, HouseError> {
         ensure_external(&self.root)?;

@@ -25,6 +25,7 @@ write it for you from a few answers or register one you wrote and reviewed.
 | `requiredChecks` | Checks every change needs. |
 | `grants` | Standing, repository-scoped grants with explicit backend and credential identifiers. |
 | `policyLimits` | Limits kept separate from grants. |
+| `backend` | The [worker backend](#the-worker-backend) commands build for this house. |
 | `mergeReadiness` | Optional. The readiness level (`checked`, `reliable` or `covered`) each work type must reach before the merge gate may merge in a repository with a merge grant. Readiness never grants merge authority. Below the level, a merge needs an owner's Roger approval for that exact pull request, head and base; Kitchen persists the Ask, with the work type, levels and reason, before it is sent. Unobserved readiness counts as `unready`. |
 
 Permission given during an interactive session is never promoted into a
@@ -45,6 +46,22 @@ directory. kitchn never copies it into its configuration, the repository or a
 command line. `kitchn house init` offers the logged-in `gh` account as the
 default. A house can instead write as a GitHub App: bind its app ID and
 installation, and place the app's private key where the token would go.
+
+## The worker backend
+
+`backend` names the worker backend a house runs on: its `kind` (`orca` is the
+only one), the backend namespace its grants name, and the credential that
+backend acts under. It holds names, never a credential value. Guided
+`kitchn house init` writes `{"kind": "orca", "backend": "orca", "credential":
+"orca"}` unless `--worker-backend` names another supported backend.
+
+Every command that needs a backend, such as `kitchn budget`, builds it from
+this binding and refuses a backend that lacks a capability the workflow
+requires, naming each missing one. A house without a binding, or bound to a
+kind this kitchn does not know, is refused by name; kitchn never assumes Orca.
+A house registered before bindings existed gets one by rerunning
+`kitchn house init` with the same answers, or by adding the `backend` field to
+its policy.
 
 ## The repository binding
 

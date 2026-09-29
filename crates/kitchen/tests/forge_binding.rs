@@ -50,6 +50,7 @@ fn house_config(policy_limits: BTreeSet<Grant>) -> TestResult<HouseConfig> {
         merge_readiness: Default::default(),
         disk_pressure: None,
         follow_up: None,
+        backend: None,
     })
 }
 
@@ -668,11 +669,11 @@ fn guided_init_offers_the_logged_in_gh_account_and_binds_it() -> TestResult {
     let temp = tempfile::tempdir()?;
     let home = temp.path().canonicalize()?;
     // Registry, house, repositories, destinations, three stations, checks,
-    // reviewers, fix rounds, review requests, forge requester, credential
-    // name, confirmation.
+    // reviewers, fix rounds, review requests, worker backend, forge
+    // requester, credential name, confirmation.
     let mut script = Script {
         answers: [
-            "", "acme", "", "", "", "", "", "none", "", "", "", "", "", "y",
+            "", "acme", "", "", "", "", "", "none", "", "", "", "", "", "", "y",
         ]
         .into(),
         transcript: Vec::new(),

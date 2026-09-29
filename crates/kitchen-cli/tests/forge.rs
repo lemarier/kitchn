@@ -436,6 +436,7 @@ mod apply {
                 merge_readiness: Default::default(),
                 disk_pressure: None,
                 follow_up: None,
+                backend: None,
             };
             let registry = HouseRegistry::new(root.join("registry"))?;
             registry.initialize(&config)?;

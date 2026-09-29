@@ -100,6 +100,7 @@ fn flags(registry: &Path) -> InitAnswers {
         required_reviewers: Some("expediter".to_owned()),
         fix_rounds: Some("2".to_owned()),
         review_requests: Some("1".to_owned()),
+        worker_backend: Some("orca".to_owned()),
         forge_requester: Some("none".to_owned()),
         forge_credential: None,
         kitchen: Some(KITCHEN.to_owned()),
@@ -130,6 +131,7 @@ fn expected_config() -> TestResult<HouseConfig> {
             "policyLimits": [],
             "grants": [],
             "followUp": {{"fixRounds": 2, "reviewRequests": 1}},
+            "backend": {{"kind": "orca", "backend": "orca", "credential": "orca"}},
             "agents": {{
                 "default": {{"agent": "codex"}},
                 "rules": [
@@ -146,9 +148,8 @@ fn blank_answers_take_the_checkout_remote_and_station_defaults() -> TestResult {
     let temp = tempfile::tempdir()?;
     let home = temp.path().canonicalize()?;
     // Registry, house, repositories, destinations, three stations, checks,
-    // reviewers, fix rounds, review requests, forge requester, confirmation. The
-    // commit is this build's,
-    // so it is not asked.
+    // reviewers, fix rounds, review requests, worker backend, forge
+    // requester, confirmation. The commit is this build's, so it is not asked.
     let mut script = Script::new(&[
         "",
         "acme",
@@ -158,6 +159,7 @@ fn blank_answers_take_the_checkout_remote_and_station_defaults() -> TestResult {
         "",
         "",
         "test, lint",
+        "",
         "",
         "",
         "",
@@ -645,7 +647,7 @@ fn embedded_guidance_needs_this_builds_commit() -> TestResult {
         plan_house_init(&unanswered, &unknown, &NoGitHubAccess, None),
         Err(HouseInitError::MissingAnswers(missing)) if missing == [InitQuestion::House]
     ));
-    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test", "", "", "", ""]);
+    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test", "", "", "", "", ""]);
     let prompted = plan_house_init(
         &InitAnswers::default(),
         &unknown,

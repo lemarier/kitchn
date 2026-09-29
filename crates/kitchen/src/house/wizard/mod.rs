@@ -31,9 +31,9 @@ use crate::{
     },
     contracts::{CommitId, ExternalRef, PostingBudget, Repository, Role},
     house::{
-        BindOutcome, CredentialKind, CredentialStatus, FORGE_BINDING_SCHEMA, FollowUpPolicy,
-        ForgeBinding, ForgeKind, HouseConfig, HouseError, MAX_FOLLOW_UP, bind_forge,
-        credential_path, credential_status,
+        BackendBinding, BackendKind, BackendName, BindOutcome, CredentialKind, CredentialStatus,
+        FORGE_BINDING_SCHEMA, FollowUpPolicy, ForgeBinding, ForgeKind, HouseConfig, HouseError,
+        MAX_FOLLOW_UP, bind_forge, credential_path, credential_status,
     },
     scheduling::AgentFamily,
     selection::{AgentPolicy, AgentSelection, RuleMatch, SelectionRule},
@@ -50,6 +50,8 @@ const DEFAULT_CREDENTIAL: &str = "github";
 const GITHUB_BACKEND: &str = "github";
 /// Per-task posting budget of a new forge binding.
 const DEFAULT_POSTING_BUDGET: u32 = 20;
+/// The worker backend offered when nothing else is chosen.
+const DEFAULT_WORKER_BACKEND: BackendKind = BackendKind::Orca;
 
 /// A station the wizard assigns an agent to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +125,8 @@ pub enum InitQuestion {
     FixRounds,
     /// Review requests per pull request head.
     ReviewRequests,
+    /// The worker backend the house runs its workers on.
+    WorkerBackend,
     /// The forge login Kitchen writes as, or none for no forge binding.
     ForgeRequester,
     /// The credential name of the forge binding.
@@ -149,6 +153,7 @@ impl InitQuestion {
             Self::RequiredReviewers => "--required-reviewers",
             Self::FixRounds => "--fix-rounds",
             Self::ReviewRequests => "--review-requests",
+            Self::WorkerBackend => "--worker-backend",
             Self::ForgeRequester => "--forge-requester",
             Self::ForgeCredential => "--forge-credential",
             Self::Kitchen => "--kitchen",
@@ -169,6 +174,7 @@ impl InitQuestion {
             Self::Agent(_) => "claude or codex",
             Self::RequiredChecks | Self::RequiredReviewers => "comma-separated names, or none",
             Self::FixRounds | Self::ReviewRequests => "a whole number from 0 to 10",
+            Self::WorkerBackend => "orca",
             Self::ForgeRequester => "a GitHub login, or none",
             Self::ForgeCredential => "a credential name such as github",
             Self::Kitchen => "a full 40- or 64-character lowercase hex commit",
@@ -209,6 +215,8 @@ pub struct InitAnswers {
     pub fix_rounds: Option<String>,
     /// `--review-requests`.
     pub review_requests: Option<String>,
+    /// `--worker-backend`.
+    pub worker_backend: Option<String>,
     /// `--forge-requester`.
     pub forge_requester: Option<String>,
     /// `--forge-credential`.
@@ -497,6 +505,21 @@ pub fn plan_house_init(
         Some(Offer::plain(DEFAULT_REVIEW_REQUESTS.to_string())),
         follow_up_count,
     )?;
+    let worker_backend = session.answer(
+        InitQuestion::WorkerBackend,
+        answers.worker_backend.as_deref(),
+        "Worker backend",
+        Some(Offer {
+            value: DEFAULT_WORKER_BACKEND.as_str().to_owned(),
+            note: Some("the only one this Kitchen supports"),
+        }),
+        |text| {
+            BackendName::new(text)
+                .ok()
+                .and_then(|name| name.kind())
+                .ok_or(())
+        },
+    )?;
     let forge = session.forge(answers, facts.forge_login.as_ref())?;
     // Unanswered questions are reported first; an unknown build commit is
     // only worth an error once every other answer is in hand.
@@ -517,6 +540,7 @@ pub fn plan_house_init(
         Some(required_reviewers),
         Some(fix_rounds),
         Some(review_requests),
+        Some(worker_backend),
         Some(forge),
         Some(kitchen),
     ) = (
@@ -529,6 +553,7 @@ pub fn plan_house_init(
         required_reviewers,
         fix_rounds,
         review_requests,
+        worker_backend,
         forge,
         kitchen,
     )
@@ -562,6 +587,7 @@ pub fn plan_house_init(
             fix_rounds,
             review_requests,
         }),
+        backend: Some(default_binding(worker_backend)?),
     };
     config.validate()?;
     bundle.validate(&config)?;
@@ -690,6 +716,7 @@ pub fn register_house(plan: &HouseInitPlan) -> Result<HouseInitReport, HouseInit
     if plan.bundle.role_cards_digest != role_cards_digest() {
         return Err(HouseError::PinMismatch.into());
     }
+    bind_legacy_house(&registry, &plan.config)?;
     registry.initialize(&plan.config)?;
     let instructions = registry
         .sync(&plan.config.house, &plan.bundle)
@@ -725,6 +752,41 @@ pub fn register_house(plan: &HouseInitPlan) -> Result<HouseInitReport, HouseInit
         forge,
         store,
     })
+}
+
+/// The binding for `kind`: its backend namespace and credential are named
+/// after it, and grants for its effects must name them.
+fn default_binding(kind: BackendKind) -> Result<BackendBinding, HouseError> {
+    let invalid = |_| HouseError::InvalidInput;
+    Ok(BackendBinding {
+        kind: kind.into(),
+        backend: BackendId::new(kind.as_str()).map_err(invalid)?,
+        credential: CredentialId::new(kind.as_str()).map_err(invalid)?,
+    })
+}
+
+/// A house registered before worker backend bindings, identical to `config`
+/// except for the binding, gets `config`'s binding: rerunning `house init`
+/// with the same answers is how it writes the Orca default explicitly. Any
+/// other stored house is left for [`HouseRegistry::initialize`] to judge.
+fn bind_legacy_house(registry: &HouseRegistry, config: &HouseConfig) -> Result<(), HouseError> {
+    let Some(binding) = &config.backend else {
+        return Ok(());
+    };
+    let stored = match registry.load(&config.house) {
+        Ok(stored) => stored,
+        // A new house: nothing to migrate.
+        Err(HouseError::Io(std::io::ErrorKind::NotFound)) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let bound = HouseConfig {
+        backend: Some(binding.clone()),
+        ..stored.clone()
+    };
+    if stored.backend.is_none() && bound == *config {
+        registry.bind_backend(&stored, binding)?;
+    }
+    Ok(())
 }
 
 /// A forge requester and its credential name.

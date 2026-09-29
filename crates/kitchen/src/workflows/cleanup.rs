@@ -1235,7 +1235,8 @@ pub fn retire(
                 WorkItem::Resource { resource } => Some(resource),
                 WorkItem::Issue { .. }
                 | WorkItem::PullRequest { .. }
-                | WorkItem::Repository { .. } => None,
+                | WorkItem::Repository { .. }
+                | WorkItem::Task { .. } => None,
             })
             .collect(),
         tasks,

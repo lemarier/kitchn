@@ -372,8 +372,47 @@ pub fn credential_status(
     })
 }
 
+/// Open the registry root as a directory descriptor, or `None` when the path
+/// no longer names the directory it resolved to.
+///
+/// The root is canonicalized once, so links above it, such as `/var` on macOS
+/// or a symlinked `~/.local/share`, resolve as system or user configuration
+/// that Kitchen trusts. The canonical path is then opened without following a
+/// final link, and the descriptor's (device, inode) must equal the canonical
+/// path's, so a root swapped for a link or another directory in between is
+/// refused. `after_resolve` runs between the two steps for race tests.
+#[cfg(unix)]
+fn open_registry_root(
+    root: &std::path::Path,
+    after_resolve: impl FnOnce(),
+) -> Result<Option<rustix::fd::OwnedFd>, ForgeError> {
+    use rustix::{
+        fs::{Mode, OFlags, open},
+        io::Errno,
+    };
+    use std::os::unix::fs::MetadataExt;
+
+    let canonical = root.canonicalize().map_err(HouseError::from)?;
+    let expected = std::fs::metadata(&canonical).map_err(HouseError::from)?;
+    after_resolve();
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let descriptor = match open(&canonical, flags, Mode::empty()) {
+        Ok(descriptor) => descriptor,
+        Err(Errno::LOOP | Errno::NOTDIR | Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(HouseError::from(std::io::Error::from(error)).into()),
+    };
+    let opened = File::from(descriptor);
+    let actual = opened.metadata().map_err(HouseError::from)?;
+    if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
+        return Ok(None);
+    }
+    Ok(Some(opened.into()))
+}
+
 /// Open the token file at [`credential_path`] from the registry root, one
-/// name at a time, refusing a link at every step. Ownership, type, and mode
+/// name at a time, refusing a link at every step below the canonical root.
+/// Path components above the canonical registry root are trusted system or
+/// user configuration. Ownership, type, and mode
 /// are checked on the opened descriptor, which the caller reads the token
 /// from, so replacing the file after the check cannot change what is read.
 #[cfg(unix)]
@@ -382,7 +421,7 @@ fn open_credential(
     binding: &ForgeBinding,
 ) -> Result<Result<File, CredentialStatus>, ForgeError> {
     use rustix::{
-        fs::{Mode, OFlags, open, openat},
+        fs::{Mode, OFlags, openat},
         io::Errno,
     };
     use std::os::unix::fs::MetadataExt;
@@ -394,8 +433,9 @@ fn open_credential(
     // Loads the house and refuses a private directory inside a repository.
     registry.private_path(&binding.house)?;
     let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    // The registry root is the caller's choice and may itself be a link.
-    let mut parent = open(registry.root(), directory, Mode::empty()).map_err(failed)?;
+    let Some(mut parent) = open_registry_root(registry.root(), || {})? else {
+        return Ok(Err(CredentialStatus::Redirected));
+    };
     for name in ["private", binding.house.as_str(), CREDENTIALS] {
         parent = match openat(&parent, name, directory | OFlags::NOFOLLOW, Mode::empty()) {
             Ok(child) => child,
@@ -712,6 +752,57 @@ mod tests {
         write_token(&path, &"t".repeat(16 * 1024), 0o600)?;
         let loaded = apply_then_load(&registry, &binding, || Ok(()))?;
         assert_eq!(loaded.map(|token| token.len()), Ok(16 * 1024));
+        Ok(())
+    }
+
+    #[test]
+    fn a_registry_root_swapped_for_a_link_is_refused() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let base = temp.path().canonicalize()?;
+        let (registry, binding, _) = bound(&base)?;
+        let root = base.join("registry");
+
+        // Another registry holding a token of the same name.
+        let (_, _, other_token) = bound(&base.join("elsewhere"))?;
+        let other_root = base.join("elsewhere/registry");
+        write_token(&other_token, "other-registry-fixture-token", 0o600)?;
+
+        let refused = open_registry_root(&root, || {
+            fs::rename(&root, base.join("moved")).ok();
+            std::os::unix::fs::symlink(&other_root, &root).ok();
+        })?;
+        assert!(refused.is_none());
+        // With the link in place the registry's own path check refuses too.
+        assert!(matches!(
+            credential_status(&registry, &binding),
+            Err(ForgeError::House(HouseError::RedirectedPath))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_registry_root_replaced_by_another_directory_is_refused() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let base = temp.path().canonicalize()?;
+        let (_registry, _binding, _) = bound(&base)?;
+        let root = base.join("registry");
+        let refused = open_registry_root(&root, || {
+            fs::rename(&root, base.join("moved")).ok();
+            fs::create_dir(&root).ok();
+        })?;
+        assert!(refused.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn links_above_the_registry_root_still_resolve() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let base = temp.path().canonicalize()?;
+        bound(&base)?;
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&base, &alias)?;
+        assert!(open_registry_root(&alias.join("registry"), || {})?.is_some());
+        assert!(open_registry_root(&base.join("absent"), || {}).is_err());
         Ok(())
     }
 }

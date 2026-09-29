@@ -42,7 +42,7 @@ use crate::{
     state::{HouseStore, Lease, OwnershipEvent, StateError, TaskState},
     workflows::{
         coordination::REQUIRED_WORKER_CAPABILITIES,
-        pickup::{DEFAULT_FIX_ROUNDS, IssueRef, TaskTemplate},
+        pickup::{FollowUpBudget, IssueRef, TaskTemplate},
         repair::{Mergeability, PullRequestState, PullRequestView, repair_task_id},
     },
 };
@@ -978,8 +978,11 @@ pub struct PrRequest<'a> {
     pub facts: &'a PrFacts,
     /// What the person asked for, or `None` to route from the facts.
     pub intent: Option<PrIntent>,
+    /// The house's follow-up budget, from
+    /// [`crate::house::HouseConfig::follow_up_budget`].
+    pub follow_up: FollowUpBudget,
     /// A lower review-fix round budget the person asked for, or `None` for
-    /// the house budget, [`DEFAULT_FIX_ROUNDS`]. It can never raise it.
+    /// the house budget. It can never raise it.
     pub fix_rounds: Option<u8>,
     /// The person's session; must be interactive.
     pub claimant: &'a Claimant,
@@ -1032,8 +1035,8 @@ fn current_round(store: &HouseStore, repository: &Repository, number: IssueNumbe
 /// its exact head. A writer round claims the current round's task, the one
 /// scheduled repair derives and claims, so a round scheduled repair holds is
 /// skipped and the two never write to the same pull request at once. Rounds
-/// spent and the budget come from the house store and
-/// [`DEFAULT_FIX_ROUNDS`], never from the session.
+/// spent come from the house store and the budget from the house's
+/// follow-up policy, never from the session.
 ///
 /// # Errors
 /// [`InteractiveError::NeedsPerson`] for a non-interactive claimant,
@@ -1043,12 +1046,12 @@ fn current_round(store: &HouseStore, repository: &Repository, number: IssueNumbe
 pub fn pull_request(request: &PrRequest<'_>) -> Result<(PrPlan, Option<Lease>)> {
     require_person(request.claimant)?;
     let budget = match request.fix_rounds {
-        None => DEFAULT_FIX_ROUNDS,
-        Some(requested) if requested <= DEFAULT_FIX_ROUNDS => requested,
+        None => request.follow_up.fix_rounds(),
+        Some(requested) if requested <= request.follow_up.fix_rounds() => requested,
         Some(requested) => {
             return Err(InteractiveError::BudgetAboveHouse {
                 requested,
-                house: DEFAULT_FIX_ROUNDS,
+                house: request.follow_up.fix_rounds(),
             }
             .into());
         }

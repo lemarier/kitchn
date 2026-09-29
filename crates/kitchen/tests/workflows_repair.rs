@@ -7,7 +7,7 @@ mod workflows_support;
 
 use std::time::Duration;
 
-use common::{TestResult, commit, scheduled, ttl};
+use common::{TestResult, commit, house_with_fix_rounds, scheduled, ttl};
 use kitchen::{
     TaskId,
     contracts::{
@@ -17,7 +17,6 @@ use kitchen::{
     state::StateError,
     workflows::{
         coordination::{LaunchOutcome, launch_worker},
-        pickup::FollowUpBudget,
         repair::{
             HandOver, MAX_CONCURRENT_REPAIRS, Mergeability, Observed, Ownership, PullRequestState,
             PullRequestView, RepairCandidate, RepairDecision, RepairKind, RepairPolicy, Skip,
@@ -38,14 +37,8 @@ fn task(value: &str) -> TestResult<TaskId> {
 
 type Edit = Box<dyn Fn(&mut RepairCandidate) -> TestResult>;
 
-fn repair_policy() -> RepairPolicy {
-    RepairPolicy {
-        max_unknown_rechecks: 2,
-        budget: FollowUpBudget {
-            fix_rounds: 2,
-            review_requests: 1,
-        },
-    }
+fn repair_policy() -> TestResult<RepairPolicy> {
+    Ok(RepairPolicy::for_house(&house_with_fix_rounds(None)?, 2))
 }
 
 fn view(
@@ -86,7 +79,7 @@ fn conflicting(pr: u64) -> TestResult<RepairCandidate> {
 
 #[test]
 fn repair_only_touches_settled_owned_branches_with_preserved_work() -> TestResult {
-    let policy = repair_policy();
+    let policy = repair_policy()?;
     let decide = |edit: &dyn Fn(&mut RepairCandidate) -> TestResult| -> TestResult<RepairDecision> {
         let mut candidate = conflicting(1)?;
         edit(&mut candidate)?;
@@ -239,7 +232,7 @@ fn layer(stack: &str, depth: u8, contains: Observed<bool>) -> TestResult<StackLa
 
 #[test]
 fn a_layer_is_restacked_only_after_its_lower_layer_merged() -> TestResult {
-    let policy = repair_policy();
+    let policy = repair_policy()?;
     let mut candidate = conflicting(2)?;
     candidate.pull_request.mergeability = Mergeability::Clean;
     candidate.stack = Some(layer("stack-a", 2, Observed::Known(false))?);
@@ -272,7 +265,7 @@ fn a_layer_is_restacked_only_after_its_lower_layer_merged() -> TestResult {
 
 #[test]
 fn repairs_use_their_own_bounded_slots_and_one_writer_per_stack() -> TestResult {
-    let policy = repair_policy();
+    let policy = repair_policy()?;
     // Issue capacity is irrelevant here: repair slots are separate.
     let candidates = [conflicting(3)?, conflicting(1)?, conflicting(2)?];
     let decisions = plan(&policy, &candidates, 0);
@@ -325,7 +318,7 @@ fn a_lower_layer_waiting_for_a_person_blocks_the_layers_above() -> TestResult {
         ..layer("stack-d", 2, Observed::Known(true))?
     });
     assert_eq!(
-        plan(&repair_policy(), &[upper, lower], 0),
+        plan(&repair_policy()?, &[upper, lower], 0),
         vec![
             (
                 number(20)?,
@@ -467,7 +460,7 @@ fn the_branch_writer_comes_from_the_backend_observation() -> TestResult {
     let mut candidate = conflicting(7)?;
     candidate.writer = writer;
     assert_eq!(
-        assess(&repair_policy(), &candidate),
+        assess(&repair_policy()?, &candidate),
         RepairDecision::HandOver(HandOver::PersonOwnsTerminal)
     );
     for running in [
@@ -497,7 +490,7 @@ fn the_branch_writer_comes_from_the_backend_observation() -> TestResult {
 
 #[test]
 fn a_restacked_layer_still_gets_its_conflicts_repaired() -> TestResult {
-    let policy = repair_policy();
+    let policy = repair_policy()?;
     // The layer already contains its merged lower layer, but now conflicts
     // with its new base.
     let mut candidate = conflicting(2)?;
@@ -554,6 +547,47 @@ fn a_repair_task_carries_the_selection_the_house_policy_resolves() -> TestResult
         Some(kitchen::selection::SelectionSource::Repository {
             repository: repo()?
         })
+    );
+    Ok(())
+}
+
+#[test]
+fn repair_takes_its_round_budget_from_the_house() -> TestResult {
+    let base: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/house/origin89.json"))?;
+    let house = |follow_up: Option<serde_json::Value>| -> TestResult<kitchen::house::HouseConfig> {
+        let mut json = base.clone();
+        if let Some(follow_up) = follow_up {
+            json["followUp"] = follow_up;
+        }
+        Ok(serde_json::from_value(json)?)
+    };
+    let after_two_rounds = |policy: &RepairPolicy| -> TestResult<RepairDecision> {
+        let mut candidate = conflicting(1)?;
+        candidate.rounds_used = 2;
+        Ok(assess(policy, &candidate))
+    };
+    // Without a policy the library default of two rounds is spent.
+    let default = RepairPolicy::for_house(&house(None)?, 2);
+    assert_eq!(default.budget().fix_rounds(), 2);
+    assert_eq!(default.max_unknown_rechecks, 2);
+    assert_eq!(
+        after_two_rounds(&default)?,
+        RepairDecision::HandOver(HandOver::BudgetExhausted)
+    );
+    // A house that allows three keeps repairing after two.
+    let generous = RepairPolicy::for_house(&house(Some(json!({ "fixRounds": 3 })))?, 2);
+    assert_eq!(
+        after_two_rounds(&generous)?,
+        RepairDecision::Repair(RepairKind::Conflict)
+    );
+    // A house that allows none hands over before the first round.
+    let none = RepairPolicy::for_house(&house(Some(json!({ "fixRounds": 0 })))?, 2);
+    let mut fresh = conflicting(1)?;
+    fresh.rounds_used = 0;
+    assert_eq!(
+        assess(&none, &fresh),
+        RepairDecision::HandOver(HandOver::BudgetExhausted)
     );
     Ok(())
 }

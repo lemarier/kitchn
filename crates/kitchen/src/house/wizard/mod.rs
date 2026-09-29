@@ -28,11 +28,13 @@ use crate::{
     adoption::{HouseRegistry, InstructionBundle, ResolvedInstructions, encode, role_cards_digest},
     contracts::{CommitId, ExternalRef, PostingBudget, Repository, Role},
     house::{
-        BindOutcome, CredentialStatus, FORGE_BINDING_SCHEMA, ForgeBinding, ForgeKind, HouseConfig,
-        HouseError, bind_forge, credential_path, credential_status,
+        BindOutcome, CredentialStatus, FORGE_BINDING_SCHEMA, FollowUpPolicy, ForgeBinding,
+        ForgeKind, HouseConfig, HouseError, MAX_FOLLOW_UP, bind_forge, credential_path,
+        credential_status,
     },
     scheduling::AgentFamily,
     selection::{AgentPolicy, AgentSelection, RuleMatch, SelectionRule},
+    workflows::pickup::{DEFAULT_FIX_ROUNDS, DEFAULT_REVIEW_REQUESTS},
 };
 
 /// Prompts per question before the wizard gives up on invalid answers.
@@ -114,6 +116,10 @@ pub enum InitQuestion {
     RequiredChecks,
     /// Reviewers every pull request needs.
     RequiredReviewers,
+    /// Review-fix rounds per pull request.
+    FixRounds,
+    /// Review requests per pull request head.
+    ReviewRequests,
     /// The forge login Kitchen writes as, or none for no forge binding.
     ForgeRequester,
     /// The credential name of the forge binding.
@@ -138,6 +144,8 @@ impl InitQuestion {
             Self::Agent(Station::Expediter) => "--expediter",
             Self::RequiredChecks => "--required-checks",
             Self::RequiredReviewers => "--required-reviewers",
+            Self::FixRounds => "--fix-rounds",
+            Self::ReviewRequests => "--review-requests",
             Self::ForgeRequester => "--forge-requester",
             Self::ForgeCredential => "--forge-credential",
             Self::Kitchen => "--kitchen",
@@ -157,6 +165,7 @@ impl InitQuestion {
             }
             Self::Agent(_) => "claude or codex",
             Self::RequiredChecks | Self::RequiredReviewers => "comma-separated names, or none",
+            Self::FixRounds | Self::ReviewRequests => "a whole number from 0 to 10",
             Self::ForgeRequester => "a GitHub login, or none",
             Self::ForgeCredential => "a credential name such as github",
             Self::Kitchen => "a full 40- or 64-character lowercase hex commit",
@@ -193,6 +202,10 @@ pub struct InitAnswers {
     pub required_checks: Option<String>,
     /// `--required-reviewers`.
     pub required_reviewers: Option<String>,
+    /// `--fix-rounds`.
+    pub fix_rounds: Option<String>,
+    /// `--review-requests`.
+    pub review_requests: Option<String>,
     /// `--forge-requester`.
     pub forge_requester: Option<String>,
     /// `--forge-credential`.
@@ -403,6 +416,20 @@ pub fn plan_house_init(
         Some(Offer::plain(Role::Expediter.as_str().to_owned())),
         names,
     )?;
+    let fix_rounds = session.answer(
+        InitQuestion::FixRounds,
+        answers.fix_rounds.as_deref(),
+        "Review-fix rounds per pull request",
+        Some(Offer::plain(DEFAULT_FIX_ROUNDS.to_string())),
+        follow_up_count,
+    )?;
+    let review_requests = session.answer(
+        InitQuestion::ReviewRequests,
+        answers.review_requests.as_deref(),
+        "Review requests per pull request head",
+        Some(Offer::plain(DEFAULT_REVIEW_REQUESTS.to_string())),
+        follow_up_count,
+    )?;
     let forge = session.forge(answers, facts.forge_login.as_ref())?;
     // Unanswered questions are reported first; an unknown build commit is
     // only worth an error once every other answer is in hand.
@@ -421,6 +448,8 @@ pub fn plan_house_init(
         Some(agents),
         Some(required_checks),
         Some(required_reviewers),
+        Some(fix_rounds),
+        Some(review_requests),
         Some(forge),
         Some(kitchen),
     ) = (
@@ -431,6 +460,8 @@ pub fn plan_house_init(
         agents,
         required_checks,
         required_reviewers,
+        fix_rounds,
+        review_requests,
         forge,
         kitchen,
     )
@@ -460,6 +491,10 @@ pub fn plan_house_init(
         schedules: None,
         merge_readiness: BTreeMap::new(),
         disk_pressure: None,
+        follow_up: Some(FollowUpPolicy {
+            fix_rounds,
+            review_requests,
+        }),
     };
     config.validate()?;
     bundle.validate(&config)?;
@@ -927,6 +962,13 @@ fn names(text: &str) -> Result<BTreeSet<String>, ()> {
             }
         })
         .collect()
+}
+
+fn follow_up_count(text: &str) -> Result<u8, ()> {
+    text.parse::<u8>()
+        .ok()
+        .filter(|count| *count <= MAX_FOLLOW_UP)
+        .ok_or(())
 }
 
 fn parse_agent(text: &str) -> Result<AgentFamily, ()> {

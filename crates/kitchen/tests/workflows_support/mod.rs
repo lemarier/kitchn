@@ -18,7 +18,7 @@ use kitchen::{
     workflows::{
         coordination::{ConsentSource, Context, Standing, SupervisionPolicy},
         pickup::{
-            Base, Blockers, Candidate, FollowUpBudget, IssueRef, LinkedWork, Overlap, PickupPolicy,
+            Base, Blockers, Candidate, IssueRef, LinkedWork, Overlap, PickupPolicy,
             PinnedInstructions, Readiness, TaskTemplate, WorkerBrief,
         },
     },
@@ -26,7 +26,7 @@ use kitchen::{
 
 use crate::common::{
     Fixture, ManualClock, TestResult, WORKER_PERMISSIONS, backend_id, commit, credential, grant,
-    house, ttl,
+    house, house_with_fix_rounds, ttl,
 };
 
 pub fn repo() -> TestResult<Repository> {
@@ -148,10 +148,7 @@ pub fn brief(number: u64) -> TestResult<WorkerBrief> {
             entrypoint: Text::new("snapshots/origin89/AGENTS.md")?,
         },
         acceptance: vec![Text::new("The firmware builds with the new driver.")?],
-        budget: FollowUpBudget {
-            fix_rounds: 2,
-            review_requests: 1,
-        },
+        budget: house_with_fix_rounds(None)?.follow_up_budget(),
         report_path: Text::new("reports/issue.md")?,
     })
 }

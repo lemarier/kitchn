@@ -8,8 +8,14 @@ use crate::{
     contracts::{CommitId, Grant, HouseGrants, Repository, Text},
     scheduling::{BudgetError, SchedulePolicy},
     selection::{AgentPolicy, SelectionError},
-    workflows::cleanup::DiskPressurePolicy,
+    workflows::{
+        cleanup::DiskPressurePolicy,
+        pickup::{DEFAULT_FIX_ROUNDS, DEFAULT_REVIEW_REQUESTS, FollowUpBudget},
+    },
 };
+
+/// Largest fix-round or review-request budget a house may set.
+pub const MAX_FOLLOW_UP: u8 = 10;
 
 /// The tool a house requires for dependent branches and stacked pull
 /// requests. When one is configured, Kitchen creates, rebases, retargets,
@@ -28,6 +34,53 @@ impl StackTool {
         match self {
             Self::GhStack => "gh stack",
         }
+    }
+}
+
+/// How many follow-up rounds a house allows per pull request. Repair, the
+/// merge gate, and interactive `pr` can only obtain a
+/// [`FollowUpBudget`] through [`HouseConfig::follow_up_budget`]; a session may
+/// lower it, never raise it. A field left out keeps the library default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FollowUpPolicy {
+    /// Review-feedback fix and repair rounds per pull request.
+    #[serde(default = "default_fix_rounds")]
+    pub fix_rounds: u8,
+    /// Independent review requests per pull request head.
+    #[serde(default = "default_review_requests")]
+    pub review_requests: u8,
+}
+
+const fn default_fix_rounds() -> u8 {
+    DEFAULT_FIX_ROUNDS
+}
+
+const fn default_review_requests() -> u8 {
+    DEFAULT_REVIEW_REQUESTS
+}
+
+impl Default for FollowUpPolicy {
+    fn default() -> Self {
+        Self {
+            fix_rounds: DEFAULT_FIX_ROUNDS,
+            review_requests: DEFAULT_REVIEW_REQUESTS,
+        }
+    }
+}
+
+impl FollowUpPolicy {
+    /// The budget this policy grants.
+    #[must_use]
+    pub(crate) const fn budget(self) -> FollowUpBudget {
+        FollowUpBudget::new(self.fix_rounds, self.review_requests)
+    }
+
+    fn validate(self) -> Result<(), HouseError> {
+        if self.fix_rounds > MAX_FOLLOW_UP || self.review_requests > MAX_FOLLOW_UP {
+            return Err(HouseError::InvalidInput);
+        }
+        Ok(())
     }
 }
 
@@ -74,9 +127,20 @@ pub struct HouseConfig {
     /// inspection. Absent means free space is not watched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_pressure: Option<DiskPressurePolicy>,
+    /// Fix-round and review-request budgets per pull request. Absent means
+    /// the library defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up: Option<FollowUpPolicy>,
 }
 
 impl HouseConfig {
+    /// The house's follow-up budget: its policy, or the library defaults.
+    /// Every consumer reads the budget here.
+    #[must_use]
+    pub fn follow_up_budget(&self) -> FollowUpBudget {
+        self.follow_up.unwrap_or_default().budget()
+    }
+
     /// Check bounds and ensure no grant or destination escapes the allowlist.
     pub fn validate(&self) -> Result<(), HouseError> {
         if self.schema != 1
@@ -88,6 +152,9 @@ impl HouseConfig {
             || self.merge_readiness.len() > super::MAX_WORK_TYPES
         {
             return Err(HouseError::InvalidInput);
+        }
+        if let Some(follow_up) = self.follow_up {
+            follow_up.validate()?;
         }
         validate_names(&self.required_reviewers)?;
         validate_names(&self.required_checks)?;

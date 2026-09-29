@@ -713,6 +713,7 @@ mod tests {
             schedules: None,
             merge_readiness: Default::default(),
             disk_pressure: None,
+            follow_up: None,
         };
         let registry = HouseRegistry::new(root.join("registry"))?;
         registry.initialize(&config)?;

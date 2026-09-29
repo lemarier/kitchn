@@ -649,18 +649,43 @@ pub struct PinnedInstructions {
     pub entrypoint: Text,
 }
 
-/// Review-fix and repair rounds a house allows per pull request. The merge
-/// gate hands over at this count, and an interactive `pr` session may only
-/// lower it.
+/// Review-fix and repair rounds a house allows per pull request when its
+/// policy sets none. The merge gate hands over at the house's count, and an
+/// interactive `pr` session may only lower it.
 pub const DEFAULT_FIX_ROUNDS: u8 = 2;
 
-/// Review and fix budgets carried into the brief and enforced by repair.
+/// Independent review requests a house allows per pull request head unless
+/// its policy says otherwise.
+pub const DEFAULT_REVIEW_REQUESTS: u8 = 1;
+
+/// Review and fix budgets carried into the brief and enforced by repair and
+/// the merge gate. Only [`crate::house::HouseConfig::follow_up_budget`] can
+/// produce one, so no consumer can hold a number the house did not validate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FollowUpBudget {
+    fix_rounds: u8,
+    review_requests: u8,
+}
+
+impl FollowUpBudget {
+    pub(crate) const fn new(fix_rounds: u8, review_requests: u8) -> Self {
+        Self {
+            fix_rounds,
+            review_requests,
+        }
+    }
+
     /// Review-feedback fix rounds per pull request.
-    pub fix_rounds: u8,
+    #[must_use]
+    pub const fn fix_rounds(self) -> u8 {
+        self.fix_rounds
+    }
+
     /// Independent review requests per pull request head.
-    pub review_requests: u8,
+    #[must_use]
+    pub const fn review_requests(self) -> u8 {
+        self.review_requests
+    }
 }
 
 /// A standalone worker brief: everything the worker needs without the
@@ -846,7 +871,7 @@ impl WorkerBrief {
             text,
             "Budgets: {} attempt(s), {} review-fix round(s), {} review request(s).",
             spec.retry.max_attempts(),
-            self.budget.fix_rounds,
+            self.budget.fix_rounds(),
             self.budget.review_requests
         );
         let _ = writeln!(

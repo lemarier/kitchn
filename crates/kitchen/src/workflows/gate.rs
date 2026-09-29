@@ -11,7 +11,7 @@ use crate::{
     },
     house::{HouseError, IssuedAuthority, MergeSubject},
     integrations::github::MergeStatusValue,
-    workflows::pickup::DEFAULT_FIX_ROUNDS,
+    workflows::pickup::FollowUpBudget,
 };
 
 mod store;
@@ -100,6 +100,9 @@ pub struct GateEvidence {
     pub supporting_subject: Option<(CommitId, CommitId)>,
     /// Verified removal of the handover label by a person, if observed.
     pub reopen_event: Option<GateReopenEvent>,
+    /// The house's follow-up budget; its fix rounds are the fix requests
+    /// allowed on this PR before the gate hands over.
+    pub follow_up: FollowUpBudget,
 }
 /// Scoped evidence that a person removed the handover label after a verdict.
 #[derive(Debug, Clone)]
@@ -810,7 +813,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
                 | Gap::ReviewerStale
         )
     }) && grants.fix_request.covers(&e.house, &e.repository)
-        && history.fix_rounds < DEFAULT_FIX_ROUNDS
+        && history.fix_rounds < e.follow_up.fix_rounds()
         && !history.requested_this_head
         && (!gaps.contains(&Gap::ReviewerStale) || can_invoke_missing(e, &grants))
     {
@@ -820,7 +823,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     {
         Verdict::Skip
     } else {
-        if history.fix_rounds >= DEFAULT_FIX_ROUNDS {
+        if history.fix_rounds >= e.follow_up.fix_rounds() {
             gaps.push(Gap::FixBudget);
         }
         Verdict::HandOver { gaps }
@@ -1957,6 +1960,32 @@ pub struct ForgeGatePolicy {
     pub authors: Vec<String>,
     /// Reviewer logins required at the current head.
     pub expected_reviewers: Vec<String>,
+    /// The house's follow-up budget. Private: [`Self::for_house`] is the
+    /// only constructor, so the budget cannot be set apart from the house.
+    follow_up: FollowUpBudget,
+}
+
+impl ForgeGatePolicy {
+    /// Gate policy whose fix-request limit is the house's
+    /// [`crate::house::HouseConfig::follow_up_budget`].
+    #[must_use]
+    pub fn for_house(
+        house: &crate::house::HouseConfig,
+        authors: Vec<String>,
+        expected_reviewers: Vec<String>,
+    ) -> Self {
+        Self {
+            authors,
+            expected_reviewers,
+            follow_up: house.follow_up_budget(),
+        }
+    }
+
+    /// The follow-up budget this policy enforces.
+    #[must_use]
+    pub const fn budget(&self) -> FollowUpBudget {
+        self.follow_up
+    }
 }
 /// Non-forge evidence supplied by independent house-scoped reviewers and workers.
 #[derive(Debug, Clone)]
@@ -2221,6 +2250,7 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
         writer_working: supplement.writer_working,
         supporting_subject: supplement.subject,
         reopen_event,
+        follow_up: policy.follow_up,
     })
 }
 fn known<T>(observation: crate::integrations::github::Observation<T>) -> Option<T> {

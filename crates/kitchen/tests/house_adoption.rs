@@ -802,3 +802,40 @@ fn house_policy_may_set_a_disk_pressure_threshold() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn house_policy_may_set_the_follow_up_budget() -> TestResult {
+    let mut json: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/house/origin89.json"))?;
+    // Absent keeps today's budget.
+    let absent = config("origin89")?;
+    assert_eq!(absent.follow_up, None);
+    assert_eq!(absent.follow_up_budget().fix_rounds(), 2);
+    assert_eq!(absent.follow_up_budget().review_requests(), 1);
+    // A partial policy keeps the default for the field it leaves out.
+    json["followUp"] = serde_json::json!({ "fixRounds": 4 });
+    let house: HouseConfig = serde_json::from_value(json.clone())?;
+    house.validate()?;
+    assert_eq!(house.follow_up_budget().fix_rounds(), 4);
+    assert_eq!(house.follow_up_budget().review_requests(), 1);
+    // Zero and the ceiling are allowed; above the ceiling, unknown keys, and
+    // negative values are refused.
+    for allowed in [0, 10] {
+        json["followUp"] = serde_json::json!({ "fixRounds": allowed, "reviewRequests": allowed });
+        let house: HouseConfig = serde_json::from_value(json.clone())?;
+        house.validate()?;
+        assert_eq!(house.follow_up_budget().fix_rounds(), allowed);
+    }
+    json["followUp"] = serde_json::json!({ "fixRounds": 11 });
+    let too_many: HouseConfig = serde_json::from_value(json.clone())?;
+    assert!(too_many.validate().is_err());
+    for invalid in [
+        serde_json::json!({ "fixRounds": -1 }),
+        serde_json::json!({ "fixRounds": 300 }),
+        serde_json::json!({ "fixRounds": 1, "rounds": 2 }),
+    ] {
+        json["followUp"] = invalid;
+        assert!(serde_json::from_value::<HouseConfig>(json.clone()).is_err());
+    }
+    Ok(())
+}

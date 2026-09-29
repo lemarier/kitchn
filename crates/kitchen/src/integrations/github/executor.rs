@@ -154,7 +154,7 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
             .map_err(|_| EffectFailure::NotApplied(NotAppliedReason::Rejected))?
         {
             Inspection::Applied(receipt) => return Ok(receipt),
-            Inspection::Conflict | Inspection::Retargeted => {
+            Inspection::Conflict | Inspection::Retargeted | Inspection::MergedAtOtherHead => {
                 return Err(EffectFailure::NotApplied(NotAppliedReason::Rejected));
             }
             Inspection::Missing => {}
@@ -178,7 +178,10 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
             .map_err(uncertain)?
         {
             Inspection::Applied(receipt) => Ok(receipt),
-            Inspection::Missing | Inspection::Conflict | Inspection::Retargeted => {
+            Inspection::Missing
+            | Inspection::Conflict
+            | Inspection::Retargeted
+            | Inspection::MergedAtOtherHead => {
                 Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
             }
         }
@@ -200,9 +203,12 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
             {
                 Ok(Lookup::Absent)
             }
-            Ok(Inspection::Missing | Inspection::Conflict | Inspection::Retargeted) => {
-                Ok(Lookup::Unknown)
-            }
+            Ok(
+                Inspection::Missing
+                | Inspection::Conflict
+                | Inspection::Retargeted
+                | Inspection::MergedAtOtherHead,
+            ) => Ok(Lookup::Unknown),
             Err(IntegrationError::Timeout) => Err(BackendUnavailable::Timeout),
             Err(IntegrationError::LimitExceeded) => Err(BackendUnavailable::LimitExceeded),
             Err(_) => Err(BackendUnavailable::Transport),

@@ -1833,19 +1833,12 @@ fn merge_with_an_unreadable_actual_base_stays_unresolved() -> TestResult {
 }
 
 #[test]
-fn merge_of_a_different_head_is_not_applied() -> TestResult {
+fn merge_of_a_different_head_stays_unresolved() -> TestResult {
+    // Merged, but at another head: the approved merge may have landed before
+    // the branch advanced, so this proves neither the merge nor its absence.
     let (report, _) = reconcile_lost_merge(merged_pull_request(MOVED, "release"))?;
-    assert!(report.unresolved.is_empty());
-    assert!(matches!(
-        report.resolved.as_slice(),
-        [record] if matches!(
-            record.state(),
-            EffectState::NotApplied {
-                reason: NotAppliedReason::ConfirmedAbsent,
-                ..
-            }
-        )
-    ));
+    assert!(report.resolved.is_empty());
+    assert_eq!(report.unresolved.len(), 1);
     Ok(())
 }
 
@@ -1892,6 +1885,26 @@ fn lost_merge_on_a_retargeted_and_moved_pull_request_is_absent() -> TestResult {
             }
         )
     ));
+    Ok(())
+}
+
+#[test]
+fn lost_merge_on_a_pull_request_merged_before_its_head_moved_stays_uncertain() -> TestResult {
+    // The approved merge may have completed before the branch advanced, so a
+    // merged pull request at another head is not absence evidence.
+    let (report, calls) = reconcile_lost_merge(merged_pull_request(MOVED, "main"))?;
+    assert!(report.resolved.is_empty());
+    assert!(matches!(
+        report.unresolved.as_slice(),
+        [record] if matches!(
+            record.state(),
+            EffectState::Uncertain {
+                reason: UncertainReason::LookupInconclusive,
+                ..
+            }
+        )
+    ));
+    assert_eq!(calls, 1, "reconciliation never writes");
     Ok(())
 }
 

@@ -132,6 +132,10 @@ pub(crate) enum Inspection {
     /// base. No new merge may start, but an earlier request carrying the
     /// expected head can still merge it, so this is not absence evidence.
     Retargeted,
+    /// The pull request was merged, but its head has moved from the expected
+    /// one since: the approved merge may have completed before the branch
+    /// advanced, so this is neither a new merge's target nor absence evidence.
+    MergedAtOtherHead,
 }
 
 /// Per-operation read budget; an exhausted page budget is never absence evidence.
@@ -314,7 +318,11 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                     .and_then(Value::as_bool)
                     .ok_or(IntegrationError::Unknown)?;
                 if head != expected_head.as_str() {
-                    return Ok(Inspection::Conflict);
+                    return Ok(if merged {
+                        Inspection::MergedAtOtherHead
+                    } else {
+                        Inspection::Conflict
+                    });
                 }
                 if merged {
                     let sha = pr

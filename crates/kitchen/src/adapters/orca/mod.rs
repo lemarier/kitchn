@@ -108,6 +108,7 @@
 //!   from a failed one, and cannot prevent overlapping runs of one schedule;
 //!   Kitchen's consumer lease must.
 
+mod accounts;
 mod backend;
 mod branch;
 mod error;
@@ -121,6 +122,7 @@ mod schedule;
 mod signals;
 mod wire;
 
+pub use accounts::{ACCOUNT_LIST_TIMEOUT, ManagedAccounts, managed_accounts};
 pub use backend::{
     BranchCollision, DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT,
     MAX_REPO_WORKTREES, MAX_RUN_TASKS, OrcaBackend, OrcaConfig, SCHEDULE_SELECTION,

@@ -3,12 +3,13 @@
 use clap::Args;
 use kitchen::{
     CredentialId, HouseId,
+    adapters::orca::{ManagedAccounts, SystemRunner, managed_accounts},
     adoption::{checkout_remotes, decode},
     contracts::{BranchName, CommitId, ExternalRef, Permission, PostingBudget, Repository},
     house::{
-        HouseError, HouseInitError, InitAnswers, InitDecision, InitFacts, InstalledAgents,
-        NoGitHubAccess, ObservedChecks, Prompter, RequiredCheckSource, plan_house_init,
-        register_house,
+        AgentEvidence, AgentInventory, HouseError, HouseInitError, InitAnswers, InitDecision,
+        InitFacts, NoGitHubAccess, ObservedChecks, Probe, Prompter, RequiredCheckSource,
+        plan_house_init, register_house,
     },
     integrations::github::{
         CredentialFile, CredentialRef, GhCli, GitHubClient, HouseScope, Observation, ReadLimits,
@@ -148,7 +149,10 @@ pub fn run(
             .and_then(|start| checkout_remotes(&start))
             .map(|remotes| remotes.selected.repository),
         kitchen: option_env!("KITCHEN_COMMIT").and_then(|commit| CommitId::new(commit).ok()),
-        agents: installed_agents(std::env::var_os("PATH")),
+        agents: {
+            let path = std::env::var_os("PATH");
+            agent_inventory(path.as_deref(), orca_accounts(path.as_deref()))
+        },
         forge_login: super::forge::gh_login(std::env::var_os("PATH")),
     };
     let github = match args.github {
@@ -236,27 +240,45 @@ impl Prompter for Terminal {
     }
 }
 
-/// Agent executables on `PATH`. Found means an executable file exists; it
-/// is never run.
-fn installed_agents(path: Option<std::ffi::OsString>) -> InstalledAgents {
-    let Some(path) = path else {
-        return InstalledAgents::Unknown;
-    };
-    let directories: Vec<PathBuf> = std::env::split_paths(&path)
+/// The executable `name` in the absolute `PATH` entries, if any. Found means
+/// an executable file exists; it is never run by this lookup.
+fn on_path(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
         .filter(|directory| directory.is_absolute())
         .take(MAX_PATH_ENTRIES)
-        .collect();
-    let found = [AgentFamily::Claude, AgentFamily::Codex]
-        .into_iter()
-        .filter(|agent| {
-            directories
-                .iter()
-                .any(|directory| executable(&directory.join(agent.as_str())))
-        })
-        .collect();
-    InstalledAgents::Observed {
-        source: "PATH",
-        found,
+        .map(|directory| directory.join(name))
+        .find(|candidate| executable(candidate))
+}
+
+/// The managed accounts `orca account list --json` reports, or `None` when
+/// Orca is not on `PATH` or does not answer. Only the account list is read;
+/// no agent is started.
+fn orca_accounts(path: Option<&std::ffi::OsStr>) -> Option<ManagedAccounts> {
+    let orca = on_path(path?, "orca")?;
+    managed_accounts(&SystemRunner::new(orca)).ok()
+}
+
+/// What `PATH` and Orca's account list show for each agent. A missing `PATH`
+/// or an unreadable account list is unknown, never absent.
+fn agent_inventory(
+    path: Option<&std::ffi::OsStr>,
+    accounts: Option<ManagedAccounts>,
+) -> AgentInventory {
+    let evidence = |agent: AgentFamily| AgentEvidence {
+        path: match path {
+            None => Probe::Unknown,
+            Some(path) if on_path(path, agent.as_str()).is_some() => Probe::Found,
+            Some(_) => Probe::NotFound,
+        },
+        orca_account: match accounts.and_then(|accounts| accounts.count(agent)) {
+            None => Probe::Unknown,
+            Some(0) => Probe::NotFound,
+            Some(_) => Probe::Found,
+        },
+    };
+    AgentInventory {
+        claude: evidence(AgentFamily::Claude),
+        codex: evidence(AgentFamily::Codex),
     }
 }
 
@@ -349,6 +371,10 @@ mod tests {
         Ok(())
     }
 
+    fn accounts(claude: Option<usize>, codex: Option<usize>) -> Option<ManagedAccounts> {
+        Some(ManagedAccounts { claude, codex })
+    }
+
     #[test]
     fn agents_on_path_are_observed_without_running_them() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -360,33 +386,65 @@ mod tests {
         // The fake exits 1 if run; only its presence counts.
         tool(&second, "codex", 0o755)?;
         let path = std::env::join_paths([&first, &second])?;
-        assert_eq!(
-            installed_agents(Some(path.clone())),
-            InstalledAgents::Observed {
-                source: "PATH",
-                found: vec![AgentFamily::Codex],
-            }
-        );
+        let found = agent_inventory(Some(&path), None);
+        assert_eq!(found.codex.path, Probe::Found);
+        assert_eq!(found.claude.path, Probe::NotFound);
         // Not executable, a directory, and a relative entry are not agents.
         #[cfg(unix)]
         tool(&first, "claude", 0o644)?;
         std::fs::create_dir_all(second.join("claude"))?;
         let relative = std::env::join_paths([std::path::Path::new("first"), &first, &second])?;
+        assert_eq!(agent_inventory(Some(&relative), None), found);
+        let empty = agent_inventory(Some(std::ffi::OsStr::new("")), None);
+        assert_eq!(empty.claude.path, Probe::NotFound);
+        assert_eq!(empty.codex.path, Probe::NotFound);
+        // Without a PATH nothing is claimed either way.
+        assert_eq!(agent_inventory(None, None), AgentInventory::UNKNOWN);
+        Ok(())
+    }
+
+    #[test]
+    fn orca_accounts_are_kept_apart_from_path_evidence() {
+        let none = std::ffi::OsStr::new("");
+        let inventory = agent_inventory(Some(none), accounts(Some(2), Some(0)));
+        assert_eq!(inventory.claude.orca_account, Probe::Found);
+        assert_eq!(inventory.codex.orca_account, Probe::NotFound);
+        assert_eq!(inventory.claude.path, Probe::NotFound);
+        // A family the account list did not report, and an unreadable list,
+        // are unknown rather than absent.
+        let partial = agent_inventory(Some(none), accounts(None, Some(1)));
+        assert_eq!(partial.claude.orca_account, Probe::Unknown);
+        assert_eq!(partial.codex.orca_account, Probe::Found);
         assert_eq!(
-            installed_agents(Some(relative)),
-            InstalledAgents::Observed {
-                source: "PATH",
-                found: vec![AgentFamily::Codex],
-            }
+            agent_inventory(Some(none), None).claude.orca_account,
+            Probe::Unknown
         );
-        assert_eq!(
-            installed_agents(Some(std::ffi::OsString::new())),
-            InstalledAgents::Observed {
-                source: "PATH",
-                found: Vec::new(),
-            }
-        );
-        assert_eq!(installed_agents(None), InstalledAgents::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_orca_on_path_is_asked_only_for_its_account_list()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().canonicalize()?;
+        let path = std::env::join_paths([&directory])?;
+        assert_eq!(orca_accounts(Some(&path)), None, "no orca on PATH");
+        assert_eq!(orca_accounts(None), None);
+        let write = |script: &str| -> std::io::Result<()> {
+            let file = directory.join("orca");
+            std::fs::write(&file, script)?;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+        };
+        write(
+            "#!/bin/sh\n[ \"$*\" = 'account list --json' ] || exit 3\necho '{\"ok\":true,\"result\":{\"claude\":{\"accounts\":[{}]},\"codex\":{\"accounts\":[]}}}'\n",
+        )?;
+        assert_eq!(orca_accounts(Some(&path)), accounts(Some(1), Some(0)));
+        // A failing or garbled Orca leaves the accounts unknown.
+        write("#!/bin/sh\nexit 1\n")?;
+        assert_eq!(orca_accounts(Some(&path)), None);
+        write("#!/bin/sh\necho garbage\n")?;
+        assert_eq!(orca_accounts(Some(&path)), None);
         Ok(())
     }
 }

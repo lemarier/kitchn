@@ -6,8 +6,8 @@ use kitchen::{
     adoption::{HouseRegistry, InstructionBundle, resolve_instructions},
     contracts::{CommitId, Repository, Role},
     house::{
-        HouseConfig, HouseError, HouseInitError, InitAnswers, InitDecision, InitFacts,
-        InitQuestion, InstalledAgents, NoGitHubAccess, ObservedChecks, Prompter,
+        AgentEvidence, AgentInventory, HouseConfig, HouseError, HouseInitError, InitAnswers,
+        InitDecision, InitFacts, InitQuestion, NoGitHubAccess, ObservedChecks, Probe, Prompter,
         RequiredCheckSource, Station, default_guidance, plan_house_init, register_house,
     },
     scheduling::AgentFamily,
@@ -68,14 +68,18 @@ impl RequiredCheckSource for Protection {
     }
 }
 
+fn evidence(path: Probe, orca_account: Probe) -> AgentEvidence {
+    AgentEvidence { path, orca_account }
+}
+
 fn facts(home: &Path) -> TestResult<InitFacts> {
     Ok(InitFacts {
         home: Some(home.to_path_buf()),
         checkout: Ok("acme/app".parse()?),
         kitchen: Some(CommitId::new(KITCHEN)?),
-        agents: InstalledAgents::Observed {
-            source: "PATH",
-            found: vec![AgentFamily::Claude, AgentFamily::Codex],
+        agents: AgentInventory {
+            claude: evidence(Probe::Found, Probe::Found),
+            codex: evidence(Probe::Found, Probe::NotFound),
         },
         forge_login: None,
     })
@@ -172,7 +176,8 @@ fn blank_answers_take_the_checkout_remote_and_station_defaults() -> TestResult {
         default_guidance(&"acme".parse()?, &CommitId::new(KITCHEN)?)?
     );
     assert!(script.said("Repositories kitchen may work in [acme/app, from this checkout]: "));
-    assert!(script.said("Found Claude Code and Codex on PATH."));
+    assert!(script.said("Claude Code: found on PATH; Orca has a managed account."));
+    assert!(script.said("Codex: found on PATH; Orca has no managed account."));
     assert!(script.said("No house-scoped GitHub access to read required checks"));
     // The printed configuration is what gets registered.
     assert!(script.said(r#""house": "acme""#));
@@ -266,7 +271,7 @@ fn unknown_agents_are_asked_without_claiming_any_available() -> TestResult {
         ..flags(&home.join("registry"))
     };
     let unknown = InitFacts {
-        agents: InstalledAgents::Unknown,
+        agents: AgentInventory::UNKNOWN,
         ..facts(&home)?
     };
     let mut script = Script::new(&["", "claude", "codex"]);
@@ -276,9 +281,12 @@ fn unknown_agents_are_asked_without_claiming_any_available() -> TestResult {
         &NoGitHubAccess,
         Some(&mut script),
     )?)?;
-    assert!(script.said("Kitchen cannot tell which agents are installed."));
-    assert!(!script.said("Found"));
-    assert!(!script.said("not found"));
+    assert!(script.said("Claude Code: PATH not checked; Orca's account list could not be read."));
+    assert!(script.said("do not show what Orca can launch"));
+    assert!(!script.said("found on PATH"));
+    assert!(!script.said("was not found"));
+    // Nothing checked means nothing verified, so the choice is flagged.
+    assert!(script.said("could not be verified"));
     let policy = plan.config.agents.ok_or("no agents policy")?;
     assert_eq!(
         policy
@@ -288,23 +296,48 @@ fn unknown_agents_are_asked_without_claiming_any_available() -> TestResult {
         AgentFamily::Claude
     );
 
-    // Observed, but the chosen agent is missing: say so, keep the choice.
+    // Both probes ran and neither finds Codex: say so, keep the choice.
     let only_claude = InitFacts {
-        agents: InstalledAgents::Observed {
-            source: "PATH",
-            found: vec![AgentFamily::Claude],
+        agents: AgentInventory {
+            claude: evidence(Probe::Found, Probe::NotFound),
+            codex: evidence(Probe::NotFound, Probe::NotFound),
+        },
+        ..facts(&home)?
+    };
+    let mut script = Script::new(&["", "", ""]);
+    let plan = confirmed(plan_house_init(
+        &answers,
+        &only_claude,
+        &NoGitHubAccess,
+        Some(&mut script),
+    )?)?;
+    assert!(script.said("Claude Code: found on PATH; Orca has no managed account."));
+    assert!(script.said("Codex: not on PATH; Orca has no managed account."));
+    assert!(script.said("Codex was not found; install it"));
+    assert!(!script.said("Claude Code was not found"));
+    assert!(plan.config.agents.is_some());
+
+    // A partial failure is unverified rather than absent, and a managed
+    // account without the executable does not show Orca can launch it.
+    let mixed = InitFacts {
+        agents: AgentInventory {
+            claude: evidence(Probe::NotFound, Probe::Unknown),
+            codex: evidence(Probe::NotFound, Probe::Found),
         },
         ..facts(&home)?
     };
     let mut script = Script::new(&["", "", ""]);
     confirmed(plan_house_init(
         &answers,
-        &only_claude,
+        &mixed,
         &NoGitHubAccess,
         Some(&mut script),
     )?)?;
-    assert!(script.said("Found Claude Code on PATH."));
-    assert!(script.said("Codex was not found on PATH"));
+    assert!(script.said("Claude Code: not on PATH; Orca's account list could not be read."));
+    assert!(script.said("Claude Code could not be verified"));
+    assert!(script.said("Codex: not on PATH; Orca has a managed account."));
+    assert!(!script.said("Codex was not found"));
+    assert!(script.said("Codex could not be verified"));
     Ok(())
 }
 

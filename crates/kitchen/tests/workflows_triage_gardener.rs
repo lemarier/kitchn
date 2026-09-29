@@ -226,6 +226,14 @@ fn revision(seconds: u64, last_comment: Option<&str>) -> IssueRevision {
         last_comment: last_comment.and_then(|id| ExternalRef::new(id).ok()),
     }
 }
+#[expect(clippy::unwrap_used, reason = "fixed fixture decision ids")]
+fn resolution(decision: &str, body: &str) -> triage::Resolution {
+    triage::Resolution {
+        decision: ExternalRef::new(decision).unwrap(),
+        kind: triage::ResolutionKind::Evidence,
+        body: body.into(),
+    }
+}
 #[expect(clippy::unwrap_used, reason = "fixed fixture repository")]
 fn triage_input() -> triage::Evidence {
     triage::Evidence {
@@ -244,7 +252,7 @@ fn triage_input() -> triage::Evidence {
         human_only: false,
         claim: ClaimState::Unclaimed,
         open_dependencies: false,
-        factual_resolution: Some("Resolved from code".into()),
+        factual_resolution: Some(resolution("spec-10", "Resolved from code")),
         pending_product_questions: 0,
         existing_decisions: vec![],
         ready_label_present: false,
@@ -257,7 +265,7 @@ fn triage_input() -> triage::Evidence {
 #[derive(Default)]
 struct Recorded {
     asked: Vec<IssueRevision>,
-    posted: Vec<String>,
+    posted: Vec<(ExternalRef, triage::ResolutionKind)>,
 }
 impl triage::MarkerView for Recorded {
     fn asked(&self, _: &Repository, _: IssueNumber) -> Result<Vec<IssueRevision>, WorkflowError> {
@@ -267,9 +275,12 @@ impl triage::MarkerView for Recorded {
         &self,
         _: &Repository,
         _: IssueNumber,
-        resolution: &str,
+        resolution: &triage::Resolution,
     ) -> Result<bool, WorkflowError> {
-        Ok(self.posted.iter().any(|posted| posted == resolution))
+        Ok(self
+            .posted
+            .iter()
+            .any(|(decision, kind)| decision == &resolution.decision && *kind == resolution.kind))
     }
 }
 fn plan_after(
@@ -317,7 +328,10 @@ fn triage_resolves_then_rerun_is_idle() {
     ));
     input.changed_since_last_pass = false;
     assert_eq!(precheck_after(&markers, &input), Ok(Precheck::Actionable));
-    markers.posted.push("Resolved from code".into());
+    markers.posted.push((
+        ExternalRef::new("spec-10").unwrap(),
+        triage::ResolutionKind::Evidence,
+    ));
     assert_eq!(plan_after(&markers, &input).unwrap().len(), 1);
     input.ready_label_present = true;
     assert_eq!(plan_after(&markers, &input).unwrap().len(), 1); // clear needs-spec
@@ -567,24 +581,24 @@ fn store_marker_stops_a_repeated_resolution_after_the_post_moves_the_revision() 
     assert!(posts_resolution(&triage::plan_with_markers(
         &input, &markers
     )?));
-    let record = |at: &IssueRevision, body: &str| {
+    let record = |at: &IssueRevision, resolution: &triage::Resolution| {
         triage::record_resolution(
             &fixture.store,
             &workflow,
             &input.repository,
             input.issue,
             at,
-            body,
+            resolution,
             &recorder,
             common::at(5),
         )
     };
     assert!(matches!(
-        record(&judged, "Resolved from code"),
+        record(&judged, &resolution("spec-10", "Resolved from code")),
         Ok(kitchen::state::MarkerRecording::Recorded(_))
     ));
     assert!(matches!(
-        record(&judged, "Resolved from code"),
+        record(&judged, &resolution("spec-10", "Resolved from code")),
         Ok(kitchen::state::MarkerRecording::AlreadyRecorded(_))
     ));
     // Posting adds a comment, so the next pass sees a new revision. The
@@ -602,26 +616,231 @@ fn store_marker_stops_a_repeated_resolution_after_the_post_moves_the_revision() 
             present: true,
         }))
     );
-    // A different resolution after new evidence is posted.
-    input.factual_resolution = Some("Resolved by the new comment".into());
+    // A resolution of another decision after new evidence is posted.
+    input.factual_resolution = Some(resolution("spec-10-b", "Resolved by the new comment"));
     assert!(posts_resolution(&triage::plan_with_markers(
         &input, &restarted
     )?));
-    // One judged revision records one resolution.
+    // One judged revision records one decision's resolution.
     assert_eq!(
-        record(&judged, "Another resolution"),
+        record(&judged, &resolution("spec-10-b", "Another resolution")),
         Err(WorkflowError::DecisionMismatch)
     );
     assert_eq!(
-        record(&judged, "  "),
+        record(&judged, &resolution("spec-10", "  ")),
         Err(WorkflowError::IncompleteEvidence)
     );
     // Another issue's marker does not suppress this one.
     input.issue = issue(11);
-    input.factual_resolution = Some("Resolved from code".into());
+    input.factual_resolution = Some(resolution("spec-10", "Resolved from code"));
     assert!(posts_resolution(&triage::plan_with_markers(
         &input, &restarted
     )?));
+    Ok(())
+}
+
+#[test]
+fn a_reworded_resolution_is_not_posted_again_after_the_gardeners_own_post() -> common::TestResult {
+    let fixture = common::Fixture::new()?;
+    let workflow = triage_workflow()?;
+    let recorder = common::scheduled("triage-tick")?;
+    let mut input = triage_input();
+    let first = resolution("spec-10", "Resolved from code");
+    triage::record_resolution(
+        &fixture.store,
+        &workflow,
+        &input.repository,
+        input.issue,
+        &input.revision,
+        &first,
+        &recorder,
+        common::at(5),
+    )?;
+    // The post moves the revision; the next judgment words it differently.
+    let judged = input.revision.clone();
+    input.revision = revision(2, Some("50"));
+    input.factual_resolution = Some(resolution(
+        "spec-10",
+        "The limit is already enforced in the parser.",
+    ));
+    let markers = triage::IssueMarkers::new(&fixture.store, workflow.clone());
+    assert!(!posts_resolution(&triage::plan_with_markers(
+        &input, &markers
+    )?));
+    // Recording the reworded resolution at the judged revision is the same
+    // decision, not a conflict.
+    assert!(matches!(
+        triage::record_resolution(
+            &fixture.store,
+            &workflow,
+            &input.repository,
+            input.issue,
+            &judged,
+            &resolution("spec-10", "Reworded"),
+            &recorder,
+            common::at(6),
+        ),
+        Ok(kitchen::state::MarkerRecording::AlreadyRecorded(_))
+    ));
+    // The same decision settled another way is a distinct resolution.
+    input.factual_resolution = Some(triage::Resolution {
+        kind: triage::ResolutionKind::Answer,
+        ..resolution("spec-10", "The owner chose limit 3.")
+    });
+    assert!(posts_resolution(&triage::plan_with_markers(
+        &input, &markers
+    )?));
+    Ok(())
+}
+
+fn record_digest_resolution(
+    fixture: &common::Fixture,
+    judged: &IssueRevision,
+) -> common::TestResult {
+    use kitchen::state::{MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, WorkItem};
+    use std::num::{NonZeroU32, NonZeroU64};
+    fixture.store.record_marker(
+        MarkerKey {
+            workflow: triage_workflow()?,
+            item: WorkItem::Issue {
+                repository: project(),
+                number: NonZeroU64::new(10).ok_or("issue")?,
+            },
+            subject: MarkerSubject::Issue(judged.clone()),
+        },
+        MarkerFact::workflow(
+            MarkerSchema::new("triage.resolution", NonZeroU32::MIN)?,
+            &serde_json::json!({"digest": "00"}),
+        )?,
+        &common::scheduled("triage-tick")?,
+        common::at(1),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn a_text_digest_resolution_marker_means_posted_with_the_decision_unknown() -> common::TestResult {
+    let fixture = common::Fixture::new()?;
+    // A version 1 marker holds only a text digest. It proves a resolution
+    // was posted but not which decision it settled, so the pass neither
+    // fails nor posts again.
+    record_digest_resolution(&fixture, &revision(0, None))?;
+    let markers = triage::IssueMarkers::new(&fixture.store, triage_workflow()?);
+    let mut input = triage_input();
+    assert!(!posts_resolution(&triage::plan_with_markers(
+        &input, &markers
+    )?));
+    // The same holds for any decision the pass judges next.
+    input.factual_resolution = Some(resolution("spec-11", "Another answer"));
+    assert!(!posts_resolution(&triage::plan_with_markers(
+        &input, &markers
+    )?));
+    Ok(())
+}
+
+#[test]
+fn a_new_resolution_supersedes_a_text_digest_marker_at_its_revision() -> common::TestResult {
+    use kitchen::state::{MarkerKey, MarkerRecording, MarkerSubject, WorkItem};
+    use std::num::NonZeroU64;
+    let fixture = common::Fixture::new()?;
+    let workflow = triage_workflow()?;
+    let judged = revision(0, None);
+    record_digest_resolution(&fixture, &judged)?;
+    let input = triage_input();
+    let recorded = triage::record_resolution(
+        &fixture.store,
+        &workflow,
+        &input.repository,
+        input.issue,
+        &judged,
+        &resolution("spec-10", "Resolved from code"),
+        &common::scheduled("triage-tick")?,
+        common::at(2),
+    )?;
+    let MarkerRecording::Superseded(marker) = recorded else {
+        return Err("expected the version 1 marker to be superseded".into());
+    };
+    assert_eq!(marker.history().len(), 1);
+    // The identity now matches by decision, so the legacy marker no longer
+    // blocks a different decision from posting.
+    let markers = triage::IssueMarkers::new(&fixture.store, workflow.clone());
+    assert!(!posts_resolution(&triage::plan_with_markers(
+        &input, &markers
+    )?));
+    let mut other = triage_input();
+    other.factual_resolution = Some(resolution("spec-11", "Another answer"));
+    assert!(posts_resolution(&triage::plan_with_markers(
+        &other, &markers
+    )?));
+    let stored = fixture.store.marker(&MarkerKey {
+        workflow,
+        item: WorkItem::Issue {
+            repository: project(),
+            number: NonZeroU64::new(10).ok_or("issue")?,
+        },
+        subject: MarkerSubject::Issue(judged),
+    })?;
+    assert_eq!(stored.map(|stored| stored.history().len()), Some(1));
+    Ok(())
+}
+
+#[test]
+fn a_new_resolution_at_another_revision_outranks_a_text_digest_marker() -> common::TestResult {
+    let fixture = common::Fixture::new()?;
+    let workflow = triage_workflow()?;
+    record_digest_resolution(&fixture, &revision(0, None))?;
+    let input = triage_input();
+    assert!(matches!(
+        triage::record_resolution(
+            &fixture.store,
+            &workflow,
+            &input.repository,
+            input.issue,
+            &input.revision,
+            &resolution("spec-10", "Resolved from code"),
+            &common::scheduled("triage-tick")?,
+            common::at(2),
+        ),
+        Ok(kitchen::state::MarkerRecording::Recorded(_))
+    ));
+    let markers = triage::IssueMarkers::new(&fixture.store, workflow);
+    assert!(!posts_resolution(&triage::plan_with_markers(
+        &input, &markers
+    )?));
+    let mut other = triage_input();
+    other.factual_resolution = Some(resolution("spec-11", "Another answer"));
+    assert!(posts_resolution(&triage::plan_with_markers(
+        &other, &markers
+    )?));
+    Ok(())
+}
+
+#[test]
+fn an_unknown_resolution_marker_version_fails_closed() -> common::TestResult {
+    use kitchen::state::{MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, WorkItem};
+    use std::num::{NonZeroU32, NonZeroU64};
+    let fixture = common::Fixture::new()?;
+    fixture.store.record_marker(
+        MarkerKey {
+            workflow: triage_workflow()?,
+            item: WorkItem::Issue {
+                repository: project(),
+                number: NonZeroU64::new(10).ok_or("issue")?,
+            },
+            subject: MarkerSubject::Issue(revision(0, None)),
+        },
+        MarkerFact::workflow(
+            MarkerSchema::new("triage.resolution", NonZeroU32::new(3).ok_or("version")?)?,
+            &serde_json::json!({"digest": "00"}),
+        )?,
+        &common::scheduled("triage-tick")?,
+        common::at(1),
+    )?;
+    let markers = triage::IssueMarkers::new(&fixture.store, triage_workflow()?);
+    assert_eq!(
+        triage::plan_with_markers(&triage_input(), &markers),
+        Err(WorkflowError::IncompleteEvidence)
+    );
     Ok(())
 }
 

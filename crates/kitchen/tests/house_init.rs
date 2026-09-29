@@ -3,8 +3,8 @@
 //! Orca is involved.
 use kitchen::{
     ErrorClass, HouseId,
-    adoption::{HouseRegistry, InstructionBundle, resolve_instructions},
-    contracts::{CommitId, Repository, Role},
+    adoption::{HouseRegistry, InstructionBundle, StoreOutcome, StoreSetup, resolve_instructions},
+    contracts::{CommitId, ContractError, Repository, Role},
     house::{
         AgentEvidence, AgentInventory, HouseConfig, HouseError, HouseInitError, InitAnswers,
         InitDecision, InitFacts, InitQuestion, NoGitHubAccess, ObservedChecks, Probe, Prompter,
@@ -12,6 +12,7 @@ use kitchen::{
     },
     scheduling::AgentFamily,
     selection::SelectionRequest,
+    state::{HouseStore, StateError, StoreOptions},
 };
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -768,5 +769,134 @@ fn the_follow_up_budget_is_offered_with_its_default_and_takes_an_answer() -> Tes
         None,
     )?)?;
     assert_eq!(plan.config.follow_up_budget().fix_rounds(), 2);
+    Ok(())
+}
+
+/// The plan the default flags produce for a registry under `root`.
+fn store_plan(root: &Path) -> TestResult<kitchen::house::HouseInitPlan> {
+    confirmed(plan_house_init(
+        &flags(&root.join("registry")),
+        &facts(root)?,
+        &NoGitHubAccess,
+        None,
+    )?)
+}
+
+/// The store's marker and snapshot bytes, which a kept store leaves as is.
+fn store_files(store: &Path) -> TestResult<(Vec<u8>, Vec<u8>)> {
+    Ok((
+        fs::read(store.join("store.json"))?,
+        fs::read(store.join("state.json"))?,
+    ))
+}
+
+#[test]
+fn init_creates_the_house_store_and_a_rerun_keeps_it() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let plan = store_plan(&root)?;
+    let report = register_house(&plan)?;
+    let path = root.join("registry/private/acme/store");
+    assert_eq!(
+        report.store,
+        StoreSetup {
+            path: path.clone(),
+            outcome: StoreOutcome::Created
+        }
+    );
+    let acme: HouseId = "acme".parse()?;
+    let registry = HouseRegistry::new(root.join("registry"))?;
+    assert_eq!(registry.store_path(&acme)?, path);
+    let store = HouseStore::open(&path, acme.clone(), StoreOptions::default())?;
+    assert!(store.tasks()?.is_empty());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o700);
+    }
+    let before = store_files(&path)?;
+
+    let rerun = register_house(&plan)?;
+    assert_eq!(rerun.store.outcome, StoreOutcome::Existing);
+    assert_eq!(rerun.store.path, path);
+    assert_eq!(store_files(&path)?, before);
+    // Only a registered house has a store location.
+    assert!(matches!(
+        registry.store_path(&"ghost".parse()?),
+        Err(HouseError::Io(std::io::ErrorKind::NotFound))
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_store_belonging_to_another_house_is_refused_and_kept() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let path = root.join("registry/private/acme/store");
+    let other: HouseId = "other".parse()?;
+    HouseStore::initialize(&path, other.clone(), StoreOptions::default())?;
+    let before = store_files(&path)?;
+
+    let error = register_house(&store_plan(&root)?)
+        .err()
+        .ok_or("adopted another house's store")?;
+    let HouseInitError::StoreNotInitialized { source } = &error else {
+        return Err(format!("unexpected error: {error}").into());
+    };
+    assert!(
+        matches!(
+            source.as_ref(),
+            kitchen::Error::Contract(ContractError::CrossHouse { expected, found })
+                if expected.as_str() == "acme" && *found == other
+        ),
+        "{source}"
+    );
+    assert_eq!(error.class(), ErrorClass::Refused);
+    // The house is registered; the other house's store is untouched.
+    assert!(root.join("registry/houses/acme.json").exists());
+    assert_eq!(store_files(&path)?, before);
+    HouseStore::open(&path, other, StoreOptions::default())?;
+    Ok(())
+}
+
+#[test]
+fn a_store_that_lost_its_snapshot_fails_closed_on_rerun() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let plan = store_plan(&root)?;
+    let path = register_house(&plan)?.store.path;
+    // As if a crash followed the marker write.
+    fs::remove_file(path.join("state.json"))?;
+    let error = register_house(&plan)
+        .err()
+        .ok_or("accepted a store without its snapshot")?;
+    assert!(matches!(
+        &error,
+        HouseInitError::StoreNotInitialized { source }
+            if matches!(source.as_ref(), kitchen::Error::State(StateError::StateMissing))
+    ));
+    // Nothing writes a replacement snapshot.
+    assert!(!path.join("state.json").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_redirected_store_is_refused_without_writing_through_it() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let elsewhere = root.join("elsewhere");
+    fs::create_dir_all(&elsewhere)?;
+    fs::create_dir_all(root.join("registry/private/acme"))?;
+    std::os::unix::fs::symlink(&elsewhere, root.join("registry/private/acme/store"))?;
+    let error = register_house(&store_plan(&root)?)
+        .err()
+        .ok_or("followed a redirected store")?;
+    assert!(matches!(
+        &error,
+        HouseInitError::StoreNotInitialized { source }
+            if matches!(source.as_ref(), kitchen::Error::State(StateError::RedirectedPath))
+    ));
+    assert_eq!(fs::read_dir(&elsewhere)?.count(), 0);
     Ok(())
 }

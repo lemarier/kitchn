@@ -16,13 +16,15 @@ codes: `0` when there is work to do, `1` when there is none, `2` for invalid
 input and `3` when their inputs cannot be read. `decompose preview` exits `1`
 while ownership overlaps are unordered.
 
-Commands that take `--store` need the house's state store. It must already exist;
-no command creates one yet.
+Commands that take `--store` default to the house state store that
+`house init` created at `<registry>/private/<house>/store`, located through
+`--registry`. Pass `--store` to use another initialized store instead. A store
+is never created on the way; a missing one fails.
 
 ## `kitchn house init`
 
-Register a house and pin its guidance. Grants no authority and activates no
-workflows.
+Register a house, pin its guidance, and create its state store. Grants no
+authority and activates no workflows.
 
 ```sh
 kitchn house init [options]
@@ -51,7 +53,9 @@ brackets. Each question has a flag:
 Grants and policy limits stay empty. When standard input is not a terminal,
 answers come only from flags and defaults, and any missing answer fails with
 exit 2 naming the flags to pass. Rerunning with the same answers changes
-nothing; different answers for an existing house are refused.
+nothing and keeps the house's existing store; different answers for an existing
+house are refused. Init refuses a store that belongs to another house, a
+redirected store path, and a store inside a Git checkout.
 
 ## `kitchn house sync`
 
@@ -156,9 +160,9 @@ prints a plan. `work` and the `pr` writer rounds (`follow-up`, `repair`) take a
 durable claim shared with scheduled runs; `review` and `gate` only read.
 
 ```sh
-kitchn work <issue> --facts <issue.json> --revision <sha> --registry <dir> --store <dir> --holder <you> [--json]
-kitchn pr <number> --facts <pr.json> [--as review|follow-up|repair|gate] --revision <sha> --registry <dir> --store <dir> --holder <you> [--json]
-kitchn hand-back <task> --registry <dir> --store <dir> --holder <you>
+kitchn work <issue> --facts <issue.json> --revision <sha> --registry <dir> [--store <dir>] --holder <you> [--json]
+kitchn pr <number> --facts <pr.json> [--as review|follow-up|repair|gate] --revision <sha> --registry <dir> [--store <dir>] --holder <you> [--json]
+kitchn hand-back <task> --registry <dir> [--store <dir>] --holder <you>
 ```
 
 | Option | Description |
@@ -179,7 +183,7 @@ Preview an issue draft. Posts nothing.
 ```sh
 kitchn issue new --draft <draft.json> --revision <sha> --registry <dir> [--json]
 kitchn issue refine <issue> --draft <draft.json> --revision <sha> --registry <dir> [--json]
-kitchn issue acknowledge <task> --reason <text> [--accept-unknown] --registry <dir> --store <dir> --holder <you>
+kitchn issue acknowledge <task> --reason <text> [--accept-unknown] --registry <dir> [--store <dir>] --holder <you>
 ```
 
 `acknowledge` releases the subject of a draft that settled after writing, or
@@ -193,8 +197,8 @@ preview to the forge.
 
 ```sh
 kitchn decompose preview --proposal <proposal.json> [--json]
-kitchn decompose apply --proposal <proposal.json> --approve <sha256:...> --registry <dir> --house <id> --store <dir> --holder <you> [--json]
-kitchn decompose acknowledge --store <dir> --house <id> --task <task> --holder <you> --reason <text> [--registry <dir>] [--without-forge] [--accept-unknown] [--json]
+kitchn decompose apply --proposal <proposal.json> --approve <sha256:...> --registry <dir> --house <id> [--store <dir>] --holder <you> [--json]
+kitchn decompose acknowledge (--registry <dir> | --store <dir>) --house <id> --task <task> --holder <you> --reason <text> [--without-forge] [--accept-unknown] [--json]
 ```
 
 `preview` writes nothing. It prints a digest and exits 0 when the proposal can
@@ -216,8 +220,8 @@ Preview what the dishwasher would release, and record your approval.
 Releases nothing.
 
 ```sh
-kitchn cleanup preview --store <dir> --house <id> --inventory <inventory.json> [--remote origin] [--trigger manual] [--json]
-kitchn cleanup approve --store <dir> --house <id> --inventory <inventory.json> --holder <you> --digest <sha256:...>
+kitchn cleanup preview (--registry <dir> | --store <dir>) --house <id> --inventory <inventory.json> [--remote origin] [--trigger manual] [--json]
+kitchn cleanup approve (--registry <dir> | --store <dir>) --house <id> --inventory <inventory.json> --holder <you> --digest <sha256:...>
 ```
 
 The inventory is a snapshot exported from the backend; Git reads each listed
@@ -244,7 +248,7 @@ Post the gardener's stale-issue report and record the issue as handled, so the
 daily precheck stays idle for it until someone updates the issue again.
 
 ```sh
-kitchn gardener report-stale --registry <dir> --house <id> --store <dir> \
+kitchn gardener report-stale --registry <dir> --house <id> [--store <dir>] \
   --repository <owner/name> --issue <n> --body <text> \
   --github-backend <id> --requester <login> --credential <name> --credential-file <path> --gh <path>
 ```
@@ -264,7 +268,7 @@ The schedule budget tick: pause schedules that exhausted their usage budget and
 report them to the owner.
 
 ```sh
-kitchn budget precheck --registry <dir> --house <id> --store <dir> --orca <path> --backend <id> --credential <name> --runtime-dir <dir>
+kitchn budget precheck --registry <dir> --house <id> [--store <dir>] --orca <path> --backend <id> --credential <name> --runtime-dir <dir>
 kitchn budget run      [same options] [report options]
 kitchn budget install  [same options] [report options] --kitchen <path> --cron "15 * * * *" --timezone <tz> --agent claude|codex
 ```
@@ -291,8 +295,8 @@ How full the house store is, and the retention pass that removes markers and
 settled tasks no workflow still needs.
 
 ```sh
-kitchn store capacity --house <id> --store <dir> [--json]
-kitchn store retain   --house <id> --store <dir> [--registry <dir> --gh <path>] [--window-days 31] [--max-lookups 200] [--apply] [--json]
+kitchn store capacity --house <id> (--registry <dir> | --store <dir>) [--json]
+kitchn store retain   --house <id> (--registry <dir> | --store <dir>) [--gh <path>] [--window-days 31] [--max-lookups 200] [--apply] [--json]
 ```
 
 `capacity` exits 1 when a table is at 80% of its limit or more. `retain` only

@@ -50,9 +50,10 @@ struct ReportStaleArgs {
     registry: PathBuf,
     #[arg(long)]
     house: HouseId,
-    /// Absolute path of the house's initialized state store.
+    /// Absolute path of the house's initialized state store (default: the
+    /// one `house init` created in the registry).
     #[arg(long)]
-    store: PathBuf,
+    store: Option<PathBuf>,
     /// The stale issue's repository, one of the house's posting destinations.
     #[arg(long)]
     repository: Repository,
@@ -210,7 +211,11 @@ fn read_client(
 }
 
 fn report_stale(args: ReportStaleArgs) -> Result<gardener::StaleReportOutcome, Failure> {
-    if !args.store.is_absolute() {
+    if args
+        .store
+        .as_ref()
+        .is_some_and(|store| !store.is_absolute())
+    {
         return Err(Failure::Invalid);
     }
     let issue = IssueNumber::new(args.issue).map_err(invalid)?;
@@ -256,8 +261,9 @@ fn report_stale(args: ReportStaleArgs) -> Result<gardener::StaleReportOutcome, F
         return Err(reported(IntegrationError::PermissionDenied.into()));
     }
     let grants = config.authority().map_err(|error| reported(error.into()))?;
-    let store =
-        HouseStore::open(args.store, args.house, StoreOptions::default()).map_err(reported)?;
+    let store = super::house::store_or_default(args.store, Some(&args.registry), &args.house)
+        .map_err(|error| reported(error.into()))?;
+    let store = HouseStore::open(store, args.house, StoreOptions::default()).map_err(reported)?;
     let pass = gardener::StaleReportPass {
         store: &store,
         client: &client,

@@ -52,8 +52,9 @@ session: report it and ask the person how to proceed. Never pick a house.
 
 ## 2. Entrypoints
 
-Claims use the same durable tasks as scheduled runs. Pass `--store <house
-store dir>` and `--holder <person's handle>` to `work` and `pr`. If the plan
+Claims use the same durable tasks as scheduled runs, kept in the house store
+`kitchn house init` created. Pass `--holder <person's handle>` to `work` and
+`pr`; add `--store <dir>` only when the person names another store. If the plan
 is `skipped`, someone else holds the item: say who (`scheduled` or
 `interactive`) and stop. Use `--take-over` only when the plan says the
 previous claim expired and the person asks for it.
@@ -66,7 +67,7 @@ Write the issue facts you read from the forge to a temporary file:
 { "status": "open", "subIssues": [{ "number": 15, "status": "open", "blocked": false }], "independentParts": false }
 ```
 
-`kitchn work <issue> --facts <file> --revision <rev> --registry <dir> --store <dir> --holder <you> [orca flags] --json`
+`kitchn work <issue> --facts <file> --revision <rev> --registry <dir> --holder <you> [orca flags] --json`
 
 - `coordinate`: list ready and waiting sub-issues. With `fanOut: true`, ask
   the person before starting each worker. Otherwise work them one at a time.
@@ -84,7 +85,7 @@ Facts at one head:
 { "state": "open", "head": "<40-hex sha>", "headBranch": "…", "baseBranch": "main", "mergeability": "clean", "review": "unreviewed" }
 ```
 
-`kitchn pr <number> --facts <file> [--as review|follow-up|repair|gate] --revision <rev> --registry <dir> --store <dir> --holder <you> [orca flags] --json`
+`kitchn pr <number> --facts <file> [--as review|follow-up|repair|gate] --revision <rev> --registry <dir> --holder <you> [orca flags] --json`
 
 Kitchen reads the rounds already spent from the house store and applies the
 house's fix-round budget. `--fix-rounds <n>` can only lower that budget.
@@ -116,7 +117,7 @@ dependency, and the digest. A preview with open questions is not ready.
 Nothing is posted by these commands. Once the person approves that digest,
 post it with the same draft file:
 
-`kitchn issue apply --draft <file> --approve <digest> --registry <dir> --store <dir> --holder <you>`
+`kitchn issue apply --draft <file> --approve <digest> --registry <dir> --holder <you>`
 
 It writes through the house's forge binding, and only the exact preview the
 digest names; a changed draft is refused until the person approves its new
@@ -129,7 +130,7 @@ A draft refused because an earlier draft settled after writing
 Show them the task and its writes, have them check those writes on the
 forge, and run with their reason:
 
-`kitchn issue acknowledge <task> --reason <why> --registry <dir> --store <dir> --holder <you>`
+`kitchn issue acknowledge <task> --reason <why> --registry <dir> --holder <you>`
 
 With a forge binding it first re-reads the forge for writes whose outcome is
 unknown; without one, such a write stays unknown. Add `--accept-unknown`
@@ -141,7 +142,7 @@ your own.
 When you stop before the work is done, hand the claim back so scheduled runs
 or another session can adopt it:
 
-`kitchn hand-back <task> --registry <dir> --store <dir> --holder <you>`
+`kitchn hand-back <task> --registry <dir> --holder <you>`
 
 ## 4. Scheduling
 

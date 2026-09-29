@@ -57,8 +57,8 @@ When you stop before the work is done, tell the session to hand the claim back.
 A scheduled run or another session can then adopt it. Under the hood the
 session runs `kitchn hand-back`.
 
-Claims live in the house's state store. The store must already exist, and
-kitchn has no command that creates one yet.
+Claims live in the house's state store. `kitchn house init` creates it in the
+registry, and sessions find it there.
 
 ## Pull request plans
 

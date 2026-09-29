@@ -148,7 +148,7 @@ fn guided_init_without_gh_binds_nothing_and_show_names_the_missing_binding() -> 
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
     assert!(!text(&output.stdout).contains("Bound the house"));
     let registry = fixture.home.join(".kitchn");
-    assert!(!registry.join("private").exists());
+    assert!(!registry.join("private/acme/forge.json").exists());
 
     let registry = registry.display().to_string();
     let show = kitchen(

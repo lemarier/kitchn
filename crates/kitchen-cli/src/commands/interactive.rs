@@ -90,9 +90,10 @@ struct Session {
 /// The durable claim the person takes.
 #[derive(Args)]
 struct Claim {
-    /// The house's initialized state store.
+    /// The house's initialized state store (default: the one `house init`
+    /// created in the registry).
     #[arg(long)]
-    store: PathBuf,
+    store: Option<PathBuf>,
     /// The person present.
     #[arg(long)]
     holder: HolderId,
@@ -235,9 +236,10 @@ struct StoreArgs {
     /// A path inside the checkout whose remotes identify the repository.
     #[arg(long, default_value = ".")]
     repository_path: PathBuf,
-    /// The house's initialized state store.
+    /// The house's initialized state store (default: the one `house init`
+    /// created in the registry).
     #[arg(long)]
-    store: PathBuf,
+    store: Option<PathBuf>,
     /// The person present.
     #[arg(long)]
     holder: HolderId,
@@ -260,11 +262,11 @@ impl StoreArgs {
             RepositoryMatch::Bound(binding) => binding,
             RepositoryMatch::Unbound { .. } => return Err(HouseError::HouseSelection.into()),
         };
-        let store = HouseStore::open(
-            absolute(self.store.clone())?,
-            binding.house.clone(),
-            StoreOptions::default(),
-        )?;
+        let store = match &self.store {
+            Some(store) => absolute(store.clone())?,
+            None => registry.store_path(&binding.house)?,
+        };
+        let store = HouseStore::open(store, binding.house.clone(), StoreOptions::default())?;
         Ok(BoundStore {
             registry,
             house: binding.house,
@@ -320,6 +322,7 @@ fn capture(path: &PathBuf) -> Option<Vec<u8>> {
 
 /// A resolved session: the bound house and the execution mode.
 struct Opened {
+    registry: HouseRegistry,
     house: ResolvedHouse,
     mode: ExecutionMode,
     json: bool,
@@ -351,6 +354,7 @@ fn open(session: Session) -> Result<Result<Opened, String>, kitchen::Error> {
     };
     let mode = execution_mode(&house.binding.repository, &orchestrator);
     Ok(Ok(Opened {
+        registry,
         house,
         mode,
         json: session.json,
@@ -379,12 +383,13 @@ fn ttl(claim: &Claim) -> Result<LeaseTtl, kitchen::Error> {
     ))?)
 }
 
-fn store(claim: &Claim, house: &ResolvedHouse) -> Result<HouseStore, kitchen::Error> {
-    HouseStore::open(
-        absolute(claim.store.clone())?,
-        house.binding.house.clone(),
-        StoreOptions::default(),
-    )
+fn store(claim: &Claim, opened: &Opened) -> Result<HouseStore, kitchen::Error> {
+    let house = &opened.house.binding.house;
+    let store = match &claim.store {
+        Some(store) => absolute(store.clone())?,
+        None => opened.registry.store_path(house)?,
+    };
+    HouseStore::open(store, house.clone(), StoreOptions::default())
 }
 
 #[derive(Serialize)]
@@ -481,7 +486,7 @@ fn run_work(args: WorkArgs) -> Result<(String, bool), kitchen::Error> {
         Ok(opened) => opened,
         Err(setup) => return Ok((setup, false)),
     };
-    let store = store(&args.claim, &opened.house)?;
+    let store = store(&args.claim, &opened)?;
     let template = template(&opened.house)?;
     let issue = IssueRef {
         repository: opened.house.binding.repository.clone(),
@@ -632,7 +637,7 @@ fn run_pr(args: PrArgs) -> Result<(String, bool), kitchen::Error> {
         Ok(opened) => opened,
         Err(setup) => return Ok((setup, false)),
     };
-    let store = store(&args.claim, &opened.house)?;
+    let store = store(&args.claim, &opened)?;
     let template = template(&opened.house)?;
     let claimant = Claimant::interactive(args.claim.holder.clone());
     let (plan, lease) = pull_request(&PrRequest {

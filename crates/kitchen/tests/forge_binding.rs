@@ -737,7 +737,7 @@ fn guided_init_without_a_login_binds_nothing_by_default() -> TestResult {
     assert!(plan.forge_text().contains("kitchn forge bind"));
     let report = register_house(&plan)?;
     assert_eq!(report.forge, None);
-    assert!(!registry.join("private").exists());
+    assert!(!registry.join("private/acme/forge.json").exists());
     let registry = HouseRegistry::new(registry)?;
     assert!(matches!(
         forge_binding(&registry, &HouseId::new("acme")?),

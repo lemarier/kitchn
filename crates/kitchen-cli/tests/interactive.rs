@@ -175,6 +175,85 @@ fn work_claims_the_issue_and_a_second_session_is_skipped() -> TestResult {
 }
 
 #[test]
+fn claims_default_to_the_house_store_and_store_overrides_it() -> TestResult {
+    let setup = setup(true)?;
+    let house: kitchen::HouseId = "crabnebula".parse()?;
+    let default = setup.registry.initialize_store(&house)?.path;
+    let facts = setup.file("facts.json", ISSUE)?;
+    let facts = facts.to_str().ok_or("path")?;
+    let kitchn = |args: &[&str]| -> TestResult<Output> {
+        Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
+            .current_dir(&setup.consumer)
+            .args(args)
+            .arg("--registry")
+            .arg(setup.registry.root())
+            .output()?)
+    };
+    let tasks = |store: &Path| -> TestResult<usize> {
+        Ok(
+            HouseStore::open(store, house.clone(), StoreOptions::default())?
+                .tasks()?
+                .len(),
+        )
+    };
+
+    // Without --store the claim lands in the store house init created.
+    let work = kitchn(&[
+        "work",
+        "17",
+        "--facts",
+        facts,
+        "--revision",
+        REVISION,
+        "--holder",
+        "person",
+        "--json",
+    ])?;
+    assert_eq!(work.status.code(), Some(0), "{work:?}");
+    let task = json(&work)?["plan"]["task"]
+        .as_str()
+        .ok_or("task")?
+        .to_owned();
+    assert_eq!((tasks(&default)?, tasks(&setup.store)?), (1, 0));
+    let released = kitchn(&["hand-back", &task, "--holder", "person"])?;
+    assert_eq!(released.status.code(), Some(0), "{released:?}");
+
+    // An explicit --store is used instead of the default.
+    let store = setup.store.to_str().ok_or("path")?;
+    let work = kitchn(&[
+        "work",
+        "18",
+        "--facts",
+        facts,
+        "--revision",
+        REVISION,
+        "--holder",
+        "person",
+        "--store",
+        store,
+    ])?;
+    assert_eq!(work.status.code(), Some(0), "{work:?}");
+    assert_eq!((tasks(&default)?, tasks(&setup.store)?), (1, 1));
+    // A store that does not exist is refused, never created on the way.
+    let missing = setup.root.join("missing");
+    let refused = kitchn(&[
+        "work",
+        "19",
+        "--facts",
+        facts,
+        "--revision",
+        REVISION,
+        "--holder",
+        "person",
+        "--store",
+        missing.to_str().ok_or("path")?,
+    ])?;
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(!missing.exists());
+    Ok(())
+}
+
+#[test]
 fn orca_captures_enable_fan_out_only_for_this_repository() -> TestResult {
     let setup = setup(true)?;
     let facts = setup.file(

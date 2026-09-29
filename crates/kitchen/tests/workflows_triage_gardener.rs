@@ -978,12 +978,19 @@ fn gardener_installs_a_disabled_daily_schedule_with_its_own_precheck() -> common
         ConsumerId,
         contracts::{Effect, Permission, ScheduleEffect},
         scheduling::{AgentFamily, Recurrence, TimeOfDay, Timezone},
+        selection::{AgentSelection, ResolvedSelection},
     };
     let consumer = ConsumerId::new("gardener-sample-project")?;
     let at = TimeOfDay::new(6, 30)?;
     let zone = Timezone::new("America/Toronto")?;
     let install = |args: &gardener::PrecheckArgs| {
-        gardener::install(consumer.clone(), at, zone.clone(), AgentFamily::Codex, args)
+        gardener::install(
+            consumer.clone(),
+            at,
+            zone.clone(),
+            ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Codex)),
+            args,
+        )
     };
     let Effect::Schedule(effect) = install(&precheck_args()?)? else {
         return Err("expected a schedule effect".into());
@@ -996,7 +1003,10 @@ fn gardener_installs_a_disabled_daily_schedule_with_its_own_precheck() -> common
     assert_eq!(schedule.consumer(), &consumer);
     assert_eq!(schedule.recurrence(), &Recurrence::Daily(at));
     assert_eq!(schedule.timezone(), &zone);
-    assert_eq!(schedule.agent(), AgentFamily::Codex);
+    assert_eq!(
+        schedule.agent(),
+        &ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Codex))
+    );
     assert!(schedule.prompt().as_str().contains("sample/project"));
     let precheck = schedule.precheck().ok_or("missing precheck")?;
     let argv: Vec<&str> = precheck.argv().iter().map(Text::as_str).collect();

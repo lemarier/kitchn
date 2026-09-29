@@ -354,7 +354,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 ScheduleField::Prompt,
             ),
             (
-                automation.agent_id.as_deref() == Some(spec.agent().as_str()),
+                automation.agent_id.as_deref() == Some(spec.agent().selection.agent.as_str()),
                 ScheduleField::Agent,
             ),
             (
@@ -406,7 +406,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 &native_schedule_name(&config.house, spec.consumer()),
             )
             .value("prompt", spec.prompt().as_str())
-            .value("provider", spec.agent().as_str())
+            .value("provider", spec.agent().selection.agent.as_str())
             .value("timezone", spec.timezone().as_str())
             .value(
                 "missed-run-grace-minutes",
@@ -451,13 +451,19 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// Install `spec` paused, or return the paused schedule already installed
     /// for its consumer with the same definition.
     ///
+    /// A selection naming a model or effort is refused before anything is
+    /// read or reserved: Orca automations take only a provider
+    /// ([`SCHEDULE_SELECTION`](super::SCHEDULE_SELECTION)).
+    ///
     /// Concurrent installers for one house and consumer take turns: the
     /// listing, the create, and the read-back happen under a reservation, so
     /// a second installer finds the schedule the first created.
     ///
     /// # Errors
-    /// [`OrcaError::ScheduleActive`] when the consumer's schedule is firing
-    /// and [`OrcaError::ScheduleDiffers`] when it is not the requested one;
+    /// [`OrcaError::Selection`] naming every part of the selection Orca
+    /// cannot launch. [`OrcaError::ScheduleActive`] when the consumer's
+    /// schedule is firing and [`OrcaError::ScheduleDiffers`] when it is not
+    /// the requested one;
     /// neither changes anything. [`OrcaError::DuplicateSchedules`] when
     /// several share the name, [`OrcaError::InstallUncertain`] when a create
     /// may have happened but no listing shows it,
@@ -471,6 +477,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// [`OrcaBackend::install_schedule`], and whether this call created the
     /// schedule or reused one already installed.
     fn install(&self, spec: &ScheduleSpec) -> Result<(ResourceRef, Install), OrcaError> {
+        backend::SCHEDULE_SELECTION.check(&spec.agent().selection)?;
         let consumer = spec.consumer();
         let mut reservation = self.reserve(format!(
             "schedule-{:032x}",
@@ -575,6 +582,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 scheduled_for: run.scheduled_for.map(Timestamp::from_unix_millis),
                 created_at: run.created_at.map(Timestamp::from_unix_millis),
                 usage: run_usage(run),
+                // Orca's run records carry no provider, and the automation's
+                // current one may have been edited since the run.
+                agent: None,
             })
             .collect();
         Ok(ScheduleObservation {
@@ -720,6 +730,7 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::BranchTaken { .. }
         | OrcaError::Schedule(_)
         | OrcaError::ScheduleLimit(_)
+        | OrcaError::Selection(_)
         | OrcaError::Contract(_) => EffectFailure::NotApplied(NotAppliedReason::Rejected),
         // Nothing was sent, but the holder may be about to install it.
         OrcaError::Timeout | OrcaError::ReservationBusy => {
@@ -810,6 +821,15 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         };
         match effect {
             ScheduleEffect::InstallDisabled { schedule } => {
+                // The lookup matches on the provider alone, so it must refuse
+                // a selection an install would have refused: Orca cannot
+                // have launched a model or effort it does not take.
+                if backend::SCHEDULE_SELECTION
+                    .check(&schedule.agent().selection)
+                    .is_err()
+                {
+                    return Ok(Lookup::Unknown);
+                }
                 let listed = self.automations().map_err(unavailable)?;
                 // Applied only when an install would reuse the schedule: one
                 // that is active or different is not what was requested. The

@@ -12,6 +12,10 @@ use common::{
     Fixture, ManualClock, TestResult, at, commit, creator, house, other_house, scheduled, task_id,
     ttl,
 };
+use kitchen::selection::{
+    AgentModel, AgentSelection, EffortLevel, ResolvedSelection, SelectionError, SelectionGap,
+    SelectionSource,
+};
 use kitchen::{
     BackendId, ConsumerId, CredentialId, EffectName,
     adapters::orca::{
@@ -1156,6 +1160,13 @@ fn adoption_moves_the_mailbox_to_the_new_coordinator() -> TestResult {
 }
 
 fn schedule_spec(consumer: &str) -> TestResult<ScheduleSpec> {
+    schedule_spec_for(
+        consumer,
+        ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Claude)),
+    )
+}
+
+fn schedule_spec_for(consumer: &str, agent: ResolvedSelection) -> TestResult<ScheduleSpec> {
     let precheck = Precheck::new(
         vec![
             Text::new("kitchen")?,
@@ -1170,14 +1181,14 @@ fn schedule_spec(consumer: &str) -> TestResult<ScheduleSpec> {
         Recurrence::Cron(CronExpr::new("17,37,57 * * * *")?),
         Timezone::new("America/Toronto")?,
         Text::new("Run Kitchen pickup.")?,
-        AgentFamily::Claude,
+        agent,
     )
     .with_precheck(precheck))
 }
 
 fn install(consumer: &str) -> TestResult<ScheduleEffect> {
     Ok(ScheduleEffect::InstallDisabled {
-        schedule: schedule_spec(consumer)?,
+        schedule: schedule_spec(consumer)?.into(),
     })
 }
 
@@ -1240,6 +1251,148 @@ fn install_creates_paused_once_and_reuses_it() -> TestResult {
         listed.first().map(|s| s.state),
         Some(ObservedScheduleState::Paused)
     );
+    Ok(())
+}
+
+#[test]
+fn a_schedule_naming_a_model_or_effort_is_refused_before_orca_is_called() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let resolved = |model: Option<&str>, effort: Option<&str>| -> TestResult<ResolvedSelection> {
+        Ok(ResolvedSelection {
+            selection: AgentSelection {
+                agent: AgentFamily::Claude,
+                model: model.map(AgentModel::new).transpose()?,
+                effort: effort.map(EffortLevel::new).transpose()?,
+            },
+            source: SelectionSource::HouseRule,
+        })
+    };
+    for (agent, gaps) in [
+        (resolved(Some("sonnet"), None)?, vec![SelectionGap::Model]),
+        (resolved(None, Some("low"))?, vec![SelectionGap::Effort]),
+        (
+            resolved(Some("sonnet"), Some("low"))?,
+            vec![SelectionGap::Model, SelectionGap::Effort],
+        ),
+    ] {
+        let spec = schedule_spec_for("pickup", agent)?;
+        assert_eq!(
+            backend.install_schedule(&spec),
+            Err(OrcaError::Selection(SelectionError::Unsupported {
+                agent: AgentFamily::Claude,
+                gaps,
+            }))
+        );
+        let effect = request(
+            ScheduleEffect::InstallDisabled {
+                schedule: spec.into(),
+            },
+            "install-model",
+        )?;
+        assert_eq!(
+            backend.execute(&effect),
+            Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+        );
+    }
+    assert!(
+        sim.calls_to(&["automations"]).is_empty(),
+        "nothing is listed, reserved, or created for a refused selection"
+    );
+
+    // The same policy source with only a family installs.
+    let family = resolved(None, None)?;
+    let installed = backend.install_schedule(&schedule_spec_for("pickup", family)?)?;
+    let creates = sim.calls_to(&["automations", "create"]);
+    let create = creates.first().ok_or("one create")?;
+    assert_eq!(flag(create, "provider"), Some("claude"));
+    assert_eq!(flag(create, "model"), None);
+    assert_eq!(flag(create, "effort"), None);
+    sim.state().runs = vec![json!({"status": "completed", "scheduledFor": 1000})];
+    let readiness = Readiness::new(&[], at(0), Duration::from_secs(300));
+    let observed = backend.inspect_schedule(&installed, &readiness)?;
+    assert_eq!(
+        observed
+            .recent_runs
+            .iter()
+            .map(|judged| judged.run.agent.clone())
+            .collect::<Vec<_>>(),
+        [None],
+        "Orca records no provider per run, so none is claimed"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_run_is_not_attributed_to_the_automations_current_provider() -> TestResult {
+    // Orca run records carry no provider. An automation edited to another
+    // provider after its runs must not relabel them, so every provider,
+    // known or not, leaves the run's agent unrecorded.
+    for provider in ["claude", "codex", "gemini"] {
+        let sim = SimOrca::default();
+        sim.state().automations.push(SimAutomation {
+            flags: std::collections::BTreeMap::from([("provider".to_owned(), provider.to_owned())]),
+            ..automation("auto-9", "kitchen:origin89:pickup", false)
+        });
+        sim.state().runs = vec![
+            json!({"status": "completed", "scheduledFor": 1000}),
+            json!({"status": "completed", "scheduledFor": 2000}),
+        ];
+        let backend = connect(&sim)?;
+        let readiness = Readiness::new(&[], at(0), Duration::from_secs(300));
+        let observed = backend.inspect_schedule(&schedule("auto-9")?, &readiness)?;
+        let agents: Vec<_> = observed
+            .recent_runs
+            .iter()
+            .map(|judged| judged.run.agent.clone())
+            .collect();
+        assert_eq!(agents, [None, None], "provider {provider}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_lookup_never_finds_a_selection_orca_cannot_launch_applied() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    // A paused family-only schedule with the same definition exists, as
+    // when an install's outcome was not recorded.
+    backend.install_schedule(&schedule_spec_for(
+        "pickup",
+        ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Claude)),
+    )?)?;
+    let named = |model: Option<&str>, effort: Option<&str>| -> TestResult<ScheduleEffect> {
+        Ok(ScheduleEffect::InstallDisabled {
+            schedule: schedule_spec_for(
+                "pickup",
+                ResolvedSelection {
+                    selection: AgentSelection {
+                        agent: AgentFamily::Claude,
+                        model: model.map(AgentModel::new).transpose()?,
+                        effort: effort.map(EffortLevel::new).transpose()?,
+                    },
+                    source: SelectionSource::HouseRule,
+                },
+            )?
+            .into(),
+        })
+    };
+    for (model, effort) in [
+        (Some("sonnet"), None),
+        (None, Some("low")),
+        (Some("sonnet"), Some("low")),
+    ] {
+        assert_eq!(
+            backend.resolve(&request(named(model, effort)?, "lookup")?)?,
+            Lookup::Unknown,
+            "model {model:?} effort {effort:?}"
+        );
+    }
+    // The family-only definition of the same schedule still resolves.
+    assert!(matches!(
+        backend.resolve(&request(named(None, None)?, "lookup")?)?,
+        Lookup::Applied(_)
+    ));
     Ok(())
 }
 
@@ -1792,7 +1945,7 @@ fn installing_disabled_refuses_a_schedule_that_differs_from_the_request() -> Tes
             Recurrence::Cron(CronExpr::new("0 9 * * *")?),
             spec.timezone().clone(),
             Text::new("A different prompt.")?,
-            AgentFamily::Codex,
+            ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Codex)),
         )))?,
         differs(&[
             ScheduleField::Prompt,
@@ -1854,7 +2007,7 @@ fn presets_are_sent_and_compared_as_cron() -> TestResult {
             recurrence,
             Timezone::new("UTC")?,
             Text::new("Run it.")?,
-            AgentFamily::Claude,
+            ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Claude)),
         ))
     };
     let daily = spec(Recurrence::Daily(TimeOfDay::new(9, 5)?))?;

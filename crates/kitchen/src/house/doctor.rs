@@ -91,6 +91,9 @@ pub enum DoctorCode {
     Capability,
     /// A configured model is not offered by the installed agent, or was not checked.
     AgentModel,
+    /// A scheduled workflow's resolved selection names a model or effort the
+    /// schedule backend cannot enforce.
+    ScheduleAgent,
     /// A legacy `.kitchen.json` remains in the working tree.
     LegacyBinding,
     /// The configured stack tool is missing or was not probed.
@@ -309,6 +312,33 @@ pub fn doctor(
                 .collect::<Vec<_>>()
                 .join(", ");
             findings.push(DoctorFinding { code: DoctorCode::AgentModel, message: format!("{message}: {names}."), next_step: "List the models each installed agent offers and rerun doctor with that observation. Correct the house agents policy for any model that is not offered; Kitchen refuses launches it cannot provide and never substitutes another model.".into() });
+        }
+    }
+    if let Some(agents) = &house.agents
+        && !capabilities.supports(Capability::AgentSelectModel)
+    {
+        for workflow in &repository.workflows {
+            let request = workflow
+                .schedule_request()
+                .map_err(|_| HouseError::InvalidInput)?;
+            let selection = agents.resolve(&request).selection;
+            let named: Vec<String> = [
+                selection
+                    .model
+                    .as_ref()
+                    .map(|model| format!("model {model}")),
+                selection
+                    .effort
+                    .as_ref()
+                    .map(|effort| format!("effort {effort}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if named.is_empty() {
+                continue;
+            }
+            findings.push(DoctorFinding { code: DoctorCode::ScheduleAgent, message: format!("Scheduled {workflow} resolves to {} {}, which the schedule backend cannot enforce; Kitchen refuses to install it rather than run the agent's default.", selection.agent.as_str(), named.join(" and ")), next_step: format!("Add a family-only house agents rule for role {} and work type {workflow}, so the schedule stays a trigger and the workers it hands work to carry the model; or configure a schedule backend that fully supports {}.", workflow.role(), Capability::AgentSelectModel) });
         }
     }
     if let Some(tool) = house.stack_tool

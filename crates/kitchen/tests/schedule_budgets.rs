@@ -13,6 +13,7 @@ use common::{
     Fixture, ManualClock, TestResult, at, commit, creator, house, other_house, scheduled, task_id,
     ttl,
 };
+use kitchen::selection::{AgentSelection, ResolvedSelection};
 use kitchen::{
     BackendId, ConsumerId, CredentialId, EffectName, HouseId,
     adapters::orca::{OrcaBackend, OrcaConfig, OrcaError},
@@ -85,7 +86,7 @@ fn spec(name: &str, cron: &str) -> TestResult<ScheduleSpec> {
         Recurrence::Cron(CronExpr::new(cron)?),
         Timezone::new("America/Toronto")?,
         Text::new("Run Kitchen pickup.")?,
-        AgentFamily::Claude,
+        ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Claude)),
     ))
 }
 
@@ -121,6 +122,7 @@ fn run(due_ms: u64, verdict: RunVerdict, usage: Measurement<u64>) -> JudgedRun {
             scheduled_for: Some(Timestamp::from_unix_millis(due_ms)),
             created_at: None,
             usage,
+            agent: None,
         },
         verdict,
     }
@@ -1230,7 +1232,7 @@ fn orca_refuses_an_install_that_breaks_a_limit_before_creating_anything() -> Tes
         kitchen::contracts::AttemptNumber::FIRST,
         kitchen::contracts::IdempotencyKey::from_ref(ExternalRef::new("install-1")?),
         Effect::Schedule(ScheduleEffect::InstallDisabled {
-            schedule: spec("pickup", "*/20 * * * *")?,
+            schedule: spec("pickup", "*/20 * * * *")?.into(),
         }),
     );
     assert!(matches!(

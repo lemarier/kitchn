@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConsumerId,
     contracts::{ResourceRef, Text},
+    selection::{AgentSelection, ResolvedSelection},
 };
 
 /// A rejected schedule value. Input text is never echoed.
@@ -333,7 +334,7 @@ impl Timezone {
     }
 }
 
-/// The agent family a scheduled run starts.
+/// An agent family Kitchen can launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentFamily {
@@ -572,7 +573,7 @@ pub struct ScheduleSpec {
     recurrence: Recurrence,
     timezone: Timezone,
     prompt: Text,
-    agent: AgentFamily,
+    agent: ResolvedSelection,
     precheck: Option<Precheck>,
     workspace: ScheduleWorkspace,
     missed_run_grace: GraceMinutes,
@@ -582,6 +583,11 @@ pub struct ScheduleSpec {
 impl ScheduleSpec {
     /// A schedule with no precheck, a fresh workspace per run, no missed-run
     /// grace, and no session reuse.
+    ///
+    /// `agent` is the selection the house policy resolved for the scheduled
+    /// work, kept with the schedule for attribution. A backend that cannot
+    /// launch all of it refuses the install, naming the gap, and never runs
+    /// the agent's default model in its place.
     #[must_use]
     pub const fn new(
         workflow: WorkflowName,
@@ -589,7 +595,7 @@ impl ScheduleSpec {
         recurrence: Recurrence,
         timezone: Timezone,
         prompt: Text,
-        agent: AgentFamily,
+        agent: ResolvedSelection,
     ) -> Self {
         Self {
             workflow,
@@ -673,10 +679,10 @@ impl ScheduleSpec {
         &self.prompt
     }
 
-    /// The agent family each run starts.
+    /// The agent selection each run starts, and where it came from.
     #[must_use]
-    pub const fn agent(&self) -> AgentFamily {
-        self.agent
+    pub const fn agent(&self) -> &ResolvedSelection {
+        &self.agent
     }
 
     /// The precheck, if any.
@@ -712,12 +718,31 @@ struct RawScheduleSpec {
     recurrence: Recurrence,
     timezone: Timezone,
     prompt: Text,
-    agent: AgentFamily,
+    agent: RawAgent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     precheck: Option<Precheck>,
     workspace: ScheduleWorkspace,
     missed_run_grace: GraceMinutes,
     reuse_session: bool,
+}
+
+/// A schedule's agent as stored. Schedules persisted before selections were
+/// recorded name only a family; they decode as that family's default,
+/// chosen outside the policy.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum RawAgent {
+    Resolved(ResolvedSelection),
+    Family(AgentFamily),
+}
+
+impl From<RawAgent> for ResolvedSelection {
+    fn from(raw: RawAgent) -> Self {
+        match raw {
+            RawAgent::Resolved(resolved) => resolved,
+            RawAgent::Family(agent) => Self::owner(AgentSelection::agent_default(agent)),
+        }
+    }
 }
 
 impl TryFrom<RawScheduleSpec> for ScheduleSpec {
@@ -730,7 +755,7 @@ impl TryFrom<RawScheduleSpec> for ScheduleSpec {
             recurrence: raw.recurrence,
             timezone: raw.timezone,
             prompt: raw.prompt,
-            agent: raw.agent,
+            agent: raw.agent.into(),
             precheck: raw.precheck,
             workspace: raw.workspace,
             missed_run_grace: raw.missed_run_grace,
@@ -752,7 +777,7 @@ impl From<ScheduleSpec> for RawScheduleSpec {
             recurrence: spec.recurrence,
             timezone: spec.timezone,
             prompt: spec.prompt,
-            agent: spec.agent,
+            agent: RawAgent::Resolved(spec.agent),
             precheck: spec.precheck,
             workspace: spec.workspace,
             missed_run_grace: spec.missed_run_grace,

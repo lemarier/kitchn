@@ -6,6 +6,7 @@ use crate::{
     ErrorClass,
     contracts::ContractError,
     scheduling::{BudgetError, ScheduleError, ScheduleField},
+    selection::SelectionError,
 };
 
 /// An Orca adapter failure. Messages from Orca are redacted and truncated;
@@ -163,6 +164,10 @@ pub enum OrcaError {
     /// The house's schedule limits refused the change; nothing was sent.
     #[error(transparent)]
     ScheduleLimit(#[from] BudgetError),
+    /// The launch surface cannot provide the requested agent selection;
+    /// nothing was sent.
+    #[error(transparent)]
+    Selection(#[from] SelectionError),
     /// A contract value was rejected.
     #[error(transparent)]
     Contract(#[from] ContractError),
@@ -176,6 +181,7 @@ impl OrcaError {
             Self::Schedule(_) => ErrorClass::InvalidInput,
             Self::ScheduleLimit(error) => error.class(),
             Self::Contract(error) => error.class(),
+            Self::Selection(error) => error.class(),
             Self::UnsupportedVersion { .. }
             | Self::MissingRuntimeFeature(_)
             | Self::NotKitchenOwned

@@ -26,7 +26,7 @@ use crate::{
         RogerEffect, Role, ScheduleEffect, Text, WorkerBackend, WorkerState, Workspace,
     },
     scheduling::{AgentFamily, Recurrence, ScheduleSpec, Timezone, WorkflowName},
-    selection::AgentSelection,
+    selection::{AgentSelection, ResolvedSelection},
 };
 
 /// One contract check.
@@ -493,8 +493,11 @@ impl<'a> Runner<'a> {
                         Timezone::new("UTC")
                             .or_else(|_| fail(Check::Fixture, "invalid sample time zone"))?,
                         self.fixture.brief.clone(),
-                        AgentFamily::Claude,
-                    ),
+                        ResolvedSelection::owner(AgentSelection::agent_default(
+                            AgentFamily::Claude,
+                        )),
+                    )
+                    .into(),
                 }),
             ),
         ])

@@ -123,8 +123,8 @@ mod wire;
 
 pub use backend::{
     BranchCollision, DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT,
-    MAX_REPO_WORKTREES, MAX_RUN_TASKS, OrcaBackend, OrcaConfig, WORKER_SELECTION, launch_marker,
-    verify_branch,
+    MAX_REPO_WORKTREES, MAX_RUN_TASKS, OrcaBackend, OrcaConfig, SCHEDULE_SELECTION,
+    WORKER_SELECTION, launch_marker, verify_branch,
 };
 pub use error::OrcaError;
 pub use inspect::{

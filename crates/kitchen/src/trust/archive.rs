@@ -127,10 +127,14 @@ pub struct Archival {
 }
 
 impl Archival {
-    /// Records the batch moved.
+    /// Records the batch moved; `None` when the counts overflow, which only
+    /// a corrupt snapshot can hold.
     #[must_use]
-    pub const fn records(&self) -> usize {
-        self.observations + self.bindings + self.inspections
+    pub const fn records(&self) -> Option<usize> {
+        match self.observations.checked_add(self.bindings) {
+            Some(sum) => sum.checked_add(self.inspections),
+            None => None,
+        }
     }
 
     /// Committed length of [`ARCHIVE_FILE`]: the sum of every batch line;

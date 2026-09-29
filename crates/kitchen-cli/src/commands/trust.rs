@@ -127,7 +127,11 @@ fn capacity_text(capacity: &Capacity, archivals: &[Archival]) -> String {
             "Near the limit: ordinary writes stop when either limit is reached. Run `kitchn trust archive` to preview what can leave.\n",
         );
     }
-    let records: usize = archivals.iter().map(Archival::records).sum();
+    // A loaded ledger has already refused counts that overflow.
+    let records = archivals
+        .iter()
+        .filter_map(Archival::records)
+        .fold(0_usize, usize::saturating_add);
     let _ = writeln!(
         text,
         "Archived: {records} record(s) in {} archival(s)",

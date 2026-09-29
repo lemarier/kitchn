@@ -587,6 +587,15 @@ fn a_stored_summary_that_is_empty_or_malformed_is_corrupt() -> TestResult {
             "{field} must be refused"
         );
     }
+    // Record counts whose sum overflows are refused, not summed.
+    let mut counted = original.clone();
+    counted["archivals"][0]["observations"] = serde_json::json!(usize::MAX);
+    counted["archivals"][0]["bindings"] = serde_json::json!(1);
+    fs::write(&path, serde_json::to_vec(&counted)?)?;
+    assert!(matches!(
+        Ledger::open(f.dir.path().join("trust"), house()?),
+        Err(TrustError::Corrupt)
+    ));
     // Two summaries whose lengths overflow a file length.
     let mut overflowing = original.clone();
     let summaries = overflowing["archivals"].as_array_mut().ok_or("archivals")?;

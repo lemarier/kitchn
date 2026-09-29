@@ -5,7 +5,10 @@
 //! It never supplies secret values through a workflow payload. [`CredentialFile`]
 //! resolves the private token only at the CLI boundary; [`GhCli`] clears ambient
 //! CLI configuration and verifies the authenticated GitHub login before each call.
-//! GitHub credentials that cannot authenticate `/user` are explicitly unavailable.
+//! A token that cannot authenticate `/user` is explicitly unavailable. A GitHub
+//! App credential ([`GhCli::app`]) instead runs each effect's calls with an
+//! installation token that [`AppTokens`] mints for that effect's repository and
+//! [`TokenScope`], verified through its installation.
 //!
 //! Build a [`GitHubExecutor::effect`], put it in a [`crate::state::EffectPlan`],
 //! and call [`crate::state::run_effect`]. The core owns claims, current authority,
@@ -46,12 +49,17 @@
 //! applied with its URL, even after its head moved or its base changed, so
 //! reconciling an uncertain open finds it instead of opening another.
 
+mod app;
 mod mutation;
 pub(crate) mod process;
 mod scope;
 pub use crate::contracts::{
     CloseReason, GitHubAction, GitHubMutation, IssueNumber, LabelDefinition, MergeMethod,
     PostingBudget,
+};
+pub use app::{
+    Access, AppApi, AppAuth, AppId, AppPermission, AppRequest, AppResponse, AppTokens, CurlApi,
+    GitHubApp, InstallationId, Installed, REFRESH_MARGIN, TokenScope,
 };
 pub use mutation::LabelSetup;
 pub use process::{CredentialFile, GhCli};

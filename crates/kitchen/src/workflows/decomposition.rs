@@ -1330,6 +1330,10 @@ impl ApprovedWrite for ApprovedDecomposition<'_> {
     type Digest = PreviewDigest;
     type Report = ApplyReport;
 
+    fn repository(&self) -> &Repository {
+        &self.proposal.repository
+    }
+
     fn digest(&self) -> Result<PreviewDigest> {
         Ok(preview(self.proposal)?.digest)
     }

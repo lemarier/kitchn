@@ -164,6 +164,106 @@ fn guided_init_without_gh_binds_nothing_and_show_names_the_missing_binding() -> 
 }
 
 #[test]
+fn an_app_binding_shows_its_key_file_and_needs_both_ids() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let fixture = fixture(&temp.path().canonicalize()?, None)?;
+    assert_eq!(
+        init(&fixture, &["--forge-requester", "none"])?
+            .status
+            .code(),
+        Some(0)
+    );
+    let registry = fixture.home.join(".kitchn");
+    let registry_arg = registry.display().to_string();
+    let bind = |requester: &str, ids: &[&str]| {
+        let mut args = vec![
+            "forge",
+            "bind",
+            "--registry",
+            &registry_arg,
+            "--house",
+            "acme",
+            "--requester",
+            requester,
+        ];
+        args.extend_from_slice(ids);
+        kitchen(&fixture, &args)
+    };
+
+    // An app needs both IDs, nonzero, and its bot login.
+    for (requester, ids) in [
+        ("kitchn-app[bot]", &["--app-id", "12"][..]),
+        ("kitchn-app[bot]", &["--installation", "34"][..]),
+        (
+            "kitchn-app[bot]",
+            &["--app-id", "0", "--installation", "34"][..],
+        ),
+        (
+            "kitchn-app",
+            &["--app-id", "12", "--installation", "34"][..],
+        ),
+    ] {
+        let output = bind(requester, ids)?;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{ids:?}: {}",
+            text(&output.stderr)
+        );
+        assert!(!registry.join("private/acme/forge.json").exists());
+    }
+
+    let output = bind(
+        "kitchn-app[bot]",
+        &["--app-id", "12", "--installation", "34"],
+    )?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.starts_with(
+            "Bound house acme to GitHub as kitchn-app[bot] (GitHub App 12, installation 34)."
+        ),
+        "{stdout}"
+    );
+    let key = registry.join("private/acme/credentials/github");
+    assert!(
+        stdout.contains(&format!("Private key file {} is missing.", key.display())),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("gh auth token"), "{stdout}");
+
+    fs::create_dir_all(key.parent().ok_or("no parent")?)?;
+    fs::write(
+        &key,
+        "-----BEGIN RSA PRIVATE KEY-----\nfixture\n-----END RSA PRIVATE KEY-----\n",
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600))?;
+    }
+    let output = kitchen(
+        &fixture,
+        &[
+            "forge",
+            "show",
+            "--registry",
+            &registry_arg,
+            "--house",
+            "acme",
+        ],
+    )?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let stdout = text(&output.stdout);
+    assert!(stdout.contains(
+        "House acme writes to GitHub as kitchn-app[bot] (GitHub App 12, installation 34) with credential github"
+    ), "{stdout}");
+    assert!(stdout.contains("of GitHub App 12 is ready."), "{stdout}");
+    assert!(!stdout.contains("fixture"));
+    Ok(())
+}
+
+#[test]
 fn bind_then_show_reports_the_token_file_without_reading_it() -> TestResult {
     let temp = tempfile::tempdir()?;
     let fixture = fixture(&temp.path().canonicalize()?, None)?;
@@ -275,8 +375,8 @@ mod apply {
         adoption::HouseRegistry,
         contracts::{CommitId, ExternalRef, Grant, Permission, PostingBudget, Repository},
         house::{
-            FORGE_BINDING_SCHEMA, ForgeBinding, ForgeKind, HouseConfig, RepositoryConfig,
-            bind_forge, credential_path,
+            CredentialKind, FORGE_BINDING_SCHEMA, ForgeBinding, ForgeKind, HouseConfig,
+            RepositoryConfig, bind_forge, credential_path,
         },
         state::{HouseStore, StoreOptions},
     };
@@ -357,6 +457,7 @@ mod apply {
                         backend: BackendId::new("github")?,
                         requester: ExternalRef::new("acme-bot")?,
                         credential: CredentialId::new("github")?,
+                        credential_kind: CredentialKind::Token,
                         posting_budget: PostingBudget::new(5)?,
                     },
                 )?;

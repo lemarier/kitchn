@@ -3,17 +3,19 @@ use clap::{Args, Subcommand};
 use kitchen::{
     BackendId, CredentialId, HouseId,
     adoption::HouseRegistry,
-    contracts::{EffectExecutor, ExternalRef, NotAppliedReason, PostingBudget},
+    contracts::{EffectExecutor, ExternalRef, NotAppliedReason, PostingBudget, SystemClock},
     house::{
-        BindOutcome, CredentialStatus, FORGE_BINDING_SCHEMA, ForgeBinding, ForgeError, ForgeKind,
-        ForgeReader, bind_forge, credential_path, credential_status, forge_binding, forge_reader,
+        BindOutcome, CredentialKind, CredentialStatus, FORGE_BINDING_SCHEMA, ForgeBinding,
+        ForgeCredential, ForgeError, ForgeKind, ForgeReader, bind_forge, credential_path,
+        credential_status, forge_binding, forge_reader,
     },
-    integrations::github::{CredentialFile, GhCli},
+    integrations::github::{AppId, AppTokens, CurlApi, GhCli, GitHubApp, InstallationId},
 };
 use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -32,17 +34,25 @@ pub struct ForgeArgs {
 
 #[derive(Subcommand)]
 enum ForgeCommand {
-    /// Bind a house to the GitHub account it writes as. Stores no credential:
-    /// the token stays in a file only you place, in the house's private
-    /// registry directory.
+    /// Bind a house to the GitHub account or app it writes as. Stores no
+    /// credential: the token or app private key stays in a file only you
+    /// place, in the house's private registry directory.
     Bind {
         #[arg(long)]
         registry: PathBuf,
         #[arg(long)]
         house: HouseId,
-        /// The GitHub login the token must authenticate as.
+        /// The GitHub login the token must authenticate as; for an app, its
+        /// `<app-slug>[bot]` login.
         #[arg(long)]
         requester: ExternalRef,
+        /// Write as this GitHub App; the credential file then holds its PEM
+        /// private key. Needs --installation.
+        #[arg(long, requires = "installation")]
+        app_id: Option<u64>,
+        /// The app's installation on the account owning the repositories.
+        #[arg(long, requires = "app_id")]
+        installation: Option<u64>,
         /// Credential name; house policy limits for forge writes must name it.
         #[arg(long, default_value = "github")]
         credential: CredentialId,
@@ -66,10 +76,20 @@ pub fn run(args: ForgeArgs) -> Result<(String, bool), kitchen::Error> {
             registry,
             house,
             requester,
+            app_id,
+            installation,
             credential,
             posting_budget,
         } => {
             let registry = HouseRegistry::new(super::house::canonical_root(registry)?)?;
+            let credential_kind = match (app_id, installation) {
+                (Some(app_id), Some(installation)) => CredentialKind::GitHubApp(GitHubApp {
+                    app_id: AppId::new(app_id)?,
+                    installation: InstallationId::new(installation)?,
+                }),
+                // Clap requires both or neither.
+                _ => CredentialKind::Token,
+            };
             let binding = ForgeBinding {
                 schema: FORGE_BINDING_SCHEMA,
                 house,
@@ -77,13 +97,14 @@ pub fn run(args: ForgeArgs) -> Result<(String, bool), kitchen::Error> {
                 backend: BackendId::new("github")?,
                 requester,
                 credential,
+                credential_kind,
                 posting_budget: PostingBudget::new(posting_budget)?,
             };
             let outcome = bind_forge(&registry, &binding)?;
             let (path, status) = token(&registry, &binding)?;
             Ok((
                 format!(
-                    "{} house {} to {} as {}.\n{}",
+                    "{} house {} to {} as {}{}.\n{}",
                     match outcome {
                         BindOutcome::Created => "Bound",
                         BindOutcome::Unchanged => "Already bound",
@@ -91,6 +112,7 @@ pub fn run(args: ForgeArgs) -> Result<(String, bool), kitchen::Error> {
                     binding.house,
                     binding.forge,
                     binding.requester.as_str(),
+                    app_text(&binding),
                     token_text(&binding, &path, status),
                 ),
                 true,
@@ -102,10 +124,11 @@ pub fn run(args: ForgeArgs) -> Result<(String, bool), kitchen::Error> {
             let (path, status) = token(&registry, &binding)?;
             Ok((
                 format!(
-                    "House {} writes to {} as {} with credential {}, at most {} writes per task.\n{}",
+                    "House {} writes to {} as {}{} with credential {}, at most {} writes per task.\n{}",
                     binding.house,
                     binding.forge,
                     binding.requester.as_str(),
+                    app_text(&binding),
                     binding.credential,
                     binding.posting_budget.limit(),
                     token_text(&binding, &path, status),
@@ -125,10 +148,26 @@ fn token(
     Ok((path, status))
 }
 
+/// The app and installation an app binding writes through, or nothing.
+fn app_text(binding: &ForgeBinding) -> String {
+    match binding.credential_kind {
+        CredentialKind::Token => String::new(),
+        CredentialKind::GitHubApp(app) => {
+            format!(
+                " (GitHub App {}, installation {})",
+                app.app_id, app.installation
+            )
+        }
+    }
+}
+
 /// Where the token file belongs, its state, and how to place it. Never
 /// prints or reads the token.
 pub fn token_text(binding: &ForgeBinding, path: &Path, status: CredentialStatus) -> String {
     let file = path.display();
+    if let CredentialKind::GitHubApp(app) = binding.credential_kind {
+        return key_text(app, path, status);
+    }
     match status {
         CredentialStatus::Ready => format!(
             "Token file {file} is ready. Kitchen reads it only when it writes and never copies it."
@@ -153,6 +192,32 @@ pub fn token_text(binding: &ForgeBinding, path: &Path, status: CredentialStatus)
     }
 }
 
+/// Where an app's private key file belongs, its state, and how to place it.
+/// Never prints or reads the key.
+fn key_text(app: GitHubApp, path: &Path, status: CredentialStatus) -> String {
+    let file = path.display();
+    match status {
+        CredentialStatus::Ready => format!(
+            "Private key file {file} of GitHub App {} is ready. Kitchen reads it only to mint installation tokens when it writes and never copies it.",
+            app.app_id
+        ),
+        CredentialStatus::NotRegularFile
+        | CredentialStatus::Redirected
+        | CredentialStatus::NotOwned => format!(
+            "Private key file {file} is {status}, so kitchn will not use it. Remove what is there, keep every directory on that path a real directory you own, then place the private key of GitHub App {} readable only by you.",
+            app.app_id
+        ),
+        CredentialStatus::Missing | CredentialStatus::Exposed => {
+            let directory = quote(&path.parent().unwrap_or(path).display().to_string());
+            format!(
+                "Private key file {file} is {status}. Place the .pem private key of GitHub App {} there, readable only by you, for example:\n  mkdir -p {directory} && (umask 077; cp <downloaded-key.pem> {target})\nKitchen reads it only to mint installation tokens when it writes and never copies it.",
+                app.app_id,
+                target = quote(&file.to_string()),
+            )
+        }
+    }
+}
+
 /// Single-quote `text` for a POSIX shell.
 fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
@@ -160,18 +225,33 @@ fn quote(text: &str) -> String {
 
 /// The first `gh` in the absolute entries of `path`.
 fn gh_executable(path: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    executable(path, "gh")
+}
+
+/// The first `name` in the absolute entries of `path`.
+fn executable(path: Option<std::ffi::OsString>, name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path?)
         .filter(|directory| directory.is_absolute())
         .take(MAX_PATH_ENTRIES)
-        .map(|directory| directory.join("gh"))
+        .map(|directory| directory.join(name))
         .find(|candidate| candidate.is_file())
 }
 
-/// The GitHub CLI on `PATH`, over the house's checked token file. `gh` gets
-/// only that token, never the host's own login.
-pub fn connect_gh(credential: CredentialFile) -> Result<GhCli, ForgeError> {
-    let gh = gh_executable(std::env::var_os("PATH")).ok_or(ForgeError::GhNotFound)?;
-    GhCli::new(gh, credential).map_err(ForgeError::Integration)
+/// The GitHub CLI on `PATH`, over the house's checked credential file. `gh`
+/// gets only that token, or for an app the installation tokens `curl` on
+/// `PATH` mints with its key, never the host's own login.
+pub fn connect_gh(credential: ForgeCredential) -> Result<GhCli, ForgeError> {
+    let path = std::env::var_os("PATH");
+    let gh = gh_executable(path.clone()).ok_or(ForgeError::GhNotFound)?;
+    match credential {
+        ForgeCredential::Token(file) => GhCli::new(gh, file),
+        ForgeCredential::App { app, key } => {
+            let curl = executable(path, "curl").ok_or(ForgeError::CurlNotFound)?;
+            let api = CurlApi::new(curl).map_err(ForgeError::Integration)?;
+            GhCli::app(gh, AppTokens::new(app, key, api, Arc::new(SystemClock)))
+        }
+    }
+    .map_err(ForgeError::Integration)
 }
 
 /// Whether a command re-reads the forge, and why not when it does not.

@@ -2232,11 +2232,26 @@ fn append_clone(document: &mut serde_json::Value, list: &str) -> TestResult {
 fn persisted_duplicate_identities_load_as_corrupt_not_conflict() -> TestResult {
     let f = Fixture::new()?;
     let (l, recorded) = populated(&f)?;
-    let shapes: [(&str, Edit); 4] = [
+    let shapes: [(&str, Edit); 7] = [
         ("observation revision", |d| append_clone(d, "observations")),
         ("task under two streams", |d| {
             append_clone(d, "observations")?;
             d["observations"][1]["id"] = serde_json::json!("fixture:other-stream");
+            Ok(())
+        }),
+        ("stream under two tasks", |d| {
+            append_clone(d, "observations")?;
+            let second = &mut d["observations"][1];
+            second["revision"] = serde_json::json!(2);
+            second["correction"] = serde_json::json!("fixture:correction");
+            second["task"] = serde_json::json!("other-task");
+            second["pullRequest"]["value"]["task"] = serde_json::json!("other-task");
+            Ok(())
+        }),
+        ("binding identity", |d| append_clone(d, "bindings")),
+        ("grant evidence revision", |d| {
+            *d.pointer_mut("/grants/0/evidence/0/1")
+                .ok_or("evidence revision")? = serde_json::json!(2);
             Ok(())
         }),
         ("grant identity", |d| append_clone(d, "grants")),
@@ -2329,5 +2344,96 @@ fn write_time_validation_keeps_its_own_error_class() -> TestResult {
     ));
     assert_eq!(fs::read(ledger_path(&f))?, before);
     assert_eq!(l.history()?.len(), 1);
+    Ok(())
+}
+
+/// Fill the ledger to `MAX_HISTORY - 1` entries: `streams` observations with
+/// one binding each, and grants that each cite `MAX_ITEMS` of those streams.
+/// Every entry is valid, so each load and write validates the whole snapshot.
+fn fill_with_evidence_heavy_grants(f: &Fixture, streams: usize) -> TestResult {
+    tamper(f, |document| {
+        let observation = document["observations"][0].clone();
+        let binding = document["bindings"][0].clone();
+        let mut grant = document["grants"][0].clone();
+        grant
+            .as_object_mut()
+            .ok_or("grant object")?
+            .remove("proposal");
+        let observations = document["observations"]
+            .as_array_mut()
+            .ok_or("observations")?;
+        for index in 1..streams {
+            let task = format!("bulk-{index}");
+            let mut copy = observation.clone();
+            copy["id"] = serde_json::json!(format!("fixture:bulk-{index}"));
+            copy["task"] = serde_json::json!(task);
+            copy["pullRequest"]["value"]["task"] = serde_json::json!(task);
+            observations.push(copy);
+        }
+        let bindings = document["bindings"].as_array_mut().ok_or("bindings")?;
+        for index in 1..streams {
+            let mut copy = binding.clone();
+            copy["spec"]["id"] = serde_json::json!(format!("bulk-{index}"));
+            bindings.push(copy);
+        }
+        let grants = document["grants"].as_array_mut().ok_or("grants")?;
+        let count = 4096 - 1 - 2 * streams;
+        for index in 1..count {
+            let mut copy = grant.clone();
+            copy["id"] = serde_json::json!(format!("fixture:grant-{index}"));
+            let evidence: Vec<_> = (0..128)
+                .map(|k| {
+                    let stream = streams - 1 - (index * 128 + k) % (streams - 1);
+                    serde_json::json!([format!("fixture:bulk-{stream}"), 1])
+                })
+                .collect();
+            copy["evidence"] = serde_json::json!(evidence);
+            grants.push(copy);
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Observation streams in the full-ledger fixture; the rest are grants.
+const STREAMS: usize = 1536;
+
+#[test]
+fn a_full_ledger_with_heavy_grant_evidence_validates_well_inside_the_lock_timeout() -> TestResult {
+    use std::time::{Duration, Instant};
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    l.record(&f.store, eligible(observation(&f)?)?)?;
+    bind_evidence(&l, &f)?;
+    issue(&l, &grants()?)?;
+    fill_with_evidence_heavy_grants(&f, STREAMS)?;
+    let bytes = fs::metadata(ledger_path(&f))?.len();
+    assert!(
+        bytes < ORDINARY_LIMIT,
+        "{bytes} bytes leaves no room for a write"
+    );
+
+    let started = Instant::now();
+    let reopened = reopen(&f)?;
+    // One ordinary write validates the whole snapshot on load and again
+    // after the change, and takes the last free entry.
+    assert!(try_bind_extra(&reopened)??);
+    let elapsed = started.elapsed();
+    eprintln!("open and one write of a full ledger ({bytes} bytes): {elapsed:?}");
+    assert!(matches!(try_bind_extra(&reopened)?, Ok(false)));
+    assert_eq!(reopened.grant_history()?.len(), 4096 - 1 - 2 * STREAMS);
+    // The snapshot lock times out after 2 s. Scanning every entry per
+    // evidence reference took about 1 s optimized and 8 s unoptimized on this
+    // fixture; indexed validation takes about 0.2 s and 1.6 s, most of it
+    // JSON handling. The unoptimized bound leaves room for slower CI hosts.
+    let bound = if cfg!(debug_assertions) {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(600)
+    };
+    assert!(
+        elapsed < bound,
+        "full-ledger open and write took {elapsed:?}"
+    );
     Ok(())
 }

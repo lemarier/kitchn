@@ -143,14 +143,16 @@ impl Inspection {
                 Some(SampleResult::NoFinding { .. } | SampleResult::Unavailable) | None => None,
             })
     }
+    /// Observation revision the inspection was started against.
+    pub(crate) const fn revision(&self) -> std::num::NonZeroU32 {
+        self.revision
+    }
+    /// Check the inspection against its observation revision, looked up by
+    /// the caller from [`Self::plan`] and [`Self::revision`].
     pub(crate) fn validate_observation(
         &self,
-        observations: &[crate::trust::Observation],
+        observation: &crate::trust::Observation,
     ) -> Result<(), TrustError> {
-        let observation = observations
-            .iter()
-            .find(|o| o.id == self.plan.observation && o.revision == self.revision)
-            .ok_or(TrustError::Corrupt)?;
         if !matches!(
             observation.state,
             TaskState::Settled {

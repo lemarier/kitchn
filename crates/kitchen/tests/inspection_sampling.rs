@@ -16,20 +16,25 @@ use kitchen::{
         WindowUsage,
     },
     selection::{AgentModel, AgentSelection, ResolvedSelection, WorkType},
-    state::{MarkerRecording, StateError},
+    state::{
+        HouseStore, Inventory, MAX_MARKERS, MarkerRecording, Presence, RetentionPolicy, StateError,
+        StoreOptions, WorkItem,
+    },
     trust::{
         Attribution, EvidenceMode, Finding, Ledger, Measurement, Observation, PullRequestEvidence,
         StationScope,
     },
     workflows::inspector::{FollowUpRoute, InspectionPlan, SampleResult},
     workflows::sampling::{
-        Outcome, OwnerReport, Rate, RateRaise, RateSchedule, RecordedFinding, SamplingDecision,
-        SamplingError, SamplingPolicy, ScopeRecord, select,
+        GrantEpoch, Outcome, OwnerReport, Rate, RateRaise, RateSchedule, RecordedFinding,
+        SamplingDecision, SamplingError, SamplingPolicy, ScopeRecord, SelectionKey, compact,
+        select,
     },
 };
 use std::{
     collections::BTreeMap,
-    num::{NonZeroU16, NonZeroU32},
+    fs,
+    num::{NonZeroU16, NonZeroU32, NonZeroU64},
 };
 
 const DAY: u64 = 86_400;
@@ -112,6 +117,35 @@ fn day(n: u64) -> Timestamp {
     at(n * DAY)
 }
 
+/// A house store with the repository's selection key and the fixture
+/// scope's grant epoch, first seen at time zero like [`record`]'s grant.
+struct Sampler {
+    f: Fixture,
+    key: SelectionKey,
+    epoch: GrantEpoch,
+}
+
+fn sampler() -> TestResult<Sampler> {
+    let f = Fixture::new()?;
+    let recorder = scheduled("sampling")?;
+    let key = SelectionKey::establish(&f.store, &project()?, &recorder, at(0))?;
+    let epoch = GrantEpoch::establish(&f.store, &scope()?, &recorder, at(0))?;
+    Ok(Sampler { f, key, epoch })
+}
+
+impl Sampler {
+    fn select(
+        &self,
+        policy: &SamplingPolicy,
+        merged: &MergeSubject,
+        record: &ScopeRecord,
+        budget: &BudgetAssessment,
+        now: Timestamp,
+    ) -> Result<SamplingDecision, SamplingError> {
+        select(policy, &self.key, merged, record, &self.epoch, budget, now)
+    }
+}
+
 fn budget(exhausted: Option<Exhausted>, complete: bool) -> BudgetAssessment {
     BudgetAssessment {
         window: UsageWindow {
@@ -147,6 +181,7 @@ fn rate_at(record: &ScopeRecord, now: Timestamp) -> TestResult<u16> {
 
 /// How many of pull requests 1..=count `policy` picks for `record` at `now`.
 fn picked(
+    s: &Sampler,
     policy: &SamplingPolicy,
     record: &ScopeRecord,
     now: Timestamp,
@@ -154,14 +189,7 @@ fn picked(
 ) -> TestResult<usize> {
     let mut picked = 0;
     for number in 1..=count {
-        let decision = select(
-            policy,
-            &house()?,
-            &merge(number)?,
-            record,
-            &open_budget(),
-            now,
-        )?;
+        let decision = s.select(policy, &merge(number)?, record, &open_budget(), now)?;
         if decision.record.outcome == Outcome::Selected {
             picked += 1;
         }
@@ -171,16 +199,10 @@ fn picked(
 
 #[test]
 fn a_new_grant_samples_at_the_initial_rate() -> TestResult {
+    let s = sampler()?;
     let fresh = record([])?;
     assert_eq!(rate_at(&fresh, at(0))?, 500);
-    let decision = select(
-        &policy()?,
-        &house()?,
-        &merge(1)?,
-        &fresh,
-        &open_budget(),
-        at(0),
-    )?;
+    let decision = s.select(&policy()?, &merge(1)?, &fresh, &open_budget(), at(0))?;
     assert_eq!(decision.record.rate, rate(500)?);
     assert_eq!(decision.record.inputs.clean_merges, 0);
     let expected = if decision.record.draw < 500 {
@@ -190,18 +212,20 @@ fn a_new_grant_samples_at_the_initial_rate() -> TestResult {
     };
     assert_eq!(decision.record.outcome, expected);
     // Draws spread over 0..1000, so about half of a new grant's merges are
-    // picked; the fixed digests make this count exact across runs.
-    let half = picked(&policy()?, &fresh, at(0), 1000)?;
+    // picked. The key is random, so the bounds are six standard deviations
+    // wide.
+    let half = picked(&s, &policy()?, &fresh, at(0), 1000)?;
     assert!((400..=600).contains(&half), "picked {half} of 1000");
-    assert_eq!(picked(&flat(1000)?, &fresh, at(0), 50)?, 50);
+    assert_eq!(picked(&s, &flat(1000)?, &fresh, at(0), 50)?, 50);
     Ok(())
 }
 
 #[test]
 fn a_long_clean_record_sits_at_the_floor_and_still_samples() -> TestResult {
+    let s = sampler()?;
     let mature = record(1..=60)?;
     assert_eq!(rate_at(&mature, day(120))?, 20);
-    let picks = picked(&policy()?, &mature, day(120), 2000)?;
+    let picks = picked(&s, &policy()?, &mature, day(120), 2000)?;
     assert!((1..=100).contains(&picks), "picked {picks} of 2000 at 2%");
     // Both maturities are required: an old grant with few clean deliveries
     // stays high, and so does a young grant with many.
@@ -264,11 +288,11 @@ fn a_confirmed_finding_raises_the_rate_and_restarts_the_clean_record() -> TestRe
 
 #[test]
 fn budget_exhaustion_defers_a_pick_and_is_reported_without_lowering_the_rate() -> TestResult {
+    let s = sampler()?;
     let always = flat(1000)?;
     let fresh = record([])?;
-    let deferred = select(
+    let deferred = s.select(
         &always,
-        &house()?,
         &merge(1)?,
         &fresh,
         &budget(Some(exhausted()), true),
@@ -294,24 +318,16 @@ fn budget_exhaustion_defers_a_pick_and_is_reported_without_lowering_the_rate() -
         }
         other => return Err(format!("expected a budget report, got {other:?}").into()),
     }
-    deferred.replay(&always)?;
+    deferred.replay(&always, &s.key)?;
 
     // The floor is the same with and without budget.
     let mature = record(1..=60)?;
     let (mut with_budget, mut without) = (Vec::new(), Vec::new());
     for number in 1..=200 {
         let merged = merge(number)?;
-        let open = select(
+        let open = s.select(&policy()?, &merged, &mature, &open_budget(), day(120))?;
+        let spent = s.select(
             &policy()?,
-            &house()?,
-            &merged,
-            &mature,
-            &open_budget(),
-            day(120),
-        )?;
-        let spent = select(
-            &policy()?,
-            &house()?,
             &merged,
             &mature,
             &budget(Some(exhausted()), true),
@@ -330,40 +346,19 @@ fn budget_exhaustion_defers_a_pick_and_is_reported_without_lowering_the_rate() -
 
     // Missing or stale budget evidence is not budget.
     assert!(matches!(
-        select(
-            &always,
-            &house()?,
-            &merge(1)?,
-            &fresh,
-            &budget(None, false),
-            at(0)
-        ),
+        s.select(&always, &merge(1)?, &fresh, &budget(None, false), at(0)),
         Err(SamplingError::IncompleteBudget)
     ));
     assert!(matches!(
-        select(
-            &always,
-            &house()?,
-            &merge(1)?,
-            &fresh,
-            &open_budget(),
-            day(1000)
-        ),
+        s.select(&always, &merge(1)?, &fresh, &open_budget(), day(1000)),
         Err(SamplingError::StaleBudget)
     ));
     // A skipped merge spends nothing, so exhaustion does not matter.
     let rare = flat(1)?;
     let skipped = (1..=50)
         .map(|number| {
-            select(
-                &rare,
-                &house()?,
-                &merge(number)?,
-                &fresh,
-                &budget(None, false),
-                at(0),
-            )
-            .map_err(Into::into)
+            s.select(&rare, &merge(number)?, &fresh, &budget(None, false), at(0))
+                .map_err(Into::into)
         })
         .collect::<TestResult<Vec<_>>>()?;
     assert!(
@@ -376,29 +371,16 @@ fn budget_exhaustion_defers_a_pick_and_is_reported_without_lowering_the_rate() -
 
 #[test]
 fn selection_is_recorded_and_replays_from_its_inputs() -> TestResult {
-    let f = Fixture::new()?;
+    let s = sampler()?;
+    let f = &s.f;
     let recorder = scheduled("sampling")?;
     let mut history = record(1..=20)?;
     history.findings.push(RecordedFinding {
         source: source("fixture:finding")?,
         at: day(3),
     });
-    let first = select(
-        &policy()?,
-        &house()?,
-        &merge(7)?,
-        &history,
-        &open_budget(),
-        day(40),
-    )?;
-    let again = select(
-        &policy()?,
-        &house()?,
-        &merge(7)?,
-        &history,
-        &open_budget(),
-        day(40),
-    )?;
+    let first = s.select(&policy()?, &merge(7)?, &history, &open_budget(), day(40))?;
+    let again = s.select(&policy()?, &merge(7)?, &history, &open_budget(), day(40))?;
     assert_eq!(first, again);
     assert_eq!(first.record.inputs.clean_since, day(3));
     assert_eq!(first.record.inputs.clean_merges, 18);
@@ -414,18 +396,11 @@ fn selection_is_recorded_and_replays_from_its_inputs() -> TestResult {
     ));
     let loaded = SamplingDecision::load(&f.store, &merge(7)?)?.ok_or("decision not recorded")?;
     assert_eq!(loaded, first);
-    loaded.replay(&policy()?)?;
+    loaded.replay(&policy()?, &s.key)?;
     assert_eq!(SamplingDecision::load(&f.store, &merge(8)?)?, None);
 
     // A later decision for the same merge cannot replace the recorded one.
-    let later = select(
-        &policy()?,
-        &house()?,
-        &merge(7)?,
-        &history,
-        &open_budget(),
-        day(90),
-    )?;
+    let later = s.select(&policy()?, &merge(7)?, &history, &open_budget(), day(90))?;
     assert_ne!(later.record, first.record);
     assert!(matches!(
         later.record(&f.store, &recorder, day(90)),
@@ -436,7 +411,7 @@ fn selection_is_recorded_and_replays_from_its_inputs() -> TestResult {
     let mut tampered = loaded.clone();
     tampered.record.draw = (tampered.record.draw + 1) % 1000;
     assert!(matches!(
-        tampered.replay(&policy()?),
+        tampered.replay(&policy()?, &s.key),
         Err(SamplingError::NotReproducible)
     ));
     let mut outcome = loaded.clone();
@@ -445,19 +420,19 @@ fn selection_is_recorded_and_replays_from_its_inputs() -> TestResult {
         _ => Outcome::Skipped,
     };
     assert!(matches!(
-        outcome.replay(&policy()?),
+        outcome.replay(&policy()?, &s.key),
         Err(SamplingError::NotReproducible)
     ));
     let mut revised = policy()?;
     revised.revision = NonZeroU32::new(2).ok_or("zero")?;
     assert!(matches!(
-        loaded.replay(&revised),
+        loaded.replay(&revised, &s.key),
         Err(SamplingError::NotReproducible)
     ));
     let mut backwards = loaded.clone();
     backwards.record.inputs.clean_since = day(50);
     assert!(matches!(
-        backwards.replay(&policy()?),
+        backwards.replay(&policy()?, &s.key),
         Err(SamplingError::InvalidInput)
     ));
 
@@ -473,6 +448,7 @@ fn selection_is_recorded_and_replays_from_its_inputs() -> TestResult {
 
 #[test]
 fn policies_never_reach_zero_and_inputs_must_agree() -> TestResult {
+    let s = sampler()?;
     assert!(matches!(Rate::new(0), Err(SamplingError::InvalidPolicy)));
     assert!(matches!(Rate::new(1001), Err(SamplingError::InvalidPolicy)));
     assert_eq!(Rate::new(1)?.per_mille(), 1);
@@ -499,14 +475,7 @@ fn policies_never_reach_zero_and_inputs_must_agree() -> TestResult {
     }
     for invalid in [inverted, ignores_findings, endless, crowded] {
         assert!(matches!(
-            select(
-                &invalid,
-                &house()?,
-                &merge(1)?,
-                &fresh,
-                &open_budget(),
-                at(0)
-            ),
+            s.select(&invalid, &merge(1)?, &fresh, &open_budget(), at(0)),
             Err(SamplingError::InvalidPolicy)
         ));
     }
@@ -516,14 +485,7 @@ fn policies_never_reach_zero_and_inputs_must_agree() -> TestResult {
     per_type
         .work_types
         .insert(WorkType::new("implementation")?, flat(1000)?.default);
-    let decision = select(
-        &per_type,
-        &house()?,
-        &merge(1)?,
-        &fresh,
-        &open_budget(),
-        at(0),
-    )?;
+    let decision = s.select(&per_type, &merge(1)?, &fresh, &open_budget(), at(0))?;
     assert_eq!(decision.record.rate, rate(1000)?);
 
     let elsewhere = ScopeRecord {
@@ -534,16 +496,12 @@ fn policies_never_reach_zero_and_inputs_must_agree() -> TestResult {
         ..record([])?
     };
     assert!(matches!(
-        select(
-            &policy()?,
-            &house()?,
-            &merge(1)?,
-            &elsewhere,
-            &open_budget(),
-            at(0)
-        ),
+        s.select(&policy()?, &merge(1)?, &elsewhere, &open_budget(), at(0)),
         Err(SamplingError::InvalidInput)
     ));
+    // A decision before the scope's epoch has no grant to judge.
+    let late = Fixture::new()?;
+    let epoch = GrantEpoch::establish(&late.store, &scope()?, &scheduled("sampling")?, day(5))?;
     let future = ScopeRecord {
         granted_at: day(5),
         ..record([])?
@@ -551,9 +509,10 @@ fn policies_never_reach_zero_and_inputs_must_agree() -> TestResult {
     assert!(matches!(
         select(
             &policy()?,
-            &house()?,
+            &s.key,
             &merge(1)?,
             &future,
+            &epoch,
             &open_budget(),
             day(4)
         ),
@@ -703,7 +662,16 @@ fn the_ledger_record_counts_live_evidence_per_station_and_work_type() -> TestRes
         vec![revert("https://example.invalid/revert/fw")?],
     )?;
 
-    let implementation = ScopeRecord::from_ledger(&ledger, &scope()?, at(0))?;
+    let recorder = scheduled("sampling")?;
+    let epoch = |work_type: &str| -> TestResult<GrantEpoch> {
+        Ok(GrantEpoch::establish(
+            &f.store,
+            &scope_of(work_type)?,
+            &recorder,
+            at(0),
+        )?)
+    };
+    let implementation = ScopeRecord::from_ledger(&ledger, &epoch("implementation")?)?;
     assert_eq!(implementation.clean, vec![at(4)]);
     assert_eq!(
         implementation.findings,
@@ -722,24 +690,34 @@ fn the_ledger_record_counts_live_evidence_per_station_and_work_type() -> TestRes
     assert_eq!((raise.from, raise.to), (rate(500)?, rate(800)?));
 
     // Another work type keeps its own record.
-    let firmware = ScopeRecord::from_ledger(&ledger, &scope_of("firmware")?, at(0))?;
+    let firmware = ScopeRecord::from_ledger(&ledger, &epoch("firmware")?)?;
     assert!(firmware.clean.is_empty());
     assert_eq!(firmware.findings.len(), 1);
-    let idle = ScopeRecord::from_ledger(&ledger, &scope_of("docs")?, at(0))?;
+    let idle = ScopeRecord::from_ledger(&ledger, &epoch("docs")?)?;
     assert!(idle.clean.is_empty() && idle.findings.is_empty());
 
-    // Deliveries before the grant are not part of its clean record.
-    let later = ScopeRecord::from_ledger(&ledger, &scope()?, at(5))?;
-    assert!(later.clean.is_empty());
+    // Another house's epoch cannot read this ledger.
+    let foreign = Fixture::new()?;
+    let other = HouseStore::initialize(
+        foreign.dir.path().join("other"),
+        other_house()?,
+        StoreOptions::default(),
+    )?;
+    let foreign_epoch = GrantEpoch::establish(&other, &scope()?, &recorder, at(0))?;
+    assert!(matches!(
+        ScopeRecord::from_ledger(&ledger, &foreign_epoch),
+        Err(SamplingError::HouseMismatch)
+    ));
     Ok(())
 }
 
-#[test]
-fn a_confirmed_inspection_sample_is_a_finding_for_the_delivering_scope() -> TestResult {
-    let f = Fixture::new()?;
+/// Deliver one clean change, then reserve one inspection sample of it at
+/// time 6, under an inspector claim taken at time 0. Returns the ledger, the
+/// inspection's plan, and the claim's fence.
+fn reserved_sample(f: &Fixture) -> TestResult<(Ledger, InspectionPlan, kitchen::contracts::Fence)> {
     let ledger = Ledger::initialize(f.dir.path().join("trust"), house()?)?;
     deliver(
-        &f,
+        f,
         &ledger,
         "clean",
         "implementation",
@@ -780,9 +758,24 @@ fn a_confirmed_inspection_sample_is_a_finding_for_the_delivering_scope() -> Test
         50,
         &ManualClock::starting_at(6),
     )?;
+    Ok((ledger, plan, fence))
+}
+
+fn confirmed() -> TestResult<SampleResult> {
+    Ok(SampleResult::Confirmed {
+        finding: revert("fixture:inspection-finding")?,
+        route: FollowUpRoute::Issue,
+    })
+}
+
+#[test]
+fn a_confirmed_inspection_sample_is_a_finding_for_the_delivering_scope() -> TestResult {
+    let s = sampler()?;
+    let f = &s.f;
+    let (ledger, plan, fence) = reserved_sample(f)?;
     // Before the result arrives the delivery is clean.
     assert_eq!(
-        ScopeRecord::from_ledger(&ledger, &scope()?, at(0))?.findings,
+        ScopeRecord::from_ledger(&ledger, &s.epoch)?.findings,
         Vec::new()
     );
     ledger.finish_sample(
@@ -790,26 +783,412 @@ fn a_confirmed_inspection_sample_is_a_finding_for_the_delivering_scope() -> Test
         &plan.id,
         fence,
         1,
-        SampleResult::Confirmed {
-            finding: revert("fixture:inspection-finding")?,
-            route: FollowUpRoute::Issue,
-        },
+        confirmed()?,
         &ManualClock::starting_at(7),
     )?;
 
-    let record = ScopeRecord::from_ledger(&ledger, &scope()?, at(0))?;
+    let record = ScopeRecord::from_ledger(&ledger, &s.epoch)?;
     assert_eq!(
         record.findings,
         vec![RecordedFinding {
             source: source("fixture:inspection-finding")?,
-            at: at(6),
+            at: at(7),
         }]
     );
     assert_eq!(rate_at(&record, at(10))?, 800);
+    let firmware = GrantEpoch::establish(
+        &f.store,
+        &scope_of("firmware")?,
+        &scheduled("sampling")?,
+        at(0),
+    )?;
     assert!(
-        ScopeRecord::from_ledger(&ledger, &scope_of("firmware")?, at(0))?
+        ScopeRecord::from_ledger(&ledger, &firmware)?
             .findings
             .is_empty()
     );
+    Ok(())
+}
+
+#[test]
+fn a_late_confirmation_raises_the_rate_for_a_full_window_from_its_arrival() -> TestResult {
+    let s = sampler()?;
+    let f = &s.f;
+    let (ledger, plan, _) = reserved_sample(f)?;
+    // The result arrives 40 days after its reservation, past the 30-day
+    // finding window, under a fresh claim of the inspector task.
+    let fence = f
+        .store
+        .take_over(
+            &task_id("inspector")?,
+            &scheduled("reviewer")?,
+            ttl(600)?,
+            day(40),
+        )?
+        .fence();
+    ledger.finish_sample(
+        &f.store,
+        &plan.id,
+        fence,
+        1,
+        confirmed()?,
+        &ManualClock::starting_at(40 * DAY),
+    )?;
+    let record = ScopeRecord::from_ledger(&ledger, &s.epoch)?;
+    assert_eq!(record.findings[0].at, day(40));
+    // Dated at its reservation, the finding would already be outside the
+    // window and the rate would stay below the raised rate.
+    assert_eq!(rate_at(&record, day(40))?, 800);
+    let finding = source("fixture:inspection-finding")?;
+    let raise = RateRaise::of(&policy()?, &record, &finding, day(40))?;
+    assert_eq!(raise.finding_at, day(40));
+    assert!(raise.from < raise.to, "{raise:?}");
+    assert_eq!(raise.to, rate(800)?);
+    // The window runs from the confirmation: raised until day 70, then back
+    // to the initial rate, and the raise is no longer reportable.
+    assert_eq!(rate_at(&record, day(69))?, 800);
+    assert_eq!(rate_at(&record, day(70))?, 500);
+    assert!(matches!(
+        RateRaise::of(&policy()?, &record, &finding, day(70)),
+        Err(SamplingError::ExpiredFinding)
+    ));
+
+    // A result recorded before results carried their time counts from its
+    // reservation.
+    let path = f.dir.path().join("trust").join("ledger.json");
+    let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let sample = &mut doc["inspections"][0]["samples"][0];
+    assert_eq!(sample["finishedAt"], serde_json::json!(40 * DAY * 1000));
+    sample
+        .as_object_mut()
+        .ok_or("sample is not an object")?
+        .remove("finishedAt");
+    fs::write(&path, serde_json::to_vec(&doc)?)?;
+    let legacy = Ledger::open(f.dir.path().join("trust"), house()?)?;
+    assert_eq!(
+        ScopeRecord::from_ledger(&legacy, &s.epoch)?.findings[0].at,
+        at(6)
+    );
+    Ok(())
+}
+
+#[test]
+fn deliveries_before_the_house_first_saw_the_grant_do_not_lower_the_rate() -> TestResult {
+    let f = Fixture::new()?;
+    let recorder = scheduled("sampling")?;
+    let ledger = Ledger::initialize(f.dir.path().join("trust"), house()?)?;
+    deliver(
+        &f,
+        &ledger,
+        "before",
+        "implementation",
+        EvidenceMode::Live,
+        Vec::new(),
+    )?;
+    // Sampling first sees the grant on day 61, after that delivery.
+    let epoch = GrantEpoch::establish(&f.store, &scope()?, &recorder, day(61))?;
+    assert_eq!(epoch.at(), day(61));
+    let observed = ScopeRecord::from_ledger(&ledger, &epoch)?;
+    assert_eq!(observed.granted_at, day(61));
+    assert!(observed.clean.is_empty());
+    assert_eq!(rate_at(&observed, day(61))?, 500);
+
+    // The epoch never moves, even when a later call, another process, or a
+    // restart asks again.
+    let again = GrantEpoch::establish(&f.reopen()?, &scope()?, &recorder, day(90))?;
+    assert_eq!(again, epoch);
+
+    // A record that claims an older grant, so that 60 earlier clean
+    // deliveries would count and the rate would sit at the floor, is refused.
+    let key = SelectionKey::establish(&f.store, &project()?, &recorder, day(61))?;
+    let backdated = record(1..=60)?;
+    assert_eq!(rate_at(&backdated, day(120))?, 20);
+    assert!(matches!(
+        select(
+            &policy()?,
+            &key,
+            &merge(1)?,
+            &backdated,
+            &epoch,
+            &open_budget(),
+            day(120)
+        ),
+        Err(SamplingError::UnboundRecord)
+    ));
+    // The same deliveries, dated before the epoch, count for nothing in a
+    // bound record: the rate is still the one for a new grant on day 62.
+    let bound = ScopeRecord {
+        granted_at: epoch.at(),
+        ..record(1..=60)?
+    };
+    let decision = select(
+        &policy()?,
+        &key,
+        &merge(1)?,
+        &bound,
+        &epoch,
+        &open_budget(),
+        day(62),
+    )?;
+    assert_eq!(decision.record.inputs.clean_merges, 0);
+    assert_eq!(decision.record.rate, rate(500)?);
+
+    // Another scope's epoch does not bind this scope's record.
+    let docs = GrantEpoch::establish(&f.store, &scope_of("docs")?, &recorder, day(61))?;
+    assert!(matches!(
+        select(
+            &policy()?,
+            &key,
+            &merge(1)?,
+            &bound,
+            &docs,
+            &open_budget(),
+            day(62)
+        ),
+        Err(SamplingError::UnboundRecord)
+    ));
+    Ok(())
+}
+
+/// The recorded key's hexadecimal text, read from the store file.
+fn stored_key(f: &Fixture) -> TestResult<String> {
+    let state: serde_json::Value = serde_json::from_str(&fs::read_to_string(f.state_path())?)?;
+    let markers = state["markers"].as_array().ok_or("no markers")?;
+    let marker = markers
+        .iter()
+        .find(|marker| marker["fact"]["schema"] == "inspection-sampling.selection-key/1")
+        .ok_or("no key marker")?;
+    let payload: serde_json::Value =
+        serde_json::from_str(marker["fact"]["payload"].as_str().ok_or("no payload")?)?;
+    Ok(payload["key"].as_str().ok_or("no key")?.to_owned())
+}
+
+#[test]
+fn an_author_cannot_precompute_draws_for_candidate_heads() -> TestResult {
+    let house_a = sampler()?;
+    let house_b = sampler()?;
+    let always = flat(1000)?;
+    let fresh = record([])?;
+    // One pull request, 300 heads its author could push. Anyone without the
+    // house key, modelled by a second house's key, computes unrelated draws.
+    let mut agree = 0;
+    for n in 0..300u64 {
+        let candidate = MergeSubject {
+            head: CommitId::new(&format!("{:040x}", 0xabc0_0000 + n))?,
+            ..merge(7)?
+        };
+        let a = house_a.select(&always, &candidate, &fresh, &open_budget(), at(0))?;
+        let b = house_b.select(&always, &candidate, &fresh, &open_budget(), at(0))?;
+        if a.record.draw == b.record.draw {
+            agree += 1;
+        }
+    }
+    // Independent draws agree about once in 1000 tries.
+    assert!(agree <= 10, "{agree} of 300 draws agreed without the key");
+
+    // The key is stable for the house: another handle reads the same key and
+    // replays the same decisions; the other key does not.
+    let decision = house_a.select(&always, &merge(7)?, &fresh, &open_budget(), at(0))?;
+    let reread = SelectionKey::load(&house_a.f.reopen()?, &project()?)?.ok_or("no key")?;
+    assert_eq!(reread, house_a.key);
+    decision.replay(&always, &reread)?;
+    let mut mismatched = 0;
+    for number in 1..=50 {
+        let decision = house_a.select(&always, &merge(number)?, &fresh, &open_budget(), at(0))?;
+        if matches!(
+            decision.replay(&always, &house_b.key),
+            Err(SamplingError::NotReproducible)
+        ) {
+            mismatched += 1;
+        }
+    }
+    assert!(mismatched >= 45, "only {mismatched} of 50 failed to replay");
+    let again = SelectionKey::establish(
+        &house_a.f.store,
+        &project()?,
+        &scheduled("sampling")?,
+        day(1),
+    )?;
+    assert_eq!(again, house_a.key);
+
+    // The key is never printed.
+    let text = stored_key(&house_a.f)?;
+    assert_eq!(text.len(), 64);
+    assert!(text.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(!format!("{:?}", house_a.key).contains(&text));
+    assert!(!format!("{decision:?}").contains(&text));
+
+    // A key for another repository cannot select or replay this merge.
+    let elsewhere = SelectionKey::establish(
+        &house_a.f.store,
+        &Repository::new("example/other")?,
+        &scheduled("sampling")?,
+        at(0),
+    )?;
+    assert_ne!(elsewhere, house_a.key);
+    assert!(matches!(
+        select(
+            &always,
+            &elsewhere,
+            &merge(7)?,
+            &fresh,
+            &house_a.epoch,
+            &open_budget(),
+            at(0)
+        ),
+        Err(SamplingError::UnboundRecord)
+    ));
+    assert!(matches!(
+        decision.replay(&always, &elsewhere),
+        Err(SamplingError::UnboundRecord)
+    ));
+
+    // A damaged key is refused, not replaced with a fresh one.
+    let path = house_a.f.state_path();
+    let damaged = fs::read_to_string(&path)?.replace(&text, &"z".repeat(64));
+    fs::write(&path, damaged)?;
+    assert!(matches!(
+        SelectionKey::establish(
+            &house_a.f.reopen()?,
+            &project()?,
+            &scheduled("sampling")?,
+            day(2)
+        ),
+        Err(kitchen::Error::Sampling(SamplingError::MalformedRecord))
+    ));
+    Ok(())
+}
+
+#[test]
+fn compaction_frees_a_full_store_and_keeps_replay_evidence() -> TestResult {
+    let s = sampler()?;
+    let recorder = scheduled("sampling")?;
+    let always = flat(1000)?;
+    let history = record(1..=5)?;
+    let decide = |number: u64, now: Timestamp| -> TestResult<SamplingDecision> {
+        Ok(s.select(&always, &merge(number)?, &history, &open_budget(), now)?)
+    };
+    let old = decide(1, day(1))?;
+    old.record(&s.f.store, &recorder, day(1))?;
+    let recent = decide(2, day(50))?;
+    recent.record(&s.f.store, &recorder, day(50))?;
+    // The only decision of another scope stays however old it is.
+    let docs_epoch = GrantEpoch::establish(&s.f.store, &scope_of("docs")?, &recorder, at(0))?;
+    let docs_record = ScopeRecord {
+        scope: scope_of("docs")?,
+        ..record([])?
+    };
+    let docs = select(
+        &always,
+        &s.key,
+        &merge(3)?,
+        &docs_record,
+        &docs_epoch,
+        &open_budget(),
+        day(1),
+    )?;
+    docs.record(&s.f.store, &recorder, day(1))?;
+    // Raises for a finding long past its window and a recent one.
+    let mut found = record(1..=5)?;
+    for (name, when) in [
+        ("fixture:old-finding", day(2)),
+        ("fixture:new-finding", day(55)),
+    ] {
+        found.findings.push(RecordedFinding {
+            source: source(name)?,
+            at: when,
+        });
+    }
+    RateRaise::of(&policy()?, &found, &source("fixture:old-finding")?, day(3))?.record(
+        &s.f.store,
+        &recorder,
+        day(3),
+    )?;
+    RateRaise::of(&policy()?, &found, &source("fixture:new-finding")?, day(56))?.record(
+        &s.f.store,
+        &recorder,
+        day(56),
+    )?;
+
+    // Fill the store with copies of the old decision, one pull request each.
+    let path = s.f.state_path();
+    let mut state: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let markers = state["markers"].as_array().ok_or("no markers")?.clone();
+    let template = markers
+        .iter()
+        .find(|marker| marker["key"]["item"]["number"] == 1)
+        .ok_or("no decision")?
+        .clone();
+    let copies = MAX_MARKERS - markers.len();
+    let mut filled = markers;
+    filled.extend((0..copies).map(|n| {
+        let mut copy = template.clone();
+        copy["key"]["item"]["number"] = (1000 + n).into();
+        copy
+    }));
+    state["markers"] = filled.into();
+    fs::write(&path, serde_json::to_vec(&state)?)?;
+    let store = s.f.reopen()?;
+    assert_eq!(store.capacity()?.markers.used, MAX_MARKERS);
+    let next = decide(4, day(60))?;
+    assert!(matches!(
+        next.record(&store, &recorder, day(60)),
+        Err(kitchen::Error::State(StateError::CapacityExceeded { .. }))
+    ));
+
+    // The store's retention pass leaves sampling markers to their owner,
+    // even when their merged pull requests are observed closed.
+    let mut inventory = Inventory::new();
+    for number in [1, 2, 3] {
+        inventory.observe(
+            WorkItem::PullRequest {
+                repository: project()?,
+                number: NonZeroU64::new(number).ok_or("zero")?,
+            },
+            Presence::Gone,
+        );
+    }
+    let preview = store.preview_retention(&RetentionPolicy::default(), &inventory, day(60))?;
+    assert!(preview.markers.is_empty(), "{:?}", preview.markers);
+
+    let compaction = compact(&store, &policy()?, &recorder, day(60))?;
+    assert_eq!(compaction.decisions, copies + 1);
+    assert_eq!(compaction.raises, 1);
+    // Recent decisions, the newest decision per scope, the recent raise,
+    // the key, and both epochs remain.
+    assert_eq!(store.capacity()?.markers.used, 6);
+    for (kept, number) in [(&recent, 2), (&docs, 3)] {
+        let loaded = SamplingDecision::load(&store, &merge(number)?)?.ok_or("retired")?;
+        assert_eq!(&loaded, kept);
+    }
+    SamplingDecision::load(&store, &merge(2)?)?
+        .ok_or("retired")?
+        .replay(&always, &s.key)?;
+    assert_eq!(SamplingDecision::load(&store, &merge(1)?)?, None);
+    assert_eq!(
+        SelectionKey::load(&store, &project()?)?.as_ref(),
+        Some(&s.key)
+    );
+    assert_eq!(
+        GrantEpoch::establish(&store, &scope()?, &recorder, day(60))?,
+        s.epoch
+    );
+    assert!(matches!(
+        next.record(&store, &recorder, day(60))?,
+        MarkerRecording::Recorded(_)
+    ));
+    // A second pass has nothing left to retire.
+    assert_eq!(
+        compact(&store, &policy()?, &recorder, day(60))?,
+        kitchen::workflows::sampling::Compaction::default()
+    );
+    // An invalid policy retires nothing.
+    let mut inverted = policy()?;
+    inverted.default.floor = rate(600)?;
+    assert!(matches!(
+        compact(&store, &inverted, &recorder, day(400)),
+        Err(kitchen::Error::Sampling(SamplingError::InvalidPolicy))
+    ));
+    assert_eq!(store.capacity()?.markers.used, 7);
     Ok(())
 }

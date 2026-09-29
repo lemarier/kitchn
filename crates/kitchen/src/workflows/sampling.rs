@@ -12,24 +12,38 @@
 //! recent. A finding also restarts the clean record, so the rate climbs back
 //! down from `initial` once the finding ages out.
 //!
-//! Selection is deterministic: a SHA-256 digest of the house, the merged pull
+//! The grant's age comes from a [`GrantEpoch`], never from the caller: the
+//! time sampling first saw the scope, recorded once in the house store. A
+//! finding counts from when it was confirmed, so a late inspection result
+//! still raises the rate for a full finding window.
+//!
+//! Selection is keyed: a SHA-256 digest of a secret [`SelectionKey`] the
+//! house generates once per repository and keeps in its store, the merged pull
 //! request with its exact head and base, and the policy revision gives a draw
-//! from 0 to 999, and the merge is picked when the draw is below the rate in
-//! thousandths. The decision keeps its inputs, rate, and draw, and is recorded
-//! once as a house-store marker, so [`SamplingDecision::replay`] can show why
-//! a merge was skipped.
+//! from 0 to 999. The merge is picked when the draw is below the rate in
+//! thousandths. Without the key, a pull-request author cannot compute the
+//! draw for a candidate head, so trying heads offline until one is skipped
+//! does not work. The decision keeps its inputs, rate, and draw, and is
+//! recorded once as a house-store marker; [`SamplingDecision::replay`] needs
+//! the house's key to show why a merge was skipped.
 //!
 //! A picked merge spends the house usage budget. While that budget is
 //! exhausted the decision is [`Outcome::BudgetExhausted`] and carries an
 //! [`OwnerReport`]; exhaustion never changes the rate or the floor.
+//!
+//! Decisions and rate raises are markers in the shared store, so [`compact`]
+//! retires the ones replay and deduplication no longer need; the store's
+//! retention pass leaves them to it.
 //!
 //! This module launches no inspection and posts nothing:
 //! [`crate::workflows::inspector`] runs samples, and callers deliver
 //! [`OwnerReport`]s through their own reporting authority.
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
+    hash::{BuildHasher as _, RandomState},
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -37,12 +51,13 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     ErrorClass, HouseId, WorkflowId,
-    contracts::{Claimant, EvidenceSubject, ExternalRef, Timestamp},
+    contracts::{Claimant, EvidenceSubject, ExternalRef, Repository, Timestamp},
     house::MergeSubject,
     scheduling::{BudgetAssessment, Exhausted},
     selection::WorkType,
     state::{
-        HouseStore, MarkerFact, MarkerKey, MarkerRecording, MarkerSchema, MarkerSubject, WorkItem,
+        HouseStore, MarkerFact, MarkerKey, MarkerRecording, MarkerSchema, MarkerSubject,
+        StateError, WorkItem, WorkflowMarker,
     },
     trust::{EvidenceMode, Ledger, Measurement, Observation, StationScope, TrustError},
     workflows::inspector::SampleResult,
@@ -57,8 +72,13 @@ pub const MAX_DAYS: u16 = 3650;
 
 const DECISION_SCHEMA: &str = "inspection-sampling.decision";
 const RAISE_SCHEMA: &str = "inspection-sampling.rate-raise";
+const KEY_SCHEMA: &str = "inspection-sampling.selection-key";
+const EPOCH_SCHEMA: &str = "inspection-sampling.grant-epoch";
 /// Separates this digest from any other use of the same fields.
-const DRAW_DOMAIN: &str = "kitchen.inspection-sampling.draw/1";
+const DRAW_DOMAIN: &str = "kitchen.inspection-sampling.draw/2";
+/// The marker subject of a repository's selection key.
+const KEY_SUBJECT: &str = "selection-key";
+const KEY_BYTES: usize = 32;
 const DAY_MILLIS: u128 = 86_400_000;
 const PER_MILLE: u16 = 1000;
 
@@ -76,6 +96,17 @@ pub enum SamplingError {
     /// A rate raise names a finding the scope's record does not hold.
     #[error("the finding is not in the scope's record")]
     UnknownFinding,
+    /// A rate raise names a finding older than the finding window, which no
+    /// longer raises the rate.
+    #[error("the finding is older than the finding window")]
+    ExpiredFinding,
+    /// The record's grant time or scope is not the house's recorded
+    /// [`GrantEpoch`], or the selection key is for another repository.
+    #[error("the sampling record does not match the house's grant epoch or selection key")]
+    UnboundRecord,
+    /// A recorded selection key or grant epoch does not decode.
+    #[error("a recorded sampling key or grant epoch is malformed")]
+    MalformedRecord,
     /// The house budget assessment is for another window than the decision.
     #[error("the house budget assessment does not cover the decision time")]
     StaleBudget,
@@ -99,11 +130,16 @@ impl SamplingError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
-            Self::InvalidPolicy | Self::InvalidInput | Self::UnknownFinding => {
-                ErrorClass::InvalidInput
-            }
-            Self::StaleBudget | Self::IncompleteBudget | Self::HouseMismatch => ErrorClass::Refused,
+            Self::InvalidPolicy
+            | Self::InvalidInput
+            | Self::UnknownFinding
+            | Self::ExpiredFinding => ErrorClass::InvalidInput,
+            Self::StaleBudget
+            | Self::IncompleteBudget
+            | Self::HouseMismatch
+            | Self::UnboundRecord => ErrorClass::Refused,
             Self::NotReproducible => ErrorClass::Conflict,
+            Self::MalformedRecord => ErrorClass::Execution,
             Self::Trust(error) => error.class(),
         }
     }
@@ -288,17 +324,140 @@ impl RateInputs {
 pub struct RecordedFinding {
     /// Stable finding source, used for deduplication.
     pub source: ExternalRef,
-    /// When the observation or inspection sample recorded it.
+    /// When the observation recorded it, or when the inspection result that
+    /// confirmed it was recorded.
     pub at: Timestamp,
+}
+
+/// When sampling first saw merge authority for one station scope, as the
+/// house records it. Built only by [`Self::establish`], so a caller cannot
+/// choose an earlier time and count deliveries made before the grant.
+///
+/// Merge authority is standing house authority; neither the house
+/// configuration nor the trust ledger records when it took effect, and the
+/// ledger's earned grants never include merging. The first establishment
+/// therefore records its own time, which is no earlier than the real grant,
+/// so the grant can only look younger and sample more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantEpoch {
+    house: HouseId,
+    scope: StationScope,
+    at: Timestamp,
+}
+
+/// The recorded first-seen time of a scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FirstSeen {
+    scope: StationScope,
+    at: Timestamp,
+}
+
+impl GrantEpoch {
+    /// The epoch for `scope`. The first call records `now` once in the house
+    /// store; later calls, and a concurrent first call that lost, read the
+    /// recorded time, so it never moves. Call it only once the house has
+    /// merge authority for the scope's repository.
+    ///
+    /// # Errors
+    /// [`SamplingError::MalformedRecord`] for an undecodable record, and
+    /// store failures.
+    pub fn establish(
+        store: &HouseStore,
+        scope: &StationScope,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> crate::Result<Self> {
+        let key = epoch_key(scope)?;
+        let schema = epoch_schema()?;
+        let at = match store.marker(&key)? {
+            Some(marker) => decode_epoch(&marker, &schema, scope)?,
+            None => {
+                let first = FirstSeen {
+                    scope: scope.clone(),
+                    at: now,
+                };
+                let fact = MarkerFact::workflow(schema.clone(), &first)?;
+                match store.record_marker(key.clone(), fact, recorded_by, now) {
+                    Ok(_) => now,
+                    // Another caller recorded it first; theirs stands.
+                    Err(crate::Error::State(StateError::MarkerConflict)) => {
+                        let marker = store.marker(&key)?.ok_or(SamplingError::MalformedRecord)?;
+                        decode_epoch(&marker, &schema, scope)?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        Ok(Self {
+            house: store.house().clone(),
+            scope: scope.clone(),
+            at,
+        })
+    }
+
+    /// The owning house.
+    #[must_use]
+    pub const fn house(&self) -> &HouseId {
+        &self.house
+    }
+
+    /// Station, project, and work type.
+    #[must_use]
+    pub const fn scope(&self) -> &StationScope {
+        &self.scope
+    }
+
+    /// When sampling first saw the scope's merge authority.
+    #[must_use]
+    pub const fn at(&self) -> Timestamp {
+        self.at
+    }
+}
+
+fn epoch_schema() -> crate::Result<MarkerSchema> {
+    Ok(MarkerSchema::new(EPOCH_SCHEMA, NonZeroU32::MIN)?)
+}
+
+fn epoch_key(scope: &StationScope) -> crate::Result<MarkerKey> {
+    Ok(MarkerKey {
+        workflow: WorkflowId::new(WORKFLOW)?,
+        item: WorkItem::Repository {
+            repository: scope.project.clone(),
+        },
+        subject: MarkerSubject::Observation(ExternalRef::new(&format!(
+            "grant-epoch:{}:{}",
+            scope.station,
+            scope.work_type.as_str()
+        ))?),
+    })
+}
+
+fn decode_epoch(
+    marker: &WorkflowMarker,
+    schema: &MarkerSchema,
+    scope: &StationScope,
+) -> crate::Result<Timestamp> {
+    let seen: FirstSeen = marker
+        .fact()
+        .decode(schema)
+        .map_err(|_| SamplingError::MalformedRecord)?;
+    if &seen.scope != scope {
+        return Err(SamplingError::MalformedRecord.into());
+    }
+    Ok(seen.at)
 }
 
 /// What the trust ledger holds about one station scope since its merge grant.
 /// Only live evidence counts; simulated runs neither lower nor raise a rate.
+///
+/// [`select`] accepts a record only when its scope and grant time are those
+/// of the house's [`GrantEpoch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeRecord {
     /// Station, project, and work type.
     pub scope: StationScope,
-    /// When the merge grant for this scope took effect.
+    /// When the merge grant for this scope took effect: [`GrantEpoch::at`].
     pub granted_at: Timestamp,
     /// When each clean live delivery at or after `granted_at` was observed.
     pub clean: Vec<Timestamp>,
@@ -309,22 +468,23 @@ pub struct ScopeRecord {
 
 impl ScopeRecord {
     /// Read the scope's record from the trust ledger. The latest revision of
-    /// each observation stream counts: a stream attributed to `scope` with
-    /// any confirmed finding, revert, or regression contributes those
-    /// findings, and a trust-eligible stream without them, observed at or
-    /// after `granted_at`, is one clean delivery. Confirmed inspection
-    /// samples of the scope's deliveries are findings at their reservation
-    /// time. Records an operator archived no longer count.
+    /// each observation stream counts: a stream attributed to the epoch's
+    /// scope with any confirmed finding, revert, or regression contributes
+    /// those findings, and a trust-eligible stream without them, observed at
+    /// or after the epoch, is one clean delivery. Confirmed inspection
+    /// samples of the scope's deliveries are findings when their result was
+    /// recorded; a result recorded before results carried that time counts
+    /// from its reservation. Records an operator archived no longer count.
     ///
     /// # Errors
-    /// Ledger read failures, and a stream in the scope whose revisions have
-    /// a gap ([`TrustError::Incomplete`]): missing evidence is not a clean
-    /// record.
-    pub fn from_ledger(
-        ledger: &Ledger,
-        scope: &StationScope,
-        granted_at: Timestamp,
-    ) -> Result<Self, SamplingError> {
+    /// [`SamplingError::HouseMismatch`] for another house's epoch, ledger
+    /// read failures, and a stream in the scope whose revisions have a gap
+    /// ([`TrustError::Incomplete`]): missing evidence is not a clean record.
+    pub fn from_ledger(ledger: &Ledger, epoch: &GrantEpoch) -> Result<Self, SamplingError> {
+        if ledger.house() != &epoch.house {
+            return Err(SamplingError::HouseMismatch);
+        }
+        let (scope, granted_at) = (&epoch.scope, epoch.at);
         let mut record = Self {
             scope: scope.clone(),
             granted_at,
@@ -368,7 +528,8 @@ impl ScopeRecord {
                 }
                 for sample in inspection.samples() {
                     if let Some(SampleResult::Confirmed { finding, .. }) = &sample.result {
-                        record.add_finding(&finding.source, sample.reserved_at);
+                        let confirmed = sample.finished_at.unwrap_or(sample.reserved_at);
+                        record.add_finding(&finding.source, confirmed);
                     }
                 }
             }
@@ -495,20 +656,173 @@ pub struct SamplingDecision {
     pub record: DecisionRecord,
 }
 
+/// A house's secret selection key for one repository. The draw mixes it in,
+/// so only the house can compute or replay a decision; it is never printed
+/// and never leaves the house store.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SelectionKey {
+    house: HouseId,
+    repository: Repository,
+    key: [u8; KEY_BYTES],
+}
+
+impl fmt::Debug for SelectionKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectionKey")
+            .field("house", &self.house)
+            .field("repository", &self.repository)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The recorded form of a selection key: lowercase hexadecimal.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KeyRecord {
+    key: String,
+}
+
+impl SelectionKey {
+    /// The key for `repository` in `store`'s house. The first call generates
+    /// it and records it once; later calls, and concurrent first calls, all
+    /// read the recorded key.
+    ///
+    /// # Errors
+    /// [`SamplingError::MalformedRecord`] for an undecodable key, and store
+    /// failures.
+    pub fn establish(
+        store: &HouseStore,
+        repository: &Repository,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> crate::Result<Self> {
+        if let Some(key) = Self::load(store, repository)? {
+            return Ok(key);
+        }
+        let fresh = fresh_key();
+        let fact = MarkerFact::workflow(key_schema()?, &KeyRecord { key: hex(&fresh) })?;
+        match store.record_marker(key_key(repository)?, fact, recorded_by, now) {
+            Ok(_) => Ok(Self {
+                house: store.house().clone(),
+                repository: repository.clone(),
+                key: fresh,
+            }),
+            // Another caller recorded a key first; theirs stands.
+            Err(crate::Error::State(StateError::MarkerConflict)) => {
+                Self::load(store, repository)?.ok_or_else(|| SamplingError::MalformedRecord.into())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The recorded key for `repository`, if any.
+    ///
+    /// # Errors
+    /// [`SamplingError::MalformedRecord`] for an undecodable key, and store
+    /// failures.
+    pub fn load(store: &HouseStore, repository: &Repository) -> crate::Result<Option<Self>> {
+        let Some(marker) = store.marker(&key_key(repository)?)? else {
+            return Ok(None);
+        };
+        let record: KeyRecord = marker
+            .fact()
+            .decode(&key_schema()?)
+            .map_err(|_| SamplingError::MalformedRecord)?;
+        let key = unhex(&record.key).ok_or(SamplingError::MalformedRecord)?;
+        Ok(Some(Self {
+            house: store.house().clone(),
+            repository: repository.clone(),
+            key,
+        }))
+    }
+
+    /// The owning house.
+    #[must_use]
+    pub const fn house(&self) -> &HouseId {
+        &self.house
+    }
+
+    /// The repository the key selects merges of.
+    #[must_use]
+    pub const fn repository(&self) -> &Repository {
+        &self.repository
+    }
+}
+
+fn key_schema() -> crate::Result<MarkerSchema> {
+    Ok(MarkerSchema::new(KEY_SCHEMA, NonZeroU32::MIN)?)
+}
+
+fn key_key(repository: &Repository) -> crate::Result<MarkerKey> {
+    Ok(MarkerKey {
+        workflow: WorkflowId::new(WORKFLOW)?,
+        item: WorkItem::Repository {
+            repository: repository.clone(),
+        },
+        subject: MarkerSubject::Observation(ExternalRef::new(KEY_SUBJECT)?),
+    })
+}
+
+/// A 256-bit key digested from the standard library's hasher keys, which
+/// hold 128 bits of operating-system randomness per thread, mixed with the
+/// process and time. The workspace has no other randomness source.
+fn fresh_key() -> [u8; KEY_BYTES] {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let mut hasher = Sha256::new();
+    for round in 0u8..8 {
+        // Each `RandomState` has distinct keys.
+        let word = RandomState::new().hash_one((round, std::process::id(), now));
+        hasher.update(word.to_be_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 0x0f])
+        .filter_map(|nibble| char::from_digit(u32::from(nibble), 16))
+        .collect()
+}
+
+fn unhex(text: &str) -> Option<[u8; KEY_BYTES]> {
+    let digits = text.as_bytes();
+    if digits.len() != KEY_BYTES * 2 {
+        return None;
+    }
+    let nibble = |digit: u8| match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        _ => None,
+    };
+    let mut key = [0u8; KEY_BYTES];
+    for (byte, [high, low]) in key.iter_mut().zip(digits.as_chunks::<2>().0) {
+        *byte = (nibble(*high)? << 4) | nibble(*low)?;
+    }
+    Some(key)
+}
+
 /// Decide whether to inspect `merge`, delivered under `record`'s scope.
-/// `budget` is the house usage assessment at `now`; it matters only when the
-/// draw picks the merge.
+/// `record` must carry `epoch`'s scope and time, and `key` must be the
+/// house's key for the merge's repository. `budget` is the house usage
+/// assessment at `now`; it matters only when the draw picks the merge.
 ///
 /// # Errors
-/// [`SamplingError::InvalidPolicy`], [`SamplingError::InvalidInput`] for a
-/// scope in another repository or a grant after `now`, and for a picked
-/// merge [`SamplingError::StaleBudget`] or [`SamplingError::IncompleteBudget`]
-/// when the budget evidence cannot show whether budget remains.
+/// [`SamplingError::InvalidPolicy`], [`SamplingError::UnboundRecord`] for a
+/// record, epoch, and key that do not belong together,
+/// [`SamplingError::InvalidInput`] for a scope in another repository or a
+/// grant after `now`, and for a picked merge [`SamplingError::StaleBudget`]
+/// or [`SamplingError::IncompleteBudget`] when the budget evidence cannot
+/// show whether budget remains.
 pub fn select(
     policy: &SamplingPolicy,
-    house: &HouseId,
+    key: &SelectionKey,
     merge: &MergeSubject,
     record: &ScopeRecord,
+    epoch: &GrantEpoch,
     budget: &BudgetAssessment,
     now: Timestamp,
 ) -> Result<SamplingDecision, SamplingError> {
@@ -516,10 +830,17 @@ pub fn select(
     if record.scope.project != merge.repository {
         return Err(SamplingError::InvalidInput);
     }
+    if key.house != epoch.house
+        || key.repository != merge.repository
+        || record.scope != epoch.scope
+        || record.granted_at != epoch.at
+    {
+        return Err(SamplingError::UnboundRecord);
+    }
     let schedule = policy.schedule(&record.scope.work_type);
     let inputs = record.inputs(schedule, now)?;
     let rate = schedule.rate(&inputs);
-    let draw = draw(house, merge, policy.revision);
+    let draw = draw(key, merge, policy.revision);
     let outcome = if draw >= rate.0 {
         Outcome::Skipped
     } else if !budget.window.contains(now) {
@@ -532,7 +853,7 @@ pub fn select(
         Outcome::Selected
     };
     Ok(SamplingDecision {
-        house: house.clone(),
+        house: key.house.clone(),
         merge: merge.clone(),
         record: DecisionRecord {
             policy_revision: policy.revision,
@@ -545,15 +866,16 @@ pub fn select(
     })
 }
 
-/// The draw for `merge`: a SHA-256 digest of length-prefixed fields, reduced
-/// to 0..1000.
-fn draw(house: &HouseId, merge: &MergeSubject, revision: NonZeroU32) -> u16 {
+/// The draw for `merge`: a SHA-256 digest of the secret key and
+/// length-prefixed public fields, reduced to 0..1000.
+fn draw(key: &SelectionKey, merge: &MergeSubject, revision: NonZeroU32) -> u16 {
     let number = u64::from(merge.number).to_string();
     let revision = revision.to_string();
     let mut hasher = Sha256::new();
+    hasher.update(key.key);
     for field in [
         DRAW_DOMAIN,
-        house.as_str(),
+        key.house.as_str(),
         merge.repository.as_str(),
         &number,
         merge.head.as_str(),
@@ -574,14 +896,19 @@ fn draw(house: &HouseId, merge: &MergeSubject, revision: NonZeroU32) -> u16 {
 
 impl SamplingDecision {
     /// Recompute the rate and draw from the recorded inputs under `policy`
-    /// and check that they, and the outcome, match.
+    /// and the house's selection `key`, and check that they, and the
+    /// outcome, match.
     ///
     /// # Errors
-    /// [`SamplingError::NotReproducible`] for another policy revision or any
-    /// mismatch, [`SamplingError::InvalidInput`] for inconsistent inputs, and
-    /// [`SamplingError::InvalidPolicy`].
-    pub fn replay(&self, policy: &SamplingPolicy) -> Result<(), SamplingError> {
+    /// [`SamplingError::UnboundRecord`] for a key of another house or
+    /// repository, [`SamplingError::NotReproducible`] for another policy
+    /// revision or any mismatch, [`SamplingError::InvalidInput`] for
+    /// inconsistent inputs, and [`SamplingError::InvalidPolicy`].
+    pub fn replay(&self, policy: &SamplingPolicy, key: &SelectionKey) -> Result<(), SamplingError> {
         policy.validate()?;
+        if key.house != self.house || key.repository != self.merge.repository {
+            return Err(SamplingError::UnboundRecord);
+        }
         let record = &self.record;
         record.inputs.validate()?;
         if policy.revision != record.policy_revision
@@ -592,7 +919,7 @@ impl SamplingDecision {
         let rate = policy
             .schedule(&record.scope.work_type)
             .rate(&record.inputs);
-        let draw = draw(&self.house, &self.merge, policy.revision);
+        let draw = draw(key, &self.merge, policy.revision);
         let picked = draw < rate.0;
         let recorded_pick = match record.outcome {
             Outcome::Skipped => false,
@@ -683,6 +1010,8 @@ pub struct RateRaise {
     pub scope: StationScope,
     /// The finding's source.
     pub finding: ExternalRef,
+    /// When the finding was recorded or confirmed.
+    pub finding_at: Timestamp,
     /// The rate without this finding.
     pub from: Rate,
     /// The rate with it; never lower than `from`.
@@ -698,8 +1027,9 @@ impl RateRaise {
     ///
     /// # Errors
     /// [`SamplingError::UnknownFinding`] when `record` lacks the finding,
-    /// [`SamplingError::InvalidInput`] for a grant after `now`, and
-    /// [`SamplingError::InvalidPolicy`].
+    /// [`SamplingError::ExpiredFinding`] once the finding is older than the
+    /// finding window, [`SamplingError::InvalidInput`] for a grant after
+    /// `now`, and [`SamplingError::InvalidPolicy`].
     pub fn of(
         policy: &SamplingPolicy,
         record: &ScopeRecord,
@@ -707,20 +1037,25 @@ impl RateRaise {
         now: Timestamp,
     ) -> Result<Self, SamplingError> {
         policy.validate()?;
-        if !record
+        let finding_at = record
             .findings
             .iter()
-            .any(|found| &found.source == finding && found.at <= now)
-        {
-            return Err(SamplingError::UnknownFinding);
-        }
+            .find(|found| &found.source == finding && found.at <= now)
+            .ok_or(SamplingError::UnknownFinding)?
+            .at;
         let schedule = policy.schedule(&record.scope.work_type);
+        // An expired raise is never reported, so [`compact`] may retire its
+        // marker without a later call reporting the finding again.
+        if now.saturating_since(finding_at) >= schedule.finding_window() {
+            return Err(SamplingError::ExpiredFinding);
+        }
         let from = schedule.rate(&record.inputs_without(schedule, now, Some(finding))?);
         let to = schedule.rate(&record.inputs(schedule, now)?);
         Ok(Self {
             policy_revision: policy.revision,
             scope: record.scope.clone(),
             finding: finding.clone(),
+            finding_at,
             from,
             to,
             at: now,
@@ -741,16 +1076,102 @@ impl RateRaise {
         recorded_by: &Claimant,
         now: Timestamp,
     ) -> crate::Result<MarkerRecording> {
+        // A digest of the source, so no source can take the key or epoch
+        // markers' subjects.
+        let source = Sha256::digest(self.finding.as_str().as_bytes());
         let key = MarkerKey {
             workflow: WorkflowId::new(WORKFLOW)?,
             item: WorkItem::Repository {
                 repository: self.scope.project.clone(),
             },
-            subject: MarkerSubject::Observation(self.finding.clone()),
+            subject: MarkerSubject::Observation(ExternalRef::new(&format!(
+                "finding:{}",
+                hex(&source)
+            ))?),
         };
-        let fact = MarkerFact::workflow(MarkerSchema::new(RAISE_SCHEMA, NonZeroU32::MIN)?, self)?;
+        let fact = MarkerFact::workflow(raise_schema()?, self)?;
         store.record_marker(key, fact, recorded_by, now)
     }
+}
+
+fn raise_schema() -> crate::Result<MarkerSchema> {
+    Ok(MarkerSchema::new(RAISE_SCHEMA, NonZeroU32::MIN)?)
+}
+
+/// What [`compact`] retired.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Compaction {
+    /// Decision markers retired.
+    pub decisions: usize,
+    /// Rate-raise markers retired.
+    pub raises: usize,
+}
+
+/// Retire the sampling markers replay and deduplication no longer need,
+/// in one store transaction:
+///
+/// - a decision judged at least its scope's finding window before `now`,
+///   unless it is the newest decision for its station scope;
+/// - a rate raise whose finding is at least the finding window old, which
+///   [`RateRaise::of`] no longer produces, so it cannot be reported twice.
+///
+/// Selection keys and grant epochs stay. A marker that does not decode also
+/// stays. Windows come from `policy`; run this with the policy current
+/// sampling uses, such as after each recorded decision.
+///
+/// # Errors
+/// [`SamplingError::InvalidPolicy`], a marker changed since it was read
+/// (`StateError::MarkerConflict`; run it again), and store failures.
+pub fn compact(
+    store: &HouseStore,
+    policy: &SamplingPolicy,
+    recorded_by: &Claimant,
+    now: Timestamp,
+) -> crate::Result<Compaction> {
+    policy.validate()?;
+    let (decision, raise) = (decision_schema()?, raise_schema()?);
+    let markers = store.markers(&WorkflowId::new(WORKFLOW)?)?;
+    let expired = |scope: &StationScope, at: Timestamp| {
+        now.saturating_since(at) >= policy.schedule(&scope.work_type).finding_window()
+    };
+    let decisions: Vec<(&WorkflowMarker, DecisionRecord)> = markers
+        .iter()
+        .filter_map(|marker| Some((marker, marker.fact().decode(&decision).ok()?)))
+        .collect();
+    // The newest decision per scope, by judged time and then key. Scopes
+    // are few, so a list is enough.
+    let mut newest: Vec<(&StationScope, (Timestamp, &MarkerKey))> = Vec::new();
+    for (marker, record) in &decisions {
+        let candidate = (record.inputs.at, marker.key());
+        match newest.iter_mut().find(|(scope, _)| *scope == &record.scope) {
+            Some((_, current)) => *current = (*current).max(candidate),
+            None => newest.push((&record.scope, candidate)),
+        }
+    }
+    let mut retire = Vec::new();
+    let mut compaction = Compaction::default();
+    for (marker, record) in &decisions {
+        let latest = newest
+            .iter()
+            .any(|(scope, (_, key))| *scope == &record.scope && *key == marker.key());
+        if !latest && expired(&record.scope, record.inputs.at) {
+            retire.push((marker.key().clone(), marker.fact().clone()));
+            compaction.decisions += 1;
+        }
+    }
+    for marker in &markers {
+        let Ok(raised) = marker.fact().decode::<RateRaise>(&raise) else {
+            continue;
+        };
+        if expired(&raised.scope, raised.finding_at) {
+            retire.push((marker.key().clone(), marker.fact().clone()));
+            compaction.raises += 1;
+        }
+    }
+    if !retire.is_empty() {
+        store.compact_markers(&retire, Vec::new(), recorded_by, now)?;
+    }
+    Ok(compaction)
 }
 
 /// Something the house owner must be told. Delivery is the caller's.

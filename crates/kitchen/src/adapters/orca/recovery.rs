@@ -37,6 +37,9 @@ impl WorkerSignals {
     /// - A provider failure other than an auth, quota, or rate limit does not
     ///   stop the agent until the provider recovers, so it is no
     ///   interruption.
+    /// - An auth, quota, or rate limit is an interruption only while Orca
+    ///   reports the agent at its prompt. An error line beside a working
+    ///   agent is stale output, so the coordinator never parks that worker.
     #[must_use]
     pub fn recovery(&self) -> Option<RecoverySignals> {
         match self.dispatch {
@@ -72,12 +75,18 @@ impl WorkerSignals {
                     TerminalHolder::Unknown
                 }
             },
-            provider: self.provider_error.and_then(|class| match class {
-                ProviderErrorClass::Auth => Some(ProviderInterruption::Auth),
-                ProviderErrorClass::Quota => Some(ProviderInterruption::Quota),
-                ProviderErrorClass::RateLimit => Some(ProviderInterruption::RateLimit),
-                ProviderErrorClass::Other => None,
-            }),
+            provider: match self.prompt {
+                AgentPrompt::AtPrompt => self.provider_error.and_then(|class| match class {
+                    ProviderErrorClass::Auth => Some(ProviderInterruption::Auth),
+                    ProviderErrorClass::Quota => Some(ProviderInterruption::Quota),
+                    ProviderErrorClass::RateLimit => Some(ProviderInterruption::RateLimit),
+                    ProviderErrorClass::Other => None,
+                }),
+                // An error line in the scrollback of an agent Orca reports as
+                // working, or in any state Orca cannot place, is not proof
+                // that the provider stopped it.
+                AgentPrompt::Working | AgentPrompt::AwaitingHuman | AgentPrompt::Unknown => None,
+            },
         })
     }
 }

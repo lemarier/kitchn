@@ -84,6 +84,15 @@ fn transcript(messages: Vec<SimMessage>) -> Option<SimOutput> {
     })
 }
 
+/// A live agent Orca reports at its prompt, where a provider refusal has
+/// stopped it.
+fn idle() -> SimWorker {
+    SimWorker {
+        activity: "idle",
+        ..live()
+    }
+}
+
 fn live() -> SimWorker {
     SimWorker::new("ready", "in_progress", "live", false)
 }
@@ -258,13 +267,13 @@ fn a_launch_orca_failed_before_the_agent_was_ready_is_no_turn_on_an_unknown_term
 fn only_provider_refusals_that_stop_the_agent_interrupt_it() -> TestResult {
     let auth = SimWorker {
         last_error: Some("API Error: 401 authentication_error invalid x-api-key"),
-        ..live()
+        ..idle()
     };
     let quota = SimWorker {
         output: Some(SimOutput::Terminal(vec![
             "You've hit your usage limit. Try again at 3pm.".to_owned(),
         ])),
-        ..live()
+        ..idle()
     };
     let throttled = SimWorker {
         output: transcript(vec![message(
@@ -272,18 +281,18 @@ fn only_provider_refusals_that_stop_the_agent_interrupt_it() -> TestResult {
             "API Error: 429 rate_limit_error",
             2_000,
         )]),
-        ..live()
+        ..idle()
     };
     let other = SimWorker {
         preview: Some("API Error: 500 internal server error"),
-        ..live()
+        ..idle()
     };
     let cases = [
         (auth, Some(ProviderInterruption::Auth)),
         (quota, Some(ProviderInterruption::Quota)),
         (throttled, Some(ProviderInterruption::RateLimit)),
         (other, None),
-        (live(), None),
+        (idle(), None),
     ];
     for (index, (sim_worker, expected)) in cases.into_iter().enumerate() {
         assert_eq!(
@@ -291,6 +300,23 @@ fn only_provider_refusals_that_stop_the_agent_interrupt_it() -> TestResult {
             expected,
             "case {index}"
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_provider_error_line_never_parks_a_worker_orca_reports_as_working() -> TestResult {
+    // The line is scrollback: the agent has moved on and Orca says it works.
+    let error = "API Error: 429 rate_limit_error";
+    for (index, activity) in ["working", "blocked", "unknown"].into_iter().enumerate() {
+        let sim_worker = SimWorker {
+            activity,
+            preview: Some(error),
+            output: Some(SimOutput::Terminal(vec![error.to_owned()])),
+            last_error: Some(error),
+            ..live()
+        };
+        assert_eq!(recovered(sim_worker, 1_000)?.provider, None, "case {index}");
     }
     Ok(())
 }

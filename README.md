@@ -192,8 +192,10 @@ Never commit credentials or private operational records.
 kitchn stands on [pstack](https://github.com/cursor/plugins/tree/main/pstack)
 by Lauren Tan ([@poteto](https://x.com/poteto)). Its core idea, *if you want to
 go fast, go deep first*, is the one kitchn is built on: rigor is what makes
-parallel agents safe to trust. pstack makes one agent work like a careful
-engineer; kitchn organizes many of them into a brigade.
+parallel agents safe to trust. The engineering skills kitchn is developed with
+adapt pstack's `interrogate`, `arena` and `swarm` skills and its overnight-run
+guidance for Orca, under pstack's MIT license. Those notices move with the
+skills when they come into this repository.
 
 ## License
 

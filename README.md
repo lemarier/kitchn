@@ -16,8 +16,9 @@ use; [Orca](https://github.com/stablyai/orca) is the first.
 
 ## Why I built this
 
-I co-founded Popcorn Time, ran VPN.ht for 50,000 users on 150+ servers, built
-Tauri's updater, and have sat on Tauri's board since 2021.
+I co-founded Popcorn Time, ran VPN.ht for 50,000 users on 150+ servers, and
+built Tauri's updater. I was a founding member of Tauri's board and now build
+with Tauri at CrabNebula.
 
 In the ten months to September 2026, my agents merged 797 pull requests and
 3,500+ commits across 28 repositories. 610 of those pull requests landed in the

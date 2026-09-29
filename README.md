@@ -46,9 +46,9 @@ earned, never assumed.
 — [David Lemarier](https://lemarier.ca)
 
 > [!NOTE]
-> kitchn is early. You can register a house, bind repositories and draft issues
-> from your session today. Working issues and pull requests needs a house state
-> store that no command creates yet. Unattended runs are still being validated ([#1](https://github.com/lemarier/kitchn/issues/1)). The install
+> kitchn is early. You can register a house, bind repositories, draft issues,
+> and claim issues and pull requests from your session today. Unattended runs
+> are still being validated ([#1](https://github.com/lemarier/kitchn/issues/1)). The install
 > script and the crates.io release arrive with
 > [#18](https://github.com/lemarier/kitchn/issues/18).
 
@@ -137,8 +137,8 @@ and verbose on purpose, because agents and schedules call them, not people.
 
 If you want to look under the hood, `kitchn --help` lists every command and
 the [CLI reference](https://getkitchn.com/docs/reference/cli/) documents
-their flags and exit codes. One current gap: commands that track claims need a
-house state store, and no command creates one yet.
+their flags and exit codes. `house init` also creates the house state store
+where claims live, and commands find it through the registry.
 
 ## Repository layout
 

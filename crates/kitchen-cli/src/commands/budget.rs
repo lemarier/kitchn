@@ -94,9 +94,10 @@ struct Source {
     registry: PathBuf,
     #[arg(long)]
     house: HouseId,
-    /// The house's initialized state store.
+    /// The house's initialized state store (default: the one `house init`
+    /// created in the registry).
     #[arg(long)]
-    store: PathBuf,
+    store: Option<PathBuf>,
     /// Absolute path of the Orca executable.
     #[arg(long)]
     orca: PathBuf,
@@ -109,6 +110,13 @@ struct Source {
     /// House-scoped Orca runtime storage shared by every caller.
     #[arg(long)]
     runtime_dir: PathBuf,
+}
+
+impl Source {
+    /// `--store`, else the house's store in the registry.
+    fn store(&self) -> Result<PathBuf, HouseError> {
+        super::house::store_or_default(self.store.clone(), Some(&self.registry), &self.house)
+    }
 }
 
 /// Where owner reports are posted. Without `--report-issue` a run still
@@ -236,7 +244,11 @@ impl Opened {
             .schedules
             .clone()
             .ok_or(WorkflowError::IncompleteEvidence)?;
-        let store = HouseStore::open(&source.store, source.house.clone(), StoreOptions::default())?;
+        let store = HouseStore::open(
+            source.store()?,
+            source.house.clone(),
+            StoreOptions::default(),
+        )?;
         let backend = OrcaBackend::connect(
             OrcaConfig {
                 backend: source.backend.clone(),
@@ -485,7 +497,7 @@ fn install(
         kitchen,
         registry: source.registry.clone(),
         house: source.house.clone(),
-        store: source.store.clone(),
+        store: source.store()?,
         orca: source.orca.clone(),
         backend: source.backend.clone(),
         credential: source.credential.clone(),

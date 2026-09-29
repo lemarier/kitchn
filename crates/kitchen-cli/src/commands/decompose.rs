@@ -67,9 +67,10 @@ enum DecomposeCommand {
         registry: PathBuf,
         #[arg(long)]
         house: HouseId,
-        /// The house's initialized state store.
+        /// The house's initialized state store (default: the one `house init`
+        /// created in the registry).
         #[arg(long)]
-        store: PathBuf,
+        store: Option<PathBuf>,
         /// You, the person approving.
         #[arg(long)]
         holder: HolderId,
@@ -85,9 +86,10 @@ enum DecomposeCommand {
     /// recorded as unproven. Check the forge for that task's issues first.
     /// Nothing is released without it, and a scheduled run cannot do it.
     Acknowledge {
-        /// The house's initialized state store.
-        #[arg(long)]
-        store: PathBuf,
+        /// The house's initialized state store (default: the one `house init`
+        /// created in --registry).
+        #[arg(long, required_unless_present = "registry")]
+        store: Option<PathBuf>,
         #[arg(long)]
         house: HouseId,
         /// The house registry; its forge binding is used to re-read the
@@ -139,6 +141,10 @@ pub fn run(args: DecomposeArgs) -> Result<(String, bool), kitchen::Error> {
             let proposal: Proposal = decode(&proposal)?;
             let registry = HouseRegistry::new(super::house::canonical_root(registry)?)?;
             let config = registry.load(&house)?;
+            let store = match store {
+                Some(store) => store,
+                None => registry.store_path(&house)?,
+            };
             let store = HouseStore::open(store, house.clone(), StoreOptions::default())?;
             let grants = config.authority()?;
             let options = ApplyOptions {
@@ -186,14 +192,15 @@ pub fn run(args: DecomposeArgs) -> Result<(String, bool), kitchen::Error> {
             accept_unknown,
             json,
         } => {
-            let reread = match registry {
+            let reread = match &registry {
                 Some(registry) => Reread::open(
-                    &HouseRegistry::new(super::house::canonical_root(registry)?)?,
+                    &HouseRegistry::new(super::house::canonical_root(registry.clone())?)?,
                     &house,
                     without_forge,
                 )?,
                 None => Reread::NoRegistry,
             };
+            let store = super::house::store_or_default(store, registry.as_deref(), &house)?;
             let store = HouseStore::open(store, house.clone(), StoreOptions::default())?;
             let report = acknowledge(
                 &store,

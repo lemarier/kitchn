@@ -3,7 +3,7 @@ use kitchen::{
     HouseId,
     adoption::{
         BindingDigest, HouseRegistry, InstructionBundle, LegacyImportStatus, RepositoryMatch,
-        decode, encode, legacy_binding,
+        StoreOutcome, StoreSetup, decode, encode, legacy_binding,
     },
     contracts::Repository,
     house::{
@@ -15,7 +15,7 @@ use kitchen::{
 use std::{
     collections::BTreeSet,
     io::{self, BufRead, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[derive(Args)]
@@ -132,10 +132,12 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             let registry = HouseRegistry::new(canonical_root(registry)?)?;
             let config: HouseConfig = decode(&config)?;
             registry.initialize(&config)?;
+            let store = registry.initialize_store(&config.house)?;
             Ok((
                 format!(
-                    "Registered house {}. No authority or workflows activated.\nNext: from a checkout of an allowed repository, run kitchn house setup --registry '{}'",
+                    "Registered house {}. No authority or workflows activated.\n{}\nNext: from a checkout of an allowed repository, run kitchn house setup --registry '{}'",
                     config.house,
+                    store_text(&store),
                     registry.root().display()
                 ),
                 true,
@@ -455,6 +457,28 @@ pub(super) fn prompt(message: &str) -> Result<String, HouseError> {
         line.push(byte);
     }
     Err(HouseError::InvalidInput)
+}
+/// One line saying where the house store is and whether this run created it.
+pub(super) fn store_text(store: &StoreSetup) -> String {
+    match store.outcome {
+        StoreOutcome::Created => format!("Created the house store at {}.", store.path.display()),
+        StoreOutcome::Existing => format!("Kept the house store at {}.", store.path.display()),
+    }
+}
+/// `--store` when given, else the house's store in `--registry`. Clap
+/// requires one of them; neither is invalid input.
+pub(super) fn store_or_default(
+    store: Option<PathBuf>,
+    registry: Option<&Path>,
+    house: &HouseId,
+) -> Result<PathBuf, HouseError> {
+    match (store, registry) {
+        (Some(store), _) => Ok(store),
+        (None, Some(registry)) => {
+            HouseRegistry::new(canonical_root(registry.to_path_buf())?)?.store_path(house)
+        }
+        (None, None) => Err(HouseError::InvalidInput),
+    }
 }
 pub(super) fn canonical_root(path: PathBuf) -> Result<PathBuf, HouseError> {
     // Preserve path redirects for the library to reject; canonicalization would

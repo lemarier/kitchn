@@ -205,7 +205,7 @@ pub fn run(
     };
     Ok((
         format!(
-            "Registered house {} in {} and pinned {} guidance at {}.\nNo authority or workflows activated.{forge}\nSaved your answers as {}. Review it any time.\nNext: from a checkout of an allowed repository, run kitchn house setup --registry '{}'",
+            "Registered house {} in {} and pinned {} guidance at {}.\nNo authority or workflows activated.{forge}\n{}\nSaved your answers as {}. Review it any time.\nNext: from a checkout of an allowed repository, run kitchn house setup --registry '{}'",
             plan.config.house,
             plan.registry.display(),
             if answers.bundle.is_some() {
@@ -214,6 +214,7 @@ pub fn run(
                 "the default"
             },
             guidance.get(..7).unwrap_or(guidance),
+            super::house::store_text(&report.store),
             report.config_path.display(),
             plan.registry.display(),
         ),

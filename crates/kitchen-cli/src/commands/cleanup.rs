@@ -42,9 +42,13 @@ pub struct CleanupArgs {
 /// Where the inventory comes from and which house it belongs to.
 #[derive(Args)]
 struct Source {
-    /// The house's initialized state store.
+    /// The house's initialized state store (default: the one `house init`
+    /// created in --registry).
+    #[arg(long, required_unless_present = "registry")]
+    store: Option<PathBuf>,
+    /// The house registry, used only to locate the house store.
     #[arg(long)]
-    store: PathBuf,
+    registry: Option<PathBuf>,
     #[arg(long)]
     house: HouseId,
     /// Inventory snapshot exported from the backend (JSON). Trusted input:
@@ -156,7 +160,9 @@ struct Opened {
 fn open(source: Source) -> Result<Opened, kitchen::Error> {
     let snapshot: Snapshot = decode(&source.inventory)?;
     let backend = SnapshotBackend::new(source.house.clone(), snapshot)?;
-    let store = HouseStore::open(source.store, source.house, StoreOptions::default())?;
+    let store =
+        super::house::store_or_default(source.store, source.registry.as_deref(), &source.house)?;
+    let store = HouseStore::open(store, source.house, StoreOptions::default())?;
     Ok(Opened {
         backend,
         store,

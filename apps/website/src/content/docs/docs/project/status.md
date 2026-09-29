@@ -16,7 +16,7 @@ From the CLI:
 - `doctor` reports for pins, access, labels, backend capabilities and merge readiness
 - Repository templates with previews, provenance and conflict detection
 - Forge binding: the GitHub account a house writes as, with the token kept in a file you place
-- Interactive sessions through the [`/kitchn` skill](/docs/guides/sessions/): `work`, `pr`, `issue new`, `issue refine` and `hand-back`, sharing durable claims with scheduled runs ([#17](https://github.com/lemarier/kitchn/issues/17)). Commands that take `--store` need a house state store, and no command creates one yet.
+- Interactive sessions through the [`/kitchn` skill](/docs/guides/sessions/): `work`, `pr`, `issue new`, `issue refine` and `hand-back`, sharing durable claims with scheduled runs ([#17](https://github.com/lemarier/kitchn/issues/17)), kept in the house state store `house init` creates ([#173](https://github.com/lemarier/kitchn/issues/173))
 - Dishwasher cleanup previews and digest-bound approvals, including a disk-space trigger
 - Project decomposition previews with dependency and ownership checks
 - The gardener's scheduled precheck

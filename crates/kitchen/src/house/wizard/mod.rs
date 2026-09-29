@@ -25,7 +25,10 @@ use std::{
 
 use crate::{
     BackendId, CredentialId, HouseId,
-    adoption::{HouseRegistry, InstructionBundle, ResolvedInstructions, encode, role_cards_digest},
+    adoption::{
+        HouseRegistry, InstructionBundle, ResolvedInstructions, StoreSetup, encode,
+        role_cards_digest,
+    },
     contracts::{CommitId, ExternalRef, PostingBudget, Repository, Role},
     house::{
         BindOutcome, CredentialStatus, FORGE_BINDING_SCHEMA, FollowUpPolicy, ForgeBinding,
@@ -664,18 +667,22 @@ pub struct HouseInitReport {
     pub instructions: ResolvedInstructions,
     /// The forge binding, when the plan had one.
     pub forge: Option<BoundForge>,
+    /// The house's state store, which commands use when `--store` is omitted.
+    pub store: StoreSetup,
 }
 
-/// Register a confirmed plan and pin its guidance in the same run. Create-only:
-/// identical existing content is kept, so rerunning with the same answers
-/// resumes a run that stopped between the two writes.
+/// Register a confirmed plan, pin its guidance, and create the house's state
+/// store in the same run. Create-only: identical existing content and the
+/// house's existing store are kept, so rerunning with the same answers resumes
+/// a run that stopped between the writes.
 ///
 /// # Errors
 /// Refuses a registry inside a repository or a bundle that does not match
 /// the configuration before writing; a different existing house is a
 /// conflict; [`HouseInitError::GuidanceNotPinned`] when only the snapshot
 /// failed; [`HouseInitError::ForgeNotBound`] when only the forge binding
-/// failed.
+/// failed; [`HouseInitError::StoreNotInitialized`] when only the store failed,
+/// including a store there that belongs to another house.
 pub fn register_house(plan: &HouseInitPlan) -> Result<HouseInitReport, HouseInitError> {
     let registry = HouseRegistry::new(plan.registry.clone())?;
     plan.bundle.validate(&plan.config)?;
@@ -703,6 +710,11 @@ pub fn register_house(plan: &HouseInitPlan) -> Result<HouseInitReport, HouseInit
         .map_err(|source| HouseInitError::ForgeNotBound {
             source: Box::new(source),
         })?;
+    let store = registry
+        .initialize_store(&plan.config.house)
+        .map_err(|source| HouseInitError::StoreNotInitialized {
+            source: Box::new(source),
+        })?;
     Ok(HouseInitReport {
         config_path: registry
             .root()
@@ -710,6 +722,7 @@ pub fn register_house(plan: &HouseInitPlan) -> Result<HouseInitReport, HouseInit
             .join(format!("{}.json", plan.config.house)),
         instructions,
         forge,
+        store,
     })
 }
 

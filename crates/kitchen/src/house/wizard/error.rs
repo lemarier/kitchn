@@ -47,6 +47,16 @@ pub enum HouseInitError {
         /// Why the binding was not stored.
         source: Box<crate::house::ForgeError>,
     },
+    /// The house was registered, its guidance pinned, and any forge binding
+    /// stored, but its state store was not created. Rerunning `house init`
+    /// with the same answers resumes; a store for another house is refused.
+    #[error(
+        "registered the house, but its state store was not created ({source}); rerun house init with the same answers"
+    )]
+    StoreNotInitialized {
+        /// Why the store was not created.
+        source: Box<crate::Error>,
+    },
     /// Registry validation or storage failed.
     #[error(transparent)]
     House(#[from] HouseError),
@@ -66,6 +76,7 @@ impl HouseInitError {
             | Self::KitchenNotThisBuild => ErrorClass::InvalidInput,
             Self::GuidanceNotPinned { source } | Self::House(source) => source.class(),
             Self::ForgeNotBound { source } => source.class(),
+            Self::StoreNotInitialized { source } => source.class(),
             Self::Io(_) => ErrorClass::Execution,
         }
     }

@@ -8,6 +8,7 @@ use crate::{
     HouseId,
     contracts::{CommitId, Repository},
     house::{HouseConfig, HouseError, REPOSITORY_BINDING_SCHEMA, RepositoryConfig},
+    state::{HouseStore, StateError, StoreOptions},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -24,6 +25,8 @@ use std::{
 pub const LEGACY_REPOSITORY_CONFIG: &str = ".kitchen.json";
 /// Registry directory holding one binding per repository.
 const BINDINGS: &str = "repositories";
+/// The house's state store, inside its private directory.
+const HOUSE_STORE: &str = "store";
 /// Longest wait for the registry lock before reporting it busy.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -57,6 +60,24 @@ fn try_lock_file(file: &File) -> Result<Attempt, HouseError> {
         Err(fs::TryLockError::WouldBlock) => Ok(Attempt::Contended),
         Err(fs::TryLockError::Error(error)) => Err(error.into()),
     }
+}
+
+/// Whether [`HouseRegistry::initialize_store`] created the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOutcome {
+    /// The store was created.
+    Created,
+    /// The house's store was already there and was kept.
+    Existing,
+}
+
+/// The house store [`HouseRegistry::initialize_store`] established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreSetup {
+    /// The store directory.
+    pub path: PathBuf,
+    /// Whether this run created it.
+    pub outcome: StoreOutcome,
 }
 
 /// External registry containing house policy, immutable snapshots, and one
@@ -413,6 +434,34 @@ impl HouseRegistry {
         let path = self.root.join("private").join(house.as_str());
         ensure_external(&path)?;
         Ok(path)
+    }
+    /// Where the house's state store lives: `private/<house>/store`. Commands
+    /// default `--store` to it. Does not create or open it.
+    ///
+    /// # Errors
+    /// The errors of [`Self::private_path`].
+    pub fn store_path(&self, house: &HouseId) -> Result<PathBuf, HouseError> {
+        Ok(self.private_path(house)?.join(HOUSE_STORE))
+    }
+    /// Create the house's state store at [`Self::store_path`], or confirm the
+    /// one already there belongs to `house`, so rerunning init succeeds.
+    ///
+    /// # Errors
+    /// The refusals of [`HouseStore::initialize`] other than already
+    /// initialized; for an existing store, those of [`HouseStore::open`],
+    /// including [`crate::contracts::ContractError::CrossHouse`] when it
+    /// belongs to another house.
+    pub fn initialize_store(&self, house: &HouseId) -> Result<StoreSetup, crate::Error> {
+        let path = self.store_path(house)?;
+        let outcome = match HouseStore::initialize(&path, house.clone(), StoreOptions::default()) {
+            Ok(_) => StoreOutcome::Created,
+            Err(crate::Error::State(StateError::AlreadyInitialized)) => {
+                HouseStore::open(&path, house.clone(), StoreOptions::default())?;
+                StoreOutcome::Existing
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(StoreSetup { path, outcome })
     }
     fn config_path(&self, house: &HouseId) -> PathBuf {
         self.root.join("houses").join(format!("{house}.json"))

@@ -43,9 +43,13 @@ enum StoreCommand {
     Capacity {
         #[arg(long)]
         house: HouseId,
-        /// Absolute path of the house's initialized state store.
+        /// Absolute path of the house's initialized state store (default:
+        /// the one `house init` created in --registry).
+        #[arg(long, required_unless_present = "registry")]
+        store: Option<PathBuf>,
+        /// The house registry, used only to locate the house store.
         #[arg(long)]
-        store: PathBuf,
+        registry: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -62,9 +66,10 @@ struct RetainArgs {
     registry: Option<PathBuf>,
     #[arg(long)]
     house: HouseId,
-    /// Absolute path of the house's initialized state store.
-    #[arg(long)]
-    store: PathBuf,
+    /// Absolute path of the house's initialized state store (default: the
+    /// one `house init` created in --registry).
+    #[arg(long, required_unless_present = "registry")]
+    store: Option<PathBuf>,
     /// Absolute path of the GitHub CLI, used with the house's forge binding
     /// to read which issues and pull requests are closed. Without it nothing
     /// that depends on an issue or pull request is removed.
@@ -87,7 +92,13 @@ struct RetainArgs {
 
 pub fn run(args: StoreArgs) -> Result<(String, bool), kitchen::Error> {
     match args.command {
-        StoreCommand::Capacity { house, store, json } => {
+        StoreCommand::Capacity {
+            house,
+            store,
+            registry,
+            json,
+        } => {
+            let store = super::house::store_or_default(store, registry.as_deref(), &house)?;
             let capacity = open(&store, house)?.capacity()?;
             let healthy = !capacity.near_limit();
             let output = if json {
@@ -125,7 +136,9 @@ fn retain(args: RetainArgs) -> Result<(String, bool), kitchen::Error> {
     if args.gh.as_ref().is_some_and(|gh| !gh.is_absolute()) {
         return Err(HouseError::InvalidInput.into());
     }
-    let store = open(&args.store, args.house.clone())?;
+    let store =
+        super::house::store_or_default(args.store.clone(), args.registry.as_deref(), &args.house)?;
+    let store = open(&store, args.house.clone())?;
     let subjects = store.retention_subjects()?;
     let mut inventory = Inventory::new();
     let (looked_up, observed) = match &args.gh {

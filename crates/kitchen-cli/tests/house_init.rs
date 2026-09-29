@@ -164,6 +164,106 @@ fn flags_register_the_same_house_as_the_config_path() -> TestResult {
 }
 
 #[test]
+fn init_creates_the_house_store_that_commands_default_to() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let (checkout, home) = fixture(&root)?;
+    let acme = bundle(&root, "acme")?;
+    let flags = [
+        "--house",
+        "acme",
+        "--required-checks",
+        "none",
+        "--bundle",
+        &acme,
+        "--yes",
+    ];
+    let registry = home.join(".kitchn");
+    let store = registry.join("private/acme/store");
+    let first = init(&checkout, &home, &flags)?;
+    assert_eq!(first.status.code(), Some(0), "{first:?}");
+    let created = format!("Created the house store at {}.", store.display());
+    assert!(String::from_utf8(first.stdout)?.contains(&created));
+    assert!(store.join("store.json").exists());
+    let marker = fs::read(store.join("store.json"))?;
+    let rerun = init(&checkout, &home, &flags)?;
+    assert_eq!(rerun.status.code(), Some(0), "{rerun:?}");
+    let kept = format!("Kept the house store at {}.", store.display());
+    assert!(String::from_utf8(rerun.stdout)?.contains(&kept));
+    assert_eq!(fs::read(store.join("store.json"))?, marker);
+    assert_eq!(git(&checkout, &["status", "--porcelain", "--ignored"])?, "");
+
+    let kitchn = |args: &[&str]| -> TestResult<Output> {
+        Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
+            .current_dir(&root)
+            .args(args)
+            .output()?)
+    };
+    let registry_arg = registry.display().to_string();
+    // --registry alone locates the store house init created.
+    let capacity = kitchn(&[
+        "store",
+        "capacity",
+        "--house",
+        "acme",
+        "--registry",
+        &registry_arg,
+    ])?;
+    assert_eq!(capacity.status.code(), Some(0), "{capacity:?}");
+    assert!(String::from_utf8(capacity.stdout)?.starts_with("Tasks: 0 of "));
+    // An explicit --store wins over the registry's store.
+    let elsewhere = root.join("elsewhere").display().to_string();
+    let explicit = kitchn(&[
+        "store",
+        "capacity",
+        "--house",
+        "acme",
+        "--registry",
+        &registry_arg,
+        "--store",
+        &elsewhere,
+    ])?;
+    assert_eq!(explicit.status.code(), Some(1), "{explicit:?}");
+    assert!(
+        String::from_utf8(explicit.stderr)?.contains("no store is initialized in this directory")
+    );
+    // A house the registry does not hold has no default store.
+    let ghost = kitchn(&[
+        "store",
+        "capacity",
+        "--house",
+        "ghost",
+        "--registry",
+        &registry_arg,
+    ])?;
+    assert_eq!(ghost.status.code(), Some(1), "{ghost:?}");
+    // Without either flag there is nothing to locate the store from.
+    let neither = kitchn(&["store", "capacity", "--house", "acme"])?;
+    assert_eq!(neither.status.code(), Some(2), "{neither:?}");
+
+    // Registering a reviewed file creates the store as well.
+    let manual = root.join("manual");
+    let reviewed = registry.join("houses/acme.json").display().to_string();
+    let config = init(
+        &checkout,
+        &home,
+        &[
+            "--registry",
+            &manual.display().to_string(),
+            "--config",
+            &reviewed,
+        ],
+    )?;
+    assert_eq!(config.status.code(), Some(0), "{config:?}");
+    let created = format!(
+        "Created the house store at {}.",
+        manual.join("private/acme/store").display()
+    );
+    assert!(String::from_utf8(config.stdout)?.contains(&created));
+    Ok(())
+}
+
+#[test]
 fn invalid_flags_and_mixed_modes_exit_2() -> TestResult {
     let temp = tempfile::tempdir()?;
     let (checkout, home) = fixture(&temp.path().canonicalize()?)?;

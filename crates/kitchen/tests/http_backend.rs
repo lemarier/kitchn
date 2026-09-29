@@ -992,3 +992,22 @@ fn visit(dir: &Path, found: &mut dyn FnMut(&Path, &str)) -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn a_url_pattern_in_the_endpoint_sends_one_request() -> TestResult {
+    let sim = capable()?;
+    let config = HttpConfig {
+        endpoint: HttpEndpoint::new(&format!("{}/x{{a,b}}", sim.endpoint()))?,
+        ..config(&sim, "coordinator-1", Duration::from_secs(5))?
+    };
+    // Connecting may fail against this path; what matters is that curl sent
+    // exactly one request and did not expand the braces into two URLs.
+    let _ = HttpBackend::connect(config, TOKEN);
+    let paths: Vec<String> = sim.requests().into_iter().map(|r| r.path).collect();
+    assert_eq!(paths.len(), 1, "{paths:?}");
+    assert!(
+        !paths.iter().any(|path| path.starts_with("/xa")),
+        "{paths:?}"
+    );
+    Ok(())
+}

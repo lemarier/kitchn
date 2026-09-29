@@ -129,6 +129,8 @@ impl Transport {
                 })
             ),
             "silent".to_owned(),
+            // One request per call: no `{a,b}` or `[1-3]` URL expansion.
+            "globoff".to_owned(),
             format!("max-time = {:.3}", timeout.as_secs_f64()),
             format!("max-filesize = {RESPONSE_LIMIT}"),
             "write-out = \"\\n%{http_code}\"".to_owned(),

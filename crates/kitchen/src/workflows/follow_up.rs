@@ -167,6 +167,9 @@ pub(crate) fn hold(
     }
     let claimant = owner(record, fence, now)?;
     let task = &record.spec().id;
+    // Follow-ups addressed or sent since the last supervision step do not
+    // count against the bound.
+    prune(store, task)?;
     let stored = Stored {
         id: id.clone(),
         body: body.clone(),

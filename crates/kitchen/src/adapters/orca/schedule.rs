@@ -709,6 +709,7 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::ReservationInsideRepository
         | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
+        | OrcaError::BranchTaken { .. }
         | OrcaError::Schedule(_)
         | OrcaError::ScheduleLimit(_)
         | OrcaError::Contract(_) => EffectFailure::NotApplied(NotAppliedReason::Rejected),

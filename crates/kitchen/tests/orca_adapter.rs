@@ -15,8 +15,8 @@ use common::{
 use kitchen::{
     BackendId, ConsumerId, CredentialId, EffectName,
     adapters::orca::{
-        MAX_INVENTORY_PAGES, MessageKind, OrcaBackend, OrcaConfig, OrcaError, RetainedReason,
-        TerminalAccounting, launch_marker, verify_branch,
+        BranchCollision, MAX_INVENTORY_PAGES, MAX_REPO_WORKTREES, MessageKind, OrcaBackend,
+        OrcaConfig, OrcaError, RetainedReason, TerminalAccounting, launch_marker, verify_branch,
     },
     contracts::{
         AttemptNumber, BackendUnavailable, BranchName, Capability, CapabilityRequirements, Effect,
@@ -339,7 +339,12 @@ fn launch_creates_one_keyed_task_with_separated_arguments() -> TestResult {
     let [create] = creates.as_slice() else {
         return Err("expected one task".into());
     };
-    assert_eq!(flag(create, "spec"), Some(brief), "brief is one argv entry");
+    let spec = format!("{brief}\n\nkitchen-requested-branch: ");
+    assert_eq!(
+        flag(create, "spec"),
+        Some(spec.as_str()),
+        "brief is one argv entry, followed by the empty branch record"
+    );
     let marker = launch_marker(&house()?, &key("launch-1")?);
     assert_eq!(flag(create, "task-title"), Some(marker.as_str()));
     assert_eq!(flag(create, "run"), Some("run_sim"));
@@ -2184,6 +2189,352 @@ fn a_stop_that_fails_once_is_retried_within_the_launch() -> TestResult {
             requested: "lemarier/issue-6".to_owned(),
             actual: Some("other/issue-6".to_owned()),
         })
+    );
+    Ok(())
+}
+
+fn nothing_launched(sim: &SimOrca) {
+    assert!(sim.calls_to(&["orchestration", "task-create"]).is_empty());
+    assert!(sim.calls_to(&["orchestration", "worker-start"]).is_empty());
+}
+
+#[test]
+fn a_branch_an_orca_worktree_holds_is_refused_before_anything_is_created() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().worktrees.push((
+        "wt_held".to_owned(),
+        "refs/heads/lemarier/issue-6".to_owned(),
+    ));
+    let backend = connect(&sim)?;
+    let launch = request(
+        launch_on("lemarier/issue-6", Workspace::Isolated)?,
+        "branch-held",
+    )?;
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+    );
+    nothing_launched(&sim);
+    let listings = sim.calls_to(&["worktree", "list"]);
+    let [listing] = listings.as_slice() else {
+        return Err("expected one worktree listing".into());
+    };
+    assert_eq!(flag(listing, "repo"), Some("id:repo-1"));
+    // The reason, for a caller that asks.
+    assert_eq!(
+        backend.check_branch_free(&branch("lemarier/issue-6")?),
+        Err(OrcaError::BranchTaken {
+            requested: "lemarier/issue-6".to_owned()
+        })
+    );
+    // Another branch of the same repository is free.
+    assert_eq!(
+        backend.check_branch_free(&branch("lemarier/issue-7")?),
+        Ok(())
+    );
+
+    // Explicit reuse: launching in the worktree that holds the branch.
+    sim.state().existing_branch = Some("lemarier/issue-6");
+    let reuse = request(
+        launch_on(
+            "lemarier/issue-6",
+            Workspace::Existing(worktree("wt_held")?),
+        )?,
+        "branch-reused",
+    )?;
+    let listed = sim.calls_to(&["worktree", "list"]).len();
+    let receipt = backend.execute(&reuse)?;
+    verify_branch(&receipt, "lemarier/issue-6")?;
+    assert_eq!(
+        sim.calls_to(&["worktree", "list"]).len(),
+        listed,
+        "no check for reuse"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_listing_that_cannot_show_the_branch_free_refuses_the_launch() -> TestResult {
+    type Setup = fn(&SimOrca);
+    let setups: [(&str, Setup); 6] = [
+        ("truncated", |sim| sim.state().listing_truncated = true),
+        ("counts more than it returns", |sim| {
+            sim.state().unlisted_worktrees = 1;
+        }),
+        ("a host left out", |sim| {
+            sim.state().omitted_hosts.push("remote-1")
+        }),
+        ("garbage", |sim| {
+            sim.fault_on(&["worktree", "list"], Fault::Garbage)
+        }),
+        ("timeout", |sim| {
+            sim.fault_on(&["worktree", "list"], Fault::TimeoutBeforeEffect);
+        }),
+        ("refused", |sim| {
+            sim.fault_on(&["worktree", "list"], Fault::Refuse("repo_not_found"));
+        }),
+    ];
+    for (case, setup) in setups {
+        let sim = SimOrca::default();
+        let backend = connect(&sim)?;
+        setup(&sim);
+        assert_eq!(
+            backend.execute(&request(
+                launch_on("lemarier/issue-6", Workspace::Isolated)?,
+                "unproven",
+            )?),
+            Err(EffectFailure::NotApplied(NotAppliedReason::Rejected)),
+            "{case}"
+        );
+        nothing_launched(&sim);
+    }
+    // At the row limit the listing may be cut short, whatever it says.
+    let sim = SimOrca::default();
+    sim.state().worktrees = (0..MAX_REPO_WORKTREES)
+        .map(|n| (format!("wt_{n}"), format!("refs/heads/lemarier/other-{n}")))
+        .collect();
+    let backend = connect(&sim)?;
+    assert_eq!(
+        backend.check_branch_free(&branch("lemarier/issue-6")?),
+        Err(OrcaError::BranchTaken {
+            requested: "lemarier/issue-6".to_owned()
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn a_collision_is_stopped_released_and_reported_with_its_owner() -> TestResult {
+    let sim = SimOrca::default();
+    // The branch exists in Git only, so the listing cannot see it.
+    sim.state().git_branches.push("lemarier/issue-6".to_owned());
+    // A host whose stop leaves the terminal open.
+    sim.state().stop_releases = false;
+    let backend = connect(&sim)?;
+    let launch = request(
+        launch_on("lemarier/issue-6", Workspace::Isolated)?,
+        "collision",
+    )?;
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    assert_eq!(stops(&sim), 1);
+    let releases = sim.calls_to(&["orchestration", "worker-release"]);
+    assert_eq!(releases.len(), 1, "the stopped worker's terminal is closed");
+    let (dispatch, stray_worktree) = {
+        let state = sim.state();
+        let (dispatch, sim_worker) = state.workers.iter().next().ok_or("a worker")?;
+        (
+            dispatch.clone(),
+            sim_worker.worktree.clone().ok_or("a worktree")?,
+        )
+    };
+    let collision = backend
+        .launch_collision(launch.key(), &branch("lemarier/issue-6")?)?
+        .ok_or("the collision is reported")?;
+    assert_eq!(
+        collision,
+        BranchCollision {
+            requested: branch("lemarier/issue-6")?,
+            branch: ResourceRef {
+                kind: ResourceKind::Branch,
+                backend: orca_id()?,
+                handle: ExternalRef::new("lemarier/issue-6-2")?,
+            },
+            worker: worker(&dispatch)?,
+            worktrees: vec![worktree(&stray_worktree)?],
+            owner: ExternalRef::new(&launch_marker(&house()?, launch.key()))?,
+            settled: true,
+            terminal_released: true,
+        }
+    );
+    // The launch stays held, and a resubmission starts, stops, and releases
+    // nothing again.
+    assert_eq!(
+        backend.verify_launch_branch(launch.key(), &branch("lemarier/issue-6")?),
+        Err(OrcaError::BranchMismatch {
+            requested: "lemarier/issue-6".to_owned(),
+            actual: Some("lemarier/issue-6-2".to_owned()),
+        })
+    );
+    assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
+    assert_eq!(stops(&sim), 1);
+    assert_eq!(sim.calls_to(&["orchestration", "worker-release"]).len(), 1);
+    // The adapter never removes the worktree or the branch.
+    assert!(sim.calls_to(&["worktree", "rm"]).is_empty());
+    // No collision for a key that never launched, or for a branch Orca
+    // did not suffix.
+    assert_eq!(
+        backend.launch_collision(&key("never-launched")?, &branch("lemarier/issue-6")?)?,
+        None
+    );
+    assert_eq!(
+        backend.launch_collision(launch.key(), &branch("lemarier/issue-7")?)?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn a_collision_whose_worker_keeps_running_is_reported_unsettled() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().git_branches.push("lemarier/issue-6".to_owned());
+    let backend = connect(&sim)?;
+    for _ in 0..3 {
+        sim.fault_on(
+            &["orchestration", "worker-stop"],
+            Fault::TimeoutBeforeEffect,
+        );
+    }
+    let launch = request(
+        launch_on("lemarier/issue-6", Workspace::Isolated)?,
+        "collision-running",
+    )?;
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    // A worker that was not stopped keeps its terminal.
+    assert!(
+        sim.calls_to(&["orchestration", "worker-release"])
+            .is_empty()
+    );
+    let collision = backend
+        .launch_collision(launch.key(), &branch("lemarier/issue-6")?)?
+        .ok_or("the collision is reported")?;
+    assert!(!collision.settled);
+    assert!(!collision.terminal_released);
+    // A release Orca retains leaves the terminal reported open.
+    sim.state().stop_releases = false;
+    sim.state().release_action = "retained";
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    let collision = backend
+        .launch_collision(launch.key(), &branch("lemarier/issue-6")?)?
+        .ok_or("the collision is reported")?;
+    assert!(collision.settled);
+    assert!(!collision.terminal_released);
+    Ok(())
+}
+
+#[test]
+fn a_matching_suffix_under_another_requested_branch_is_not_a_collision() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    // The launch asked for `lemarier/issue-2` and got it: no collision. A
+    // caller naming `lemarier/issue` sees a numeric suffix, which is not
+    // evidence that this launch asked for that branch.
+    let launch = request(
+        launch_on("lemarier/issue-2", Workspace::Isolated)?,
+        "other-request",
+    )?;
+    backend.execute(&launch)?;
+    assert_eq!(
+        backend.launch_collision(launch.key(), &branch("lemarier/issue")?)?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn a_launch_without_a_requested_branch_is_not_a_collision() -> TestResult {
+    let sim = SimOrca::default();
+    // Orca names the branch after the Task when none is requested; this
+    // one exists, so Orca suffixes it exactly as it does a collision.
+    sim.state()
+        .git_branches
+        .push("lemarier/kitchen-task_1".to_owned());
+    let backend = connect(&sim)?;
+    let launch = request(launch_op("Implement it.")?, "no-request")?;
+    let receipt = backend.execute(&launch)?;
+    assert!(
+        receipt.created().iter().any(|resource| {
+            resource.kind == ResourceKind::Branch
+                && resource.handle.as_str() == "lemarier/kitchen-task_1-2"
+        }),
+        "the launch reports a branch that looks like a collision: {receipt:?}"
+    );
+    assert_eq!(
+        backend.launch_collision(launch.key(), &branch("lemarier/kitchen-task_1")?)?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn a_collision_is_found_when_the_brief_is_long_and_multiline() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().git_branches.push("lemarier/issue-6".to_owned());
+    let backend = connect(&sim)?;
+    // Orca's `--brief` listing would collapse this and cut it at 160
+    // characters, dropping the requested-branch line.
+    let long = format!("Implement it.\n\n{}", "Details.\n".repeat(60));
+    let launch = request(
+        Operation::LaunchWorker {
+            role: Role::StationCook,
+            workspace: Workspace::Isolated,
+            brief: Text::new(&long)?,
+            branch: Some(branch("lemarier/issue-6")?),
+            agent: None,
+        },
+        "long-collision",
+    )?;
+    let _ = backend.execute(&launch);
+    assert!(
+        backend
+            .launch_collision(launch.key(), &branch("lemarier/issue-6")?)?
+            .is_some(),
+        "the collision is reported from the full spec"
+    );
+    Ok(())
+}
+
+#[test]
+fn duplicate_tasks_for_one_key_record_no_requested_branch() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().git_branches.push("lemarier/issue-6".to_owned());
+    let backend = connect(&sim)?;
+    let launch = request(
+        launch_on("lemarier/issue-6", Workspace::Isolated)?,
+        "duplicated",
+    )?;
+    let _ = backend.execute(&launch);
+    let twin = {
+        let state = sim.state();
+        let mut twin = state.tasks.last().ok_or("a task")?.clone();
+        twin.id = "task_twin".to_owned();
+        twin
+    };
+    sim.state().tasks.push(twin);
+    assert_eq!(
+        backend.launch_collision(launch.key(), &branch("lemarier/issue-6")?)?,
+        None,
+        "an unexplained duplicate is not evidence"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_mismatch_under_another_prefix_is_not_a_collision() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().branch_prefix = "other/";
+    let backend = connect(&sim)?;
+    let launch = request(
+        launch_on("lemarier/issue-6", Workspace::Isolated)?,
+        "not-a-collision",
+    )?;
+    assert!(backend.execute(&launch).is_err());
+    assert_eq!(
+        backend.launch_collision(launch.key(), &branch("lemarier/issue-6")?)?,
+        None
     );
     Ok(())
 }

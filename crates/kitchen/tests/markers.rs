@@ -1258,3 +1258,53 @@ fn a_task_marker_is_superseded_only_under_the_tasks_current_live_claim() -> Test
     );
     Ok(())
 }
+
+#[test]
+fn a_claim_on_one_task_never_writes_another_tasks_marker() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let owned = task_id("owned-task")?;
+    let other = task_id("other-task")?;
+    for task in [&owned, &other] {
+        store.create_task(spec(task.as_str())?, &common::creator()?, at(0))?;
+    }
+    let claim = store.claim(&owned, &scheduled("owner")?, ttl(60)?, at(0))?;
+    let waiting = verdict(EvidenceVerdict::Pass);
+    let briefed = verdict(EvidenceVerdict::Fail);
+    let foreign = task_key(&other, "a")?;
+    store.record_marker(
+        foreign.clone(),
+        waiting.clone(),
+        &scheduled("other")?,
+        at(1),
+    )?;
+
+    let recorded = store.record_task_marker_unless(
+        task_key(&other, "b")?,
+        waiting.clone(),
+        &owned,
+        claim.fence(),
+        at(2),
+        |_| Ok(None::<()>),
+    );
+    assert!(
+        matches!(recorded, Err(Error::State(StateError::MarkerNotForTask(_)))),
+        "{recorded:?}"
+    );
+    assert_eq!(store.marker(&task_key(&other, "b")?)?, None);
+
+    let superseded =
+        store.supersede_task_marker(&foreign, &waiting, briefed, &owned, claim.fence(), at(3));
+    assert!(
+        matches!(
+            superseded,
+            Err(Error::State(StateError::MarkerNotForTask(_)))
+        ),
+        "{superseded:?}"
+    );
+    assert_eq!(
+        store.marker(&foreign)?.map(|marker| marker.fact().clone()),
+        Some(waiting)
+    );
+    Ok(())
+}

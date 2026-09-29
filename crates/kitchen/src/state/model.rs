@@ -2379,12 +2379,22 @@ impl StoreState {
         now: Timestamp,
         guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
     ) -> Result<MarkerAttempt<R>> {
-        let owner = self.task_owner(task, fence, now)?;
+        let owner = self.task_owner(&key, task, fence, now)?;
         self.record_marker_guarded(key, fact, &owner, now, None, guard)
     }
 
-    /// The claimant owning `task`'s live claim at `fence`.
-    fn task_owner(&self, task: &TaskId, fence: Fence, now: Timestamp) -> Result<Claimant> {
+    /// The claimant owning `task`'s live claim at `fence`, for a marker of
+    /// that task only: a claim on one task never writes another's marker.
+    fn task_owner(
+        &self,
+        key: &MarkerKey,
+        task: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<Claimant> {
+        if !matches!(&key.item, WorkItem::Task { task: item } if item == task) {
+            return fail(StateError::MarkerNotForTask(task.clone()));
+        }
         let lease = self.task(task)?.owned_lease(fence, now, true)?;
         Ok(Claimant {
             holder: lease.holder.clone(),
@@ -2489,7 +2499,7 @@ impl StoreState {
         fence: Fence,
         now: Timestamp,
     ) -> Result<MarkerRecording> {
-        let owner = self.task_owner(task, fence, now)?;
+        let owner = self.task_owner(key, task, fence, now)?;
         self.supersede_marker(key, expected, fact, &owner, now)
     }
 

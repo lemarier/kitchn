@@ -730,15 +730,15 @@ fn run_acknowledge(args: AcknowledgeArgs) -> Result<(String, bool), kitchen::Err
         AcknowledgeOutcome::Recorded(recorded) => write!(
             text,
             "Acknowledged task {task} for {}: {}\nIts subject is released; a revised draft may proceed.",
-            recorded.by.holder,
-            recorded.acknowledgement.reason.as_str()
+            recorded.by,
+            recorded.reason.as_str()
         ),
         AcknowledgeOutcome::AlreadyRecorded(recorded) => write!(
             text,
             "Task {task} was already acknowledged by {} at {}: {}\nNothing changed.",
-            recorded.by.holder,
+            recorded.by,
             recorded.at,
-            recorded.acknowledgement.reason.as_str()
+            recorded.reason.as_str()
         ),
         AcknowledgeOutcome::Unknown { .. } => write!(
             text,

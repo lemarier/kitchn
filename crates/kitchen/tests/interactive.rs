@@ -1382,6 +1382,13 @@ fn a_new_issue_is_written_only_after_approval_with_consent_per_write() -> TestRe
         effect.authorization(),
         Authorization::Consent { given_by, .. } if given_by == &person
     )));
+    // Each write names the approved preview it rested on.
+    let digest = ExternalRef::new(draft_preview(&draft)?.digest.as_str())?;
+    assert!(
+        task.effects()
+            .iter()
+            .all(|effect| effect.basis() == Some(&digest))
+    );
     assert!(matches!(
         task.state(),
         TaskState::Settled {
@@ -1705,14 +1712,13 @@ fn an_owner_acknowledgement_releases_a_settled_draft_subject() -> TestResult {
     let AcknowledgeOutcome::Recorded(recorded) = report.outcome else {
         return Err(format!("not recorded: {:?}", report.outcome).into());
     };
-    assert_eq!(recorded.by, person);
+    assert_eq!(recorded.by, holder("person")?);
     assert_eq!(recorded.at, at);
-    assert_eq!(recorded.acknowledgement.reason.as_str(), reason);
-    assert_eq!(
-        recorded.acknowledgement.applied,
-        vec![kitchen::EffectName::new("create")?]
-    );
-    assert!(recorded.acknowledgement.unknown.is_empty());
+    assert_eq!(recorded.reason.as_str(), reason);
+    assert!(recorded.unresolved.is_empty());
+    // The store holds it on the settled task itself.
+    let store = &desk.world.fixture.store;
+    assert_eq!(store.task(&stuck)?.write_acknowledgement(), Some(&recorded));
 
     // The subject is released: the revised draft, a new digest, proceeds.
     let after = desk.apply(&revised, Some(&approval(&revised)?))?;
@@ -1732,8 +1738,7 @@ fn an_owner_acknowledgement_releases_a_settled_draft_subject() -> TestResult {
     let AcknowledgeOutcome::AlreadyRecorded(first) = again.outcome else {
         return Err(format!("not kept: {:?}", again.outcome).into());
     };
-    assert_eq!((first.by, first.at), (person, at));
-    assert_eq!(first.acknowledgement.reason.as_str(), reason);
+    assert_eq!(first, recorded);
     Ok(())
 }
 
@@ -1761,10 +1766,15 @@ fn scheduled_claimants_cannot_acknowledge_a_draft() -> TestResult {
     Ok(())
 }
 
-/// A new-issue draft whose create response was lost and that its owner
-/// handed over and cancelled: settled, with the create's outcome unknown.
-fn settle_with_unknown_create(desk: &Desk, draft: &IssueDraft) -> TestResult<kitchen::TaskId> {
-    desk.forge.plan_faults(vec![Some(Fault::LoseAfterApply)]);
+/// A new-issue draft whose create response was lost (`fault`, before or
+/// after the forge applied it) and that its owner handed over and
+/// cancelled: settled, with the create's outcome unknown.
+fn settle_with_unknown_create(
+    desk: &Desk,
+    draft: &IssueDraft,
+    fault: Fault,
+) -> TestResult<kitchen::TaskId> {
+    desk.forge.plan_faults(vec![Some(fault)]);
     let lost = desk.apply(draft, Some(&approval(draft)?))?;
     assert!(matches!(lost.outcome, DraftOutcome::Uncertain { .. }));
     let id = draft_task_id(&draft_preview(draft)?)?;
@@ -1801,7 +1811,7 @@ fn settle_with_unknown_create(desk: &Desk, draft: &IssueDraft) -> TestResult<kit
 fn an_unknown_write_after_rereading_needs_explicit_acceptance() -> TestResult {
     let desk = Desk::new(10)?;
     let draft = new_issue_draft()?;
-    let stuck = settle_with_unknown_create(&desk, &draft)?;
+    let stuck = settle_with_unknown_create(&desk, &draft, Fault::LoseAfterApply)?;
     let mut revised = new_issue_draft()?;
     revised.add_labels = vec!["ready".to_owned()];
     let blocked = desk.apply(&revised, Some(&approval(&revised)?))?;
@@ -1844,16 +1854,15 @@ fn an_unknown_write_after_rereading_needs_explicit_acceptance() -> TestResult {
     let AcknowledgeOutcome::Recorded(recorded) = report.outcome else {
         return Err(format!("not recorded: {:?}", report.outcome).into());
     };
-    assert_eq!(recorded.acknowledgement.unknown, create);
-    assert!(recorded.acknowledgement.applied.is_empty());
+    assert_eq!(recorded.unresolved, create);
     desk.forge.blind(false);
     let after = desk.apply(&revised, Some(&approval(&revised)?))?;
     assert_eq!(after.outcome, DraftOutcome::Completed);
 
     // Where the forge proves the outcome, the re-read resolves it and no
-    // acceptance is needed; the proof is recorded.
+    // acceptance is needed; the proof is recorded on the task.
     let desk = Desk::new(10)?;
-    let stuck = settle_with_unknown_create(&desk, &draft)?;
+    let stuck = settle_with_unknown_create(&desk, &draft, Fault::LoseAfterApply)?;
     let report = desk.acknowledge(&stuck, "Keep #101.", false, &person, true)?;
     assert_eq!(
         report.writes.first().map(|write| write.state.clone()),
@@ -1862,8 +1871,41 @@ fn an_unknown_write_after_rereading_needs_explicit_acceptance() -> TestResult {
     let AcknowledgeOutcome::Recorded(recorded) = report.outcome else {
         return Err(format!("not recorded: {:?}", report.outcome).into());
     };
-    assert_eq!(recorded.acknowledgement.applied, create);
-    assert!(recorded.acknowledgement.unknown.is_empty());
+    assert!(recorded.unresolved.is_empty());
+    let record = desk.world.fixture.store.task(&stuck)?;
+    assert!(
+        record
+            .effects()
+            .iter()
+            .all(|effect| matches!(effect.state(), kitchen::state::EffectState::Applied { .. }))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_reread_that_proves_every_write_absent_frees_the_subject() -> TestResult {
+    let desk = Desk::new(10)?;
+    let draft = new_issue_draft()?;
+    let stuck = settle_with_unknown_create(&desk, &draft, Fault::LoseBeforeApply)?;
+    let report = desk.acknowledge(&stuck, "Checked.", false, &interactive("person")?, true)?;
+    assert_eq!(report.outcome, AcknowledgeOutcome::NotHeld);
+    assert_eq!(
+        report.writes,
+        vec![WriteReadBack {
+            effect: kitchen::EffectName::new("create")?,
+            state: ReadBack::Absent,
+        }]
+    );
+    // Nothing was acknowledged, and nothing needs to be: the create never
+    // landed, so the revision posts the issue once.
+    let store = &desk.world.fixture.store;
+    assert_eq!(store.task(&stuck)?.write_acknowledgement(), None);
+    let mut revised = new_issue_draft()?;
+    revised.add_labels = vec!["ready".to_owned()];
+    let after = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert_eq!(after.outcome, DraftOutcome::Completed);
+    // The lost create never made #101, so the revision's create is the first.
+    assert_eq!(after.issue, Some(IssueNumber::new(101)?));
     Ok(())
 }
 
@@ -1899,7 +1941,7 @@ fn acknowledgements_refuse_bad_reasons_and_tasks_that_hold_nothing() -> TestResu
 }
 
 #[test]
-fn only_an_interactive_acknowledgement_of_the_task_releases_it() -> TestResult {
+fn a_forged_marker_does_not_release_a_settled_draft() -> TestResult {
     use kitchen::{
         WorkflowId,
         state::{MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, WorkItem},
@@ -1909,6 +1951,9 @@ fn only_an_interactive_acknowledgement_of_the_task_releases_it() -> TestResult {
     let stuck = settle_after_create(&desk, &draft)?;
     let store = &desk.world.fixture.store;
     let now = kitchen::contracts::Clock::now(&desk.world.clock);
+    // What the public marker API lets any library caller write: an
+    // acknowledgement-shaped fact for this task, recorded under an
+    // interactive claimant without acknowledge_draft's checks.
     let fact = MarkerFact::workflow(
         MarkerSchema::new(
             "interactive-draft.acknowledgement",
@@ -1922,23 +1967,16 @@ fn only_an_interactive_acknowledgement_of_the_task_releases_it() -> TestResult {
             "unknown": ["create"],
         }),
     )?;
-    let key = |task: &kitchen::TaskId| -> TestResult<MarkerKey> {
-        Ok(MarkerKey {
-            workflow: WorkflowId::new("interactive-draft")?,
-            item: WorkItem::Task { task: task.clone() },
-            subject: MarkerSubject::Observation(ExternalRef::new(task.as_str())?),
-        })
+    let key = MarkerKey {
+        workflow: WorkflowId::new("interactive-draft")?,
+        item: WorkItem::Repository {
+            repository: repo()?,
+        },
+        subject: MarkerSubject::Observation(ExternalRef::new(stuck.as_str())?),
     };
-    // Recorded by a scheduled claimant, bypassing acknowledge_draft.
-    store.record_marker(
-        key(&stuck)?,
-        fact.clone(),
-        &scheduled("gardener-tick")?,
-        now,
-    )?;
-    // Recorded by a person, but under another task's key.
-    let other = issue_task_id(&issue(9)?)?;
-    store.record_marker(key(&other)?, fact, &interactive("person")?, now)?;
+    for claimant in [interactive("person")?, scheduled("gardener-tick")?] {
+        store.record_marker(key.clone(), fact.clone(), &claimant, now)?;
+    }
 
     let mut revised = new_issue_draft()?;
     revised.add_labels = vec!["ready".to_owned()];
@@ -1947,5 +1985,18 @@ fn only_an_interactive_acknowledgement_of_the_task_releases_it() -> TestResult {
         blocked.outcome,
         DraftOutcome::EarlierSettledWithWrites { .. }
     ));
+    assert_eq!(store.task(&stuck)?.write_acknowledgement(), None);
+
+    // The forged markers do not stand in for the real record either.
+    let report = desk.acknowledge(
+        &stuck,
+        "Checked #101.",
+        false,
+        &interactive("person")?,
+        true,
+    )?;
+    assert!(matches!(report.outcome, AcknowledgeOutcome::Recorded(_)));
+    let after = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert_eq!(after.outcome, DraftOutcome::Completed);
     Ok(())
 }

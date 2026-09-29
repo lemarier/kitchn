@@ -15,7 +15,7 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
-    TaskId, WorkflowId,
+    WorkflowId,
     contracts::{
         Claimant, EvidenceSubject, EvidenceVerdict, ExternalRef, Repository, ResourceRef, Timestamp,
     },
@@ -56,11 +56,6 @@ pub enum WorkItem {
     Repository {
         /// The repository.
         repository: Repository,
-    },
-    /// A Kitchen task, such as one whose deliberation thread is recorded.
-    Task {
-        /// The task.
-        task: TaskId,
     },
 }
 

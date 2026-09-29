@@ -626,11 +626,12 @@ fn issue_acknowledge_releases_a_settled_draft_for_the_person_only() -> TestResul
     assert_eq!(again.status.code(), Some(0));
     let report = json(&again)?;
     assert_eq!(report["outcome"]["type"], "already-recorded");
-    assert_eq!(report["outcome"]["by"]["holder"], "person");
+    assert_eq!(report["outcome"]["by"], "person");
     assert_eq!(
-        report["outcome"]["acknowledgement"]["reason"],
+        report["outcome"]["reason"],
         "Comment on #72 stands; label it by hand."
     );
+    assert_eq!(report["outcome"]["unresolved"], serde_json::json!([]));
 
     let after = apply_refinement(&store, &forge, &["ready", "cli"])?;
     assert_eq!(after.outcome, DraftOutcome::Completed);

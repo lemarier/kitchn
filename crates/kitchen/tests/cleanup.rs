@@ -22,10 +22,11 @@ use kitchen::{
     Error, ErrorClass, TaskId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, BackendUnavailable,
-        Capability, CapabilitySet, Claimant, Clock, CommitId, Consent, Effect, EffectExecutor,
-        EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, Fence, Grant, HouseGrants,
-        Liveness, Lookup, NotAppliedReason, Operation, Permission, Provenance, Receipt,
-        ResourceKind, ResourceObservation, ResourceRef, WorkerBackend, WorkerOutcome, WorkerState,
+        BranchName, Capability, CapabilitySet, Claimant, Clock, CommitId, Consent, Effect,
+        EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, Fence, Grant,
+        HouseGrants, Liveness, Lookup, NotAppliedReason, Operation, Permission, Provenance,
+        Receipt, ResourceKind, ResourceObservation, ResourceRef, WorkerBackend, WorkerOutcome,
+        WorkerState,
         fake::{ExecuteFault, FakeBackend},
     },
     state::{
@@ -392,6 +393,11 @@ impl Harness {
     /// Create and claim a task, and apply its launch effect. The task stays
     /// unsettled; its worker reports success.
     fn launch_task(&self, name: &str) -> TestResult<Launched> {
+        self.launch_task_with(name, launch()?)
+    }
+
+    /// As [`Self::launch_task`], with `operation` as the launch.
+    fn launch_task_with(&self, name: &str, operation: Operation) -> TestResult<Launched> {
         let task = TaskId::new(name)?;
         let store = self.store();
         store.create_task(spec(name)?, &scheduled("pickup")?, self.clock.now())?;
@@ -406,7 +412,7 @@ impl Harness {
             store,
             &self.backend,
             &grants()?,
-            plan(&task, fence, "launch", launch()?)?,
+            plan(&task, fence, "launch", operation)?,
             &self.clock,
         )?;
         let EffectState::Applied { receipt, .. } = launched.state() else {
@@ -2585,6 +2591,107 @@ fn branches_and_schedules_are_never_reclaimed_even_when_a_task_created_them() ->
     }
     // Nothing is released: the backend lists the task's worker without an
     // owner record, and the branch and schedule are not reclaimable at all.
+    assert_eq!(effects_from_applying(&harness)?, 0);
+    Ok(())
+}
+
+/// A settled task whose launch created a worker, a pushed worktree, and a
+/// branch; the backend lists the branch at `liveness`, owned by the launch.
+fn task_with_branch(harness: &mut Harness, liveness: Liveness) -> TestResult<(Owned, ResourceRef)> {
+    let Operation::LaunchWorker {
+        role,
+        workspace,
+        brief,
+        agent,
+        ..
+    } = launch()?
+    else {
+        return Err("not a launch".into());
+    };
+    let launched = harness.launch_task_with(
+        "task-1",
+        Operation::LaunchWorker {
+            role,
+            workspace,
+            brief,
+            branch: Some(BranchName::new("lemarier/task-1")?),
+            agent,
+        },
+    )?;
+    harness.store().finish_attempt(
+        &launched.task,
+        launched.fence,
+        launched.attempt,
+        AttemptOutcome::Succeeded,
+        harness.clock.now(),
+    )?;
+    harness.checkout(&launched)?;
+    let branch = ResourceRef {
+        kind: ResourceKind::Branch,
+        backend: backend_id()?,
+        handle: ExternalRef::new("lemarier/task-1")?,
+    };
+    harness
+        .backend
+        .add(branch.clone(), Some(launched.key.clone()), liveness);
+    let owned = Owned {
+        task: launched.task,
+        worker: launched.worker,
+        worktree: launched.worktree,
+        key: launched.key,
+    };
+    Ok((owned, branch))
+}
+
+#[test]
+fn a_live_branch_does_not_keep_the_tasks_other_resources() -> TestResult {
+    let mut harness = Harness::new()?;
+    let (owned, branch) = task_with_branch(&mut harness, Liveness::Live)?;
+    let preview = harness.inspect()?;
+    // The branch is never reclaimed, so its liveness keeps only itself.
+    assert!(matches!(
+        preview.entry(&branch).ok_or("branch")?.ownership,
+        Ownership::Task(ref owner) if owner.task == owned.task
+    ));
+    assert_eq!(
+        reasons(&preview, &branch)?,
+        [Exclusion::NotReclaimable, Exclusion::InUse]
+    );
+    assert_eq!(reasons(&preview, &owned.worker)?, []);
+    assert_eq!(reasons(&preview, &owned.worktree)?, []);
+    // The settled worker and its worktree are released; the branch stays.
+    let before = harness.backend.fake.effects_performed();
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    let report = harness.apply()?;
+    assert_eq!(outcome(&report, &owned.worker)?, ReleaseOutcome::Released);
+    assert_eq!(outcome(&report, &owned.worktree)?, ReleaseOutcome::Released);
+    assert_eq!(harness.backend.fake.effects_performed() - before, 2);
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|result| result.resource != branch)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_busy_worktree_still_keeps_its_siblings_next_to_an_idle_branch() -> TestResult {
+    let mut harness = Harness::new()?;
+    let (owned, branch) = task_with_branch(&mut harness, Liveness::Exited)?;
+    for observation in harness.backend.extra.borrow_mut().iter_mut() {
+        if observation.resource == owned.worktree {
+            observation.liveness = Liveness::Live;
+        }
+    }
+    let preview = harness.inspect()?;
+    assert_eq!(reasons(&preview, &owned.worktree)?, [Exclusion::InUse]);
+    assert_eq!(reasons(&preview, &owned.worker)?, [Exclusion::SiblingInUse]);
+    assert_eq!(
+        reasons(&preview, &branch)?,
+        [Exclusion::NotReclaimable, Exclusion::SiblingInUse]
+    );
     assert_eq!(effects_from_applying(&harness)?, 0);
     Ok(())
 }

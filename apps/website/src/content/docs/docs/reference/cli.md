@@ -304,6 +304,40 @@ one; it lists the report as late for a person to review. Source times are
 capped at the house time a report was reserved, so a source clock running ahead
 cannot move that cutoff.
 
+## `kitchn trust`
+
+How full the house trust ledger is, and the archival that moves records no
+grant needs out of it.
+
+```sh
+kitchn trust capacity --house <id> --ledger <dir> [--json]
+kitchn trust archive  --house <id> --ledger <dir> [--apply] [--json]
+```
+
+The ledger holds at most 4096 entries and 8 MiB. When either limit is reached,
+new observations and task bindings are refused and earned standing stops
+applying to new tasks; revocation still works. `capacity` exits 1 at 80% of
+either limit and lists every past archival with its digest.
+
+`archive` only previews unless `--apply` is given. It moves an observation
+stream, with every revision and its task's binding, when no grant decision
+cites it (proposed, issued, or revoked) and no inspection of it must stay. It
+also moves inspections whose deadline has passed and whose samples all have a
+result, once their stream leaves too; an inspection of a stream that stays
+live, such as one a grant cites, stays with it. Grants, the evidence they cite, and bindings of tasks with no recorded
+observation stay, so revoking a grant never needs the archive. The records go
+to `archive.jsonl` in the ledger directory, owner-only like the ledger, and the
+ledger keeps the batch's SHA-256 digest, counts, and length as one entry.
+Bytes past the committed length, left by an archival that failed partway, are
+cut off before the next batch, but only when that loses no record: a partial
+line, or a batch whose records are all still in the ledger. First, every
+committed line is checked against its entry's length and digest. A symlinked,
+hard-linked, or shortened archive file, a committed line that does not match,
+or an uncommitted batch holding records the ledger lacks is refused without
+changing either file. The last happens when `ledger.json` was restored from an
+older copy; restore the ledger that committed those batches, or reconcile the
+archive file by hand. An archived stream no longer supports new grant proposals.
+
 ## `kitchn pickup`
 
 Offline pickup diagnostics.

@@ -110,6 +110,16 @@ pub enum Corruption {
     EffectKey,
     /// Two workflow markers share a key.
     DuplicateWorkflowMarker,
+    /// An append-only file beside the snapshot is shorter than the length
+    /// the snapshot records as committed.
+    TruncatedAppend,
+    /// The committed bytes of an append-only file differ from the records
+    /// the snapshot keeps for them.
+    AppendMismatch,
+    /// An append-only file holds complete records past the length the
+    /// snapshot records as committed, and the snapshot does not hold them,
+    /// as when the snapshot was restored from an older copy.
+    UnreconciledAppend,
 }
 
 impl fmt::Display for Corruption {
@@ -132,6 +142,15 @@ impl fmt::Display for Corruption {
             Self::Ownership => formatter.write_str("ownership history contradicts the claim"),
             Self::EffectKey => formatter.write_str("effect key differs from its derivation"),
             Self::DuplicateWorkflowMarker => formatter.write_str("workflow markers share a key"),
+            Self::TruncatedAppend => {
+                formatter.write_str("append-only file is shorter than its committed length")
+            }
+            Self::AppendMismatch => {
+                formatter.write_str("append-only file differs from its committed records")
+            }
+            Self::UnreconciledAppend => formatter.write_str(
+                "append-only file holds records past its committed length that the snapshot lacks; restore the snapshot that committed them, or have an operator reconcile the file",
+            ),
             Self::StoreIdentity => {
                 formatter.write_str("snapshot belongs to a different store than its marker")
             }
@@ -338,8 +357,9 @@ pub enum StateError {
     /// The directory already holds a store or a snapshot.
     #[error("a store is already initialized in this directory")]
     AlreadyInitialized,
-    /// The store directory or a managed file is a symlink or not a regular file.
-    #[error("store path is redirected or not a regular file")]
+    /// The store directory or a managed file is a symlink or not a regular
+    /// file, or an append-only file has another hard link.
+    #[error("store path is redirected, shared, or not a regular file")]
     RedirectedPath,
     /// A store that requires private storage found a directory or managed
     /// file readable or writable by other users.

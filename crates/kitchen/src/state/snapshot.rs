@@ -13,7 +13,7 @@
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
     hash::{BuildHasher, RandomState},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
     thread,
@@ -447,6 +447,84 @@ impl<S: Snapshot> SnapshotStore<S> {
         self.write_file(self.layout.snapshot, bytes)
     }
 
+    /// Append `bytes` to the append-only file `name` beside the snapshot and
+    /// sync it, creating it owner-only. `committed` is the length the
+    /// snapshot records for the file. Before anything changes, `verify` reads
+    /// exactly the `committed` bytes once and checks them against the
+    /// snapshot's records. Bytes past `committed` are an uncommitted tail:
+    /// usually the remains of an append whose snapshot commit never happened,
+    /// but also what a snapshot restored from an older copy no longer
+    /// records. `tail` reads them and returns an error, which refuses the
+    /// append, unless cutting them off loses nothing. Call inside
+    /// [`Self::transact`], so appends are serialized by the store lock and
+    /// `committed` cannot change underneath.
+    ///
+    /// Type, link count, and mode are checked on the opened descriptor, which
+    /// is the one read and written, so the path cannot be swapped after the
+    /// check.
+    ///
+    /// # Errors
+    /// A symlink, non-regular, or hard-linked file is
+    /// [`StateError::RedirectedPath`]; a nonprivate one in a private store is
+    /// [`StateError::PublicPath`]; a file shorter than `committed` is
+    /// [`Corruption::TruncatedAppend`]; `verify`'s and `tail`'s errors are
+    /// returned as is. Nothing is cut off or appended in those cases, though
+    /// a missing file is created empty.
+    pub(crate) fn append_private(
+        &self,
+        name: &str,
+        committed: u64,
+        verify: impl FnOnce(&mut dyn Read) -> Result<(), StateError>,
+        tail: impl FnOnce(&mut dyn Read) -> Result<(), StateError>,
+        bytes: &[u8],
+    ) -> Result<(), StateError> {
+        self.append_with(name, committed, verify, tail, bytes, |file, bytes| {
+            file.write_all(bytes)
+        })
+    }
+
+    /// [`Self::append_private`] with the write step injected, so tests can
+    /// fail it partway or act between the checks and the write.
+    fn append_with(
+        &self,
+        name: &str,
+        committed: u64,
+        verify: impl FnOnce(&mut dyn Read) -> Result<(), StateError>,
+        tail: impl FnOnce(&mut dyn Read) -> Result<(), StateError>,
+        bytes: &[u8],
+        write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
+    ) -> Result<(), StateError> {
+        let io = |error| StateError::io(StorageOperation::Write, error);
+        let mut file = open_append_file(&self.dir.join(name))?;
+        let metadata = file.metadata().map_err(io)?;
+        if !metadata.is_file() || links(&metadata) != 1 {
+            return Err(StateError::RedirectedPath);
+        }
+        if self.layout.require_private && is_public(&metadata) {
+            return Err(StateError::PublicPath);
+        }
+        if metadata.len() < committed {
+            return Err(StateError::CorruptState(Corruption::TruncatedAppend));
+        }
+        // A fresh descriptor reads from the start; appends ignore the offset.
+        verify(&mut (&file).take(committed))?;
+        if metadata.len() > committed {
+            (&file)
+                .seek(SeekFrom::Start(committed))
+                .map_err(|error| StateError::io(StorageOperation::Read, error))?;
+            tail(&mut (&file).take(metadata.len() - committed))?;
+            file.set_len(committed).map_err(io)?;
+        }
+        write(&mut file, bytes).map_err(io)?;
+        file.sync_all().map_err(io)?;
+        drop(file);
+        if committed == 0 {
+            // The file may be new; make its directory entry durable too.
+            sync_dir(&self.dir).map_err(io)?;
+        }
+        Ok(())
+    }
+
     /// Atomically replace `name` with `bytes` through the temporary file.
     fn write_file(&self, name: &str, bytes: &[u8]) -> Result<(), StateError> {
         let io = |error| StateError::io(StorageOperation::Write, error);
@@ -521,6 +599,65 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
         .create(true)
         .truncate(false)
         .open(path)
+}
+
+/// Open `path` for reading and appending without following a final symlink,
+/// creating it owner-only. Non-blocking, so a FIFO placed there cannot stall the open.
+#[cfg(unix)]
+fn open_append_file(path: &Path) -> Result<File, StateError> {
+    use rustix::{
+        fs::{Mode, OFlags, open},
+        io::Errno,
+    };
+    let flags = OFlags::RDWR
+        | OFlags::APPEND
+        | OFlags::CREATE
+        | OFlags::NOFOLLOW
+        | OFlags::NONBLOCK
+        | OFlags::NOCTTY
+        | OFlags::CLOEXEC;
+    match open(path, flags, Mode::RUSR | Mode::WUSR) {
+        Ok(descriptor) => Ok(File::from(descriptor)),
+        // A final symlink, or a FIFO with no reader.
+        Err(Errno::LOOP | Errno::NXIO) => Err(StateError::RedirectedPath),
+        Err(error) => Err(StateError::io(
+            StorageOperation::Write,
+            std::io::Error::from(error),
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_append_file(path: &Path) -> Result<File, StateError> {
+    refuse_redirected(path)?;
+    OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|error| StateError::io(StorageOperation::Write, error))
+}
+
+#[cfg(unix)]
+fn links(metadata: &fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::nlink(metadata)
+}
+
+/// Link counts are not available on this platform; treat the file as unshared.
+#[cfg(not(unix))]
+fn links(_metadata: &fs::Metadata) -> u64 {
+    1
+}
+
+#[cfg(unix)]
+fn is_public(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o077 != 0
+}
+
+#[cfg(not(unix))]
+fn is_public(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 /// Create the store directory (and missing parents) readable only by the owner.
@@ -598,10 +735,9 @@ fn refuse_redirected(path: &Path) -> Result<(), StateError> {
 /// Refuse a path that other users can read or write.
 #[cfg(unix)]
 fn require_private(path: &Path) -> Result<(), StateError> {
-    use std::os::unix::fs::PermissionsExt;
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| StateError::io(StorageOperation::Prepare, error))?;
-    if metadata.permissions().mode() & 0o077 != 0 {
+    if is_public(&metadata) {
         return Err(StateError::PublicPath);
     }
     Ok(())
@@ -694,6 +830,12 @@ mod tests {
 
     fn house() -> std::result::Result<HouseId, crate::IdentifierError> {
         HouseId::new("example")
+    }
+
+    /// A verifier that accepts any committed bytes.
+    #[expect(clippy::unnecessary_wraps, reason = "matches the verifier signature")]
+    fn unchecked(_: &mut dyn Read) -> Result<(), StateError> {
+        Ok(())
     }
 
     /// A store whose ordinary writes may reach exactly the encoded size of
@@ -853,6 +995,160 @@ mod tests {
         assert!(matches!(
             store.read(|toy| toy.items.len()),
             Err(crate::Error::State(StateError::PublicPath))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_partial_append_is_cut_off_before_the_retry() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        store.append_private("log", 0, unchecked, unchecked, b"one\n")?;
+        // The write stops partway, as a full disk or a crash would leave it.
+        let failed = store.append_with("log", 4, unchecked, unchecked, b"two\n", |file, bytes| {
+            file.write_all(bytes.get(..2).unwrap_or_default())?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+        assert!(matches!(
+            failed,
+            Err(StateError::Io {
+                operation: StorageOperation::Write,
+                ..
+            })
+        ));
+        assert_eq!(fs::read(path.join("log"))?, b"one\ntw");
+        store.append_private("log", 4, unchecked, unchecked, b"two\n")?;
+        assert_eq!(fs::read(path.join("log"))?, b"one\ntwo\n");
+        // A whole line the snapshot never committed is cut off the same way.
+        store.append_private("log", 4, unchecked, unchecked, b"three\n")?;
+        assert_eq!(fs::read(path.join("log"))?, b"one\nthree\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_append_file_shorter_than_committed_is_refused_unchanged() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        store.append_private("log", 0, unchecked, unchecked, b"one\n")?;
+        assert!(matches!(
+            store.append_private("log", 5, unchecked, unchecked, b"two\n"),
+            Err(StateError::CorruptState(Corruption::TruncatedAppend))
+        ));
+        assert_eq!(fs::read(path.join("log"))?, b"one\n");
+        Ok(())
+    }
+
+    #[test]
+    fn the_verifier_reads_only_committed_bytes_and_a_refusal_changes_nothing() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        store.append_private("log", 0, unchecked, unchecked, b"one\n")?;
+        // An uncommitted tail after the committed line.
+        fs::write(path.join("log"), b"one\ntw")?;
+        let mut seen = Vec::new();
+        let refused = store.append_private(
+            "log",
+            4,
+            |file| {
+                file.read_to_end(&mut seen)
+                    .map_err(|error| StateError::io(StorageOperation::Read, error))?;
+                Err(StateError::CorruptState(Corruption::AppendMismatch))
+            },
+            unchecked,
+            b"two\n",
+        );
+        assert_eq!(seen, b"one\n");
+        assert!(matches!(
+            refused,
+            Err(StateError::CorruptState(Corruption::AppendMismatch))
+        ));
+        // Neither the tail was cut nor the new line appended.
+        assert_eq!(fs::read(path.join("log"))?, b"one\ntw");
+        store.append_private("log", 4, unchecked, unchecked, b"two\n")?;
+        assert_eq!(fs::read(path.join("log"))?, b"one\ntwo\n");
+        Ok(())
+    }
+
+    #[test]
+    fn the_tail_check_reads_only_the_uncommitted_tail_and_can_keep_it() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        store.append_private("log", 0, unchecked, unchecked, b"one\n")?;
+        fs::write(path.join("log"), b"one\ntwo\n")?;
+        let mut seen = Vec::new();
+        // The verifier reads nothing, yet the tail check starts at the tail.
+        let refused = store.append_private(
+            "log",
+            4,
+            unchecked,
+            |file| {
+                file.read_to_end(&mut seen)
+                    .map_err(|error| StateError::io(StorageOperation::Read, error))?;
+                Err(StateError::CorruptState(Corruption::UnreconciledAppend))
+            },
+            b"three\n",
+        );
+        assert_eq!(seen, b"two\n");
+        assert!(matches!(
+            refused,
+            Err(StateError::CorruptState(Corruption::UnreconciledAppend))
+        ));
+        assert_eq!(fs::read(path.join("log"))?, b"one\ntwo\n");
+        // With nothing past the committed length, the tail check never runs.
+        store.append_private(
+            "log",
+            8,
+            unchecked,
+            |_| Err(StateError::CorruptState(Corruption::UnreconciledAppend)),
+            b"three\n",
+        )?;
+        assert_eq!(fs::read(path.join("log"))?, b"one\ntwo\nthree\n");
+        Ok(())
+    }
+
+    /// The checks read the opened descriptor, and the write goes to that
+    /// descriptor, so a file swapped in after the checks never receives it.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_swapped_in_after_the_checks_is_not_written() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        let other = dir.path().join("other");
+        fs::write(&other, b"other\n")?;
+        let log = path.join("log");
+        store.append_with("log", 0, unchecked, unchecked, b"one\n", |file, bytes| {
+            fs::remove_file(&log)?;
+            fs::hard_link(&other, &log)?;
+            file.write_all(bytes)
+        })?;
+        assert_eq!(fs::read(&other)?, b"other\n");
+        // The swapped-in file now has two links, so the next append refuses it.
+        assert!(matches!(
+            store.append_private("log", 0, unchecked, unchecked, b"two\n"),
+            Err(StateError::RedirectedPath)
+        ));
+        assert_eq!(fs::read(&other)?, b"other\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_append_file_is_refused_without_blocking() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        let made = std::process::Command::new("mkfifo")
+            .arg(path.join("log"))
+            .status()?;
+        assert!(made.success());
+        assert!(matches!(
+            store.append_private("log", 0, unchecked, unchecked, b"one\n"),
+            Err(StateError::RedirectedPath)
         ));
         Ok(())
     }

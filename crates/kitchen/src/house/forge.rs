@@ -15,6 +15,9 @@
 //! name the preview's current digest, all before any credential is read.
 //! Posting once, resuming after an interruption, and never duplicating a write
 //! are the [`ApprovedWrite`] implementation's duty, through the core task store.
+//! [`forge_reader`] builds the same house-scoped executor for re-reading the
+//! forge, such as when a person acknowledges a settled write; it submits
+//! nothing.
 
 use std::{fmt, fs::File, path::PathBuf};
 
@@ -24,7 +27,10 @@ use super::{HouseConfig, HouseError};
 use crate::{
     BackendId, CredentialId, ErrorClass, HouseId,
     adoption::{FileMode, HouseRegistry, NewFile, RelativePath, decode, encode},
-    contracts::{Claimant, ExternalRef, PostingBudget, Trigger},
+    contracts::{
+        BackendDescriptor, BackendUnavailable, Claimant, EffectExecutor, EffectFailure,
+        EffectRequest, ExternalRef, Lookup, NotAppliedReason, PostingBudget, Receipt, Trigger,
+    },
     integrations::github::{
         CredentialFile, CredentialRef, GitHubExecutor, GitHubMutationTransport, HouseScope,
         IntegrationError, ReadLimits,
@@ -238,6 +244,10 @@ pub enum ForgeError {
         /// Why it cannot be used.
         status: CredentialStatus,
     },
+    /// The GitHub CLI, which Kitchen writes and reads through, is not
+    /// installed. Nothing was read or written.
+    #[error("the GitHub CLI (`gh`) was not found on PATH; install it to write to GitHub")]
+    GhNotFound,
     /// Registry storage or validation failed.
     #[error(transparent)]
     House(#[from] HouseError),
@@ -268,6 +278,7 @@ impl ForgeError {
             | Self::NoPostingDestinations { .. }
             | Self::NeedsPerson
             | Self::CredentialUnavailable { .. } => ErrorClass::Refused,
+            Self::GhNotFound => ErrorClass::Execution,
             Self::BindingConflict { .. } | Self::StaleApproval { .. } => ErrorClass::Conflict,
             Self::House(error) => error.class(),
             Self::Integration(error) => error.class(),
@@ -529,7 +540,7 @@ pub fn apply_approved<W, T>(
     write: &W,
     approved: &W::Digest,
     claimant: &Claimant,
-    connect: impl FnOnce(CredentialFile) -> Result<T, IntegrationError>,
+    connect: impl FnOnce(CredentialFile) -> Result<T, ForgeError>,
 ) -> crate::Result<W::Report>
 where
     W: ApprovedWrite,
@@ -548,22 +559,75 @@ where
         }
         .into());
     }
-    let scope = binding.scope(&config)?;
+    let executor = executor(registry, &config, binding, connect)?;
+    write.apply(&executor, approved, claimant)
+}
+
+/// The house-scoped executor over its checked token file.
+fn executor<T: GitHubMutationTransport>(
+    registry: &HouseRegistry,
+    config: &HouseConfig,
+    binding: ForgeBinding,
+    connect: impl FnOnce(CredentialFile) -> Result<T, ForgeError>,
+) -> Result<GitHubExecutor<T>, ForgeError> {
+    let scope = binding.scope(config)?;
     let file = match open_credential(registry, &binding)? {
         Ok(file) => file,
         Err(status) => {
             return Err(ForgeError::CredentialUnavailable {
-                house: house.clone(),
+                house: binding.house,
                 credential: binding.credential,
                 status,
-            }
-            .into());
+            });
         }
     };
     let credential = CredentialFile::opened(binding.credential_ref(), file);
-    let transport = connect(credential).map_err(ForgeError::Integration)?;
-    let executor = GitHubExecutor::new(binding.backend, scope, transport, ReadLimits::default());
-    write.apply(&executor, approved, claimant)
+    let transport = connect(credential)?;
+    Ok(GitHubExecutor::new(
+        binding.backend,
+        scope,
+        transport,
+        ReadLimits::default(),
+    ))
+}
+
+/// The house's forge, for looking up what earlier writes did. Every
+/// submission is refused before it reaches the forge; writes go through
+/// [`apply_approved`].
+pub struct ForgeReader<T>(GitHubExecutor<T>);
+
+impl<T: GitHubMutationTransport> EffectExecutor for ForgeReader<T> {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.0.descriptor()
+    }
+
+    fn execute(&self, _: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+    }
+
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.0.lookup(request)
+    }
+}
+
+/// Build a [`ForgeReader`] with the house's forge binding, for re-reading
+/// the outcome of earlier writes.
+///
+/// Refuses, before reading any credential, a house without a forge binding
+/// or posting destinations, and a missing, redirected, foreign, or exposed
+/// token file. `connect` then builds the transport over the checked token
+/// file, as for [`apply_approved`].
+///
+/// # Errors
+/// The refusals above and `connect` failures.
+pub fn forge_reader<T: GitHubMutationTransport>(
+    registry: &HouseRegistry,
+    house: &HouseId,
+    connect: impl FnOnce(CredentialFile) -> Result<T, ForgeError>,
+) -> Result<ForgeReader<T>, ForgeError> {
+    let config = registry.load(house)?;
+    let binding = forge_binding(registry, house)?;
+    executor(registry, &config, binding, connect).map(ForgeReader)
 }
 
 #[cfg(all(test, unix))]
@@ -688,7 +752,7 @@ mod tests {
             &"sha256:aaaa",
             &claimant,
             |file| {
-                replace().map_err(|_| IntegrationError::Unavailable)?;
+                replace().map_err(|_| ForgeError::Integration(IntegrationError::Unavailable))?;
                 handed.replace(Some(file));
                 Ok(Offline)
             },

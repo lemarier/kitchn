@@ -36,7 +36,7 @@ enum Command {
     Adopt(commands::scaffold::ScaffoldArgs),
     /// Preview dishwasher cleanup decisions and record a person's approval; releases nothing.
     Cleanup(commands::cleanup::CleanupArgs),
-    /// Preview a project's decomposition into dependency-linked issues; writes nothing.
+    /// Preview a project's decomposition into dependency-linked issues, or post an approved one.
     Decompose(commands::decompose::DecomposeArgs),
     /// Daily issue hygiene: the scheduled precheck. Reads only.
     Gardener(commands::gardener::GardenerArgs),

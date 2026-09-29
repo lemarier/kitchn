@@ -59,6 +59,7 @@ use crate::{
         HouseGrants, IssueNumber, LeaseTtl, NotAppliedReason, Provenance, Repository, RetryPolicy,
         Role, Settlement, TaskAuthority, TaskSpec, Text, Timestamp, Trigger,
     },
+    house::ApprovedWrite,
     integrations::github::{GitHubExecutor, GitHubMutationTransport},
     state::{
         EffectPlan, EffectRecord, EffectState, HouseStore, Limit, MAX_ACKNOWLEDGEMENT_REASON_BYTES,
@@ -1283,6 +1284,52 @@ pub fn apply<T: GitHubMutationTransport>(
         writer.clock.now(),
     )?;
     Ok(run)
+}
+
+/// A decomposition to write through [`crate::house::apply_approved`], which
+/// checks the house's forge binding and the approved digest and then calls
+/// [`apply`] with the person's approval: given by the claimant of that call,
+/// for the digest passed there.
+pub struct ApprovedDecomposition<'a> {
+    /// The proposal.
+    pub proposal: &'a Proposal,
+    /// The house's durable store.
+    pub store: &'a HouseStore,
+    /// The house's current grants.
+    pub grants: &'a HouseGrants,
+    /// Time source.
+    pub clock: &'a dyn Clock,
+    /// Bounds for the decomposition task.
+    pub options: &'a ApplyOptions,
+}
+
+impl ApprovedWrite for ApprovedDecomposition<'_> {
+    type Digest = PreviewDigest;
+    type Report = ApplyReport;
+
+    fn digest(&self) -> Result<PreviewDigest> {
+        Ok(preview(self.proposal)?.digest)
+    }
+
+    fn apply<T: GitHubMutationTransport>(
+        &self,
+        forge: &GitHubExecutor<T>,
+        approved: &PreviewDigest,
+        claimant: &Claimant,
+    ) -> Result<ApplyReport> {
+        let writer = Writer {
+            store: self.store,
+            executor: forge,
+            grants: self.grants,
+            clock: self.clock,
+        };
+        let approval = Approval {
+            id: ExternalRef::new(approved.as_str())?,
+            given_by: claimant.holder.clone(),
+            digest: approved.clone(),
+        };
+        apply(&writer, self.proposal, &approval, claimant, self.options)
+    }
 }
 
 /// What [`acknowledge`] found and recorded.

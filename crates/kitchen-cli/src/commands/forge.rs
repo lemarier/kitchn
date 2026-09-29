@@ -3,11 +3,12 @@ use clap::{Args, Subcommand};
 use kitchen::{
     BackendId, CredentialId, HouseId,
     adoption::HouseRegistry,
-    contracts::{ExternalRef, PostingBudget},
+    contracts::{EffectExecutor, ExternalRef, NotAppliedReason, PostingBudget},
     house::{
-        BindOutcome, CredentialStatus, FORGE_BINDING_SCHEMA, ForgeBinding, ForgeKind, bind_forge,
-        credential_path, credential_status, forge_binding,
+        BindOutcome, CredentialStatus, FORGE_BINDING_SCHEMA, ForgeBinding, ForgeError, ForgeKind,
+        ForgeReader, bind_forge, credential_path, credential_status, forge_binding, forge_reader,
     },
+    integrations::github::{CredentialFile, GhCli},
 };
 use std::{
     io::Read,
@@ -157,14 +158,96 @@ fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-/// The GitHub login `gh` is logged in as, from its configuration. Runs
-/// `gh config get user`, which reads no token; any failure means unknown.
-pub fn gh_login(path: Option<std::ffi::OsString>) -> Option<ExternalRef> {
-    let gh = std::env::split_paths(&path?)
+/// The first `gh` in the absolute entries of `path`.
+fn gh_executable(path: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    std::env::split_paths(&path?)
         .filter(|directory| directory.is_absolute())
         .take(MAX_PATH_ENTRIES)
         .map(|directory| directory.join("gh"))
-        .find(|candidate| candidate.is_file())?;
+        .find(|candidate| candidate.is_file())
+}
+
+/// The GitHub CLI on `PATH`, over the house's checked token file. `gh` gets
+/// only that token, never the host's own login.
+pub fn connect_gh(credential: CredentialFile) -> Result<GhCli, ForgeError> {
+    let gh = gh_executable(std::env::var_os("PATH")).ok_or(ForgeError::GhNotFound)?;
+    GhCli::new(gh, credential).map_err(ForgeError::Integration)
+}
+
+/// Whether a command re-reads the forge, and why not when it does not.
+pub enum Reread {
+    /// Through the house's forge binding.
+    Forge(Box<ForgeReader<GhCli>>),
+    /// The person chose not to.
+    Declined,
+    /// The house has no forge binding.
+    Unbound,
+    /// No registry was given to read the binding from.
+    NoRegistry,
+}
+
+impl Reread {
+    /// Build the house's forge reader, unless `declined`. A house without a
+    /// forge binding is not re-read; any other refusal is an error, since
+    /// the person expects the forge to be checked.
+    pub fn open(
+        registry: &HouseRegistry,
+        house: &HouseId,
+        declined: bool,
+    ) -> Result<Self, kitchen::Error> {
+        if declined {
+            return Ok(Self::Declined);
+        }
+        match forge_reader(registry, house, connect_gh) {
+            Ok(reader) => Ok(Self::Forge(Box::new(reader))),
+            Err(ForgeError::MissingBinding { .. }) => Ok(Self::Unbound),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// The executor to re-read with, if any.
+    pub fn executor(&self) -> Option<&dyn EffectExecutor> {
+        match self {
+            Self::Forge(reader) => Some(reader.as_ref()),
+            Self::Declined | Self::Unbound | Self::NoRegistry => None,
+        }
+    }
+
+    /// A sentence for a report, when the forge was not re-read.
+    pub fn skipped(&self, house: &HouseId) -> Option<String> {
+        match self {
+            Self::Forge(_) => None,
+            Self::Declined => Some("The forge was not re-read (--without-forge).".to_owned()),
+            Self::Unbound => Some(format!(
+                "The forge was not re-read: house {house} has no forge binding (`kitchen forge bind`)."
+            )),
+            Self::NoRegistry => Some(
+                "The forge was not re-read: pass --registry to use the house's forge binding."
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+/// Why the forge refused a write, for a report.
+pub fn not_applied(reason: NotAppliedReason) -> String {
+    match reason {
+        NotAppliedReason::Rejected => "rejected; check the token's account and access".to_owned(),
+        NotAppliedReason::RateLimited {
+            retry_after: Some(delay),
+        } => format!("rate limited; retry after {}s", delay.as_secs()),
+        NotAppliedReason::RateLimited { retry_after: None } => "rate limited".to_owned(),
+        NotAppliedReason::Unsupported(capability) => format!("unsupported: {capability}"),
+        NotAppliedReason::CrossHouse => "another house's request".to_owned(),
+        NotAppliedReason::ForeignBackend => "another backend's request".to_owned(),
+        NotAppliedReason::ConfirmedAbsent => "confirmed absent".to_owned(),
+    }
+}
+
+/// The GitHub login `gh` is logged in as, from its configuration. Runs
+/// `gh config get user`, which reads no token; any failure means unknown.
+pub fn gh_login(path: Option<std::ffi::OsString>) -> Option<ExternalRef> {
+    let gh = gh_executable(path)?;
     let mut command = Command::new(gh);
     command
         .args(["config", "get", "user", "--host", "github.com"])

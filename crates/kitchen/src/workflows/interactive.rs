@@ -50,11 +50,11 @@ use crate::{
 mod draft;
 
 pub use draft::{
-    AcknowledgeOutcome, AcknowledgeReason, AcknowledgeReport, Acknowledgement, DRAFT_TASK_PREFIX,
-    DraftApproval, DraftDigest, DraftOptions, DraftOutcome, DraftReport, DraftTarget, DraftWriter,
-    ForgeWriter, IssueDraft, MAX_ACKNOWLEDGE_REASON_BYTES, MAX_DRAFT_BLOCKERS, MAX_DRAFT_LABELS,
-    MAX_DRAFT_QUESTIONS, PlannedWrite, Preview, ReadBack, WriteReadBack, Written,
-    acknowledge_draft, apply_draft, draft_preview, draft_task_id,
+    AcknowledgeOutcome, AcknowledgeReason, AcknowledgeReport, Acknowledgement, ApprovedDraft,
+    DRAFT_TASK_PREFIX, DraftApproval, DraftDigest, DraftOptions, DraftOutcome, DraftReport,
+    DraftTarget, DraftWriter, ForgeWriter, IssueDraft, MAX_ACKNOWLEDGE_REASON_BYTES,
+    MAX_DRAFT_BLOCKERS, MAX_DRAFT_LABELS, MAX_DRAFT_QUESTIONS, PlannedWrite, Preview, ReadBack,
+    WriteReadBack, Written, acknowledge_draft, apply_draft, draft_preview, draft_task_id,
 };
 
 type Result<T> = std::result::Result<T, crate::Error>;

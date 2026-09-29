@@ -113,11 +113,16 @@ and `removeLabels` is allowed.
 
 Show the person the whole preview: every issue, comment, label, and
 dependency, and the digest. A preview with open questions is not ready.
-Nothing is posted by these commands. Posting an approved draft goes through
-Kitchen's durable writer (`apply_draft`), which reruns without duplicates;
-this build has no command for it, so tell the person the approved text is
-ready and that Kitchen could not post it. Post nothing yourself unless the
-person approves that exact post.
+Nothing is posted by these commands. Once the person approves that digest,
+post it with the same draft file:
+
+`kitchen issue apply --draft <file> --approve <digest> --registry <dir> --store <dir> --holder <you>`
+
+It writes through the house's forge binding, and only the exact preview the
+digest names; a changed draft is refused until the person approves its new
+digest. When it stops early (a refused or unknown write), rerun the same
+command: it resumes without duplicates. A house without a forge binding is
+refused; tell the person to run `kitchen forge bind`. Post nothing yourself.
 
 A draft refused because an earlier draft settled after writing
 (`EarlierSettledWithWrites`) stays refused until the person releases it.
@@ -126,9 +131,10 @@ forge, and run with their reason:
 
 `kitchn issue acknowledge <task> --reason <why> --registry <dir> --store <dir> --holder <you>`
 
-This build cannot re-read the forge, so a write without a recorded receipt
-is reported as unknown. Add `--accept-unknown` only after the person has
-checked it and says to. Never release a subject on your own.
+With a forge binding it first re-reads the forge for writes whose outcome is
+unknown; without one, such a write stays unknown. Add `--accept-unknown`
+only after the person has checked it and says to. Never release a subject on
+your own.
 
 ## 3. End or hand over
 

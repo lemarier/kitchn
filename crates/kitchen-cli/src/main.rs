@@ -44,6 +44,8 @@ enum Command {
     Budget(Box<commands::budget::BudgetArgs>),
     /// Offline issue pickup diagnostics.
     Pickup(commands::pickup::PickupArgs),
+    /// Bind a house to the forge account it writes as, or show its binding.
+    Forge(commands::forge::ForgeArgs),
 }
 
 fn main() -> ExitCode {
@@ -82,6 +84,7 @@ fn main() -> ExitCode {
             commands::budget::Outcome::Output(result) => result,
         },
         Some(Command::Pickup(args)) => commands::pickup::run(args).map(|output| (output, true)),
+        Some(Command::Forge(args)) => commands::forge::run(args),
         None => return output_status(Cli::command().print_help()),
     };
     match result {

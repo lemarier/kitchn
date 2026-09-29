@@ -24,7 +24,7 @@ use std::{
 const MAX_PATH_ENTRIES: usize = 256;
 
 /// Argument ids that answer guided questions; none may accompany `--config`.
-pub const GUIDED: [&str; 15] = [
+pub const GUIDED: [&str; 17] = [
     "house",
     "repositories",
     "posting_destinations",
@@ -33,6 +33,8 @@ pub const GUIDED: [&str; 15] = [
     "expediter",
     "required_checks",
     "required_reviewers",
+    "forge_requester",
+    "forge_credential",
     "kitchen",
     "bundle",
     "yes",
@@ -69,6 +71,13 @@ pub struct InitArgs {
     /// Comma-separated required reviewers, or none (default: expediter).
     #[arg(long)]
     required_reviewers: Option<String>,
+    /// GitHub login kitchen writes as, or none (default: the logged-in gh
+    /// account, else none). Stores a forge binding, never a credential.
+    #[arg(long)]
+    forge_requester: Option<String>,
+    /// Credential name of the forge binding (default: github).
+    #[arg(long)]
+    forge_credential: Option<String>,
     /// Kitchen commit to pin (default: the commit this binary records).
     #[arg(long)]
     kitchen: Option<String>,
@@ -114,6 +123,8 @@ pub fn run(
         expediter: args.expediter,
         required_checks: args.required_checks,
         required_reviewers: args.required_reviewers,
+        forge_requester: args.forge_requester,
+        forge_credential: args.forge_credential,
         kitchen: args.kitchen,
         bundle: args.bundle.as_deref().map(decode).transpose()?,
         yes: args.yes,
@@ -128,6 +139,7 @@ pub fn run(
             .map(|remotes| remotes.selected.repository),
         kitchen: option_env!("KITCHEN_COMMIT").and_then(|commit| CommitId::new(commit).ok()),
         agents: installed_agents(std::env::var_os("PATH")),
+        forge_login: super::forge::gh_login(std::env::var_os("PATH")),
     };
     let github = match args.github {
         GitHubArgs {
@@ -161,13 +173,25 @@ pub fn run(
     };
     if answers.yes {
         // The interactive path already showed the config when asking.
-        announce(&plan.config_text()?, &mut io::stderr().lock())?;
+        announce(
+            &format!("{}\n{}", plan.config_text()?, plan.forge_text()),
+            &mut io::stderr().lock(),
+        )?;
     }
     let report = register_house(&plan)?;
     let guidance = plan.config.guidance.as_str();
+    let forge = match &report.forge {
+        Some(bound) => format!(
+            "\nBound the house to {} as {}.\n{}",
+            bound.binding.forge,
+            bound.binding.requester.as_str(),
+            super::forge::token_text(&bound.binding, &bound.credential_path, bound.credential),
+        ),
+        None => String::new(),
+    };
     Ok((
         format!(
-            "Registered house {} in {} and pinned {} guidance at {}.\nNo authority or workflows activated.\nSaved your answers as {}. Review it any time.\nNext: from a checkout of an allowed repository, run kitchen house setup --registry '{}'",
+            "Registered house {} in {} and pinned {} guidance at {}.\nNo authority or workflows activated.{forge}\nSaved your answers as {}. Review it any time.\nNext: from a checkout of an allowed repository, run kitchen house setup --registry '{}'",
             plan.config.house,
             plan.registry.display(),
             if answers.bundle.is_some() {

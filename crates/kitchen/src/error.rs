@@ -80,6 +80,9 @@ pub enum Error {
     /// Guided house registration failed or had missing answers.
     #[error(transparent)]
     HouseInit(#[from] crate::house::HouseInitError),
+    /// A forge binding was missing or refused an approved write.
+    #[error(transparent)]
+    Forge(#[from] crate::house::ForgeError),
 }
 
 impl Error {
@@ -105,6 +108,7 @@ impl Error {
             Self::Budget(error) => error.class(),
             Self::Intake(error) => error.class(),
             Self::HouseInit(error) => error.class(),
+            Self::Forge(error) => error.class(),
         }
     }
 }

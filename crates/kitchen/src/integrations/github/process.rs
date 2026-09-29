@@ -14,8 +14,22 @@ use std::{
 #[derive(Clone)]
 pub struct CredentialFile {
     reference: CredentialRef,
-    path: PathBuf,
+    source: Source,
 }
+
+/// Where a token is read from.
+#[derive(Clone)]
+enum Source {
+    /// A caller-selected path, opened on each load.
+    Path(PathBuf),
+    /// A descriptor its owner opened and checked; read in place, never
+    /// reopened by path.
+    #[cfg(unix)]
+    Opened(std::sync::Arc<File>),
+}
+
+/// Largest accepted token file, in bytes.
+const TOKEN_LIMIT: u16 = 16 * 1024;
 
 #[cfg(all(test, unix))]
 mod isolation_tests {
@@ -68,7 +82,20 @@ impl CredentialFile {
         if !path.is_absolute() {
             return Err(IntegrationError::InvalidInput);
         }
-        Ok(Self { reference, path })
+        Ok(Self {
+            reference,
+            source: Source::Path(path),
+        })
+    }
+    /// Bind a token file the house layer already opened and checked. Every
+    /// load reads this descriptor from its start, so replacing the file at
+    /// its path afterwards does not change the token.
+    #[cfg(unix)]
+    pub(crate) fn opened(reference: CredentialRef, file: File) -> Self {
+        Self {
+            reference,
+            source: Source::Opened(std::sync::Arc::new(file)),
+        }
     }
     /// Bound reference, without the credential or private path.
     #[must_use]
@@ -79,19 +106,26 @@ impl CredentialFile {
         if requested != &self.reference {
             return Err(IntegrationError::ScopeMismatch);
         }
-        let file = File::open(&self.path).map_err(|_| IntegrationError::Unavailable)?;
-        if !file
-            .metadata()
-            .map_err(|_| IntegrationError::Unavailable)?
-            .is_file()
-        {
-            return Err(IntegrationError::InvalidInput);
-        }
-        let mut bytes = Vec::new();
-        file.take(16 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| IntegrationError::Unavailable)?;
-        if bytes.len() > 16 * 1024 {
+        let bytes = match &self.source {
+            Source::Path(path) => {
+                let file = File::open(path).map_err(|_| IntegrationError::Unavailable)?;
+                if !file
+                    .metadata()
+                    .map_err(|_| IntegrationError::Unavailable)?
+                    .is_file()
+                {
+                    return Err(IntegrationError::InvalidInput);
+                }
+                let mut bytes = Vec::new();
+                file.take(u64::from(TOKEN_LIMIT) + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| IntegrationError::Unavailable)?;
+                bytes
+            }
+            #[cfg(unix)]
+            Source::Opened(file) => read_from_start(file)?,
+        };
+        if bytes.len() > usize::from(TOKEN_LIMIT) {
             return Err(IntegrationError::LimitExceeded);
         }
         let token = String::from_utf8(bytes).map_err(|_| IntegrationError::InvalidInput)?;
@@ -101,6 +135,26 @@ impl CredentialFile {
         }
         Ok(token.into())
     }
+}
+
+/// Read up to one byte past [`TOKEN_LIMIT`] from offset zero with positioned
+/// reads, so clones sharing the descriptor never move each other's offset.
+#[cfg(unix)]
+fn read_from_start(file: &File) -> Result<Vec<u8>, IntegrationError> {
+    use std::os::unix::fs::FileExt;
+    let mut bytes = vec![0; usize::from(TOKEN_LIMIT) + 1];
+    let mut filled = 0;
+    while let Some(rest) = bytes.get_mut(filled..).filter(|rest| !rest.is_empty()) {
+        let offset = u64::try_from(filled).map_err(|_| IntegrationError::LimitExceeded)?;
+        match file.read_at(rest, offset) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(IntegrationError::Unavailable),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
 }
 
 /// Installed GitHub CLI, pinned by absolute executable path.

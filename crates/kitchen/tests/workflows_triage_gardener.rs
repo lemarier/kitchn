@@ -1358,6 +1358,186 @@ fn a_foreign_fact_at_the_handled_key_fails_the_precheck() -> common::TestResult 
     Ok(())
 }
 
+/// Record a handled-stale marker as `report_stale` writes it: the revision
+/// and the applied report that backs it (`bound`).
+fn record_handled(
+    fixture: &common::Fixture,
+    repository: &Repository,
+    number: u64,
+    revision_millis: u64,
+    bound: bool,
+) -> common::TestResult {
+    use kitchen::state::{MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, WorkItem};
+    use serde_json::json;
+    let mut payload = json!({"revision": revision_millis});
+    if bound {
+        payload["report"] = json!({
+            "task": "gardener-stale-report",
+            "receipt": "https://github.com/sample/project/issues/1#issuecomment-1",
+        });
+    }
+    fixture.store.record_marker(
+        MarkerKey {
+            workflow: WorkflowId::new(gardener::WORKFLOW)?,
+            item: WorkItem::Issue {
+                repository: repository.clone(),
+                number: std::num::NonZeroU64::new(number).ok_or("issue")?,
+            },
+            subject: MarkerSubject::Observation(ExternalRef::new("stale-handled")?),
+        },
+        MarkerFact::workflow(
+            MarkerSchema::new("gardener.stale-handled", std::num::NonZeroU32::MIN)?,
+            &payload,
+        )?,
+        &common::scheduled("gardener-tick")?,
+        common::at(1),
+    )?;
+    Ok(())
+}
+
+/// 2025-12-02 and 2025-12-03 00:00:00Z in Unix milliseconds.
+const STALE_A_HANDLED: u64 = 1_764_633_600_000;
+const STALE_B_HANDLED: u64 = 1_764_720_000_000;
+
+fn daily_window(day: u64) -> common::TestResult<gardener::Window> {
+    // Each later day moves the change window and the stale cutoff forward.
+    let shift = day * 86_400_000;
+    Ok(gardener::Window::new(
+        Timestamp::from_unix_millis(1_768_003_200_000 + shift),
+        Timestamp::from_unix_millis(1_767_225_600_000 + shift),
+    )?)
+}
+
+#[test]
+fn every_stale_candidate_handled_at_its_current_revision_is_idle_each_day() -> common::TestResult {
+    use serde_json::json;
+    let fixture = common::Fixture::new()?;
+    let markers = gardener::StaleMarkers::new(&fixture.store)?;
+    let a = forge_issue(3, "open", "2025-12-02T00:00:00Z", &[]);
+    let b = forge_issue(5, "open", "2025-12-03T00:00:00Z", &[]);
+    let open = json!([a.clone(), b.clone()]);
+
+    // Never handled: actionable.
+    assert_eq!(
+        gardener_precheck(Some(&markers), daily_window(0)?, json!([]), open.clone())?,
+        Ok(Precheck::Actionable)
+    );
+    // One handled candidate does not idle the other.
+    record_handled(&fixture, &project(), 3, STALE_A_HANDLED, true)?;
+    assert_eq!(
+        gardener_precheck(Some(&markers), daily_window(0)?, json!([]), open.clone())?,
+        Ok(Precheck::Actionable)
+    );
+    // All handled: idle on every following day, including while the reports
+    // still sit inside the change window.
+    record_handled(&fixture, &project(), 5, STALE_B_HANDLED, true)?;
+    for day in 0..4 {
+        assert_eq!(
+            gardener_precheck(
+                Some(&markers),
+                daily_window(day)?,
+                json!([a.clone(), b.clone()]),
+                open.clone()
+            )?,
+            Ok(Precheck::Idle),
+            "day {day}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_new_revision_reopens_only_its_own_candidate() -> common::TestResult {
+    use serde_json::json;
+    let fixture = common::Fixture::new()?;
+    let markers = gardener::StaleMarkers::new(&fixture.store)?;
+    record_handled(&fixture, &project(), 3, STALE_A_HANDLED, true)?;
+    record_handled(&fixture, &project(), 5, STALE_B_HANDLED, true)?;
+    let a = forge_issue(3, "open", "2025-12-02T00:00:00Z", &[]);
+    let b = forge_issue(5, "open", "2025-12-03T00:00:00Z", &[]);
+    assert_eq!(
+        gardener_precheck(Some(&markers), daily_window(0)?, json!([]), json!([a, b]))?,
+        Ok(Precheck::Idle)
+    );
+    // Someone comments on issue 5 a second later: still stale, no longer the
+    // handled revision.
+    let touched = forge_issue(5, "open", "2025-12-03T00:00:01Z", &[]);
+    let a = forge_issue(3, "open", "2025-12-02T00:00:00Z", &[]);
+    assert_eq!(
+        gardener_precheck(
+            Some(&markers),
+            daily_window(0)?,
+            json!([]),
+            json!([a.clone(), touched])
+        )?,
+        Ok(Precheck::Actionable)
+    );
+    // An older revision than the handled one is not handled either.
+    let earlier = forge_issue(5, "open", "2025-12-02T23:59:59Z", &[]);
+    assert_eq!(
+        gardener_precheck(
+            Some(&markers),
+            daily_window(0)?,
+            json!([]),
+            json!([a, earlier])
+        )?,
+        Ok(Precheck::Actionable)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_marker_that_proves_no_report_or_names_another_repository_handles_nothing() -> common::TestResult
+{
+    use serde_json::json;
+    let fixture = common::Fixture::new()?;
+    let markers = gardener::StaleMarkers::new(&fixture.store)?;
+    let stale = forge_issue(3, "open", "2025-12-02T00:00:00Z", &[]);
+    // No applied report behind it.
+    record_handled(&fixture, &project(), 3, STALE_A_HANDLED, false)?;
+    assert_eq!(
+        gardener_precheck(
+            Some(&markers),
+            daily_window(0)?,
+            json!([]),
+            json!([stale.clone()])
+        )?,
+        Ok(Precheck::Actionable)
+    );
+    // A report on the same issue number of another repository.
+    let elsewhere = Repository::new("sample/other")?;
+    record_handled(&fixture, &elsewhere, 3, STALE_A_HANDLED, true)?;
+    assert_eq!(
+        gardener_precheck(Some(&markers), daily_window(0)?, json!([]), json!([stale]))?,
+        Ok(Precheck::Actionable)
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unreadable_marker_store_never_reads_as_a_handled_idle_day() -> common::TestResult {
+    use serde_json::json;
+    let fixture = common::Fixture::new()?;
+    let markers = gardener::StaleMarkers::new(&fixture.store)?;
+    record_handled(&fixture, &project(), 3, STALE_A_HANDLED, true)?;
+    let stale = forge_issue(3, "open", "2025-12-02T00:00:00Z", &[]);
+    assert_eq!(
+        gardener_precheck(
+            Some(&markers),
+            daily_window(0)?,
+            json!([]),
+            json!([stale.clone()])
+        )?,
+        Ok(Precheck::Idle)
+    );
+    fs::write(fixture.state_path(), b"{not json")?;
+    assert_eq!(
+        gardener_precheck(Some(&markers), daily_window(0)?, json!([]), json!([stale]))?,
+        Err(WorkflowError::PrecheckFailed)
+    );
+    Ok(())
+}
+
 /// The gardener precheck over `changed` and `open` inventory pages.
 fn gardener_precheck(
     markers: Option<&gardener::StaleMarkers<'_>>,

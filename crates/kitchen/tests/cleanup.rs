@@ -37,8 +37,9 @@ use kitchen::{
         ApplyOptions, ApplyReport, ApprovalOutcome, ApprovalResult, BuildOutcome, BuildReport,
         CACHEDIR_SIGNATURE, CleanupError, ConsentSource, Decision, EXTERNAL_CACHE_SUGGESTIONS,
         Exclusion, GitLimits, GitOperation, GitReadError, InspectionTrigger, Inspector, NoConsent,
-        Ownership, Precheck, Preview, ReleaseConsent, ReleaseOutcome, RemoteName, Step,
-        TASK_PREFIX, apply, approve, inspect, inspect_worktree, reclaim_build_output,
+        ObservationDigest, Ownership, Precheck, Preview, ReleaseConsent, ReleaseOutcome,
+        RemoteName, Step, TASK_PREFIX, apply, approve, inspect, inspect_worktree,
+        reclaim_build_output,
     },
 };
 
@@ -1472,13 +1473,13 @@ fn a_marker_a_person_did_not_record_approves_nothing() -> TestResult {
         .ok_or("worktree")?
         .observation
         .clone();
-    let key = |resource: &ResourceRef, digest: &ExternalRef| -> TestResult<MarkerKey> {
+    let key = |resource: &ResourceRef, digest: &ObservationDigest| -> TestResult<MarkerKey> {
         Ok(MarkerKey {
             workflow: kitchen::WorkflowId::new("dishwasher")?,
             item: WorkItem::Resource {
                 resource: resource.clone(),
             },
-            subject: MarkerSubject::Observation(digest.clone()),
+            subject: MarkerSubject::Observation(ExternalRef::new(digest.as_str())?),
         })
     };
     let schema = MarkerSchema::new("cleanup.approval", NonZeroU32::MIN)?;
@@ -1539,7 +1540,7 @@ fn an_approval_names_exact_current_evidence() -> TestResult {
         .ok_or("dirty")?
         .observation
         .clone();
-    let unknown = ExternalRef::new("sha256:0000")?;
+    let unknown = ObservationDigest::new(&format!("sha256:{}", "0".repeat(64)))?;
     let results = approve(
         &harness.inspector(),
         &interactive("david")?,
@@ -1996,7 +1997,7 @@ fn an_interrupted_release_is_reconciled_not_repeated() -> TestResult {
 /// it named, each for the digest they saw, and to nothing else.
 struct Shown {
     house: kitchen::HouseId,
-    seen: BTreeMap<ResourceRef, ExternalRef>,
+    seen: BTreeMap<ResourceRef, ObservationDigest>,
 }
 
 impl ConsentSource for Shown {
@@ -2094,6 +2095,77 @@ fn interactive_release_needs_consent_for_each_resource() -> TestResult {
         ReleaseOutcome::Released
     );
     assert_eq!(outcome(&approved, &owned.worker)?, ReleaseOutcome::Released);
+    Ok(())
+}
+
+/// The evidence basis the release effect of `resource`'s release task recorded.
+fn release_basis(
+    harness: &Harness,
+    report: &ApplyReport,
+    resource: &ResourceRef,
+) -> TestResult<Option<String>> {
+    let task = report
+        .results
+        .iter()
+        .find(|result| &result.resource == resource)
+        .and_then(|result| result.task.clone())
+        .ok_or("no release task")?;
+    let record = harness.store().task(&task)?;
+    let effect = record
+        .effects()
+        .iter()
+        .find(|effect| {
+            matches!(
+                effect.request().effect(),
+                Effect::Worker(Operation::ReleaseResource { .. })
+            )
+        })
+        .ok_or("no release effect")?;
+    Ok(effect.basis().map(|basis| basis.as_str().to_owned()))
+}
+
+#[test]
+fn a_scheduled_release_records_the_digest_a_person_approved() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let approved = harness.approve_all()?;
+    let digest = approved
+        .iter()
+        .find(|result| {
+            result.outcome
+                == ApprovalOutcome::Approved {
+                    resource: owned.worker.clone(),
+                    step: Step::Release,
+                }
+        })
+        .ok_or("worker not approved")?
+        .observation
+        .clone();
+    harness.clock.advance(60);
+    let report = harness.apply()?;
+    assert_eq!(outcome(&report, &owned.worker)?, ReleaseOutcome::Released);
+    assert_eq!(
+        release_basis(&harness, &report, &owned.worker)?.as_deref(),
+        Some(digest.as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn an_interactive_release_records_the_digest_the_person_saw() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    let preview = harness.inspect()?;
+    let consents = shown(&preview)?;
+    let report = harness.apply_as(&grants()?, &interactive("session")?, &consents)?;
+    for resource in [&owned.worker, &owned.worktree] {
+        assert_eq!(outcome(&report, resource)?, ReleaseOutcome::Released);
+        let seen = consents.seen.get(resource).ok_or("not shown")?;
+        assert_eq!(
+            release_basis(&harness, &report, resource)?.as_deref(),
+            Some(seen.as_str())
+        );
+    }
     Ok(())
 }
 
@@ -2243,7 +2315,7 @@ fn a_consent_naming_no_digest_is_refused_before_any_effect() -> TestResult {
 /// for the digest of the preview the person is shown now.
 struct Replay {
     consent: Consent,
-    digest: ExternalRef,
+    digest: ObservationDigest,
 }
 
 impl ConsentSource for Replay {

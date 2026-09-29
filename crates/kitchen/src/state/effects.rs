@@ -435,6 +435,7 @@ mod tests {
                 }
                 .into(),
                 consent: None,
+                basis: None,
             };
             let record = run_effect(&self.store, &self.backend, &self.grants, plan, &Fixed)?;
             Ok(record.state().clone())

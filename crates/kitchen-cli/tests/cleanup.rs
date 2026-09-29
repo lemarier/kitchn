@@ -149,6 +149,7 @@ fn settled_task(store: &HouseStore) -> TestResult<(String, String, String)> {
             }
             .into(),
             consent: None,
+            basis: None,
         },
         &Fixed(now),
     )?;
@@ -353,6 +354,16 @@ fn an_approval_for_evidence_that_no_longer_matches_is_refused() -> TestResult {
     // At least one digest is required.
     let output = kitchen(&approve_args(text(&store_dir)?, text(&inventory)?, &[]))?;
     assert_eq!(output.status.code(), Some(2));
+    // A digest that is not a preview's is invalid input, and nothing is recorded.
+    for malformed in ["sha256:0000", "consent-task-1"] {
+        let output = kitchen(&approve_args(
+            text(&store_dir)?,
+            text(&inventory)?,
+            &[malformed],
+        ))?;
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+    }
+    assert!(store.markers(&WorkflowId::new("dishwasher")?)?.is_empty());
     Ok(())
 }
 

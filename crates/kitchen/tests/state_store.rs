@@ -460,6 +460,62 @@ fn repeated_events_are_idempotent_and_contradictions_rejected() -> TestResult {
 }
 
 #[test]
+fn an_effect_records_its_evidence_basis_for_audit() -> TestResult {
+    let fixture = Fixture::new()?;
+    let fence = claimed_attempt(&fixture, "task-1", at(0))?;
+    let task = task_id("task-1")?;
+    let store = &fixture.store;
+    let basis = ExternalRef::new("sha256:preview")?;
+    let with_basis = |basis: Option<ExternalRef>| -> TestResult<_> {
+        let mut plan = plan(&task, fence, "launch", launch()?)?;
+        plan.basis = basis;
+        Ok(plan)
+    };
+    let EffectStart::Execute(intent) = store.begin_effect(
+        with_basis(Some(basis.clone()))?,
+        &grants()?,
+        &common::refusing()?,
+        at(1),
+    )?
+    else {
+        return Err("expected a new effect".into());
+    };
+    assert_eq!(intent.basis(), Some(&basis));
+    // The same name with another basis, or none, is a different decision.
+    for other in [Some(ExternalRef::new("sha256:other")?), None] {
+        assert!(matches!(
+            store.begin_effect(with_basis(other)?, &grants()?, &common::refusing()?, at(2)),
+            Err(Error::State(StateError::EffectNameConflict(seq))) if seq == intent.seq()
+        ));
+    }
+    // It is persisted with the effect.
+    let persisted = store.task(&task)?;
+    let recorded = persisted.effects().first().ok_or("no effect")?;
+    assert_eq!(recorded.basis(), Some(&basis));
+    Ok(())
+}
+
+#[test]
+fn a_snapshot_written_before_effect_bases_still_loads() -> TestResult {
+    let fixture = Fixture::new()?;
+    let fence = claimed_attempt(&fixture, "task-1", at(0))?;
+    let task = task_id("task-1")?;
+    fixture.store.begin_effect(
+        plan(&task, fence, "launch", launch()?)?,
+        &grants()?,
+        &common::refusing()?,
+        at(1),
+    )?;
+    // An effect without a basis writes no field, as snapshots did before.
+    let text = fs::read_to_string(fixture.state_path())?;
+    assert!(!text.contains("\"basis\""), "{text}");
+    let reopened = fixture.reopen()?;
+    let record = reopened.task(&task)?;
+    assert_eq!(record.effects().first().ok_or("no effect")?.basis(), None);
+    Ok(())
+}
+
+#[test]
 fn retry_budget_bounds_attempt_count_and_elapsed_time() -> TestResult {
     let fixture = Fixture::new()?;
     let store = &fixture.store;

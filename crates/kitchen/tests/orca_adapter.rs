@@ -136,6 +136,7 @@ fn assert_shared_suite_passed(report: &conformance::ConformanceReport) {
         Check::InventoryListsLaunch,
         Check::MessageRecovery,
         Check::CancelObserved,
+        Check::ReleaseKeepsBranch,
     ] {
         assert_eq!(report.result(check), Some(CheckResult::Passed), "{check}");
     }
@@ -925,6 +926,7 @@ fn plan(
         decided_at: EvidenceRevision::INITIAL,
         effect: effect.into(),
         consent: None,
+        basis: None,
     })
 }
 

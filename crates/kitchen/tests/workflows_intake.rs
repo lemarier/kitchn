@@ -978,6 +978,7 @@ impl Kitchen {
                 decided_at: EvidenceRevision::INITIAL,
                 effect: Effect::GitHub(effect),
                 consent: None,
+                basis: None,
             },
             &common::ManualClock::starting_at(1),
         )?)

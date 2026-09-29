@@ -157,6 +157,7 @@ pub fn plan(
         decided_at: EvidenceRevision::INITIAL,
         effect: action.into(),
         consent: None,
+        basis: None,
     })
 }
 

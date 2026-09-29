@@ -1669,6 +1669,7 @@ fn an_exhausted_schedule_is_paused_through_the_adapter() -> TestResult {
             decided_at: EvidenceRevision::INITIAL,
             effect: exhausted.pause_effect().ok_or("a pause")?,
             consent: None,
+            basis: None,
         },
         &clock,
     )?;

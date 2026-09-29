@@ -223,7 +223,8 @@ pub enum StateError {
     /// No effect has this number.
     #[error("effect {0} not found")]
     EffectNotFound(EffectSeq),
-    /// An effect name was reused within an attempt for a different operation.
+    /// An effect name was reused within an attempt for a different operation
+    /// or evidence basis.
     #[error("effect {0} already uses this name for a different operation")]
     EffectNameConflict(EffectSeq),
     /// The effect was persisted for another backend namespace; only that

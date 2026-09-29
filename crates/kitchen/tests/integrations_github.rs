@@ -6,6 +6,8 @@ use kitchen::{
 };
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::VecDeque, time::Duration};
+mod common;
+
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Default)]
@@ -275,11 +277,9 @@ fn label_setup_preserves_present_and_conflicting_definitions() -> Result {
 
 #[cfg(unix)]
 fn fake_cli(script: &str) -> Result<(tempfile::TempDir, std::path::PathBuf, CredentialFile)> {
-    use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir()?;
     let executable = root.path().join("fake-gh");
-    std::fs::write(&executable, format!("#!/bin/sh\n{script}\n"))?;
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+    common::executable::write_executable(&executable, format!("#!/bin/sh\n{script}\n"))?;
     let token = root.path().join("token");
     std::fs::write(&token, "sanitized-fixture-token")?;
     let credential = CredentialFile::new(scope()?.credential().clone(), token)?;

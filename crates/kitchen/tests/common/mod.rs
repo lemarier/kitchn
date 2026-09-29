@@ -5,6 +5,9 @@
 
 use std::{cell::Cell, time::Duration};
 
+#[cfg(unix)]
+pub mod executable;
+
 use kitchen::{
     BackendId, CredentialId, EffectName, HolderId, HouseId, TaskId,
     contracts::{

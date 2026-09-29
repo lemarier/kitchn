@@ -1345,11 +1345,10 @@ mod git_remote {
         fs::create_dir_all(&hooks)?;
         for dir in [hooks.clone(), repos.worker.join(".git").join("hooks")] {
             let hook = dir.join("pre-push");
-            fs::write(
+            common::executable::write_executable(
                 &hook,
                 format!("#!/bin/sh\ntouch '{}'\nexit 0\n", text(&marker)?),
             )?;
-            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
         }
         git(&repos.worker, &["config", "core.hooksPath", text(&hooks)?])?;
         let mine = commit_in(&repos.worker, "mine")?;
@@ -2102,8 +2101,7 @@ mod git_remote {
         )?;
         // A write that fails leaves the previous file as it was.
         let failing = dir.join("failing-git");
-        fs::write(&failing, "#!/bin/sh\nexit 1\n")?;
-        fs::set_permissions(&failing, fs::Permissions::from_mode(0o755))?;
+        common::executable::write_executable(&failing, "#!/bin/sh\nexit 1\n")?;
         assert_eq!(
             IsolatedGitConfig::create(
                 &failing,
@@ -2126,8 +2124,7 @@ mod git_remote {
     fn git_calls_are_bounded_by_the_deadline() -> TestResult {
         let dir = tempfile::tempdir()?;
         let slow = dir.path().join("git");
-        fs::write(&slow, "#!/bin/sh\nexec sleep 30\n")?;
-        fs::set_permissions(&slow, fs::Permissions::from_mode(0o755))?;
+        common::executable::write_executable(&slow, "#!/bin/sh\nexec sleep 30\n")?;
         let kitchen = tempfile::tempdir()?;
         let remote = GitRemote::new(
             slow,

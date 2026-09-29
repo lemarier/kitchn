@@ -1102,7 +1102,6 @@ fn an_unfinished_operation_keeps_the_worktree_but_not_its_regenerable_build_outp
 #[cfg(unix)]
 #[test]
 fn a_rebase_stopped_on_a_clean_tree_keeps_a_worktree_that_head_alone_calls_pushed() -> TestResult {
-    use std::os::unix::fs::PermissionsExt;
     let mut harness = Harness::new()?;
     let owned = harness.owner("task-1", true)?;
     let path = harness.path(&owned.worktree)?.to_path_buf();
@@ -1110,11 +1109,10 @@ fn a_rebase_stopped_on_a_clean_tree_keeps_a_worktree_that_head_alone_calls_pushe
     // `break` before replaying anything: HEAD sits on the pushed base.
     commit_locally(&path, "local.txt")?;
     let editor = harness.repo.dir.path().join("break-first.sh");
-    fs::write(
+    common::executable::write_executable(
         &editor,
         "#!/bin/sh\n{ echo break; cat \"$1\"; } > \"$1.new\" && mv \"$1.new\" \"$1\"\n",
     )?;
-    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755))?;
     let sequence_editor = format!("sequence.editor={}", path_str(&editor)?);
     git_stops(
         &path,
@@ -2785,11 +2783,9 @@ fn a_declined_interactive_run_does_not_block_the_scheduled_release() -> TestResu
 #[cfg(unix)]
 #[test]
 fn a_hung_git_call_is_killed_at_its_deadline() -> TestResult {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir()?;
     let script = dir.path().join("git");
-    fs::write(&script, "#!/bin/sh\nsleep 30\n")?;
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    common::executable::write_executable(&script, "#!/bin/sh\nsleep 30\n")?;
     let limits = GitLimits {
         program: script,
         call_timeout: Duration::from_millis(200),

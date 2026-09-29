@@ -1860,7 +1860,7 @@ fn gh_stack_commands_are_non_interactive_with_an_explicit_remote() -> TestResult
 
 #[cfg(unix)]
 mod gh_process {
-    use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+    use std::{fs, path::Path, time::Duration};
 
     use super::*;
 
@@ -1870,7 +1870,7 @@ mod gh_process {
     fn fake_gh(dir: &Path, stdout: &str, code: i32) -> TestResult<std::path::PathBuf> {
         let path = dir.join("gh");
         let log = dir.join("log");
-        fs::write(
+        common::executable::write_executable(
             &path,
             format!(
                 "#!/bin/sh\n\
@@ -1883,7 +1883,6 @@ mod gh_process {
                 log = log.display(),
             ),
         )?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         Ok(path)
     }
 
@@ -2005,8 +2004,7 @@ mod gh_process {
         );
         // A probe that does not finish is not evidence.
         let slow = dir.join("slow-gh");
-        fs::write(&slow, "#!/bin/sh\nsleep 5\n")?;
-        fs::set_permissions(&slow, fs::Permissions::from_mode(0o755))?;
+        common::executable::write_executable(&slow, "#!/bin/sh\nsleep 5\n")?;
         assert_eq!(
             GhStack::detect(&slow, &dir, Duration::from_millis(200)),
             None
@@ -2721,7 +2719,7 @@ exec {GIT} \"$@\"
         )?;
         let log = root.join("scopes");
         let gh_path = root.join("gh");
-        fs::write(
+        common::executable::write_executable(
             &gh_path,
             format!(
                 "#!/bin/sh
@@ -2731,7 +2729,6 @@ exec {GIT} \"$@\"
                 log = log.display()
             ),
         )?;
-        fs::set_permissions(&gh_path, fs::Permissions::from_mode(0o755))?;
         let gh = GhStack::new(
             gh_path,
             worker,
@@ -2779,7 +2776,7 @@ exec {GIT} \"$@\"
         // A stand-in `gh` whose own Git reads the configuration it would push
         // with.
         let gh_path = root.join("gh");
-        fs::write(
+        common::executable::write_executable(
             &gh_path,
             format!(
                 "#!/bin/sh\nfor key in core.hooksPath core.sshCommand push.followTags \
@@ -2788,7 +2785,6 @@ exec {GIT} \"$@\"
                 log = root.join("config-log").display()
             ),
         )?;
-        fs::set_permissions(&gh_path, fs::Permissions::from_mode(0o755))?;
         let (gh, _kitchen) = adapter(gh_path, &worker)?;
         assert_eq!(gh.run(&StackCommand::Push), StackResult::Done);
         assert_eq!(

@@ -4,10 +4,12 @@
 
 use std::{
     error::Error,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
+
+#[path = "../../kitchen/tests/common/executable.rs"]
+mod executable;
 
 use kitchen::{
     CredentialId, HouseId,
@@ -33,8 +35,7 @@ fn fake_gh(root: &Path, changed: &str, open: &str) -> TestResult<PathBuf> {
         "#!/bin/sh\nif [ \"$4\" = user ]; then printf '%s' '{{\"login\":\"sample-bot\"}}'; exit 0; fi\ncase \"$6\" in\n  *since=*) printf '%s' '{changed}' ;;\n  *state=open*) printf '%s' '{open}' ;;\n  *) exit 1 ;;\nesac\n"
     );
     let path = root.join("gh");
-    std::fs::write(&path, script)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    executable::write_executable(&path, script)?;
     Ok(path)
 }
 

@@ -25,7 +25,7 @@ use kitchen::{
         EvidenceRevision, ExternalRef, GitHubAction, GitHubEffect, GitHubMutation, Grant,
         HouseGrants, IssueNumber, Lookup, Permission, PostingBudget, Provenance, Receipt,
         Repository, ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleEffect, TaskAuthority,
-        TaskSpec, Text, Timestamp,
+        TaskSpec, Text, Timestamp, UncertainReason,
         fake::{ExecuteFault, FakeBackend},
     },
     house::{
@@ -45,11 +45,11 @@ use kitchen::{
         Precheck, WorkflowError,
         budget::{
             self, BudgetPass, Delivery, PassAction, PassClaim, ReportChannel, Tick, TickArgs,
-            TickCommand,
+            TickCommand, TickReport,
         },
     },
 };
-use orca_sim::SimOrca;
+use orca_sim::{Fault, SimOrca};
 use serde_json::json;
 
 const HOUR_MS: u64 = 3_600_000;
@@ -1708,7 +1708,12 @@ fn enable(sim: &SimOrca, schedule: &ResourceRef) {
 
 /// `count` completed agent runs on day twenty, one per hour from midnight.
 fn day_twenty_runs(count: u64) -> Vec<serde_json::Value> {
-    let day = 20 * DAY_MS;
+    runs_on_day(20, count)
+}
+
+/// `count` completed agent runs on `day`, one per hour from midnight.
+fn runs_on_day(day: u64, count: u64) -> Vec<serde_json::Value> {
+    let day = day * DAY_MS;
     (0..count)
         .map(|index| {
             json!({"id": format!("run-{index}"), "status": "completed",
@@ -2128,7 +2133,7 @@ fn a_budget_tick_pauses_posts_the_report_once_and_then_idles() -> TestResult {
     assert!(fixture.store.marker(&delivered.marker_key()?)?.is_some());
     // The window's task is given back for the next tick.
     let task = fixture.store.task(&task_id(&format!(
-        "budget-{}",
+        "budget-{}-24h",
         delivered.window.start.as_unix_millis()
     ))?)?;
     assert!(matches!(task.state(), TaskState::Open));
@@ -2464,7 +2469,7 @@ fn a_budget_tick_refuses_while_another_tick_holds_the_window() -> TestResult {
     // Another tick created and claimed this window's task and is still running.
     budget::tick(&holder, &policy, &evidence)?;
     let window = evidence_window(&fixture, &policy, &evidence)?;
-    let task = task_id(&format!("budget-{window}"))?;
+    let task = task_id(&format!("budget-{window}-24h"))?;
     fixture.store.claim(&task, &other, ttl(300)?, clock.now())?;
     enable(&sim, &installed);
     let edits = sim.calls_to(&["automations", "edit"]).len();
@@ -2521,7 +2526,10 @@ fn a_tick_in_a_later_window_settles_the_earlier_windows_task() -> TestResult {
     let [Delivery::Delivered(earlier)] = first.deliveries.as_slice() else {
         return Err(format!("expected a delivered report, got {first:?}").into());
     };
-    let earlier_task = task_id(&format!("budget-{}", earlier.window.start.as_unix_millis()))?;
+    let earlier_task = task_id(&format!(
+        "budget-{}-24h",
+        earlier.window.start.as_unix_millis()
+    ))?;
 
     // Next day: the owner re-activated it and it ran out again.
     let next_day = connect(&sim)?.with_clock(noon_on_day_twenty_one);
@@ -2740,7 +2748,7 @@ fn a_windows_task_stays_retryable_for_the_longest_window() -> TestResult {
         // The task is created at the first exhaustion in the window and must
         // be claimable until the window's last instant, however long it is.
         let task = fixture.store.task(&task_id(&format!(
-            "budget-{}",
+            "budget-{}-{hours}h",
             window.start.as_unix_millis()
         ))?)?;
         assert_eq!(
@@ -2765,22 +2773,27 @@ fn a_window_task_from_an_earlier_retry_policy_is_continued_not_refused() -> Test
     exhausted_pickup(&sim, &backend)?;
     let evidence = backend.schedule_evidence()?;
     let window = policy.window_hours.containing(evidence.observed_at);
-    let id = task_id(&format!("budget-{}", window.start.as_unix_millis()))?;
+    let start = window.start.as_unix_millis();
+    let sized = task_id(&format!("budget-{start}-24h"))?;
+    let id = task_id(&format!("budget-{start}"))?;
     let clock = ManualClock::starting_at(1);
     budget::tick(
         &tick_with(&fresh, &backend, None, &grants, &claimant, &clock)?,
         &policy,
         &evidence,
     )?;
-    let current = fresh.store.task(&id)?.spec().clone();
+    let current = TaskSpec {
+        id: id.clone(),
+        ..fresh.store.task(&sized)?.spec().clone()
+    };
 
-    // An earlier release created the same window's task with another retry
-    // policy; the tick continues it and still acts.
+    // An earlier release created the window's task under its unsized name
+    // and another retry policy; the tick continues it and still acts.
     let earlier = Fixture::new()?;
     let sim = SimOrca::default();
     let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
     exhausted_pickup(&sim, &backend)?;
-    let old_retry = RetryPolicy::new(1, Duration::from_secs(3600))?;
+    let old_retry = RetryPolicy::new(1, Duration::from_secs(30 * 24 * 3600))?;
     earlier.store.create_task(
         TaskSpec {
             retry: old_retry,
@@ -2796,6 +2809,10 @@ fn a_window_task_from_an_earlier_retry_policy_is_continued_not_refused() -> Test
     )?;
     assert!(matches!(report.pass, BudgetPass::Acted(_)), "{report:?}");
     assert_eq!(earlier.store.task(&id)?.spec().retry, old_retry);
+    assert!(
+        earlier.store.task(&sized).is_err(),
+        "no second task for the window"
+    );
 
     // Any other difference is still a conflict.
     let other = Fixture::new()?;
@@ -2821,6 +2838,755 @@ fn a_window_task_from_an_earlier_retry_policy_is_continued_not_refused() -> Test
             Err(kitchen::Error::State(StateError::TaskConflict(_)))
         ),
         "{refused:?}"
+    );
+    Ok(())
+}
+
+/// Day thirty-one starts both a 24 hour and a 744 hour window: the epoch-
+/// aligned windows of the two lengths share a start there.
+fn thirty_one_at_noon() -> Timestamp {
+    Timestamp::from_unix_millis(31 * DAY_MS + 12 * HOUR_MS)
+}
+
+fn thirty_one_at_one() -> Timestamp {
+    Timestamp::from_unix_millis(31 * DAY_MS + 13 * HOUR_MS)
+}
+
+fn thirty_one_at_two() -> Timestamp {
+    Timestamp::from_unix_millis(31 * DAY_MS + 14 * HOUR_MS)
+}
+
+fn thirty_one_at_three() -> Timestamp {
+    Timestamp::from_unix_millis(31 * DAY_MS + 15 * HOUR_MS)
+}
+
+/// One tick under a policy whose window is `hours` long.
+fn tick_at_length(
+    fixture: &Fixture,
+    backend: &OrcaBackend<&SimOrca>,
+    reporter: &FakeBackend,
+    hours: u16,
+    clock: &ManualClock,
+) -> TestResult<TickReport> {
+    let policy = SchedulePolicy {
+        window_hours: WindowHours::new(hours)?,
+        ..policy()?
+    };
+    let channel = ReportChannel {
+        executor: reporter,
+        effect: &report_effect,
+    };
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+    let tick = tick_with(fixture, backend, Some(channel), &grants, &claimant, clock)?;
+    Ok(budget::tick(&tick, &policy, &backend.schedule_evidence()?)?)
+}
+
+/// One tick under a policy whose window is `hours` long, on `store`, such as
+/// a store reopened after a restart, over an observation already made. The
+/// outer result is the test setup; the inner one is the tick's.
+fn tick_on_store(
+    fixture: &Fixture,
+    store: &kitchen::state::HouseStore,
+    backend: &OrcaBackend<&SimOrca>,
+    reporter: &FakeBackend,
+    hours: u16,
+    clock: &ManualClock,
+    evidence: &ScheduleEvidence,
+) -> TestResult<kitchen::Result<TickReport>> {
+    let policy = SchedulePolicy {
+        window_hours: WindowHours::new(hours)?,
+        ..policy()?
+    };
+    let channel = ReportChannel {
+        executor: reporter,
+        effect: &report_effect,
+    };
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+    let tick = tick_with(fixture, backend, Some(channel), &grants, &claimant, clock)?;
+    Ok(budget::tick(&Tick { store, ..tick }, &policy, evidence))
+}
+
+/// The budget tasks in the store, by id: id and retry elapsed budget in
+/// hours.
+fn budget_tasks(fixture: &Fixture) -> TestResult<Vec<(String, u64)>> {
+    Ok(fixture
+        .store
+        .tasks()?
+        .iter()
+        .filter(|task| task.spec().id.as_str().starts_with("budget-"))
+        .map(|task| {
+            (
+                task.spec().id.as_str().to_owned(),
+                task.spec().retry.max_elapsed().as_secs() / 3600,
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+fn repaused(report: &TickReport) -> bool {
+    matches!(&report.pass, BudgetPass::Acted(actions)
+        if matches!(actions.as_slice(), [PassAction::Repaused(_)]))
+}
+
+#[test]
+fn lengthening_and_shortening_the_window_mid_window_pauses_again_but_reports_once() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let at_noon = connect(&sim)?.with_clock(thirty_one_at_noon);
+    let installed = at_noon.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    enable(&sim, &installed);
+    sim.state().runs = runs_on_day(31, 4);
+    let reporter = reporter()?;
+    let clock = ManualClock::starting_at(1);
+    let start = 31 * DAY_MS;
+
+    // 24 hours: exhausted, paused, and reported.
+    let first = tick_at_length(&fixture, &at_noon, &reporter, 24, &clock)?;
+    assert!(matches!(
+        first.deliveries.as_slice(),
+        [Delivery::Delivered(_)]
+    ));
+    assert_eq!(reporter.effects_performed(), 1);
+
+    // The owner re-activates it, then the house lengthens the window to 744
+    // hours. The new window starts at the same instant, but the 24 hour
+    // task's retry budget ends with the 24 hour window.
+    enable(&sim, &installed);
+    let at_one = connect(&sim)?.with_clock(thirty_one_at_one);
+    let longer = tick_at_length(&fixture, &at_one, &reporter, 744, &clock)?;
+    assert!(repaused(&longer), "{longer:?}");
+    assert!(longer.deliveries.is_empty(), "the owner is not told twice");
+    assert!(!enabled(&sim, installed.handle.as_str()));
+    assert_eq!(
+        budget_tasks(&fixture)?,
+        [
+            (format!("budget-{start}-24h"), 24),
+            (format!("budget-{start}-744h"), 744)
+        ],
+        "the 744 hour window has a task retryable for its whole length"
+    );
+
+    // Back to 24 hours: the 24 hour task is used again, not a third one.
+    enable(&sim, &installed);
+    let at_two = connect(&sim)?.with_clock(thirty_one_at_two);
+    let shorter = tick_at_length(&fixture, &at_two, &reporter, 24, &clock)?;
+    assert!(repaused(&shorter), "{shorter:?}");
+    assert!(shorter.deliveries.is_empty());
+    assert!(!enabled(&sim, installed.handle.as_str()));
+
+    // And to 744 again: the same second task.
+    enable(&sim, &installed);
+    let at_three = connect(&sim)?.with_clock(thirty_one_at_three);
+    let again = tick_at_length(&fixture, &at_three, &reporter, 744, &clock)?;
+    assert!(repaused(&again), "{again:?}");
+    assert_eq!(budget_tasks(&fixture)?.len(), 2);
+    assert_eq!(reporter.effects_performed(), 1, "one report for the window");
+    assert_eq!(activations(&sim), 0, "the tick never activates a schedule");
+    Ok(())
+}
+
+#[test]
+fn a_shorter_window_sharing_a_start_gets_its_own_task_and_no_second_report() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let at_noon = connect(&sim)?.with_clock(thirty_one_at_noon);
+    let installed = at_noon.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    enable(&sim, &installed);
+    sim.state().runs = runs_on_day(31, 4);
+    let reporter = reporter()?;
+    let clock = ManualClock::starting_at(1);
+
+    let first = tick_at_length(&fixture, &at_noon, &reporter, 744, &clock)?;
+    assert!(matches!(
+        first.deliveries.as_slice(),
+        [Delivery::Delivered(_)]
+    ));
+
+    enable(&sim, &installed);
+    let at_one = connect(&sim)?.with_clock(thirty_one_at_one);
+    let shorter = tick_at_length(&fixture, &at_one, &reporter, 24, &clock)?;
+    assert!(repaused(&shorter), "{shorter:?}");
+    assert!(shorter.deliveries.is_empty());
+    assert_eq!(
+        budget_tasks(&fixture)?,
+        [
+            (format!("budget-{}-24h", 31 * DAY_MS), 24),
+            (format!("budget-{}-744h", 31 * DAY_MS), 744)
+        ],
+        "each length's task names its hours"
+    );
+    assert_eq!(reporter.effects_performed(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_window_that_starts_elsewhere_does_not_report_the_same_exhaustion_again() -> TestResult {
+    // Day twenty: the 24 hour window starts on day twenty, the 744 hour one
+    // on day zero, so the two windows have different tasks and markers.
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = exhausted_pickup(&sim, &backend)?;
+    let reporter = reporter()?;
+    let clock = ManualClock::starting_at(1);
+
+    let first = tick_at_length(&fixture, &backend, &reporter, 24, &clock)?;
+    assert!(matches!(
+        first.deliveries.as_slice(),
+        [Delivery::Delivered(_)]
+    ));
+    assert_eq!(reporter.effects_performed(), 1);
+
+    // Paused and reported; the longer window is exhausted too, and idle.
+    let longer_policy = SchedulePolicy {
+        window_hours: WindowHours::new(744)?,
+        ..policy()?
+    };
+    assert_eq!(
+        budget::precheck(
+            &fixture.store,
+            &house()?,
+            &longer_policy,
+            &backend.schedule_evidence()?
+        )?,
+        Precheck::Idle
+    );
+    let longer = tick_at_length(&fixture, &backend, &reporter, 744, &clock)?;
+    assert_eq!(longer.pass, BudgetPass::Idle, "{longer:?}");
+    assert_eq!(reporter.effects_performed(), 1);
+
+    // Re-activated, it is paused again under either length without a report.
+    enable(&sim, &installed);
+    let one_pm = connect(&sim)?.with_clock(one_pm_on_day_twenty);
+    let paused = tick_at_length(&fixture, &one_pm, &reporter, 744, &clock)?;
+    assert!(repaused(&paused), "{paused:?}");
+    enable(&sim, &installed);
+    let back = tick_at_length(&fixture, &one_pm, &reporter, 24, &clock)?;
+    assert!(
+        back.deliveries.is_empty(),
+        "no second report: {:?}",
+        back.deliveries
+    );
+    assert_eq!(reporter.effects_performed(), 1);
+
+    // The next day's window is a new exhaustion and is reported.
+    sim.state().runs = runs_on_day(21, 4);
+    let next_day = connect(&sim)?.with_clock(noon_on_day_twenty_one);
+    enable(&sim, &installed);
+    let next = tick_at_length(&fixture, &next_day, &reporter, 24, &clock)?;
+    assert!(
+        next.deliveries
+            .iter()
+            .any(|delivery| matches!(delivery, Delivery::Delivered(_))),
+        "{next:?}"
+    );
+    assert_eq!(reporter.effects_performed(), 2);
+    Ok(())
+}
+
+/// A window task as a release before #182 created it: the same spec with a
+/// fixed 30 day retry budget.
+fn earlier_release_task(
+    fixture: &Fixture,
+    window_start: u64,
+    claimant: &kitchen::contracts::Claimant,
+) -> TestResult {
+    let grants = tick_grants()?;
+    let TickSpecProbe { spec } = TickSpecProbe::of(&grants, window_start)?;
+    fixture.store.create_task(
+        TaskSpec {
+            retry: RetryPolicy::new(16, Duration::from_secs(30 * 24 * 3600))?,
+            ..spec
+        },
+        claimant,
+        Timestamp::from_unix_millis(1),
+    )?;
+    Ok(())
+}
+
+struct TickSpecProbe {
+    spec: TaskSpec,
+}
+
+impl TickSpecProbe {
+    /// The spec this release gives the window that starts at `start`.
+    fn of(grants: &HouseGrants, start: u64) -> TestResult<Self> {
+        Ok(Self {
+            spec: TaskSpec {
+                id: task_id(&format!("budget-{start}"))?,
+                role: Role::Expediter,
+                repository: None,
+                authority: TaskAuthority::delegate(
+                    grants,
+                    [
+                        Grant::house(Permission::ManageSchedule, orca_id()?, credential()?),
+                        comment_grant()?,
+                    ],
+                )?,
+                retry: RetryPolicy::new(16, Duration::from_secs(24 * 3600))?,
+                provenance: Provenance {
+                    kitchen: commit('a')?,
+                    house_guidance: commit('b')?,
+                    repository_instructions: None,
+                },
+                requires: CapabilityRequirements::new(),
+                resources: BTreeSet::new(),
+                agent: None,
+                work_type: None,
+            },
+        })
+    }
+}
+
+#[test]
+fn a_task_from_before_the_retry_bound_is_looked_up_before_a_longer_window_acts() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let at_noon = connect(&sim)?.with_clock(thirty_one_at_noon);
+    let installed = at_noon.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    enable(&sim, &installed);
+    sim.state().runs = runs_on_day(31, 4);
+    let reporter = reporter()?;
+    let clock = ManualClock::starting_at(1);
+    let start = 31 * DAY_MS;
+    earlier_release_task(&fixture, start, &scheduled("budget-tick")?)?;
+
+    // The earlier release's task is continued for the 24 hour window; its
+    // report post is applied but the response is lost.
+    reporter.inject(ExecuteFault::ApplyThenLoseResponse);
+    let first = tick_at_length(&fixture, &at_noon, &reporter, 24, &clock)?;
+    let [Delivery::NotDelivered { record, .. }] = first.deliveries.as_slice() else {
+        return Err(format!("expected an uncertain post, got {first:?}").into());
+    };
+    assert!(matches!(record.state(), EffectState::Uncertain { .. }));
+    assert_eq!(budget_tasks(&fixture)?, [(format!("budget-{start}"), 720)]);
+
+    // Its 30 days are shorter than a 744 hour window, so the longer window
+    // gets its own task, which looks the post up and does not repeat it.
+    let at_one = connect(&sim)?.with_clock(thirty_one_at_one);
+    let longer = tick_at_length(&fixture, &at_one, &reporter, 744, &clock)?;
+    assert!(
+        matches!(longer.deliveries.as_slice(), [Delivery::Delivered(_)]),
+        "{longer:?}"
+    );
+    assert_eq!(reporter.effects_performed(), 1, "found, not reposted");
+    assert_eq!(
+        budget_tasks(&fixture)?,
+        [
+            (format!("budget-{start}"), 720),
+            (format!("budget-{start}-744h"), 744)
+        ]
+    );
+    let idle = tick_at_length(&fixture, &at_one, &reporter, 744, &clock)?;
+    assert_eq!(idle.pass, BudgetPass::Idle);
+    assert_eq!(reporter.effects_performed(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_window_whose_earlier_task_cannot_be_looked_up_is_refused_not_acted_on() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let at_noon = connect(&sim)?.with_clock(thirty_one_at_noon);
+    let installed = at_noon.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    enable(&sim, &installed);
+    sim.state().runs = runs_on_day(31, 4);
+    let reporter = reporter()?;
+    let clock = ManualClock::starting_at(1);
+    earlier_release_task(&fixture, 31 * DAY_MS, &scheduled("budget-tick")?)?;
+    reporter.inject(ExecuteFault::ApplyThenLoseResponse);
+    tick_at_length(&fixture, &at_noon, &reporter, 24, &clock)?;
+    enable(&sim, &installed);
+    let edits = sim.calls_to(&["automations", "edit"]).len();
+
+    // The post cannot be looked up: nothing is paused or posted, and the
+    // next tick that can look it up carries on.
+    reporter.fail_lookups(1);
+    let refused = tick_at_length(&fixture, &at_noon, &reporter, 744, &clock);
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(enabled(&sim, installed.handle.as_str()), "not paused");
+    assert_eq!(sim.calls_to(&["automations", "edit"]).len(), edits);
+    assert_eq!(reporter.effects_performed(), 1);
+
+    let at_one = connect(&sim)?.with_clock(thirty_one_at_one);
+    let retried = tick_at_length(&fixture, &at_one, &reporter, 744, &clock)?;
+    assert!(!enabled(&sim, installed.handle.as_str()), "{retried:?}");
+    assert_eq!(reporter.effects_performed(), 1);
+    Ok(())
+}
+
+/// The start of the window of `hours` that holds noon on day twenty: day
+/// twenty for 24 hours, day zero for 744.
+fn day_twenty_window_start(hours: u16) -> u64 {
+    let length = u64::from(hours) * HOUR_MS;
+    (20 * DAY_MS + 12 * HOUR_MS) / length * length
+}
+
+/// Which release created the task whose report post is lost.
+#[derive(Clone, Copy)]
+enum PostedBy {
+    /// This release: `budget-<start>-<hours>h`.
+    ThisRelease,
+    /// An earlier release: `budget-<start>` with a 30 day retry budget,
+    /// which is also what a 720 hour window's task looked like.
+    EarlierRelease,
+}
+
+/// A report post that applied under a window of `first` hours but whose
+/// response was lost, then a tick under `second` hours, whose window starts
+/// elsewhere, on a store reopened as by a new process.
+fn a_lost_report_across_a_length_change(first: u16, second: u16, by: PostedBy) -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    exhausted_pickup(&sim, &backend)?;
+    let reporter = reporter()?;
+    let clock = ManualClock::starting_at(1);
+    let start = day_twenty_window_start(first);
+    let earlier = task_id(&match by {
+        PostedBy::ThisRelease => format!("budget-{start}-{first}h"),
+        PostedBy::EarlierRelease => {
+            earlier_release_task(&fixture, start, &scheduled("budget-tick")?)?;
+            format!("budget-{start}")
+        }
+    })?;
+    reporter.inject(ExecuteFault::ApplyThenLoseResponse);
+    let lost = tick_at_length(&fixture, &backend, &reporter, first, &clock)?;
+    let [Delivery::NotDelivered { record, .. }] = lost.deliveries.as_slice() else {
+        return Err(format!("expected an uncertain post, got {lost:?}").into());
+    };
+    assert!(matches!(record.state(), EffectState::Uncertain { .. }));
+    assert_eq!(reporter.effects_performed(), 1, "the post applied");
+    assert_eq!(
+        fixture.store.task(&earlier)?.unresolved_effects().count(),
+        1
+    );
+
+    let restarted = fixture.reopen()?;
+    let one_pm = connect(&sim)?.with_clock(one_pm_on_day_twenty);
+    let evidence = one_pm.schedule_evidence()?;
+    let found = tick_on_store(
+        &fixture, &restarted, &one_pm, &reporter, second, &clock, &evidence,
+    )??;
+    assert!(
+        matches!(found.deliveries.as_slice(), [Delivery::Delivered(_)]),
+        "{found:?}"
+    );
+    assert_eq!(reporter.effects_performed(), 1, "found, not posted again");
+    assert_eq!(restarted.task(&earlier)?.unresolved_effects().count(), 0);
+    assert!(
+        budget_tasks(&fixture)?
+            .iter()
+            .any(|(id, _)| *id == format!("budget-{}-{second}h", day_twenty_window_start(second))),
+        "the new window has its own task"
+    );
+
+    let idle = tick_on_store(
+        &fixture, &restarted, &one_pm, &reporter, second, &clock, &evidence,
+    )??;
+    assert_eq!(idle.pass, BudgetPass::Idle, "{idle:?}");
+    assert_eq!(reporter.effects_performed(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_report_lost_before_the_window_lengthens_is_found_not_posted_again() -> TestResult {
+    a_lost_report_across_a_length_change(24, 744, PostedBy::ThisRelease)
+}
+
+#[test]
+fn a_report_lost_before_the_window_shortens_is_found_not_posted_again() -> TestResult {
+    a_lost_report_across_a_length_change(744, 24, PostedBy::ThisRelease)
+}
+
+#[test]
+fn a_report_an_earlier_release_lost_before_a_720_hour_window_shortens_is_not_posted_again()
+-> TestResult {
+    // The earlier task's window may be 720 hours long and still open, so its
+    // post counts although the task could also be a day's.
+    a_lost_report_across_a_length_change(720, 24, PostedBy::EarlierRelease)
+}
+
+#[test]
+fn a_report_an_earlier_release_lost_before_the_window_lengthens_to_720_hours_is_not_posted_again()
+-> TestResult {
+    a_lost_report_across_a_length_change(24, 720, PostedBy::EarlierRelease)
+}
+
+/// Orca, except that the response to every effect it applies is lost.
+struct LosesResponses<'a>(&'a OrcaBackend<&'a SimOrca>);
+
+impl EffectExecutor for LosesResponses<'_> {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.0.descriptor()
+    }
+
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        self.0.execute(request)?;
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    }
+
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.0.lookup(request)
+    }
+}
+
+/// A pause that applied under a window of `first` hours but whose response
+/// was lost, then ticks under `second` hours on a reopened store: refused
+/// while the pause cannot be looked up, then found applied and reported once.
+fn a_lost_pause_across_a_length_change(first: u16, second: u16) -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = exhausted_pickup(&sim, &backend)?;
+    let reporter = reporter()?;
+    let clock = ManualClock::starting_at(1);
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+    let losing = LosesResponses(&backend);
+    let tick = Tick {
+        schedules: &losing,
+        ..tick_with(&fixture, &backend, None, &grants, &claimant, &clock)?
+    };
+    let first_policy = SchedulePolicy {
+        window_hours: WindowHours::new(first)?,
+        ..policy()?
+    };
+    let lost = budget::tick(&tick, &first_policy, &backend.schedule_evidence()?)?;
+    let BudgetPass::Acted(actions) = &lost.pass else {
+        return Err(format!("expected a pause, got {lost:?}").into());
+    };
+    let [PassAction::PauseNotApplied { record, .. }] = actions.as_slice() else {
+        return Err(format!("expected an uncertain pause, got {actions:?}").into());
+    };
+    assert!(matches!(record.state(), EffectState::Uncertain { .. }));
+    assert!(lost.deliveries.is_empty());
+    assert!(
+        !enabled(&sim, installed.handle.as_str()),
+        "the pause applied"
+    );
+    let earlier = task_id(&format!(
+        "budget-{}-{first}h",
+        day_twenty_window_start(first)
+    ))?;
+    let edits = sim.calls_to(&["automations", "edit"]).len();
+
+    // The house changes the window's length and the next tick runs in a new
+    // process that cannot reach Orca to look the pause up: nothing happens.
+    let restarted = fixture.reopen()?;
+    let one_pm = connect(&sim)?.with_clock(one_pm_on_day_twenty);
+    let evidence = one_pm.schedule_evidence()?;
+    sim.fault(Fault::Spawn);
+    let refused = tick_on_store(
+        &fixture, &restarted, &one_pm, &reporter, second, &clock, &evidence,
+    )?;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(sim.calls_to(&["automations", "edit"]).len(), edits);
+    assert_eq!(reporter.effects_performed(), 0);
+    assert_eq!(restarted.task(&earlier)?.unresolved_effects().count(), 1);
+
+    // The lookup finds it applied; the new task reports once.
+    let found = tick_on_store(
+        &fixture, &restarted, &one_pm, &reporter, second, &clock, &evidence,
+    )??;
+    assert!(
+        matches!(found.deliveries.as_slice(), [Delivery::Delivered(_)]),
+        "{found:?}"
+    );
+    assert_eq!(restarted.task(&earlier)?.unresolved_effects().count(), 0);
+    assert_eq!(reporter.effects_performed(), 1);
+    assert_eq!(activations(&sim), 0);
+    Ok(())
+}
+
+#[test]
+fn a_pause_lost_before_the_window_lengthens_is_looked_up_first() -> TestResult {
+    a_lost_pause_across_a_length_change(24, 744)
+}
+
+#[test]
+fn a_pause_lost_before_the_window_shortens_is_looked_up_first() -> TestResult {
+    a_lost_pause_across_a_length_change(744, 24)
+}
+
+#[test]
+fn a_task_from_before_the_retry_bound_settles_once_a_later_window_starts() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = exhausted_pickup(&sim, &backend)?;
+    let reporter = reporter()?;
+    let clock = ManualClock::starting_at(1);
+    let earlier = task_id(&format!("budget-{}", 20 * DAY_MS))?;
+    earlier_release_task(&fixture, 20 * DAY_MS, &scheduled("budget-tick")?)?;
+    let first = tick_at_length(&fixture, &backend, &reporter, 24, &clock)?;
+    assert!(matches!(
+        first.deliveries.as_slice(),
+        [Delivery::Delivered(_)]
+    ));
+
+    // Its 30 day retry budget runs on, but the next day's window has begun
+    // and nothing on it is unresolved.
+    sim.state().runs = runs_on_day(21, 4);
+    enable(&sim, &installed);
+    let next_day = connect(&sim)?.with_clock(noon_on_day_twenty_one);
+    let later = tick_at_length(&fixture, &next_day, &reporter, 24, &clock)?;
+    assert_eq!(later.settled, std::slice::from_ref(&earlier));
+    assert_eq!(reporter.effects_performed(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_shortened_window_settles_an_earlier_releases_task_and_a_restored_one_gets_a_sized_task()
+-> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = exhausted_pickup(&sim, &backend)?;
+    let reporter = reporter()?;
+    let clock = ManualClock::starting_at(1);
+    let start = day_twenty_window_start(720);
+    let longer = format!("budget-{start}");
+    earlier_release_task(&fixture, start, &scheduled("budget-tick")?)?;
+    let first = tick_at_length(&fixture, &backend, &reporter, 720, &clock)?;
+    assert!(matches!(
+        first.deliveries.as_slice(),
+        [Delivery::Delivered(_)]
+    ));
+
+    // Shortened: the day's window starts after the earlier release's task,
+    // which has nothing unresolved and settles.
+    enable(&sim, &installed);
+    let one_pm = connect(&sim)?.with_clock(one_pm_on_day_twenty);
+    let shorter = tick_at_length(&fixture, &one_pm, &reporter, 24, &clock)?;
+    assert!(repaused(&shorter), "{shorter:?}");
+    assert_eq!(shorter.settled, [task_id(&longer)?]);
+
+    // Restored: its window is still open, so it gets a sized task, is
+    // paused again, and is not reported twice.
+    enable(&sim, &installed);
+    let restored = tick_at_length(&fixture, &one_pm, &reporter, 720, &clock)?;
+    assert!(repaused(&restored), "{restored:?}");
+    assert!(
+        restored.settled.is_empty(),
+        "the sized tasks are not settled"
+    );
+    assert_eq!(
+        budget_tasks(&fixture)?,
+        [
+            (longer.clone(), 720),
+            (format!("{longer}-720h"), 720),
+            (format!("budget-{}-24h", 20 * DAY_MS), 24),
+        ]
+    );
+    assert_eq!(reporter.effects_performed(), 1);
+    assert!(!enabled(&sim, installed.handle.as_str()));
+    Ok(())
+}
+
+/// An earlier release's task for day twenty's 24 hour window whose report
+/// post applied but whose response was lost.
+fn an_earlier_releases_lost_post(
+    fixture: &Fixture,
+    sim: &SimOrca,
+    reporter: &FakeBackend,
+    clock: &ManualClock,
+) -> TestResult<(kitchen::TaskId, ResourceRef)> {
+    let backend = connect(sim)?.with_clock(noon_on_day_twenty);
+    let installed = exhausted_pickup(sim, &backend)?;
+    let earlier = task_id(&format!("budget-{}", 20 * DAY_MS))?;
+    earlier_release_task(fixture, 20 * DAY_MS, &scheduled("budget-tick")?)?;
+    reporter.inject(ExecuteFault::ApplyThenLoseResponse);
+    tick_at_length(fixture, &backend, reporter, 24, clock)?;
+    assert_eq!(
+        fixture.store.task(&earlier)?.unresolved_effects().count(),
+        1
+    );
+    assert_eq!(reporter.effects_performed(), 1);
+    Ok((earlier, installed))
+}
+
+#[test]
+fn an_earlier_releases_unknown_post_holds_back_later_windows_until_it_is_found() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let reporter = reporter()?;
+    let clock = ManualClock::starting_at(1);
+    let (earlier, installed) = an_earlier_releases_lost_post(&fixture, &sim, &reporter, &clock)?;
+
+    // Next day the post still cannot be looked up. The task could be a 720
+    // hour window's, still open, so the day's window waits on it.
+    reporter.fail_lookups(1);
+    sim.state().runs = runs_on_day(21, 4);
+    enable(&sim, &installed);
+    let next_day = connect(&sim)?.with_clock(noon_on_day_twenty_one);
+    let edits = sim.calls_to(&["automations", "edit"]).len();
+    let refused = tick_at_length(&fixture, &next_day, &reporter, 24, &clock);
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(enabled(&sim, installed.handle.as_str()), "not paused");
+    assert_eq!(sim.calls_to(&["automations", "edit"]).len(), edits);
+    assert_eq!(reporter.effects_performed(), 1);
+
+    // Found applied with no report marker: its window may still be open, so
+    // the post counts for the day's window, and the task settles.
+    let later = tick_at_length(&fixture, &next_day, &reporter, 24, &clock)?;
+    assert!(
+        matches!(later.deliveries.as_slice(), [Delivery::Delivered(_)]),
+        "{later:?}"
+    );
+    assert!(!enabled(&sim, installed.handle.as_str()));
+    assert_eq!(reporter.effects_performed(), 1, "not posted again");
+    assert_eq!(later.settled, std::slice::from_ref(&earlier));
+    Ok(())
+}
+
+fn noon_on_day_fifty() -> Timestamp {
+    Timestamp::from_unix_millis(50 * DAY_MS + 12 * HOUR_MS)
+}
+
+fn noon_on_day_fifty_one() -> Timestamp {
+    Timestamp::from_unix_millis(51 * DAY_MS + 12 * HOUR_MS)
+}
+
+#[test]
+fn an_earlier_releases_unknown_post_holds_back_no_window_after_the_longest() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let reporter = reporter()?;
+    let clock = ManualClock::starting_at(1);
+    let (earlier, installed) = an_earlier_releases_lost_post(&fixture, &sim, &reporter, &clock)?;
+    reporter.fail_lookups(8);
+
+    // Day fifty is inside the 744 hours from day twenty: refused.
+    sim.state().runs = runs_on_day(50, 4);
+    enable(&sim, &installed);
+    let day_fifty = connect(&sim)?.with_clock(noon_on_day_fifty);
+    let refused = tick_at_length(&fixture, &day_fifty, &reporter, 24, &clock);
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(enabled(&sim, installed.handle.as_str()));
+
+    // Day fifty-one starts after them: paused and reported, and the task
+    // stays open with its post unknown.
+    sim.state().runs = runs_on_day(51, 4);
+    let day_fifty_one = connect(&sim)?.with_clock(noon_on_day_fifty_one);
+    let acted = tick_at_length(&fixture, &day_fifty_one, &reporter, 24, &clock)?;
+    assert!(
+        matches!(acted.deliveries.as_slice(), [Delivery::Delivered(_)]),
+        "{acted:?}"
+    );
+    assert!(!enabled(&sim, installed.handle.as_str()));
+    assert_eq!(reporter.effects_performed(), 2);
+    assert!(
+        !acted.settled.contains(&earlier),
+        "its post is still unknown"
+    );
+    assert_eq!(
+        fixture.store.task(&earlier)?.unresolved_effects().count(),
+        1
     );
     Ok(())
 }

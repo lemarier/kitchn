@@ -328,6 +328,7 @@ pub fn signals(
         start: StartEvidence::TurnObserved,
         prompt: PromptState::Working,
         transcript: Some(TranscriptProgress {
+            complete: true,
             agent_spoke: true,
             last_activity,
         }),
@@ -344,6 +345,7 @@ pub fn never_started(worker: &ResourceRef) -> kitchen::workflows::recovery::Reco
         start: StartEvidence::NoTurn,
         prompt: PromptState::Idle,
         transcript: Some(TranscriptProgress {
+            complete: true,
             agent_spoke: false,
             last_activity: None,
         }),

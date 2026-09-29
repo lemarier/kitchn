@@ -156,8 +156,18 @@ fn a_start_is_retried_only_on_proof_it_never_began() -> TestResult {
             start: StartEvidence::Unknown,
             ..proof.clone()
         },
+        // A truncated transcript's silence may hide an earlier agent turn.
         RecoverySignals {
             transcript: Some(TranscriptProgress {
+                complete: false,
+                agent_spoke: false,
+                last_activity: None,
+            }),
+            ..proof.clone()
+        },
+        RecoverySignals {
+            transcript: Some(TranscriptProgress {
+                complete: true,
                 agent_spoke: true,
                 last_activity: None,
             }),

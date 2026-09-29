@@ -115,6 +115,7 @@ fn a_working_agent_maps_every_signal() -> TestResult {
             start: StartEvidence::TurnObserved,
             prompt: PromptState::Working,
             transcript: Some(TranscriptProgress {
+                complete: true,
                 agent_spoke: true,
                 last_activity: Some(Timestamp::from_unix_millis(2_000)),
             }),
@@ -135,6 +136,34 @@ fn a_launch_that_never_started_is_proven_only_after_its_window_closes() -> TestR
     let open = recovered(unanswered("live"), 1_000)?;
     assert_eq!(open.start, StartEvidence::Unknown);
     assert!(!open.proves_never_started());
+    Ok(())
+}
+
+#[test]
+fn a_truncated_transcript_without_an_agent_message_proves_nothing() -> TestResult {
+    // Only the newest page was read, and it holds no agent message: the agent
+    // may have spoken earlier.
+    let truncated = SimWorker {
+        activity: "idle",
+        output: Some(SimOutput::Transcript {
+            messages: vec![message("user", "nudge", 9_000)],
+            complete: false,
+        }),
+        ..SimWorker::new("ready", "in_progress", "live", false)
+    };
+    let signals = recovered(truncated, 300_000)?;
+    assert_eq!(signals.start, StartEvidence::Unknown);
+    assert_eq!(signals.prompt, PromptState::Idle);
+    assert_eq!(signals.terminal, TerminalHolder::Agent);
+    assert_eq!(
+        signals.transcript,
+        Some(TranscriptProgress {
+            complete: false,
+            agent_spoke: false,
+            last_activity: Some(Timestamp::from_unix_millis(9_000)),
+        })
+    );
+    assert!(!signals.proves_never_started());
     Ok(())
 }
 

@@ -347,6 +347,142 @@ fn human_time_comes_from_recorded_replies_and_interactive_sessions() -> TestResu
     Ok(())
 }
 
+/// One attempt from `start` to `finish` under a scheduled claim, with
+/// each `(asked, answered)` reply recorded at its answer time.
+fn replied(
+    fixture: &Fixture,
+    name: &str,
+    start: u64,
+    replies: &[(u64, u64)],
+    finish: u64,
+) -> TestResult<kitchen::state::AttemptUsageEntry> {
+    let (id, fence) = claimed(fixture, name, 0)?;
+    fixture.store.start_attempt(&id, fence, at(start))?;
+    for (index, (asked, answered)) in replies.iter().enumerate() {
+        let question = ExternalRef::new(&format!("question-{index}"))?;
+        fixture
+            .store
+            .record_human_reply(&id, fence, &question, at(*asked), at(*answered))?;
+    }
+    fixture.store.finish_attempt(
+        &id,
+        fence,
+        AttemptNumber::FIRST,
+        AttemptOutcome::Succeeded,
+        at(finish),
+    )?;
+    only_entry(&fixture.store)
+}
+
+#[test]
+fn a_question_asked_before_the_attempt_counts_only_from_its_start() -> TestResult {
+    let fixture = Fixture::new()?;
+    let entry = replied(&fixture, "usage-early", 200, &[(100, 300)], 400)?;
+    assert_eq!(entry.human.replies, Duration::from_secs(100));
+    assert_eq!(entry.human.sessions, Duration::ZERO);
+    Ok(())
+}
+
+#[test]
+fn a_reply_answered_after_the_attempt_ended_counts_only_to_its_end() -> TestResult {
+    let fixture = Fixture::new()?;
+    // The person answers at 500, after the attempt closes at 300: only
+    // 100..300 falls in the attempt.
+    let entry = replied(&fixture, "usage-late", 0, &[(100, 500)], 300)?;
+    assert_eq!(entry.human.replies, Duration::from_secs(200));
+    Ok(())
+}
+
+#[test]
+fn partly_overlapping_replies_count_their_union_once() -> TestResult {
+    let fixture = Fixture::new()?;
+    let entry = replied(
+        &fixture,
+        "usage-overlap",
+        0,
+        &[(100, 300), (200, 400), (500, 600), (520, 560)],
+        700,
+    )?;
+    // 100..400 and 500..600.
+    assert_eq!(entry.human.replies, Duration::from_secs(400));
+    assert_eq!(entry.human.total(), Duration::from_secs(400));
+    Ok(())
+}
+
+#[test]
+fn a_reply_overlapping_a_session_counts_only_beyond_the_session() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let (id, scheduled_fence) = claimed(&fixture, "usage-session-overlap", 0)?;
+    store.start_attempt(&id, scheduled_fence, at(0))?;
+    store.relinquish(&id, scheduled_fence, at(150))?;
+    // The person adopts the task at 200 and answers, at 400, a question
+    // asked at 100; the session runs to 500.
+    let session = store
+        .claim(&id, &interactive("david")?, ttl(3600)?, at(200))?
+        .fence();
+    store.continue_attempt(&id, session, at(200))?;
+    let question = ExternalRef::new("question-1")?;
+    store.record_human_reply(&id, session, &question, at(100), at(400))?;
+    store.finish_attempt(
+        &id,
+        session,
+        AttemptNumber::FIRST,
+        AttemptOutcome::Succeeded,
+        at(500),
+    )?;
+
+    let entry = only_entry(&fixture.reopen()?)?;
+    assert_eq!(
+        entry.human,
+        HumanTime {
+            replies: Duration::from_secs(100),
+            sessions: Duration::from_secs(300),
+            complete: true,
+        }
+    );
+    assert_eq!(entry.human.total(), Duration::from_secs(400));
+    Ok(())
+}
+
+#[test]
+fn a_reply_spanning_two_attempts_is_split_between_them() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let (id, fence) = claimed(&fixture, "usage-span", 0)?;
+    store.start_attempt(&id, fence, at(0))?;
+    store.finish_attempt(
+        &id,
+        fence,
+        AttemptNumber::FIRST,
+        AttemptOutcome::Failed(FailureClass::Retryable),
+        at(500),
+    )?;
+    store.start_attempt(&id, fence, at(800))?;
+    // Asked during the first attempt, answered during the second.
+    let question = ExternalRef::new("question-1")?;
+    store.record_human_reply(&id, fence, &question, at(300), at(1000))?;
+    store.finish_attempt(
+        &id,
+        fence,
+        AttemptNumber::new(2).ok_or("attempt")?,
+        AttemptOutcome::Succeeded,
+        at(1200),
+    )?;
+
+    let replies: Vec<Duration> = store
+        .attempt_usage()?
+        .into_iter()
+        .map(|entry| entry.human.replies)
+        .collect();
+    // 300..800 and 800..1000: the 700s wait is charged once in all.
+    assert_eq!(
+        replies,
+        [Duration::from_secs(500), Duration::from_secs(200)]
+    );
+    Ok(())
+}
+
 #[test]
 fn a_reply_needs_a_running_attempt_and_an_earlier_question() -> TestResult {
     let fixture = Fixture::new()?;

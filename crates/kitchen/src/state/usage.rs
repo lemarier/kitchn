@@ -11,6 +11,15 @@
 //! claims held under [`Trigger::Interactive`], the sessions in which a
 //! person reviewed or reworked the task.
 //!
+//! One rule keeps a minute from counting twice. Each attempt's window runs
+//! from its start to the next attempt's start (or the task's settlement).
+//! Reply waits, from question to answer, and interactive sessions are both
+//! clipped to that window, and human time is the union of the intervals:
+//! [`HumanTime::sessions`] is the union of sessions, and
+//! [`HumanTime::replies`] adds only what waits cover beyond them. A wait
+//! that began before the attempt counts only from its start, and one that
+//! spans two attempts is split between them.
+//!
 //! Records live on their task: they are house-scoped with it, bounded by the
 //! task's attempt budget and [`MAX_HUMAN_REPLIES_PER_ATTEMPT`], and retire
 //! with it under the house retention policy
@@ -168,9 +177,8 @@ impl HumanReply {
 /// Human time spent on one attempt, derived from recorded events.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HumanTime {
-    /// Reply latency to worker questions answered outside an interactive
-    /// session. Latency is how long the worker waited, an upper bound on the
-    /// person's attention.
+    /// Time the worker waited on a person's reply, outside interactive
+    /// sessions. A wait is an upper bound on the person's attention.
     pub replies: Duration,
     /// Interactive sessions: time a person-present claim was held within
     /// the attempt's window.
@@ -182,8 +190,8 @@ pub struct HumanTime {
 }
 
 impl HumanTime {
-    /// Replies and sessions together. A reply answered during a session
-    /// counts only in the session.
+    /// Replies and sessions together: the time covered by any of them, so a
+    /// minute is never counted twice.
     #[must_use]
     pub const fn total(&self) -> Duration {
         self.replies.saturating_add(self.sessions)
@@ -340,36 +348,67 @@ fn human_time(task: &TaskRecord, index: usize) -> HumanTime {
             TaskState::Settled { at, .. } => Some(*at),
             TaskState::Open | TaskState::Claimed { .. } => None,
         });
-    let mut time = HumanTime {
-        complete: true,
-        ..HumanTime::default()
-    };
-    let interactive: Vec<Session> = sessions(task.ownership())
+    let mut complete = true;
+    let mut spans = Vec::new();
+    for session in sessions(task.ownership())
         .into_iter()
         .filter(|session| session.interactive)
-        .collect();
-    for session in &interactive {
-        let from = session.start.max(start);
+    {
         let Some(until) = session.end else {
             if end.is_none_or(|end| session.start < end) {
-                time.complete = false;
+                complete = false;
             }
             continue;
         };
-        let until = end.map_or(until, |end| until.min(end));
-        time.sessions = time.sessions.saturating_add(until.saturating_since(from));
+        spans.extend(clip(session.start, until, start, end));
     }
-    let in_session = |at: Timestamp| {
-        interactive
+    let sessions = merge(spans);
+    // A wait belongs to every attempt whose window it overlaps, whichever
+    // attempt recorded the answer.
+    let mut everyone = sessions.clone();
+    everyone.extend(
+        task.attempts()
             .iter()
-            .any(|session| session.start <= at && session.end.is_none_or(|end| at <= end))
-    };
-    time.replies = attempt
-        .replies()
-        .iter()
-        .filter(|reply| !in_session(reply.answered_at))
-        .fold(Duration::ZERO, |sum, reply| {
-            sum.saturating_add(reply.latency())
-        });
-    time
+            .flat_map(AttemptRecord::replies)
+            .filter_map(|reply| clip(reply.asked_at, reply.answered_at, start, end)),
+    );
+    let sessions_time = total(&sessions);
+    HumanTime {
+        replies: total(&merge(everyone)).saturating_sub(sessions_time),
+        sessions: sessions_time,
+        complete,
+    }
+}
+
+/// `[from, until)` limited to the window `[start, end)`; `end` is `None`
+/// while the window is open. `None` when nothing is left.
+fn clip(
+    from: Timestamp,
+    until: Timestamp,
+    start: Timestamp,
+    end: Option<Timestamp>,
+) -> Option<(Timestamp, Timestamp)> {
+    let from = from.max(start);
+    let until = end.map_or(until, |end| until.min(end));
+    (from < until).then_some((from, until))
+}
+
+/// Overlapping and touching intervals joined, in order.
+fn merge(mut intervals: Vec<(Timestamp, Timestamp)>) -> Vec<(Timestamp, Timestamp)> {
+    intervals.sort_unstable();
+    let mut merged: Vec<(Timestamp, Timestamp)> = Vec::with_capacity(intervals.len());
+    for (from, until) in intervals {
+        match merged.last_mut() {
+            Some((_, last)) if from <= *last => *last = (*last).max(until),
+            Some(_) | None => merged.push((from, until)),
+        }
+    }
+    merged
+}
+
+/// The time covered by disjoint intervals.
+fn total(intervals: &[(Timestamp, Timestamp)]) -> Duration {
+    intervals.iter().fold(Duration::ZERO, |sum, (from, until)| {
+        sum.saturating_add(until.saturating_since(*from))
+    })
 }

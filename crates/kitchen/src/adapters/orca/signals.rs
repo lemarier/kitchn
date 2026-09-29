@@ -31,6 +31,11 @@ use crate::{
 /// in [`TranscriptProgress`] is a lower bound past this.
 pub const SIGNAL_WINDOW_ROWS: usize = 50;
 
+/// Most `worker-read` pages read from a released worker's archive to reach
+/// its newest messages. An archive that does not end within them yields no
+/// transcript: a window not shown to be the newest is not progress.
+pub const MAX_ARCHIVE_PAGES: usize = 8;
+
 /// Most bytes of provider output scanned for an error, taken from the end.
 const MAX_SCAN_BYTES: usize = 8 * 1024;
 
@@ -229,6 +234,10 @@ impl WorkerSignals {
 struct WorkerRead {
     #[serde(default)]
     source: Option<String>,
+    /// Set when the output comes from a released worker's archive, which
+    /// Orca reads from its oldest message forward.
+    #[serde(default)]
+    archived: Option<bool>,
     #[serde(default)]
     content_complete: Option<bool>,
     #[serde(default)]
@@ -243,6 +252,8 @@ struct Transcript {
     messages: Vec<TranscriptMessage>,
     #[serde(default)]
     limited: Option<bool>,
+    #[serde(default, rename = "nextCursor")]
+    next_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -674,9 +685,10 @@ fn provider_error(shown: &WorkerShow, read: Option<&WorkerRead>) -> Option<Provi
 impl<R: OrcaRunner> OrcaBackend<R> {
     /// Read the recovery signals for `worker`.
     ///
-    /// Makes two read-only calls: `worker-show`, then a bounded `worker-read`
+    /// Makes read-only calls only: `worker-show`, then a bounded `worker-read`
     /// of the newest [`SIGNAL_WINDOW_ROWS`] transcript messages (or terminal lines when
-    /// Orca has no proven transcript). A `worker-read` Orca refuses leaves
+    /// Orca has no proven transcript); a released worker's archive takes up
+    /// to [`MAX_ARCHIVE_PAGES`] reads. A `worker-read` Orca refuses leaves
     /// [`WorkerSignals::transcript`] empty; the other signals still hold.
     /// `Ok(None)` means Orca has no record of the worker.
     ///
@@ -716,13 +728,70 @@ impl<R: OrcaRunner> OrcaBackend<R> {
 
     /// The newest output of `dispatch`: its proven transcript, or the
     /// terminal tail when there is none. A refusal reads as no output.
+    ///
+    /// A live worker's read is its newest window. A released worker's
+    /// transcript comes from Orca's archive, read from the oldest archived
+    /// message forward (observed on 1.4.212), so its cursor is followed to
+    /// an empty page, at most [`MAX_ARCHIVE_PAGES`] pages, keeping the newest
+    /// [`SIGNAL_WINDOW_ROWS`] messages. An archive that does not end within
+    /// the bound, a later page Orca refuses, or a page without a cursor that
+    /// does not prove the archive complete, yields no output.
     fn read_output(&self, dispatch: &str) -> Result<Option<WorkerRead>, OrcaError> {
-        let args = wire::Args::command(&["orchestration", "worker-read"])
+        let Some(mut read) = self.read_page(dispatch, None)? else {
+            return Ok(None);
+        };
+        if read.archived != Some(true) || read.source.as_deref() != Some("transcript") {
+            return Ok(Some(read));
+        }
+        for _ in 1..MAX_ARCHIVE_PAGES {
+            let Some(transcript) = read.transcript.as_mut() else {
+                return Ok(Some(read));
+            };
+            // Every page Orca observably returns carries a cursor until it
+            // is empty. Without one, the page is the end only when it says
+            // it holds the whole archive; otherwise the end is unknown.
+            let Some(cursor) = transcript.next_cursor.take() else {
+                let whole = read.content_complete == Some(true) && transcript.limited != Some(true);
+                return Ok(whole.then_some(read));
+            };
+            let Some(page) = self
+                .read_page(dispatch, Some(&cursor))?
+                .and_then(|page| page.transcript)
+            else {
+                return Ok(None);
+            };
+            if page.messages.is_empty() {
+                return Ok(Some(read));
+            }
+            transcript.messages.extend(page.messages);
+            let older = transcript.messages.len().saturating_sub(SIGNAL_WINDOW_ROWS);
+            transcript.messages.drain(..older);
+            // A later page cannot claim the whole archive, so one without a
+            // cursor leaves the newest messages unproven.
+            let Some(next) = page.next_cursor else {
+                return Ok(None);
+            };
+            transcript.next_cursor = Some(next);
+            // The window is a part of the archive now.
+            transcript.limited = Some(true);
+        }
+        Ok(None)
+    }
+
+    /// One `worker-read` page, from `cursor` when given.
+    fn read_page(
+        &self,
+        dispatch: &str,
+        cursor: Option<&str>,
+    ) -> Result<Option<WorkerRead>, OrcaError> {
+        let mut args = wire::Args::command(&["orchestration", "worker-read"])
             .value("dispatch", dispatch)
             .value("source", "auto")
-            .value("limit", &SIGNAL_WINDOW_ROWS.to_string())
-            .json();
-        match self.call(args, self.config().call_timeout) {
+            .value("limit", &SIGNAL_WINDOW_ROWS.to_string());
+        if let Some(cursor) = cursor {
+            args = args.value("cursor", cursor);
+        }
+        match self.call(args.json(), self.config().call_timeout) {
             Ok(value) => wire::typed(value, "worker read").map(Some),
             Err(OrcaError::Refused { .. }) => Ok(None),
             Err(error) => Err(error),

@@ -92,7 +92,9 @@
 //!   [`OrcaBackend::adopt_run`]; the previous terminal is then fenced from the
 //!   mailbox (`consumer_fenced`). Workers keep running.
 //! - Released terminals. `worker-release` is idempotent and archives output;
-//!   a released worker stays observable and keeps its settled state.
+//!   a released worker stays observable and keeps its settled state. Orca
+//!   reads an archive from its oldest message forward, so signals follow its
+//!   cursor, a bounded number of pages, to the newest.
 //! - Shutdown. Nothing runs in the background: a call that exceeds its
 //!   deadline is killed and reported as a timeout, which is uncertain for
 //!   effects and unavailable for reads.
@@ -100,7 +102,8 @@
 //!   request key. Installs are named `kitchen:<house>:<consumer>`, created
 //!   disabled, reconciled against a complete listing before and after every
 //!   create, and every change is read back. An existing schedule is reused
-//!   only when it is paused and matches the requested definition; an active
+//!   only when it is paused and matches the requested definition, and its
+//!   receipt then lists it as touched, not created; an active
 //!   or different one is refused and never changed. Orca cannot tell an idle precheck
 //!   from a failed one, and cannot prevent overlapping runs of one schedule;
 //!   Kitchen's consumer lease must.
@@ -137,6 +140,6 @@ pub use runtime::{
 };
 pub use schedule::{MAX_AUTOMATIONS, native_schedule_name};
 pub use signals::{
-    AgentPrompt, DispatchActivity, ProviderErrorClass, SIGNAL_WINDOW_ROWS, StartOutcome,
-    StartWindow, TerminalOwner, TranscriptProgress, WorkerSignals,
+    AgentPrompt, DispatchActivity, MAX_ARCHIVE_PAGES, ProviderErrorClass, SIGNAL_WINDOW_ROWS,
+    StartOutcome, StartWindow, TerminalOwner, TranscriptProgress, WorkerSignals,
 };

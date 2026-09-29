@@ -32,10 +32,16 @@ everything around it:
 - a cleanup script one command away from deleting unpushed work,
 - and me, at midnight, being the only process there was.
 
-[pstack](https://github.com/cursor/plugins/tree/main/pstack) by Lauren Tan
-showed me how to make one agent rigorous. kitchn is what I built to make a whole
-team of them trustworthy: one owner per task, an independent check at the exact
-commit, cleanup only with proof, and autonomy earned, never assumed.
+Then I heard Lauren Tan in [an interview about working with agents](https://x.com/poteto/status/2102050467505430555):
+*"I like to call it the Michelin kitchen because I think it's not a factory…
+how do we get quality at scale?"* And on trust: watch the agent work, correct
+it, turn what you corrected into a skill, and only then let it run on its own.
+That was the missing piece. Speed was never the problem. Trust that's earned,
+step by step, with evidence, was.
+
+kitchn is that Michelin kitchen, built as a product: one owner per task, an
+independent check at the exact commit, cleanup only with proof, and autonomy
+earned, never assumed.
 
 — [David Lemarier](https://lemarier.ca)
 
@@ -189,13 +195,15 @@ Never commit credentials or private operational records.
 
 ## Acknowledgements
 
-kitchn stands on [pstack](https://github.com/cursor/plugins/tree/main/pstack)
-by Lauren Tan ([@poteto](https://x.com/poteto)). Its core idea, *if you want to
-go fast, go deep first*, is the one kitchn is built on: rigor is what makes
-parallel agents safe to trust. The engineering skills kitchn is developed with
-adapt pstack's `interrogate`, `arena` and `swarm` skills and its overnight-run
-guidance for Orca, under pstack's MIT license. Those notices move with the
-skills when they come into this repository.
+The kitchen is Lauren Tan's ([@poteto](https://x.com/poteto)) idea: a Michelin
+kitchen, not a software factory, where quality holds at scale and agents earn
+trust gradually. kitchn builds that idea into a tool.
+
+The engineering skills kitchn is developed with adapt
+[pstack](https://github.com/cursor/plugins/tree/main/pstack), also by Lauren
+Tan: its `interrogate`, `arena` and `swarm` skills and its overnight-run
+guidance, under pstack's MIT license. Those notices move with the skills when
+they come into this repository.
 
 ## License
 

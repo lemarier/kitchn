@@ -27,18 +27,29 @@
 //! schedule change. This module changes no guidance, grant, or schedule and
 //! posts nothing. A caller files each [`Proposal::draft`] through the
 //! existing issue workflow, and applying it needs the owner's decision. Each
-//! draft carries a hidden [`marker`] naming its [`ProposalKey`]; the caller
-//! reads the keys of open proposals back with [`proposal_key`] and passes
-//! them in, and the audit proposes nothing an open proposal already covers.
+//! draft carries a hidden [`marker`] naming its [`ProposalKey`].
 //!
-//! A run spends the house usage budget like any scheduled run: it is refused
-//! while that budget is exhausted, or when the schedule evidence cannot show
-//! that budget remains. At most [`AuditPolicy::max_proposals`] proposals come
-//! out of one run; the rest are listed as deferred.
+//! Proposals come out of a run only when both of these are known; otherwise
+//! the run reports without proposing, and says why ([`Withheld`]):
+//!
+//! - the house budget: the schedule evidence must be [`ListedSchedules`], the
+//!   complete inventory the house's bound schedule backend lists, and its
+//!   window must reach back to the window's start. Evidence from anywhere
+//!   else may omit schedules whose runs spent the budget.
+//! - the open proposals: the caller passes the complete set of keys of open
+//!   proposals, read back from the forge with [`proposal_key`]. The audit
+//!   does not read the forge itself, and a missing set is never taken as
+//!   empty, so an open proposal is not drafted again.
+//!
+//! A run is refused while the house budget is shown exhausted. At most
+//! [`AuditPolicy::max_proposals`] proposals come out of one run; the rest
+//! are listed as deferred.
 //!
 //! The report copies no free text from its inputs: finding consequences,
-//! task specifications, and transcripts stay in the house. It holds typed
-//! names, counts, and source references only.
+//! task specifications, and transcripts stay in the house. Evidence sources
+//! are listed only when they are public-safe [`EvidenceLink`]s: an `https`
+//! link on the house's forge into one of its own repositories, or a Kitchen
+//! identifier. Every other source is private: it is counted, never listed.
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{self, Write as _},
@@ -49,7 +60,8 @@ use serde::Serialize;
 
 use crate::{
     ConsumerId, ErrorClass, HouseId,
-    contracts::{ExternalRef, ResourceRef, Role, Text, Timestamp},
+    contracts::{Capability, ExternalRef, Repository, Role, ScheduleBackend, Text, Timestamp},
+    house::ForgeKind,
     scheduling::{Exhausted, ScheduleEvidence, SchedulePolicy, UsageWindow},
     selection::WorkType,
     state::{AttemptUsage, HouseStore},
@@ -61,7 +73,7 @@ use crate::{
 pub const WORKFLOW: &str = "brigade-audit";
 /// Most proposals one run may return.
 pub const MAX_PROPOSALS: usize = 32;
-/// Most evidence links listed in one draft; the rest are counted.
+/// Most evidence links listed for one item; the rest are counted.
 pub const MAX_LISTED: usize = 20;
 /// Longest [`ProposalKey`] in bytes.
 pub const MAX_KEY_BYTES: usize = 200;
@@ -83,10 +95,10 @@ pub enum AuditError {
     /// The house usage budget is exhausted in the current window.
     #[error("the house usage budget is exhausted")]
     BudgetExhausted(Exhausted),
-    /// The schedule evidence does not reach back to its window's start, so
-    /// it cannot show that the house budget remains.
-    #[error("the house budget assessment is incomplete")]
-    IncompleteBudget,
+    /// The backend does not fully support schedule management, so it cannot
+    /// list the house's schedules.
+    #[error("the schedule backend cannot list the house's schedules")]
+    ListingUnsupported,
 }
 
 impl AuditError {
@@ -95,7 +107,7 @@ impl AuditError {
     pub const fn class(&self) -> ErrorClass {
         match self {
             Self::InvalidPolicy => ErrorClass::InvalidInput,
-            Self::CrossHouse | Self::BudgetExhausted(_) | Self::IncompleteBudget => {
+            Self::CrossHouse | Self::BudgetExhausted(_) | Self::ListingUnsupported => {
                 ErrorClass::Refused
             }
         }
@@ -216,6 +228,89 @@ pub fn proposal_key(body: &str) -> Option<ProposalKey> {
     ProposalKey::parse(rest.get(..end)?)
 }
 
+/// Every schedule of one house as its bound schedule backend lists them: the
+/// only schedule evidence that can show the house budget remains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedSchedules(ScheduleEvidence);
+
+impl ListedSchedules {
+    /// List the house's schedules and their recent runs through `backend`.
+    ///
+    /// # Errors
+    /// [`AuditError::ListingUnsupported`] when the backend does not fully
+    /// support [`Capability::ScheduleManage`], [`AuditError::CrossHouse`]
+    /// when the listing names another house than the backend serves, and the
+    /// backend's read failures.
+    pub fn read<B: ScheduleBackend>(backend: &B) -> crate::Result<Self> {
+        let descriptor = backend.descriptor();
+        if !descriptor.capabilities.supports(Capability::ScheduleManage) {
+            return Err(AuditError::ListingUnsupported.into());
+        }
+        let evidence = backend.schedule_evidence().map_err(Into::into)?;
+        if evidence.house != descriptor.house {
+            return Err(AuditError::CrossHouse.into());
+        }
+        Ok(Self(evidence))
+    }
+
+    /// The listed evidence.
+    #[must_use]
+    pub const fn evidence(&self) -> &ScheduleEvidence {
+        &self.0
+    }
+}
+
+/// The schedule evidence an audit reads, and whether it is the house's
+/// complete schedule inventory.
+#[derive(Debug, Clone, Copy)]
+pub enum ScheduleInventory<'a> {
+    /// The complete listing from the house's schedule backend.
+    Listed(&'a ListedSchedules),
+    /// Evidence from any other source, such as a file. It may omit
+    /// schedules, so it cannot show that the house budget remains, and the
+    /// run proposes nothing.
+    Unproven(&'a ScheduleEvidence),
+}
+
+impl<'a> ScheduleInventory<'a> {
+    /// The evidence either way.
+    #[must_use]
+    pub const fn evidence(&self) -> &'a ScheduleEvidence {
+        match self {
+            Self::Listed(listed) => listed.evidence(),
+            Self::Unproven(evidence) => evidence,
+        }
+    }
+}
+
+/// Where the house's public-safe evidence links point.
+#[derive(Debug, Clone, Copy)]
+pub struct Publication<'a> {
+    /// The forge the house's binding names, if any. Without one no source
+    /// is a public forge link.
+    pub forge: Option<ForgeKind>,
+    /// The house's own repositories.
+    pub repositories: &'a BTreeSet<Repository>,
+}
+
+impl Publication<'_> {
+    fn evidence<'r>(&self, sources: impl IntoIterator<Item = &'r ExternalRef>) -> LinkedEvidence {
+        let mut evidence = LinkedEvidence::default();
+        for source in sources {
+            evidence.total = evidence.total.saturating_add(1);
+            match self
+                .forge
+                .and_then(|forge| EvidenceLink::forge(forge, self.repositories, source))
+            {
+                Some(link) if evidence.links.len() < MAX_LISTED => evidence.links.push(link),
+                Some(_) => evidence.unlisted = evidence.unlisted.saturating_add(1),
+                None => evidence.private = evidence.private.saturating_add(1),
+            }
+        }
+        evidence
+    }
+}
+
 /// What the audit reads. Every source must belong to `house`.
 #[derive(Debug, Clone, Copy)]
 pub struct AuditInputs<'a> {
@@ -227,10 +322,106 @@ pub struct AuditInputs<'a> {
     pub store: &'a HouseStore,
     /// The house schedule policy, for budgets and the idle threshold.
     pub schedules: &'a SchedulePolicy,
-    /// Observed runs of every house schedule; its time is the audit's time.
-    pub evidence: &'a ScheduleEvidence,
-    /// Keys of proposals still open on the forge.
-    pub open: &'a BTreeSet<ProposalKey>,
+    /// Observed runs of the house's schedules; its time is the audit's time.
+    pub inventory: ScheduleInventory<'a>,
+    /// The complete set of keys of proposals still open on the forge, or
+    /// `None` when it is not known. `None` is never taken as empty: the run
+    /// then proposes nothing.
+    pub open: Option<&'a BTreeSet<ProposalKey>>,
+    /// Which evidence sources may be listed.
+    pub publication: Publication<'a>,
+}
+
+/// A public-safe evidence link.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "kebab-case")]
+pub enum EvidenceLink {
+    /// An `https` link on the house's forge into one of its repositories.
+    Forge(ExternalRef),
+    /// A Kitchen schedule consumer of the house.
+    Consumer(ConsumerId),
+}
+
+impl EvidenceLink {
+    /// `source` as a forge link when it is public-safe: for GitHub,
+    /// `https://github.com/<owner>/<repo>` with `<owner>/<repo>` one of
+    /// `repositories`, then only path segments of ASCII letters, digits, `-`,
+    /// `_`, and `.` (never `.` or `..` alone), and an optional `#` fragment
+    /// of letters, digits, `-`, and `_`. A query, port, credential, or any
+    /// other host is private.
+    #[must_use]
+    pub fn forge(
+        forge: ForgeKind,
+        repositories: &BTreeSet<Repository>,
+        source: &ExternalRef,
+    ) -> Option<Self> {
+        match forge {
+            ForgeKind::GitHub => {
+                let rest = source.as_str().strip_prefix("https://github.com/")?;
+                let (path, fragment) = match rest.split_once('#') {
+                    Some((path, fragment)) => (path, Some(fragment)),
+                    None => (rest, None),
+                };
+                let fragment_safe = fragment.is_none_or(|fragment| {
+                    !fragment.is_empty()
+                        && fragment
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                });
+                let segment_safe = |segment: &str| {
+                    !matches!(segment, "" | "." | "..")
+                        && segment.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                        })
+                };
+                let mut segments = path.split('/');
+                let (owner, name) = (segments.next()?, segments.next()?);
+                let own = repositories.iter().any(|repository| {
+                    repository.owner().eq_ignore_ascii_case(owner)
+                        && repository.name().eq_ignore_ascii_case(name)
+                });
+                (own && fragment_safe
+                    && segment_safe(owner)
+                    && segment_safe(name)
+                    && segments.all(segment_safe))
+                .then(|| Self::Forge(source.clone()))
+            }
+        }
+    }
+}
+
+impl fmt::Display for EvidenceLink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Forge(link) => write!(formatter, "{link}"),
+            Self::Consumer(consumer) => write!(formatter, "schedule consumer `{consumer}`"),
+        }
+    }
+}
+
+/// Distinct evidence sources, listing only public-safe links.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedEvidence {
+    /// Distinct sources.
+    pub total: u32,
+    /// Public-safe links, at most [`MAX_LISTED`].
+    pub links: Vec<EvidenceLink>,
+    /// Public-safe links beyond the listing.
+    pub unlisted: u32,
+    /// Private sources: counted, kept in the house, never listed.
+    pub private: u32,
+}
+
+impl LinkedEvidence {
+    fn consumer(consumer: &ConsumerId) -> Self {
+        Self {
+            total: 1,
+            links: vec![EvidenceLink::Consumer(consumer.clone())],
+            unlisted: 0,
+            private: 0,
+        }
+    }
 }
 
 /// Token and cost use of one station and work type's attempts. Unreported
@@ -285,12 +476,12 @@ pub struct StationRecord {
     /// First-pass acceptance of the live deliveries.
     pub first_pass: Acceptance,
     /// Pull requests of the live deliveries not accepted on the first pass.
-    pub first_pass_rejected: BTreeSet<ExternalRef>,
-    /// Sources of the distinct confirmed findings, reverts, and regressions,
-    /// including confirmed inspection samples.
-    pub findings: BTreeSet<ExternalRef>,
+    pub first_pass_rejected: LinkedEvidence,
+    /// Distinct confirmed findings, reverts, and regressions, including
+    /// confirmed inspection samples.
+    pub findings: LinkedEvidence,
     /// Pull requests of the live deliveries those findings concern.
-    pub deliveries_with_findings: BTreeSet<ExternalRef>,
+    pub deliveries_with_findings: LinkedEvidence,
     /// Attempt usage of the station's tasks of this work type.
     pub usage: UsageSummary,
 }
@@ -319,14 +510,12 @@ pub enum ScheduleSignal {
     },
 }
 
-/// A schedule the report lists.
+/// A schedule the report lists. The backend's handle for it stays private.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleRecord {
     /// The consumer scope it serves.
     pub consumer: ConsumerId,
-    /// The backend resource: the evidence link.
-    pub schedule: ResourceRef,
     /// Why it is listed.
     pub signal: ScheduleSignal,
 }
@@ -342,7 +531,7 @@ pub struct Divergence {
     /// The work type accepted least often, and its acceptance.
     pub trailing: (WorkType, Acceptance),
     /// Pull requests of the trailing work type not accepted on the first pass.
-    pub evidence: Vec<ExternalRef>,
+    pub evidence: LinkedEvidence,
 }
 
 /// A schedule change a proposal asks the owner to consider.
@@ -405,13 +594,14 @@ pub struct Proposal {
     pub kind: ProposalKind,
     /// Observations behind it: the sample size.
     pub samples: u32,
-    /// Evidence links.
-    pub evidence: Vec<ExternalRef>,
+    /// Its evidence.
+    pub evidence: LinkedEvidence,
 }
 
 impl Proposal {
     /// The draft issue body: its marker, what it proposes, the sample size,
-    /// and at most [`MAX_LISTED`] evidence links.
+    /// the listed evidence links, and how many more and private sources
+    /// there are. Private sources are never listed.
     ///
     /// # Errors
     /// Returns a [`crate::contracts::ContractError`] if the body exceeds
@@ -447,18 +637,50 @@ impl Proposal {
             "\nSample size: {}. This is a draft from the brigade audit; applying it needs the owner's decision, and the audit changed no guidance, grant, or schedule.\n",
             self.samples
         );
-        for link in self.evidence.iter().take(MAX_LISTED) {
+        for link in &self.evidence.links {
             let _ = writeln!(body, "- {link}");
         }
-        if let Some(rest) = self
-            .evidence
-            .len()
-            .checked_sub(MAX_LISTED)
-            .filter(|n| *n > 0)
-        {
-            let _ = writeln!(body, "- and {rest} more");
+        if self.evidence.unlisted > 0 {
+            let _ = writeln!(body, "- and {} more", self.evidence.unlisted);
+        }
+        if self.evidence.private > 0 {
+            let _ = writeln!(
+                body,
+                "- {} private references are kept in the house and not listed",
+                self.evidence.private
+            );
         }
         Ok(Text::new(&body)?)
+    }
+}
+
+/// Why a run proposed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Withheld {
+    /// Budget unknown: the schedule evidence is not the complete listing
+    /// from the house's schedule backend.
+    UnprovenInventory,
+    /// Budget unknown: the observed runs do not reach back to the start of
+    /// the budget window.
+    IncompleteWindow,
+    /// The complete set of open proposals was not supplied.
+    OpenProposalsUnknown,
+}
+
+impl fmt::Display for Withheld {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnprovenInventory => {
+                "budget unknown: the schedule evidence is not the complete listing from the house's schedule backend"
+            }
+            Self::IncompleteWindow => {
+                "budget unknown: the observed schedule runs do not reach back to the start of the budget window"
+            }
+            Self::OpenProposalsUnknown => {
+                "open proposals unknown: the complete set of open proposal keys was not supplied"
+            }
+        })
     }
 }
 
@@ -482,47 +704,71 @@ pub struct AuditReport {
     pub schedules: Vec<ScheduleRecord>,
     /// Stations whose work types have diverged.
     pub divergences: Vec<Divergence>,
+    /// Why this run proposed nothing; empty when it could propose.
+    pub withheld: Vec<Withheld>,
     /// Draft proposals from this run.
     pub proposals: Vec<Proposal>,
     /// Proposals left out because an open proposal already covers them.
     pub deduplicated: Vec<ProposalKey>,
     /// Proposals beyond this run's limit, for a later run.
     pub deferred: Vec<ProposalKey>,
+    /// Proposals a run would make once nothing is [`Self::withheld`].
+    pub withheld_proposals: Vec<ProposalKey>,
 }
+
+/// One station and work type's sources, before publication.
+#[derive(Default)]
+struct Tally {
+    deliveries: u32,
+    simulated: u32,
+    first_pass: Acceptance,
+    rejected: BTreeSet<ExternalRef>,
+    findings: BTreeSet<ExternalRef>,
+    delivered: BTreeSet<ExternalRef>,
+    usage: UsageSummary,
+}
+
+type Tallies = BTreeMap<(Role, WorkType), Tally>;
 
 /// Run the audit for `inputs.house`. Reads only.
 ///
 /// # Errors
 /// [`AuditError::CrossHouse`] when any source belongs to another house,
-/// [`AuditError::BudgetExhausted`] or [`AuditError::IncompleteBudget`] when
-/// the run cannot spend the house budget, [`AuditError::InvalidPolicy`],
-/// and any schedule-evidence, ledger, or store read failure.
+/// [`AuditError::BudgetExhausted`] when the house budget is spent,
+/// [`AuditError::InvalidPolicy`], and any schedule-evidence, ledger, or
+/// store read failure.
 pub fn audit(policy: &AuditPolicy, inputs: &AuditInputs<'_>) -> crate::Result<AuditReport> {
     policy.validate()?;
     let house = inputs.house;
-    if inputs.ledger.house() != house
-        || inputs.store.house() != house
-        || &inputs.evidence.house != house
-    {
+    let evidence = inputs.inventory.evidence();
+    if inputs.ledger.house() != house || inputs.store.house() != house || &evidence.house != house {
         return Err(AuditError::CrossHouse.into());
     }
-    let assessment = inputs.schedules.assess(house, inputs.evidence)?;
+    let assessment = inputs.schedules.assess(house, evidence)?;
     if let Some(exhausted) = assessment.house_exhausted {
         return Err(AuditError::BudgetExhausted(exhausted).into());
     }
+    let mut withheld = Vec::new();
+    match inputs.inventory {
+        ScheduleInventory::Listed(_) => {}
+        ScheduleInventory::Unproven(_) => withheld.push(Withheld::UnprovenInventory),
+    }
     if !assessment.house.complete {
-        return Err(AuditError::IncompleteBudget.into());
+        withheld.push(Withheld::IncompleteWindow);
+    }
+    if inputs.open.is_none() {
+        withheld.push(Withheld::OpenProposalsUnknown);
     }
 
-    let mut stations: BTreeMap<(Role, WorkType), StationRecord> = BTreeMap::new();
-    let incomplete_streams = read_ledger(inputs.ledger, &mut stations)?;
+    let mut tallies = Tallies::new();
+    let incomplete_streams = read_ledger(inputs.ledger, &mut tallies)?;
     let mut unattributed_attempts = 0_u32;
     for entry in inputs.store.attempt_usage()? {
         let Some(work_type) = entry.work_type else {
             unattributed_attempts = unattributed_attempts.saturating_add(1);
             continue;
         };
-        let usage = &mut record(&mut stations, entry.station, &work_type).usage;
+        let usage = &mut tally(&mut tallies, entry.station, &work_type).usage;
         usage.attempts = usage.attempts.saturating_add(1);
         if let AttemptUsage::Reported { report, .. } = &entry.usage {
             usage.reported = usage.reported.saturating_add(1);
@@ -536,7 +782,8 @@ pub fn audit(policy: &AuditPolicy, inputs: &AuditInputs<'_>) -> crate::Result<Au
             }
         }
     }
-    let stations: Vec<StationRecord> = stations.into_values().collect();
+    let publication = &inputs.publication;
+    let divergences = divergences(policy, &tallies, publication);
 
     let mut schedules: Vec<ScheduleRecord> = assessment
         .schedules
@@ -547,7 +794,6 @@ pub fn audit(policy: &AuditPolicy, inputs: &AuditInputs<'_>) -> crate::Result<Au
                 >= u64::from(allowed) * u64::from(policy.high_usage_percent);
             high.then(|| ScheduleRecord {
                 consumer: schedule.consumer.clone(),
-                schedule: schedule.schedule.clone(),
                 signal: ScheduleSignal::HighUsage {
                     runs: schedule.usage.runs,
                     allowed,
@@ -559,21 +805,19 @@ pub fn audit(policy: &AuditPolicy, inputs: &AuditInputs<'_>) -> crate::Result<Au
     schedules.extend(
         inputs
             .schedules
-            .idle_schedules(inputs.evidence)
+            .idle_schedules(evidence)
             .into_iter()
             .map(|idle| ScheduleRecord {
                 consumer: idle.consumer,
-                schedule: idle.schedule,
                 signal: ScheduleSignal::MostlyIdle {
                     runs: idle.runs,
                     idle_runs: idle.idle_runs,
                 },
             }),
     );
-    let divergences = divergences(policy, &stations);
 
     let mut candidates: BTreeMap<ProposalKey, Proposal> = BTreeMap::new();
-    let mut add = |kind: ProposalKind, samples: u32, evidence: Vec<ExternalRef>| {
+    let mut add = |kind: ProposalKind, samples: u32, evidence: LinkedEvidence| {
         let key = ProposalKey::of(&kind);
         candidates.entry(key.clone()).or_insert(Proposal {
             key,
@@ -582,23 +826,17 @@ pub fn audit(policy: &AuditPolicy, inputs: &AuditInputs<'_>) -> crate::Result<Au
             evidence,
         });
     };
-    for station in &stations {
-        let findings = u32::try_from(station.findings.len()).unwrap_or(u32::MAX);
+    for ((station, work_type), tally) in &tallies {
+        let findings = u32::try_from(tally.findings.len()).unwrap_or(u32::MAX);
         if findings >= policy.repeated_findings.get() {
-            let evidence = station
-                .findings
-                .iter()
-                .chain(&station.deliveries_with_findings)
-                .cloned()
-                .collect();
             add(
                 ProposalKind::Guidance {
-                    station: station.station,
-                    work_type: station.work_type.clone(),
+                    station: *station,
+                    work_type: work_type.clone(),
                     findings,
                 },
-                station.deliveries,
-                evidence,
+                tally.deliveries,
+                publication.evidence(tally.findings.union(&tally.delivered)),
             );
         }
     }
@@ -627,65 +865,66 @@ pub fn audit(policy: &AuditPolicy, inputs: &AuditInputs<'_>) -> crate::Result<Au
                 change,
             },
             samples,
-            vec![schedule.schedule.handle.clone()],
+            LinkedEvidence::consumer(&schedule.consumer),
         );
     }
 
-    let limit = usize::try_from(policy.max_proposals.get()).unwrap_or(MAX_PROPOSALS);
-    let (deduplicated, fresh): (Vec<Proposal>, Vec<Proposal>) = candidates
-        .into_values()
-        .partition(|proposal| inputs.open.contains(&proposal.key));
-    let mut proposals = fresh;
-    let deferred = proposals
-        .split_off(limit.min(proposals.len()))
+    let (deduplicated, fresh): (Vec<Proposal>, Vec<Proposal>) = match inputs.open {
+        Some(open) => candidates
+            .into_values()
+            .partition(|proposal| open.contains(&proposal.key)),
+        None => (Vec::new(), candidates.into_values().collect()),
+    };
+    let keys = |proposals: Vec<Proposal>| -> Vec<ProposalKey> {
+        proposals.into_iter().map(|proposal| proposal.key).collect()
+    };
+    let (proposals, deferred, withheld_proposals) = if withheld.is_empty() {
+        let limit = usize::try_from(policy.max_proposals.get()).unwrap_or(MAX_PROPOSALS);
+        let mut proposals = fresh;
+        let deferred = proposals.split_off(limit.min(proposals.len()));
+        (proposals, keys(deferred), Vec::new())
+    } else {
+        (Vec::new(), Vec::new(), keys(fresh))
+    };
+    let stations = tallies
         .into_iter()
-        .map(|proposal| proposal.key)
+        .map(|((station, work_type), tally)| StationRecord {
+            station,
+            work_type,
+            deliveries: tally.deliveries,
+            simulated: tally.simulated,
+            first_pass: tally.first_pass,
+            first_pass_rejected: publication.evidence(&tally.rejected),
+            findings: publication.evidence(&tally.findings),
+            deliveries_with_findings: publication.evidence(&tally.delivered),
+            usage: tally.usage,
+        })
         .collect();
     Ok(AuditReport {
         house: house.clone(),
-        observed_at: inputs.evidence.observed_at,
+        observed_at: evidence.observed_at,
         window: assessment.window,
         stations,
         incomplete_streams,
         unattributed_attempts,
         schedules,
         divergences,
+        withheld,
         proposals,
-        deduplicated: deduplicated
-            .into_iter()
-            .map(|proposal| proposal.key)
-            .collect(),
+        deduplicated: keys(deduplicated),
         deferred,
+        withheld_proposals,
     })
 }
 
-fn record<'a>(
-    stations: &'a mut BTreeMap<(Role, WorkType), StationRecord>,
-    station: Role,
-    work_type: &WorkType,
-) -> &'a mut StationRecord {
-    stations
-        .entry((station, work_type.clone()))
-        .or_insert_with(|| StationRecord {
-            station,
-            work_type: work_type.clone(),
-            deliveries: 0,
-            simulated: 0,
-            first_pass: Acceptance::default(),
-            first_pass_rejected: BTreeSet::new(),
-            findings: BTreeSet::new(),
-            deliveries_with_findings: BTreeSet::new(),
-            usage: UsageSummary::default(),
-        })
+fn tally<'a>(tallies: &'a mut Tallies, station: Role, work_type: &WorkType) -> &'a mut Tally {
+    tallies.entry((station, work_type.clone())).or_default()
 }
 
 /// Fold the latest revision of every observation stream, and the confirmed
-/// inspection samples of live deliveries, into `stations`. Returns how many
+/// inspection samples of live deliveries, into `tallies`. Returns how many
 /// streams have a revision gap and were left out.
-fn read_ledger(
-    ledger: &Ledger,
-    stations: &mut BTreeMap<(Role, WorkType), StationRecord>,
-) -> Result<u32, TrustError> {
+fn read_ledger(ledger: &Ledger, tallies: &mut Tallies) -> Result<u32, TrustError> {
     ledger.read(|doc| {
         let streams: BTreeSet<&ExternalRef> = doc
             .observations
@@ -704,7 +943,7 @@ fn read_ledger(
                 Err(error) => return Err(error),
             };
             let scope = &observation.attribution.scope;
-            let entry = record(stations, scope.station, &scope.work_type);
+            let entry = tally(tallies, scope.station, &scope.work_type);
             match observation.mode {
                 EvidenceMode::Simulated => {
                     entry.simulated = entry.simulated.saturating_add(1);
@@ -722,14 +961,14 @@ fn read_ledger(
                 if *value {
                     entry.first_pass.accepted = entry.first_pass.accepted.saturating_add(1);
                 } else {
-                    entry.first_pass_rejected.insert(pr.source.clone());
+                    entry.rejected.insert(pr.source.clone());
                 }
             }
             for list in [&pr.findings, &pr.reverts, &pr.regressions] {
                 if let Measurement::Observed { value, .. } = list {
                     for finding in value {
                         entry.findings.insert(finding.source.clone());
-                        entry.deliveries_with_findings.insert(pr.source.clone());
+                        entry.delivered.insert(pr.source.clone());
                     }
                 }
             }
@@ -738,7 +977,7 @@ fn read_ledger(
             let Some((station, work_type)) = live.get(&inspection.plan().observation) else {
                 continue;
             };
-            let entry = record(stations, *station, work_type);
+            let entry = tally(tallies, *station, work_type);
             for sample in inspection.samples() {
                 if let Some(SampleResult::Confirmed { finding, .. }) = &sample.result {
                     entry.findings.insert(finding.source.clone());
@@ -751,29 +990,33 @@ fn read_ledger(
 
 /// Per station, the work types with enough verdicts whose acceptance is
 /// furthest apart, when the gap reaches the policy's divergence.
-fn divergences(policy: &AuditPolicy, stations: &[StationRecord]) -> Vec<Divergence> {
-    let mut by_station: BTreeMap<Role, Vec<(&StationRecord, u64)>> = BTreeMap::new();
-    for record in stations {
-        if record.first_pass.judged < policy.min_samples.get() {
+fn divergences(
+    policy: &AuditPolicy,
+    tallies: &Tallies,
+    publication: &Publication<'_>,
+) -> Vec<Divergence> {
+    let mut by_station: BTreeMap<Role, Vec<(&WorkType, &Tally, u64)>> = BTreeMap::new();
+    for ((station, work_type), tally) in tallies {
+        if tally.first_pass.judged < policy.min_samples.get() {
             continue;
         }
-        if let Some(percent) = record.first_pass.percent() {
+        if let Some(percent) = tally.first_pass.percent() {
             by_station
-                .entry(record.station)
+                .entry(*station)
                 .or_default()
-                .push((record, percent));
+                .push((work_type, tally, percent));
         }
     }
     by_station
         .into_iter()
         .filter_map(|(station, types)| {
-            let (leading, high) = types.iter().max_by_key(|(_, percent)| *percent)?;
-            let (trailing, low) = types.iter().min_by_key(|(_, percent)| *percent)?;
+            let (leading, lead, high) = types.iter().max_by_key(|(_, _, percent)| *percent)?;
+            let (trailing, trail, low) = types.iter().min_by_key(|(_, _, percent)| *percent)?;
             (high.saturating_sub(*low) >= u64::from(policy.divergence_points)).then(|| Divergence {
                 station,
-                leading: (leading.work_type.clone(), leading.first_pass),
-                trailing: (trailing.work_type.clone(), trailing.first_pass),
-                evidence: trailing.first_pass_rejected.iter().cloned().collect(),
+                leading: ((*leading).clone(), lead.first_pass),
+                trailing: ((*trailing).clone(), trail.first_pass),
+                evidence: publication.evidence(&trail.rejected),
             })
         })
         .collect()

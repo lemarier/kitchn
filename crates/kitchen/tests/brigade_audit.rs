@@ -11,14 +11,17 @@ use common::{
 use kitchen::{
     BackendId, ConsumerId, ErrorClass, HouseId,
     contracts::{
-        AttemptNumber, AttemptOutcome, Capability, CapabilitySet, Evidence, EvidenceKind,
-        EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, Repository, ResourceKind,
-        ResourceRef, Role, Support, TaskSpec, Text,
+        AttemptNumber, AttemptOutcome, BackendDescriptor, BackendUnavailable, Capability,
+        CapabilitySet, EffectExecutor, EffectFailure, EffectRequest, Evidence, EvidenceKind,
+        EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, Lookup, Receipt, Repository,
+        ResourceKind, ResourceRef, Role, ScheduleBackend, Support, TaskSpec, Text,
+        fake::FakeBackend,
     },
+    house::ForgeKind,
     scheduling::{
         AgentFamily, Budget, IdlePolicy, IntervalMinutes, JudgedRun, ObservedScheduleState,
-        RunOutcome, RunVerdict, ScheduleEvidence, ScheduleObservation, SchedulePolicy, ScheduleRun,
-        ScheduleUsage, WindowHours,
+        Readiness, RunOutcome, RunVerdict, ScheduleEvidence, ScheduleObservation, SchedulePolicy,
+        ScheduleRun, ScheduleSpec, ScheduleUsage, WindowHours,
     },
     selection::{AgentModel, AgentSelection, ResolvedSelection, WorkType},
     state::{Cost, CostBasis, HouseStore, StoreOptions, TokenCounts, UsageReport, UsdMicros},
@@ -28,8 +31,10 @@ use kitchen::{
     },
     workflows::{
         audit::{
-            Acceptance, AuditError, AuditInputs, AuditPolicy, AuditReport, MAX_PROPOSALS, Proposal,
-            ProposalKey, ProposalKind, ScheduleChange, ScheduleSignal, audit, marker, proposal_key,
+            Acceptance, AuditError, AuditInputs, AuditPolicy, AuditReport, EvidenceLink,
+            LinkedEvidence, ListedSchedules, MAX_LISTED, MAX_PROPOSALS, Proposal, ProposalKey,
+            ProposalKind, Publication, ScheduleChange, ScheduleInventory, ScheduleSignal, Withheld,
+            audit, marker, proposal_key,
         },
         inspector::{FollowUpRoute, InspectionPlan, SampleResult},
     },
@@ -40,6 +45,9 @@ const MODEL: &str = "fixture-model-v1";
 const ATTRIBUTED_MODEL: &str = "claude:fixture-model-v1";
 /// Private detail a confirmed finding carries; it must never reach a report.
 const CONSEQUENCE: &str = "Private: leaked the staging token in worker transcript line 42.";
+/// A private transcript locator used as a finding source; it must never be
+/// listed in a report or draft.
+const PRIVATE_SOURCE: &str = "file:///home/owner/.orca/transcripts/run-42.jsonl#L42";
 
 fn project() -> TestResult<Repository> {
     Ok(Repository::new("example/project")?)
@@ -73,7 +81,16 @@ fn finding(name: &str) -> TestResult<Finding> {
 }
 
 fn pr(name: &str) -> TestResult<ExternalRef> {
-    source(&format!("https://example.invalid/pr/{name}"))
+    source(&format!("https://github.com/example/project/pull/{name}"))
+}
+
+/// A public review comment on `name`'s pull request.
+fn review(name: &str) -> String {
+    format!("https://github.com/example/project/pull/{name}#discussion_r1")
+}
+
+fn forge(value: &str) -> TestResult<EvidenceLink> {
+    Ok(EvidenceLink::Forge(source(value)?))
 }
 
 /// One delivery: settle task `name` under `work_type`, bind it, and record
@@ -240,14 +257,75 @@ fn evidence(house: HouseId, schedules: Vec<ScheduleUsage>) -> ScheduleEvidence {
     }
 }
 
-fn run_audit(
+/// A schedule backend listing `evidence` as every schedule of its house.
+struct Listing {
+    fake: FakeBackend,
+    evidence: ScheduleEvidence,
+}
+
+impl Listing {
+    fn new(evidence: ScheduleEvidence, capabilities: CapabilitySet) -> TestResult<Self> {
+        Ok(Self {
+            fake: FakeBackend::new(BackendId::new("orca-local")?, house()?, capabilities),
+            evidence,
+        })
+    }
+}
+
+impl EffectExecutor for Listing {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.fake.descriptor()
+    }
+
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        self.fake.execute(request)
+    }
+
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.fake.lookup(request)
+    }
+}
+
+impl ScheduleBackend for Listing {
+    type Error = kitchen::Error;
+
+    fn install_schedule(&self, _: &ScheduleSpec) -> Result<ResourceRef, Self::Error> {
+        Err(AuditError::ListingUnsupported.into())
+    }
+
+    fn inspect_schedule(
+        &self,
+        _: &ResourceRef,
+        _: &Readiness<'_>,
+    ) -> Result<ScheduleObservation, Self::Error> {
+        Err(AuditError::ListingUnsupported.into())
+    }
+
+    fn schedule_evidence(&self) -> Result<ScheduleEvidence, Self::Error> {
+        Ok(self.evidence.clone())
+    }
+}
+
+/// `evidence` as the listing of a schedule backend of this house.
+fn listed(evidence: &ScheduleEvidence) -> TestResult<ListedSchedules> {
+    Ok(ListedSchedules::read(&Listing::new(
+        evidence.clone(),
+        CapabilitySet::supporting(Capability::ALL),
+    )?)?)
+}
+
+fn repositories() -> TestResult<BTreeSet<Repository>> {
+    Ok(BTreeSet::from([project()?]))
+}
+
+fn audit_with(
     f: &Fixture,
     ledger: &Ledger,
-    evidence: &ScheduleEvidence,
-    open: &BTreeSet<ProposalKey>,
+    inventory: ScheduleInventory<'_>,
+    open: Option<&BTreeSet<ProposalKey>>,
     policy: &AuditPolicy,
 ) -> TestResult<kitchen::Result<AuditReport>> {
-    let (house, schedules) = (house()?, schedules()?);
+    let (house, schedules, repositories) = (house()?, schedules()?, repositories()?);
     Ok(audit(
         policy,
         &AuditInputs {
@@ -255,10 +333,33 @@ fn run_audit(
             ledger,
             store: &f.store,
             schedules: &schedules,
-            evidence,
+            inventory,
             open,
+            publication: Publication {
+                forge: Some(ForgeKind::GitHub),
+                repositories: &repositories,
+            },
         },
     ))
+}
+
+/// Audit with `evidence` listed by the backend and `open` as the complete
+/// set of open proposals.
+fn run_audit(
+    f: &Fixture,
+    ledger: &Ledger,
+    evidence: &ScheduleEvidence,
+    open: &BTreeSet<ProposalKey>,
+    policy: &AuditPolicy,
+) -> TestResult<kitchen::Result<AuditReport>> {
+    let listed = listed(evidence)?;
+    audit_with(
+        f,
+        ledger,
+        ScheduleInventory::Listed(&listed),
+        Some(open),
+        policy,
+    )
 }
 
 fn only(report: &AuditReport) -> TestResult<&Proposal> {
@@ -291,6 +392,7 @@ fn an_empty_ledger_reports_nothing_and_proposes_nothing() -> TestResult {
     assert!(report.divergences.is_empty());
     assert!(report.proposals.is_empty());
     assert!(report.deduplicated.is_empty() && report.deferred.is_empty());
+    assert!(report.withheld.is_empty() && report.withheld_proposals.is_empty());
     assert_eq!(
         (report.incomplete_streams, report.unattributed_attempts),
         (0, 0)
@@ -304,13 +406,14 @@ fn repeated_confirmed_findings_propose_a_guidance_draft_with_evidence() -> TestR
     let ledger = ledger(&f)?;
     Delivery::live("clean", "implementation").record(&f, &ledger)?;
     Delivery {
-        findings: vec![finding("https://example.invalid/review/1")?],
+        findings: vec![finding(&review("first"))?],
         first_pass: false,
         ..Delivery::live("first", "implementation")
     }
     .record(&f, &ledger)?;
+    // A private transcript locator as a finding source is counted, never listed.
     Delivery {
-        findings: vec![finding("https://example.invalid/review/2")?],
+        findings: vec![finding(PRIVATE_SOURCE)?],
         ..Delivery::live("second", "implementation")
     }
     .record(&f, &ledger)?;
@@ -323,7 +426,7 @@ fn repeated_confirmed_findings_propose_a_guidance_draft_with_evidence() -> TestR
     .record(&f, &ledger)?;
     // One finding on another work type is not repeated.
     Delivery {
-        findings: vec![finding("https://example.invalid/review/fw")?],
+        findings: vec![finding(&review("firmware"))?],
         ..Delivery::live("firmware", "firmware")
     }
     .record(&f, &ledger)?;
@@ -339,7 +442,7 @@ fn repeated_confirmed_findings_propose_a_guidance_draft_with_evidence() -> TestR
         return Err(format!("expected two station records, got {:?}", report.stations).into());
     };
     assert_eq!(firmware.work_type, WorkType::new("firmware")?);
-    assert_eq!(firmware.findings.len(), 1);
+    assert_eq!(firmware.findings.total, 1);
     assert_eq!(implementation.station, Role::StationCook);
     assert_eq!(
         (implementation.deliveries, implementation.simulated),
@@ -354,14 +457,23 @@ fn repeated_confirmed_findings_propose_a_guidance_draft_with_evidence() -> TestR
     );
     assert_eq!(
         implementation.findings,
-        BTreeSet::from([
-            source("https://example.invalid/review/1")?,
-            source("https://example.invalid/review/2")?,
-        ])
+        LinkedEvidence {
+            total: 2,
+            links: vec![forge(&review("first"))?],
+            unlisted: 0,
+            private: 1,
+        }
     );
     assert_eq!(
-        implementation.deliveries_with_findings,
-        BTreeSet::from([pr("first")?, pr("second")?])
+        implementation.deliveries_with_findings.links,
+        vec![
+            forge(pr("first")?.as_str())?,
+            forge(pr("second")?.as_str())?
+        ]
+    );
+    assert_eq!(
+        implementation.first_pass_rejected.links,
+        vec![forge(pr("first")?.as_str())?]
     );
 
     let proposal = only(&report)?;
@@ -377,12 +489,16 @@ fn repeated_confirmed_findings_propose_a_guidance_draft_with_evidence() -> TestR
     assert_eq!(proposal.samples, 3);
     assert_eq!(
         proposal.evidence,
-        vec![
-            source("https://example.invalid/review/1")?,
-            source("https://example.invalid/review/2")?,
-            pr("first")?,
-            pr("second")?,
-        ]
+        LinkedEvidence {
+            total: 4,
+            links: vec![
+                forge(pr("first")?.as_str())?,
+                forge(&review("first"))?,
+                forge(pr("second")?.as_str())?,
+            ],
+            unlisted: 0,
+            private: 1,
+        }
     );
 
     let draft = proposal.draft()?;
@@ -390,14 +506,18 @@ fn repeated_confirmed_findings_propose_a_guidance_draft_with_evidence() -> TestR
     assert_eq!(proposal_key(draft.as_str()), Some(proposal.key.clone()));
     assert!(draft.as_str().contains("Sample size: 3."));
     assert!(draft.as_str().contains("needs the owner's decision"));
+    assert!(draft.as_str().contains(&format!("- {}\n", review("first"))));
     assert!(
         draft
             .as_str()
-            .contains("- https://example.invalid/review/2")
+            .contains("- 1 private references are kept in the house and not listed")
     );
     // Nothing private reaches the draft or the serialized report.
-    assert!(!draft.as_str().contains(CONSEQUENCE));
-    assert!(!serde_json::to_string(&report)?.contains(CONSEQUENCE));
+    let json = serde_json::to_string(&report)?;
+    for private in [CONSEQUENCE, PRIVATE_SOURCE, "transcripts"] {
+        assert!(!draft.as_str().contains(private), "{private} in the draft");
+        assert!(!json.contains(private), "{private} in the report");
+    }
     Ok(())
 }
 
@@ -406,7 +526,7 @@ fn a_confirmed_inspection_sample_counts_as_a_finding_of_the_delivery() -> TestRe
     let f = Fixture::new()?;
     let ledger = ledger(&f)?;
     Delivery {
-        findings: vec![finding("https://example.invalid/review/1")?],
+        findings: vec![finding(&review("reviewed"))?],
         ..Delivery::live("reviewed", "implementation")
     }
     .record(&f, &ledger)?;
@@ -476,10 +596,19 @@ fn a_confirmed_inspection_sample_counts_as_a_finding_of_the_delivery() -> TestRe
     )??;
     let proposal = only(&report)?;
     assert_eq!(proposal.key, key("guidance:station-cook:implementation")?);
-    assert!(
-        proposal
-            .evidence
-            .contains(&source("fixture:inspection-finding")?)
+    // The inspection finding's fixture source is not a forge link: counted,
+    // not listed.
+    assert_eq!(
+        proposal.evidence,
+        LinkedEvidence {
+            total: 3,
+            links: vec![
+                forge(pr("reviewed")?.as_str())?,
+                forge(&review("reviewed"))?
+            ],
+            unlisted: 0,
+            private: 1,
+        }
     );
     Ok(())
 }
@@ -525,7 +654,13 @@ fn a_mostly_idle_schedule_proposes_fewer_idle_runs() -> TestResult {
         }
     );
     assert_eq!(proposal.samples, 10);
-    assert_eq!(proposal.evidence, vec![source("orca-automation:gardener")?]);
+    assert_eq!(
+        proposal.evidence.links,
+        vec![EvidenceLink::Consumer(ConsumerId::new("gardener")?)]
+    );
+    // The backend's schedule handle is not published.
+    assert!(!serde_json::to_string(&report)?.contains("orca-automation"));
+    assert!(!proposal.draft()?.as_str().contains("orca-automation"));
     Ok(())
 }
 
@@ -616,8 +751,12 @@ fn diverged_work_types_of_one_station_propose_a_split() -> TestResult {
     assert_eq!(proposal.key, key("split:station-cook:docs")?);
     assert_eq!(proposal.samples, 10);
     assert_eq!(
-        proposal.evidence,
-        vec![pr("docs-2")?, pr("docs-3")?, pr("docs-4")?]
+        proposal.evidence.links,
+        vec![
+            forge(pr("docs-2")?.as_str())?,
+            forge(pr("docs-3")?.as_str())?,
+            forge(pr("docs-4")?.as_str())?
+        ]
     );
 
     // A wider threshold than the 60-point gap reports no divergence.
@@ -642,7 +781,7 @@ fn an_open_proposal_is_not_proposed_again_and_the_limit_defers_the_rest() -> Tes
     let ledger = ledger(&f)?;
     for name in ["first", "second"] {
         Delivery {
-            findings: vec![finding(&format!("https://example.invalid/review/{name}"))?],
+            findings: vec![finding(&review(name))?],
             ..Delivery::live(name, "implementation")
         }
         .record(&f, &ledger)?;
@@ -688,6 +827,28 @@ fn an_open_proposal_is_not_proposed_again_and_the_limit_defers_the_rest() -> Tes
         second.deferred,
         vec![key("schedule:pickup:revisit-budget")?]
     );
+
+    // Without the complete set of open proposals nothing is proposed: the
+    // filed guidance draft would otherwise come out again.
+    let listed = listed(&observed)?;
+    let unknown = audit_with(
+        &f,
+        &ledger,
+        ScheduleInventory::Listed(&listed),
+        None,
+        &AuditPolicy::default(),
+    )??;
+    assert_eq!(unknown.withheld, vec![Withheld::OpenProposalsUnknown]);
+    assert!(unknown.proposals.is_empty());
+    assert!(unknown.deduplicated.is_empty() && unknown.deferred.is_empty());
+    assert_eq!(
+        unknown.withheld_proposals,
+        vec![
+            key("guidance:station-cook:implementation")?,
+            key("schedule:gardener:reduce-idle-runs")?,
+            key("schedule:pickup:revisit-budget")?,
+        ]
+    );
     Ok(())
 }
 
@@ -701,17 +862,25 @@ fn the_audit_refuses_to_read_another_house() -> TestResult {
         other_house()?,
         StoreOptions::default(),
     )?;
-    let ours = evidence(house()?, Vec::new());
-    let theirs = evidence(other_house()?, Vec::new());
+    let ours = listed(&evidence(house()?, Vec::new()))?;
+    let theirs_evidence = evidence(other_house()?, Vec::new());
+    let theirs = ListedSchedules::read(&Listing {
+        fake: FakeBackend::fully_capable(BackendId::new("orca-local")?, other_house()?),
+        evidence: theirs_evidence.clone(),
+    })?;
     let policy = AuditPolicy::default();
     let open = BTreeSet::new();
-    let schedules = schedules()?;
+    let (schedules, repositories) = (schedules()?, repositories()?);
+    let publication = Publication {
+        forge: Some(ForgeKind::GitHub),
+        repositories: &repositories,
+    };
     let cases = [
         (&foreign_ledger, &f.store, &ours),
         (&ledger, &foreign_store, &ours),
         (&ledger, &f.store, &theirs),
     ];
-    for (ledger, store, evidence) in cases {
+    for (ledger, store, listed) in cases {
         let refused = audit(
             &policy,
             &AuditInputs {
@@ -719,8 +888,9 @@ fn the_audit_refuses_to_read_another_house() -> TestResult {
                 ledger,
                 store,
                 schedules: &schedules,
-                evidence,
-                open: &open,
+                inventory: ScheduleInventory::Listed(listed),
+                open: Some(&open),
+                publication,
             },
         );
         let Err(kitchen::Error::Audit(error)) = refused else {
@@ -729,6 +899,15 @@ fn the_audit_refuses_to_read_another_house() -> TestResult {
         assert_eq!(error, AuditError::CrossHouse);
         assert_eq!(error.class(), ErrorClass::Refused);
     }
+    // A backend listing another house's schedules is refused.
+    let misreported = ListedSchedules::read(&Listing::new(
+        theirs_evidence,
+        CapabilitySet::supporting(Capability::ALL),
+    )?);
+    assert!(matches!(
+        misreported,
+        Err(kitchen::Error::Audit(AuditError::CrossHouse))
+    ));
     // The foreign house can audit its own sources.
     let own = audit(
         &policy,
@@ -737,16 +916,17 @@ fn the_audit_refuses_to_read_another_house() -> TestResult {
             ledger: &foreign_ledger,
             store: &foreign_store,
             schedules: &schedules,
-            evidence: &theirs,
-            open: &open,
+            inventory: ScheduleInventory::Listed(&theirs),
+            open: Some(&open),
+            publication,
         },
     )?;
-    assert!(own.stations.is_empty());
+    assert!(own.stations.is_empty() && own.withheld.is_empty());
     Ok(())
 }
 
 #[test]
-fn an_exhausted_or_unproven_house_budget_refuses_the_run() -> TestResult {
+fn an_exhausted_house_budget_refuses_the_run() -> TestResult {
     let f = Fixture::new()?;
     let ledger = ledger(&f)?;
     // Three schedules with 4 runs each exhaust the 10-run house budget.
@@ -769,13 +949,54 @@ fn an_exhausted_or_unproven_house_budget_refuses_the_run() -> TestResult {
         return Err(format!("an exhausted budget was not refused: {refused:?}").into());
     };
     assert_eq!((exhausted.used, exhausted.allowed), (12, 10));
+    // Partial evidence already showing exhaustion is refused too.
+    let refused = audit_with(
+        &f,
+        &ledger,
+        ScheduleInventory::Unproven(&spent),
+        Some(&BTreeSet::new()),
+        &AuditPolicy::default(),
+    )?;
+    assert!(matches!(
+        refused,
+        Err(kitchen::Error::Audit(AuditError::BudgetExhausted(_)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn an_unknown_house_budget_reports_without_proposing() -> TestResult {
+    let f = Fixture::new()?;
+    let ledger = ledger(&f)?;
+    // A file listing one busy schedule may omit the schedules that spent the
+    // house budget: it is reported, but nothing is proposed.
+    let partial = evidence(house()?, vec![schedule("pickup", 4, 0)?]);
+    let report = audit_with(
+        &f,
+        &ledger,
+        ScheduleInventory::Unproven(&partial),
+        Some(&BTreeSet::new()),
+        &AuditPolicy::default(),
+    )??;
+    assert_eq!(report.withheld, vec![Withheld::UnprovenInventory]);
+    assert_eq!(report.schedules.len(), 1);
+    assert!(report.proposals.is_empty() && report.deferred.is_empty());
+    assert_eq!(
+        report.withheld_proposals,
+        vec![key("schedule:pickup:revisit-budget")?]
+    );
+    assert!(
+        Withheld::UnprovenInventory
+            .to_string()
+            .starts_with("budget unknown")
+    );
 
     // A full run history that starts inside the window holds lower bounds
-    // only, so it cannot show that budget remains.
+    // only, so even the backend's listing cannot show that budget remains.
     let truncated = (0..u64::try_from(kitchen::scheduling::MAX_SCHEDULE_RUNS)?)
         .map(|n| run(4000 + n % 900, RunVerdict::Idle))
         .collect();
-    let unproven = evidence(
+    let lower_bound = evidence(
         house()?,
         vec![ScheduleUsage {
             consumer: ConsumerId::new("pickup")?,
@@ -786,17 +1007,119 @@ fn an_exhausted_or_unproven_house_budget_refuses_the_run() -> TestResult {
             },
         }],
     );
-    let refused = run_audit(
+    let report = run_audit(
         &f,
         &ledger,
-        &unproven,
+        &lower_bound,
         &BTreeSet::new(),
         &AuditPolicy::default(),
+    )??;
+    assert_eq!(report.withheld, vec![Withheld::IncompleteWindow]);
+    assert!(report.proposals.is_empty());
+    assert!(!report.withheld_proposals.is_empty());
+
+    // A backend that does not declare schedule management cannot list.
+    let unsupported = ListedSchedules::read(&Listing::new(
+        evidence(house()?, Vec::new()),
+        CapabilitySet::default(),
+    )?);
+    let Err(kitchen::Error::Audit(error)) = unsupported else {
+        return Err(format!("an unsupported listing was accepted: {unsupported:?}").into());
+    };
+    assert_eq!(error, AuditError::ListingUnsupported);
+    assert_eq!(error.class(), ErrorClass::Refused);
+    Ok(())
+}
+
+#[test]
+fn only_links_into_the_house_repositories_are_public() -> TestResult {
+    let repositories = repositories()?;
+    let public = |value: &str| -> TestResult<bool> {
+        Ok(EvidenceLink::forge(ForgeKind::GitHub, &repositories, &source(value)?).is_some())
+    };
+    for listed in [
+        "https://github.com/example/project/pull/7",
+        "https://github.com/example/project/pull/7#discussion_r12",
+        "https://github.com/Example/Project/commit/abc123",
+        "https://github.com/example/project",
+    ] {
+        assert!(public(listed)?, "{listed} should be public");
+    }
+    for private in [
+        PRIVATE_SOURCE,
+        "fixture:inspection-finding",
+        "http://github.com/example/project/pull/7",
+        "https://github.com/example/other/pull/7",
+        "https://github.com/example/project.git/pull/7",
+        "https://github.com/example/project/../other/pull/7",
+        "https://github.com/example/project/pull/7/",
+        "https://github.com/example/project/pull/7?token=secret",
+        "https://github.com/example/project/pull/7#",
+        "https://github.com/example/project/pull/7#a=b",
+        "https://github.com:8443/example/project/pull/7",
+        "https://user@github.com/example/project/pull/7",
+        "https://github.com.evil.example/example/project/pull/7",
+        "https://github.com/example",
+    ] {
+        assert!(!public(private)?, "{private} should be private");
+    }
+    Ok(())
+}
+
+#[test]
+fn evidence_beyond_the_listing_limit_is_counted() -> TestResult {
+    let f = Fixture::new()?;
+    let ledger = ledger(&f)?;
+    let many = u32::try_from(MAX_LISTED)? + 2;
+    Delivery {
+        findings: (0..many)
+            .map(|n| {
+                finding(&format!(
+                    "https://github.com/example/project/pull/many#r{n}"
+                ))
+            })
+            .collect::<TestResult<_>>()?,
+        ..Delivery::live("many", "implementation")
+    }
+    .record(&f, &ledger)?;
+    let report = run_audit(
+        &f,
+        &ledger,
+        &evidence(house()?, Vec::new()),
+        &BTreeSet::new(),
+        &AuditPolicy::default(),
+    )??;
+    let proposal = only(&report)?;
+    // Every finding plus the delivery's pull request.
+    assert_eq!(proposal.evidence.total, many + 1);
+    assert_eq!(proposal.evidence.links.len(), MAX_LISTED);
+    assert_eq!(
+        (proposal.evidence.unlisted, proposal.evidence.private),
+        (3, 0)
+    );
+    assert!(proposal.draft()?.as_str().contains("- and 3 more\n"));
+
+    // Without a forge binding no source is a public link.
+    let (house, schedules, repositories) = (house()?, schedules()?, repositories()?);
+    let listed = listed(&evidence(house.clone(), Vec::new()))?;
+    let unbound = audit(
+        &AuditPolicy::default(),
+        &AuditInputs {
+            house: &house,
+            ledger: &ledger,
+            store: &f.store,
+            schedules: &schedules,
+            inventory: ScheduleInventory::Listed(&listed),
+            open: Some(&BTreeSet::new()),
+            publication: Publication {
+                forge: None,
+                repositories: &repositories,
+            },
+        },
     )?;
-    assert!(matches!(
-        refused,
-        Err(kitchen::Error::Audit(AuditError::IncompleteBudget))
-    ));
+    let evidence = &only(&unbound)?.evidence;
+    assert!(evidence.links.is_empty());
+    assert_eq!(evidence.private, many + 1);
     Ok(())
 }
 

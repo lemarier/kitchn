@@ -2,29 +2,48 @@
 //!
 //! The report and its draft proposals come from
 //! [`kitchen::workflows::audit`]. Nothing is filed, and no guidance, grant,
-//! or schedule changes. Schedule evidence is the house's observed schedule
-//! runs as JSON (a [`ScheduleEvidence`]); open proposals are the keys read
-//! back from open issues with [`kitchen::workflows::audit::proposal_key`].
+//! or schedule changes.
+//!
+//! Drafts are proposed only when the house budget and the open proposals
+//! are both known. The budget is known from `--orca`: the house's bound
+//! backend lists every house schedule. A `--schedule-evidence` file may omit
+//! schedules, so with it the preview reports without proposing ("budget
+//! unknown"). The open proposals are known when the operator states their
+//! complete set, read from open forge issues with
+//! [`kitchen::workflows::audit::proposal_key`]: each key with
+//! `--open-proposal`, or `--no-open-proposals` when none is open. The
+//! preview does not read the forge itself, and never takes a missing set as
+//! empty.
 
 use std::{collections::BTreeSet, fmt::Write as _, path::PathBuf};
 
-use clap::Args;
+use clap::{ArgGroup, Args};
 use kitchen::{
     HouseId,
+    adapters::{
+        OrcaSession,
+        orca::{
+            DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, SystemRunner,
+        },
+        resolve_backend,
+    },
     adoption::{HouseRegistry, decode, encode},
-    house::HouseError,
-    scheduling::ScheduleEvidence,
+    contracts::{Capability, ExternalRef},
+    house::{ForgeError, HouseError, forge_binding},
+    scheduling::{AgentFamily, ScheduleEvidence},
     state::{HouseStore, StoreOptions},
     trust::Ledger,
     workflows::{
         WorkflowError,
         audit::{
-            AuditInputs, AuditPolicy, AuditReport, ProposalKey, ProposalKind, ScheduleSignal, audit,
+            self, AuditInputs, AuditPolicy, AuditReport, LinkedEvidence, ListedSchedules,
+            ProposalKey, ProposalKind, Publication, ScheduleInventory, ScheduleSignal,
         },
     },
 };
 
 #[derive(Args)]
+#[command(group(ArgGroup::new("inventory").required(true).args(["orca", "schedule_evidence"])))]
 pub struct AuditArgs {
     /// The house registry holding the house configuration and its schedule
     /// policy.
@@ -39,45 +58,107 @@ pub struct AuditArgs {
     /// Absolute path of the house's initialized trust ledger directory.
     #[arg(long)]
     ledger: PathBuf,
-    /// JSON file of the house's observed schedule runs.
+    /// Absolute path of the Orca executable: list every house schedule
+    /// through the house's bound backend.
+    #[arg(long, requires = "runtime_dir")]
+    orca: Option<PathBuf>,
+    /// House-scoped Orca runtime storage shared by every caller.
+    #[arg(long, requires = "orca")]
+    runtime_dir: Option<PathBuf>,
+    /// Absolute path of a JSON file of observed schedule runs. It may omit
+    /// schedules, so the preview reports without proposing.
     #[arg(long)]
-    schedule_evidence: PathBuf,
-    /// Key of a proposal still open on the forge; repeat for each.
+    schedule_evidence: Option<PathBuf>,
+    /// Key of a proposal still open on the forge; repeat for each, so that
+    /// together they are every open proposal.
     #[arg(long = "open-proposal")]
     open: Vec<String>,
+    /// No proposal is open on the forge.
+    #[arg(long, conflicts_with = "open")]
+    no_open_proposals: bool,
     /// Print the full report, with each draft's body, as JSON.
     #[arg(long)]
     json: bool,
 }
 
 pub fn run(args: AuditArgs) -> Result<(String, bool), kitchen::Error> {
-    if !args.ledger.is_absolute() || !args.schedule_evidence.is_absolute() {
+    let absolute = |path: &Option<PathBuf>| path.as_ref().is_none_or(|path| path.is_absolute());
+    if !args.ledger.is_absolute()
+        || !absolute(&args.orca)
+        || !absolute(&args.runtime_dir)
+        || !absolute(&args.schedule_evidence)
+    {
         return Err(HouseError::InvalidInput.into());
     }
-    let config = HouseRegistry::new(&args.registry)?.load(&args.house)?;
+    let registry = HouseRegistry::new(&args.registry)?;
+    let config = registry.load(&args.house)?;
     // Without a policy there is no budget to spend the run against.
-    let schedules = config.schedules.ok_or(WorkflowError::IncompleteEvidence)?;
+    let schedules = config
+        .schedules
+        .clone()
+        .ok_or(WorkflowError::IncompleteEvidence)?;
+    let forge = match forge_binding(&registry, &args.house) {
+        Ok(binding) => Some(binding.forge),
+        Err(ForgeError::MissingBinding { .. }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let open = args
+        .open
+        .iter()
+        .map(|key| ProposalKey::parse(key).ok_or(HouseError::InvalidInput))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let open = (args.no_open_proposals || !open.is_empty()).then_some(open);
     let store = HouseStore::open(
         super::house::store_or_default(args.store, Some(&args.registry), &args.house)?,
         args.house.clone(),
         StoreOptions::default(),
     )?;
     let ledger = Ledger::open(&args.ledger, args.house.clone())?;
-    let evidence: ScheduleEvidence = decode(&args.schedule_evidence)?;
-    let open = args
-        .open
-        .iter()
-        .map(|key| ProposalKey::parse(key).ok_or(HouseError::InvalidInput))
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    let report = audit(
+    let listed;
+    let file: ScheduleEvidence;
+    let inventory = match (args.orca, args.runtime_dir, args.schedule_evidence) {
+        (Some(orca), Some(runtime_dir), _) => {
+            let backend = resolve_backend(
+                &config,
+                OrcaSession {
+                    // Schedule calls name no Run, coordinator, or repository.
+                    run: ExternalRef::new(audit::WORKFLOW)?,
+                    coordinator: ExternalRef::new(audit::WORKFLOW)?,
+                    repo: ExternalRef::new(audit::WORKFLOW)?,
+                    base_branch: None,
+                    branch_prefix: None,
+                    agent: AgentFamily::Claude,
+                    call_timeout: DEFAULT_CALL_TIMEOUT,
+                    launch_timeout: DEFAULT_LAUNCH_TIMEOUT,
+                    runtime_dir,
+                    reservation_timeout: DEFAULT_RESERVATION_TIMEOUT,
+                },
+                SystemRunner::new(&orca),
+                &[Capability::ScheduleManage],
+            )?;
+            listed = ListedSchedules::read(&backend)?;
+            ScheduleInventory::Listed(&listed)
+        }
+        (_, _, Some(path)) => {
+            file = decode(&path)?;
+            ScheduleInventory::Unproven(&file)
+        }
+        // Clap requires one source, and `--orca` with `--runtime-dir`.
+        _ => return Err(HouseError::InvalidInput.into()),
+    };
+    let report = audit::audit(
         &AuditPolicy::default(),
         &AuditInputs {
             house: &args.house,
             ledger: &ledger,
             store: &store,
             schedules: &schedules,
-            evidence: &evidence,
-            open: &open,
+            inventory,
+            open: open.as_ref(),
+            publication: Publication {
+                forge,
+                repositories: &config.repositories,
+            },
         },
     )?;
     let text = if args.json {
@@ -106,11 +187,37 @@ fn json_text(report: &AuditReport) -> Result<String, kitchen::Error> {
     Ok(String::from_utf8(encode(&output)?).map_err(|_| HouseError::InvalidInput)?)
 }
 
+/// `label` with its source count, then each listed link, how many more
+/// there are, and how many private sources were left out. Nothing for no
+/// sources.
+fn evidence_text(text: &mut String, indent: &str, label: &str, evidence: &LinkedEvidence) {
+    if evidence.total == 0 {
+        return;
+    }
+    let _ = writeln!(text, "{indent}{label}: {}", evidence.total);
+    for link in &evidence.links {
+        let _ = writeln!(text, "{indent}  - {link}");
+    }
+    if evidence.unlisted > 0 {
+        let _ = writeln!(text, "{indent}  - and {} more", evidence.unlisted);
+    }
+    if evidence.private > 0 {
+        let _ = writeln!(
+            text,
+            "{indent}  - {} private, kept in the house and not listed",
+            evidence.private
+        );
+    }
+}
+
 fn report_text(report: &AuditReport) -> String {
     let mut text = format!(
         "Brigade audit of {} (preview; nothing is filed or changed)\n",
         report.house
     );
+    for reason in &report.withheld {
+        let _ = writeln!(text, "No drafts proposed: {reason}.");
+    }
     text.push_str("\nStations:\n");
     if report.stations.is_empty() {
         text.push_str("  none recorded\n");
@@ -125,9 +232,22 @@ fn report_text(report: &AuditReport) -> String {
             station.simulated,
             station.first_pass.accepted,
             station.first_pass.judged,
-            station.findings.len(),
+            station.findings.total,
             station.usage.attempts,
             station.usage.reported,
+        );
+        evidence_text(&mut text, "    ", "findings", &station.findings);
+        evidence_text(
+            &mut text,
+            "    ",
+            "deliveries with findings",
+            &station.deliveries_with_findings,
+        );
+        evidence_text(
+            &mut text,
+            "    ",
+            "rejected on the first pass",
+            &station.first_pass_rejected,
         );
     }
     if report.incomplete_streams > 0 {
@@ -156,15 +276,14 @@ fn report_text(report: &AuditReport) -> String {
                 complete,
             } => writeln!(
                 text,
-                "  {}: {}{runs} of {allowed} runs this window ({})",
+                "  {}: {}{runs} of {allowed} runs this window",
                 schedule.consumer,
                 if complete { "" } else { "at least " },
-                schedule.schedule.handle,
             ),
             ScheduleSignal::MostlyIdle { runs, idle_runs } => writeln!(
                 text,
-                "  {}: {idle_runs} of {runs} recent runs idle ({})",
-                schedule.consumer, schedule.schedule.handle,
+                "  {}: {idle_runs} of {runs} recent runs idle",
+                schedule.consumer,
             ),
         };
     }
@@ -180,6 +299,12 @@ fn report_text(report: &AuditReport) -> String {
             divergence.trailing.1.judged,
             divergence.trailing.0,
         );
+        evidence_text(
+            &mut text,
+            "  ",
+            "rejected on the first pass",
+            &divergence.evidence,
+        );
     }
     text.push_str("\nDraft proposals:\n");
     if report.proposals.is_empty() {
@@ -193,11 +318,10 @@ fn report_text(report: &AuditReport) -> String {
         };
         let _ = writeln!(
             text,
-            "  {}: {what}, {} samples, {} evidence links",
-            proposal.key,
-            proposal.samples,
-            proposal.evidence.len()
+            "  {}: {what}, {} samples",
+            proposal.key, proposal.samples
         );
+        evidence_text(&mut text, "    ", "evidence", &proposal.evidence);
     }
     for key in &report.deduplicated {
         let _ = writeln!(text, "  {key}: already open");
@@ -205,5 +329,105 @@ fn report_text(report: &AuditReport) -> String {
     for key in &report.deferred {
         let _ = writeln!(text, "  {key}: deferred past this run's limit");
     }
+    for key in &report.withheld_proposals {
+        let _ = writeln!(text, "  {key}: withheld");
+    }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use kitchen::{
+        contracts::{Role, Timestamp},
+        scheduling::UsageWindow,
+        selection::WorkType,
+        workflows::audit::{Acceptance, Divergence, EvidenceLink, StationRecord, UsageSummary},
+    };
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn link(n: u32) -> Result<EvidenceLink, kitchen::contracts::ContractError> {
+        Ok(EvidenceLink::Forge(ExternalRef::new(&format!(
+            "https://github.com/example/project/pull/{n}"
+        ))?))
+    }
+
+    fn report(evidence: &LinkedEvidence) -> Result<AuditReport, Box<dyn std::error::Error>> {
+        let first_pass = Acceptance {
+            accepted: 1,
+            judged: 5,
+        };
+        Ok(AuditReport {
+            house: HouseId::new("origin89")?,
+            observed_at: Timestamp::from_unix_millis(0),
+            window: UsageWindow {
+                start: Timestamp::from_unix_millis(0),
+                end: Timestamp::from_unix_millis(1),
+            },
+            stations: vec![StationRecord {
+                station: Role::StationCook,
+                work_type: WorkType::new("docs")?,
+                deliveries: 5,
+                simulated: 0,
+                first_pass,
+                first_pass_rejected: evidence.clone(),
+                findings: evidence.clone(),
+                deliveries_with_findings: LinkedEvidence::default(),
+                usage: UsageSummary::default(),
+            }],
+            incomplete_streams: 0,
+            unattributed_attempts: 0,
+            schedules: Vec::new(),
+            divergences: vec![Divergence {
+                station: Role::StationCook,
+                leading: (WorkType::new("implementation")?, first_pass),
+                trailing: (WorkType::new("docs")?, first_pass),
+                evidence: evidence.clone(),
+            }],
+            withheld: Vec::new(),
+            proposals: Vec::new(),
+            deduplicated: Vec::new(),
+            deferred: Vec::new(),
+            withheld_proposals: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn the_text_report_lists_bounded_evidence_with_counts() -> TestResult {
+        let evidence = LinkedEvidence {
+            total: 6,
+            links: vec![link(1)?, link(2)?],
+            unlisted: 3,
+            private: 1,
+        };
+        let text = report_text(&report(&evidence)?);
+        let listing = "6\n      - https://github.com/example/project/pull/1\n      - https://github.com/example/project/pull/2\n      - and 3 more\n      - 1 private, kept in the house and not listed\n";
+        assert!(text.contains(&format!("    findings: {listing}")), "{text}");
+        assert!(
+            text.contains(&format!("    rejected on the first pass: {listing}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  rejected on the first pass: 6\n    - https://github.com/example/project/pull/1\n"
+            ),
+            "{text}"
+        );
+        // A record without sources lists nothing for them.
+        assert!(!text.contains("deliveries with findings"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_without_sources_prints_only_its_counts() -> TestResult {
+        let text = report_text(&report(&LinkedEvidence::default())?);
+        assert!(text.contains("1 of 5; 0 confirmed findings"), "{text}");
+        assert!(
+            !text.contains("findings:") && !text.contains("rejected on"),
+            "{text}"
+        );
+        Ok(())
+    }
 }

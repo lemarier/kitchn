@@ -137,6 +137,16 @@ pub enum DecompositionError {
     /// the forge.
     #[error("task {0} is not a settled decomposition that holds its repository")]
     NotHeld(TaskId),
+    /// A write of the task is still unknown after the re-read, and the
+    /// person did not accept that. Nothing was recorded and the repository
+    /// stays held.
+    #[error("task {task} has writes whose outcome is unknown: {}; check them on the forge, then accept them explicitly", render_names(.writes))]
+    UnknownWrites {
+        /// The settled task.
+        task: TaskId,
+        /// The writes neither the record nor the forge could prove.
+        writes: Vec<EffectName>,
+    },
     /// A created issue's receipt does not name an issue in the repository.
     #[error("the forge receipt of a created issue names no issue in the repository")]
     UnreadableReceipt,
@@ -156,12 +166,24 @@ impl DecompositionError {
             | Self::UnknownBlocker { .. }
             | Self::InvalidBlocker(_)
             | Self::Cycle(_) => ErrorClass::InvalidInput,
-            Self::ApprovalNeedsPerson | Self::AcknowledgementNeedsPerson | Self::NotHeld(_) => {
-                ErrorClass::Refused
-            }
+            Self::ApprovalNeedsPerson
+            | Self::AcknowledgementNeedsPerson
+            | Self::NotHeld(_)
+            | Self::UnknownWrites { .. } => ErrorClass::Refused,
             Self::UnreadableReceipt | Self::Encoding => ErrorClass::Execution,
         }
     }
+}
+
+fn render_names(names: &[EffectName]) -> String {
+    let mut out = String::new();
+    for (index, name) in names.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(name.as_str());
+    }
+    out
 }
 
 fn render_cycle(keys: &[IssueKey]) -> String {
@@ -1364,18 +1386,22 @@ pub struct AcknowledgeReport {
 /// runs it after looking at what the task left on the forge. With an
 /// `executor` it first re-reads the forge for every write of the task whose
 /// outcome is unknown ([`reread_settled`]), so a write the forge proves
-/// applied or absent stops being unknown. Whatever it still cannot prove is
-/// listed in the recorded [`WriteAcknowledgement`], together with the
-/// claimant, the time, and `reason`; the person accepts that those writes may
-/// or may not exist. Without an `executor` nothing is re-read and every
-/// unknown write is listed the same way. Repeating the call for an
+/// applied or absent stops being unknown. A write still unproven releases
+/// nothing unless `accept_unknown` is set; without an `executor` nothing is
+/// re-read, so every write without a proven outcome is unproven. With
+/// `accept_unknown`, whatever the forge could not prove is listed in the
+/// recorded [`WriteAcknowledgement`], together with the claimant, the time,
+/// and `reason`; the person accepts that those writes may or may not exist.
+/// Repeating the call for an
 /// acknowledged task reads nothing and returns the first record.
 ///
 /// Nothing is released automatically, and nothing here submits a write.
 ///
 /// # Errors
 /// [`DecompositionError::AcknowledgementNeedsPerson`] for a non-interactive
-/// claimant; [`DecompositionError::NotHeld`] unless `task` is a settled,
+/// claimant; [`DecompositionError::UnknownWrites`] for a write still unproven
+/// after the re-read without `accept_unknown`, before anything is recorded;
+/// [`DecompositionError::NotHeld`] unless `task` is a settled,
 /// unsuccessful decomposition with a write that reached or may have reached
 /// the forge, including after a re-read that proved every write absent and so
 /// released the repository itself; [`StateError::CapacityExceeded`] for a
@@ -1387,6 +1413,7 @@ pub fn acknowledge(
     task: &TaskId,
     claimant: &Claimant,
     reason: &Text,
+    accept_unknown: bool,
     clock: &dyn Clock,
 ) -> Result<AcknowledgeReport> {
     match claimant.trigger {
@@ -1444,6 +1471,25 @@ pub fn acknowledge(
                 names.push(effect.name().clone());
             }
         }
+    }
+    // Every write with a record the forge has not proven, as the store lists
+    // them in the acknowledgement, even where another record of the same
+    // write was applied. A write is unproven without an executor too.
+    let after = store.task(task)?;
+    let mut unknown: Vec<EffectName> = Vec::new();
+    if !forge_writes(&after).is_empty() {
+        for effect in after.effects() {
+            if !effect.state().is_resolved() && !unknown.contains(effect.name()) {
+                unknown.push(effect.name().clone());
+            }
+        }
+    }
+    if !unknown.is_empty() && !accept_unknown {
+        return Err(DecompositionError::UnknownWrites {
+            task: task.clone(),
+            writes: unknown,
+        }
+        .into());
     }
     // A re-read that proved every write absent left nothing to hold the
     // repository, so there is nothing to acknowledge either.

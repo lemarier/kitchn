@@ -308,6 +308,7 @@ impl House {
         task: &kitchen::TaskId,
         claimant: &kitchen::contracts::Claimant,
         reread: bool,
+        accept_unknown: bool,
     ) -> TestResult<AcknowledgeReport> {
         let executor = GitHubExecutor::new(
             BackendId::new("github")?,
@@ -322,6 +323,7 @@ impl House {
             task,
             claimant,
             &Text::new("the earlier issues were reviewed by hand")?,
+            accept_unknown,
             &self.clock,
         )?)
     }
@@ -1214,7 +1216,7 @@ fn acknowledging_a_settled_task_releases_the_repository() -> TestResult {
     ));
 
     let id = task_id(&original.digest)?;
-    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, true)?;
+    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, true, false)?;
     assert!(report.reread);
     assert!(!report.already_acknowledged);
     assert!(report.unresolved.is_empty());
@@ -1253,7 +1255,7 @@ fn a_scheduled_claimant_cannot_acknowledge() -> TestResult {
     exhausted_after_a_refused_write(&house, &forge, &proposal, &approval_of(&original)?)?;
     let id = task_id(&original.digest)?;
 
-    let refused = house.acknowledge(&forge, &id, &scheduled("tick")?, true);
+    let refused = house.acknowledge(&forge, &id, &scheduled("tick")?, true, true);
     let Err(error) = refused else {
         return Err("a scheduled claimant acknowledged".into());
     };
@@ -1318,7 +1320,7 @@ fn a_reread_resolves_an_unknown_write_the_forge_proves_applied() -> TestResult {
     let forge = RefCell::new(Forge::seeded());
     let (_, id) = settled_with_an_unknown_write(&house, &forge, Fault::LoseAfterApply)?;
 
-    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, true)?;
+    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, true, false)?;
     assert_eq!(names(&report.applied), ["issue-core"]);
     assert!(report.unresolved.is_empty());
     assert!(report.acknowledgement.unresolved.is_empty());
@@ -1343,7 +1345,7 @@ fn an_unproven_write_needs_the_acknowledgement_to_release() -> TestResult {
         ApplyOutcome::EarlierSettledWithWrites { .. }
     ));
     // Reads still fail: the re-read proves nothing, so the write stays unknown.
-    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, true)?;
+    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, true, true)?;
     assert!(report.reread);
     assert!(report.applied.is_empty() && report.absent.is_empty());
     assert_eq!(names(&report.unresolved), ["issue-core"]);
@@ -1361,13 +1363,80 @@ fn an_unproven_write_needs_the_acknowledgement_to_release() -> TestResult {
 }
 
 #[test]
+fn a_write_the_reread_cannot_prove_refuses_without_accept_unknown() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge::seeded());
+    let (proposal, id) = settled_with_an_unknown_write(&house, &forge, Fault::LoseAfterApply)?;
+    forge.borrow_mut().reads_fail = true;
+    let person = interactive("owner-session")?;
+
+    let error = house
+        .acknowledge(&forge, &id, &person, true, false)
+        .err()
+        .ok_or("an unproven write was released without acceptance")?;
+    let Some(DecompositionError::UnknownWrites { task, writes }) =
+        error.downcast_ref::<Error>().and_then(decomposition_error)
+    else {
+        return Err(format!("wrong refusal: {error}").into());
+    };
+    assert_eq!(task, &id);
+    assert_eq!(names(writes), ["issue-core"]);
+    assert_eq!(house.fixture.store.task(&id)?.write_acknowledgement(), None);
+    // The repository is still held.
+    let (next, next_approval) = revised(&proposal)?;
+    let held = house.apply(&forge, &next, &next_approval)?;
+    assert!(matches!(
+        held.outcome,
+        ApplyOutcome::EarlierSettledWithWrites { .. }
+    ));
+
+    // The same call with the flag records the unproven write.
+    let accepted = house.acknowledge(&forge, &id, &person, true, true)?;
+    assert_eq!(names(&accepted.unresolved), ["issue-core"]);
+    assert!(
+        house
+            .fixture
+            .store
+            .task(&id)?
+            .write_acknowledgement()
+            .is_some()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_skipped_reread_refuses_without_accept_unknown() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge::seeded());
+    let (_, id) = settled_with_an_unknown_write(&house, &forge, Fault::LoseAfterApply)?;
+    let person = interactive("owner-session")?;
+    let submissions = forge.borrow().submissions;
+
+    let error = house
+        .acknowledge(&forge, &id, &person, false, false)
+        .err()
+        .ok_or("an unread write was released without acceptance")?;
+    assert!(matches!(
+        error.downcast_ref::<Error>().and_then(decomposition_error),
+        Some(DecompositionError::UnknownWrites { .. })
+    ));
+    assert_eq!(house.fixture.store.task(&id)?.write_acknowledgement(), None);
+    assert_eq!(forge.borrow().submissions, submissions);
+
+    let accepted = house.acknowledge(&forge, &id, &person, false, true)?;
+    assert!(!accepted.reread);
+    assert_eq!(names(&accepted.unresolved), ["issue-core"]);
+    Ok(())
+}
+
+#[test]
 fn acknowledging_without_a_backend_reads_nothing() -> TestResult {
     let house = House::new(20)?;
     let forge = RefCell::new(Forge::seeded());
     let (_, id) = settled_with_an_unknown_write(&house, &forge, Fault::LoseBeforeApply)?;
     let reads_before = forge.borrow().submissions;
 
-    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, false)?;
+    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, false, true)?;
     assert!(!report.reread);
     assert_eq!(names(&report.unresolved), ["issue-core"]);
     assert_eq!(forge.borrow().submissions, reads_before);
@@ -1386,8 +1455,8 @@ fn a_repeated_acknowledgement_keeps_the_first_record() -> TestResult {
     exhausted_after_a_refused_write(&house, &forge, &proposal, &approval_of(&original)?)?;
     let id = task_id(&original.digest)?;
 
-    let first = house.acknowledge(&forge, &id, &interactive("first-session")?, true)?;
-    let second = house.acknowledge(&forge, &id, &interactive("second-session")?, true)?;
+    let first = house.acknowledge(&forge, &id, &interactive("first-session")?, true, true)?;
+    let second = house.acknowledge(&forge, &id, &interactive("second-session")?, true, true)?;
     assert!(second.already_acknowledged);
     assert_eq!(second.acknowledgement, first.acknowledgement);
     assert_eq!(second.acknowledgement.by.as_str(), "first-session");
@@ -1405,13 +1474,13 @@ fn only_a_settled_unsuccessful_decomposition_can_be_acknowledged() -> TestResult
     let person = interactive("owner-session")?;
 
     // No such task.
-    assert!(house.acknowledge(&forge, &id, &person, true).is_err());
+    assert!(house.acknowledge(&forge, &id, &person, true, true).is_err());
 
     // Settled successfully: nothing is held.
     let done = house.apply(&forge, &proposal, &approval)?;
     assert_eq!(done.outcome, ApplyOutcome::Completed);
     let error = house
-        .acknowledge(&forge, &id, &person, true)
+        .acknowledge(&forge, &id, &person, true, false)
         .err()
         .ok_or("a successful task was acknowledged")?;
     assert!(
@@ -1427,7 +1496,7 @@ fn only_a_settled_unsuccessful_decomposition_can_be_acknowledged() -> TestResult
     let other = House::new(20)?;
     other.apply(&pending, &proposal, &approval)?;
     let unsettled = other
-        .acknowledge(&pending, &id, &person, true)
+        .acknowledge(&pending, &id, &person, true, false)
         .err()
         .ok_or("an unsettled task was acknowledged")?;
     assert!(matches!(
@@ -1458,6 +1527,7 @@ fn an_overlong_reason_is_refused_before_the_forge_is_read() -> TestResult {
         &id,
         &interactive("owner-session")?,
         &long,
+        true,
         &house.clock,
     )
     .err()
@@ -1495,6 +1565,7 @@ fn a_reread_that_proves_every_write_absent_leaves_nothing_to_acknowledge() -> Te
         &id,
         &interactive("owner-session")?,
         &Text::new("checked by hand")?,
+        false,
         &house.clock,
     )
     .err()
@@ -1540,7 +1611,7 @@ fn a_snapshot_without_an_acknowledgement_still_loads() -> TestResult {
     let before: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     assert!(before["tasks"][key].get("acknowledgement").is_none());
 
-    house.acknowledge(&forge, &id, &interactive("owner-session")?, true)?;
+    house.acknowledge(&forge, &id, &interactive("owner-session")?, true, true)?;
     let mut state: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     assert!(state["tasks"][key].get("acknowledgement").is_some());
 

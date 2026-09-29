@@ -192,15 +192,17 @@ Preview a project split into dependency-linked issues. Writes nothing.
 
 ```sh
 kitchn decompose preview --proposal <proposal.json> [--json]
-kitchn decompose acknowledge --store <dir> --house <id> --task <task> --holder <you> --reason <text>
+kitchn decompose acknowledge --store <dir> --house <id> --task <task> --holder <you> --reason <text> [--accept-unknown]
 ```
 
 `preview` prints a digest and exits 0 when the proposal can be approved, 1 while
 ownership overlaps are unordered, and 2 for an invalid proposal such as a
 dependency cycle. `acknowledge` releases the repository from an earlier
 decomposition that settled without success after writing, or possibly writing,
-to the forge. Check the forge for that task's issues first: kitchn cannot
-re-read it, so every write not proven applied is recorded as unproven.
+to the forge. Check the forge for that task's issues first. A write still not
+proven after the forge re-read, including every such write when the forge is not
+read, refuses the release unless you pass `--accept-unknown`; the write is then
+recorded as unproven.
 
 ## `kitchn cleanup`
 

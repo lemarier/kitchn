@@ -80,9 +80,10 @@ enum DecomposeCommand {
     /// without success after writing, or possibly writing, to the forge.
     /// Records who acknowledged, when, and why. With --registry and a house
     /// forge binding it first re-reads the forge for writes whose outcome is
-    /// unknown; every write still not proven is recorded as unproven. Check
-    /// the forge for that task's issues first. Nothing is released without
-    /// it, and a scheduled run cannot do it.
+    /// unknown. A write still not proven, including any when the forge is not
+    /// read, refuses the release unless --accept-unknown is given; then it is
+    /// recorded as unproven. Check the forge for that task's issues first.
+    /// Nothing is released without it, and a scheduled run cannot do it.
     Acknowledge {
         /// The house's initialized state store.
         #[arg(long)]
@@ -105,6 +106,10 @@ enum DecomposeCommand {
         /// Why you are content to proceed. Recorded with the acknowledgement.
         #[arg(long)]
         reason: String,
+        /// Release the repository even though a write's outcome is still
+        /// unknown.
+        #[arg(long)]
+        accept_unknown: bool,
         #[arg(long)]
         json: bool,
     },
@@ -178,6 +183,7 @@ pub fn run(args: DecomposeArgs) -> Result<(String, bool), kitchen::Error> {
             task,
             holder,
             reason,
+            accept_unknown,
             json,
         } => {
             let reread = match registry {
@@ -195,6 +201,7 @@ pub fn run(args: DecomposeArgs) -> Result<(String, bool), kitchen::Error> {
                 &task,
                 &Claimant::interactive(holder),
                 &Text::new(&reason)?,
+                accept_unknown,
                 &SystemClock,
             )?;
             let output = if json {

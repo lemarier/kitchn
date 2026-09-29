@@ -80,13 +80,7 @@ impl Document {
         if &self.house != house {
             return Err(TrustError::Refused);
         }
-        if self.schema != SCHEMA
-            || self.observations.len()
-                + self.bindings.len()
-                + self.grants.len()
-                + self.inspections.len()
-                > MAX_HISTORY
-        {
+        if self.schema != SCHEMA || self.entries() > MAX_HISTORY {
             return Err(TrustError::Corrupt);
         }
         let mut revisions = HashMap::with_capacity(self.observations.len());
@@ -170,6 +164,11 @@ impl Document {
         Ok(())
     }
 
+    /// History entries counted against [`MAX_HISTORY`].
+    fn entries(&self) -> usize {
+        self.observations.len() + self.bindings.len() + self.grants.len() + self.inspections.len()
+    }
+
     pub(crate) fn latest(
         &self,
         id: &crate::contracts::ExternalRef,
@@ -212,6 +211,40 @@ impl Snapshot for Document {
     /// inherent method and keep those classes.
     fn validate(&self, house: &HouseId) -> Result<(), TrustError> {
         Self::validate(self, house).map_err(|_| TrustError::Corrupt)
+    }
+}
+
+/// How full a ledger is. History is never discarded: once either limit is
+/// reached, `record`, `bind_task`, and other ordinary writes fail and earned
+/// standing stops applying to new tasks. Revocation stays possible because it
+/// uses a byte reserve outside [`Self::max_bytes`] and adds no entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capacity {
+    /// Stored observations, task bindings, grant audits, and inspections.
+    pub entries: usize,
+    /// Entry limit for ordinary writes.
+    pub max_entries: usize,
+    /// Size of the stored snapshot.
+    pub bytes: u64,
+    /// Snapshot size limit for ordinary writes.
+    pub max_bytes: u64,
+}
+
+impl Capacity {
+    /// Percentage of either limit at which [`Self::near_limit`] reports.
+    pub const WARNING_PERCENT: u64 = 80;
+
+    /// Whether either limit is at least [`Self::WARNING_PERCENT`] used, so an
+    /// operator can act before ordinary writes stop.
+    #[must_use]
+    pub fn near_limit(&self) -> bool {
+        let reached = |used: u64, limit: u64| {
+            u128::from(used) * 100 >= u128::from(limit) * u128::from(Self::WARNING_PERCENT)
+        };
+        reached(
+            u64::try_from(self.entries).unwrap_or(u64::MAX),
+            u64::try_from(self.max_entries).unwrap_or(u64::MAX),
+        ) || reached(self.bytes, self.max_bytes)
     }
 }
 
@@ -538,6 +571,19 @@ impl Ledger {
         })
     }
 
+    /// Current use of the entry and byte limits.
+    ///
+    /// # Errors
+    /// Returns storage failures, including a corrupt snapshot.
+    pub fn capacity(&self) -> Result<Capacity, TrustError> {
+        self.engine.read_sized(|doc, bytes| Capacity {
+            entries: doc.entries(),
+            max_entries: MAX_HISTORY,
+            bytes,
+            max_bytes: MAX_BYTES,
+        })
+    }
+
     /// Current decisions with original proposal, approval, and revocation sources.
     ///
     /// # Errors
@@ -618,12 +664,7 @@ impl Ledger {
         let house = self.house();
         self.engine.transact(|doc| {
             let result = apply(doc)?;
-            if doc.observations.len()
-                + doc.bindings.len()
-                + doc.grants.len()
-                + doc.inspections.len()
-                > MAX_HISTORY
-            {
+            if doc.entries() > MAX_HISTORY {
                 return Err(TrustError::Exhausted);
             }
             doc.validate(house)?;

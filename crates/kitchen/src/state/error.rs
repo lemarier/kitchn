@@ -204,6 +204,12 @@ pub enum StateError {
     /// The target resource was not reported by an applied effect of this task.
     #[error("the task does not own the target resource")]
     ResourceNotOwned,
+    /// The schedule has no requirements recorded from a Kitchen install, so
+    /// activating or trying it cannot be shown to meet them.
+    #[error(
+        "the schedule's workflow requirements were not recorded when it was installed; reinstall it before activating or trying it"
+    )]
+    ScheduleRequirementsUnknown,
     /// A worker launch named another agent selection than the task's own.
     #[error("the launch does not use the agent selection recorded for its task")]
     AgentSelectionMismatch,
@@ -363,6 +369,7 @@ impl StateError {
         match self {
             Self::SubmissionBudgetExhausted(_)
             | Self::ConsentReused
+            | Self::ScheduleRequirementsUnknown
             | Self::AcknowledgementNeedsPerson => ErrorClass::Refused,
             Self::MarkerSchemaInvalid | Self::MarkerPayloadInvalid => ErrorClass::InvalidInput,
             Self::TaskNotFound(_)

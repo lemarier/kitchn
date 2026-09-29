@@ -1227,7 +1227,10 @@ fn install_creates_paused_once_and_reuses_it() -> TestResult {
     let create = creates.first().ok_or("one create")?;
     assert!(create.iter().any(|arg| arg == "--disabled"));
     assert!(!create.iter().any(|arg| arg == "--enabled"));
-    assert_eq!(flag(create, "name"), Some("kitchen:origin89:pickup"));
+    assert_eq!(
+        flag(create, "name"),
+        Some("kitchen:origin89:pickup:requires=")
+    );
     assert_eq!(
         flag(create, "precheck"),
         Some(r"'kitchen' 'precheck' 'it'\''s pickup'")
@@ -1979,8 +1982,10 @@ fn installing_disabled_refuses_a_schedule_that_differs_from_the_request() -> Tes
             ScheduleField::Precheck,
             ScheduleField::Workspace,
             ScheduleField::MissedRunGrace,
+            ScheduleField::Requirements,
         ]),
-        "Orca always reports session reuse, so only that field matches"
+        "Orca always reports session reuse, so only that field matches; the \
+         name records no requirements"
     );
     assert_eq!(
         backend.execute(&request(install("gardener")?, "install-bare")?),

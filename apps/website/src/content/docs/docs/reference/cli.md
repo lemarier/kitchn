@@ -278,7 +278,9 @@ required capabilities (no overlapping runs, an enforced run timeout, and typed
 idle and error precheck results); otherwise `install` exits 1 naming the missing
 and partial ones, and nothing is created. Orca does not provide the first two
 and reports precheck errors only in its run history, so the install is refused
-there.
+there. Activating or trying an installed schedule checks the same requirements
+again; a schedule installed before Kitchen recorded them is refused until it is
+removed and installed again.
 
 ## `kitchn store`
 

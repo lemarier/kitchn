@@ -596,6 +596,7 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::BranchMismatch { .. }
         | OrcaError::WrongBranchRunning { .. }
         | OrcaError::TrialRequiresPaused
+        | OrcaError::ScheduleRequirementsUnknown
         | OrcaError::InstallUncertain
         | OrcaError::StateMismatch
         | OrcaError::Schedule(_)
@@ -645,6 +646,7 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::BranchMismatch { .. }
         | OrcaError::WrongBranchRunning { .. }
         | OrcaError::TrialRequiresPaused
+        | OrcaError::ScheduleRequirementsUnknown
         | OrcaError::ScheduleActive
         | OrcaError::ScheduleDiffers { .. }
         | OrcaError::ScheduleLimit(_)

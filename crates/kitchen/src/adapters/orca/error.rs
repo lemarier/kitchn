@@ -93,6 +93,14 @@ pub enum OrcaError {
         /// Which parts differ, or could not be read back to compare.
         fields: Vec<ScheduleField>,
     },
+    /// The automation's name records no workflow requirements this Kitchen
+    /// can read, as for one installed before they were recorded, so it is
+    /// neither activated nor tried. Nothing was changed; remove it and
+    /// install it again.
+    #[error(
+        "the schedule records no readable workflow requirements; remove and reinstall it before activating or trying it"
+    )]
+    ScheduleRequirementsUnknown,
     /// A trial run needs a paused schedule.
     #[error("a trial run needs a paused schedule")]
     TrialRequiresPaused,
@@ -186,6 +194,7 @@ impl OrcaError {
             | Self::MissingRuntimeFeature(_)
             | Self::NotKitchenOwned
             | Self::TrialRequiresPaused
+            | Self::ScheduleRequirementsUnknown
             | Self::ReservationRedirected
             | Self::ReservationInsideRepository
             | Self::BranchUnobtainable { .. }

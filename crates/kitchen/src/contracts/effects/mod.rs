@@ -29,7 +29,7 @@ pub use github::{
 pub use roger::{
     AskKind, AskRisk, DecisionBinding, DecisionOwner, MAX_ASKS_PER_TASK, RogerAsk, RogerEffect,
 };
-pub use schedule::ScheduleEffect;
+pub use schedule::{ScheduleEffect, ScheduleRequirements};
 
 use crate::{
     HouseId, TaskId,
@@ -224,15 +224,16 @@ impl Effect {
         }
     }
 
-    /// The capabilities the effect's workflow declares for the executor
-    /// beyond [`Self::required_capability`], such as a schedule install's
+    /// Where the capabilities the effect's scheduled workflow requires of
+    /// the executor come from, beyond [`Self::required_capability`], such as
+    /// a schedule install's
     /// [`ScheduleSpec::requires`](crate::scheduling::ScheduleSpec::requires).
-    pub fn workflow_requirements(&self) -> impl Iterator<Item = Capability> + '_ {
-        let declared = match self {
-            Self::Schedule(effect) => effect.workflow_requirements(),
-            Self::Worker(_) | Self::GitHub(_) | Self::Roger(_) => None,
-        };
-        declared.into_iter().flatten().copied()
+    #[must_use]
+    pub const fn schedule_requirements(&self) -> ScheduleRequirements<'_> {
+        match self {
+            Self::Schedule(effect) => effect.schedule_requirements(),
+            Self::Worker(_) | Self::GitHub(_) | Self::Roger(_) => ScheduleRequirements::None,
+        }
     }
 
     /// The task permission this effect needs.

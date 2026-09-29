@@ -14,6 +14,20 @@ use crate::{
     scheduling::{ScheduleSpec, ScheduleState},
 };
 
+/// The workflow requirements an effect must meet before it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleRequirements<'a> {
+    /// The effect starts no scheduled run: pausing, removing, or not a
+    /// schedule effect.
+    None,
+    /// An install, carrying its workflow's declared requirements.
+    Declared(&'a BTreeSet<Capability>),
+    /// Activating or trying this installed schedule starts runs, so the
+    /// requirements recorded when it was installed apply; one with none
+    /// recorded is refused.
+    Installed(&'a ResourceRef),
+}
+
 /// A schedule change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -66,13 +80,24 @@ impl ScheduleEffect {
         }
     }
 
-    /// The capabilities the scheduled workflow requires of the executor,
-    /// beyond [`Self::required_capability`]; only an install carries them.
+    /// Where the capabilities the scheduled workflow requires of the
+    /// executor, beyond [`Self::required_capability`], come from.
     #[must_use]
-    pub fn workflow_requirements(&self) -> Option<&BTreeSet<Capability>> {
+    pub const fn schedule_requirements(&self) -> ScheduleRequirements<'_> {
         match self {
-            Self::InstallDisabled { schedule } => Some(schedule.requires()),
-            Self::SetState { .. } | Self::Remove { .. } | Self::Trial { .. } => None,
+            Self::InstallDisabled { schedule } => {
+                ScheduleRequirements::Declared(schedule.requires())
+            }
+            Self::SetState {
+                schedule,
+                state: ScheduleState::Active,
+            }
+            | Self::Trial { schedule } => ScheduleRequirements::Installed(schedule),
+            Self::SetState {
+                state: ScheduleState::Paused,
+                ..
+            }
+            | Self::Remove { .. } => ScheduleRequirements::None,
         }
     }
 

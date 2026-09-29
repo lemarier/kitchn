@@ -99,17 +99,19 @@
 //!   deadline is killed and reported as a timeout, which is uncertain for
 //!   effects and unavailable for reads.
 //! - Schedules. `automations create`, `edit`, `remove`, and `run` take no
-//!   request key. Installs are named `kitchen:<house>:<consumer>`, created
-//!   disabled, reconciled against a complete listing before and after every
-//!   create, and every change is read back. An existing schedule is reused
-//!   only when it is paused and matches the requested definition, and its
-//!   receipt then lists it as touched, not created; an active
-//!   or different one is refused and never changed. Orca skips a run on any
+//!   request key. Installs are named
+//!   `kitchen:<house>:<consumer>:requires=<capabilities>`, created disabled,
+//!   reconciled against a complete listing before and after every create,
+//!   and every change is read back. An existing schedule is reused only when
+//!   it is paused and matches the requested definition and requirements, and
+//!   its receipt then lists it as touched, not created; an active or
+//!   different one is refused and never changed. Orca skips a run on any
 //!   non-zero precheck exit; only its run history tells an idle precheck from
 //!   a failed one. It cannot prevent overlapping runs of one schedule or
 //!   enforce a run timeout, so a schedule whose workflow requires either is
-//!   refused; for other schedules, Kitchen's consumer lease must prevent
-//!   overlap.
+//!   refused at install, activation, and trial; one whose name records no
+//!   requirements is not activated or tried. For other schedules, Kitchen's
+//!   consumer lease must prevent overlap.
 
 mod accounts;
 mod backend;

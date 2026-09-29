@@ -725,3 +725,29 @@ fn doctor_reports_a_configured_stack_tool_that_is_missing() -> TestResult {
     assert!(doctor(&registry, &repository, Some(&evidence))?.healthy());
     Ok(())
 }
+
+#[test]
+fn house_policy_may_set_a_disk_pressure_threshold() -> TestResult {
+    let mut json: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/house/origin89.json"))?;
+    // Absent by default: free space is not watched.
+    assert_eq!(config("origin89")?.disk_pressure, None);
+    json["diskPressure"] = serde_json::json!({ "minFreeBytes": 21_474_836_480_u64 });
+    let house: HouseConfig = serde_json::from_value(json.clone())?;
+    house.validate()?;
+    assert_eq!(
+        house
+            .disk_pressure
+            .map(|policy| policy.min_free_bytes.get()),
+        Some(21_474_836_480)
+    );
+    // A zero threshold or an unknown key is refused.
+    for invalid in [
+        serde_json::json!({ "minFreeBytes": 0 }),
+        serde_json::json!({ "minFreeBytes": 1, "path": "/tmp" }),
+    ] {
+        json["diskPressure"] = invalid;
+        assert!(serde_json::from_value::<HouseConfig>(json.clone()).is_err());
+    }
+    Ok(())
+}

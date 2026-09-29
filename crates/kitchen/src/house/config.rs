@@ -8,6 +8,7 @@ use crate::{
     contracts::{CommitId, Grant, HouseGrants, Repository, Text},
     scheduling::{BudgetError, SchedulePolicy},
     selection::{AgentPolicy, SelectionError},
+    workflows::cleanup::DiskPressurePolicy,
 };
 
 /// The tool a house requires for dependent branches and stacked pull
@@ -69,6 +70,10 @@ pub struct HouseConfig {
     /// Readiness never grants merge authority itself.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub merge_readiness: BTreeMap<Text, ReadinessLevel>,
+    /// Free space below which the dishwasher starts a preview-only
+    /// inspection. Absent means free space is not watched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_pressure: Option<DiskPressurePolicy>,
 }
 
 impl HouseConfig {

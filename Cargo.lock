@@ -240,6 +240,7 @@ name = "kitchen"
 version = "0.1.0"
 dependencies = [
  "kitchen",
+ "rustix",
  "saphyr-parser",
  "serde",
  "serde_json",

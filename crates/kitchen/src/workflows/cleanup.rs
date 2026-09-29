@@ -91,6 +91,10 @@
 //! Every step reports the space it measured before acting; that is an upper
 //! bound on what it frees, not a measurement afterwards.
 //!
+//! [`check_disk_pressure`] measures free space through a [`FreeSpaceProbe`]
+//! and, below the house's [`DiskPressurePolicy`] threshold, starts the same
+//! preview-only inspection with those suggestions.
+//!
 //! # Backend requirements
 //!
 //! The pushed check examines `HEAD` only, so it is sound only if a backend's
@@ -102,6 +106,7 @@
 //! The dishwasher itself never removes a branch.
 
 mod build;
+mod disk;
 mod git;
 
 use std::{
@@ -109,7 +114,7 @@ use std::{
     fmt::{self, Write as _},
     io,
     num::NonZeroU32,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -120,6 +125,7 @@ pub use build::{
     BuildDirectory, CACHEDIR_SIGNATURE, DiskUsage, MAX_MEASURED_ENTRIES, MAX_TOP_LEVEL_ENTRIES,
     disk_usage,
 };
+pub use disk::{DiskPressurePolicy, FreeSpace, FreeSpaceProbe, ProbeError, StatvfsProbe};
 pub use git::{
     GitLimits, GitOperation, GitReadError, MAX_IGNORED_PATHS, RemoteName, WorktreeState,
     inspect_worktree,
@@ -183,6 +189,9 @@ pub enum CleanupError {
     /// so a later run could create the same task again.
     #[error("release task retention must be at least the maximum approval age")]
     RetentionTooShort,
+    /// Free space could not be measured; nothing is inferred from it.
+    #[error("free space could not be measured: {0}")]
+    DiskProbe(ProbeError),
 }
 
 impl CleanupError {
@@ -195,7 +204,9 @@ impl CleanupError {
             | Self::InvalidDigest
             | Self::RetentionTooShort => ErrorClass::InvalidInput,
             Self::ApprovalNeedsPerson => ErrorClass::Refused,
-            Self::Backend(_) | Self::DuplicateResource | Self::Encoding => ErrorClass::Execution,
+            Self::Backend(_) | Self::DuplicateResource | Self::Encoding | Self::DiskProbe(_) => {
+                ErrorClass::Execution
+            }
         }
     }
 }
@@ -730,6 +741,53 @@ pub fn inspect(
             InspectionTrigger::DiskPressure => EXTERNAL_CACHE_SUGGESTIONS.to_vec(),
             InspectionTrigger::Schedule | InspectionTrigger::Manual => Vec::new(),
         },
+    })
+}
+
+/// The result of [`check_disk_pressure`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum PressureCheck {
+    /// Free space is at or above the threshold; nothing was inspected.
+    Clear {
+        /// What was measured.
+        free: FreeSpace,
+    },
+    /// Free space is below the threshold, so an inspection ran.
+    Low {
+        /// What was measured.
+        free: FreeSpace,
+        /// The preview-only inspection, with commands for caches Kitchen
+        /// does not own.
+        preview: Box<Preview>,
+    },
+}
+
+/// Measure free space on the filesystem holding `path` (such as where the
+/// backend places worktrees) and, when it is below `policy`'s threshold,
+/// start a [`InspectionTrigger::DiskPressure`] inspection. Like [`inspect`],
+/// this only reads: disk pressure never makes a resource eligible, approves
+/// a step, or removes anything. A person reviews the preview and approves
+/// steps as for any other inspection.
+///
+/// # Errors
+/// [`CleanupError::DiskProbe`] when free space cannot be measured, which is
+/// reported rather than taken as pressure or its absence; and as [`inspect`].
+pub fn check_disk_pressure(
+    inspector: &Inspector<'_>,
+    probe: &dyn FreeSpaceProbe,
+    path: &Path,
+    policy: &DiskPressurePolicy,
+    now: Timestamp,
+) -> Result<PressureCheck> {
+    let free = probe.free_space(path).map_err(CleanupError::DiskProbe)?;
+    if !policy.under_pressure(free) {
+        return Ok(PressureCheck::Clear { free });
+    }
+    let preview = inspect(inspector, InspectionTrigger::DiskPressure, now)?;
+    Ok(PressureCheck::Low {
+        free,
+        preview: Box::new(preview),
     })
 }
 

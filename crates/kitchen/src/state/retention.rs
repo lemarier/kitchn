@@ -278,6 +278,14 @@ const MARKER_RULES: &[(&str, MarkerRule)] = &[
     // Delivered only to a worker of an unsettled task, so one held for a
     // settled task, even one written after its owner pruned, is never read.
     ("coordination.held-follow-up", MarkerRule::UntilTaskSettled),
+    // A merged pull request is closed at once, but its decision is replay
+    // evidence for a finding window; sampling::compact retires both.
+    ("inspection-sampling.decision", MarkerRule::Compacted),
+    ("inspection-sampling.rate-raise", MarkerRule::Compacted),
+    // One per repository and one per station scope; replay and grant age
+    // need them for as long as the house samples.
+    ("inspection-sampling.selection-key", MarkerRule::Keep),
+    ("inspection-sampling.grant-epoch", MarkerRule::Keep),
 ];
 
 /// The retention rule for a marker's fact.

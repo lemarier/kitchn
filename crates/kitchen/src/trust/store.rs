@@ -738,7 +738,8 @@ pub(crate) fn store_error(error: crate::Error) -> TrustError {
         | crate::Error::Forge(_)
         | crate::Error::Deliberation(_)
         | crate::Error::Interactive(_)
-        | crate::Error::Backend(_) => TrustError::Refused,
+        | crate::Error::Backend(_)
+        | crate::Error::Sampling(_) => TrustError::Refused,
     }
 }
 fn audit_identity(audit: &GrantAudit) -> (&crate::contracts::ExternalRef, &HouseId) {

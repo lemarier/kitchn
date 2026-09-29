@@ -108,6 +108,10 @@ pub struct Sample {
     pub reserved_at: Timestamp,
     /// Result supplied by the adapter, or none for an interrupted/in-flight sample.
     pub result: Option<SampleResult>,
+    /// When the result was recorded; a result can arrive after the deadline.
+    /// Absent for samples recorded before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<Timestamp>,
 }
 
 /// Whether this call created a reservation or merely recovered one.
@@ -229,6 +233,9 @@ impl Inspection {
                 || u32::try_from(index + 1).ok() != Some(sample.number)
                 || sample.reserved_at < earliest
                 || sample.reserved_at >= self.plan.deadline
+                || sample.finished_at.is_some_and(|finished| {
+                    sample.result.is_none() || finished < sample.reserved_at
+                })
             {
                 return Err(TrustError::Invalid);
             }
@@ -418,14 +425,16 @@ impl Ledger {
                 tokens,
                 reserved_at: now,
                 result: None,
+                finished_at: None,
             };
             doc.inspections[index].samples.push(sample.clone());
             Ok(SampleReservation::Reserved(sample))
         })
     }
 
-    /// Record one result once. Late results are retained after cancellation/deadline;
-    /// they grant no new execution. A changed observation requires a new inspection.
+    /// Record one result once, with the time it was recorded. Late results are
+    /// retained after cancellation/deadline; they grant no new execution. A
+    /// changed observation requires a new inspection.
     ///
     /// # Errors
     /// Rejects conflicting outcomes, stale subjects, nonexistent reservations,
@@ -439,7 +448,7 @@ impl Ledger {
         result: SampleResult,
         clock: &dyn Clock,
     ) -> Result<bool, TrustError> {
-        self.fenced(store, clock, |core, doc, _, live| {
+        self.fenced(store, clock, |core, doc, now, live| {
             let inspection = doc
                 .inspections
                 .iter_mut()
@@ -460,6 +469,9 @@ impl Ledger {
                 };
             }
             sample.result = Some(result);
+            // A clock that stepped back still dates the result no earlier
+            // than its reservation.
+            sample.finished_at = Some(now.max(sample.reserved_at));
             Ok(true)
         })
     }

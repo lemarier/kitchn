@@ -383,20 +383,6 @@ struct MessageBody {
     body: Option<String>,
 }
 
-/// The adoption answer: `{}`, or `{"status":"fenced"}`.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AdoptionBody {
-    #[serde(default)]
-    status: Option<AdoptionStatus>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum AdoptionStatus {
-    Fenced,
-}
-
 /// What a 200 adoption response says.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Adoption {
@@ -409,14 +395,15 @@ pub(super) enum Adoption {
 /// Parse a 200 adoption response, or `None` for any body other than the two
 /// the protocol defines.
 pub(super) fn adoption(body: &[u8]) -> Option<Adoption> {
-    // Parsed through a map, since serde also reads a struct from `[]`.
+    // Matched as exact objects: an explicit `null` status, an extra field,
+    // or any other value is not one of the two answers.
     let object = serde_json::from_slice::<serde_json::Map<String, Value>>(body).ok()?;
-    match serde_json::from_value::<AdoptionBody>(Value::Object(object))
-        .ok()?
-        .status
-    {
-        None => Some(Adoption::Adopted),
-        Some(AdoptionStatus::Fenced) => Some(Adoption::Fenced),
+    if object.is_empty() {
+        return Some(Adoption::Adopted);
+    }
+    match (object.len(), object.get("status")) {
+        (1, Some(Value::String(status))) if status == "fenced" => Some(Adoption::Fenced),
+        _ => None,
     }
 }
 
@@ -649,6 +636,8 @@ mod tests {
         for refused in [
             &br#"{"status":"adopted"}"#[..],
             br#"{"status":null,"adopted":true}"#,
+            br#"{"status":null}"#,
+            br#"{"status":"fenced","extra":1}"#,
             br#"{"status":"empty"}"#,
             b"[]",
             b"",

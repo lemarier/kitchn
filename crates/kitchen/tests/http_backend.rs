@@ -275,7 +275,12 @@ fn adoption_needs_the_protocols_answer() -> TestResult {
     backend.adopt_run()?;
     sim.inject(Fault::Raw(200, r#"{"status":"fenced"}"#.into()));
     assert_eq!(backend.adopt_run(), Err(MailboxError::Fenced));
-    for garbage in [r#"{"status":"adopted"}"#, "<html>proxy</html>", ""] {
+    for garbage in [
+        r#"{"status":"adopted"}"#,
+        r#"{"status":null}"#,
+        "<html>proxy</html>",
+        "",
+    ] {
         sim.inject(Fault::Raw(200, garbage.into()));
         assert_eq!(
             backend.adopt_run(),

@@ -509,14 +509,32 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
     }
 }
 
+/// Setup failures need a change on this machine; anything else, including a
+/// kind added to `io::ErrorKind` later, may pass on a retry.
+fn reservation_failure(kind: std::io::ErrorKind) -> BackendUnavailable {
+    use std::io::ErrorKind;
+    match kind {
+        ErrorKind::NotFound
+        | ErrorKind::PermissionDenied
+        | ErrorKind::InvalidInput
+        | ErrorKind::InvalidData
+        | ErrorKind::NotADirectory
+        | ErrorKind::IsADirectory
+        | ErrorKind::ReadOnlyFilesystem
+        | ErrorKind::Unsupported => BackendUnavailable::LocalConfiguration,
+        _ => BackendUnavailable::Transport,
+    }
+}
+
 pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
     match error {
         OrcaError::Timeout => BackendUnavailable::Timeout,
         // Kitchen's own reservation directory failed before any Orca request:
         // a retry cannot help until the local setup changes.
-        OrcaError::ReservationInsideRepository
-        | OrcaError::ReservationRedirected
-        | OrcaError::ReservationUnavailable(_) => BackendUnavailable::LocalConfiguration,
+        OrcaError::ReservationInsideRepository | OrcaError::ReservationRedirected => {
+            BackendUnavailable::LocalConfiguration
+        }
+        OrcaError::ReservationUnavailable(kind) => reservation_failure(*kind),
         OrcaError::Spawn(_)
         | OrcaError::OutputLimit { .. }
         | OrcaError::Io(_)
@@ -1477,6 +1495,36 @@ mod tests {
             read_failure(&OrcaError::Timeout),
             BackendUnavailable::Timeout
         );
+    }
+
+    #[test]
+    fn a_transient_reservation_failure_stays_retryable() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::OutOfMemory,
+        ] {
+            assert_eq!(
+                read_failure(&OrcaError::ReservationUnavailable(kind)),
+                BackendUnavailable::Transport,
+                "{kind:?} can pass on a retry"
+            );
+        }
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::NotADirectory,
+            ErrorKind::ReadOnlyFilesystem,
+        ] {
+            assert_eq!(
+                read_failure(&OrcaError::ReservationUnavailable(kind)),
+                BackendUnavailable::LocalConfiguration,
+                "{kind:?} needs a local setup change"
+            );
+        }
     }
 
     #[test]

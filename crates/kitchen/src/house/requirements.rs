@@ -1,5 +1,8 @@
 use super::HouseError;
-use crate::contracts::{Capability, CapabilitySet};
+use crate::{
+    contracts::{Capability, CapabilitySet, Role},
+    selection::{SelectionError, SelectionRequest, WorkType},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -43,6 +46,28 @@ impl Workflow {
             Self::Dishwasher => "dishwasher",
             Self::Inspector => "inspector",
         }
+    }
+    /// The role a scheduled run of this workflow acts as.
+    pub const fn role(self) -> Role {
+        match self {
+            Self::Pickup => Role::SousChef,
+            Self::Triage | Self::Gardener => Role::Gardener,
+            Self::Gate => Role::Expediter,
+            Self::Dishwasher => Role::Dishwasher,
+            Self::Inspector => Role::Inspector,
+        }
+    }
+    /// The house agent-policy request for a scheduled run: the workflow's
+    /// role, with its name as the work type so a house rule can single out
+    /// scheduled work.
+    ///
+    /// # Errors
+    /// None in practice: every workflow name is a valid work type.
+    pub fn schedule_request(self) -> Result<SelectionRequest, SelectionError> {
+        Ok(SelectionRequest {
+            work_type: Some(WorkType::new(self.as_str())?),
+            ..SelectionRequest::new(self.role())
+        })
     }
 }
 impl std::fmt::Display for Workflow {

@@ -8,6 +8,7 @@ use common::{
     Fixture, ManualClock, TestResult, at, backend_id, creator, credential, grant, house, launch,
     other_house, plan, scheduled, spec, task_id, ttl,
 };
+use kitchen::selection::{AgentSelection, ResolvedSelection};
 use kitchen::{
     BackendId, ConsumerId, Error, TaskId,
     contracts::{
@@ -110,8 +111,9 @@ fn install() -> TestResult<Effect> {
             Recurrence::Hourly,
             Timezone::new("UTC")?,
             Text::new("Run pickup.")?,
-            AgentFamily::Claude,
-        ),
+            ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Claude)),
+        )
+        .into(),
     }
     .into())
 }

@@ -26,7 +26,7 @@ pub enum ScheduleEffect {
     #[serde(rename_all = "camelCase")]
     InstallDisabled {
         /// What to install, including its workflow and consumer scope.
-        schedule: ScheduleSpec,
+        schedule: Box<ScheduleSpec>,
     },
     /// Pause or activate an installed schedule.
     #[serde(rename_all = "camelCase")]

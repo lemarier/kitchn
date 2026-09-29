@@ -5,6 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Fixture, at, scheduled, ttl};
+use kitchen::selection::{AgentSelection, ResolvedSelection};
 use kitchen::{
     BackendId, ConsumerId,
     contracts::{ExternalRef, ResourceKind, ResourceRef, Text},
@@ -156,7 +157,7 @@ fn session_reuse_needs_an_existing_workspace() -> TestResult {
         Recurrence::Weekdays(TimeOfDay::new(9, 0)?),
         Timezone::new("UTC")?,
         Text::new("Triage needs-spec issues.")?,
-        AgentFamily::Codex,
+        ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Codex)),
     );
     assert_eq!(
         spec.clone().with_session_reuse(),
@@ -210,7 +211,7 @@ fn persisted_specs_round_trip_and_revalidate() -> TestResult {
         Recurrence::Weekly(kitchen::scheduling::Weekday::Monday, TimeOfDay::new(9, 30)?),
         Timezone::new("America/Toronto")?,
         Text::new("Garden the issues.")?,
-        AgentFamily::Claude,
+        ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Claude)),
     )
     .with_precheck(Precheck::new(
         vec![Text::new("kitchen")?, Text::new("precheck")?],
@@ -224,6 +225,24 @@ fn persisted_specs_round_trip_and_revalidate() -> TestResult {
     assert_eq!(json["precheck"]["timeout"], 45_000);
     let back: ScheduleSpec = serde_json::from_value(json.clone())?;
     assert_eq!(back, spec);
+    assert_eq!(
+        json["agent"],
+        serde_json::json!({"selection": {"agent": "claude"}, "source": {"type": "owner"}})
+    );
+    // A spec persisted before selections were recorded names only a family,
+    // and loads as that family's default chosen outside the policy.
+    let mut legacy = json.clone();
+    legacy["agent"] = serde_json::json!("codex");
+    assert_eq!(
+        serde_json::from_value::<ScheduleSpec>(legacy)?.agent(),
+        &ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Codex))
+    );
+    let mut unknown_family = json.clone();
+    unknown_family["agent"] = serde_json::json!("gemini");
+    assert!(serde_json::from_value::<ScheduleSpec>(unknown_family).is_err());
+    let mut bad_model = json.clone();
+    bad_model["agent"]["selection"]["model"] = serde_json::json!("-rf");
+    assert!(serde_json::from_value::<ScheduleSpec>(bad_model).is_err());
 
     let mut reuse_without_workspace = json.clone();
     reuse_without_workspace["reuseSession"] = serde_json::Value::Bool(true);
@@ -258,6 +277,7 @@ fn an_agent_that_never_became_ready_is_a_launch_failure() {
         scheduled_for: Some(due),
         created_at: None,
         usage: Measurement::Missing,
+        agent: None,
     };
     let within = due.saturating_add(Duration::from_secs(60));
     let past = due.saturating_add(Duration::from_secs(601));
@@ -279,6 +299,7 @@ fn an_agent_that_never_became_ready_is_a_launch_failure() {
         scheduled_for: None,
         created_at: None,
         usage: Measurement::Missing,
+        agent: None,
     };
     assert_eq!(
         run_verdict(&undated, false, past, deadline),
@@ -296,6 +317,7 @@ fn an_agent_that_never_became_ready_is_a_launch_failure() {
             scheduled_for: Some(due),
             created_at: None,
             usage: Measurement::Missing,
+            agent: None,
         };
         assert_eq!(
             run_verdict(&run, true, past, deadline),
@@ -341,6 +363,7 @@ fn run(outcome: RunOutcome, due_seconds: Option<u64>) -> ScheduleRun {
         scheduled_for: due_seconds.map(at),
         created_at: None,
         usage: Measurement::Missing,
+        agent: None,
     }
 }
 

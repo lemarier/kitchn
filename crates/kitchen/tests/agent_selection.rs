@@ -12,8 +12,8 @@ use common::{
     Fixture, ManualClock, TestResult, at, commit, creator, house, scheduled, task_id, ttl,
 };
 use kitchen::{
-    BackendId, CredentialId, Error, TaskId,
-    adapters::orca::{OrcaBackend, OrcaConfig, WORKER_SELECTION},
+    BackendId, ConsumerId, CredentialId, Error, TaskId,
+    adapters::orca::{OrcaBackend, OrcaConfig, OrcaError, WORKER_SELECTION},
     adoption::HouseRegistry,
     contracts::{
         AttemptNumber, AttemptOutcome, BranchName, Capability, CapabilityRequirements, Effect,
@@ -21,11 +21,12 @@ use kitchen::{
         Fence, Grant, HouseGrants, IdempotencyKey, NotAppliedReason, Operation, Permission,
         Provenance, Repository, RetryPolicy, Role, TaskAuthority, TaskSpec, Text, Workspace,
     },
-    contracts::{CapabilitySet, ContractError, fake::FakeBackend},
+    contracts::{CapabilitySet, ContractError, Support, fake::FakeBackend},
     house::{
-        AccessStatus, DoctorCode, DoctorEvidence, HouseConfig, HouseError, RepositoryConfig, doctor,
+        AccessStatus, DoctorCode, DoctorEvidence, HouseConfig, HouseError, RepositoryConfig,
+        Workflow, doctor,
     },
-    scheduling::AgentFamily,
+    scheduling::{AgentFamily, Recurrence, ScheduleSpec, Timezone, WorkflowName},
     selection::{
         AgentModel, AgentPolicy, AgentSelection, EffortLevel, EffortSupport, MAX_SELECTION_RULES,
         OfferedModels, ResolvedSelection, RuleMatch, SelectionError, SelectionGap,
@@ -461,6 +462,67 @@ fn doctor_reports_configured_models_the_agents_do_not_offer() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn doctor_reports_scheduled_workflows_the_schedule_backend_cannot_select_for() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let registry = HouseRegistry::new(temp.path().canonicalize()?.join("registry"))?;
+    // Pickup falls to the model-naming default; gardener has a family-only
+    // rule; triage (also the gardener role) names only an effort.
+    let agents = json!({
+        "default": {"agent": "codex", "model": "gpt-6-sol"},
+        "rules": [
+            {"when": {"role": "gardener"}, "use": {"agent": "claude"}},
+            {"when": {"role": "gardener", "workType": "triage"}, "use": {"agent": "codex", "effort": "low"}}
+        ]
+    });
+    let house = house_config(agents.clone())?;
+    registry.initialize(&house)?;
+    let repository: RepositoryConfig = serde_json::from_value(json!({
+        "schema": 2, "house": "origin89", "repository": "origin89hq/firmware",
+        "workflows": ["pickup", "gardener", "triage"], "additionalReviewers": [], "additionalChecks": [],
+    }))?;
+    let evidence = |support: Support| -> TestResult<DoctorEvidence> {
+        Ok(DoctorEvidence {
+            house: house.house.clone(),
+            repository: firmware()?,
+            capabilities: CapabilitySet::new().with(Capability::AgentSelectModel, support),
+            labels: None,
+            access: AccessStatus::Unobserved,
+            schedules: None,
+            agent_models: None,
+            stack_tool: None,
+            readiness: None,
+        })
+    };
+    let schedule_findings = |evidence: Option<&DoctorEvidence>| -> TestResult<Vec<String>> {
+        Ok(doctor(&registry, &repository, evidence)?
+            .findings
+            .into_iter()
+            .filter(|finding| finding.code == DoctorCode::ScheduleAgent)
+            .map(|finding| finding.message)
+            .collect())
+    };
+
+    // Orca declares model selection partial: automations take only a provider.
+    let partial = evidence(Support::Partial)?;
+    let [pickup, triage] = schedule_findings(Some(&partial))?
+        .try_into()
+        .map_err(|_| "two findings")?;
+    assert!(
+        pickup.starts_with("Scheduled pickup resolves to codex model gpt-6-sol,"),
+        "{pickup}"
+    );
+    assert!(
+        triage.starts_with("Scheduled triage resolves to codex effort low,"),
+        "{triage}"
+    );
+    // Unobserved capabilities are not success either.
+    assert_eq!(schedule_findings(None)?.len(), 2);
+    // A schedule backend that can select a model enforces the selection.
+    assert!(schedule_findings(Some(&evidence(Support::Supported)?))?.is_empty());
+    Ok(())
+}
+
 // --- Store and Orca adapter: record, launch, retry, and policy change. ---
 
 fn orca_id() -> TestResult<BackendId> {
@@ -704,6 +766,88 @@ fn a_retry_launches_with_the_recorded_selection_after_a_policy_change() -> TestR
             .agent
             .as_ref(),
         Some(&now_resolves)
+    );
+    Ok(())
+}
+
+fn pickup_schedule(agent: ResolvedSelection) -> TestResult<ScheduleSpec> {
+    Ok(ScheduleSpec::new(
+        WorkflowName::new("pickup")?,
+        ConsumerId::new("pickup")?,
+        Recurrence::Hourly,
+        Timezone::new("UTC")?,
+        Text::new("Run Kitchen pickup.")?,
+        agent,
+    ))
+}
+
+#[test]
+fn a_scheduled_trigger_stays_family_only_and_its_worker_carries_the_model() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let trigger = Workflow::Pickup.schedule_request()?;
+
+    // A policy whose default names a model cannot install the trigger:
+    // Orca automations would run the agent's default model instead.
+    let unscoped: AgentPolicy =
+        serde_json::from_value(json!({"default": {"agent": "codex", "model": "gpt-6-sol"}}))?;
+    let refused = unscoped.resolve(&trigger);
+    assert_eq!(
+        backend.install_schedule(&pickup_schedule(refused)?),
+        Err(OrcaError::Selection(SelectionError::Unsupported {
+            agent: AgentFamily::Codex,
+            gaps: vec![SelectionGap::Model],
+        }))
+    );
+    assert!(sim.calls_to(&["automations", "create"]).is_empty());
+
+    // A family-only rule for scheduled pickup installs the cheap trigger.
+    let policy: AgentPolicy = serde_json::from_value(json!({
+        "default": {"agent": "codex", "model": "gpt-6-sol"},
+        "rules": [{"when": {"role": "sous-chef", "workType": "pickup"}, "use": {"agent": "codex"}}]
+    }))?;
+    let scheduled_pickup = policy.resolve(&trigger);
+    assert_eq!(scheduled_pickup.source, SelectionSource::HouseRule);
+    backend.install_schedule(&pickup_schedule(scheduled_pickup)?)?;
+    let creates = sim.calls_to(&["automations", "create"]);
+    let create = creates.first().ok_or("one create")?;
+    assert_eq!(flag(create, "provider").as_deref(), Some("codex"));
+    assert_eq!(flag(create, "model"), None);
+
+    // The work the trigger hands off launches as a worker with the model the
+    // same policy resolves for it, recorded on the task.
+    let fixture = Fixture::new()?;
+    let clock = ManualClock::starting_at(1);
+    let work = policy.resolve(&SelectionRequest::new(Role::StationCook));
+    let task = task_id("task-picked")?;
+    fixture
+        .store
+        .create_task(spec("task-picked", Some(work.clone()))?, &creator()?, at(0))?;
+    let fence = fixture
+        .store
+        .claim(&task, &scheduled("pickup")?, ttl(600)?, at(0))?
+        .fence();
+    fixture.store.start_attempt(&task, fence, at(0))?;
+    let launched = run_effect(
+        &fixture.store,
+        &backend,
+        &grants()?,
+        plan(
+            &task,
+            fence,
+            "launch",
+            launch(Some(work.selection.clone()))?,
+        )?,
+        &clock,
+    )?;
+    assert!(matches!(launched.state(), EffectState::Applied { .. }));
+    assert_eq!(
+        starts(&sim),
+        vec![owned(("codex", Some("gpt-6-sol"), None))]
+    );
+    assert_eq!(
+        fixture.store.task(&task)?.spec().agent.as_ref(),
+        Some(&work)
     );
     Ok(())
 }

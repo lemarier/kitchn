@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConsumerId,
     contracts::{ResourceRef, Timestamp},
+    selection::AgentSelection,
     state::{ConsumerEvent, ConsumerRecord},
     trust::Measurement,
 };
@@ -71,6 +72,13 @@ pub struct ScheduleRun {
     /// Tokens the run used as the backend reports them. A backend that
     /// reports no usage leaves it missing or unavailable, never zero.
     pub usage: Measurement<u64>,
+    /// The selection the run launched with, as the backend reports it, for
+    /// attributing its usage and outcome. `None` when the backend did not
+    /// show one, and never inferred from the schedule's current definition,
+    /// which may have changed since the run. A backend that records only a
+    /// family reports that family's default, never a model it did not launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentSelection>,
 }
 
 /// How a scheduled run ended, once readiness evidence is taken into account.

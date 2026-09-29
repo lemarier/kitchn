@@ -105,6 +105,16 @@ pub const WORKER_SELECTION: SelectionSupport = SelectionSupport {
     effort: EffortSupport::WithModel,
 };
 
+/// What `automations create` can launch: both agent families through
+/// `--provider`, with no model or effort option (checked on Orca 1.4.216).
+/// A schedule whose selection names either is refused, not run on the
+/// agent's default model.
+pub const SCHEDULE_SELECTION: SelectionSupport = SelectionSupport {
+    families: &[AgentFamily::Claude, AgentFamily::Codex],
+    model: false,
+    effort: EffortSupport::Unsupported,
+};
+
 /// Where and as whom one backend instance acts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrcaConfig {
@@ -570,7 +580,8 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::BranchTaken { .. }
         | OrcaError::ScheduleActive
         | OrcaError::ScheduleDiffers { .. }
-        | OrcaError::ScheduleLimit(_) => not_applied(),
+        | OrcaError::ScheduleLimit(_)
+        | OrcaError::Selection(_) => not_applied(),
         OrcaError::Refused { .. }
         | OrcaError::OutputLimit { .. }
         | OrcaError::NoResult { .. }
@@ -637,6 +648,7 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::ScheduleActive
         | OrcaError::ScheduleDiffers { .. }
         | OrcaError::ScheduleLimit(_)
+        | OrcaError::Selection(_)
         | OrcaError::ReservationBusy
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::BranchTaken { .. }

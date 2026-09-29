@@ -21,9 +21,9 @@ use crate::{
     },
     integrations::github::{GitHubClient, GitHubReadTransport, Issue as GitHubIssue, IssueState},
     scheduling::{
-        self, AgentFamily, PrecheckTimeout, Recurrence, ScheduleSpec, TimeOfDay, Timezone,
-        WorkflowName,
+        self, PrecheckTimeout, Recurrence, ScheduleSpec, TimeOfDay, Timezone, WorkflowName,
     },
+    selection::ResolvedSelection,
     state::{
         HouseStore, MarkerFact, MarkerKey, MarkerRecording, MarkerSchema, MarkerSubject, WorkItem,
     },
@@ -170,7 +170,10 @@ fn absolute(path: &Path) -> Result<&str, WorkflowError> {
 
 /// The effect that installs the gardener's daily schedule for `consumer`,
 /// paused. There is no gardener path that activates it: turning it on is a
-/// separate schedule effect under its own permission.
+/// separate schedule effect under its own permission. `agent` is the house
+/// policy's resolution for
+/// [`Workflow::Gardener`](crate::house::Workflow::Gardener)'s
+/// [`schedule_request`](crate::house::Workflow::schedule_request).
 ///
 /// # Errors
 /// Refuses invalid precheck arguments.
@@ -178,7 +181,7 @@ pub fn install(
     consumer: ConsumerId,
     at: TimeOfDay,
     timezone: Timezone,
-    agent: AgentFamily,
+    agent: ResolvedSelection,
     precheck: &PrecheckArgs,
 ) -> Result<Effect, WorkflowError> {
     let invalid = |_| WorkflowError::IncompleteEvidence;
@@ -202,7 +205,7 @@ pub fn install(
     )
     .with_precheck(check);
     Ok(Effect::Schedule(ScheduleEffect::InstallDisabled {
-        schedule,
+        schedule: schedule.into(),
     }))
 }
 

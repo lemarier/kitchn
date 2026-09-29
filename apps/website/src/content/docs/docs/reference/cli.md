@@ -11,6 +11,14 @@ description: Every kitchn command, its flags and exit codes.
 | `1` | Conflict, refusal, execution or output failure, or doctor findings remain. |
 | `2` | Invalid input. |
 
+Scheduled prechecks (`gardener precheck`, `budget precheck`) use their own
+codes: `0` when there is work to do, `1` when there is none, `2` for invalid
+input and `3` when their inputs cannot be read. `decompose preview` exits `1`
+while ownership overlaps are unordered.
+
+Commands that take `--store` need the house's state store. It must already exist;
+no command creates one yet.
+
 ## `kitchn house init`
 
 Register a house and pin its guidance. Grants no authority and activates no
@@ -34,6 +42,8 @@ brackets. Each question has a flag:
 | `--sous-chef`, `--station-cook`, `--expediter` `<claude\|codex>` | Claude Code at the pass, Codex at the stations |
 | `--required-checks <name,...\|none>` | the default branch's required checks, when `--github-requester`, `--github-credential`, `--github-credential-file` and `--gh` can read them; otherwise asked |
 | `--required-reviewers <name,...\|none>` | `expediter` |
+| `--forge-requester <login\|none>` | the logged-in `gh` account, else none. Stores a [forge binding](/docs/concepts/houses/#the-forge-binding), never a credential |
+| `--forge-credential <name>` | `github` |
 | `--kitchen <commit>` | the commit the binary was built from, when it records one |
 | `--bundle <bundle.json>` | kitchn's default guidance, pinned at the kitchn commit |
 | `--yes` | ask before registering |
@@ -116,11 +126,131 @@ kitchn adopt <dir> --registry <dir> --template <name> [options]
 
 | Option | Description |
 | --- | --- |
-| `--house <id>` | Required for an unbound repository. |
-| `--repository <owner/name>` | Required for an unbound repository. |
+| `--house <id>` | Required for an unbound repository; never inferred. |
+| `--repository <owner/name>` | Defaults to the repository the target checkout's remotes name. The binding is stored in the registry, never in the target. |
 | `--set <name=value>` | Template variable, repeatable. |
 | `--confirm` | Print the preview, then ask. |
 | `--yes` | Apply without asking. |
+
+## `kitchn forge bind` and `kitchn forge show`
+
+Bind a house to the GitHub account it writes as. kitchn stores no credential:
+the token stays in a file you place in the house's private registry directory.
+
+```sh
+kitchn forge bind --registry <dir> --house <id> --requester <login> [--credential github] [--posting-budget 20]
+kitchn forge show --registry <dir> --house <id>
+```
+
+`--posting-budget` caps the writes one task may make (0 to 100). House policy
+limits for forge writes must name the credential. `show` exits 1 when the token
+file is not in place.
+
+## `kitchn work`, `kitchn pr` and `kitchn hand-back`
+
+The entrypoints behind the [`/kitchn` skill](/docs/guides/sessions/). Each
+prints a plan and takes a durable claim shared with scheduled runs.
+
+```sh
+kitchn work <issue> --facts <issue.json> --revision <sha> --registry <dir> --store <dir> --holder <you> [--json]
+kitchn pr <number> --facts <pr.json> [--as review|follow-up|repair|gate] --revision <sha> --registry <dir> --store <dir> --holder <you> [--json]
+kitchn hand-back <task> --registry <dir> --store <dir> --holder <you>
+```
+
+| Option | Description |
+| --- | --- |
+| `--facts <file>` | What the session read from the forge: issue status and sub-issues, or pull request state at one head. |
+| `--revision <sha>` | The commit whose repository instructions are pinned, such as `git rev-parse HEAD`. |
+| `--orca-status <file>`, `--orca-worktree <file>` | Captured `orca status --json` and `orca worktree current --json`. Without them the session works as a single agent. |
+| `--repository-path <dir>` | A path inside the checkout (default: the current directory). |
+| `--lease-minutes <n>` | Claim lease (default: 120). |
+| `--take-over` | Take a claim whose lease expired without a hand-back. |
+| `--as <intent>` | `pr` only. Routed from the facts when omitted. |
+| `--fix-rounds <n>` | `pr` only. Lowers the house's fix-round budget; it cannot raise it. |
+
+## `kitchn issue`
+
+Preview an issue draft. Posts nothing.
+
+```sh
+kitchn issue new --draft <draft.json> --revision <sha> --registry <dir> [--json]
+kitchn issue refine <issue> --draft <draft.json> --revision <sha> --registry <dir> [--json]
+kitchn issue acknowledge <task> --reason <text> [--accept-unknown] --registry <dir> --store <dir> --holder <you>
+```
+
+`acknowledge` releases the subject of a draft that settled after writing, or
+possibly writing, to the forge. Check those writes first. `--accept-unknown`
+releases it even when a write's outcome is unknown.
+
+## `kitchn decompose`
+
+Preview a project split into dependency-linked issues. Writes nothing.
+
+```sh
+kitchn decompose preview --proposal <proposal.json> [--json]
+kitchn decompose acknowledge --store <dir> --house <id> --task <task> --holder <you> --reason <text>
+```
+
+`preview` prints a digest and exits 0 when the proposal can be approved, 1 while
+ownership overlaps are unordered, and 2 for an invalid proposal such as a
+dependency cycle. `acknowledge` releases the repository from an earlier
+decomposition that settled without success after writing, or possibly writing,
+to the forge. Check the forge for that task's issues first: kitchn cannot
+re-read it, so every write not proven applied is recorded as unproven.
+
+## `kitchn cleanup`
+
+Preview what the dishwasher would release, and record your approval.
+Releases nothing.
+
+```sh
+kitchn cleanup preview --store <dir> --house <id> --inventory <inventory.json> [--remote origin] [--trigger manual] [--json]
+kitchn cleanup approve --store <dir> --house <id> --inventory <inventory.json> --holder <you> --digest <sha256:...>
+```
+
+The inventory is a snapshot exported from the backend; Git reads each listed
+worktree path. A commit that no `--remote` tracking ref contains is unpushed, so
+a worktree holding it is kept. `--trigger` is `manual`, `schedule` or
+`disk-pressure`. A scheduled run acts only on steps a person approved by
+digest, and only while the evidence still matches. Run `approve` yourself: the
+command cannot tell a person from a script.
+
+## `kitchn gardener precheck`
+
+The daily hygiene schedule's precheck. Reads GitHub and the store; writes
+nothing.
+
+```sh
+kitchn gardener precheck --house <id> --repository <owner/name> --requester <login> \
+  --credential <name> --credential-file <path> --gh <path> \
+  --ready-label <label> --working-label <label> --lookback-hours <1-168> --stale-days <1-365> [--store <dir>]
+```
+
+## `kitchn budget`
+
+The schedule budget tick: pause schedules that exhausted their usage budget and
+report them to the owner.
+
+```sh
+kitchn budget precheck --registry <dir> --house <id> --store <dir> --orca <path> --backend <id> --credential <name> --runtime-dir <dir>
+kitchn budget run      [same options] [report options]
+kitchn budget install  [same options] [report options] --kitchen <path> --cron "15 * * * *" --timezone <tz> --agent claude|codex
+```
+
+Report options (`--report-issue owner/repo#n`, `--github-backend`,
+`--requester`, `--github-credential`, `--credential-file`, `--gh`) name where
+and as whom the owner report is posted. `run` exits 1 when a pause or report
+did not go through. `install` adds the tick's schedule paused; activating it is
+the owner's separate decision.
+
+## `kitchn pickup`
+
+Offline pickup diagnostics.
+
+```sh
+kitchn pickup task-id <owner/name> <issue>   # the task id scheduled and interactive work share
+kitchn pickup check-branch <name>            # validate a worker branch name without Git
+```
 
 ## `kitchn validate-house` and `kitchn validate-task`
 

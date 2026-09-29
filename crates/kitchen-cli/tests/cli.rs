@@ -20,7 +20,7 @@ fn help_and_default_invocation_explain_the_available_surface() -> Result<(), Box
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout)?;
         assert!(stdout.contains("Usage: kitchen"));
-        assert!(stdout.contains("not implemented yet"));
+        assert!(stdout.contains("https://getkitchn.com/docs/"));
         assert!(output.stderr.is_empty());
     }
     Ok(())

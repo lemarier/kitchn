@@ -2,7 +2,9 @@
 //!
 //! A [`BackendBinding`] in [`super::HouseConfig`] names the backend kind, the
 //! backend namespace house grants name, and the credential that backend acts
-//! under. It holds names only, never a credential value. The kind is stored as
+//! under. It holds names only, never a credential value. An HTTP backend's
+//! binding also holds its [`HttpEndpoint`]; its bearer token stays in the
+//! house's private registry directory. The kind is stored as
 //! its name so a house bound to a backend this Kitchen does not know still
 //! loads, and is refused by name where a backend is built
 //! ([`crate::adapters::resolve_backend`]).
@@ -19,17 +21,21 @@ use crate::{BackendId, CredentialId, IdentifierError, id::validate_identifier};
 pub enum BackendKind {
     /// The Orca desktop orchestrator, through the `orca` CLI.
     Orca,
+    /// Any service implementing Kitchen's HTTP worker protocol
+    /// ([`crate::adapters::http`]), such as a hosted sandbox control plane.
+    Http,
 }
 
 impl BackendKind {
     /// Every backend this Kitchen can build.
-    pub const ALL: [Self; 1] = [Self::Orca];
+    pub const ALL: [Self; 2] = [Self::Orca, Self::Http];
 
     /// The name a binding stores.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Orca => "orca",
+            Self::Http => "http",
         }
     }
 }
@@ -107,6 +113,99 @@ impl fmt::Display for BackendName {
     }
 }
 
+/// Longest accepted [`HttpEndpoint`], in bytes.
+pub const MAX_ENDPOINT_BYTES: usize = 512;
+
+/// A rejected [`HttpEndpoint`]. The input is deliberately excluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "an HTTP backend endpoint must be an https URL, or http to a loopback host, of at most 512 bytes, without user information, query, fragment, quotes, or spaces"
+)]
+pub struct EndpointError;
+
+/// The base URL of an HTTP worker backend, such as
+/// `https://sandbox.example.com/kitchen`.
+///
+/// It must use `https`, except plain `http` to a loopback host
+/// (`127.0.0.1`, `localhost`, `[::1]`) for a service on the same machine. It
+/// carries no user information, query, or fragment, so no credential can
+/// hide in it, and no whitespace, quote, or control character. A trailing
+/// slash is dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct HttpEndpoint(String);
+
+impl HttpEndpoint {
+    /// Validate an endpoint.
+    ///
+    /// # Errors
+    /// [`EndpointError`] for an endpoint outside the rules above.
+    pub fn new(value: &str) -> Result<Self, EndpointError> {
+        let value = value.strip_suffix('/').unwrap_or(value);
+        let rest = value
+            .strip_prefix("https://")
+            .or_else(|| {
+                value
+                    .strip_prefix("http://")
+                    .filter(|rest| Self::is_loopback(rest))
+            })
+            .ok_or(EndpointError)?;
+        let host = rest.split('/').next().unwrap_or_default();
+        if value.len() > MAX_ENDPOINT_BYTES
+            || host.is_empty()
+            || host.contains('@')
+            || value.contains(['?', '#', '"', '\\', '\''])
+            || value.bytes().any(|byte| !byte.is_ascii_graphic())
+        {
+            return Err(EndpointError);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    fn is_loopback(rest: &str) -> bool {
+        let authority = rest.split('/').next().unwrap_or_default();
+        let host = authority
+            .rsplit_once(':')
+            .filter(|(host, port)| {
+                !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+            })
+            .map_or(authority, |(host, _)| host);
+        matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+    }
+
+    /// Whether the endpoint uses plain `http`, which only a loopback host may.
+    #[must_use]
+    pub fn is_plain_http(&self) -> bool {
+        self.0.starts_with("http://")
+    }
+
+    /// The URL as stored.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for HttpEndpoint {
+    type Error = EndpointError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(&value)
+    }
+}
+
+impl From<HttpEndpoint> for String {
+    fn from(endpoint: HttpEndpoint) -> Self {
+        endpoint.0
+    }
+}
+
+impl fmt::Display for HttpEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// Which worker backend a house uses. Contains no credential value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -116,8 +215,13 @@ pub struct BackendBinding {
     /// Backend namespace; house grants for this backend's effects name it.
     pub backend: BackendId,
     /// The credential the backend acts under, by name. For Orca, the host
-    /// session it runs with.
+    /// session it runs with; for HTTP, the bearer token file
+    /// `private/<house>/credentials/<credential>` in the house registry.
     pub credential: CredentialId,
+    /// Where an HTTP backend listens. Required for `http`, refused for
+    /// every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<HttpEndpoint>,
 }
 
 #[cfg(test)]
@@ -149,12 +253,62 @@ mod tests {
     }
 
     #[test]
+    fn an_http_binding_round_trips_with_its_endpoint() -> Result<(), Box<dyn std::error::Error>> {
+        let text = r#"{"kind":"http","backend":"sandbox","credential":"sandbox-token","endpoint":"https://sandbox.example.com/kitchen"}"#;
+        let binding: BackendBinding = serde_json::from_str(text)?;
+        assert_eq!(binding.kind.kind(), Some(BackendKind::Http));
+        assert_eq!(
+            binding.endpoint.as_ref().map(HttpEndpoint::as_str),
+            Some("https://sandbox.example.com/kitchen")
+        );
+        assert_eq!(serde_json::to_string(&binding)?, text);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoints_are_https_or_loopback_http_without_hidden_credentials() {
+        for accepted in [
+            "https://sandbox.example.com",
+            "https://sandbox.example.com:8443/kitchen/",
+            "http://127.0.0.1:9000",
+            "http://localhost/api",
+            "http://[::1]:8080",
+        ] {
+            assert!(HttpEndpoint::new(accepted).is_ok(), "{accepted}");
+        }
+        assert_eq!(
+            HttpEndpoint::new("https://example.com/base/").map(String::from),
+            Ok("https://example.com/base".to_owned())
+        );
+        assert!(HttpEndpoint::new("http://127.0.0.1:9000").is_ok_and(|e| e.is_plain_http()));
+        for refused in [
+            "",
+            "https://",
+            "http://sandbox.example.com",
+            "http://127.0.0.1.example.com",
+            "http://localhost:x",
+            "ftp://example.com",
+            "https://user:secret@example.com",
+            "https://example.com/?token=secret",
+            "https://example.com/#frag",
+            "https://exa mple.com",
+            "https://example.com/\"x",
+            "https://example.com/\n",
+        ] {
+            assert_eq!(HttpEndpoint::new(refused), Err(EndpointError), "{refused}");
+        }
+        let long = format!("https://example.com/{}", "a".repeat(MAX_ENDPOINT_BYTES));
+        assert_eq!(HttpEndpoint::new(&long), Err(EndpointError));
+    }
+
+    #[test]
     fn malformed_bindings_are_rejected() {
         for invalid in [
             r#"{"kind":"","backend":"orca","credential":"c"}"#,
             r#"{"kind":"or ca","backend":"orca","credential":"c"}"#,
             r#"{"kind":"orca","backend":"orca"}"#,
             r#"{"kind":"orca","backend":"orca","credential":"c","token":"secret"}"#,
+            r#"{"kind":"http","backend":"b","credential":"c","endpoint":"https://u:p@example.com"}"#,
         ] {
             assert!(
                 serde_json::from_str::<BackendBinding>(invalid).is_err(),

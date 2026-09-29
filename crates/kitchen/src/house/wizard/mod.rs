@@ -511,12 +511,14 @@ pub fn plan_house_init(
         "Worker backend",
         Some(Offer {
             value: DEFAULT_WORKER_BACKEND.as_str().to_owned(),
-            note: Some("the only one this Kitchen supports"),
+            note: Some("the only one guided init sets up"),
         }),
+        // An HTTP backend also needs its endpoint, which init does not ask.
         |text| {
             BackendName::new(text)
                 .ok()
                 .and_then(|name| name.kind())
+                .filter(|kind| *kind == BackendKind::Orca)
                 .ok_or(())
         },
     )?;
@@ -762,6 +764,7 @@ fn default_binding(kind: BackendKind) -> Result<BackendBinding, HouseError> {
         kind: kind.into(),
         backend: BackendId::new(kind.as_str()).map_err(invalid)?,
         credential: CredentialId::new(kind.as_str()).map_err(invalid)?,
+        endpoint: None,
     })
 }
 

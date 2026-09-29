@@ -48,6 +48,7 @@ fn bound_house() -> TestResult<HouseConfig> {
             kind: BackendKind::Orca.into(),
             backend: BackendId::new("orca-local")?,
             credential: CredentialId::new("orca-host-session")?,
+            endpoint: None,
         }),
         ..legacy_house()?
     })
@@ -225,6 +226,7 @@ fn orca_default() -> TestResult<BackendBinding> {
         kind: BackendKind::Orca.into(),
         backend: BackendId::new("orca")?,
         credential: CredentialId::new("orca")?,
+        endpoint: None,
     })
 }
 
@@ -300,7 +302,7 @@ fn guided_init_offers_orca_and_asks_again_for_an_unknown_backend() -> TestResult
         prompter
             .transcript
             .iter()
-            .any(|line| line == "Worker backend [orca, the only one this Kitchen supports]: "),
+            .any(|line| line == "Worker backend [orca, the only one guided init sets up]: "),
         "{:?}",
         prompter.transcript
     );
@@ -317,7 +319,8 @@ fn guided_init_offers_orca_and_asks_again_for_an_unknown_backend() -> TestResult
 #[test]
 fn guided_init_refuses_an_unknown_backend_flag() -> TestResult {
     let (_temp, home) = temp_home()?;
-    for unknown in ["sandbox", "Orca", ""] {
+    // `http` is a known kind, but guided init cannot ask for its endpoint.
+    for unknown in ["sandbox", "Orca", "", "http"] {
         let answers = InitAnswers {
             worker_backend: Some(unknown.to_owned()),
             ..flags(&home.join("registry"))

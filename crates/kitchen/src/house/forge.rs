@@ -450,10 +450,12 @@ pub fn credential_status(
     registry: &HouseRegistry,
     binding: &ForgeBinding,
 ) -> Result<CredentialStatus, ForgeError> {
-    Ok(match open_credential(registry, binding)? {
-        Ok(_) => CredentialStatus::Ready,
-        Err(status) => status,
-    })
+    Ok(
+        match open_credential(registry, &binding.house, &binding.credential)? {
+            Ok(_) => CredentialStatus::Ready,
+            Err(status) => status,
+        },
+    )
 }
 
 /// Open the registry root as a directory descriptor, or `None` when the path
@@ -469,7 +471,7 @@ pub fn credential_status(
 fn open_registry_root(
     root: &std::path::Path,
     after_resolve: impl FnOnce(),
-) -> Result<Option<rustix::fd::OwnedFd>, ForgeError> {
+) -> Result<Option<rustix::fd::OwnedFd>, HouseError> {
     use rustix::{
         fs::{Mode, OFlags, open},
         io::Errno,
@@ -483,7 +485,7 @@ fn open_registry_root(
     let descriptor = match open(&canonical, flags, Mode::empty()) {
         Ok(descriptor) => descriptor,
         Err(Errno::LOOP | Errno::NOTDIR | Errno::NOENT) => return Ok(None),
-        Err(error) => return Err(HouseError::from(std::io::Error::from(error)).into()),
+        Err(error) => return Err(HouseError::from(std::io::Error::from(error))),
     };
     let opened = File::from(descriptor);
     let actual = opened.metadata().map_err(HouseError::from)?;
@@ -493,34 +495,37 @@ fn open_registry_root(
     Ok(Some(opened.into()))
 }
 
-/// Open the token file at [`credential_path`] from the registry root, one
-/// name at a time, refusing a link at every step below the canonical root.
+/// Open the credential file `private/<house>/credentials/<credential>`, the
+/// forge binding's [`credential_path`] or a worker backend's token, from the
+/// registry root, one name at a time, refusing a link at every step below
+/// the canonical root.
 /// Path components above the canonical registry root are trusted system or
 /// user configuration. Ownership, type, and mode
 /// are checked on the opened descriptor, which the caller reads the token
 /// from, so replacing the file after the check cannot change what is read.
 #[cfg(unix)]
-fn open_credential(
+pub(crate) fn open_credential(
     registry: &HouseRegistry,
-    binding: &ForgeBinding,
-) -> Result<Result<File, CredentialStatus>, ForgeError> {
+    house: &HouseId,
+    credential: &CredentialId,
+) -> Result<Result<File, CredentialStatus>, HouseError> {
     use rustix::{
         fs::{Mode, OFlags, openat},
         io::Errno,
     };
     use std::os::unix::fs::MetadataExt;
 
-    fn failed(error: Errno) -> ForgeError {
-        HouseError::from(std::io::Error::from(error)).into()
+    fn failed(error: Errno) -> HouseError {
+        HouseError::from(std::io::Error::from(error))
     }
 
     // Loads the house and refuses a private directory inside a repository.
-    registry.private_path(&binding.house)?;
+    registry.private_path(house)?;
     let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     let Some(mut parent) = open_registry_root(registry.root(), || {})? else {
         return Ok(Err(CredentialStatus::Redirected));
     };
-    for name in ["private", binding.house.as_str(), CREDENTIALS] {
+    for name in ["private", house.as_str(), CREDENTIALS] {
         parent = match openat(&parent, name, directory | OFlags::NOFOLLOW, Mode::empty()) {
             Ok(child) => child,
             Err(Errno::NOENT) => return Ok(Err(CredentialStatus::Missing)),
@@ -531,13 +536,13 @@ fn open_credential(
     // Non-blocking, so a FIFO placed there cannot stall the open.
     let token =
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
-    let file = match openat(&parent, binding.credential.as_str(), token, Mode::empty()) {
+    let file = match openat(&parent, credential.as_str(), token, Mode::empty()) {
         Ok(descriptor) => File::from(descriptor),
         Err(Errno::NOENT) => return Ok(Err(CredentialStatus::Missing)),
         Err(Errno::LOOP) => return Ok(Err(CredentialStatus::NotRegularFile)),
         Err(error) => return Err(failed(error)),
     };
-    let metadata = file.metadata().map_err(HouseError::from)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Ok(Err(CredentialStatus::NotRegularFile));
     }
@@ -552,12 +557,13 @@ fn open_credential(
 
 /// Without no-follow opens and owner checks, no token file is trusted.
 #[cfg(not(unix))]
-fn open_credential(
+pub(crate) fn open_credential(
     registry: &HouseRegistry,
-    binding: &ForgeBinding,
-) -> Result<Result<File, CredentialStatus>, ForgeError> {
-    registry.private_path(&binding.house)?;
-    Err(HouseError::Io(std::io::ErrorKind::Unsupported).into())
+    house: &HouseId,
+    _credential: &CredentialId,
+) -> Result<Result<File, CredentialStatus>, HouseError> {
+    registry.private_path(house)?;
+    Err(HouseError::Io(std::io::ErrorKind::Unsupported))
 }
 
 /// A previewed forge write that a person approves by its digest, such as an
@@ -660,7 +666,7 @@ fn executor<T: GitHubMutationTransport>(
     connect: impl FnOnce(ForgeCredential) -> Result<T, ForgeError>,
 ) -> Result<GitHubExecutor<T>, ForgeError> {
     let scope = binding.scope(config)?;
-    let file = match open_credential(registry, &binding)? {
+    let file = match open_credential(registry, &binding.house, &binding.credential)? {
         Ok(file) => file,
         Err(status) => {
             return Err(ForgeError::CredentialUnavailable {

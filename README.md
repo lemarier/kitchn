@@ -74,8 +74,9 @@ can't cross.
   workflow or opening a role starts no worker and grants no authority.
 - **Approvals cover one commit.** When a pull request head moves, earlier
   approvals no longer count.
-- **Your repository stays clean.** Houses, pins and bindings live in a private
-  registry (`~/.kitchn`), never in your working tree.
+- **Your repository stays clean.** House policies, pins and repository bindings
+  live in a private registry (`~/.kitchn`), never in your working tree. Only a
+  confirmed `init` or `adopt` adds template files to the target repository.
 - **Houses never mix.** Your employer, a client and your open-source work each
   get their own rules, credentials and history.
 - **Missing evidence counts as failure.** An unobserved check or an unsupported
@@ -91,10 +92,12 @@ git clone https://github.com/lemarier/kitchen && cd kitchen
 just install
 ```
 
-**2. Set up your house.** Run this once, inside one of your repositories. It
-asks for a name, infers the rest, and shows you everything before saving it.
+**2. Set up your house.** Change into the repository you want to register, then
+run this once. It asks for a name, infers the rest from that checkout, and shows
+you everything before saving it.
 
 ```sh
+cd /path/to/your/repository
 kitchn house init
 ```
 

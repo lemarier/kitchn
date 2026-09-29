@@ -1288,6 +1288,81 @@ fn the_cook_launch_carries_the_records_pinned_to_its_task() -> TestResult {
 }
 
 #[test]
+fn an_oversized_pinned_context_does_not_hide_a_held_branch() -> TestResult {
+    use kitchen::contracts::WorkerState;
+    use kitchen::workflows::coordination::{
+        LaunchOutcome, Supervision, SupervisionInput, launch_worker, supervise,
+    };
+    use kitchen::workflows::recovery::{PromptState, RecoverySignals};
+    let world = workflows_support::World::new()?;
+    let (claimant, _) = workflows_support::under_consumer(&world, "coordinator")?;
+    let (task, fence) = claim_issue_task(&world, &claimant, 1)?;
+    let worker = match launch_worker(
+        &world.ctx(),
+        &task,
+        fence,
+        Workspace::Isolated,
+        &workflows_support::brief(1)?,
+    )? {
+        LaunchOutcome::Accepted { worker, .. } => worker,
+        other => return Err(format!("launch not accepted: {other:?}").into()),
+    };
+    // A person takes the terminal over and it goes idle: the branch is theirs.
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::UserTakeover);
+    let last = world.now();
+    world.clock.advance(241);
+    let signals = RecoverySignals {
+        prompt: PromptState::Idle,
+        ..workflows_support::signals(&worker, Some(last))
+    };
+    let input = SupervisionInput {
+        signals: Some(&signals),
+        ..SupervisionInput::default()
+    };
+    let step = supervise(
+        &world.ctx(),
+        &task,
+        fence,
+        &workflows_support::supervision()?,
+        &input,
+    )?;
+    assert!(matches!(step, Supervision::Replace { .. }), "{step:?}");
+    // Pin more context than a brief may carry.
+    let deliberations = Deliberations::new(&world.fixture.store, &claimant)?;
+    let descriptor = kitchen::contracts::EffectExecutor::descriptor(&world.backend);
+    let noisy = "@".repeat(kitchen::workflows::deliberation::MAX_RECORD_ITEM_BYTES);
+    for index in 0..4 {
+        publish_on(
+            &deliberations,
+            descriptor,
+            &task,
+            &format!("t{index}"),
+            &noisy,
+            6,
+            world.now(),
+        )?;
+    }
+    // The held branch is reported, not the context error, and nothing runs.
+    let effects = world.backend.effects_performed();
+    assert_eq!(
+        launch_worker(
+            &world.ctx(),
+            &task,
+            fence,
+            Workspace::Isolated,
+            &workflows_support::brief(1)?,
+        )?,
+        LaunchOutcome::BranchHeld {
+            branch: workflows_support::branch("lemarier/issue-1")?
+        }
+    );
+    assert_eq!(world.backend.effects_performed(), effects);
+    Ok(())
+}
+
+#[test]
 fn an_oversized_pinned_context_refuses_the_launch_instead_of_truncating() -> TestResult {
     use kitchen::workflows::coordination::launch_worker;
     let world = workflows_support::World::new()?;

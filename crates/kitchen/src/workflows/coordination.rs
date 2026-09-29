@@ -489,8 +489,6 @@ pub fn launch_worker(
     // Follow-ups an earlier worker could not receive or did not address go
     // into the next brief, so none is dropped.
     let text = brief.render_with(record.spec(), &outstanding_follow_ups(&record))?;
-    // Context records pinned to the task travel with its brief, bounded.
-    let text = deliberation::context_brief(&deliberation::task_context(ctx.store, task)?, &text)?;
     if held_branches(&record).contains(&brief.branch) {
         return Ok(LaunchOutcome::BranchHeld {
             branch: brief.branch.clone(),
@@ -499,6 +497,10 @@ pub fn launch_worker(
     if let Some(worker) = unstopped_worker(ctx, &record, fence) {
         return Ok(LaunchOutcome::SuperviseFirst { worker });
     }
+    // Context records pinned to the task travel with its brief, bounded. The
+    // outcomes above use no brief, so an oversized context cannot hide them;
+    // it is still refused before an attempt starts.
+    let text = deliberation::context_brief(&deliberation::task_context(ctx.store, task)?, &text)?;
     // A selection the executor cannot launch is a configuration problem no
     // retry fixes: refuse it before an attempt is spent on it.
     if let Some(resolved) = &record.spec().agent {

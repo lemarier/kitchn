@@ -4,11 +4,14 @@
 //! Workers report to their coordinator through the backend: questions,
 //! completion reports, escalations, and liveness notes. A backend that
 //! declares [`Capability::WorkerDeliveries`] hands them over in batches
-//! ([`Delivery`]) at least once: it replays the oldest unacknowledged batch
-//! until the coordinator acknowledges it, so a coordinator that crashes
-//! between reading and handling a batch loses nothing. A backend that
-//! declares [`Capability::RunTransfer`] lets a new coordinator adopt the run
-//! after a restart; the previous one is then fenced from the mailbox.
+//! ([`Delivery`]). Delivery is at least once per message: the backend replays
+//! the oldest unacknowledged batch until the coordinator acknowledges it by
+//! its batch id, so a coordinator that crashes between reading and handling
+//! a batch loses nothing. A backend that declares [`Capability::RunTransfer`]
+//! lets a new coordinator adopt the run after a restart; the previous one is
+//! then fenced from the mailbox, and the adopter receives every
+//! unacknowledged message, possibly regrouped under a new batch id. A handler
+//! that must not act twice deduplicates by message id, never by batch id.
 //! Coordination requires deliveries
 //! ([`crate::workflows::coordination::REQUIRED_WORKER_CAPABILITIES`]).
 //!
@@ -65,7 +68,8 @@ pub struct MailMessage {
 /// One unacknowledged mailbox batch. The backend replays it until acknowledged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
-    /// The id that acknowledges the batch.
+    /// The id that acknowledges the batch. It names this grouping only: after
+    /// run adoption the same messages can return under another id.
     pub id: ExternalRef,
     /// Messages in arrival order. Rows Kitchen cannot identify are dropped,
     /// counted in `unreadable`.
@@ -125,11 +129,13 @@ pub enum MailboxError {
 ///   unacknowledged batch, the same one on every call, until
 ///   [`Self::acknowledge`] names it. Messages arrive in the order workers
 ///   sent them.
-/// - Acknowledging a batch that was already acknowledged succeeds and never
-///   consumes a later batch.
-/// - After a restart, a new instance that adopts the run reads the same
-///   unacknowledged batch, and the previous instance's calls fail with
-///   [`MailboxError::Fenced`]. Adoption stops and moves no worker.
+/// - Acknowledging a batch that is not the current one, because it was
+///   already acknowledged or was read before an adoption, succeeds, consumes
+///   nothing, and returns the current batch.
+/// - After a restart, a new instance that adopts the run receives every
+///   unacknowledged message, oldest first, possibly in a batch with a new
+///   id; it acknowledges by that new id. The previous instance's calls fail
+///   with [`MailboxError::Fenced`]. Adoption stops and moves no worker.
 /// - `None` means nothing is waiting now. It is a checkpoint, never evidence
 ///   that a worker stopped.
 pub trait CoordinatorMailbox: WorkerBackend {

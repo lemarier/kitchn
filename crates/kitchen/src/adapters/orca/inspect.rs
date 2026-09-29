@@ -376,13 +376,22 @@ impl<R: OrcaRunner> CoordinatorMailbox for OrcaBackend<R> {
 
     /// Acknowledge a batch after every message in it was handled, and read
     /// the next one.
+    ///
+    /// Orca 1.4.216 refuses an acknowledgement of a batch id issued before
+    /// this terminal adopted the Run with `consumer_fenced`, although the
+    /// terminal still holds the Run. A plain read tells the two apart: when
+    /// it succeeds, the acknowledgement named a batch that is no longer
+    /// current, which consumes nothing, as the contract requires.
     fn acknowledge(&self, delivery: &ExternalRef) -> Result<Option<Delivery>, MailboxError> {
         let args = wire::Args::command(&["orchestration", "check"])
             .value("terminal", self.config().coordinator.as_str())
             .value("run", self.config().run.as_str())
             .value("ack", delivery.as_str())
             .json();
-        self.delivery(args).map_err(|error| mailbox_failure(&error))
+        match self.delivery(args).map_err(|error| mailbox_failure(&error)) {
+            Err(MailboxError::Fenced) => self.next_delivery(),
+            result @ (Ok(_) | Err(MailboxError::Unavailable(_))) => result,
+        }
     }
 
     /// Wait up to `wait` (at most [`MAX_MAILBOX_WAIT`]) for a question,

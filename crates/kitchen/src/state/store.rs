@@ -645,9 +645,9 @@ impl HouseStore {
     }
 
     /// Like [`Self::record_marker_unless`], recorded by the owner of `task`'s
-    /// claim at `fence`. The claim is checked in the same transaction as the
-    /// guard and the write, so an owner that was taken over, or whose task
-    /// settled, since it read the task writes nothing.
+    /// live claim at `fence`. The claim is checked in the same transaction as
+    /// the guard and the write, so an owner whose claim expired or was taken
+    /// over, or whose task settled, since it read the task writes nothing.
     ///
     /// # Errors
     /// Returns [`StateError::TaskNotFound`], [`StateError::TaskSettled`],
@@ -729,6 +729,24 @@ impl HouseStore {
         now: Timestamp,
     ) -> Result<MarkerRecording> {
         self.transact(|state| state.supersede_marker(key, expected, fact, recorded_by, now))
+    }
+
+    /// Like [`Self::supersede_marker`], by the owner of `task`'s live claim at
+    /// `fence`, checked in the same transaction as the write.
+    ///
+    /// # Errors
+    /// Returns the claim errors of [`Self::record_task_marker_unless`] and
+    /// the errors of [`Self::supersede_marker`].
+    pub fn supersede_task_marker(
+        &self,
+        key: &MarkerKey,
+        expected: &MarkerFact,
+        fact: MarkerFact,
+        task: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<MarkerRecording> {
+        self.transact(|state| state.supersede_task_marker(key, expected, fact, task, fence, now))
     }
 
     /// Remove each marker recorded under its key whose fact is still the

@@ -2379,13 +2379,18 @@ impl StoreState {
         now: Timestamp,
         guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
     ) -> Result<MarkerAttempt<R>> {
+        let owner = self.task_owner(task, fence, now)?;
+        self.record_marker_guarded(key, fact, &owner, now, None, guard)
+    }
+
+    /// The claimant owning `task`'s live claim at `fence`.
+    fn task_owner(&self, task: &TaskId, fence: Fence, now: Timestamp) -> Result<Claimant> {
         let lease = self.task(task)?.owned_lease(fence, now, true)?;
-        let owner = Claimant {
+        Ok(Claimant {
             holder: lease.holder.clone(),
             trigger: lease.trigger.clone(),
             consumer: lease.consumer.clone(),
-        };
-        self.record_marker_guarded(key, fact, &owner, now, None, guard)
+        })
     }
 
     /// Record `first` and, when the guard asks for it, `second` in one
@@ -2471,6 +2476,21 @@ impl StoreState {
         self.markers
             .supersede(key, expected, fact, recorded_by, now)
             .or_else(marker_refusal)
+    }
+
+    /// Like [`Self::supersede_marker`], by the owner of `task`'s live claim
+    /// at `fence`, checked in this transaction.
+    pub(crate) fn supersede_task_marker(
+        &mut self,
+        key: &MarkerKey,
+        expected: &MarkerFact,
+        fact: MarkerFact,
+        task: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<MarkerRecording> {
+        let owner = self.task_owner(task, fence, now)?;
+        self.supersede_marker(key, expected, fact, &owner, now)
     }
 
     pub(crate) fn retire_markers(

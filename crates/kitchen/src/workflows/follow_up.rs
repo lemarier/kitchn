@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     TaskId, WorkflowId,
-    contracts::{Claimant, ExternalRef, Fence, Text, Timestamp},
+    contracts::{ExternalRef, Fence, Text, Timestamp},
     state::{
         EffectState, HouseStore, MarkerAttempt, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject,
         StateError, TaskRecord, TaskState, WorkItem, WorkflowMarker,
@@ -114,30 +114,6 @@ fn fact(stored: &Stored) -> Result<MarkerFact> {
         StateError::MarkerPayloadInvalid => CoordinationError::FollowUpTooLarge.into(),
         other => other.into(),
     })
-}
-
-/// The claimant owning the task at `fence`, refusing a stale or expired
-/// claim. A consumer lease it acts under is checked again when a marker is
-/// written.
-fn owner(record: &TaskRecord, fence: Fence, now: Timestamp) -> Result<Claimant> {
-    match record.state() {
-        TaskState::Claimed { lease } if lease.fence() == fence => {
-            if !lease.is_live(now) {
-                return Err(StateError::LeaseExpired {
-                    expired_at: lease.expires_at(),
-                }
-                .into());
-            }
-            Ok(Claimant {
-                holder: lease.holder().clone(),
-                trigger: lease.trigger().clone(),
-                consumer: lease.consumer().cloned(),
-            })
-        }
-        TaskState::Open | TaskState::Claimed { .. } | TaskState::Settled { .. } => {
-            Err(StateError::StaleFence { presented: fence }.into())
-        }
-    }
 }
 
 fn markers_of<'a>(
@@ -254,13 +230,13 @@ pub(crate) fn mark_briefed(
     if waiting.is_empty() {
         return Ok(());
     }
-    let claimant = owner(record, fence, now)?;
+    let task = &record.spec().id;
     for held in waiting {
         let briefed = fact(&Stored {
             delivery: Delivery::Briefed,
             ..held.stored
         })?;
-        store.supersede_marker(&held.key, &held.fact, briefed, &claimant, now)?;
+        store.supersede_task_marker(&held.key, &held.fact, briefed, task, fence, now)?;
     }
     Ok(())
 }

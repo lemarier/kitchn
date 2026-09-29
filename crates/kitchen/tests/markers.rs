@@ -1196,3 +1196,65 @@ fn a_task_marker_is_recorded_only_under_the_tasks_current_live_claim() -> TestRe
     assert_eq!(store.markers(&WorkflowId::new("held-follow-up")?)?.len(), 1);
     Ok(())
 }
+
+#[test]
+fn a_task_marker_is_superseded_only_under_the_tasks_current_live_claim() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let task = task_id("briefed-task")?;
+    store.create_task(spec(task.as_str())?, &common::creator()?, at(0))?;
+    let first = store.claim(&task, &scheduled("first")?, ttl(60)?, at(0))?;
+    let key = task_key(&task, "a")?;
+    let waiting = verdict(EvidenceVerdict::Pass);
+    let briefed = verdict(EvidenceVerdict::Fail);
+    store.record_marker(key.clone(), waiting.clone(), &scheduled("first")?, at(1))?;
+
+    // Taken over: the old owner changes nothing.
+    let second = store.take_over(&task, &scheduled("second")?, ttl(60)?, at(61))?;
+    let stale = store.supersede_task_marker(
+        &key,
+        &waiting,
+        briefed.clone(),
+        &task,
+        first.fence(),
+        at(62),
+    );
+    assert!(
+        matches!(stale, Err(Error::State(StateError::StaleFence { .. }))),
+        "{stale:?}"
+    );
+    assert_eq!(
+        store.marker(&key)?.map(|marker| marker.fact().clone()),
+        Some(waiting.clone())
+    );
+
+    // The current owner supersedes it, recorded as itself.
+    let recorded = store.supersede_task_marker(
+        &key,
+        &waiting,
+        briefed.clone(),
+        &task,
+        second.fence(),
+        at(63),
+    )?;
+    let MarkerRecording::Superseded(marker) = recorded else {
+        return Err(format!("not superseded: {recorded:?}").into());
+    };
+    assert_eq!(marker.fact(), &briefed);
+    assert_eq!(marker.recorded_by().holder.as_str(), "second");
+
+    // Settled: nothing more, even from the owner that settled it.
+    store.request_cancel(&task, &common::holder("second")?, at(64))?;
+    store.settle_cancelled(&task, second.fence(), at(64))?;
+    let settled =
+        store.supersede_task_marker(&key, &briefed, waiting, &task, second.fence(), at(65));
+    assert!(
+        matches!(settled, Err(Error::State(StateError::TaskSettled { .. }))),
+        "{settled:?}"
+    );
+    assert_eq!(
+        store.marker(&key)?.map(|marker| marker.fact().clone()),
+        Some(briefed)
+    );
+    Ok(())
+}

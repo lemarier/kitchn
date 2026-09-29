@@ -429,6 +429,7 @@ pub fn plan_house_init(
         stack_tool: None,
         schedules: None,
         merge_readiness: BTreeMap::new(),
+        disk_pressure: None,
     };
     config.validate()?;
     bundle.validate(&config)?;

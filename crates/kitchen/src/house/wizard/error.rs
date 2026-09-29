@@ -37,6 +37,16 @@ pub enum HouseInitError {
         /// Why the snapshot was not installed.
         source: HouseError,
     },
+    /// The house was registered and its guidance pinned, but the forge
+    /// binding was not stored. Rerunning `house init` with the same answers
+    /// resumes: identical content is kept.
+    #[error(
+        "registered the house, but its forge binding was not stored ({source}); rerun house init with the same answers"
+    )]
+    ForgeNotBound {
+        /// Why the binding was not stored.
+        source: Box<crate::house::ForgeError>,
+    },
     /// Registry validation or storage failed.
     #[error(transparent)]
     House(#[from] HouseError),
@@ -55,6 +65,7 @@ impl HouseInitError {
             | Self::BuildCommitUnknown
             | Self::KitchenNotThisBuild => ErrorClass::InvalidInput,
             Self::GuidanceNotPinned { source } | Self::House(source) => source.class(),
+            Self::ForgeNotBound { source } => source.class(),
             Self::Io(_) => ErrorClass::Execution,
         }
     }

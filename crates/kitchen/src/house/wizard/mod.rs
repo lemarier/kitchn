@@ -7,7 +7,9 @@
 //! still missing fails with [`HouseInitError::MissingAnswers`] instead of
 //! blocking. [`register_house`] writes only to the registry, never to a working
 //! tree. Grants and policy limits stay empty: the wizard never grants
-//! authority.
+//! authority. A forge binding, when the person names a requester, is stored
+//! beside the house in its private registry directory; the credential itself
+//! is never asked for, copied, or written.
 
 mod error;
 mod guidance;
@@ -22,10 +24,13 @@ use std::{
 };
 
 use crate::{
-    HouseId,
+    BackendId, CredentialId, HouseId,
     adoption::{HouseRegistry, InstructionBundle, ResolvedInstructions, encode, role_cards_digest},
-    contracts::{CommitId, Repository, Role},
-    house::{HouseConfig, HouseError},
+    contracts::{CommitId, ExternalRef, PostingBudget, Repository, Role},
+    house::{
+        BindOutcome, CredentialStatus, FORGE_BINDING_SCHEMA, ForgeBinding, ForgeKind, HouseConfig,
+        HouseError, bind_forge, credential_path, credential_status,
+    },
     scheduling::AgentFamily,
     selection::{AgentPolicy, AgentSelection, RuleMatch, SelectionRule},
 };
@@ -34,6 +39,12 @@ use crate::{
 const MAX_ATTEMPTS: usize = 3;
 /// Registry directory under the home directory when none is given.
 const DEFAULT_REGISTRY: &str = ".kitchn";
+/// Credential name offered for the forge binding.
+const DEFAULT_CREDENTIAL: &str = "github";
+/// Backend namespace of a GitHub forge binding.
+const GITHUB_BACKEND: &str = "github";
+/// Per-task posting budget of a new forge binding.
+const DEFAULT_POSTING_BUDGET: u32 = 20;
 
 /// A station the wizard assigns an agent to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +114,10 @@ pub enum InitQuestion {
     RequiredChecks,
     /// Reviewers every pull request needs.
     RequiredReviewers,
+    /// The forge login Kitchen writes as, or none for no forge binding.
+    ForgeRequester,
+    /// The credential name of the forge binding.
+    ForgeCredential,
     /// The Kitchen revision to pin.
     Kitchen,
     /// Approval to register the printed configuration.
@@ -123,6 +138,8 @@ impl InitQuestion {
             Self::Agent(Station::Expediter) => "--expediter",
             Self::RequiredChecks => "--required-checks",
             Self::RequiredReviewers => "--required-reviewers",
+            Self::ForgeRequester => "--forge-requester",
+            Self::ForgeCredential => "--forge-credential",
             Self::Kitchen => "--kitchen",
             Self::Confirm => "--yes",
         }
@@ -140,6 +157,8 @@ impl InitQuestion {
             }
             Self::Agent(_) => "claude or codex",
             Self::RequiredChecks | Self::RequiredReviewers => "comma-separated names, or none",
+            Self::ForgeRequester => "a GitHub login, or none",
+            Self::ForgeCredential => "a credential name such as github",
             Self::Kitchen => "a full 40- or 64-character lowercase hex commit",
             Self::Confirm => "yes or no",
         }
@@ -174,6 +193,10 @@ pub struct InitAnswers {
     pub required_checks: Option<String>,
     /// `--required-reviewers`.
     pub required_reviewers: Option<String>,
+    /// `--forge-requester`.
+    pub forge_requester: Option<String>,
+    /// `--forge-credential`.
+    pub forge_credential: Option<String>,
     /// `--kitchen`.
     pub kitchen: Option<String>,
     /// A verified guidance bundle to pin instead of the default guidance.
@@ -218,6 +241,8 @@ pub struct InitFacts {
     pub kitchen: Option<CommitId>,
     /// The agents observed installed.
     pub agents: InstalledAgents,
+    /// The GitHub login the `gh` CLI is logged in as, read without its token.
+    pub forge_login: Option<ExternalRef>,
 }
 
 /// Branch protection read with house-scoped GitHub access.
@@ -276,6 +301,8 @@ pub struct HouseInitPlan {
     pub config: HouseConfig,
     /// The guidance pinned in the same run.
     pub bundle: InstructionBundle,
+    /// The forge binding stored with the house, if any.
+    pub forge: Option<ForgeBinding>,
 }
 
 /// The wizard's result before anything is written.
@@ -376,6 +403,7 @@ pub fn plan_house_init(
         Some(Offer::plain(Role::Expediter.as_str().to_owned())),
         names,
     )?;
+    let forge = session.forge(answers, facts.forge_login.as_ref())?;
     // Unanswered questions are reported first; an unknown build commit is
     // only worth an error once every other answer is in hand.
     let kitchen = match session.kitchen(answers, facts.kitchen.as_ref()) {
@@ -393,6 +421,7 @@ pub fn plan_house_init(
         Some(agents),
         Some(required_checks),
         Some(required_reviewers),
+        Some(forge),
         Some(kitchen),
     ) = (
         registry,
@@ -402,6 +431,7 @@ pub fn plan_house_init(
         agents,
         required_checks,
         required_reviewers,
+        forge,
         kitchen,
     )
     else {
@@ -433,10 +463,28 @@ pub fn plan_house_init(
     };
     config.validate()?;
     bundle.validate(&config)?;
+    let forge = forge
+        .map(
+            |(requester, credential)| -> Result<ForgeBinding, HouseInitError> {
+                Ok(ForgeBinding {
+                    schema: FORGE_BINDING_SCHEMA,
+                    house: config.house.clone(),
+                    forge: ForgeKind::GitHub,
+                    backend: BackendId::new(GITHUB_BACKEND)
+                        .map_err(|_| HouseError::InvalidInput)?,
+                    requester,
+                    credential,
+                    posting_budget: PostingBudget::new(DEFAULT_POSTING_BUDGET)
+                        .map_err(|_| HouseError::InvalidInput)?,
+                })
+            },
+        )
+        .transpose()?;
     let plan = HouseInitPlan {
         registry,
         config,
         bundle,
+        forge,
     };
     if answers.yes {
         return Ok(InitDecision::Confirmed(plan));
@@ -445,6 +493,7 @@ pub fn plan_house_init(
         return Err(HouseInitError::MissingAnswers(vec![InitQuestion::Confirm]));
     };
     prompter.show(&plan.config_text()?)?;
+    prompter.show(&plan.forge_text())?;
     let answer = prompter.ask(&format!(
         "Register house {} in {}? [y/N]: ",
         plan.config.house,
@@ -467,6 +516,44 @@ impl HouseInitPlan {
     pub fn config_text(&self) -> Result<String, HouseError> {
         String::from_utf8(encode(&self.config)?).map_err(|_| HouseError::InvalidInput)
     }
+
+    /// One line describing the forge binding [`register_house`] will store.
+    #[must_use]
+    pub fn forge_text(&self) -> String {
+        match &self.forge {
+            Some(binding) => format!(
+                "Forge: {} as {}, credential {}, at most {} writes per task. Kitchen reads its token from {} and never copies it.",
+                binding.forge,
+                binding.requester.as_str(),
+                binding.credential,
+                binding.posting_budget.limit(),
+                self.credential_file(binding).display(),
+            ),
+            None => "Forge: none; kitchen cannot write to a forge until one is bound with `kitchen forge bind`.".to_owned(),
+        }
+    }
+
+    /// Where the binding's token file belongs, from the planned registry.
+    fn credential_file(&self, binding: &ForgeBinding) -> PathBuf {
+        self.registry
+            .join("private")
+            .join(binding.house.as_str())
+            .join("credentials")
+            .join(binding.credential.as_str())
+    }
+}
+
+/// The forge binding [`register_house`] stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundForge {
+    /// The stored binding.
+    pub binding: ForgeBinding,
+    /// Whether this run stored it or found it already stored.
+    pub outcome: BindOutcome,
+    /// Where its token file belongs.
+    pub credential_path: PathBuf,
+    /// The token file's state, checked without reading it.
+    pub credential: CredentialStatus,
 }
 
 /// What [`register_house`] stored.
@@ -476,6 +563,8 @@ pub struct HouseInitReport {
     pub config_path: PathBuf,
     /// The verified guidance snapshot.
     pub instructions: ResolvedInstructions,
+    /// The forge binding, when the plan had one.
+    pub forge: Option<BoundForge>,
 }
 
 /// Register a confirmed plan and pin its guidance in the same run. Create-only:
@@ -486,6 +575,7 @@ pub struct HouseInitReport {
 /// Refuses a registry inside a repository or a bundle that does not match
 /// the configuration before writing; a different existing house is a
 /// conflict; [`HouseInitError::GuidanceNotPinned`] when only the snapshot
+/// failed; [`HouseInitError::ForgeNotBound`] when only the forge binding
 /// failed.
 pub fn register_house(plan: &HouseInitPlan) -> Result<HouseInitReport, HouseInitError> {
     let registry = HouseRegistry::new(plan.registry.clone())?;
@@ -497,14 +587,35 @@ pub fn register_house(plan: &HouseInitPlan) -> Result<HouseInitReport, HouseInit
     let instructions = registry
         .sync(&plan.config.house, &plan.bundle)
         .map_err(|source| HouseInitError::GuidanceNotPinned { source })?;
+    let forge = plan
+        .forge
+        .as_ref()
+        .map(|binding| -> Result<BoundForge, crate::house::ForgeError> {
+            let outcome = bind_forge(&registry, binding)?;
+            let path = credential_path(&registry, binding)?;
+            Ok(BoundForge {
+                binding: binding.clone(),
+                outcome,
+                credential: credential_status(&path)?,
+                credential_path: path,
+            })
+        })
+        .transpose()
+        .map_err(|source| HouseInitError::ForgeNotBound {
+            source: Box::new(source),
+        })?;
     Ok(HouseInitReport {
         config_path: registry
             .root()
             .join("houses")
             .join(format!("{}.json", plan.config.house)),
         instructions,
+        forge,
     })
 }
+
+/// A forge requester and its credential name.
+type ForgeAnswer = (ExternalRef, CredentialId);
 
 /// A default answer, and why it is the default.
 struct Offer {
@@ -707,6 +818,49 @@ impl Session<'_> {
             offer,
             names,
         )
+    }
+
+    /// The forge requester and credential name, `Some(None)` when the person
+    /// wants no binding. Offers the logged-in `gh` account.
+    fn forge(
+        &mut self,
+        answers: &InitAnswers,
+        login: Option<&ExternalRef>,
+    ) -> Result<Option<Option<ForgeAnswer>>, HouseInitError> {
+        let requester = self.answer(
+            InitQuestion::ForgeRequester,
+            answers.forge_requester.as_deref(),
+            "GitHub account kitchen writes as",
+            Some(match login {
+                Some(login) => Offer {
+                    value: login.as_str().to_owned(),
+                    note: Some("logged-in gh account"),
+                },
+                None => Offer::plain("none".to_owned()),
+            }),
+            |text| {
+                if text.eq_ignore_ascii_case("none") {
+                    Ok(None)
+                } else {
+                    ExternalRef::new(text)
+                        .ok()
+                        .filter(|login| ForgeKind::GitHub.accepts_requester(login))
+                        .map(Some)
+                        .ok_or(())
+                }
+            },
+        )?;
+        let Some(Some(requester)) = requester else {
+            return Ok(requester.map(|_| None));
+        };
+        let credential = self.answer(
+            InitQuestion::ForgeCredential,
+            answers.forge_credential.as_deref(),
+            "Credential name for its token",
+            Some(Offer::plain(DEFAULT_CREDENTIAL.to_owned())),
+            |text| CredentialId::new(text).map_err(drop),
+        )?;
+        Ok(credential.map(|credential| Some((requester, credential))))
     }
 
     fn kitchen(

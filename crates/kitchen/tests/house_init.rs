@@ -77,6 +77,7 @@ fn facts(home: &Path) -> TestResult<InitFacts> {
             source: "PATH",
             found: vec![AgentFamily::Claude, AgentFamily::Codex],
         },
+        forge_login: None,
     })
 }
 
@@ -92,6 +93,8 @@ fn flags(registry: &Path) -> InitAnswers {
         expediter: Some("claude".to_owned()),
         required_checks: Some("test,lint".to_owned()),
         required_reviewers: Some("expediter".to_owned()),
+        forge_requester: Some("none".to_owned()),
+        forge_credential: None,
         kitchen: Some(KITCHEN.to_owned()),
         bundle: None,
         yes: true,
@@ -135,8 +138,9 @@ fn blank_answers_take_the_checkout_remote_and_station_defaults() -> TestResult {
     let temp = tempfile::tempdir()?;
     let home = temp.path().canonicalize()?;
     // Registry, house, repositories, destinations, three stations, checks,
-    // reviewers, confirmation. The commit is this build's, so it is not asked.
-    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test, lint", "", "y"]);
+    // reviewers, forge requester, confirmation. The commit is this build's,
+    // so it is not asked.
+    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test, lint", "", "", "y"]);
     let plan = confirmed(plan_house_init(
         &InitAnswers::default(),
         &facts(&home)?,
@@ -589,7 +593,7 @@ fn embedded_guidance_needs_this_builds_commit() -> TestResult {
         plan_house_init(&unanswered, &unknown, &NoGitHubAccess, None),
         Err(HouseInitError::MissingAnswers(missing)) if missing == [InitQuestion::House]
     ));
-    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test", ""]);
+    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test", "", ""]);
     let prompted = plan_house_init(
         &InitAnswers::default(),
         &unknown,

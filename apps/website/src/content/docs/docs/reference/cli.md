@@ -366,6 +366,34 @@ changing either file. The last happens when `ledger.json` was restored from an
 older copy; restore the ledger that committed those batches, or reconcile the
 archive file by hand. An archived stream no longer supports new grant proposals.
 
+## `kitchn audit`
+
+Preview the brigade audit of one house: how stations, guidance, and schedules
+are performing, and the draft proposals that follow. It reads only; nothing is
+filed, and no guidance, grant, or schedule changes.
+
+```sh
+kitchn audit --registry <dir> --house <id> [--store <dir>] --ledger <dir> \
+  --schedule-evidence <file> [--open-proposal <key>]... [--json]
+```
+
+The report lists, with evidence links and sample sizes, repeated confirmed
+findings per station and work type, schedules near their run budget or mostly
+idle, and stations whose work types' first-pass acceptance has diverged.
+Simulated deliveries are counted apart and never support a proposal. Each
+draft proposes a guidance change, a work type or role split, or a schedule
+change, and applying it needs the owner's decision.
+
+`--schedule-evidence` is the house's observed schedule runs as JSON. The run
+spends the house usage budget like any scheduled run, so it is refused while
+that budget is exhausted or when the evidence cannot show that budget remains.
+Each draft carries a hidden `kitchn:brigade-audit` marker with its key; pass
+the key of every proposal still open with `--open-proposal`, and it is listed
+as already open instead of proposed again. At most 10 drafts come out of one
+run; the rest are listed as deferred. The ledger, store, and evidence must all
+belong to `--house`. Drafts hold typed names, counts, and source links only,
+never finding text or transcripts.
+
 ## `kitchn pickup`
 
 Offline pickup diagnostics.

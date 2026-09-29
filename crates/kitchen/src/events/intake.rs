@@ -67,16 +67,42 @@ pub enum Admission {
     /// another event about the same revision, or the fallback poll. Its task
     /// exists; claim it through the store as usual.
     Duplicate(TaskId),
-    /// An event about a newer revision of the same item was already
-    /// admitted, so this out-of-order event starts nothing. Names the newer
-    /// work's task.
+    /// This revision's admission was interrupted, and the store received
+    /// another revision of the same item since, so finishing it starts
+    /// nothing. Names the newer work's task.
     Stale(TaskId),
+    /// The forge reports that this revision is no longer the item's current
+    /// one, such as a late event for an older pull-request head. Nothing was
+    /// written; work starts only for the current revision.
+    Superseded,
     /// The route does not start work for this event kind. Nothing was read or
     /// written.
     Ignored,
 }
 
-/// How work was admitted, for audit and ordering.
+/// Whether a revision is still an item's current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionState {
+    /// The forge reports this revision as the item's current one.
+    Current,
+    /// The item has moved to another revision, or no longer has one, such as
+    /// a closed pull request.
+    Superseded,
+}
+
+/// Reads an item's current revision from the forge. Event and poll order is
+/// not revision order, so intake asks before it creates revision-specific
+/// work.
+pub trait RevisionSource {
+    /// Whether `subject` is still `item`'s current revision.
+    ///
+    /// # Errors
+    /// Returns an error when the forge cannot establish the current revision;
+    /// intake then writes nothing, and a redelivery or the next poll retries.
+    fn revision_state(&self, item: &WorkItem, subject: &MarkerSubject) -> Result<RevisionState>;
+}
+
+/// How work was admitted, for audit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum Via {
@@ -91,24 +117,38 @@ enum Via {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AdmissionRecord {
     task: TaskId,
-    /// Source time of the event, or the poll's observation time. Only event
-    /// times order admissions.
+    /// Source time of the event, or the poll's observation time. Recorded
+    /// for audit only: a provider or sender supplies an event's time, so it
+    /// never orders or deduplicates admissions.
     at: Timestamp,
     via: Via,
 }
 
 /// The intake for one event-started workflow in one house.
-#[derive(Debug)]
 pub struct EventIntake<'a> {
     store: &'a HouseStore,
     house: &'a HouseConfig,
     source: &'a BackendDescriptor,
+    revisions: &'a (dyn RevisionSource + Sync),
     route: EventRoute,
     schema: MarkerSchema,
 }
 
+impl std::fmt::Debug for EventIntake<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventIntake")
+            .field("store", &self.store)
+            .field("house", &self.house)
+            .field("source", &self.source)
+            .field("route", &self.route)
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> EventIntake<'a> {
-    /// Activate `route` for `house` with events delivered by `source`.
+    /// Activate `route` for `house` with events delivered by `source`, and
+    /// current revisions read from `revisions`.
     ///
     /// # Errors
     /// Returns [`ContractError::UnsupportedCapabilities`] when `source` does
@@ -120,6 +160,7 @@ impl<'a> EventIntake<'a> {
         store: &'a HouseStore,
         house: &'a HouseConfig,
         source: &'a BackendDescriptor,
+        revisions: &'a (dyn RevisionSource + Sync),
         route: EventRoute,
     ) -> Result<Self> {
         for found in [&house.house, &source.house] {
@@ -140,6 +181,7 @@ impl<'a> EventIntake<'a> {
             store,
             house,
             source,
+            revisions,
             route,
             schema,
         })
@@ -284,9 +326,9 @@ impl<'a> EventIntake<'a> {
         }
     }
 
-    /// Record the work key first, then create its task. A restart between the
-    /// two leaves the key, and the next admission of the same work creates
-    /// the task.
+    /// Confirm the revision is current, record the work key, then create its
+    /// task. A restart between the last two leaves the key, and the next
+    /// admission of the same work creates the task.
     #[expect(
         clippy::too_many_arguments,
         reason = "one private step shared by both admission paths"
@@ -302,6 +344,13 @@ impl<'a> EventIntake<'a> {
         now: Timestamp,
     ) -> Result<Admission> {
         self.check_consumer_live(claimant, now)?;
+        // Neither receipt order nor a source time says which revision is
+        // newer, so a late event for an older head would otherwise start
+        // work on it. The read happens before any write.
+        match self.revisions.revision_state(item, subject)? {
+            RevisionState::Current => {}
+            RevisionState::Superseded => return Ok(Admission::Superseded),
+        }
         let key = MarkerKey {
             workflow: self.route.workflow.clone(),
             item: item.clone(),
@@ -314,18 +363,18 @@ impl<'a> EventIntake<'a> {
             subject: subject.clone(),
             task: record.task.clone(),
         };
-        // The stale scan and the write are one store transaction, so an older
-        // event cannot record after a newer one under the same live fence.
+        // The stale scan and the write are one store transaction, so the
+        // store's receipt order is the order the scan sees.
         let fact = MarkerFact::workflow(self.schema.clone(), &record)?;
         // A redelivery that finishes an interrupted admission is checked too:
-        // a newer event may have been admitted since the key was recorded.
+        // another revision may have been received since the key was recorded.
         let recorded_now = match self.store.record_marker_unless_created(
             key.clone(),
             fact,
             claimant,
             now,
             &order.task,
-            |markers| self.newer_event(markers, &key, &record),
+            |markers| self.newer_receipt(markers, &key),
         ) {
             Ok(MarkerAttempt::Recorded(_)) => true,
             Ok(MarkerAttempt::AlreadyRecorded(_)) => false,
@@ -350,39 +399,33 @@ impl<'a> EventIntake<'a> {
         }
     }
 
-    /// For an event, the task of the newest event admitted for the same item
-    /// at another revision that occurred after it. Only events order each
-    /// other: their times come from the same source, while a poll's
-    /// observation time says nothing about when its revision was made, so a
-    /// poll never makes an event stale and is never stale itself.
-    fn newer_event(
+    /// The task of the newest admission the store received for the same item
+    /// at another revision after it first received `key`. Ordering uses only
+    /// the store's receipt order (markers are kept oldest first), never a
+    /// provider or sender time, so a skewed or hostile event time cannot make
+    /// real work stale. A revision the store has not received before is
+    /// therefore never stale; only finishing an interrupted admission can be.
+    fn newer_receipt(
         &self,
         markers: &[&WorkflowMarker],
         key: &MarkerKey,
-        record: &AdmissionRecord,
     ) -> Result<Option<TaskId>> {
-        if record.via == Via::Poll {
+        let Some(position) = markers.iter().position(|marker| marker.key() == key) else {
             return Ok(None);
-        }
-        let mut newest: Option<AdmissionRecord> = None;
-        for marker in markers {
+        };
+        let mut newest = None;
+        for marker in markers.iter().skip(position.saturating_add(1)) {
             let other = marker.key();
             let admission = matches!(
                 marker.fact(),
                 MarkerFact::Workflow { schema, .. } if schema == &self.schema
             );
-            if !admission || other.item != key.item || other.subject == key.subject {
-                continue;
-            }
-            let seen: AdmissionRecord = marker.fact().decode(&self.schema)?;
-            let newer = seen.at > record.at
-                && matches!(seen.via, Via::Event { .. })
-                && newest.as_ref().is_none_or(|best| seen.at > best.at);
-            if newer {
-                newest = Some(seen);
+            if admission && other.item == key.item && other.subject != key.subject {
+                let seen: AdmissionRecord = marker.fact().decode(&self.schema)?;
+                newest = Some(seen.task);
             }
         }
-        Ok(newest.map(|seen| seen.task))
+        Ok(newest)
     }
 
     /// The task id for work on `item` at `subject` in this workflow. Stable

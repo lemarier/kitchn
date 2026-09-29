@@ -5,7 +5,14 @@
 
 mod common;
 
-use std::{collections::BTreeSet, num::NonZeroU64};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use common::{
     Fixture, ManualClock, TestResult, at, backend_id, commit, grants, holder, house, launch,
@@ -20,9 +27,10 @@ use kitchen::{
     },
     events::{
         Admission, EventError, EventIntake, EventRoute, ForgeEvent, ForgeEventKind,
-        MAX_EVENT_BYTES, PolledWork, WorkOrder,
+        MAX_EVENT_BYTES, PolledWork, RevisionSource, RevisionState, WorkOrder,
     },
     house::HouseConfig,
+    integrations::github::IntegrationError,
     state::{
         EffectState, HouseStore, IssueRevision, MarkerSubject, StateError, TaskState, WorkItem,
         run_effect,
@@ -187,7 +195,52 @@ fn task_of(admission: &Admission) -> TestResult<TaskId> {
         Admission::Admitted(task) | Admission::Duplicate(task) | Admission::Stale(task) => {
             Ok(task.clone())
         }
-        Admission::Ignored => Err("admission names no task".into()),
+        Admission::Superseded | Admission::Ignored => Err("admission names no task".into()),
+    }
+}
+
+/// A forge whose every offered revision is still current, for tests about
+/// other admission rules.
+struct Latest;
+
+impl RevisionSource for Latest {
+    fn revision_state(&self, _: &WorkItem, _: &MarkerSubject) -> kitchen::Result<RevisionState> {
+        Ok(RevisionState::Current)
+    }
+}
+
+/// A forge reporting one current revision per item; `None` fails the read.
+#[derive(Default)]
+struct Forge {
+    current: Mutex<BTreeMap<WorkItem, MarkerSubject>>,
+    reads: AtomicUsize,
+}
+
+impl Forge {
+    fn moves_to(&self, event: &ForgeEvent) {
+        self.current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(event.item().clone(), event.subject().clone());
+    }
+}
+
+impl RevisionSource for Forge {
+    fn revision_state(
+        &self,
+        item: &WorkItem,
+        subject: &MarkerSubject,
+    ) -> kitchen::Result<RevisionState> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match current.get(item) {
+            Some(current) if current == subject => Ok(RevisionState::Current),
+            Some(_) => Ok(RevisionState::Superseded),
+            None => Err(IntegrationError::Unavailable.into()),
+        }
     }
 }
 
@@ -317,7 +370,7 @@ fn intake_requires_full_event_delivery_on_the_house_source() -> TestResult {
     let config = house_config()?;
 
     let none = source(CapabilitySet::new())?;
-    let refused = EventIntake::new(&fixture.store, &config, &none, route()?);
+    let refused = EventIntake::new(&fixture.store, &config, &none, &Latest, route()?);
     let Err(Error::Contract(ContractError::UnsupportedCapabilities { missing, partial })) = refused
     else {
         return Err("a backend without event delivery was accepted".into());
@@ -328,7 +381,7 @@ fn intake_requires_full_event_delivery_on_the_house_source() -> TestResult {
     let partial_support =
         source(CapabilitySet::new().with(Capability::EventDelivery, Support::Partial))?;
     let Err(Error::Contract(ContractError::UnsupportedCapabilities { missing, partial })) =
-        EventIntake::new(&fixture.store, &config, &partial_support, route()?)
+        EventIntake::new(&fixture.store, &config, &partial_support, &Latest, route()?)
     else {
         return Err("partial event delivery was accepted".into());
     };
@@ -338,19 +391,19 @@ fn intake_requires_full_event_delivery_on_the_house_source() -> TestResult {
     let mut foreign = delivering()?;
     foreign.house = other_house()?;
     assert!(matches!(
-        EventIntake::new(&fixture.store, &config, &foreign, route()?),
+        EventIntake::new(&fixture.store, &config, &foreign, &Latest, route()?),
         Err(Error::Contract(ContractError::CrossHouse { .. }))
     ));
 
     let mut empty = route()?;
     empty.kinds.clear();
     assert!(matches!(
-        EventIntake::new(&fixture.store, &config, &delivering()?, empty),
+        EventIntake::new(&fixture.store, &config, &delivering()?, &Latest, empty),
         Err(Error::Event(EventError::EmptyRoute))
     ));
 
     let source = delivering()?;
-    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
     assert_eq!(intake.route(), &route()?);
     Ok(())
 }
@@ -359,7 +412,7 @@ fn intake_requires_full_event_delivery_on_the_house_source() -> TestResult {
 fn redelivered_event_produces_one_task() -> TestResult {
     let fixture = Fixture::new()?;
     let (config, source) = (house_config()?, delivering()?);
-    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
     let fence = receiver_fence(&fixture.store, 0)?;
     let event = ForgeEvent::parse(ISSUE_LABELED)?;
     let claimant = receiver(&event, fence)?;
@@ -387,57 +440,165 @@ fn redelivered_event_produces_one_task() -> TestResult {
 }
 
 #[test]
-fn out_of_order_delivery_admits_each_revision_once_and_skips_stale_ones() -> TestResult {
+fn late_event_for_a_superseded_head_starts_no_work() -> TestResult {
     let fixture = Fixture::new()?;
-    let (config, source) = (house_config()?, delivering()?);
-    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let (config, source, forge) = (house_config()?, delivering()?, Forge::default());
+    let intake = EventIntake::new(&fixture.store, &config, &source, &forge, route()?)?;
     let fence = receiver_fence(&fixture.store, 0)?;
     let older = pushed("delivery-1", 'c', 10)?;
     let newer = pushed("delivery-2", 'd', 20)?;
 
-    // The newer head arrives first, then the older one, then a redelivery of
-    // the newer one.
+    // The newer head arrives first, then the older one, then redeliveries.
+    // Neither order says which head is newer; the forge's current head does.
+    forge.moves_to(&newer);
     let admitted = admit(&intake, &newer, &receiver(&newer, fence)?, 21)?;
     let newer_task = task_of(&admitted)?;
     assert_eq!(admitted, Admission::Admitted(newer_task.clone()));
+    let markers = fixture.store.markers(&route()?.workflow)?.len();
     assert_eq!(
         admit(&intake, &older, &receiver(&older, fence)?, 22)?,
-        Admission::Stale(newer_task.clone())
+        Admission::Superseded
     );
     assert_eq!(
         admit(&intake, &newer, &receiver(&newer, fence)?, 23)?,
         Admission::Duplicate(newer_task.clone())
     );
-    assert_eq!(fixture.store.tasks()?.len(), 1);
-
-    // An older event delivered before the newer one is not stale: both
-    // revisions are real work, admitted once each, in either delivery order.
-    let first = labeled("delivery-3", 7, 30)?;
-    let second = labeled("delivery-4", 7, 40)?;
-    let first_task = task_of(&admit(&intake, &first, &receiver(&first, fence)?, 41)?)?;
-    let second_task = task_of(&admit(&intake, &second, &receiver(&second, fence)?, 42)?)?;
-    assert_ne!(first_task, second_task);
     assert_eq!(
-        admit(&intake, &first, &receiver(&first, fence)?, 43)?,
-        Admission::Duplicate(first_task)
+        admit(&intake, &older, &receiver(&older, fence)?, 24)?,
+        Admission::Superseded
+    );
+    let tasks = fixture.store.tasks()?;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].spec().id, newer_task);
+    assert_eq!(fixture.store.markers(&route()?.workflow)?.len(), markers);
+
+    // A poll that observed the older head before the push is refused too.
+    let polled = PolledWork::new(pull_request(60)?, head('c')?, at(19))?;
+    let poller = scheduled("poller")?.under(consumer_id()?, fence);
+    assert_eq!(
+        intake.admit_polled(&polled, &poller, planned, at(25))?,
+        Admission::Superseded
+    );
+    assert_eq!(fixture.store.tasks()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn revisions_admitted_while_current_are_each_work() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (config, source, forge) = (house_config()?, delivering()?, Forge::default());
+    let intake = EventIntake::new(&fixture.store, &config, &source, &forge, route()?)?;
+    let fence = receiver_fence(&fixture.store, 0)?;
+
+    // Pushes and issue edits delivered while each is current start work of
+    // their own, and a redelivery after the item moved on starts nothing.
+    let mut tasks = BTreeSet::new();
+    for event in [
+        pushed("delivery-1", 'c', 10)?,
+        pushed("delivery-2", 'd', 20)?,
+        labeled("delivery-3", 7, 30)?,
+        labeled("delivery-4", 7, 40)?,
+    ] {
+        forge.moves_to(&event);
+        let admitted = admit(&intake, &event, &receiver(&event, fence)?, 41)?;
+        assert_eq!(admitted, Admission::Admitted(task_of(&admitted)?));
+        tasks.insert(task_of(&admitted)?);
+    }
+    assert_eq!(tasks.len(), 4);
+    let first = labeled("delivery-3", 7, 30)?;
+    assert_eq!(
+        admit(&intake, &first, &receiver(&first, fence)?, 42)?,
+        Admission::Superseded
+    );
+    assert_eq!(fixture.store.tasks()?.len(), 4);
+    Ok(())
+}
+
+#[test]
+fn unreadable_current_revision_writes_nothing_until_a_retry() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (config, source, forge) = (house_config()?, delivering()?, Forge::default());
+    let intake = EventIntake::new(&fixture.store, &config, &source, &forge, route()?)?;
+    let fence = receiver_fence(&fixture.store, 0)?;
+    let event = pushed("delivery-1", 'c', 10)?;
+
+    assert!(matches!(
+        admit(&intake, &event, &receiver(&event, fence)?, 11),
+        Err(Error::Integration(IntegrationError::Unavailable))
+    ));
+    assert_untouched(&fixture.store)?;
+    forge.moves_to(&event);
+    let admitted = admit(&intake, &event, &receiver(&event, fence)?, 12)?;
+    assert_eq!(admitted, Admission::Admitted(task_of(&admitted)?));
+
+    // Ignored kinds and refused claimants never read the forge.
+    let reads = forge.reads.load(Ordering::Relaxed);
+    let stranger = Claimant::event(holder("receiver")?, origin(house()?, "other")?)
+        .under(consumer_id()?, fence);
+    assert!(admit(&intake, &event, &stranger, 13).is_err());
+    assert_eq!(forge.reads.load(Ordering::Relaxed), reads);
+    Ok(())
+}
+
+/// A skewed, future, or hostile event time cannot make later real events
+/// stale or merge distinct revisions: only the store's receipt order counts.
+#[test]
+fn provider_event_times_never_order_admissions() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (config, source) = (house_config()?, delivering()?);
+    let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
+    let fence = receiver_fence(&fixture.store, 0)?;
+    let future = ForgeEvent::new(
+        origin(house()?, "delivery-future")?,
+        ForgeEventKind::PullRequestPushed,
+        pull_request(60)?,
+        head('c')?,
+        Timestamp::from_unix_millis(u64::MAX),
+    )?;
+    let future_task = task_of(&admit(&intake, &future, &receiver(&future, fence)?, 10)?)?;
+
+    // Real pushes after it, one claiming the epoch, are each new work.
+    let mut tasks = vec![future_task.clone()];
+    for (event, fill, seconds) in [("delivery-2", 'd', 11), ("delivery-3", 'e', 0)] {
+        let pushed = pushed(event, fill, seconds)?;
+        let admitted = admit(&intake, &pushed, &receiver(&pushed, fence)?, 12)?;
+        assert_eq!(admitted, Admission::Admitted(task_of(&admitted)?));
+        tasks.push(task_of(&admitted)?);
+    }
+    assert_eq!(fixture.store.tasks()?.len(), 3);
+    tasks.sort();
+    tasks.dedup();
+    assert_eq!(tasks.len(), 3);
+
+    // A redelivery of the same revision with a different claimed time is the
+    // same work, not a new or stale one.
+    let rewound = ForgeEvent::new(
+        origin(house()?, "delivery-future")?,
+        ForgeEventKind::PullRequestPushed,
+        pull_request(60)?,
+        head('c')?,
+        at(1),
+    )?;
+    assert_eq!(
+        admit(&intake, &rewound, &receiver(&rewound, fence)?, 13)?,
+        Admission::Duplicate(future_task)
     );
     assert_eq!(fixture.store.tasks()?.len(), 3);
     Ok(())
 }
 
-/// An older event never records after a newer one, even when both deliveries
-/// race under the same live consumer fence: the stale scan and the marker
-/// write are one store transaction. Each round is an independent race, so a
-/// scan separated from the write would fail some round.
+/// Racing deliveries of two revisions under the same live consumer fence
+/// each admit their own work once; the store's transaction orders the two
+/// markers. Each round is an independent race.
 #[test]
-fn racing_deliveries_never_record_an_older_event_after_a_newer_one() -> TestResult {
+fn racing_deliveries_admit_each_revision_once() -> TestResult {
     let (config, source) = (house_config()?, delivering()?);
     let older = pushed("delivery-1", 'c', 10)?;
     let newer = pushed("delivery-2", 'd', 20)?;
     let (older_head, newer_head) = (head('c')?, head('d')?);
     for round in 0..40 {
         let fixture = Fixture::new()?;
-        let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+        let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
         let fence = receiver_fence(&fixture.store, 0)?;
         let (older_claim, newer_claim) = (receiver(&older, fence)?, receiver(&newer, fence)?);
         let start = std::sync::Barrier::new(2);
@@ -456,32 +617,25 @@ fn racing_deliveries_never_record_an_older_event_after_a_newer_one() -> TestResu
             from_older.map_err(|_| "older delivery panicked")??,
             from_newer.map_err(|_| "newer delivery panicked")??,
         );
-        assert!(
-            matches!(from_newer, Admission::Admitted(_)),
-            "round {round}: {from_newer:?}"
-        );
-        let recorded: Vec<MarkerSubject> = fixture
+        for admitted in [&from_older, &from_newer] {
+            assert!(
+                matches!(admitted, Admission::Admitted(_)),
+                "round {round}: {admitted:?}"
+            );
+        }
+        let mut recorded: Vec<MarkerSubject> = fixture
             .store
             .markers(&route()?.workflow)?
             .iter()
             .map(|marker| marker.key().subject.clone())
             .collect();
-        match from_older {
-            // The older event lost the race: it left no marker or task.
-            Admission::Stale(_) => {
-                assert_eq!(recorded, std::slice::from_ref(&newer_head), "round {round}");
-                assert_eq!(fixture.store.tasks()?.len(), 1, "round {round}");
-            }
-            // The older event won: it was recorded first.
-            Admission::Admitted(_) => {
-                assert_eq!(
-                    recorded,
-                    [older_head.clone(), newer_head.clone()],
-                    "round {round}"
-                );
-            }
-            other => return Err(format!("round {round}: unexpected {other:?}").into()),
-        }
+        recorded.sort_by_key(|subject| subject == &newer_head);
+        assert_eq!(
+            recorded,
+            [older_head.clone(), newer_head.clone()],
+            "round {round}"
+        );
+        assert_eq!(fixture.store.tasks()?.len(), 2, "round {round}");
     }
     Ok(())
 }
@@ -492,7 +646,7 @@ fn restart_between_receipt_and_claim_resumes_the_same_task() -> TestResult {
     let (config, source) = (house_config()?, delivering()?);
     let event = ForgeEvent::parse(PULL_REQUEST_PUSHED)?;
     let task = {
-        let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+        let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
         let fence = receiver_fence(&fixture.store, 0)?;
         task_of(&admit(&intake, &event, &receiver(&event, fence)?, 1)?)?
     };
@@ -501,7 +655,7 @@ fn restart_between_receipt_and_claim_resumes_the_same_task() -> TestResult {
     // receipt was never acknowledged. The consumer lease expired meanwhile,
     // so the old fence is refused until someone takes the scope over.
     let reopened = fixture.reopen()?;
-    let intake = EventIntake::new(&reopened, &config, &source, route()?)?;
+    let intake = EventIntake::new(&reopened, &config, &source, &Latest, route()?)?;
     let expired = receiver(
         &event,
         reopened
@@ -543,7 +697,7 @@ fn restart_between_receipt_and_claim_resumes_the_same_task() -> TestResult {
 fn interrupted_admission_is_finished_by_the_next_delivery() -> TestResult {
     let fixture = Fixture::new()?;
     let (config, source) = (house_config()?, delivering()?);
-    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
     let fence = receiver_fence(&fixture.store, 0)?;
     let event = ForgeEvent::parse(ISSUE_LABELED)?;
     let claimant = receiver(&event, fence)?;
@@ -574,7 +728,7 @@ fn interrupted_admission_is_finished_by_the_next_delivery() -> TestResult {
 fn recovery_of_an_older_event_is_stale_once_a_newer_event_was_admitted() -> TestResult {
     let fixture = Fixture::new()?;
     let (config, source) = (house_config()?, delivering()?);
-    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
     let fence = receiver_fence(&fixture.store, 0)?;
     let older = pushed("delivery-1", 'c', 10)?;
     let newer = pushed("delivery-2", 'd', 20)?;
@@ -601,10 +755,55 @@ fn recovery_of_an_older_event_is_stale_once_a_newer_event_was_admitted() -> Test
 }
 
 #[test]
+fn a_poll_received_later_makes_an_interrupted_event_stale() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (config, source) = (house_config()?, delivering()?);
+    let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
+    // The event carries a later provider time than the poll; only receipt
+    // order counts.
+    let event = pushed("delivery-1", 'c', 50)?;
+    let fence = receiver_fence(&fixture.store, 0)?;
+    let failed = intake.admit_event(
+        &event,
+        &receiver(&event, fence)?,
+        |_| Err(Error::from(StateError::MarkerPayloadInvalid)),
+        at(1),
+    );
+    assert!(failed.is_err());
+    assert!(fixture.store.tasks()?.is_empty());
+
+    // The receiver stops; the fallback tick polls a newer head.
+    fixture
+        .store
+        .release_consumer(&consumer_id()?, fence, at(2))?;
+    let tick = scheduled("fallback-tick")?;
+    let tick_fence = acquire(&fixture.store, &tick, 3)?;
+    let polled = PolledWork::new(pull_request(60)?, head('d')?, at(4))?;
+    let polled_task = task_of(&intake.admit_polled(
+        &polled,
+        &tick.clone().under(consumer_id()?, tick_fence),
+        planned,
+        at(4),
+    )?)?;
+    fixture
+        .store
+        .release_consumer(&consumer_id()?, tick_fence, at(5))?;
+
+    // Redelivering the interrupted event does not finish its admission.
+    let fence = receiver_fence(&fixture.store, 6)?;
+    assert_eq!(
+        admit(&intake, &event, &receiver(&event, fence)?, 7)?,
+        Admission::Stale(polled_task)
+    );
+    assert_eq!(fixture.store.tasks()?.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn foreign_events_are_refused_before_any_state_changes() -> TestResult {
     let fixture = Fixture::new()?;
     let (config, source) = (house_config()?, delivering()?);
-    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
     let fence = receiver_fence(&fixture.store, 0)?;
 
     // Delivered for another house.
@@ -673,7 +872,7 @@ fn foreign_events_are_refused_before_any_state_changes() -> TestResult {
 fn claimants_must_act_under_the_event_trigger_and_route_consumer() -> TestResult {
     let fixture = Fixture::new()?;
     let (config, source) = (house_config()?, delivering()?);
-    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
     let fence = receiver_fence(&fixture.store, 0)?;
     let event = labeled("delivery-1", 1, 1)?;
     let other_event = labeled("delivery-2", 1, 1)?;
@@ -723,7 +922,7 @@ fn claimants_must_act_under_the_event_trigger_and_route_consumer() -> TestResult
 fn plan_must_target_the_work_order() -> TestResult {
     let fixture = Fixture::new()?;
     let (config, source) = (house_config()?, delivering()?);
-    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
     let fence = receiver_fence(&fixture.store, 0)?;
     let event = labeled("delivery-1", 1, 1)?;
     let claimant = receiver(&event, fence)?;
@@ -764,7 +963,7 @@ fn plan_must_target_the_work_order() -> TestResult {
 fn event_and_fallback_schedule_share_work_and_one_consumer() -> TestResult {
     let fixture = Fixture::new()?;
     let (config, source) = (house_config()?, delivering()?);
-    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
     let event = pushed("delivery-1", 'e', 10)?;
 
     // The receiver holds the scope; the fallback tick cannot become a
@@ -828,13 +1027,12 @@ fn event_and_fallback_schedule_share_work_and_one_consumer() -> TestResult {
     assert_ne!(missed_task, polled_task);
     assert_eq!(fixture.store.tasks()?.len(), 3);
 
-    // Events still order each other: one older than an admitted event is stale.
+    // Neither do event times: an event that claims to predate an admitted
+    // one is new work for a revision the store has not received.
     let old = pushed("delivery-0", 'a', 1)?;
-    assert_eq!(
-        admit(&intake, &old, &receiver(&old, fence)?, 22)?,
-        Admission::Stale(missed_task)
-    );
-    assert_eq!(fixture.store.tasks()?.len(), 3);
+    let old_task = task_of(&admit(&intake, &old, &receiver(&old, fence)?, 22)?)?;
+    assert_ne!(old_task, missed_task);
+    assert_eq!(fixture.store.tasks()?.len(), 4);
     Ok(())
 }
 
@@ -842,7 +1040,7 @@ fn event_and_fallback_schedule_share_work_and_one_consumer() -> TestResult {
 fn event_work_uses_standing_grants_and_refuses_consent() -> TestResult {
     let fixture = Fixture::new()?;
     let (config, source) = (house_config()?, delivering()?);
-    let intake = EventIntake::new(&fixture.store, &config, &source, route()?)?;
+    let intake = EventIntake::new(&fixture.store, &config, &source, &Latest, route()?)?;
     let fence = receiver_fence(&fixture.store, 0)?;
     let event = labeled("delivery-1", 1, 1)?;
     let claimant = receiver(&event, fence)?;

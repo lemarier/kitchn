@@ -16,13 +16,19 @@
 //! event or poll observed. The key is recorded as a workflow marker before the
 //! task is created, and the task id is derived from the key, so a redelivery,
 //! a poll of the same revision, or a restart between receipt and claim finds
-//! the same task instead of creating another. An event that occurred before
-//! an already admitted event about a newer revision of the same item is
-//! reported stale; polls do not take part in that ordering. Both the event
-//! receiver and the fallback schedule act under one consumer lease, so only
-//! one of them consumes the workflow scope at a time. The stale check and the
-//! marker write are one store transaction, so racing deliveries under the same
-//! live fence cannot record an older event after a newer one.
+//! the same task instead of creating another. Admissions are ordered only by
+//! the store's own receipt order, never by the event's provider-supplied time,
+//! which is kept for audit. Neither order says which revision is newer, so
+//! before creating work the intake asks the forge, through a
+//! [`RevisionSource`], whether the revision is still the item's current one;
+//! a late event for a superseded head is reported [`Admission::Superseded`]
+//! and writes nothing. Finishing an interrupted
+//! admission is reported stale once the store has received another revision
+//! of the same item since. Both the event receiver and the fallback schedule
+//! act under one consumer lease, so only one of them consumes the workflow
+//! scope at a time. The stale check and the marker write are one store
+//! transaction, so racing deliveries under the same live fence are ordered by
+//! the store.
 //!
 //! # One task per revision
 //!
@@ -43,4 +49,6 @@ mod intake;
 
 pub use delivery::{ForgeEvent, ForgeEventKind, MAX_EVENT_BYTES, PolledWork};
 pub use error::EventError;
-pub use intake::{ADMISSION_SCHEMA, Admission, EventIntake, EventRoute, WorkOrder};
+pub use intake::{
+    ADMISSION_SCHEMA, Admission, EventIntake, EventRoute, RevisionSource, RevisionState, WorkOrder,
+};

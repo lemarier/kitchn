@@ -730,17 +730,23 @@ impl HouseStore {
     /// [`crate::state::RetentionPolicy`]). Markers and settled tasks are
     /// removed only on the positive evidence in `inventory`; anything a
     /// claim, an unresolved effect, an unacknowledged failed write, a live
-    /// resource, or a remaining marker still needs is kept.
+    /// resource, or a remaining marker still needs is kept. In the same
+    /// transaction every repository's intake markers are compacted, recorded
+    /// by `recorded_by` (see [`crate::workflows::intake::IntakeLedger::compact`]);
+    /// a repository whose intake markers cannot be read is reported refused
+    /// and left unchanged.
     ///
     /// # Errors
-    /// Returns a storage error; nothing is removed then.
+    /// Returns a storage error, or a consumer lease error for
+    /// `recorded_by`; nothing is changed then.
     pub fn retain(
         &self,
         policy: &RetentionPolicy,
         inventory: &Inventory,
+        recorded_by: &Claimant,
         now: Timestamp,
     ) -> Result<RetentionReport> {
-        self.transact(|state| Ok(state.retain(policy, inventory, now)))
+        self.transact(|state| state.retain(policy, inventory, recorded_by, now))
     }
 
     /// Replace markers with fewer ones in one transaction: remove each of

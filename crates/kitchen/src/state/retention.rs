@@ -16,10 +16,10 @@
 //!   passed, or the repair rounds of a pull request that closed.
 //!
 //! Everything else is kept, including every marker dedupe still needs
-//! (asked questions, deliberation threads, counted intake digests, reports
-//! owed to an owner) and every task of an unknown family. Intake reservations
-//! are compacted by their owner ([`crate::workflows::intake::IntakeLedger::compact`])
-//! rather than retired here.
+//! (asked questions, deliberation threads, reports owed to an owner) and
+//! every task of an unknown family. Intake markers follow their owner's
+//! rules instead, in the same pass and transaction: settled reservations fold
+//! into a bounded dedupe window (see [`crate::workflows::intake`]).
 //!
 //! Retention fails safe. It retires only on positive evidence in the
 //! caller's [`Inventory`]: an item observed gone, or a resource absent from
@@ -46,7 +46,7 @@ use crate::{
         EffectState, MAX_CONSUMERS, MAX_MARKERS, MAX_TASKS, MarkerFact, MarkerKey, MarkerSchema,
         StateError, TaskRecord, TaskState, WorkItem, WorkflowMarker,
     },
-    workflows::{budget, pickup, repair},
+    workflows::{budget, intake::LedgerCompaction, pickup, repair},
 };
 
 /// The shortest settled-task window a policy accepts: the longest schedule
@@ -250,7 +250,8 @@ const MARKER_RULES: &[(&str, MarkerRule)] = &[
     // Doctor reports each one until the owner is told.
     ("schedule-budget-undeliverable", MarkerRule::Keep),
     ("intake.reservation", MarkerRule::Compacted),
-    ("intake.counted", MarkerRule::Keep),
+    ("intake.counted", MarkerRule::Compacted),
+    ("intake.forgotten", MarkerRule::Compacted),
     ("deliberation.entry", MarkerRule::Keep),
     ("deliberation.record", MarkerRule::Keep),
     ("deliberation.pin", MarkerRule::Keep),
@@ -326,6 +327,8 @@ pub struct RetentionReport {
     pub markers: Vec<RetiredMarker>,
     /// Tasks removed.
     pub tasks: Vec<RetiredTask>,
+    /// Intake compaction per repository.
+    pub intake: Vec<LedgerCompaction>,
 }
 
 /// Entries used in one bounded table.
@@ -637,6 +640,7 @@ pub(super) fn plan<'a>(
         applied: false,
         markers: retired_markers,
         tasks: retired_tasks,
+        intake: Vec::new(),
     }
 }
 

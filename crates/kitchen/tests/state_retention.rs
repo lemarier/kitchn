@@ -160,7 +160,9 @@ fn markers_of_a_closed_item_retire_and_others_stay() -> TestResult {
     assert_eq!(preview.markers.len(), 1);
     assert!(fixture.store.marker(&closed_pr)?.is_some());
 
-    let report = fixture.store.retain(&policy, &inventory, at(2))?;
+    let report = fixture
+        .store
+        .retain(&policy, &inventory, &creator()?, at(2))?;
     assert!(report.applied);
     assert_eq!(report.markers, preview.markers);
     assert_eq!(report.markers[0].key, closed_pr);
@@ -171,7 +173,12 @@ fn markers_of_a_closed_item_retire_and_others_stay() -> TestResult {
     assert!(fixture.store.marker(&open_pr)?.is_some());
     assert!(fixture.store.marker(&unobserved)?.is_some());
     // A second pass finds nothing more.
-    assert!(!fixture.store.retain(&policy, &inventory, at(3))?.applied);
+    assert!(
+        !fixture
+            .store
+            .retain(&policy, &inventory, &creator()?, at(3))?
+            .applied
+    );
     Ok(())
 }
 
@@ -185,9 +192,12 @@ fn only_the_newest_subject_of_a_latest_subject_marker_stays() -> TestResult {
     record(&fixture, &newer, fact("ready-report/1")?, 2)?;
     record(&fixture, &other, fact("ready-report/1")?, 1)?;
 
-    let report = fixture
-        .store
-        .retain(&RetentionPolicy::default(), &Inventory::new(), at(3))?;
+    let report = fixture.store.retain(
+        &RetentionPolicy::default(),
+        &Inventory::new(),
+        &creator()?,
+        at(3),
+    )?;
     assert_eq!(report.markers.len(), 1);
     assert_eq!(report.markers[0].key, older);
     assert_eq!(report.markers[0].reason, MarkerRetirement::Superseded);
@@ -205,6 +215,7 @@ fn only_the_newest_subject_of_a_latest_subject_marker_stays() -> TestResult {
     let report = fixture.store.retain(
         &RetentionPolicy::default(),
         &closed(&[pull_request(4)?]),
+        &creator()?,
         at(5),
     )?;
     assert_eq!(report.markers.len(), 1);
@@ -243,9 +254,12 @@ fn facts_dedupe_needs_are_kept_even_when_their_item_is_gone() -> TestResult {
     for (marker, value) in &kept {
         record(&fixture, marker, value.clone(), 1)?;
     }
-    let report = fixture
-        .store
-        .retain(&RetentionPolicy::default(), &closed(&[gone]), at(2))?;
+    let report = fixture.store.retain(
+        &RetentionPolicy::default(),
+        &closed(&[gone]),
+        &creator()?,
+        at(2),
+    )?;
     assert!(report.markers.is_empty(), "{report:?}");
     for (marker, _) in &kept {
         assert!(fixture.store.marker(marker)?.is_some());
@@ -269,6 +283,7 @@ fn an_unsettled_task_keeps_its_items_markers() -> TestResult {
     let report = fixture.store.retain(
         &RetentionPolicy::default(),
         &closed(&[issue(7)?]),
+        &creator()?,
         at(LATER),
     )?;
     assert!(report.markers.is_empty() && report.tasks.is_empty());
@@ -296,7 +311,7 @@ fn a_settled_repair_task_retires_after_its_window_once_its_pull_request_and_work
     assert!(
         fixture
             .store
-            .retain(&policy, &inventory, at(LATER))?
+            .retain(&policy, &inventory, &creator()?, at(LATER))?
             .tasks
             .is_empty()
     );
@@ -305,7 +320,7 @@ fn a_settled_repair_task_retires_after_its_window_once_its_pull_request_and_work
     assert!(
         fixture
             .store
-            .retain(&policy, &inventory, at(LATER))?
+            .retain(&policy, &inventory, &creator()?, at(LATER))?
             .tasks
             .is_empty()
     );
@@ -314,7 +329,7 @@ fn a_settled_repair_task_retires_after_its_window_once_its_pull_request_and_work
     assert!(
         fixture
             .store
-            .retain(&policy, &inventory, at(DAY))?
+            .retain(&policy, &inventory, &creator()?, at(DAY))?
             .tasks
             .is_empty()
     );
@@ -324,12 +339,14 @@ fn a_settled_repair_task_retires_after_its_window_once_its_pull_request_and_work
     assert!(
         fixture
             .store
-            .retain(&policy, &open, at(LATER))?
+            .retain(&policy, &open, &creator()?, at(LATER))?
             .tasks
             .is_empty()
     );
 
-    let report = fixture.store.retain(&policy, &inventory, at(LATER))?;
+    let report = fixture
+        .store
+        .retain(&policy, &inventory, &creator()?, at(LATER))?;
     assert_eq!(report.tasks.len(), 1);
     assert_eq!(report.tasks[0].task, task);
     assert_eq!(report.tasks[0].reason, TaskRetirement::ItemGone);
@@ -350,6 +367,7 @@ fn a_settled_issue_task_is_kept_after_its_issue_closes() -> TestResult {
     let report = fixture.store.retain(
         &RetentionPolicy::default(),
         &closed(&[issue(11)?]),
+        &creator()?,
         at(LATER),
     )?;
     assert!(report.tasks.is_empty());
@@ -371,9 +389,12 @@ fn a_failed_write_no_person_acknowledged_keeps_its_task() -> TestResult {
     )?;
     let mut inventory = closed(&[pull_request(9)?]);
     inventory.list_backend(common::backend_id()?, []);
-    let report = fixture
-        .store
-        .retain(&RetentionPolicy::default(), &inventory, at(LATER))?;
+    let report = fixture.store.retain(
+        &RetentionPolicy::default(),
+        &inventory,
+        &creator()?,
+        at(LATER),
+    )?;
     assert!(report.tasks.is_empty());
     assert!(fixture.store.task(&task).is_ok());
     Ok(())
@@ -395,13 +416,13 @@ fn repair_rounds_of_a_pull_request_retire_together() -> TestResult {
     assert!(
         fixture
             .store
-            .retain(&policy, &inventory, at(LATER))?
+            .retain(&policy, &inventory, &creator()?, at(LATER))?
             .tasks
             .is_empty()
     );
     let report = fixture
         .store
-        .retain(&policy, &inventory, at(LATER + 2 * DAY))?;
+        .retain(&policy, &inventory, &creator()?, at(LATER + 2 * DAY))?;
     let mut retired: Vec<TaskId> = report.tasks.into_iter().map(|task| task.task).collect();
     retired.sort();
     let mut expected = vec![first, second];
@@ -435,13 +456,13 @@ fn budget_windows_retire_after_the_window_and_unknown_tasks_stay() -> TestResult
     assert!(
         fixture
             .store
-            .retain(&policy, &Inventory::new(), at(DAY))?
+            .retain(&policy, &Inventory::new(), &creator()?, at(DAY))?
             .tasks
             .is_empty()
     );
     let report = fixture
         .store
-        .retain(&policy, &Inventory::new(), at(LATER))?;
+        .retain(&policy, &Inventory::new(), &creator()?, at(LATER))?;
     assert_eq!(report.tasks.len(), 1);
     assert_eq!(report.tasks[0].task, window);
     assert_eq!(report.tasks[0].reason, TaskRetirement::WindowEnded);
@@ -505,6 +526,7 @@ fn a_full_marker_table_accepts_new_work_after_retention() -> TestResult {
     let report = store.retain(
         &RetentionPolicy::default(),
         &closed(&[pull_request(1)?, pull_request(2)?]),
+        &creator()?,
         at(3),
     )?;
     assert_eq!(report.markers.len(), 2);
@@ -668,9 +690,10 @@ fn only_complete_forge_answers_let_markers_retire() -> TestResult {
         inventory.observe_forge(&client, &common::house()?, &subjects.items, 100),
         3
     );
-    let report = fixture
-        .store
-        .retain(&RetentionPolicy::default(), &inventory, at(2))?;
+    let report =
+        fixture
+            .store
+            .retain(&RetentionPolicy::default(), &inventory, &creator()?, at(2))?;
     let retired: Vec<WorkItem> = report
         .markers
         .into_iter()

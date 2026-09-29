@@ -262,8 +262,14 @@ previews unless `--apply` is given. With `--registry` and `--gh` it asks the
 forge, through the house's forge binding, which issues and pull requests are
 closed. Records about an issue or pull request the forge did not answer
 completely are kept. It never removes asked questions, deliberation threads,
-counted intake reports, or a task whose write failed and no person has
-acknowledged. Settled tasks stay at least 31 days.
+or a task whose write failed and no person has acknowledged. Settled tasks stay
+at least 31 days.
+
+The same pass compacts intake. Each repository's settled intake reservations
+fold into at most 32 counted-report markers; a reservation whose outcome is not
+yet known stays. When the markers are full, the oldest is evicted, and intake
+from then on drops any report received at or before the newest evicted one, so
+no report is counted twice.
 
 ## `kitchn pickup`
 

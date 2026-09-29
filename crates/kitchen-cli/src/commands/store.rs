@@ -3,6 +3,7 @@
 //! Retention previews by default. Issue and pull-request state comes from
 //! the forge through the house's forge binding, never from a file; items the
 //! forge did not answer completely keep everything that depends on them.
+//! The same pass compacts every repository's intake reservations.
 
 use std::{
     fmt::Write as _,
@@ -12,20 +13,23 @@ use std::{
 
 use clap::{Args, Subcommand};
 use kitchen::{
-    HouseId,
+    HolderId, HouseId,
     adoption::{HouseRegistry, encode},
-    contracts::{Clock, SystemClock},
+    contracts::{Claimant, Clock, SystemClock},
     house::{HouseError, credential_path, forge_binding},
     integrations::github::{CredentialFile, GhCli, GitHubClient, ReadLimits},
     state::{
         HouseStore, Inventory, RetentionPolicy, RetentionReport, StoreCapacity, StoreOptions,
         TableUsage,
     },
+    workflows::intake::CompactionOutcome,
 };
 use serde::Serialize;
 
 /// Forge lookups one retention pass makes at most.
 const MAX_LOOKUPS: usize = 1000;
+/// The holder recorded on intake markers a retention pass compacts.
+const RETAIN_HOLDER: &str = "kitchn-store-retain";
 
 #[derive(Args)]
 pub struct StoreArgs {
@@ -45,8 +49,9 @@ enum StoreCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Preview the markers and settled tasks no workflow still needs; with
-    /// --apply, remove them.
+    /// Preview the markers and settled tasks no workflow still needs, and
+    /// the intake reservations that would fold into counted digests; with
+    /// --apply, make those changes.
     Retain(RetainArgs),
 }
 
@@ -142,7 +147,8 @@ fn retain(args: RetainArgs) -> Result<(String, bool), kitchen::Error> {
     };
     let now = SystemClock.now();
     let retention = if args.apply {
-        store.retain(&policy, &inventory, now)?
+        let claimant = Claimant::interactive(HolderId::new(RETAIN_HOLDER)?);
+        store.retain(&policy, &inventory, &claimant, now)?
     } else {
         store.preview_retention(&policy, &inventory, now)?
     };
@@ -212,6 +218,27 @@ fn retain_text(output: &RetainOutput, apply: bool) -> String {
     }
     for task in &retention.tasks {
         let _ = writeln!(text, "  task {}: {:?}", task.task, task.reason);
+    }
+    for ledger in &retention.intake {
+        let _ = match ledger.outcome {
+            CompactionOutcome::Compacted(compaction) => writeln!(
+                text,
+                "  intake {} {}: {} {} reservation(s), {} {}, {} kept; {} counted marker(s) evicted",
+                ledger.workflow,
+                ledger.repository,
+                if apply { "folded" } else { "would fold" },
+                compaction.folded,
+                if apply { "dropped" } else { "would drop" },
+                compaction.dropped,
+                compaction.kept,
+                compaction.evicted,
+            ),
+            CompactionOutcome::Refused => writeln!(
+                text,
+                "  intake {} {}: unreadable marker or missing task; left unchanged",
+                ledger.workflow, ledger.repository
+            ),
+        };
     }
     if !apply {
         text.push_str("Preview only; rerun with --apply to remove them.\n");

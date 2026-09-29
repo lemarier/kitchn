@@ -30,6 +30,7 @@ use crate::{
             self, Inventory, RetentionPolicy, RetentionReport, RetentionSubjects, StoreCapacity,
         },
     },
+    workflows::intake,
 };
 
 /// The persisted schema version.
@@ -2401,17 +2402,35 @@ impl StoreState {
         inventory: &Inventory,
         now: Timestamp,
     ) -> RetentionReport {
-        retention::plan(&self.tasks, self.markers.iter(), policy, inventory, now)
+        let mut report = retention::plan(&self.tasks, self.markers.iter(), policy, inventory, now);
+        report.intake = intake::plan_house_compaction(self.markers.iter(), &self.tasks)
+            .into_iter()
+            .map(|(summary, _)| summary)
+            .collect();
+        report
     }
 
-    /// Remove what [`Self::retention_plan`] selects, in this transaction.
+    /// Compact intake and remove what [`Self::retention_plan`] selects, in
+    /// this transaction. Both are planned from the same state: the generic
+    /// pass selects no intake marker and keeps intake tasks, whose family it
+    /// does not know.
     pub(crate) fn retain(
         &mut self,
         policy: &RetentionPolicy,
         inventory: &Inventory,
+        recorded_by: &Claimant,
         now: Timestamp,
-    ) -> RetentionReport {
-        let mut report = self.retention_plan(policy, inventory, now);
+    ) -> Result<RetentionReport> {
+        let mut report = retention::plan(&self.tasks, self.markers.iter(), policy, inventory, now);
+        let compactions = intake::plan_house_compaction(self.markers.iter(), &self.tasks);
+        let mut compacted = false;
+        for (summary, changes) in compactions {
+            if !changes.is_empty() {
+                compacted = true;
+                self.compact_markers(&changes.retire, changes.writes, recorded_by, now)?;
+            }
+            report.intake.push(summary);
+        }
         let keys: BTreeSet<MarkerKey> = report
             .markers
             .iter()
@@ -2421,8 +2440,8 @@ impl StoreState {
         for retired in &report.tasks {
             self.tasks.remove(&retired.task);
         }
-        report.applied = !keys.is_empty() || !report.tasks.is_empty();
-        report
+        report.applied = compacted || !keys.is_empty() || !report.tasks.is_empty();
+        Ok(report)
     }
 
     /// Remove every marker in `retire`, each of which must still hold its

@@ -26,9 +26,9 @@ use kitchen::{
     },
     workflows::intake::{
         Classified, ConnectorFailure, Counted, FetchRequest, IntakeError, IntakeLedger,
-        IntakeSource, IntakeSources, KnownIssue, MAX_LISTED, MAX_PER_PROPOSAL, PostingAuthority,
-        PrivacyClass, ProblemKey, Proposal, RawReport, ReadScope, Report, ReportConnector,
-        ReportLink, SourceId, marker, plan, problem_marker,
+        IntakeSource, IntakeSources, KnownIssue, MAX_COUNTED_CHUNKS, MAX_LISTED, MAX_PER_PROPOSAL,
+        PostingAuthority, PrivacyClass, ProblemKey, Proposal, RawReport, ReadScope, Report,
+        ReportConnector, ReportLink, SourceId, marker, plan, problem_marker,
     },
 };
 
@@ -120,13 +120,23 @@ fn raw(
     reporter: &str,
     text: &str,
 ) -> Result<RawReport, Box<dyn std::error::Error>> {
+    raw_at(id, channel, reporter, text, 1_000)
+}
+
+fn raw_at(
+    id: &str,
+    channel: &str,
+    reporter: &str,
+    text: &str,
+    received: u64,
+) -> Result<RawReport, Box<dyn std::error::Error>> {
     Ok(RawReport {
         id: ExternalRef::new(id)?,
         channel: ExternalRef::new(channel)?,
         link: Some(ReportLink::new(&format!("https://example.test/{id}"))?),
         reporter: ExternalRef::new(reporter)?,
         text: Text::new(text)?,
-        received_at: Timestamp::from_unix_millis(1_000),
+        received_at: Timestamp::from_unix_millis(received),
     })
 }
 
@@ -1013,11 +1023,20 @@ fn login(
     sources: &IntakeSources,
     ids: &[&str],
 ) -> Result<Vec<Classified>, Box<dyn std::error::Error>> {
+    login_at(sources, ids, 1_000)
+}
+
+/// Login reports received at `received` Unix milliseconds.
+fn login_at(
+    sources: &IntakeSources,
+    ids: &[&str],
+    received: u64,
+) -> Result<Vec<Classified>, Box<dyn std::error::Error>> {
     ids.iter()
         .map(|id| -> Result<Classified, Box<dyn std::error::Error>> {
             let report = sources.accept(
                 &SourceId::new("support")?,
-                raw(id, "inbox", PRIVATE_REPORTER, PRIVATE_TEXT)?,
+                raw_at(id, "inbox", PRIVATE_REPORTER, PRIVATE_TEXT, received)?,
             )?;
             classified(report, "login-timeout")
         })
@@ -1500,11 +1519,23 @@ fn apply_reports(
     fence: Fence,
     ids: &[&str],
 ) -> TestResult {
+    apply_reports_at(kitchen, forge, task, fence, ids, 1_000)
+}
+
+/// Like [`apply_reports`], for reports received at `received`.
+fn apply_reports_at(
+    kitchen: &Kitchen,
+    forge: &Forge,
+    task: &TaskId,
+    fence: Fence,
+    ids: &[&str],
+    received: u64,
+) -> TestResult {
     let counted = kitchen.ledger(kitchen.store())?.counted(task)?;
     let proposals = plan(
         &house()?,
         &repo()?,
-        &login(&sources()?, ids)?,
+        &login_at(&sources()?, ids, received)?,
         &open_issue(3)?,
         &counted,
         &full_authority()?,
@@ -1741,5 +1772,223 @@ fn compaction_refuses_a_reservation_whose_task_is_gone() -> TestResult {
         kitchen.store().markers(&WorkflowId::new("intake")?)?.len(),
         1
     );
+    Ok(())
+}
+
+/// Apply one settled batch of `MAX_PER_PROPOSAL` new reports, received at
+/// `received`, from task `intake-batch-{batch}`, and compact.
+fn apply_batch(
+    kitchen: &Kitchen,
+    forge: &Forge,
+    batch: u64,
+    received: u64,
+) -> Result<kitchen::workflows::intake::Compaction, Box<dyn std::error::Error>> {
+    let (task, fence) = kitchen.start(&format!("intake-batch-{batch}"))?;
+    let ids: Vec<String> = (0..MAX_PER_PROPOSAL)
+        .map(|index| format!("b{batch}-{index}"))
+        .collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    apply_reports_at(kitchen, forge, &task, fence, &ids, received)?;
+    settle(
+        kitchen,
+        &task,
+        fence,
+        kitchen::contracts::AttemptOutcome::Succeeded,
+    )?;
+    Ok(kitchen
+        .ledger(kitchen.store())?
+        .compact(&common::scheduled("intake")?, common::at(3))?)
+}
+
+#[test]
+fn a_full_dedupe_window_evicts_its_oldest_chunk_and_still_dedupes() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let forge = Forge::new()?;
+    let workflow = WorkflowId::new("intake")?;
+    let chunks = u64::try_from(MAX_COUNTED_CHUNKS)?;
+    // One full batch fills one counted marker, so the window holds this
+    // many batches before anything is evicted.
+    for batch in 0..chunks {
+        let compaction = apply_batch(&kitchen, &forge, batch, (batch + 1) * 1_000)?;
+        assert_eq!((compaction.folded, compaction.evicted), (1, 0));
+        assert_eq!(compaction.forgotten_through, None);
+    }
+    assert_eq!(
+        kitchen.store().markers(&workflow)?.len(),
+        MAX_COUNTED_CHUNKS
+    );
+
+    // Saturated: the next settled reservation is still reclaimed, and the
+    // oldest chunk (batch 0, received at 1s) leaves the window.
+    let compaction = apply_batch(&kitchen, &forge, chunks, 100_000)?;
+    assert_eq!(
+        (compaction.folded, compaction.kept, compaction.evicted),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        compaction.forgotten_through,
+        Some(Timestamp::from_unix_millis(1_000))
+    );
+    // The same counted markers plus the forgotten-through marker; no
+    // reservation is left.
+    assert_eq!(
+        kitchen.store().markers(&workflow)?.len(),
+        MAX_COUNTED_CHUNKS + 1
+    );
+
+    let (next, _) = kitchen.start("intake-next")?;
+    let counted = kitchen.ledger(kitchen.store())?.counted(&next)?;
+    assert_eq!(
+        counted.forgotten_through(),
+        Some(Timestamp::from_unix_millis(1_000))
+    );
+    let problem = ProblemKey::new("login-timeout")?;
+    assert_eq!(
+        counted.total(&problem),
+        MAX_COUNTED_CHUNKS * MAX_PER_PROPOSAL
+    );
+    let sources = sources()?;
+    let mut replay = login_at(&sources, &["b0-0", "unseen-old"], 1_000)?;
+    replay.extend(login_at(&sources, &["b1-0"], 2_000)?);
+    replay.extend(login_at(&sources, &[&format!("b{chunks}-7")], 100_000)?);
+    replay.extend(login_at(&sources, &["fresh"], 200_000)?);
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &replay,
+        &open_issue(3)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    // Evicted (b0-0) and older-than-window (unseen-old) reports are dropped,
+    // reports still in the window are deduped, and only the new one is
+    // proposed, with a total that says earlier reports may be missing.
+    let [comment @ Proposal::AddReports { reports, total, .. }] = proposals.as_slice() else {
+        return Err(format!("unexpected proposals: {proposals:?}").into());
+    };
+    assert_eq!(
+        reports,
+        &login_at(&sources, &["fresh"], 200_000)?
+            .into_iter()
+            .map(|entry| entry.report.key())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(*total, MAX_COUNTED_CHUNKS * MAX_PER_PROPOSAL + 1);
+    assert!(
+        body(comment)
+            .ok_or("no body")?
+            .contains("at least 3201 counted in total"),
+        "{comment:?}"
+    );
+
+    // Another saturated pass keeps the window bounded and moves it on.
+    let compaction = apply_batch(&kitchen, &forge, chunks + 1, 300_000)?;
+    assert_eq!((compaction.folded, compaction.evicted), (1, 1));
+    assert_eq!(
+        compaction.forgotten_through,
+        Some(Timestamp::from_unix_millis(2_000))
+    );
+    assert_eq!(
+        kitchen.store().markers(&workflow)?.len(),
+        MAX_COUNTED_CHUNKS + 1
+    );
+    Ok(())
+}
+
+#[test]
+fn house_retention_compacts_intake_and_refuses_an_unreadable_ledger() -> TestResult {
+    use kitchen::{
+        state::{Inventory, RetentionPolicy},
+        workflows::intake::CompactionOutcome,
+    };
+
+    let kitchen = Kitchen::new()?;
+    let forge = Forge::new()?;
+    let workflow = WorkflowId::new("intake")?;
+    let (task, fence) = kitchen.start("intake-1")?;
+    apply_reports(&kitchen, &forge, &task, fence, &["m1", "m2"])?;
+    settle(
+        &kitchen,
+        &task,
+        fence,
+        kitchen::contracts::AttemptOutcome::Succeeded,
+    )?;
+    // A second intake workflow whose reserving task is gone: its ledger
+    // cannot tell what applied, so it must stay as it is.
+    let other = WorkflowId::new("intake-other")?;
+    let (lost, lost_fence) = kitchen.start("intake-2")?;
+    let ledger = IntakeLedger::new(kitchen.store(), other.clone(), repo()?);
+    let counted = ledger.counted(&lost)?;
+    let proposals = plan(
+        &house()?,
+        &repo()?,
+        &login(&sources()?, &["m9"])?,
+        &open_issue(3)?,
+        &counted,
+        &full_authority()?,
+    )?;
+    ledger.reserve(
+        &counted,
+        proposals.first().ok_or("no proposal")?,
+        &lost,
+        &common::scheduled("intake")?,
+        common::at(1),
+    )?;
+    settle(
+        &kitchen,
+        &lost,
+        lost_fence,
+        kitchen::contracts::AttemptOutcome::Succeeded,
+    )?;
+    kitchen.store().retire_tasks(std::slice::from_ref(&lost))?;
+    let reservation = kitchen.store().markers(&workflow)?;
+
+    let policy = RetentionPolicy::default();
+    let preview = kitchen
+        .store()
+        .preview_retention(&policy, &Inventory::new(), common::at(4))?;
+    let outcomes: Vec<_> = preview
+        .intake
+        .iter()
+        .map(|ledger| (ledger.workflow.clone(), ledger.outcome))
+        .collect();
+    let [
+        (first, CompactionOutcome::Compacted(compaction)),
+        (second, CompactionOutcome::Refused),
+    ] = outcomes.as_slice()
+    else {
+        return Err(format!("unexpected outcomes: {outcomes:?}").into());
+    };
+    assert_eq!((first, second), (&workflow, &other));
+    assert_eq!((compaction.folded, compaction.kept), (1, 0));
+    // The preview wrote nothing.
+    assert!(!preview.applied);
+    assert_eq!(kitchen.store().markers(&workflow)?, reservation);
+
+    let applied = kitchen.store().retain(
+        &policy,
+        &Inventory::new(),
+        &common::interactive("operator")?,
+        common::at(4),
+    )?;
+    assert!(applied.applied);
+    assert_eq!(applied.intake, preview.intake);
+    let markers = kitchen.store().markers(&workflow)?;
+    assert_eq!(markers.len(), 1);
+    assert_ne!(markers, reservation);
+    assert_eq!(kitchen.store().markers(&other)?.len(), 1);
+    // Counting and dedupe read the folded digests without the task.
+    kitchen.store().retire_tasks(std::slice::from_ref(&task))?;
+    let (next, _) = kitchen.start("intake-3")?;
+    let counted = kitchen.ledger(kitchen.store())?.counted(&next)?;
+    assert_eq!(counted.total(&ProblemKey::new("login-timeout")?), 2);
+    // A second pass has nothing left to change.
+    let again = kitchen.store().retain(
+        &policy,
+        &Inventory::new(),
+        &common::interactive("operator")?,
+        common::at(5),
+    )?;
+    assert!(!again.applied);
     Ok(())
 }

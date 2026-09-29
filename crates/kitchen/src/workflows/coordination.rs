@@ -1921,16 +1921,18 @@ pub fn record_worker_usage(
     let Some(view) = current_worker(&record) else {
         return Ok(UsageRoute::NoWorker);
     };
-    let ended = record
+    // A missing attempt falls through to the store, which refuses it.
+    if let Some(attempt) = record
         .attempts()
         .iter()
         .find(|attempt| attempt.number() == view.attempt)
-        .is_some_and(|attempt| match attempt.state() {
-            AttemptState::Running | AttemptState::Interrupted { .. } => false,
-            AttemptState::Finished { .. } | AttemptState::Cancelled { .. } => true,
-        });
-    if !ended {
-        return Ok(UsageRoute::AttemptOpen);
+    {
+        match attempt.state() {
+            AttemptState::Running | AttemptState::Interrupted { .. } => {
+                return Ok(UsageRoute::AttemptOpen);
+            }
+            AttemptState::Finished { .. } | AttemptState::Cancelled { .. } => {}
+        }
     }
     ctx.store.record_attempt_usage(
         task,

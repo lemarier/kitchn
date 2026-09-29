@@ -337,10 +337,18 @@ fn one_finding_attributed_to_two_scopes_records_both_raises() -> TestResult {
 
     let f = Fixture::new()?;
     let recorder = scheduled("sampling")?;
-    assert!(matches!(
-        code.record(&f.store, &recorder, day(110))?,
-        MarkerRecording::Recorded(_)
-    ));
+    let MarkerRecording::Recorded(recorded) = code.record(&f.store, &recorder, day(110))? else {
+        return Err("the first raise was not recorded".into());
+    };
+    // The subject is a fixed-width digest, the same on every host, so a store
+    // moved between architectures still finds the raise.
+    let kitchen::state::MarkerSubject::Observation(subject) = &recorded.key().subject else {
+        return Err("a raise's subject is an observation".into());
+    };
+    assert_eq!(
+        subject.as_str(),
+        "finding:51f047dca398f6ca5833b9589ca614b9dd75b93dabcf4fd909c654a18d780928"
+    );
     assert!(matches!(
         docs.record(&f.store, &recorder, day(110))?,
         MarkerRecording::Recorded(_)

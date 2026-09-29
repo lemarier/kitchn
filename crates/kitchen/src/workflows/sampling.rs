@@ -1132,7 +1132,8 @@ impl RateRaise {
             self.scope.work_type.to_string(),
             self.finding.as_str().to_owned(),
         ] {
-            digest.update(part.len().to_be_bytes());
+            // Fixed width, so the key is the same on every host.
+            digest.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
             digest.update(part.as_bytes());
         }
         Ok(MarkerKey {

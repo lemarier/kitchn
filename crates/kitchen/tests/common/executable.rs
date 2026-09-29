@@ -17,6 +17,13 @@ use std::{
 
 /// Writes `contents` to `path` with mode `0o700`, ready to execute at once.
 pub fn write_executable(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    // `cp` would copy into an existing directory instead of creating `path`.
+    if path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "executable path is a directory",
+        ));
+    }
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;

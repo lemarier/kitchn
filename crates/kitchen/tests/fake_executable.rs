@@ -64,6 +64,20 @@ fn a_missing_directory_or_file_name_is_an_error_and_leaves_nothing() -> TestResu
     Ok(())
 }
 
+#[test]
+fn a_directory_destination_is_refused_and_left_unchanged() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let target = dir.path().join("tool");
+    fs::create_dir(&target)?;
+    let error = write_executable(&target, "#!/bin/sh\n")
+        .err()
+        .ok_or("a directory destination was accepted")?;
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(fs::read_dir(&target)?.count(), 0);
+    assert_eq!(fs::read_dir(dir.path())?.count(), 1);
+    Ok(())
+}
+
 /// Regression for the Linux `ETXTBSY` race: forking threads must not make a
 /// script fail with `ETXTBSY` right after it is written. The pre-fix pattern
 /// (`fs::write` then run) fails this on Linux.

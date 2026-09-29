@@ -853,7 +853,9 @@ fn a_completion_missing_a_follow_up_becomes_a_follow_up_round() -> TestResult {
         )?,
         Supervision::Settled(Settlement::Succeeded)
     );
-    assert!(outstanding_follow_ups(&world.fixture.store.task(&task)?).is_empty());
+    assert!(
+        outstanding_follow_ups(&world.fixture.store, &world.fixture.store.task(&task)?)?.is_empty()
+    );
     Ok(())
 }
 
@@ -870,7 +872,7 @@ fn a_follow_up_to_a_completed_worker_is_queued_into_the_next_brief() -> TestResu
     let FollowUpRoute::Queued { id } = send_follow_up(&world.ctx(), &task, fence, &request)? else {
         return Err("follow-up not queued".into());
     };
-    let queued = outstanding_follow_ups(&world.fixture.store.task(&task)?);
+    let queued = outstanding_follow_ups(&world.fixture.store, &world.fixture.store.task(&task)?)?;
     assert_eq!(queued.len(), 1);
     assert_eq!(queued.first().map(|queued| &queued.id), Some(&id));
 
@@ -1066,7 +1068,7 @@ fn nothing_is_sent_into_a_terminal_a_person_holds() -> TestResult {
     let request = follow_up("review-3", "Rename the driver constant.")?;
     assert!(matches!(
         send_follow_up(&world.ctx(), &task, fence, &request)?,
-        FollowUpRoute::NextBrief { .. }
+        FollowUpRoute::Held { .. }
     ));
     // Once the takeover is recorded, the backend's later answer does not
     // matter: the terminal stays the person's.
@@ -1077,7 +1079,7 @@ fn nothing_is_sent_into_a_terminal_a_person_holds() -> TestResult {
     world.backend.set_worker_state(&worker, WorkerState::Ready);
     assert!(matches!(
         send_follow_up(&world.ctx(), &task, fence, &request)?,
-        FollowUpRoute::NextBrief { .. }
+        FollowUpRoute::Held { .. }
     ));
     assert_eq!(
         retry_validation(&world.ctx(), &task, fence)?,
@@ -1199,7 +1201,7 @@ fn a_follow_up_id_is_sent_once_even_after_the_first_send_was_not_applied() -> Te
     );
     assert_eq!(world.backend.execute_calls(), calls_after_launch);
     assert!(calls_after_launch >= calls);
-    let queued = outstanding_follow_ups(&world.fixture.store.task(&task)?);
+    let queued = outstanding_follow_ups(&world.fixture.store, &world.fixture.store.task(&task)?)?;
     let [only] = queued.as_slice() else {
         return Err(format!("expected one queued follow-up, found {}", queued.len()).into());
     };
@@ -1231,7 +1233,7 @@ fn a_delivered_follow_up_is_not_sent_again_in_a_later_attempt() -> TestResult {
         FollowUpRoute::Delivered { id: id.clone() }
     );
     assert_eq!(world.backend.execute_calls(), calls, "sent a second time");
-    let queued = outstanding_follow_ups(&world.fixture.store.task(&task)?);
+    let queued = outstanding_follow_ups(&world.fixture.store, &world.fixture.store.task(&task)?)?;
     assert_eq!(queued.len(), 1);
     // A different id is a different request and is still sent.
     let other = follow_up("review-11", "Add a test.")?;
@@ -1257,7 +1259,7 @@ fn a_follow_up_body_is_quoted_as_data() -> TestResult {
         return Err("follow-up not delivered".into());
     };
     let record = world.fixture.store.task(&task)?;
-    let queued = outstanding_follow_ups(&record);
+    let queued = outstanding_follow_ups(&world.fixture.store, &record)?;
     let [message] = queued.as_slice() else {
         return Err("expected one recorded follow-up".into());
     };

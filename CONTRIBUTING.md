@@ -86,6 +86,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #130 agent inventory for house init | `adapters/orca/accounts.rs` | `AgentInventory` in `house/wizard/`; `PATH` and `orca account list` probes in `crates/kitchen-cli/src/commands/house_init.rs`; `tests/house_init.rs` |
 | #119 task work type and derived trust scope | `TaskSpec::work_type` in `contracts/task.rs` (with #4); `StationScope::of_task` and binding checks in `trust/` (with #12) | The work type pickup, repair, and interactive rounds pass to `resolve_agent` and record; scope tests in `crates/kitchen/tests/trust_ledger.rs`; creation-to-binding tests in the pickup, repair, and interactive tests |
 | #110 trust ledger archival | `trust/archive.rs` | The `archivals` summaries in `trust/store.rs` and the archive append in `state/snapshot.rs`; `kitchn trust` in `crates/kitchen-cli/src/commands/trust.rs`; tests in `crates/kitchen/tests/trust_archive.rs` and `crates/kitchen-cli/tests/trust.rs` |
+| #88 durable follow-ups for a person-held terminal | `workflows/follow_up.rs` | Held follow-up routing in `workflows/coordination.rs` (with #8); tests in `crates/kitchen/tests/workflows_follow_up.rs` |
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.

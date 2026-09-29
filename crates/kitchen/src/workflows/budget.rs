@@ -600,8 +600,26 @@ pub fn tick(
         resources: BTreeSet::new(),
         agent: None,
     };
-    tick.store
-        .create_task(spec, tick.claimant, tick.clock.now())?;
+    match tick
+        .store
+        .create_task(spec.clone(), tick.claimant, tick.clock.now())
+    {
+        Ok(_) => {}
+        // A window task an earlier release created keeps its stored retry
+        // policy; anything else that differs is still a conflict.
+        Err(Error::State(StateError::TaskConflict(_))) => {
+            let stored = tick.store.task(&task)?.spec().clone();
+            if stored
+                != (TaskSpec {
+                    retry: stored.retry,
+                    ..spec
+                })
+            {
+                return Err(Error::State(StateError::TaskConflict(task)));
+            }
+        }
+        Err(error) => return Err(error),
+    }
     let fence = claim(tick, &task)?;
     let result = act(tick, &task, fence, policy, evidence);
     let released = tick.store.relinquish(&task, fence, tick.clock.now());

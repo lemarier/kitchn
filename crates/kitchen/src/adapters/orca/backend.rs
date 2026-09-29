@@ -512,7 +512,11 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
 pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
     match error {
         OrcaError::Timeout => BackendUnavailable::Timeout,
-        OrcaError::ReservationInsideRepository => BackendUnavailable::LocalConfiguration,
+        // Kitchen's own reservation directory failed before any Orca request:
+        // a retry cannot help until the local setup changes.
+        OrcaError::ReservationInsideRepository
+        | OrcaError::ReservationRedirected
+        | OrcaError::ReservationUnavailable(_) => BackendUnavailable::LocalConfiguration,
         OrcaError::Spawn(_)
         | OrcaError::OutputLimit { .. }
         | OrcaError::Io(_)
@@ -533,8 +537,6 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::ScheduleDiffers { .. }
         | OrcaError::ScheduleLimit(_)
         | OrcaError::ReservationBusy
-        | OrcaError::ReservationRedirected
-        | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::InstallUncertain
         | OrcaError::StateMismatch
@@ -1453,6 +1455,21 @@ mod tests {
             "the guard runs before any Orca request"
         );
         assert_eq!(
+            read_failure(&OrcaError::ReservationRedirected),
+            BackendUnavailable::LocalConfiguration
+        );
+        assert_eq!(
+            read_failure(&OrcaError::ReservationUnavailable(
+                std::io::ErrorKind::PermissionDenied
+            )),
+            BackendUnavailable::LocalConfiguration
+        );
+        // Another holder can release a busy key, so it stays retryable.
+        assert_eq!(
+            read_failure(&OrcaError::ReservationBusy),
+            BackendUnavailable::Transport
+        );
+        assert_eq!(
             read_failure(&OrcaError::Io(std::io::ErrorKind::BrokenPipe)),
             BackendUnavailable::Transport
         );
@@ -1460,6 +1477,22 @@ mod tests {
             read_failure(&OrcaError::Timeout),
             BackendUnavailable::Timeout
         );
+    }
+
+    #[test]
+    fn a_failed_reservation_reads_as_local_configuration() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempfile::tempdir()?;
+        // A runtime "directory" that is a file cannot hold the reservation.
+        let file = root.path().join("runtime");
+        std::fs::write(&file, b"")?;
+        let error =
+            crate::adapters::orca::reserve::Reservation::acquire(&file, "k", Duration::ZERO)
+                .err()
+                .ok_or("a reservation was taken under a file")?;
+        assert!(matches!(error, OrcaError::ReservationUnavailable(_)));
+        assert_eq!(read_failure(&error), BackendUnavailable::LocalConfiguration);
+        Ok(())
     }
 
     #[test]

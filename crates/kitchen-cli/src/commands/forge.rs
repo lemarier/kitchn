@@ -1,4 +1,4 @@
-//! `kitchen forge`: the private binding a house writes to its forge with.
+//! `kitchn forge`: the private binding a house writes to its forge with.
 use clap::{Args, Subcommand};
 use kitchen::{
     BackendId, CredentialId, HouseId,
@@ -137,7 +137,7 @@ pub fn token_text(binding: &ForgeBinding, path: &Path, status: CredentialStatus)
         CredentialStatus::NotRegularFile
         | CredentialStatus::Redirected
         | CredentialStatus::NotOwned => format!(
-            "Token file {file} is {status}, so kitchen will not use it. Remove what is there, keep every directory on that path a real directory you own, then place a token for {login} readable only by you.",
+            "Token file {file} is {status}, so kitchn will not use it. Remove what is there, keep every directory on that path a real directory you own, then place a token for {login} readable only by you.",
             login = binding.requester.as_str(),
         ),
         CredentialStatus::Missing | CredentialStatus::Exposed => {

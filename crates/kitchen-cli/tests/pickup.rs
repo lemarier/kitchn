@@ -4,7 +4,7 @@ use std::error::Error;
 use std::process::{Command, Output};
 
 fn kitchen(args: &[&str]) -> std::io::Result<Output> {
-    Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .args(args)
         .output()
 }

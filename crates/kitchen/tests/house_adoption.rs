@@ -335,7 +335,7 @@ fn doctor_unknown_is_not_success_and_scoped_evidence_can_complete_it() -> TestRe
                 .any(|finding| finding.code == code && !finding.next_step.is_empty())
         );
     }
-    assert!(unknown.human_readable().contains("kitchen house sync"));
+    assert!(unknown.human_readable().contains("kitchn house sync"));
     registry.sync(&house.house, &bundle("origin89")?)?;
     let labels = unknown
         .labels

@@ -103,7 +103,7 @@ impl Fixture {
         self.command_for(verb, target, "test")
     }
     fn command_for(&self, verb: &str, target: &Path, template: &str) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kitchen"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kitchn"));
         command
             .arg(verb)
             .arg(target)
@@ -447,7 +447,7 @@ fn init_refuses_a_non_empty_root_and_adopt_accepts_it() -> Result {
     let output = f.selected("init").arg("--yes").output()?;
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert!(
-        stderr(&output).contains("kitchen adopt"),
+        stderr(&output).contains("kitchn adopt"),
         "{}",
         stderr(&output)
     );
@@ -626,7 +626,7 @@ fn printed_doctor_command_survives_quotes_and_spaces_in_paths() -> Result {
     let command = text
         .lines()
         .map(str::trim)
-        .find_map(|line| line.strip_prefix("kitchen house doctor "))
+        .find_map(|line| line.strip_prefix("kitchn house doctor "))
         .ok_or_else(|| format!("no doctor command in {text}"))?;
     let echoed = Command::new("sh")
         .arg("-c")
@@ -700,7 +700,7 @@ fn non_utf8_registry_omits_inexact_doctor_command() -> Result {
         .root
         .join(std::ffi::OsString::from_vec(b"registry-\xff".to_vec()));
     fs::rename(f.root.join("registry"), &registry)?;
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .arg("init")
         .arg(&target)
         .arg("--registry")
@@ -718,6 +718,6 @@ fn non_utf8_registry_omits_inexact_doctor_command() -> Result {
     assert!(target.join("AGENTS.md").exists());
     let text = stdout(&output);
     assert!(text.contains("an executable hint cannot represent a non-UTF-8 path"));
-    assert!(!text.contains("kitchen house doctor --registry"));
+    assert!(!text.contains("kitchn house doctor --registry"));
     Ok(())
 }

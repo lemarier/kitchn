@@ -1,7 +1,7 @@
 # Initialize or adopt a repository
 
-Register a reviewed house configuration with `kitchen house init` and import its
-pinned guidance with `kitchen house sync` first. The house allowlist must contain
+Register a reviewed house configuration with `kitchn house init` and import its
+pinned guidance with `kitchn house sync` first. The house allowlist must contain
 the repository. `--template` names a template in that guidance: Kitchen verifies
 the house's immutable snapshot for its configured guidance revision, loads
 `templates/<name>/` from the verified bundle, and records that revision in
@@ -11,7 +11,7 @@ caller's step before `house sync`. Templates are trusted code inputs and must
 terminate.
 
 ```sh
-kitchen init my-project --registry /path/to/registry \
+kitchn init my-project --registry /path/to/registry \
   --house example --repository example/my-project \
   --template example --set project_name=my-project
 ```
@@ -42,7 +42,7 @@ the repository directory and files, without running `git init` or activating
 workflow files.
 
 `init` accepts a missing or empty directory and refuses one with content. For an
-existing directory, use `kitchen adopt` with the same arguments. The repository
+existing directory, use `kitchn adopt` with the same arguments. The repository
 binding is stored in the house registry, never in the repository: the target
 receives only template files. Without `--repository`, `adopt` reads the GitHub
 `owner/name` from the target checkout's Git remotes. Once a repository is bound,
@@ -52,7 +52,7 @@ checks/reviewers are retained; new bindings select no workflows. Templates
 cannot render the legacy `.kitchen.json`. The stored binding is rechecked
 before apply, so a change after the preview blocks the apply.
 
-After `kitchen house update` selects a newer guidance revision, rerun `adopt` to
+After `kitchn house update` selects a newer guidance revision, rerun `adopt` to
 preview its template updates; earlier snapshots are retained for active tasks
 but are not used for new plans. Provenance
 markers distinguish pristine managed files whose upstream content or revision
@@ -72,9 +72,9 @@ Instruction snapshots and repository bootstrap files are separate. Import a
 caller-verified, exact-pin instruction bundle using:
 
 ```sh
-kitchen house sync --registry /path/to/registry --house example \
+kitchn house sync --registry /path/to/registry --house example \
   --bundle /path/to/verified-bundle.json
-kitchen house doctor --registry /path/to/registry --repository-path my-project
+kitchn house doctor --registry /path/to/registry --repository-path my-project
 ```
 
 `house sync` installs assets in the external registry's immutable snapshot; it

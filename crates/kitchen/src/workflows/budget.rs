@@ -2,9 +2,9 @@
 //! schedules, pause each exhausted one, and hand its owner report back once
 //! per window.
 //!
-//! [`tick`] is the caller: the `kitchen budget run` command, started by the
+//! [`tick`] is the caller: the `kitchn budget run` command, started by the
 //! house's budget schedule ([`install`], always installed paused) after
-//! `kitchen budget precheck` found work. It claims one task per budget
+//! `kitchn budget precheck` found work. It claims one task per budget
 //! window, reconciles that task's earlier effects, runs the pass, posts each
 //! due report through the report channel, and records a report only after
 //! its post applied. [`run`] can also run as a step of another workflow that
@@ -318,9 +318,9 @@ const TICK_ELAPSED: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Which budget command a schedule step runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickCommand {
-    /// `kitchen budget precheck`: reads only.
+    /// `kitchn budget precheck`: reads only.
     Precheck,
-    /// `kitchen budget run`: pauses and reports.
+    /// `kitchn budget run`: pauses and reports.
     Run,
 }
 
@@ -355,12 +355,12 @@ pub struct ReportArgs {
 }
 
 /// Everything the budget schedule's commands need, rendered as argument
-/// vectors for `kitchen budget precheck` and `kitchen budget run`. Paths are
+/// vectors for `kitchn budget precheck` and `kitchn budget run`. Paths are
 /// absolute because the backend runs them outside any checkout. Credential
 /// file paths are recorded in the schedule; tokens never are.
 #[derive(Debug, Clone)]
 pub struct TickArgs {
-    /// The installed `kitchen` executable.
+    /// The installed `kitchn` executable.
     pub kitchen: PathBuf,
     /// The house registry holding the house configuration.
     pub registry: PathBuf,
@@ -446,8 +446,8 @@ fn absolute(path: &Path) -> Result<&str> {
 /// budget pauses it too. Nothing in Kitchen activates it: turning it on, and
 /// again after a pause, is the owner's separate schedule effect under its own
 /// permission. Its precheck is
-/// `kitchen budget precheck`, so a tick with no exhausted schedule starts no
-/// agent; the agent it starts runs `kitchen budget run` and relays that
+/// `kitchn budget precheck`, so a tick with no exhausted schedule starts no
+/// agent; the agent it starts runs `kitchn budget run` and relays that
 /// output.
 ///
 /// # Errors

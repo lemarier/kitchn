@@ -1,4 +1,4 @@
-//! `kitchen forge` and the forge binding offered by guided `house init`,
+//! `kitchn forge` and the forge binding offered by guided `house init`,
 //! through the real CLI in disposable roots with a fake `gh`. Simulated: no
 //! GitHub account or token is used.
 use kitchen::contracts::CommitId;
@@ -71,7 +71,7 @@ fn fixture(root: &Path, login: Option<&str>) -> TestResult<Fixture> {
 }
 
 fn kitchen(fixture: &Fixture, args: &[&str]) -> TestResult<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .current_dir(&fixture.checkout)
         .env("HOME", &fixture.home)
         .env("PATH", &fixture.path)
@@ -158,7 +158,7 @@ fn guided_init_without_gh_binds_nothing_and_show_names_the_missing_binding() -> 
     assert_eq!(show.status.code(), Some(1));
     assert_eq!(
         text(&show.stderr),
-        "error: house acme has no forge binding, so kitchen cannot write to its forge; bind one with `kitchen forge bind --house acme` or `kitchen house init`\n"
+        "error: house acme has no forge binding, so kitchn cannot write to its forge; bind one with `kitchn forge bind --house acme` or `kitchn house init`\n"
     );
     Ok(())
 }

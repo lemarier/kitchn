@@ -18,7 +18,7 @@ pub struct ScaffoldArgs {
     /// Destination directory (created only after confirmation).
     #[arg(default_value = ".")]
     target: PathBuf,
-    /// External house registry created by kitchen house init.
+    /// External house registry created by kitchn house init.
     #[arg(long)]
     registry: PathBuf,
     /// Template name in the selected house's pinned guidance snapshot.
@@ -111,9 +111,9 @@ pub fn run(args: ScaffoldArgs, adopt: bool) -> Result<(String, bool), kitchen::E
     let healthy = plan.files().conflicts().next().is_none();
     let doctor_hint = match (shell_quote(registry.root()), shell_quote(&target)) {
         (Some(registry), Some(target)) => format!(
-            "then run:\n  kitchen house doctor --registry {registry} --repository-path {target}"
+            "then run:\n  kitchn house doctor --registry {registry} --repository-path {target}"
         ),
-        _ => "then run kitchen house doctor with the exact registry and repository paths; an executable hint cannot represent a non-UTF-8 path.".into(),
+        _ => "then run kitchn house doctor with the exact registry and repository paths; an executable hint cannot represent a non-UTF-8 path.".into(),
     };
     Ok((
         format!(

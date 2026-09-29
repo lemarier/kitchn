@@ -295,7 +295,7 @@ fn open(session: Session) -> Result<Result<Opened, String>, kitchen::Error> {
         HouseResolution::Ready(house) => *house,
         HouseResolution::NeedsSetup { repository, house } => {
             return Ok(Err(format!(
-                "Repository {repository} is claimed by house {house} but not set up.\nNext: ask the person whether to bind it, then run kitchen house setup --registry '{}' --repository {repository} --house {house}",
+                "Repository {repository} is claimed by house {house} but not set up.\nNext: ask the person whether to bind it, then run kitchn house setup --registry '{}' --repository {repository} --house {house}",
                 registry.root().display()
             )));
         }

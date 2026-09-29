@@ -11,7 +11,7 @@ a schedule) needs their approval of that exact action, in this session.
 Approval never carries over to another action, and it is never saved as a
 standing grant. Installing this skill grants nothing.
 
-The CLI binary is `kitchen` (it becomes `kitchn` with issue #18). Every
+The CLI binary is `kitchn`. Every
 command below takes `--registry <dir>`: use the path the person gave for
 their house registry. If you don't know it, ask. Kitchen writes nothing into
 the repository's working tree.
@@ -43,7 +43,7 @@ workflows to enable (`none` means interactive only). After they answer, run
 exactly:
 
 ```sh
-kitchen house setup --registry <dir> --repository <repository> --house <house> --workflows <list|none>
+kitchn house setup --registry <dir> --repository <repository> --house <house> --workflows <list|none>
 ```
 
 Show the person the doctor report it prints. Any other resolution error
@@ -66,7 +66,7 @@ Write the issue facts you read from the forge to a temporary file:
 { "status": "open", "subIssues": [{ "number": 15, "status": "open", "blocked": false }], "independentParts": false }
 ```
 
-`kitchen work <issue> --facts <file> --revision <rev> --registry <dir> --store <dir> --holder <you> [orca flags] --json`
+`kitchn work <issue> --facts <file> --revision <rev> --registry <dir> --store <dir> --holder <you> [orca flags] --json`
 
 - `coordinate`: list ready and waiting sub-issues. With `fanOut: true`, ask
   the person before starting each worker. Otherwise work them one at a time.
@@ -84,7 +84,7 @@ Facts at one head:
 { "state": "open", "head": "<40-hex sha>", "headBranch": "…", "baseBranch": "main", "mergeability": "clean", "review": "unreviewed" }
 ```
 
-`kitchen pr <number> --facts <file> [--as review|follow-up|repair|gate] --revision <rev> --registry <dir> --store <dir> --holder <you> [orca flags] --json`
+`kitchn pr <number> --facts <file> [--as review|follow-up|repair|gate] --revision <rev> --registry <dir> --store <dir> --holder <you> [orca flags] --json`
 
 Kitchen reads the rounds already spent from the house store and applies the
 house's fix-round budget. `--fix-rounds <n>` can only lower that budget.
@@ -108,8 +108,8 @@ open. Write the draft to a temporary file:
 For a refinement, the target is `{ "type": "refine", "issue": 72, "comment": "…" }`
 and `removeLabels` is allowed.
 
-`kitchen issue new --draft <file> --revision <rev> --registry <dir> --json`
-`kitchen issue refine <n> --draft <file> --revision <rev> --registry <dir> --json`
+`kitchn issue new --draft <file> --revision <rev> --registry <dir> --json`
+`kitchn issue refine <n> --draft <file> --revision <rev> --registry <dir> --json`
 
 Show the person the whole preview: every issue, comment, label, and
 dependency, and the digest. A preview with open questions is not ready.
@@ -124,7 +124,7 @@ A draft refused because an earlier draft settled after writing
 Show them the task and its writes, have them check those writes on the
 forge, and run with their reason:
 
-`kitchen issue acknowledge <task> --reason <why> --registry <dir> --store <dir> --holder <you>`
+`kitchn issue acknowledge <task> --reason <why> --registry <dir> --store <dir> --holder <you>`
 
 This build cannot re-read the forge, so a write without a recorded receipt
 is reported as unknown. Add `--accept-unknown` only after the person has
@@ -135,12 +135,12 @@ checked it and says to. Never release a subject on your own.
 When you stop before the work is done, hand the claim back so scheduled runs
 or another session can adopt it:
 
-`kitchen hand-back <task> --registry <dir> --store <dir> --holder <you>`
+`kitchn hand-back <task> --registry <dir> --store <dir> --holder <you>`
 
 ## 4. Scheduling
 
 A request such as "schedule pickup every 15 minutes" needs a preview
-(repository, interval, agent), the person's approval, and `kitchen house
+(repository, interval, agent), the person's approval, and `kitchn house
 doctor` reporting every capability scheduled pickup needs as observed. This
 build has no schedule command: say so and create nothing. Scheduled runs act
 on house grants, never on this session's approvals.

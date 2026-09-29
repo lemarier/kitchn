@@ -8,7 +8,7 @@ pub enum HouseInitError {
     /// Standard input is not a terminal and these answers have neither a
     /// flag nor a default. Nothing was written.
     #[error(
-        "standard input is not a terminal, so kitchen cannot ask; pass {} (or register a reviewed file with --config)",
+        "standard input is not a terminal, so kitchn cannot ask; pass {} (or register a reviewed file with --config)",
         flags(.0)
     )]
     MissingAnswers(Vec<InitQuestion>),
@@ -19,7 +19,7 @@ pub enum HouseInitError {
     /// The build recorded no Kitchen commit, so the embedded guidance cannot
     /// be labelled with one. Nothing was written.
     #[error(
-        "this kitchen binary did not record the commit it was built from, so it cannot label its built-in guidance; install with `just install` from a clean checkout, or pass --bundle <path> with a verified instruction bundle"
+        "this kitchn binary did not record the commit it was built from, so it cannot label its built-in guidance; install with `just install` from a clean checkout, or pass --bundle <path> with a verified instruction bundle"
     )]
     BuildCommitUnknown,
     /// `--kitchen` names a commit other than this build's. Nothing was

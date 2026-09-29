@@ -12,12 +12,12 @@ external directory; do not place the registry inside a checkout. Paths below
 are examples to replace, not commands that activate a real house.
 
 ```sh
-kitchen house init --registry /absolute/external/kitchen --config /path/house.json
-kitchen house sync --registry /absolute/external/kitchen --house example --bundle /path/verified-bundle.json
-kitchen house setup --registry /absolute/external/kitchen
+kitchn house init --registry /absolute/external/kitchen --config /path/house.json
+kitchn house sync --registry /absolute/external/kitchen --house example --bundle /path/verified-bundle.json
+kitchn house setup --registry /absolute/external/kitchen
 ```
 
-Without `--config`, `kitchen house init` asks for the house name and offers a
+Without `--config`, `kitchn house init` asks for the house name and offers a
 default for everything else: the checkout's repository, Claude Code at the pass
 and Codex at the stations, and the expediter as required reviewer. It prints
 the configuration, registers it after confirmation, and pins Kitchen's default
@@ -33,7 +33,7 @@ neither, or outside Git, is refused; `--repository owner/name` names the
 repository explicitly instead, and the house allowlist still gates it. If
 another remote belongs to a different house than the identifying one, Kitchen
 stops and names the remotes rather than choosing. A `.kitchen.json` written by
-an older Kitchen is not read; `kitchen house import` previews it in full and
+an older Kitchen is not read; `kitchn house import` previews it in full and
 `--yes --digest <digest>` stores exactly what was previewed, refusing if the
 file changed since. The binding contains the house and repository identities, selected workflows,
 and additional reviewer/check requirements. It cannot contain credentials,
@@ -57,8 +57,8 @@ Exact-name labels with color or description drift are reported informationally a
 Disabling a workflow leaves its labels in place.
 
 ```sh
-kitchen house doctor --registry /absolute/external/kitchen --repository-path /absolute/checkout --json
-kitchen house update --registry /absolute/external/kitchen --house example --bundle /path/new-verified-bundle.json
+kitchn house doctor --registry /absolute/external/kitchen --repository-path /absolute/checkout --json
+kitchn house update --registry /absolute/external/kitchen --house example --bundle /path/new-verified-bundle.json
 ```
 
 Doctor's optional `--evidence /path/scoped-observation.json` accepts a

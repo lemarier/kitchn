@@ -1,4 +1,4 @@
-//! The `kitchen budget` process contract. Orca is a fake `orca` script that
+//! The `kitchn budget` process contract. Orca is a fake `orca` script that
 //! keeps one schedule's enabled flag in a file; no live Orca or automation is
 //! contacted, so none of this is live runtime evidence.
 #![cfg(unix)]
@@ -141,7 +141,7 @@ impl Kitchen {
             path_arg(&self.path("runtime"))?,
         ];
         args.extend(extra.iter().map(|arg| (*arg).to_owned()));
-        Ok(Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
             .args(&args)
             .output()?)
     }
@@ -282,7 +282,7 @@ fn installing_the_tick_needs_the_schedule_grant() -> TestResult {
         "install",
         &[
             "--kitchen",
-            env!("CARGO_BIN_EXE_kitchen"),
+            env!("CARGO_BIN_EXE_kitchn"),
             "--cron",
             "15 * * * *",
             "--timezone",
@@ -310,7 +310,7 @@ fn installing_the_tick_with_a_report_issue_needs_the_comment_grant() -> TestResu
         "install",
         &[
             "--kitchen",
-            env!("CARGO_BIN_EXE_kitchen"),
+            env!("CARGO_BIN_EXE_kitchn"),
             "--cron",
             "15 * * * *",
             "--timezone",

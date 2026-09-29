@@ -26,9 +26,15 @@ pub enum ScheduleRequirements<'a> {
     /// cannot show what its workflow needs and is refused.
     Unrecorded,
     /// Activating or trying this installed schedule starts runs, so the
-    /// requirements recorded when it was installed apply; one with none
-    /// recorded is refused.
-    Installed(&'a ResourceRef),
+    /// requirements recorded when it was installed apply. `requires` is what
+    /// the effect carries from Kitchen's record; the effect is refused when
+    /// it or the record is missing, or when they differ.
+    Installed {
+        /// The schedule.
+        schedule: &'a ResourceRef,
+        /// The requirements the effect carries.
+        requires: Option<&'a BTreeSet<Capability>>,
+    },
 }
 
 /// A schedule change.
@@ -54,6 +60,12 @@ pub enum ScheduleEffect {
         schedule: ResourceRef,
         /// The requested state.
         state: ScheduleState,
+        /// The capabilities Kitchen recorded for the schedule's workflow when
+        /// it was installed. Activation is refused without them, or when
+        /// they differ from the store's record or from what the executor
+        /// recorded with the schedule; pausing ignores them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requires: Option<BTreeSet<Capability>>,
     },
     /// Remove an installed schedule and its run history.
     #[serde(rename_all = "camelCase")]
@@ -68,6 +80,10 @@ pub enum ScheduleEffect {
     Trial {
         /// The schedule.
         schedule: ResourceRef,
+        /// The capabilities Kitchen recorded for the schedule's workflow, as
+        /// for activating it with [`Self::SetState`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requires: Option<BTreeSet<Capability>>,
     },
 }
 
@@ -95,8 +111,12 @@ impl ScheduleEffect {
             Self::SetState {
                 schedule,
                 state: ScheduleState::Active,
+                requires,
             }
-            | Self::Trial { schedule } => ScheduleRequirements::Installed(schedule),
+            | Self::Trial { schedule, requires } => ScheduleRequirements::Installed {
+                schedule,
+                requires: requires.as_ref(),
+            },
             Self::SetState {
                 state: ScheduleState::Paused,
                 ..

@@ -1131,6 +1131,7 @@ impl BudgetExhaustion {
             Effect::Schedule(ScheduleEffect::SetState {
                 schedule: self.schedule.clone(),
                 state: ScheduleState::Paused,
+                requires: None,
             })
         })
     }

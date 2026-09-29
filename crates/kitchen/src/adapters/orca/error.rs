@@ -102,6 +102,14 @@ pub enum OrcaError {
         "the schedule records no readable workflow requirements; remove and reinstall it before activating or trying it"
     )]
     ScheduleRequirementsUnknown,
+    /// The automation's name records other workflow requirements than the
+    /// ones Kitchen recorded for the schedule, as after the automation was
+    /// renamed in Orca, so it is neither activated nor tried. Nothing was
+    /// changed.
+    #[error(
+        "the schedule's name records other workflow requirements than Kitchen's; remove and reinstall it before activating or trying it"
+    )]
+    ScheduleRequirementsMismatch,
     /// A trial run needs a paused schedule.
     #[error("a trial run needs a paused schedule")]
     TrialRequiresPaused,
@@ -196,6 +204,7 @@ impl OrcaError {
             | Self::NotKitchenOwned
             | Self::TrialRequiresPaused
             | Self::ScheduleRequirementsUnknown
+            | Self::ScheduleRequirementsMismatch
             | Self::ReservationRedirected
             | Self::ReservationInsideRepository
             | Self::BranchUnobtainable { .. }

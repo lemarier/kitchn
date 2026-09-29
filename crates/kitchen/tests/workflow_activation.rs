@@ -1,7 +1,9 @@
 //! A workflow's declared capability requirements are enforced when its
 //! schedule is installed, activated, or tried (#81): through the state store
 //! before any intent is persisted, and by the Orca adapter before any Orca
-//! change. A schedule whose requirements were never recorded is not started.
+//! change. Activation and trial carry Kitchen's recorded requirements; a
+//! schedule whose requirements were never recorded, or whose Orca name
+//! records others, is not started. Pausing it still works.
 //!
 //! Executors are the in-memory fake and the simulated Orca runtime
 //! (`orca_sim`); none of this is live runtime evidence.
@@ -360,16 +362,23 @@ fn run_on(
     .map(|record| record.state().clone()))
 }
 
-fn activate(schedule: &ResourceRef) -> ScheduleEffect {
+/// The requirement set an activation or trial carries from Kitchen's record.
+fn requiring<const N: usize>(capabilities: [Capability; N]) -> Option<BTreeSet<Capability>> {
+    Some(BTreeSet::from(capabilities))
+}
+
+fn activate(schedule: &ResourceRef, requires: Option<BTreeSet<Capability>>) -> ScheduleEffect {
     ScheduleEffect::SetState {
         schedule: schedule.clone(),
         state: ScheduleState::Active,
+        requires,
     }
 }
 
-fn trial(schedule: &ResourceRef) -> ScheduleEffect {
+fn trial(schedule: &ResourceRef, requires: Option<BTreeSet<Capability>>) -> ScheduleEffect {
     ScheduleEffect::Trial {
         schedule: schedule.clone(),
+        requires,
     }
 }
 
@@ -391,7 +400,11 @@ fn a_schedule_installed_without_recorded_requirements_is_not_started() -> TestRe
     let executor = full_scheduler()?;
     let legacy = fake_schedule("legacy-1")?;
     let task = activation_task(&fixture, "activate", std::slice::from_ref(&legacy))?;
-    for (name, effect) in [("activate", activate(&legacy)), ("trial", trial(&legacy))] {
+    let requires = requiring(budget::REQUIRED_CAPABILITIES);
+    for (name, effect) in [
+        ("activate", activate(&legacy, requires.clone())),
+        ("trial", trial(&legacy, requires)),
+    ] {
         let result = run_on(&fixture, &executor, &task, name, effect)?;
         assert!(
             matches!(
@@ -413,6 +426,7 @@ fn a_schedule_installed_without_recorded_requirements_is_not_started() -> TestRe
         ScheduleEffect::SetState {
             schedule: legacy,
             state: ScheduleState::Paused,
+            requires: None,
         },
     )?;
     assert!(matches!(paused?, EffectState::Applied { .. }));
@@ -440,11 +454,41 @@ fn activation_and_trial_recheck_the_requirements_recorded_at_install() -> TestRe
     // Another task given the schedule, on a backend that now supports its
     // precheck only in part, starts nothing.
     let task = activation_task(&fixture, "activate", std::slice::from_ref(&schedule))?;
+    let recorded = requiring([Capability::SchedulePrecheck]);
+    // The effect must carry exactly the recorded set: none, fewer, or other
+    // requirements are refused before any intent.
+    for (name, effect, mismatch) in [
+        ("activate-unstated", activate(&schedule, None), false),
+        ("trial-unstated", trial(&schedule, None), false),
+        ("activate-fewer", activate(&schedule, requiring([])), true),
+        (
+            "trial-other",
+            trial(&schedule, requiring([Capability::ScheduleRunTimeout])),
+            true,
+        ),
+    ] {
+        let result = run_on(&fixture, &installer, &task, name, effect)?;
+        let refused = if mismatch {
+            matches!(
+                result,
+                Err(Error::State(StateError::ScheduleRequirementsMismatch))
+            )
+        } else {
+            matches!(
+                result,
+                Err(Error::State(StateError::ScheduleRequirementsUnknown))
+            )
+        };
+        assert!(refused, "{name}: {result:?}");
+    }
+    assert!(fixture.store.task(&task.1)?.effects().is_empty());
+    assert_eq!(installer.execute_calls(), 1, "only the install ran");
+
     let degraded =
         scheduler(manages_schedules().with(Capability::SchedulePrecheck, Support::Partial))?;
     for (name, effect) in [
-        ("activate", activate(&schedule)),
-        ("trial", trial(&schedule)),
+        ("activate", activate(&schedule, recorded.clone())),
+        ("trial", trial(&schedule, recorded.clone())),
     ] {
         let result = run_on(&fixture, &degraded, &task, name, effect)?;
         assert!(
@@ -461,8 +505,8 @@ fn activation_and_trial_recheck_the_requirements_recorded_at_install() -> TestRe
 
     // The installing backend supports it.
     for (name, effect) in [
-        ("trial", trial(&schedule)),
-        ("activate", activate(&schedule)),
+        ("trial", trial(&schedule, recorded.clone())),
+        ("activate", activate(&schedule, recorded.clone())),
     ] {
         let result = run_on(&fixture, &installer, &task, name, effect)?;
         assert!(matches!(result?, EffectState::Applied { .. }), "{name}");
@@ -483,7 +527,7 @@ fn activation_and_trial_recheck_the_requirements_recorded_at_install() -> TestRe
         &installer,
         &task,
         "activate-again",
-        activate(&schedule),
+        activate(&schedule, recorded),
     )?;
     assert!(
         matches!(
@@ -493,6 +537,26 @@ fn activation_and_trial_recheck_the_requirements_recorded_at_install() -> TestRe
         "{again:?}"
     );
     Ok(())
+}
+
+fn orca_ref(id: &str) -> TestResult<ResourceRef> {
+    Ok(ResourceRef {
+        kind: ResourceKind::Schedule,
+        backend: BackendId::new("orca-local")?,
+        handle: ExternalRef::new(id)?,
+    })
+}
+
+fn orca_request(key: &str, effect: ScheduleEffect) -> TestResult<EffectRequest> {
+    Ok(EffectRequest::new(
+        house()?,
+        BackendId::new("orca-local")?,
+        CredentialId::new("orca-host-session")?,
+        task_id("activate")?,
+        AttemptNumber::FIRST,
+        IdempotencyKey::from_ref(ExternalRef::new(key)?),
+        effect.into(),
+    ))
 }
 
 #[test]
@@ -524,27 +588,31 @@ fn orca_does_not_start_a_schedule_whose_requirements_it_cannot_establish() -> Te
         ));
     }
     let backend = OrcaBackend::connect(orca_config(&sim)?, &sim)?;
-    let orca = |id: &str| -> TestResult<ResourceRef> {
-        Ok(ResourceRef {
-            kind: ResourceKind::Schedule,
-            backend: BackendId::new("orca-local")?,
-            handle: ExternalRef::new(id)?,
-        })
-    };
+    let kitchen = requiring(budget::REQUIRED_CAPABILITIES);
     for id in ["legacy", "unknown"] {
-        let schedule = orca(id)?;
+        let schedule = orca_ref(id)?;
         assert_eq!(
-            backend.set_schedule_state(&schedule, ScheduleState::Active),
+            backend.set_schedule_state(&schedule, ScheduleState::Active, kitchen.as_ref()),
             Err(OrcaError::ScheduleRequirementsUnknown),
             "{id}"
         );
         assert_eq!(
-            backend.trial_schedule(&schedule),
+            backend.trial_schedule(&schedule, kitchen.as_ref()),
             Err(OrcaError::ScheduleRequirementsUnknown),
             "{id}"
         );
     }
-    let shrunk = orca("shrunk")?;
+    let shrunk = orca_ref("shrunk")?;
+    let recorded = requiring([Capability::ScheduleManage, Capability::ScheduleRunTimeout]);
+    // Without Kitchen's requirements the name alone starts nothing.
+    assert_eq!(
+        backend.set_schedule_state(&shrunk, ScheduleState::Active, None),
+        Err(OrcaError::ScheduleRequirementsUnknown)
+    );
+    assert_eq!(
+        backend.trial_schedule(&shrunk, None),
+        Err(OrcaError::ScheduleRequirementsUnknown)
+    );
     let lacking = Err(OrcaError::Contract(
         ContractError::UnsupportedCapabilities {
             missing: vec![Capability::ScheduleRunTimeout],
@@ -552,27 +620,22 @@ fn orca_does_not_start_a_schedule_whose_requirements_it_cannot_establish() -> Te
         },
     ));
     assert_eq!(
-        backend.set_schedule_state(&shrunk, ScheduleState::Active),
+        backend.set_schedule_state(&shrunk, ScheduleState::Active, recorded.as_ref()),
         lacking
     );
-    assert_eq!(backend.trial_schedule(&shrunk), lacking);
+    assert_eq!(backend.trial_schedule(&shrunk, recorded.as_ref()), lacking);
     // Executed as effects, the refusals are definite.
     for (key, effect) in [
-        ("activate-legacy", activate(&orca("legacy")?)),
-        ("trial-legacy", trial(&orca("legacy")?)),
-        ("activate-shrunk", activate(&shrunk)),
+        (
+            "activate-legacy",
+            activate(&orca_ref("legacy")?, kitchen.clone()),
+        ),
+        ("trial-legacy", trial(&orca_ref("legacy")?, kitchen)),
+        ("activate-shrunk", activate(&shrunk, recorded)),
+        ("trial-unstated", trial(&shrunk, None)),
     ] {
-        let request = EffectRequest::new(
-            house()?,
-            BackendId::new("orca-local")?,
-            CredentialId::new("orca-host-session")?,
-            task_id("activate")?,
-            AttemptNumber::FIRST,
-            IdempotencyKey::from_ref(ExternalRef::new(key)?),
-            effect.into(),
-        );
         assert_eq!(
-            backend.execute(&request),
+            backend.execute(&orca_request(key, effect)?),
             Err(EffectFailure::NotApplied(NotAppliedReason::Rejected)),
             "{key}"
         );
@@ -580,11 +643,13 @@ fn orca_does_not_start_a_schedule_whose_requirements_it_cannot_establish() -> Te
     assert!(sim.calls_to(&["automations", "edit"]).is_empty());
     assert!(sim.calls_to(&["automations", "run"]).is_empty());
 
-    // Pausing starts nothing and stays available.
-    backend.set_schedule_state(&orca("legacy")?, ScheduleState::Paused)?;
+    // A legacy schedule can still be paused: that starts nothing.
+    backend.set_schedule_state(&orca_ref("legacy")?, ScheduleState::Paused, None)?;
+    assert_eq!(sim.calls_to(&["automations", "edit"]).len(), 1);
 
     // A schedule this adapter installs records its requirements and can
-    // be tried and activated.
+    // be tried and activated with Kitchen's matching set.
+    let manage = requiring([Capability::ScheduleManage]);
     let installed =
         backend.install_schedule(&plain_schedule()?.requiring([Capability::ScheduleManage]))?;
     let creates = sim.calls_to(&["automations", "create"]);
@@ -595,8 +660,56 @@ fn orca_does_not_start_a_schedule_whose_requirements_it_cannot_establish() -> Te
             .any(|arg| arg == "--name=kitchen:origin89:pickup:requires=schedule.manage"),
         "{create:?}"
     );
-    backend.trial_schedule(&installed)?;
-    backend.set_schedule_state(&installed, ScheduleState::Active)?;
+    backend.trial_schedule(&installed, manage.as_ref())?;
+    backend.set_schedule_state(&installed, ScheduleState::Active, manage.as_ref())?;
+    Ok(())
+}
+
+#[test]
+fn orca_does_not_start_a_renamed_schedule() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = OrcaBackend::connect(orca_config(&sim)?, &sim)?;
+    let kitchen = requiring([Capability::ScheduleManage]);
+    let installed =
+        backend.install_schedule(&plain_schedule()?.requiring([Capability::ScheduleManage]))?;
+    // Renamed in Orca to record no, fewer, or other requirements than
+    // Kitchen recorded at install. Orca supports every name below, so only
+    // the comparison with Kitchen's set can refuse them.
+    for renamed in [
+        "kitchen:origin89:pickup:requires=",
+        "kitchen:origin89:pickup:requires=effect.lookup",
+        "kitchen:origin89:pickup:requires=schedule.manage,effect.lookup",
+    ] {
+        sim.state().automations.first_mut().ok_or("installed")?.name = renamed.to_owned();
+        assert_eq!(
+            backend.set_schedule_state(&installed, ScheduleState::Active, kitchen.as_ref()),
+            Err(OrcaError::ScheduleRequirementsMismatch),
+            "{renamed}"
+        );
+        assert_eq!(
+            backend.trial_schedule(&installed, kitchen.as_ref()),
+            Err(OrcaError::ScheduleRequirementsMismatch),
+            "{renamed}"
+        );
+        for (key, effect) in [
+            ("activate", activate(&installed, kitchen.clone())),
+            ("trial", trial(&installed, kitchen.clone())),
+        ] {
+            assert_eq!(
+                backend.execute(&orca_request(key, effect)?),
+                Err(EffectFailure::NotApplied(NotAppliedReason::Rejected)),
+                "{renamed}: {key}"
+            );
+        }
+    }
+    assert!(sim.calls_to(&["automations", "edit"]).is_empty());
+    assert!(sim.calls_to(&["automations", "run"]).is_empty());
+
+    // With the recorded name restored, the same calls go through.
+    sim.state().automations.first_mut().ok_or("installed")?.name =
+        "kitchen:origin89:pickup:requires=schedule.manage".to_owned();
+    backend.trial_schedule(&installed, kitchen.as_ref())?;
+    backend.set_schedule_state(&installed, ScheduleState::Active, kitchen.as_ref())?;
     Ok(())
 }
 

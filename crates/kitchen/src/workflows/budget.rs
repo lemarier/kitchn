@@ -194,6 +194,7 @@ fn pause_all(
         let effect = Effect::Schedule(ScheduleEffect::SetState {
             schedule: exhaustion.schedule.clone(),
             state: ScheduleState::Paused,
+            requires: None,
         });
         let record = crate::state::run_effect(
             store,

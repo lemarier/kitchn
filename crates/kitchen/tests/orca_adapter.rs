@@ -1492,12 +1492,14 @@ fn schedule_changes_are_owned_and_read_back() -> TestResult {
             ScheduleEffect::SetState {
                 schedule: schedule(foreign)?,
                 state: ScheduleState::Paused,
+                requires: None,
             },
             ScheduleEffect::Remove {
                 schedule: schedule(foreign)?,
             },
             ScheduleEffect::Trial {
                 schedule: schedule(foreign)?,
+                requires: Some(BTreeSet::new()),
             },
         ] {
             assert_eq!(
@@ -1515,6 +1517,7 @@ fn schedule_changes_are_owned_and_read_back() -> TestResult {
     backend.execute(&request(
         ScheduleEffect::Trial {
             schedule: ours.clone(),
+            requires: Some(BTreeSet::new()),
         },
         "trial",
     )?)?;
@@ -1527,13 +1530,14 @@ fn schedule_changes_are_owned_and_read_back() -> TestResult {
         ScheduleEffect::SetState {
             schedule: ours.clone(),
             state: ScheduleState::Active,
+            requires: Some(BTreeSet::new()),
         },
         "activate",
     )?;
     let active = backend.execute(&activate)?;
     assert_eq!(backend.resolve(&activate)?, Lookup::Applied(active));
     assert_eq!(
-        backend.trial_schedule(&ours),
+        backend.trial_schedule(&ours, Some(&BTreeSet::new())),
         Err(OrcaError::TrialRequiresPaused)
     );
     sim.state().ignore_edits = true;
@@ -1542,6 +1546,7 @@ fn schedule_changes_are_owned_and_read_back() -> TestResult {
             ScheduleEffect::SetState {
                 schedule: ours.clone(),
                 state: ScheduleState::Paused,
+                requires: None,
             },
             "pause-ignored",
         )?),
@@ -1549,7 +1554,7 @@ fn schedule_changes_are_owned_and_read_back() -> TestResult {
         "an edit that did not take effect is not reported as done"
     );
     sim.state().ignore_edits = false;
-    backend.set_schedule_state(&ours, ScheduleState::Paused)?;
+    backend.set_schedule_state(&ours, ScheduleState::Paused, None)?;
 
     // Orca records every non-zero precheck exit as a skip; the recorded
     // result keeps idle apart from errors.
@@ -1923,7 +1928,7 @@ fn installing_disabled_never_settles_for_an_active_schedule() -> TestResult {
         Some(ObservedScheduleState::Active)
     );
     // Paused again, the same definition installs (reuses) as before.
-    backend.set_schedule_state(&installed, ScheduleState::Paused)?;
+    backend.set_schedule_state(&installed, ScheduleState::Paused, None)?;
     assert_eq!(
         backend.install_schedule(&schedule_spec("pickup")?)?,
         installed

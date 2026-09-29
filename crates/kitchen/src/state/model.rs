@@ -1655,13 +1655,21 @@ impl StoreState {
             ScheduleRequirements::Unrecorded => {
                 return fail(StateError::ScheduleRequirementsUnknown);
             }
-            ScheduleRequirements::Installed(schedule) => Some(
-                self.schedules
+            ScheduleRequirements::Installed { schedule, requires } => {
+                let recorded = self
+                    .schedules
                     .iter()
                     .find(|installed| &installed.schedule == schedule)
                     .map(|installed| &installed.requires)
-                    .ok_or(StateError::ScheduleRequirementsUnknown)?,
-            ),
+                    .ok_or(StateError::ScheduleRequirementsUnknown)?;
+                match requires {
+                    None => return fail(StateError::ScheduleRequirementsUnknown),
+                    Some(requires) if requires != recorded => {
+                        return fail(StateError::ScheduleRequirementsMismatch);
+                    }
+                    Some(_) => Some(recorded),
+                }
+            }
         };
         backend.capabilities.require(
             self.task(&plan.task)?

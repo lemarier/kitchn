@@ -5,9 +5,13 @@
 //! consumer scope it serves and the capabilities its workflow requires, and
 //! acts only on automations whose name decodes for its own house, so existing
 //! automations are never touched. Orca keeps no other field Kitchen could
-//! record the requirements in. Activating or trying a schedule rechecks them
-//! against Orca's support; one named without them, as installs before they
-//! were recorded were, is refused ([`OrcaError::ScheduleRequirementsUnknown`]).
+//! record the requirements in, and a name can be edited in Orca, so it is
+//! never their source. Activating or trying a schedule takes the requirements
+//! Kitchen recorded at install, refuses the schedule when its name records
+//! none ([`OrcaError::ScheduleRequirementsUnknown`], as for installs before
+//! they were recorded) or others
+//! ([`OrcaError::ScheduleRequirementsMismatch`]), and rechecks them against
+//! Orca's support. Pausing and removing check no requirements.
 //! Orca's automation commands take no request key, so:
 //!
 //! - an install holds a reservation for the house and consumer, so two
@@ -664,15 +668,19 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// Pause or activate a Kitchen schedule and read the state back.
     ///
     /// Activation starts a live consumer; the caller must hold that authority.
-    /// It is refused before anything is edited unless Orca fully supports
-    /// every capability the schedule's name records its workflow requires.
+    /// `requires` are the capabilities Kitchen recorded for the schedule's
+    /// workflow when it was installed. Activation is refused before anything
+    /// is edited when they are missing, when the automation's name records
+    /// none or others (the name is editable in Orca, so it is only checked
+    /// against Kitchen's record), or when Orca does not fully support them.
     /// With a schedule policy, activation is also refused while the
     /// schedule's or the house's budget is exhausted in the current window,
     /// or cannot be shown to hold. Pausing is never refused.
     ///
     /// # Errors
     /// [`OrcaError::NotKitchenOwned`], [`OrcaError::ScheduleNotFound`],
-    /// [`OrcaError::ScheduleRequirementsUnknown`] and
+    /// [`OrcaError::ScheduleRequirementsUnknown`],
+    /// [`OrcaError::ScheduleRequirementsMismatch`], and
     /// [`OrcaError::Contract`] with
     /// [`ContractError::UnsupportedCapabilities`](crate::contracts::ContractError::UnsupportedCapabilities)
     /// for unestablished or unsupported requirements,
@@ -682,10 +690,11 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         &self,
         schedule: &ResourceRef,
         state: ScheduleState,
+        requires: Option<&BTreeSet<Capability>>,
     ) -> Result<(), OrcaError> {
         let automation = self.owned(schedule)?;
         if state == ScheduleState::Active {
-            self.check_requirements(&automation)?;
+            self.check_requirements(&automation, requires)?;
             self.check_activation(&automation)?;
         }
         let switch = match state {
@@ -753,16 +762,26 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         Ok(())
     }
 
-    /// Refuse starting runs of `automation` unless Orca fully supports every
-    /// capability its name records its workflow requires.
-    fn check_requirements(&self, automation: &Automation) -> Result<(), OrcaError> {
-        let requires = decode_name(&self.config().house, &automation.name)
+    /// Refuse starting runs of `automation` unless Kitchen's recorded
+    /// `requires` are given, its name records exactly the same set, and Orca
+    /// fully supports every one of them.
+    fn check_requirements(
+        &self,
+        automation: &Automation,
+        requires: Option<&BTreeSet<Capability>>,
+    ) -> Result<(), OrcaError> {
+        let named = decode_name(&self.config().house, &automation.name)
             .ok_or(OrcaError::NotKitchenOwned)?
-            .requires
-            .ok_or(OrcaError::ScheduleRequirementsUnknown)?;
+            .requires;
+        let (Some(requires), Some(named)) = (requires, named) else {
+            return Err(OrcaError::ScheduleRequirementsUnknown);
+        };
+        if &named != requires {
+            return Err(OrcaError::ScheduleRequirementsMismatch);
+        }
         EffectExecutor::descriptor(self)
             .capabilities
-            .require(requires)?;
+            .require(requires.iter().copied())?;
         Ok(())
     }
 
@@ -789,8 +808,8 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }
     }
 
-    /// Run a paused Kitchen schedule once now, without enabling it. Its
-    /// recorded requirements are checked as for activation.
+    /// Run a paused Kitchen schedule once now, without enabling it.
+    /// `requires` are checked as for activation.
     ///
     /// Orca's `automations run` takes no request key: a lost response must be
     /// resolved with [`Self::inspect_schedule`] before another trial.
@@ -799,12 +818,16 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// [`OrcaError::TrialRequiresPaused`] for an active schedule, the
     /// requirement refusals of [`Self::set_schedule_state`], ownership
     /// errors, and call failures.
-    pub fn trial_schedule(&self, schedule: &ResourceRef) -> Result<(), OrcaError> {
+    pub fn trial_schedule(
+        &self,
+        schedule: &ResourceRef,
+        requires: Option<&BTreeSet<Capability>>,
+    ) -> Result<(), OrcaError> {
         let automation = self.owned(schedule)?;
         if automation.enabled {
             return Err(OrcaError::TrialRequiresPaused);
         }
-        self.check_requirements(&automation)?;
+        self.check_requirements(&automation, requires)?;
         let args = wire::Args::command(&["automations", "run"])
             .value("id", &automation.id)
             .json();
@@ -825,6 +848,7 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::BranchMismatch { .. }
         | OrcaError::TrialRequiresPaused
         | OrcaError::ScheduleRequirementsUnknown
+        | OrcaError::ScheduleRequirementsMismatch
         | OrcaError::ScheduleActive
         | OrcaError::ScheduleDiffers { .. }
         | OrcaError::ReservationRedirected
@@ -893,8 +917,12 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                     .map_err(|error| schedule_failure(&error))?;
                 schedule_receipt(&installed, Some(install))
             }
-            ScheduleEffect::SetState { schedule, state } => {
-                self.set_schedule_state(schedule, *state)
+            ScheduleEffect::SetState {
+                schedule,
+                state,
+                requires,
+            } => {
+                self.set_schedule_state(schedule, *state, requires.as_ref())
                     .map_err(|error| schedule_failure(&error))?;
                 schedule_receipt(schedule, None)
             }
@@ -903,8 +931,8 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                     .map_err(|error| schedule_failure(&error))?;
                 schedule_receipt(schedule, None)
             }
-            ScheduleEffect::Trial { schedule } => {
-                self.trial_schedule(schedule)
+            ScheduleEffect::Trial { schedule, requires } => {
+                self.trial_schedule(schedule, requires.as_ref())
                     .map_err(|error| schedule_failure(&error))?;
                 schedule_receipt(schedule, None)
             }
@@ -950,7 +978,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                     Err(error) => Err(unavailable(error)),
                 }
             }
-            ScheduleEffect::SetState { schedule, state } => match self.owned(schedule) {
+            ScheduleEffect::SetState {
+                schedule, state, ..
+            } => match self.owned(schedule) {
                 Ok(automation) if automation.enabled == matches!(state, ScheduleState::Active) => {
                     applied(schedule, None)
                 }

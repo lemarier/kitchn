@@ -109,9 +109,10 @@
 //!   non-zero precheck exit; only its run history tells an idle precheck from
 //!   a failed one. It cannot prevent overlapping runs of one schedule or
 //!   enforce a run timeout, so a schedule whose workflow requires either is
-//!   refused at install, activation, and trial; one whose name records no
-//!   requirements is not activated or tried. For other schedules, Kitchen's
-//!   consumer lease must prevent overlap.
+//!   refused at install, activation, and trial. Activation and trial take
+//!   the requirements Kitchen recorded at install, not the editable name; a
+//!   schedule whose name records none or others is not activated or tried.
+//!   For other schedules, Kitchen's consumer lease must prevent overlap.
 
 mod accounts;
 mod backend;

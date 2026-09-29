@@ -408,6 +408,7 @@ fn budget_exhaustion_mid_window_pauses_once_and_reports_once() -> TestResult {
         Some(Effect::Schedule(ScheduleEffect::SetState {
             schedule: schedule_ref("pickup")?,
             state: ScheduleState::Paused,
+            requires: None,
         }))
     );
     assert!(exhausted.report().contains("schedule run budget"));
@@ -1466,7 +1467,8 @@ fn orca_refuses_activating_an_exhausted_schedule_before_editing_it() -> TestResu
     };
     sim.state().runs = full(4);
 
-    let refused = backend.set_schedule_state(&installed, ScheduleState::Active);
+    let refused =
+        backend.set_schedule_state(&installed, ScheduleState::Active, Some(&BTreeSet::new()));
     assert_eq!(
         refused,
         Err(OrcaError::ScheduleLimit(BudgetError::Exhausted {
@@ -1490,6 +1492,7 @@ fn orca_refuses_activating_an_exhausted_schedule_before_editing_it() -> TestResu
         Effect::Schedule(ScheduleEffect::SetState {
             schedule: installed.clone(),
             state: ScheduleState::Active,
+            requires: Some(BTreeSet::new()),
         }),
     );
     assert_eq!(
@@ -1510,7 +1513,7 @@ fn orca_refuses_activating_an_exhausted_schedule_before_editing_it() -> TestResu
         })
         .collect();
     assert!(matches!(
-        backend.set_schedule_state(&installed, ScheduleState::Active),
+        backend.set_schedule_state(&installed, ScheduleState::Active, Some(&BTreeSet::new())),
         Err(OrcaError::ScheduleLimit(BudgetError::IncompleteEvidence {
             observed: 0,
             ..
@@ -1520,16 +1523,16 @@ fn orca_refuses_activating_an_exhausted_schedule_before_editing_it() -> TestResu
 
     // Headroom, or the next window, activates it.
     sim.state().runs = full(3);
-    backend.set_schedule_state(&installed, ScheduleState::Active)?;
+    backend.set_schedule_state(&installed, ScheduleState::Active, Some(&BTreeSet::new()))?;
     assert!(enabled(&sim, installed.handle.as_str()));
-    backend.set_schedule_state(&installed, ScheduleState::Paused)?;
+    backend.set_schedule_state(&installed, ScheduleState::Paused, None)?;
     sim.state().runs = full(4);
     let next = connect(&sim)?.with_clock(noon_on_day_twenty_one);
-    next.set_schedule_state(&installed, ScheduleState::Active)?;
+    next.set_schedule_state(&installed, ScheduleState::Active, Some(&BTreeSet::new()))?;
     assert!(enabled(&sim, installed.handle.as_str()));
 
     // Pausing is never refused.
-    backend.set_schedule_state(&installed, ScheduleState::Paused)?;
+    backend.set_schedule_state(&installed, ScheduleState::Paused, None)?;
     Ok(())
 }
 

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::{HouseError, ReadinessLevel, Workflow, readiness::validate_work_type};
+use super::{BackendBinding, HouseError, ReadinessLevel, Workflow, readiness::validate_work_type};
 use crate::{
     HouseId,
     contracts::{CommitId, Grant, HouseGrants, Repository, Text},
@@ -131,6 +131,11 @@ pub struct HouseConfig {
     /// the library defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_up: Option<FollowUpPolicy>,
+    /// The worker backend commands build for this house. Absent means no
+    /// backend is built: a house registered before bindings existed must
+    /// write its Orca binding explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<BackendBinding>,
 }
 
 impl HouseConfig {

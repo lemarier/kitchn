@@ -25,7 +25,7 @@ use std::{
 const MAX_PATH_ENTRIES: usize = 256;
 
 /// Argument ids that answer guided questions; none may accompany `--config`.
-pub const GUIDED: [&str; 19] = [
+pub const GUIDED: [&str; 20] = [
     "house",
     "repositories",
     "posting_destinations",
@@ -36,6 +36,7 @@ pub const GUIDED: [&str; 19] = [
     "required_reviewers",
     "fix_rounds",
     "review_requests",
+    "worker_backend",
     "forge_requester",
     "forge_credential",
     "kitchen",
@@ -80,6 +81,10 @@ pub struct InitArgs {
     /// Review requests allowed per pull request head, 0 to 10 (default: 1).
     #[arg(long)]
     review_requests: Option<String>,
+    /// The worker backend the house runs its workers on (default: orca, the
+    /// only one supported). Stored in the house configuration by name.
+    #[arg(long)]
+    worker_backend: Option<String>,
     /// GitHub login kitchn writes as, or none (default: the logged-in gh
     /// account, else none). Stores a forge binding, never a credential.
     #[arg(long)]
@@ -134,6 +139,7 @@ pub fn run(
         required_reviewers: args.required_reviewers,
         fix_rounds: args.fix_rounds,
         review_requests: args.review_requests,
+        worker_backend: args.worker_backend,
         forge_requester: args.forge_requester,
         forge_credential: args.forge_credential,
         kitchen: args.kitchen,

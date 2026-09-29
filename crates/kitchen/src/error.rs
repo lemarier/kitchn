@@ -89,6 +89,9 @@ pub enum Error {
     /// An interactive entrypoint refused its input.
     #[error(transparent)]
     Interactive(#[from] crate::workflows::interactive::InteractiveError),
+    /// A house's worker backend could not be built or lacks a required capability.
+    #[error(transparent)]
+    Backend(#[from] crate::adapters::BackendError),
 }
 
 impl Error {
@@ -117,6 +120,7 @@ impl Error {
             Self::Forge(error) => error.class(),
             Self::Deliberation(error) => error.class(),
             Self::Interactive(error) => error.class(),
+            Self::Backend(error) => error.class(),
         }
     }
 }

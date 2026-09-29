@@ -18,17 +18,21 @@ use std::{
 use clap::{Args, Subcommand, ValueEnum};
 use kitchen::{
     BackendId, CredentialId, HolderId, HouseId,
-    adapters::orca::{
-        DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, OrcaBackend,
-        OrcaConfig, SystemRunner,
+    adapters::{
+        BackendError, OrcaSession, backend_binding,
+        orca::{
+            DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, OrcaBackend,
+            SystemRunner,
+        },
+        resolve_backend,
     },
     adoption::HouseRegistry,
     contracts::{
-        Claimant, Effect, EffectExecutor, ExternalRef, GitHubAction, GitHubMutation, Grant,
-        IssueNumber, LeaseTtl, Permission, PostingBudget, Provenance, Repository, SystemClock,
-        Text,
+        Capability, Claimant, Effect, EffectExecutor, ExternalRef, GitHubAction, GitHubMutation,
+        Grant, IssueNumber, LeaseTtl, Permission, PostingBudget, Provenance, Repository,
+        SystemClock, Text,
     },
-    house::{HouseConfig, HouseError},
+    house::{BackendBinding, HouseConfig, HouseError},
     integrations::github::{
         CredentialFile, CredentialRef, GhCli, GitHubExecutor, HouseScope, IntegrationError,
         ReadLimits,
@@ -86,7 +90,8 @@ enum BudgetCommand {
     },
 }
 
-/// The house, its store, and its Orca schedules.
+/// The house, its store, and its Orca schedules. The backend namespace and
+/// credential come from the house's worker backend binding.
 #[derive(Args)]
 struct Source {
     /// The house registry holding the house configuration.
@@ -101,12 +106,12 @@ struct Source {
     /// Absolute path of the Orca executable.
     #[arg(long)]
     orca: PathBuf,
-    /// The Orca backend namespace the house's schedule grant names.
+    /// The backend namespace of the house's binding; refused when it differs.
     #[arg(long)]
-    backend: BackendId,
-    /// The Orca host session credential that grant names.
+    backend: Option<BackendId>,
+    /// The credential of the house's binding; refused when it differs.
     #[arg(long)]
-    credential: CredentialId,
+    credential: Option<CredentialId>,
     /// House-scoped Orca runtime storage shared by every caller.
     #[arg(long)]
     runtime_dir: PathBuf,
@@ -166,6 +171,10 @@ const TICK_LEASE: Duration = Duration::from_secs(15 * 60);
 /// Reports one window's task may post: the ceiling of a posting budget.
 const REPORT_POSTS: u32 = 100;
 
+/// What reading and pausing schedules requires of the backend. Installing
+/// the tick requires [`budget::REQUIRED_CAPABILITIES`].
+const TICK_CAPABILITIES: [Capability; 1] = [Capability::ScheduleManage];
+
 /// A command's result: the precheck reports through its exit status alone.
 pub enum Outcome {
     Exit(ExitCode),
@@ -189,7 +198,9 @@ pub fn run(args: BudgetArgs) -> Outcome {
 
 fn precheck(source: &Source) -> ExitCode {
     let result = Opened::open(source).and_then(|opened| {
-        let evidence = opened.backend.schedule_evidence()?;
+        let evidence = opened
+            .backend(source, &TICK_CAPABILITIES)?
+            .schedule_evidence()?;
         budget::precheck(
             &opened.store,
             &opened.config.house,
@@ -224,12 +235,13 @@ fn report_precheck(result: Result<Precheck, kitchen::Error>) -> ExitCode {
     ExitCode::from(code)
 }
 
-/// The house configuration, store, and Orca backend one command acts on.
+/// The house configuration, store, and worker backend binding one command
+/// acts on.
 struct Opened {
     config: HouseConfig,
     policy: SchedulePolicy,
     store: HouseStore,
-    backend: OrcaBackend<SystemRunner>,
+    binding: BackendBinding,
 }
 
 impl Opened {
@@ -249,11 +261,41 @@ impl Opened {
             source.house.clone(),
             StoreOptions::default(),
         )?;
-        let backend = OrcaBackend::connect(
-            OrcaConfig {
-                backend: source.backend.clone(),
-                house: source.house.clone(),
-                credential: source.credential.clone(),
+        let (binding, _) = backend_binding(&config)?;
+        // `--backend` and `--credential`, which schedules installed before
+        // bindings still pass, may only repeat the binding.
+        if source
+            .backend
+            .as_ref()
+            .is_some_and(|backend| *backend != binding.backend)
+            || source
+                .credential
+                .as_ref()
+                .is_some_and(|credential| *credential != binding.credential)
+        {
+            return Err(BackendError::BindingMismatch {
+                house: config.house.clone(),
+            }
+            .into());
+        }
+        let binding = binding.clone();
+        Ok(Self {
+            config,
+            policy,
+            store,
+            binding,
+        })
+    }
+
+    /// Build the house's bound backend, which must fully support `required`.
+    fn backend(
+        &self,
+        source: &Source,
+        required: &[Capability],
+    ) -> Result<OrcaBackend<SystemRunner>, kitchen::Error> {
+        Ok(resolve_backend(
+            &self.config,
+            OrcaSession {
                 // Schedule calls name no Run, coordinator, or repository.
                 run: ExternalRef::new(budget::WORKFLOW)?,
                 coordinator: ExternalRef::new(budget::WORKFLOW)?,
@@ -267,22 +309,18 @@ impl Opened {
                 reservation_timeout: DEFAULT_RESERVATION_TIMEOUT,
             },
             SystemRunner::new(&source.orca),
+            required,
         )?
-        .with_schedule_policy(policy.clone());
-        Ok(Self {
-            config,
-            policy,
-            store,
-            backend,
-        })
+        .with_schedule_policy(self.policy.clone()))
     }
 
-    /// The standing grant the tick pauses schedules under.
-    fn schedule_grant(&self, source: &Source) -> Grant {
+    /// The standing grant the tick pauses schedules under: the bound
+    /// backend's namespace and credential.
+    fn schedule_grant(&self) -> Grant {
         Grant::house(
             Permission::ManageSchedule,
-            source.backend.clone(),
-            source.credential.clone(),
+            self.binding.backend.clone(),
+            self.binding.credential.clone(),
         )
     }
 }
@@ -356,6 +394,7 @@ impl Report {
 
 fn tick(source: Source, flags: &ReportFlags) -> Result<(String, bool), kitchen::Error> {
     let opened = Opened::open(&source)?;
+    let backend = opened.backend(&source, &TICK_CAPABILITIES)?;
     let report = Report::from_flags(flags, &opened.config)?;
     let executor = report
         .as_ref()
@@ -368,13 +407,13 @@ fn tick(source: Source, flags: &ReportFlags) -> Result<(String, bool), kitchen::
         executor: executor as &dyn EffectExecutor,
         effect: &effect,
     });
-    let mut authority = vec![opened.schedule_grant(&source)];
+    let mut authority = vec![opened.schedule_grant()];
     authority.extend(report.as_ref().map(|report| report.grant.clone()));
     let grants = opened.config.authority()?;
     let claimant = Claimant::scheduled(HolderId::new(budget::WORKFLOW)?);
     let tick = Tick {
         store: &opened.store,
-        schedules: &opened.backend,
+        schedules: &backend,
         reports: channel,
         grants: &grants,
         authority,
@@ -387,7 +426,7 @@ fn tick(source: Source, flags: &ReportFlags) -> Result<(String, bool), kitchen::
         ttl: LeaseTtl::new(TICK_LEASE)?,
         clock: &SystemClock,
     };
-    let evidence = opened.backend.schedule_evidence()?;
+    let evidence = backend.schedule_evidence()?;
     let outcome = budget::tick(&tick, &opened.policy, &evidence)?;
     Ok(render(&outcome))
 }
@@ -478,7 +517,7 @@ fn install(
     // or every tick would fail before its first pause. The backend refuses
     // the install unless it supports the tick's required capabilities.
     let grants = opened.config.authority()?;
-    if !grants.covers(&opened.schedule_grant(&source)) {
+    if !grants.covers(&opened.schedule_grant()) {
         return Err(kitchen::contracts::ContractError::PermissionDenied {
             permission: Permission::ManageSchedule,
         }
@@ -499,8 +538,8 @@ fn install(
         house: source.house.clone(),
         store: source.store()?,
         orca: source.orca.clone(),
-        backend: source.backend.clone(),
-        credential: source.credential.clone(),
+        backend: opened.binding.backend.clone(),
+        credential: opened.binding.credential.clone(),
         runtime_dir: source.runtime_dir.clone(),
         report: report.map(|report| report.args),
     };
@@ -510,7 +549,11 @@ fn install(
         ResolvedSelection::owner(AgentSelection::agent_default(agent.into())),
         &args,
     )?;
-    let installed = opened.backend.install_schedule(&tick)?;
+    // The backend is built last, so a house without the grants is refused
+    // before Orca is contacted.
+    let installed = opened
+        .backend(&source, &budget::REQUIRED_CAPABILITIES)?
+        .install_schedule(&tick)?;
     Ok((
         format!(
             "installed paused {} ({})",

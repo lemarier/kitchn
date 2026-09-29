@@ -1,5 +1,6 @@
 //! House-scoped configuration, policy, repository requirements, and diagnostics.
 //! Configuration grants no authority merely by being installed.
+mod backend;
 mod config;
 mod doctor;
 mod error;
@@ -9,6 +10,7 @@ mod requirements;
 mod roles;
 mod wizard;
 
+pub use backend::*;
 pub use config::*;
 pub use doctor::*;
 pub use error::HouseError;

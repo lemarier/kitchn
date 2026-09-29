@@ -16,7 +16,7 @@ use kitchen::{
     BackendId, CredentialId, HouseId,
     adoption::HouseRegistry,
     contracts::{Grant, Permission},
-    house::HouseConfig,
+    house::{BackendBinding, BackendKind, HouseConfig},
     state::{HouseStore, StoreOptions},
 };
 
@@ -63,6 +63,11 @@ impl Kitchen {
         let grant = Grant::house(Permission::ManageSchedule, orca()?, credential()?);
         house.policy_limits.insert(grant.clone());
         house.grants.insert(grant);
+        house.backend = Some(BackendBinding {
+            kind: BackendKind::Orca.into(),
+            backend: orca()?,
+            credential: credential()?,
+        });
         house.schedules = Some(serde_json::from_value(serde_json::json!({
             "windowHours": 24,
             "minIntervalMinutes": 60,
@@ -122,7 +127,22 @@ impl Kitchen {
     }
 
     fn budget(&self, command: &str, extra: &[&str]) -> TestResult<Output> {
-        let mut args: Vec<String> = vec![
+        let mut args = self.source(command)?;
+        args.extend([
+            "--backend".into(),
+            "orca-local".into(),
+            "--credential".into(),
+            "orca-host-session".into(),
+        ]);
+        args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+        Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
+            .args(&args)
+            .output()?)
+    }
+
+    /// `command` with the house, store, and Orca host, but no backend flags.
+    fn source(&self, command: &str) -> TestResult<Vec<String>> {
+        Ok(vec![
             "budget".into(),
             command.into(),
             "--registry".into(),
@@ -133,16 +153,14 @@ impl Kitchen {
             path_arg(&self.path("store"))?,
             "--orca".into(),
             path_arg(&self.orca_file("orca"))?,
-            "--backend".into(),
-            "orca-local".into(),
-            "--credential".into(),
-            "orca-host-session".into(),
             "--runtime-dir".into(),
             path_arg(&self.path("runtime"))?,
-        ];
-        args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+        ])
+    }
+
+    fn run(&self, args: &[String]) -> TestResult<Output> {
         Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
-            .args(&args)
+            .args(args)
             .output()?)
     }
 }
@@ -372,5 +390,82 @@ fn installing_the_tick_with_a_report_issue_needs_the_comment_grant() -> TestResu
         "nothing read"
     );
     assert!(kitchen.calls("automations create")?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn the_budget_tick_builds_the_backend_the_house_is_bound_to() -> TestResult {
+    // No --backend or --credential: both come from the house's binding.
+    let kitchen = Kitchen::new(4, |_| Ok(()))?;
+    let precheck = kitchen.run(&kitchen.source("precheck")?)?;
+    assert_eq!(precheck.status.code(), Some(0), "{precheck:?}");
+    assert_eq!(stdout(&precheck).trim(), "actionable");
+    let run = kitchen.run(&kitchen.source("run")?)?;
+    assert!(stdout(&run).contains("paused pickup"), "{run:?}");
+    assert!(!kitchen.enabled()?, "paused under the bound grant");
+    Ok(())
+}
+
+#[test]
+fn a_house_without_a_backend_binding_is_refused_naming_it() -> TestResult {
+    // A house registered before bindings: nothing defaults to Orca.
+    let kitchen = Kitchen::new(4, |house| {
+        house.backend = None;
+        Ok(())
+    })?;
+    // A scheduled precheck reports it as unreadable (3), a run as failed (1).
+    for (command, code) in [("precheck", 3), ("run", 1)] {
+        let output = kitchen.budget(command, &[])?;
+        assert_eq!(output.status.code(), Some(code), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("house origin89 has no worker backend binding"),
+            "{stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+    assert!(kitchen.calls("")?.is_empty(), "Orca never contacted");
+    assert!(kitchen.enabled()?);
+    Ok(())
+}
+
+#[test]
+fn a_house_bound_to_an_unknown_backend_is_refused_naming_it() -> TestResult {
+    let kitchen = Kitchen::new(4, |house| {
+        if let Some(binding) = &mut house.backend {
+            binding.kind = "sandbox".parse()?;
+        }
+        Ok(())
+    })?;
+    let output = kitchen.budget("run", &[])?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bound to worker backend `sandbox`, which this Kitchen does not support"),
+        "{stderr}"
+    );
+    assert!(kitchen.calls("")?.is_empty(), "Orca never contacted");
+    Ok(())
+}
+
+#[test]
+fn backend_flags_that_disagree_with_the_binding_are_refused() -> TestResult {
+    let kitchen = Kitchen::new(4, |_| Ok(()))?;
+    for (flag, value) in [
+        ("--backend", "orca-other"),
+        ("--credential", "someone-else"),
+    ] {
+        let mut args = kitchen.source("run")?;
+        args.extend([flag.to_owned(), value.to_owned()]);
+        let output = kitchen.run(&args)?;
+        assert_eq!(output.status.code(), Some(2), "{flag}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("differs from its worker backend binding"),
+            "{output:?}"
+        );
+    }
+    assert!(kitchen.calls("")?.is_empty(), "Orca never contacted");
+    assert!(kitchen.enabled()?);
     Ok(())
 }

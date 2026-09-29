@@ -44,6 +44,7 @@ brackets. Each question has a flag:
 | `--sous-chef`, `--station-cook`, `--expediter` `<claude\|codex>` | Claude Code at the pass, Codex at the stations |
 | `--required-checks <name,...\|none>` | the default branch's required checks, when `--github-requester`, `--github-credential`, `--github-credential-file` and `--gh` can read them; otherwise asked |
 | `--required-reviewers <name,...\|none>` | `expediter` |
+| `--worker-backend <orca>` | `orca`, the only one supported. Stored as the house's [worker backend](/docs/concepts/houses/#the-worker-backend) |
 | `--forge-requester <login\|none>` | the logged-in `gh` account, else none. Stores a [forge binding](/docs/concepts/houses/#the-forge-binding), never a credential |
 | `--forge-credential <name>` | `github` |
 | `--kitchen <commit>` | the commit the binary was built from, when it records one |
@@ -276,10 +277,15 @@ The schedule budget tick: pause schedules that exhausted their usage budget and
 report them to the owner.
 
 ```sh
-kitchn budget precheck --registry <dir> --house <id> [--store <dir>] --orca <path> --backend <id> --credential <name> --runtime-dir <dir>
+kitchn budget precheck --registry <dir> --house <id> [--store <dir>] --orca <path> --runtime-dir <dir> [--backend <id> --credential <name>]
 kitchn budget run      [same options] [report options]
 kitchn budget install  [same options] [report options] --kitchen <path> --cron "15 * * * *" --timezone <tz> --agent claude|codex
 ```
+
+The Orca backend namespace and credential come from the house's
+[worker backend](/docs/concepts/houses/#the-worker-backend); a house without
+one is refused. `--backend` and `--credential` are optional and refused when
+they differ from the binding. Schedules installed earlier still pass them.
 
 Report options (`--report-issue owner/repo#n`, `--github-backend`,
 `--requester`, `--github-credential`, `--credential-file`, `--gh`) name where

@@ -425,8 +425,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             (
                 decode_name(&config.house, &automation.name)
                     .and_then(|name| name.requires)
-                    .as_ref()
-                    == Some(spec.requires()),
+                    .is_some_and(|recorded| Some(&recorded) == spec.requires()),
                 ScheduleField::Requirements,
             ),
         ]
@@ -453,10 +452,13 @@ impl<R: OrcaRunner> OrcaBackend<R> {
 
     fn create_args(&self, spec: &ScheduleSpec) -> Result<Vec<String>, OrcaError> {
         let config = self.config();
+        let requires = spec
+            .requires()
+            .ok_or(OrcaError::ScheduleRequirementsUnknown)?;
         let mut args = wire::Args::command(&["automations", "create"])
             .value(
                 "name",
-                &native_schedule_name(&config.house, spec.consumer(), spec.requires()),
+                &native_schedule_name(&config.house, spec.consumer(), requires),
             )
             .value("prompt", spec.prompt().as_str())
             .value("provider", spec.agent().selection.agent.as_str())
@@ -508,7 +510,8 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// read or reserved: Orca automations take only a provider
     /// ([`SCHEDULE_SELECTION`](super::SCHEDULE_SELECTION)).
     /// A schedule requiring a capability Orca does not fully support
-    /// ([`ScheduleSpec::requires`]) is refused the same way.
+    /// ([`ScheduleSpec::requires`]) is refused the same way, as is a spec
+    /// stored before requirements were recorded.
     ///
     /// Concurrent installers for one house and consumer take turns: the
     /// listing, the create, and the read-back happen under a reservation, so
@@ -517,7 +520,8 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// # Errors
     /// [`OrcaError::Contract`] with
     /// [`ContractError::UnsupportedCapabilities`](crate::contracts::ContractError::UnsupportedCapabilities)
-    /// naming every required capability Orca lacks or supports only in part.
+    /// naming every required capability Orca lacks or supports only in part,
+    /// and [`OrcaError::ScheduleRequirementsUnknown`] for a spec without them.
     /// [`OrcaError::Selection`] naming every part of the selection Orca
     /// cannot launch. [`OrcaError::ScheduleActive`] when the consumer's
     /// schedule is firing and [`OrcaError::ScheduleDiffers`] when it is not
@@ -535,9 +539,12 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// [`OrcaBackend::install_schedule`], and whether this call created the
     /// schedule or reused one already installed.
     fn install(&self, spec: &ScheduleSpec) -> Result<(ResourceRef, Install), OrcaError> {
-        EffectExecutor::descriptor(self)
-            .capabilities
-            .require(spec.requires().iter().copied())?;
+        EffectExecutor::descriptor(self).capabilities.require(
+            spec.requires()
+                .ok_or(OrcaError::ScheduleRequirementsUnknown)?
+                .iter()
+                .copied(),
+        )?;
         backend::SCHEDULE_SELECTION.check(&spec.agent().selection)?;
         let consumer = spec.consumer();
         let mut reservation = self.reserve(format!(

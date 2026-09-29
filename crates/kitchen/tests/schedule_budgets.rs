@@ -2553,7 +2553,7 @@ fn orca_refuses_the_budget_schedule_naming_the_capabilities_it_lacks() -> TestRe
     let tick = budget_tick("15 * * * *")?;
     assert_eq!(
         tick.requires(),
-        &BTreeSet::from(budget::REQUIRED_CAPABILITIES)
+        Some(&BTreeSet::from(budget::REQUIRED_CAPABILITIES))
     );
     // Orca cannot prevent overlapping runs or enforce a run timeout, and
     // tells a failed precheck from an idle one only after the fact.

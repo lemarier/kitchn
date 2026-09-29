@@ -1002,7 +1002,9 @@ fn gardener_installs_a_disabled_daily_schedule_with_its_own_precheck() -> common
     assert_eq!(schedule.workflow().as_str(), "gardener");
     assert_eq!(
         schedule.requires(),
-        &std::collections::BTreeSet::from(gardener::REQUIRED_CAPABILITIES),
+        Some(&std::collections::BTreeSet::from(
+            gardener::REQUIRED_CAPABILITIES
+        )),
         "an installing backend must support the gardener's requirements"
     );
     assert_eq!(schedule.consumer(), &consumer);

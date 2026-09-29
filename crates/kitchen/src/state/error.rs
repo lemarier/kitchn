@@ -204,10 +204,10 @@ pub enum StateError {
     /// The target resource was not reported by an applied effect of this task.
     #[error("the task does not own the target resource")]
     ResourceNotOwned,
-    /// The schedule has no requirements recorded from a Kitchen install, so
-    /// activating or trying it cannot be shown to meet them.
+    /// The schedule, or the stored spec being installed, has no recorded
+    /// workflow requirements, so the executor cannot be shown to meet them.
     #[error(
-        "the schedule's workflow requirements were not recorded when it was installed; reinstall it before activating or trying it"
+        "the schedule's workflow requirements were not recorded; install it again from its current workflow before installing, activating, or trying it"
     )]
     ScheduleRequirementsUnknown,
     /// A worker launch named another agent selection than the task's own.

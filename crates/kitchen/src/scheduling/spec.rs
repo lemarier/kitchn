@@ -579,7 +579,8 @@ pub struct ScheduleSpec {
     workspace: ScheduleWorkspace,
     missed_run_grace: GraceMinutes,
     reuse_session: bool,
-    requires: BTreeSet<Capability>,
+    /// `None` for a spec stored before requirements were recorded.
+    requires: Option<BTreeSet<Capability>>,
 }
 
 impl ScheduleSpec {
@@ -610,7 +611,7 @@ impl ScheduleSpec {
             workspace: ScheduleWorkspace::NewPerRun,
             missed_run_grace: GraceMinutes(0),
             reuse_session: false,
-            requires: BTreeSet::new(),
+            requires: Some(BTreeSet::new()),
         }
     }
 
@@ -618,7 +619,9 @@ impl ScheduleSpec {
     /// the workflow's declared requirements for scheduled execution.
     #[must_use]
     pub fn requiring(mut self, capabilities: impl IntoIterator<Item = Capability>) -> Self {
-        self.requires.extend(capabilities);
+        self.requires
+            .get_or_insert_with(BTreeSet::new)
+            .extend(capabilities);
         self
     }
 
@@ -720,10 +723,12 @@ impl ScheduleSpec {
         self.reuse_session
     }
 
-    /// The capabilities an installing backend must fully support.
+    /// The capabilities an installing backend must fully support, or `None`
+    /// for a spec stored before they were recorded. Such a spec cannot show
+    /// what its workflow needs, so it is not installed.
     #[must_use]
-    pub const fn requires(&self) -> &BTreeSet<Capability> {
-        &self.requires
+    pub const fn requires(&self) -> Option<&BTreeSet<Capability>> {
+        self.requires.as_ref()
     }
 }
 
@@ -741,8 +746,9 @@ struct RawScheduleSpec {
     workspace: ScheduleWorkspace,
     missed_run_grace: GraceMinutes,
     reuse_session: bool,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    requires: BTreeSet<Capability>,
+    /// Always written; absent only from specs stored before it existed.
+    #[serde(default)]
+    requires: Option<BTreeSet<Capability>>,
 }
 
 /// A schedule's agent as stored. Schedules persisted before selections were

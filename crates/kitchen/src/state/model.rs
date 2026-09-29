@@ -1652,6 +1652,9 @@ impl StoreState {
         let scheduled = match plan.effect.schedule_requirements() {
             ScheduleRequirements::None => None,
             ScheduleRequirements::Declared(requires) => Some(requires),
+            ScheduleRequirements::Unrecorded => {
+                return fail(StateError::ScheduleRequirementsUnknown);
+            }
             ScheduleRequirements::Installed(schedule) => Some(
                 self.schedules
                     .iter()
@@ -1935,6 +1938,11 @@ impl StoreState {
         };
         match effect.request.effect() {
             Effect::Schedule(ScheduleEffect::InstallDisabled { schedule: spec }) => {
+                // A spec without recorded requirements leaves the schedule
+                // unrecorded, so it is never started.
+                let Some(requires) = spec.requires() else {
+                    return;
+                };
                 for schedule in receipt
                     .created()
                     .iter()
@@ -1947,10 +1955,10 @@ impl StoreState {
                         .find(|installed| &installed.schedule == schedule)
                     {
                         // Reinstalling never narrows what was recorded.
-                        Some(installed) => installed.requires.extend(spec.requires()),
+                        Some(installed) => installed.requires.extend(requires),
                         None => self.schedules.push(InstalledRequirements {
                             schedule: schedule.clone(),
-                            requires: spec.requires().clone(),
+                            requires: requires.clone(),
                         }),
                     }
                 }

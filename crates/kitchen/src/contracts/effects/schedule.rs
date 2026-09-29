@@ -22,6 +22,9 @@ pub enum ScheduleRequirements<'a> {
     None,
     /// An install, carrying its workflow's declared requirements.
     Declared(&'a BTreeSet<Capability>),
+    /// An install of a spec stored before requirements were recorded, which
+    /// cannot show what its workflow needs and is refused.
+    Unrecorded,
     /// Activating or trying this installed schedule starts runs, so the
     /// requirements recorded when it was installed apply; one with none
     /// recorded is refused.
@@ -85,9 +88,10 @@ impl ScheduleEffect {
     #[must_use]
     pub const fn schedule_requirements(&self) -> ScheduleRequirements<'_> {
         match self {
-            Self::InstallDisabled { schedule } => {
-                ScheduleRequirements::Declared(schedule.requires())
-            }
+            Self::InstallDisabled { schedule } => match schedule.requires() {
+                Some(requires) => ScheduleRequirements::Declared(requires),
+                None => ScheduleRequirements::Unrecorded,
+            },
             Self::SetState {
                 schedule,
                 state: ScheduleState::Active,

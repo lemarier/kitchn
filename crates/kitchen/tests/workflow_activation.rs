@@ -252,12 +252,23 @@ fn orca_refuses_an_install_whose_workflow_needs_what_orca_lacks() -> TestResult 
     Ok(())
 }
 
+/// The budget tick as a binary from before requirements were recorded
+/// stored it: without `requires`.
+fn stored_before_requirements() -> TestResult<ScheduleSpec> {
+    let mut json = serde_json::to_value(budget_tick()?)?;
+    json.as_object_mut()
+        .ok_or("a spec object")?
+        .remove("requires")
+        .ok_or("requires written")?;
+    Ok(serde_json::from_value(json)?)
+}
+
 #[test]
 fn schedule_requirements_persist_and_older_specs_decode_without_them() -> TestResult {
     let tick = budget_tick()?;
     assert_eq!(
         tick.requires(),
-        &BTreeSet::from(budget::REQUIRED_CAPABILITIES)
+        Some(&BTreeSet::from(budget::REQUIRED_CAPABILITIES))
     );
     let json = serde_json::to_value(&tick)?;
     assert_eq!(
@@ -271,15 +282,15 @@ fn schedule_requirements_persist_and_older_specs_decode_without_them() -> TestRe
     );
     assert_eq!(serde_json::from_value::<ScheduleSpec>(json.clone())?, tick);
 
-    // A spec stored before requirements were recorded has none, and an
-    // empty set is not written.
+    // An empty set is recorded as such, while a spec stored before
+    // requirements were recorded has none, not an empty set.
     let plain = serde_json::to_value(plain_schedule()?)?;
-    assert_eq!(plain.get("requires"), None);
-    assert!(
-        serde_json::from_value::<ScheduleSpec>(plain)?
-            .requires()
-            .is_empty()
+    assert_eq!(plain.get("requires"), Some(&serde_json::json!([])));
+    assert_eq!(
+        serde_json::from_value::<ScheduleSpec>(plain)?.requires(),
+        Some(&BTreeSet::new())
     );
+    assert_eq!(stored_before_requirements()?.requires(), None);
 
     // An unknown capability name is rejected, not dropped.
     let mut unknown = json;
@@ -608,5 +619,37 @@ fn orca_does_not_reuse_a_matching_schedule_without_recorded_requirements() -> Te
         })
     );
     assert_eq!(sim.calls_to(&["automations", "create"]).len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_stored_spec_without_recorded_requirements_is_not_installed() -> TestResult {
+    // A backend supporting everything the tick needs today still refuses
+    // it: the stored spec cannot show what its workflow requires.
+    let executor = full_scheduler()?;
+    let (fixture, task, result) = run_install(&executor, install(stored_before_requirements()?))?;
+    assert!(
+        matches!(
+            result,
+            Err(Error::State(StateError::ScheduleRequirementsUnknown))
+        ),
+        "{result:?}"
+    );
+    assert!(fixture.store.task(&task)?.effects().is_empty());
+    assert_eq!(executor.execute_calls(), 0);
+
+    let sim = SimOrca::default();
+    let backend = OrcaBackend::connect(orca_config(&sim)?, &sim)?;
+    let mut plain = serde_json::to_value(plain_schedule()?)?;
+    plain
+        .as_object_mut()
+        .ok_or("a spec object")?
+        .remove("requires");
+    let legacy_plain: ScheduleSpec = serde_json::from_value(plain)?;
+    assert_eq!(
+        backend.install_schedule(&legacy_plain),
+        Err(OrcaError::ScheduleRequirementsUnknown)
+    );
+    assert!(sim.calls_to(&["automations"]).is_empty(), "no Orca call");
     Ok(())
 }

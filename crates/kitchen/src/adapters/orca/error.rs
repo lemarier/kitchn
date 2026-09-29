@@ -95,8 +95,9 @@ pub enum OrcaError {
     },
     /// The automation's name records no workflow requirements this Kitchen
     /// can read, as for one installed before they were recorded, so it is
-    /// neither activated nor tried. Nothing was changed; remove it and
-    /// install it again.
+    /// neither activated nor tried; or the spec being installed was stored
+    /// before they were recorded, so it is not installed. Nothing was
+    /// changed; install again from the current workflow.
     #[error(
         "the schedule records no readable workflow requirements; remove and reinstall it before activating or trying it"
     )]

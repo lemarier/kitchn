@@ -147,10 +147,12 @@ impl HouseStore {
     /// the tasks already stored. The guard reads them, and the task is
     /// created and claimed, in one store transaction, so a concurrent
     /// reservation cannot slip between the check and the write and the new
-    /// task never exists unclaimed. A task that already exists, if
-    /// identical, is reported as [`Reservation::Existing`] and is not
-    /// guarded or claimed; the caller resumes it with [`Self::claim`] or
-    /// [`Self::take_over`]. The guard returns the reason to block, and
+    /// task never exists unclaimed. A task that already exists must be
+    /// identical. If it is open or its claim expired, the guard runs on the
+    /// tasks in the same transaction and it is claimed again
+    /// ([`Reservation::Resumed`]); if it has settled or is live-claimed by
+    /// someone else, it is reported as [`Reservation::Existing`] untouched.
+    /// The guard returns the reason to block, and
     /// nothing is written then.
     ///
     /// # Errors

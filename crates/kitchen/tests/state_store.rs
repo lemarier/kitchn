@@ -1957,6 +1957,56 @@ fn a_blocked_reservation_writes_nothing_and_a_conflicting_spec_is_refused() -> T
 }
 
 #[test]
+fn resuming_an_existing_task_is_guarded_and_claimed_in_one_transaction() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let id = task_id("slot-d")?;
+    store.create_task(spec("slot-d")?, &creator()?, at(0))?;
+
+    // A guard that objects leaves the open task unclaimed.
+    let blocked = store.reserve_task(spec("slot-d")?, &creator()?, ttl(60)?, at(1), |_| {
+        Ok(Some("holder"))
+    })?;
+    assert_eq!(blocked, Reservation::Blocked("holder"));
+    assert_eq!(store.task(&id)?.state(), &TaskState::Open);
+
+    // The guard sees the other tasks and, once it passes, the open task is
+    // claimed.
+    let resumed = store.reserve_task(spec("slot-d")?, &creator()?, ttl(60)?, at(2), |tasks| {
+        assert_eq!(tasks.len(), 1);
+        Ok(None::<()>)
+    })?;
+    let Reservation::Resumed(lease) = resumed else {
+        return Err("expected the open task to be resumed".into());
+    };
+    assert!(matches!(
+        store.task(&id)?.state(),
+        TaskState::Claimed { lease: held } if held.fence() == lease.fence()
+    ));
+
+    // A live claim is left alone and the guard is not consulted.
+    let unused = task_id("unused")?;
+    let live = store.reserve_task(spec("slot-d")?, &creator()?, ttl(60)?, at(3), |_| {
+        Err(Error::State(StateError::TaskNotFound(unused)))
+    })?;
+    assert_eq!(live, Reservation::<()>::Existing);
+
+    // An expired claim is guarded too, then taken over with a newer fence.
+    let blocked = store.reserve_task(spec("slot-d")?, &creator()?, ttl(60)?, at(70), |_| {
+        Ok(Some(()))
+    })?;
+    assert_eq!(blocked, Reservation::Blocked(()));
+    let taken = store.reserve_task(spec("slot-d")?, &creator()?, ttl(60)?, at(71), |_| {
+        Ok(None::<()>)
+    })?;
+    let Reservation::Resumed(newer) = taken else {
+        return Err("expected the expired claim to be taken over".into());
+    };
+    assert_ne!(newer.fence(), lease.fence());
+    Ok(())
+}
+
+#[test]
 fn concurrent_reservations_admit_exactly_one() -> TestResult {
     let fixture = Fixture::new()?;
     let barrier = Arc::new(Barrier::new(2));

@@ -1093,6 +1093,50 @@ fn a_refused_revision_and_the_same_preview_retry_do_not_duplicate() -> TestResul
 }
 
 #[test]
+fn an_older_digest_cannot_resume_while_a_newer_one_holds_the_repository() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge {
+        fault: Some((1, Fault::Reject)),
+        ..Forge::seeded()
+    });
+    let older = project()?;
+    let older_approval = approval_of(&preview(&older)?)?;
+    // The older digest records only a refused write and is left open: it does
+    // not hold the repository.
+    let first = house.apply(&forge, &older, &older_approval)?;
+    assert!(matches!(first.outcome, ApplyOutcome::NotApplied { .. }));
+
+    // A newer digest takes the slot and is left unfinished after one applied
+    // write.
+    let mut newer = older.clone();
+    if let Some(docs) = newer.issues.first_mut() {
+        docs.title = "Build the docs site".into();
+    }
+    let newer_approval = approval_of(&preview(&newer)?)?;
+    let submitted = forge.borrow().submissions;
+    forge.borrow_mut().fault = Some((submitted + 2, Fault::Reject));
+    let second = house.apply(&forge, &newer, &newer_approval)?;
+    assert!(matches!(second.outcome, ApplyOutcome::NotApplied { .. }));
+    let after_newer = forge.borrow().submissions;
+    let newer_task = task_id(&preview(&newer)?.digest)?;
+
+    // Retrying the older digest must not claim its task or post.
+    let retry = house.apply(&forge, &older, &older_approval)?;
+    assert_eq!(
+        retry.outcome,
+        ApplyOutcome::EarlierUnfinished { task: newer_task }
+    );
+    assert_eq!(retry.task, None);
+    assert_eq!(forge.borrow().submissions, after_newer);
+    assert!(forge.borrow().created_titled("Build the docs").is_empty());
+
+    // The newer digest's own retry still resumes and completes.
+    let resumed = house.apply(&forge, &newer, &newer_approval)?;
+    assert_eq!(resumed.outcome, ApplyOutcome::Completed);
+    Ok(())
+}
+
+#[test]
 fn distinct_blocked_by_edges_never_share_an_effect_name() -> TestResult {
     let house = House::new(20)?;
     let forge = RefCell::new(Forge::seeded());

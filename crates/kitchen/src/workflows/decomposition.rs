@@ -31,7 +31,9 @@
 //! reached the forge, so a revised proposal cannot recreate issues that the
 //! earlier task created. The check, the creation of the task, and its claim
 //! are one store transaction ([`HouseStore::reserve_task`]), so two approved
-//! previews cannot both pass. The slot frees when the earlier task settles,
+//! previews cannot both pass. Resuming an older digest's open task runs the
+//! same check and re-claim in one transaction, so it cannot take the
+//! repository back from a newer digest that holds it. The slot frees when the earlier task settles,
 //! or when its claim lapses with no write that could have reached the forge.
 //! One that settled without success after such a write keeps the repository
 //! until a person runs [`acknowledge`]: it re-reads the forge for that task's
@@ -1140,7 +1142,7 @@ pub fn apply<T: GitHubMutationTransport>(
         Ok(earlier_unfinished(tasks, &id, &preview.repository, now))
     })?;
     let fence = match reservation {
-        Reservation::Reserved(lease) => lease.fence(),
+        Reservation::Reserved(lease) | Reservation::Resumed(lease) => lease.fence(),
         Reservation::Blocked(task) => {
             let record = store.task(&task)?;
             let outcome = match record.state() {
@@ -1157,27 +1159,15 @@ pub fn apply<T: GitHubMutationTransport>(
         }
         Reservation::Existing => {
             let record = store.task(&id)?;
-            let now = writer.clock.now();
-            let lease = match record.state() {
+            match record.state() {
                 TaskState::Settled { settlement, .. } => {
                     let mut done = report(preview, Some(id), ApplyOutcome::Settled(*settlement));
                     collect_applied(&record, &steps, &mut done)?;
                     return Ok(done);
                 }
-                TaskState::Open => store.claim(&id, claimant, options.lease, now),
-                TaskState::Claimed { lease } if lease.is_live(now) => {
+                TaskState::Open | TaskState::Claimed { .. } => {
                     return Ok(report(preview, Some(id), ApplyOutcome::HeldElsewhere));
                 }
-                TaskState::Claimed { .. } => store.take_over(&id, claimant, options.lease, now),
-            };
-            match lease {
-                Ok(lease) => lease.fence(),
-                Err(Error::State(
-                    StateError::ClaimHeld { .. }
-                    | StateError::LeaseExpired { .. }
-                    | StateError::LeaseLive { .. },
-                )) => return Ok(report(preview, Some(id), ApplyOutcome::HeldElsewhere)),
-                Err(error) => return Err(error),
             }
         }
     };

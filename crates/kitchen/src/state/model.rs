@@ -920,8 +920,12 @@ pub enum Reservation<R> {
     /// The task did not exist. It was created and claimed in one
     /// transaction, so it already holds its slot.
     Reserved(Lease),
-    /// An identical task already existed; nothing changed and nothing was
-    /// claimed.
+    /// An identical task already existed and was open or had an expired
+    /// claim. The guard passed and it was claimed (or taken over) in the same
+    /// transaction, so it holds its slot again.
+    Resumed(Lease),
+    /// An identical task already existed and nothing was written: it has
+    /// settled, or another claimant holds a live claim.
     Existing,
     /// The guard objected to the tasks as they were in the same transaction;
     /// nothing was written.
@@ -1245,10 +1249,25 @@ impl StoreState {
     ) -> Result<Reservation<R>> {
         let id = spec.id.clone();
         if self.tasks.contains_key(&id) {
-            // Validates that the existing task is identical; the guard
-            // protects a new slot only.
+            // Validates that the existing task is identical.
             self.create_task(spec, claimant, now)?;
-            return Ok(Reservation::Existing);
+            // A settled task or one another claimant holds live is left
+            // alone. Resuming an unfinished one takes the slot again, so the
+            // guard runs against the other tasks in this transaction.
+            match &self.task(&id)?.state {
+                TaskState::Settled { .. } => return Ok(Reservation::Existing),
+                TaskState::Claimed { lease } if lease.is_live(now) => {
+                    return Ok(Reservation::Existing);
+                }
+                TaskState::Open | TaskState::Claimed { .. } => {}
+            }
+            let tasks: Vec<&TaskRecord> = self.tasks().collect();
+            if let Some(blocked) = guard(&tasks)? {
+                return Ok(Reservation::Blocked(blocked));
+            }
+            return self
+                .take_over(&id, claimant, ttl, now)
+                .map(Reservation::Resumed);
         }
         let tasks: Vec<&TaskRecord> = self.tasks().collect();
         if let Some(blocked) = guard(&tasks)? {

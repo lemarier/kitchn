@@ -1172,18 +1172,13 @@ impl<'a> IntakeLedger<'a> {
             } else {
                 None
             };
-            let keep = match outcome {
-                None => true,
-                Some(false) => false,
-                Some(true) => !fold(&mut chunks, &reservation),
-            };
-            if keep {
-                compaction.kept += 1;
-                continue;
-            }
             match outcome {
-                Some(true) => compaction.folded += 1,
-                Some(false) | None => compaction.dropped += 1,
+                Some(true) if fold(&mut chunks, &reservation) => compaction.folded += 1,
+                Some(false) => compaction.dropped += 1,
+                Some(true) | None => {
+                    compaction.kept += 1;
+                    continue;
+                }
             }
             retire.push((marker.key().clone(), marker.fact().clone()));
         }

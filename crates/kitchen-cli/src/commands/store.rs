@@ -114,14 +114,14 @@ fn retain(args: RetainArgs) -> Result<(String, bool), kitchen::Error> {
     let policy = RetentionPolicy::new(Duration::from_secs(
         u64::from(args.window_days) * 24 * 60 * 60,
     ))?;
+    if args.gh.as_ref().is_some_and(|gh| !gh.is_absolute()) {
+        return Err(HouseError::InvalidInput.into());
+    }
     let store = open(&args.store, args.house.clone())?;
     let subjects = store.retention_subjects()?;
     let mut inventory = Inventory::new();
     let observed = match &args.gh {
         Some(gh) => {
-            if !gh.is_absolute() {
-                return Err(HouseError::InvalidInput.into());
-            }
             let registry = args.registry.ok_or(HouseError::InvalidInput)?;
             let registry = HouseRegistry::new(super::house::canonical_root(registry)?)?;
             let config = registry.load(&args.house)?;

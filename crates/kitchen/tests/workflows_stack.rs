@@ -2193,7 +2193,7 @@ mod gh_process {
     /// just before the push.
     fn git_moving_before_push(dir: &Path, before: &str) -> TestResult<std::path::PathBuf> {
         let path = dir.join("git-racing");
-        fs::write(
+        common::executable::write_executable(
             &path,
             format!(
                 "#!/bin/sh
@@ -2202,7 +2202,6 @@ exec {GIT} \"$@\"
 "
             ),
         )?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         Ok(path)
     }
 

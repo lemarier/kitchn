@@ -221,6 +221,23 @@ impl AttemptRecord {
     pub fn replies(&self) -> &[HumanReply] {
         &self.replies
     }
+
+    fn push_reply(
+        &mut self,
+        question: &ExternalRef,
+        asked_at: Timestamp,
+        answered_at: Timestamp,
+    ) -> Result<()> {
+        if self.replies.len() >= MAX_HUMAN_REPLIES_PER_ATTEMPT {
+            return Err(UsageError::TooManyReplies.into());
+        }
+        self.replies.push(HumanReply {
+            question: question.clone(),
+            asked_at,
+            answered_at,
+        });
+        Ok(())
+    }
 }
 
 const fn not_reported(usage: &AttemptUsage) -> bool {
@@ -2307,15 +2324,36 @@ impl StoreState {
         let Some(attempt) = task.running_attempt_mut(fence) else {
             return fail(StateError::NoRunningAttempt);
         };
-        if attempt.replies.len() >= MAX_HUMAN_REPLIES_PER_ATTEMPT {
-            return Err(UsageError::TooManyReplies.into());
+        attempt.push_reply(question, asked_at, now)
+    }
+
+    pub(crate) fn record_attempt_reply(
+        &mut self,
+        id: &TaskId,
+        fence: Fence,
+        number: AttemptNumber,
+        question: &ExternalRef,
+        asked_at: Timestamp,
+        answered_at: Timestamp,
+    ) -> Result<()> {
+        if asked_at > answered_at {
+            return Err(UsageError::ReplyBeforeQuestion.into());
         }
-        attempt.replies.push(HumanReply {
-            question: question.clone(),
-            asked_at,
-            answered_at: now,
-        });
-        Ok(())
+        let task = self.task_mut(id)?;
+        task.check_recorder(fence)?;
+        if task
+            .attempts
+            .iter()
+            .flat_map(|attempt| &attempt.replies)
+            .any(|reply| &reply.question == question)
+        {
+            return Ok(());
+        }
+        let index = usize::try_from(number.get().saturating_sub(1)).unwrap_or(usize::MAX);
+        let Some(attempt) = task.attempts.get_mut(index) else {
+            return fail(StateError::AttemptNotFound(number));
+        };
+        attempt.push_reply(question, asked_at, answered_at)
     }
 
     pub(crate) fn link_pull_request(

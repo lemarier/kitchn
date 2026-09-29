@@ -44,6 +44,10 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+    ignore:
+      # astro check refuses TypeScript 7; stay on 6 until @astrojs/check supports it.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
     groups:
       website:
         patterns: ["*"]

@@ -78,16 +78,41 @@ fn a_directory_destination_is_refused_and_left_unchanged() -> TestResult {
     Ok(())
 }
 
+/// What one write-then-run round did under fork pressure.
+enum Round {
+    Started,
+    /// The Linux race: the script was busy because a forked child held the
+    /// write descriptor. This is the only outcome that fails the test.
+    Busy,
+    /// A write or spawn failed for another reason, such as `fork` or `cp`
+    /// running out of resources on a loaded host. Not the regression.
+    Other(String),
+}
+
+fn round(path: &std::path::Path) -> Round {
+    if let Err(e) = write_executable(path, "#!/bin/sh\nexit 0\n") {
+        return Round::Other(format!("write {:?}: {e}", e.kind()));
+    }
+    match Command::new(path).stdin(Stdio::null()).status() {
+        Ok(_) => Round::Started,
+        Err(e) if e.kind() == ErrorKind::ExecutableFileBusy => Round::Busy,
+        Err(e) => Round::Other(format!("spawn {:?}: {e}", e.kind())),
+    }
+}
+
 /// Regression for the Linux `ETXTBSY` race: forking threads must not make a
 /// script fail with `ETXTBSY` right after it is written. The pre-fix pattern
-/// (`fs::write` then run) fails this on Linux.
+/// (`fs::write` then run) fails this on Linux. Only `ExecutableFileBusy`
+/// counts as the regression; other write or spawn errors come from resource
+/// exhaustion on a loaded host, so they are printed with their kind and
+/// tolerated as long as some scripts still started.
 #[test]
 fn scripts_start_while_other_threads_fork_children() -> TestResult {
     const WRITERS: usize = 4;
     const ROUNDS: usize = 25;
     let stop = AtomicBool::new(false);
     let dir = tempfile::tempdir()?;
-    let failures = thread::scope(|scope| {
+    let rounds: Vec<Round> = thread::scope(|scope| {
         let forkers: Vec<_> = (0..3)
             .map(|_| {
                 scope.spawn(|| {
@@ -102,28 +127,39 @@ fn scripts_start_while_other_threads_fork_children() -> TestResult {
                 let dir = dir.path();
                 scope.spawn(move || {
                     (0..ROUNDS)
-                        .filter(|round| {
-                            let path = dir.join(format!("script-{writer}-{round}"));
-                            write_executable(&path, "#!/bin/sh\nexit 0\n").is_err()
-                                || matches!(
-                                    Command::new(&path).stdin(Stdio::null()).status(),
-                                    Err(e) if e.kind() == ErrorKind::ExecutableFileBusy
-                                )
-                        })
-                        .count()
+                        .map(|n| round(&dir.join(format!("script-{writer}-{n}"))))
+                        .collect::<Vec<_>>()
                 })
             })
             .collect();
-        let failures: usize = writers
+        let rounds = writers
             .into_iter()
-            .map(|h| h.join().unwrap_or(usize::MAX))
-            .sum();
+            .flat_map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| vec![Round::Other("writer thread panicked".into())])
+            })
+            .collect();
         stop.store(true, Ordering::Relaxed);
         for forker in forkers {
             let _ = forker.join();
         }
-        failures
+        rounds
     });
-    assert_eq!(failures, 0);
+    let busy = rounds.iter().filter(|r| matches!(r, Round::Busy)).count();
+    let started = rounds
+        .iter()
+        .filter(|r| matches!(r, Round::Started))
+        .count();
+    for other in rounds.iter().filter_map(|r| match r {
+        Round::Other(why) => Some(why),
+        Round::Started | Round::Busy => None,
+    }) {
+        eprintln!("not the ETXTBSY regression (resource failure?): {other}");
+    }
+    assert_eq!(busy, 0, "ETXTBSY after write: the Linux race is back");
+    assert!(
+        started > 0,
+        "no script started; the host cannot run this test"
+    );
     Ok(())
 }

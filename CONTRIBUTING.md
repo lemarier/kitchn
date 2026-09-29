@@ -74,6 +74,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #40 schedule intervals and usage budgets | `scheduling/budget.rs` | The house `schedules` policy field and schedule doctor findings in `house/`; install refusal in the Orca schedule adapter; `tests/schedule_budgets.rs` |
 | #46 report intake | `workflows/intake.rs` | Intake source, grouping, and redaction tests |
 | #149 fake-executable test helper | `crates/kitchen/tests/common/executable.rs` | Test support only; `tests/fake_executable.rs` covers it |
+| #189 fake-executable fork-pressure test | `crates/kitchen/tests/fake_executable.rs` | Test-only; separates the Linux `ETXTBSY` regression from resource failures on loaded hosts |
 | #47 project decomposition | `workflows/decomposition.rs` | Decomposition tests; `kitchn decompose` CLI command |
 | #98 guided house init | `house/wizard/` | `kitchn house init` without `--config` in `crates/kitchen-cli/src/commands/house_init.rs`; `tests/house_init.rs` in both crates |
 | #140 house forge binding | `house/forge.rs` | The forge questions in `house/wizard/`; `kitchn forge` in `crates/kitchen-cli/src/commands/forge.rs`; the `ApprovedWrite` impls beside `apply_draft` and `decomposition::apply`, and the `issue apply`/`decompose apply` commands and acknowledgement re-reads in their command files; `tests/forge_binding.rs` and `crates/kitchen-cli/tests/forge.rs` |

@@ -92,6 +92,9 @@ pub enum Error {
     /// A house's worker backend could not be built or lacks a required capability.
     #[error(transparent)]
     Backend(#[from] crate::adapters::BackendError),
+    /// An inspection sampling decision was refused or not reproducible.
+    #[error(transparent)]
+    Sampling(#[from] crate::workflows::sampling::SamplingError),
 }
 
 impl Error {
@@ -121,6 +124,7 @@ impl Error {
             Self::Deliberation(error) => error.class(),
             Self::Interactive(error) => error.class(),
             Self::Backend(error) => error.class(),
+            Self::Sampling(error) => error.class(),
         }
     }
 }

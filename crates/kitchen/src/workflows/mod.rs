@@ -21,6 +21,7 @@ pub mod push;
 pub mod ready;
 pub mod recovery;
 pub mod repair;
+pub mod sampling;
 pub mod stack;
 pub mod triage;
 

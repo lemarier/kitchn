@@ -77,8 +77,9 @@ pub struct Delivery {
 impl Delivery {
     /// Messages that need the coordinator: questions, reports, escalations,
     /// and unrecognized types. Heartbeats and status notes are liveness and
-    /// information only; a batch holding nothing else is acknowledged and
-    /// the wait continues.
+    /// information only. Whether a batch may be acknowledged without
+    /// handling is [`Self::is_idle`], not an empty result here, since an
+    /// unreadable row may be a report or escalation.
     pub fn actionable(&self) -> impl Iterator<Item = &MailMessage> {
         self.messages.iter().filter(|message| {
             matches!(
@@ -89,6 +90,14 @@ impl Delivery {
                     | MessageKind::Other
             )
         })
+    }
+
+    /// Whether the batch holds nothing to handle: no actionable message and
+    /// no unreadable row. Only such a batch is acknowledged without handling
+    /// while the wait continues; any other batch goes to the coordinator.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.unreadable == 0 && self.actionable().next().is_none()
     }
 }
 
@@ -205,11 +214,22 @@ mod tests {
                 MessageKind::Other,
             ]
         );
+        assert!(!delivery.is_idle());
         let empty = Delivery {
             messages: Vec::new(),
             ..delivery
         };
         assert_eq!(empty.actionable().count(), 0);
+        assert!(empty.is_idle());
+        // Only heartbeats, but a row could not be read: it may be a report,
+        // so the batch is not idle and is never acknowledged blindly.
+        let heartbeats = Delivery {
+            messages: vec![message("h", MessageKind::Heartbeat)?],
+            unreadable: 1,
+            ..empty
+        };
+        assert_eq!(heartbeats.actionable().count(), 0);
+        assert!(!heartbeats.is_idle());
         Ok(())
     }
 }

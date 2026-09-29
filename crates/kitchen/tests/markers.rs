@@ -1291,6 +1291,11 @@ fn a_claim_on_one_task_never_writes_another_tasks_marker() -> TestResult {
         matches!(recorded, Err(Error::State(StateError::MarkerNotForTask(_)))),
         "{recorded:?}"
     );
+    // The same key can never succeed, so it is invalid input, not a conflict.
+    assert_eq!(
+        recorded.err().map(|error| error.class()),
+        Some(kitchen::ErrorClass::InvalidInput)
+    );
     assert_eq!(store.marker(&task_key(&other, "b")?)?, None);
 
     let superseded =

@@ -401,10 +401,11 @@ impl StateError {
             | Self::ScheduleRequirementsUnknown
             | Self::ScheduleRequirementsMismatch
             | Self::AcknowledgementNeedsPerson => ErrorClass::Refused,
-            Self::MarkerSchemaInvalid | Self::MarkerPayloadInvalid => ErrorClass::InvalidInput,
+            Self::MarkerSchemaInvalid | Self::MarkerPayloadInvalid | Self::MarkerNotForTask(_) => {
+                ErrorClass::InvalidInput
+            }
             Self::TaskNotFound(_)
             | Self::TaskConflict(_)
-            | Self::MarkerNotForTask(_)
             | Self::TaskSettled { .. }
             | Self::TaskNotSettled(_)
             | Self::TaskNotRetirable(_)

@@ -386,11 +386,13 @@ fn verify_committed(archivals: &[Archival], file: &mut dyn Read) -> Result<(), S
 const MAX_TAIL_BYTES: u64 = MAX_STATE_BYTES;
 
 /// Check that `tail`, the bytes of [`ARCHIVE_FILE`] past its committed
-/// length, can be cut off without losing a record. A line without its
-/// newline is a write that stopped partway, and a line that is not an
-/// [`ArchiveBatch`] holds no record. A batch may go only when it belongs to
-/// `house` and every record in it is still live and identical: in `doc`, or
-/// in `moving`, the batch this archival takes out of it.
+/// length, can be cut off without losing a record. Only a final line
+/// without its newline is a write that stopped partway. A complete line must
+/// be an [`ArchiveBatch`] that belongs to `house` with every record still
+/// live and identical: in `doc`, or in `moving`, the batch this archival
+/// takes out of it. An empty line holds nothing. Any other complete line,
+/// including one that does not parse, may hold records the ledger lacks, so
+/// it is refused.
 fn check_tail(
     house: &HouseId,
     doc: &Document,
@@ -409,8 +411,11 @@ fn check_tail(
         let Some(content) = line.strip_suffix(b"\n") else {
             continue;
         };
-        let Ok(batch) = serde_json::from_slice::<ArchiveBatch>(content) else {
+        if content.is_empty() {
             continue;
+        }
+        let Ok(batch) = serde_json::from_slice::<ArchiveBatch>(content) else {
+            return Err(unreconciled());
         };
         let live = batch.schema == ARCHIVE_SCHEMA
             && &batch.house == house

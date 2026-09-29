@@ -824,6 +824,37 @@ fn a_restored_older_ledger_is_refused_unchanged() -> TestResult {
     Ok(())
 }
 
+/// A complete line that does not parse may be a committed batch in another
+/// schema, or a damaged one, that the restored ledger lacks: refused, and
+/// both files stay byte-identical.
+#[test]
+fn an_unparseable_complete_tail_line_is_refused_unchanged() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    delivered(&f, &l, "first")?;
+    let older = fs::read(ledger_path(&f))?;
+    l.archive(at(100))?;
+    let mut archive = fs::read(archive_path(&f))?;
+    let line = archive.len();
+    // The restored ledger lacks this batch, and the batch is now unreadable.
+    if let Some(byte) = archive.get_mut(line.saturating_sub(3)) {
+        *byte = b'#';
+    }
+    fs::write(archive_path(&f), &archive)?;
+    fs::write(ledger_path(&f), &older)?;
+
+    let restored = reopen(&f)?;
+    assert!(matches!(
+        restored.archive(at(200)),
+        Err(TrustError::Storage(StateError::CorruptState(
+            Corruption::UnreconciledAppend
+        )))
+    ));
+    assert_eq!(fs::read(archive_path(&f))?, archive);
+    assert_eq!(fs::read(ledger_path(&f))?, older);
+    Ok(())
+}
+
 /// An archive line holding no records, as the given house.
 fn empty_batch(house: &str) -> String {
     format!(

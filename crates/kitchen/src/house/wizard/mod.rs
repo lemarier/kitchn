@@ -15,7 +15,11 @@ mod guidance;
 pub use error::HouseInitError;
 pub use guidance::default_guidance;
 
-use std::{collections::BTreeSet, fmt, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    path::PathBuf,
+};
 
 use crate::{
     HouseId,
@@ -424,6 +428,7 @@ pub fn plan_house_init(
         agents: Some(agents),
         stack_tool: None,
         schedules: None,
+        merge_readiness: BTreeMap::new(),
     };
     config.validate()?;
     bundle.validate(&config)?;

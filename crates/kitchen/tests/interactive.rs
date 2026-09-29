@@ -21,14 +21,16 @@ use kitchen::{
         Trigger, UncertainReason,
     },
     house::{HouseConfig, HouseError, RepositoryConfig, Workflow},
-    state::TaskState,
+    state::{EffectOutcome, RiskAction, RiskDecision, TaskState},
     workflows::{
         interactive::{
+            AcknowledgeOutcome, AcknowledgeReason, AcknowledgeReport, Acknowledgement,
             ClaimRefusal, Decomposer, DraftApproval, DraftOptions, DraftOutcome, DraftTarget,
             DraftWriter, ExecutionMode, ForgeWriter, HandBack, HouseResolution, Idle, IssueDraft,
-            IssueFacts, IssueStatus, MAX_DRAFT_LABELS, NoDecomposer, Orchestrator, PlannedWrite,
-            PrFacts, PrIntent, PrPlan, PrRequest, ReviewState, SoloReason, SubIssue, Unavailable,
-            WorkPlan, WorkRequest, apply_draft, draft_preview, draft_task_id, execution_mode,
+            IssueFacts, IssueStatus, MAX_ACKNOWLEDGE_REASON_BYTES, MAX_DRAFT_LABELS, NoDecomposer,
+            Orchestrator, PlannedWrite, PrFacts, PrIntent, PrPlan, PrRequest, ReadBack,
+            ReviewState, SoloReason, SubIssue, Unavailable, WorkPlan, WorkRequest, WriteReadBack,
+            acknowledge_draft, apply_draft, draft_preview, draft_task_id, execution_mode,
             hand_back, pull_request, resolve_house, work,
         },
         pickup::{ClaimOutcome, DEFAULT_FIX_ROUNDS, claim_issue, issue_task_id},
@@ -988,6 +990,8 @@ struct Forge {
     calls: u32,
     next_issue: u64,
     faults: Vec<Option<Fault>>,
+    /// Lookups cannot establish any outcome.
+    blind: bool,
 }
 
 /// An in-memory forge: applies GitHub mutations, answers lookups by key.
@@ -1033,6 +1037,10 @@ impl MemoryForge {
 
     fn calls(&self) -> u32 {
         self.state.borrow().calls
+    }
+
+    fn blind(&self, blind: bool) {
+        self.state.borrow_mut().blind = blind;
     }
 }
 
@@ -1088,6 +1096,9 @@ impl EffectExecutor for MemoryForge {
     }
 
     fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        if self.state.borrow().blind {
+            return Ok(Lookup::Unknown);
+        }
         Ok(self
             .state
             .borrow()
@@ -1206,6 +1217,30 @@ impl Desk {
             lease: kitchen::contracts::LeaseTtl::new(std::time::Duration::from_secs(600))?,
         };
         apply_draft(&writer, draft, approval, &person, &options)
+    }
+
+    /// Acknowledge `task` as `claimant`, re-reading through the forge when
+    /// `reread` is set.
+    fn acknowledge(
+        &self,
+        task: &kitchen::TaskId,
+        reason: &str,
+        accept_unknown: bool,
+        claimant: &kitchen::contracts::Claimant,
+        reread: bool,
+    ) -> kitchen::Result<AcknowledgeReport> {
+        let forge: &dyn EffectExecutor = &self.forge;
+        acknowledge_draft(
+            &self.world.fixture.store,
+            reread.then_some(forge),
+            task,
+            &Acknowledgement {
+                reason: reason.parse()?,
+                accept_unknown,
+            },
+            claimant,
+            &self.world.clock,
+        )
     }
 }
 
@@ -1581,5 +1616,336 @@ fn drafts_refuse_unattended_claimants() -> TestResult {
     );
     assert!(refused.is_err_and(|error| error.class() == ErrorClass::Refused));
     assert_eq!(desk.forge.calls(), 0);
+    Ok(())
+}
+
+/// Settle a new-issue draft whose issue was created but whose first label
+/// the forge refuses on every attempt, and return its task.
+fn settle_after_create(desk: &Desk, draft: &IssueDraft) -> TestResult<kitchen::TaskId> {
+    let approved = approval(draft)?;
+    desk.forge.plan_faults(vec![None, Some(Fault::Reject)]);
+    desk.apply(draft, Some(&approved))?;
+    loop {
+        desk.world.clock.advance(1);
+        desk.forge.plan_faults(vec![Some(Fault::Reject)]);
+        if let DraftOutcome::Settled { settlement } = desk.apply(draft, Some(&approved))?.outcome {
+            assert_eq!(settlement, Settlement::Exhausted);
+            break;
+        }
+        if desk.forge.calls() > 10 {
+            return Err("the draft never settled".into());
+        }
+    }
+    desk.forge.plan_faults(Vec::new());
+    Ok(draft_task_id(&draft_preview(draft)?)?)
+}
+
+#[test]
+fn a_stuck_new_issue_draft_blocks_only_its_own_title() -> TestResult {
+    let desk = Desk::new(10)?;
+    let draft = new_issue_draft()?;
+    let stuck = settle_after_create(&desk, &draft)?;
+
+    // A revision of the same new issue could create it twice: refused.
+    let mut revised = new_issue_draft()?;
+    revised.add_labels = vec!["ready".to_owned()];
+    let blocked = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert_eq!(
+        blocked.outcome,
+        DraftOutcome::EarlierSettledWithWrites {
+            task: stuck,
+            settlement: Settlement::Exhausted,
+            writes: vec![kitchen::EffectName::new("create")?],
+        }
+    );
+
+    // A different new issue in the same repository is not that draft.
+    let mut other = new_issue_draft()?;
+    other.target = DraftTarget::New {
+        title: "Log flash attempts".to_owned(),
+        body: "## Outcome\nLogs each attempt.".to_owned(),
+    };
+    let independent = desk.apply(&other, Some(&approval(&other)?))?;
+    assert_eq!(independent.outcome, DraftOutcome::Completed);
+    Ok(())
+}
+
+fn created(number: u64) -> TestResult<ReadBack> {
+    Ok(ReadBack::Applied {
+        reference: ExternalRef::new(&format!("https://github.com/{}/issues/{number}", repo()?))?,
+    })
+}
+
+#[test]
+fn an_owner_acknowledgement_releases_a_settled_draft_subject() -> TestResult {
+    let desk = Desk::new(10)?;
+    let draft = new_issue_draft()?;
+    let stuck = settle_after_create(&desk, &draft)?;
+    let mut revised = new_issue_draft()?;
+    revised.add_labels = vec!["ready".to_owned()];
+    let blocked = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert!(matches!(
+        blocked.outcome,
+        DraftOutcome::EarlierSettledWithWrites { .. }
+    ));
+
+    let person = interactive("person")?;
+    let reason = "Closed #101 by hand; post the revision as a new issue.";
+    desk.world.clock.advance(5);
+    let at = kitchen::contracts::Clock::now(&desk.world.clock);
+    let report = desk.acknowledge(&stuck, reason, false, &person, true)?;
+    assert_eq!(report.task, stuck);
+    assert_eq!(
+        report.writes,
+        vec![WriteReadBack {
+            effect: kitchen::EffectName::new("create")?,
+            state: created(101)?,
+        }]
+    );
+    let AcknowledgeOutcome::Recorded(recorded) = report.outcome else {
+        return Err(format!("not recorded: {:?}", report.outcome).into());
+    };
+    assert_eq!(recorded.by, person);
+    assert_eq!(recorded.at, at);
+    assert_eq!(recorded.acknowledgement.reason.as_str(), reason);
+    assert_eq!(
+        recorded.acknowledgement.applied,
+        vec![kitchen::EffectName::new("create")?]
+    );
+    assert!(recorded.acknowledgement.unknown.is_empty());
+
+    // The subject is released: the revised draft, a new digest, proceeds.
+    let after = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert_eq!(after.outcome, DraftOutcome::Completed);
+    assert_eq!(after.issue, Some(IssueNumber::new(102)?));
+
+    // The acknowledgement is durable and recorded once: a repeat keeps who,
+    // when, and why of the first.
+    desk.world.clock.advance(60);
+    let again = desk.acknowledge(
+        &stuck,
+        "Another reason.",
+        false,
+        &interactive("other")?,
+        true,
+    )?;
+    let AcknowledgeOutcome::AlreadyRecorded(first) = again.outcome else {
+        return Err(format!("not kept: {:?}", again.outcome).into());
+    };
+    assert_eq!((first.by, first.at), (person, at));
+    assert_eq!(first.acknowledgement.reason.as_str(), reason);
+    Ok(())
+}
+
+#[test]
+fn scheduled_claimants_cannot_acknowledge_a_draft() -> TestResult {
+    let desk = Desk::new(10)?;
+    let draft = new_issue_draft()?;
+    let stuck = settle_after_create(&desk, &draft)?;
+    let refused = desk.acknowledge(
+        &stuck,
+        "Tick cleanup.",
+        true,
+        &scheduled("gardener-tick")?,
+        true,
+    );
+    assert!(refused.is_err_and(|error| error.class() == ErrorClass::Refused));
+    // Nothing was recorded: a revision is still refused.
+    let mut revised = new_issue_draft()?;
+    revised.add_labels = vec!["ready".to_owned()];
+    let blocked = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert!(matches!(
+        blocked.outcome,
+        DraftOutcome::EarlierSettledWithWrites { .. }
+    ));
+    Ok(())
+}
+
+/// A new-issue draft whose create response was lost and that its owner
+/// handed over and cancelled: settled, with the create's outcome unknown.
+fn settle_with_unknown_create(desk: &Desk, draft: &IssueDraft) -> TestResult<kitchen::TaskId> {
+    desk.forge.plan_faults(vec![Some(Fault::LoseAfterApply)]);
+    let lost = desk.apply(draft, Some(&approval(draft)?))?;
+    assert!(matches!(lost.outcome, DraftOutcome::Uncertain { .. }));
+    let id = draft_task_id(&draft_preview(draft)?)?;
+    let store = &desk.world.fixture.store;
+    let now = kitchen::contracts::Clock::now(&desk.world.clock);
+    let lease = store.claim(&id, &interactive("person")?, ttl(600)?, now)?;
+    let record = store.task(&id)?;
+    let effect = record.effects().first().ok_or("effect")?;
+    store.record_effect_outcome(
+        &id,
+        lease.fence(),
+        effect.seq(),
+        EffectOutcome::Unresolvable,
+        now,
+    )?;
+    store.accept_risk(
+        &id,
+        lease.fence(),
+        effect.seq(),
+        RiskDecision {
+            effect: effect.request().key().clone(),
+            decided_by: holder("person")?,
+            revision: record.evidence().revision(),
+            action: RiskAction::SettleUnsuccessfully,
+        },
+        now,
+    )?;
+    store.request_cancel(&id, &holder("person")?, now)?;
+    store.settle_cancelled(&id, lease.fence(), now)?;
+    Ok(id)
+}
+
+#[test]
+fn an_unknown_write_after_rereading_needs_explicit_acceptance() -> TestResult {
+    let desk = Desk::new(10)?;
+    let draft = new_issue_draft()?;
+    let stuck = settle_with_unknown_create(&desk, &draft)?;
+    let mut revised = new_issue_draft()?;
+    revised.add_labels = vec!["ready".to_owned()];
+    let blocked = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert_eq!(
+        blocked.outcome,
+        DraftOutcome::EarlierSettledWithWrites {
+            task: stuck.clone(),
+            settlement: Settlement::Cancelled,
+            writes: vec![kitchen::EffectName::new("create")?],
+        }
+    );
+    let person = interactive("person")?;
+    let create = vec![kitchen::EffectName::new("create")?];
+
+    // The forge cannot tell, and no forge at all proves nothing either: the
+    // write stays unknown and nothing is recorded without acceptance.
+    desk.forge.blind(true);
+    for reread in [true, false] {
+        let report = desk.acknowledge(&stuck, "Checked by hand.", false, &person, reread)?;
+        assert_eq!(
+            report.outcome,
+            AcknowledgeOutcome::Unknown {
+                writes: create.clone()
+            }
+        );
+        assert_eq!(
+            report.writes.first().map(|write| &write.state),
+            Some(&ReadBack::Unknown)
+        );
+    }
+    let still = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert!(matches!(
+        still.outcome,
+        DraftOutcome::EarlierSettledWithWrites { .. }
+    ));
+
+    // Accepting the unknown write, with a reason, releases the subject.
+    let reason = "No issue titled Add flash retry exists; the create never landed.";
+    let report = desk.acknowledge(&stuck, reason, true, &person, true)?;
+    let AcknowledgeOutcome::Recorded(recorded) = report.outcome else {
+        return Err(format!("not recorded: {:?}", report.outcome).into());
+    };
+    assert_eq!(recorded.acknowledgement.unknown, create);
+    assert!(recorded.acknowledgement.applied.is_empty());
+    desk.forge.blind(false);
+    let after = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert_eq!(after.outcome, DraftOutcome::Completed);
+
+    // Where the forge proves the outcome, the re-read resolves it and no
+    // acceptance is needed; the proof is recorded.
+    let desk = Desk::new(10)?;
+    let stuck = settle_with_unknown_create(&desk, &draft)?;
+    let report = desk.acknowledge(&stuck, "Keep #101.", false, &person, true)?;
+    assert_eq!(
+        report.writes.first().map(|write| write.state.clone()),
+        Some(created(101)?)
+    );
+    let AcknowledgeOutcome::Recorded(recorded) = report.outcome else {
+        return Err(format!("not recorded: {:?}", report.outcome).into());
+    };
+    assert_eq!(recorded.acknowledgement.applied, create);
+    assert!(recorded.acknowledgement.unknown.is_empty());
+    Ok(())
+}
+
+#[test]
+fn acknowledgements_refuse_bad_reasons_and_tasks_that_hold_nothing() -> TestResult {
+    for bad in ["", " padded ", "two\nlines"] {
+        assert!(bad.parse::<AcknowledgeReason>().is_err(), "{bad:?}");
+    }
+    let longest = "r".repeat(MAX_ACKNOWLEDGE_REASON_BYTES);
+    assert!(longest.parse::<AcknowledgeReason>().is_ok());
+    assert!(format!("{longest}r").parse::<AcknowledgeReason>().is_err());
+
+    let desk = Desk::new(10)?;
+    let person = interactive("person")?;
+    // An unfinished draft is rerun or handed back, not acknowledged.
+    let draft = refine_draft()?;
+    desk.forge.plan_faults(vec![None, Some(Fault::Reject)]);
+    desk.apply(&draft, Some(&approval(&draft)?))?;
+    let unfinished = draft_task_id(&draft_preview(&draft)?)?;
+    let report = desk.acknowledge(&unfinished, "Done.", true, &person, true)?;
+    assert_eq!(report.outcome, AcknowledgeOutcome::Unsettled);
+    // A completed draft holds nothing.
+    desk.forge.plan_faults(Vec::new());
+    desk.world.clock.advance(1);
+    desk.apply(&draft, Some(&approval(&draft)?))?;
+    let report = desk.acknowledge(&unfinished, "Done.", true, &person, true)?;
+    assert_eq!(report.outcome, AcknowledgeOutcome::NotHeld);
+    // Only draft tasks can be acknowledged.
+    let pickup = issue_task_id(&issue(7)?)?;
+    let refused = desk.acknowledge(&pickup, "Done.", true, &person, true);
+    assert!(refused.is_err_and(|error| error.class() == ErrorClass::InvalidInput));
+    Ok(())
+}
+
+#[test]
+fn only_an_interactive_acknowledgement_of_the_task_releases_it() -> TestResult {
+    use kitchen::{
+        WorkflowId,
+        state::{MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, WorkItem},
+    };
+    let desk = Desk::new(10)?;
+    let draft = new_issue_draft()?;
+    let stuck = settle_after_create(&desk, &draft)?;
+    let store = &desk.world.fixture.store;
+    let now = kitchen::contracts::Clock::now(&desk.world.clock);
+    let fact = MarkerFact::workflow(
+        MarkerSchema::new(
+            "interactive-draft.acknowledgement",
+            std::num::NonZeroU32::MIN,
+        )?,
+        &serde_json::json!({
+            "task": stuck.as_str(),
+            "reason": "Written straight to the store.",
+            "applied": [],
+            "absent": [],
+            "unknown": ["create"],
+        }),
+    )?;
+    let key = |task: &kitchen::TaskId| -> TestResult<MarkerKey> {
+        Ok(MarkerKey {
+            workflow: WorkflowId::new("interactive-draft")?,
+            item: WorkItem::Task { task: task.clone() },
+            subject: MarkerSubject::Observation(ExternalRef::new(task.as_str())?),
+        })
+    };
+    // Recorded by a scheduled claimant, bypassing acknowledge_draft.
+    store.record_marker(
+        key(&stuck)?,
+        fact.clone(),
+        &scheduled("gardener-tick")?,
+        now,
+    )?;
+    // Recorded by a person, but under another task's key.
+    let other = issue_task_id(&issue(9)?)?;
+    store.record_marker(key(&other)?, fact, &interactive("person")?, now)?;
+
+    let mut revised = new_issue_draft()?;
+    revised.add_labels = vec!["ready".to_owned()];
+    let blocked = desk.apply(&revised, Some(&approval(&revised)?))?;
+    assert!(matches!(
+        blocked.outcome,
+        DraftOutcome::EarlierSettledWithWrites { .. }
+    ));
     Ok(())
 }

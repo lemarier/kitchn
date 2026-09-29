@@ -17,17 +17,22 @@
 //! submits only the rest: no duplicate issue, comment, label, or link. A
 //! write whose outcome stays unknown stops the run.
 //!
-//! One subject (an existing issue, or new issues in a repository) has at
-//! most one unfinished draft at a time. A per-subject slot task, claimed for
-//! the duration of the call, serializes the check for an earlier unfinished
-//! draft with the creation of this one, so two sessions cannot both pass.
+//! One subject (an existing issue, or one new issue identified by its title)
+//! has at most one unfinished draft at a time. A per-subject slot task,
+//! claimed for the duration of the call, serializes the check for an earlier
+//! unfinished draft with the creation of this one, so two sessions cannot
+//! both pass.
 //! A draft that settles without success after a write that reached, or may
 //! have reached, the forge keeps its subject
 //! ([`DraftOutcome::EarlierSettledWithWrites`]): a revision could otherwise
-//! post the same issue or comment again.
+//! post the same issue or comment again. Only a person releases it, with
+//! [`acknowledge_draft`]: it re-reads the forge for those writes and records
+//! who acknowledged them, when, and why. Nothing releases a subject on its
+//! own.
 
 use std::{
     fmt::{self, Write as _},
+    num::NonZeroU32,
     str::FromStr,
     time::Duration,
 };
@@ -37,16 +42,18 @@ use sha2::{Digest, Sha256};
 
 use super::{ClaimPolicy, ClaimRefusal, InteractiveError, claim_task, require_person};
 use crate::{
-    EffectName, HolderId, TaskId,
+    EffectName, HolderId, TaskId, WorkflowId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, CapabilityRequirements, Claimant, Clock,
-        Consent, Effect, EffectExecutor, ExternalRef, FailureClass, GitHubAction, GitHubEffect,
-        GitHubMutation, HouseGrants, IssueNumber, LeaseTtl, NotAppliedReason, Provenance,
-        Repository, RetryPolicy, Role, Settlement, TaskAuthority, TaskSpec, Text,
+        Consent, ContractError, Effect, EffectExecutor, ExternalRef, FailureClass, GitHubAction,
+        GitHubEffect, GitHubMutation, HouseGrants, IssueNumber, LeaseTtl, Lookup, NotAppliedReason,
+        Provenance, Repository, RetryPolicy, Role, Settlement, TaskAuthority, TaskSpec, Text,
+        Timestamp, Trigger,
     },
     integrations::github::{GitHubExecutor, GitHubMutationTransport},
     state::{
-        EffectPlan, EffectRecord, EffectState, HouseStore, Lease, TaskRecord, TaskState, reconcile,
+        EffectPlan, EffectRecord, EffectState, HouseStore, Lease, MarkerFact, MarkerKey,
+        MarkerRecording, MarkerSchema, MarkerSubject, TaskRecord, TaskState, WorkItem, reconcile,
         run_effect,
     },
 };
@@ -411,19 +418,31 @@ fn digest(repository: &Repository, writes: &[PlannedWrite]) -> Result<DraftDiges
     format!("sha256:{hex}").parse()
 }
 
-/// The subject a draft writes to: one existing issue, or new issues in one
-/// repository. At most one draft per subject is unfinished at a time.
-fn subject_hash(preview: &Preview) -> String {
-    let target = preview
-        .existing_issue()
-        .map_or_else(|| "new".to_owned(), |issue| issue.get().to_string());
-    sha256_hex(
-        b"kitchen-interactive-draft-subject-v1\0",
-        &[preview.repository.as_str().as_bytes(), target.as_bytes()],
+/// The subject a draft writes to: one existing issue, or one new issue in a
+/// repository, identified by its title. A revision that keeps the title is
+/// the same new issue, so it waits for or is refused by the earlier draft; a
+/// new issue with another title is independent. At most one draft per
+/// subject is unfinished at a time.
+fn subject_hash(preview: &Preview) -> Result<String> {
+    let repository = preview.repository.as_str().as_bytes();
+    let issue;
+    let parts: [&[u8]; 3] = match preview.writes.first() {
+        Some(PlannedWrite::CreateIssue { title, .. }) => [repository, b"new", title.as_bytes()],
+        Some(PlannedWrite::Comment { issue: target, .. }) => {
+            issue = target.get().to_string();
+            [repository, b"issue", issue.as_bytes()]
+        }
+        // A preview always starts with its issue creation or comment.
+        Some(PlannedWrite::Label { .. } | PlannedWrite::BlockedBy { .. }) | None => {
+            return Err(invalid("target"));
+        }
+    };
+    Ok(
+        sha256_hex(b"kitchen-interactive-draft-subject-v2\0", &parts)
+            .get(..16)
+            .unwrap_or_default()
+            .to_owned(),
     )
-    .get(..16)
-    .unwrap_or_default()
-    .to_owned()
 }
 
 /// The task that writes `preview` once approved.
@@ -438,14 +457,14 @@ pub fn draft_task_id(preview: &Preview) -> Result<TaskId> {
         .ok_or(InteractiveError::Encoding)?;
     Ok(TaskId::new(&format!(
         "{DRAFT_TASK_PREFIX}{}-{digest}",
-        subject_hash(preview)
+        subject_hash(preview)?
     ))?)
 }
 
 fn slot_task_id(preview: &Preview) -> Result<TaskId> {
     Ok(TaskId::new(&format!(
         "{SLOT_TASK_PREFIX}{}",
-        subject_hash(preview)
+        subject_hash(preview)?
     ))?)
 }
 
@@ -542,10 +561,11 @@ pub enum DraftOutcome {
         task: TaskId,
     },
     /// An earlier draft for the same subject settled without success after
-    /// writing, or possibly writing, to the forge. It keeps the subject until
-    /// its owner reconciles those writes and decides how to proceed: a
-    /// revision could post the same issue or comment again. Nothing was
-    /// written.
+    /// writing, or possibly writing, to the forge. A revision could post the
+    /// same issue or comment again, so the draft keeps the subject until a
+    /// person checks those writes and releases it with [`acknowledge_draft`]
+    /// (`kitchen issue acknowledge <task> --reason <why>`), which re-reads
+    /// the forge first. Nothing was written.
     EarlierSettledWithWrites {
         /// The settled task.
         task: TaskId,
@@ -731,16 +751,17 @@ fn collect_applied(
 /// The draft of the same subject other than `own` that still holds it, if
 /// any. One holds it while it has not settled and either holds a live claim
 /// or has a write that may have reached the forge, and after it settles
-/// without success if it has such a write: only its owner's reconciliation
-/// may release it, since a revision could post the same issue or comment
-/// again. A draft that only recorded refused or unsent writes and is not
-/// being run wrote nothing and frees the subject, as does one that settled
-/// successfully.
+/// without success if it has such a write, until a person acknowledges it
+/// with [`acknowledge_draft`]: a revision could post the same issue or
+/// comment again. A draft that only recorded refused or unsent writes and is
+/// not being run wrote nothing and frees the subject, as does one that
+/// settled successfully.
 fn earlier_unfinished<'a>(
     tasks: &'a [TaskRecord],
     own: &TaskId,
     subject: &str,
-    now: crate::contracts::Timestamp,
+    acknowledged: &[TaskId],
+    now: Timestamp,
 ) -> Option<&'a TaskRecord> {
     let prefix = format!("{DRAFT_TASK_PREFIX}{subject}-");
     tasks.iter().find(|task| {
@@ -748,7 +769,9 @@ fn earlier_unfinished<'a>(
             && task.spec().id.as_str().starts_with(&prefix)
             && match task.state() {
                 TaskState::Settled { settlement, .. } => {
-                    *settlement != Settlement::Succeeded && !forge_writes(task).is_empty()
+                    *settlement != Settlement::Succeeded
+                        && !forge_writes(task).is_empty()
+                        && !acknowledged.contains(&task.spec().id)
                 }
                 TaskState::Claimed { lease } if lease.is_live(now) => true,
                 TaskState::Open | TaskState::Claimed { .. } => !forge_writes(task).is_empty(),
@@ -906,7 +929,10 @@ fn apply_in_slot(
     let id = draft_task_id(preview)?;
     let now = clock.now();
     let tasks = store.tasks()?;
-    if let Some(earlier) = earlier_unfinished(&tasks, &id, &subject_hash(preview), now) {
+    let acknowledged = acknowledged(store)?;
+    if let Some(earlier) =
+        earlier_unfinished(&tasks, &id, &subject_hash(preview)?, &acknowledged, now)
+    {
         let task = earlier.spec().id.clone();
         return Ok(Applied::Early(match earlier.state() {
             TaskState::Settled { settlement, .. } => DraftOutcome::EarlierSettledWithWrites {
@@ -1077,6 +1103,342 @@ fn run_write(
         consent: Some(consent),
     };
     run_effect(store, writer.forge, writer.grants, plan, writer.clock)
+}
+
+/// Marker schema of draft acknowledgements.
+const ACKNOWLEDGEMENT_SCHEMA: &str = "interactive-draft.acknowledgement";
+/// Longest acknowledgement reason, in bytes.
+pub const MAX_ACKNOWLEDGE_REASON_BYTES: usize = 500;
+
+/// Why a person releases a settled draft's subject: one line of at most
+/// [`MAX_ACKNOWLEDGE_REASON_BYTES`], without surrounding whitespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AcknowledgeReason(String);
+
+impl AcknowledgeReason {
+    /// The reason text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for AcknowledgeReason {
+    type Err = crate::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        if single_line(value, MAX_ACKNOWLEDGE_REASON_BYTES) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(InteractiveError::InvalidReason.into())
+        }
+    }
+}
+
+impl TryFrom<String> for AcknowledgeReason {
+    type Error = crate::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
+
+impl From<AcknowledgeReason> for String {
+    fn from(value: AcknowledgeReason) -> Self {
+        value.0
+    }
+}
+
+/// A person's request to release a settled draft's subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Acknowledgement {
+    /// Why, as the person states it.
+    pub reason: AcknowledgeReason,
+    /// Whether the person accepts writes whose outcome the forge still
+    /// cannot establish. Without it, such a write keeps the subject held.
+    pub accept_unknown: bool,
+}
+
+/// What the forge shows for one write of a settled draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum ReadBack {
+    /// Applied, recorded or proven now.
+    Applied {
+        /// The forge reference from the receipt.
+        reference: ExternalRef,
+    },
+    /// The forge proves it never applied.
+    Absent,
+    /// The outcome is still unknown, or the forge was not read.
+    Unknown,
+}
+
+/// One write of a settled draft and what the forge shows for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteReadBack {
+    /// The write's logical name.
+    pub effect: EffectName,
+    /// What the forge shows.
+    pub state: ReadBack,
+}
+
+/// The durable record of a released draft subject.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DraftAcknowledgement {
+    /// The settled draft task.
+    pub task: TaskId,
+    /// Why the person released it.
+    pub reason: AcknowledgeReason,
+    /// Writes applied, by the task's record or the re-read.
+    pub applied: Vec<EffectName>,
+    /// Writes the re-read proved absent.
+    pub absent: Vec<EffectName>,
+    /// Writes whose outcome the person accepted as unknown.
+    pub unknown: Vec<EffectName>,
+}
+
+/// An acknowledgement with who recorded it and when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordedAcknowledgement {
+    /// What was acknowledged, and why.
+    pub acknowledgement: DraftAcknowledgement,
+    /// The person who acknowledged it.
+    pub by: Claimant,
+    /// When.
+    pub at: Timestamp,
+}
+
+/// How an [`acknowledge_draft`] call ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AcknowledgeOutcome {
+    /// Recorded now; the subject is released.
+    Recorded(RecordedAcknowledgement),
+    /// Recorded earlier; that record stands and nothing changed.
+    AlreadyRecorded(RecordedAcknowledgement),
+    /// Writes whose outcome is still unknown after the re-read. Nothing was
+    /// recorded; the person must check them and accept them explicitly.
+    Unknown {
+        /// Those writes.
+        writes: Vec<EffectName>,
+    },
+    /// The task has not settled: rerun the draft, or hand it back.
+    Unsettled,
+    /// The task settled successfully or wrote nothing; it holds no subject.
+    NotHeld,
+}
+
+/// The result of [`acknowledge_draft`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcknowledgeReport {
+    /// The draft task.
+    pub task: TaskId,
+    /// Each write that reached, or may have reached, the forge, as read
+    /// back in this call.
+    pub writes: Vec<WriteReadBack>,
+    /// How the call ended.
+    pub outcome: AcknowledgeOutcome,
+}
+
+fn acknowledgement_schema() -> Result<MarkerSchema> {
+    Ok(MarkerSchema::new(ACKNOWLEDGEMENT_SCHEMA, NonZeroU32::MIN)?)
+}
+
+fn acknowledgement_key(task: &TaskId) -> Result<MarkerKey> {
+    Ok(MarkerKey {
+        workflow: WorkflowId::new(DRAFT_WORKFLOW)?,
+        item: WorkItem::Task { task: task.clone() },
+        subject: MarkerSubject::Observation(ExternalRef::new(task.as_str())?),
+    })
+}
+
+fn recorded(marker: &crate::state::WorkflowMarker) -> Result<RecordedAcknowledgement> {
+    Ok(RecordedAcknowledgement {
+        acknowledgement: marker.fact().decode(&acknowledgement_schema()?)?,
+        by: marker.recorded_by().clone(),
+        at: marker.recorded_at(),
+    })
+}
+
+/// The draft tasks a person acknowledged. Markers are a general store API,
+/// so only an acknowledgement an interactive claimant recorded under the key
+/// of the task it names counts, as [`acknowledge_draft`] records it; any
+/// other marker in this workflow releases nothing.
+fn acknowledged(store: &HouseStore) -> Result<Vec<TaskId>> {
+    let schema = acknowledgement_schema()?;
+    let mut tasks = Vec::new();
+    for marker in store.markers(&WorkflowId::new(DRAFT_WORKFLOW)?)? {
+        if marker.recorded_by().trigger != Trigger::Interactive {
+            continue;
+        }
+        let Ok(fact) = marker.fact().decode::<DraftAcknowledgement>(&schema) else {
+            continue;
+        };
+        if *marker.key() == acknowledgement_key(&fact.task)? {
+            tasks.push(fact.task);
+        }
+    }
+    Ok(tasks)
+}
+
+/// What `forge` shows for the write `name` of `task`: its recorded receipt,
+/// or a lookup of its latest unresolved record. Without a forge, or for a
+/// write another backend received or this one cannot look up, the outcome
+/// stays unknown.
+fn read_back(forge: Option<&dyn EffectExecutor>, task: &TaskRecord, name: &EffectName) -> ReadBack {
+    let records = task.effects().iter().filter(|effect| effect.name() == name);
+    let mut latest = None;
+    for effect in records {
+        match effect.state() {
+            EffectState::Applied { receipt, .. } => {
+                return ReadBack::Applied {
+                    reference: receipt.reference().clone(),
+                };
+            }
+            EffectState::NotApplied { .. } => {}
+            EffectState::Intended
+            | EffectState::Uncertain { .. }
+            | EffectState::Unresolvable { .. }
+            | EffectState::Waived { .. } => latest = Some(effect),
+        }
+    }
+    let (Some(forge), Some(effect)) = (forge, latest) else {
+        return ReadBack::Unknown;
+    };
+    let descriptor = forge.descriptor();
+    if effect.request().backend() != &descriptor.backend
+        || !descriptor.supports_lookup(effect.request().effect())
+    {
+        return ReadBack::Unknown;
+    }
+    match forge.lookup(effect.request()) {
+        Ok(Lookup::Applied(receipt)) => ReadBack::Applied {
+            reference: receipt.reference().clone(),
+        },
+        Ok(Lookup::Absent) => ReadBack::Absent,
+        Ok(Lookup::Unknown) | Err(_) => ReadBack::Unknown,
+    }
+}
+
+/// Release the subject of a draft that settled without success after
+/// writing, or possibly writing, to the forge
+/// ([`DraftOutcome::EarlierSettledWithWrites`]).
+///
+/// Only a person present may do this, and only explicitly: nothing releases
+/// a subject on its own. The call first re-reads `forge` for every write of
+/// the task that was not recorded as not applied, resolving an unknown
+/// outcome where the forge proves it. `forge` is `None` when the caller has
+/// no forge access; every write without a recorded receipt then stays
+/// unknown. A write still unknown after the re-read releases nothing unless
+/// `acknowledgement.accept_unknown` is set. Otherwise the person, time,
+/// reason, and each write's outcome are recorded once in the house store,
+/// and later drafts of the subject no longer see the task. A repeated call
+/// keeps the first record.
+///
+/// # Errors
+/// [`InteractiveError::NeedsPerson`] for a non-interactive claimant;
+/// [`InteractiveError::NotADraft`] for a task that is not an issue draft;
+/// [`ContractError::CrossHouse`] for a forge of another house; store
+/// errors, including an unknown task.
+pub fn acknowledge_draft(
+    store: &HouseStore,
+    forge: Option<&dyn EffectExecutor>,
+    task: &TaskId,
+    acknowledgement: &Acknowledgement,
+    claimant: &Claimant,
+    clock: &dyn Clock,
+) -> Result<AcknowledgeReport> {
+    require_person(claimant)?;
+    if !task.as_str().starts_with(DRAFT_TASK_PREFIX) {
+        return Err(InteractiveError::NotADraft.into());
+    }
+    if let Some(forge) = forge
+        && &forge.descriptor().house != store.house()
+    {
+        return Err(ContractError::CrossHouse {
+            expected: store.house().clone(),
+            found: forge.descriptor().house.clone(),
+        }
+        .into());
+    }
+    let record = store.task(task)?;
+    let report = |writes, outcome| AcknowledgeReport {
+        task: task.clone(),
+        writes,
+        outcome,
+    };
+    match record.state() {
+        TaskState::Open | TaskState::Claimed { .. } => {
+            return Ok(report(Vec::new(), AcknowledgeOutcome::Unsettled));
+        }
+        TaskState::Settled {
+            settlement: Settlement::Succeeded,
+            ..
+        } => return Ok(report(Vec::new(), AcknowledgeOutcome::NotHeld)),
+        TaskState::Settled {
+            settlement: Settlement::Failed | Settlement::Cancelled | Settlement::Exhausted,
+            ..
+        } => {}
+    }
+    let names = forge_writes(&record);
+    if names.is_empty() {
+        return Ok(report(Vec::new(), AcknowledgeOutcome::NotHeld));
+    }
+    let key = acknowledgement_key(task)?;
+    if let Some(marker) = store.marker(&key)? {
+        return Ok(report(
+            Vec::new(),
+            AcknowledgeOutcome::AlreadyRecorded(recorded(&marker)?),
+        ));
+    }
+    let writes: Vec<WriteReadBack> = names
+        .into_iter()
+        .map(|effect| WriteReadBack {
+            state: read_back(forge, &record, &effect),
+            effect,
+        })
+        .collect();
+    let with = |wanted: fn(&ReadBack) -> bool| -> Vec<EffectName> {
+        writes
+            .iter()
+            .filter(|write| wanted(&write.state))
+            .map(|write| write.effect.clone())
+            .collect()
+    };
+    let unknown = with(|state| matches!(state, ReadBack::Unknown));
+    if !unknown.is_empty() && !acknowledgement.accept_unknown {
+        return Ok(report(
+            writes,
+            AcknowledgeOutcome::Unknown { writes: unknown },
+        ));
+    }
+    let fact = DraftAcknowledgement {
+        task: task.clone(),
+        reason: acknowledgement.reason.clone(),
+        applied: with(|state| matches!(state, ReadBack::Applied { .. })),
+        absent: with(|state| matches!(state, ReadBack::Absent)),
+        unknown,
+    };
+    let recording = store.record_marker(
+        key,
+        MarkerFact::workflow(acknowledgement_schema()?, &fact)?,
+        claimant,
+        clock.now(),
+    )?;
+    let outcome = match recording {
+        MarkerRecording::Recorded(marker) => AcknowledgeOutcome::Recorded(recorded(&marker)?),
+        MarkerRecording::AlreadyRecorded(marker) | MarkerRecording::Superseded(marker) => {
+            AcknowledgeOutcome::AlreadyRecorded(recorded(&marker)?)
+        }
+    };
+    Ok(report(writes, outcome))
 }
 
 #[cfg(test)]

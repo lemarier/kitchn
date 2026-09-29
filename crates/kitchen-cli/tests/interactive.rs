@@ -415,6 +415,7 @@ fn the_skill_uses_only_flags_the_cli_accepts() -> TestResult {
         vec!["pr", "--help"],
         vec!["issue", "new", "--help"],
         vec!["issue", "refine", "--help"],
+        vec!["issue", "acknowledge", "--help"],
         vec!["hand-back", "--help"],
         vec!["house", "setup", "--help"],
         vec!["house", "doctor", "--help"],
@@ -438,5 +439,226 @@ fn the_skill_uses_only_flags_the_cli_accepts() -> TestResult {
         assert!(help.contains(flag), "skill flag {flag} is not accepted");
     }
     assert!(SKILL.starts_with("---\nname: kitchn\n"));
+    Ok(())
+}
+
+/// A forge that posts comments and refuses every label while `refuse` is
+/// set. Lookups prove nothing, as for a forge that cannot be read.
+struct LabelRefusingForge {
+    descriptor: kitchen::contracts::BackendDescriptor,
+    refuse: std::cell::Cell<bool>,
+}
+
+impl kitchen::contracts::EffectExecutor for LabelRefusingForge {
+    fn descriptor(&self) -> &kitchen::contracts::BackendDescriptor {
+        &self.descriptor
+    }
+
+    fn execute(
+        &self,
+        request: &kitchen::contracts::EffectRequest,
+    ) -> Result<kitchen::contracts::Receipt, kitchen::contracts::EffectFailure> {
+        use kitchen::contracts::{
+            Effect, EffectFailure, ExternalRef, GitHubAction, NotAppliedReason, Receipt,
+        };
+        let rejected = EffectFailure::NotApplied(NotAppliedReason::Rejected);
+        match request.effect() {
+            Effect::GitHub(effect)
+                if !(self.refuse.get()
+                    && matches!(effect.mutation.action, GitHubAction::SetLabel { .. })) =>
+            {
+                let reference = ExternalRef::new(&format!("forge-{}", request.key().as_str()))
+                    .map_err(|_| rejected)?;
+                Receipt::new(reference, Vec::new(), Vec::new()).map_err(|_| rejected)
+            }
+            _ => Err(rejected),
+        }
+    }
+
+    fn lookup(
+        &self,
+        _: &kitchen::contracts::EffectRequest,
+    ) -> Result<kitchen::contracts::Lookup, kitchen::contracts::BackendUnavailable> {
+        Ok(kitchen::contracts::Lookup::Unknown)
+    }
+}
+
+impl kitchen::workflows::interactive::ForgeWriter for LabelRefusingForge {
+    fn github_effect(
+        &self,
+        mutation: kitchen::contracts::GitHubMutation,
+    ) -> kitchen::Result<kitchen::contracts::GitHubEffect> {
+        Ok(kitchen::contracts::GitHubEffect {
+            requester: kitchen::contracts::ExternalRef::new("sample-bot")?,
+            mutation,
+            posting_budget: kitchen::contracts::PostingBudget::new(10)?,
+        })
+    }
+}
+
+/// Apply `labels` with a comment on issue 72 through the library, as an
+/// approved draft would be.
+fn apply_refinement(
+    store: &HouseStore,
+    forge: &LabelRefusingForge,
+    labels: &[&str],
+) -> TestResult<kitchen::workflows::interactive::DraftReport> {
+    use kitchen::{
+        HolderId,
+        contracts::{
+            Claimant, CommitId, Grant, HouseGrants, IssueNumber, LeaseTtl, Permission, Provenance,
+            SystemClock,
+        },
+        workflows::interactive::{
+            DraftApproval, DraftOptions, DraftTarget, DraftWriter, IssueDraft, apply_draft,
+            draft_preview,
+        },
+    };
+    let draft = IssueDraft {
+        repository: "crabnebula/tauri-fixture".parse()?,
+        target: DraftTarget::Refine {
+            issue: IssueNumber::new(72)?,
+            comment: "Sharpened acceptance criteria.".to_owned(),
+        },
+        add_labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+        remove_labels: Vec::new(),
+        blocked_by: Vec::new(),
+        questions: Vec::new(),
+    };
+    let limits = [Permission::PostComment, Permission::EditLabels]
+        .into_iter()
+        .map(|permission| {
+            Ok(Grant::house(
+                permission,
+                forge.descriptor.backend.clone(),
+                kitchen::CredentialId::new("fixture")?,
+            ))
+        })
+        .collect::<TestResult<Vec<Grant>>>()?;
+    let grants = HouseGrants::with_limits(store.house().clone(), limits, [])?;
+    let writer = DraftWriter {
+        store,
+        forge,
+        grants: &grants,
+        clock: &SystemClock,
+    };
+    let approval = DraftApproval {
+        id: kitchen::contracts::ExternalRef::new("approval-1")?,
+        given_by: HolderId::new("person")?,
+        digest: draft_preview(&draft)?.digest,
+    };
+    let options = DraftOptions {
+        provenance: Provenance {
+            kitchen: CommitId::new(&"a".repeat(40))?,
+            house_guidance: CommitId::new(&"b".repeat(40))?,
+            repository_instructions: None,
+        },
+        lease: LeaseTtl::new(std::time::Duration::from_secs(600))?,
+    };
+    Ok(apply_draft(
+        &writer,
+        &draft,
+        Some(&approval),
+        &Claimant::interactive(HolderId::new("person")?),
+        &options,
+    )?)
+}
+
+#[test]
+fn issue_acknowledge_releases_a_settled_draft_for_the_person_only() -> TestResult {
+    use kitchen::workflows::interactive::DraftOutcome;
+    let setup = setup(true)?;
+    let store = HouseStore::open(&setup.store, "crabnebula".parse()?, StoreOptions::default())?;
+    let forge = LabelRefusingForge {
+        descriptor: kitchen::contracts::BackendDescriptor {
+            backend: kitchen::BackendId::new("fixture")?,
+            house: store.house().clone(),
+            capabilities: kitchen::contracts::CapabilitySet::supporting([
+                kitchen::contracts::Capability::ForgeMutation,
+                kitchen::contracts::Capability::EffectLookup,
+            ]),
+            worker_selection: None,
+        },
+        refuse: std::cell::Cell::new(true),
+    };
+    // The comment posts, then the label is refused until the task settles.
+    let task = loop {
+        let report = apply_refinement(&store, &forge, &["ready"])?;
+        if let DraftOutcome::Settled { .. } = report.outcome {
+            break report.task.ok_or("task")?;
+        }
+        if store.tasks()?.len() > 2 && report.outcome == DraftOutcome::Completed {
+            return Err("the draft completed".into());
+        }
+    };
+    forge.refuse.set(false);
+    let revised = apply_refinement(&store, &forge, &["ready", "cli"])?;
+    assert!(matches!(
+        revised.outcome,
+        DraftOutcome::EarlierSettledWithWrites { .. }
+    ));
+
+    let acknowledge = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_kitchen"))
+            .current_dir(&setup.consumer)
+            .args(["issue", "acknowledge", task.as_str(), "--registry"])
+            .arg(setup.registry.root())
+            .arg("--store")
+            .arg(&setup.store)
+            .args(args)
+            .output()
+    };
+    // A blank reason is refused before anything is read.
+    let blank = acknowledge(&["--holder", "person", "--reason", " "])?;
+    assert_eq!(blank.status.code(), Some(2), "{blank:?}");
+    // The comment's receipt is recorded, so it needs no re-read.
+    let done = acknowledge(&[
+        "--holder",
+        "person",
+        "--reason",
+        "Comment on #72 stands; label it by hand.",
+    ])?;
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    let text = String::from_utf8(done.stdout)?;
+    assert!(text.contains("comment: applied"), "{text}");
+    assert!(text.contains("Its subject is released"), "{text}");
+    let again = acknowledge(&["--holder", "other", "--reason", "Again.", "--json"])?;
+    assert_eq!(again.status.code(), Some(0));
+    let report = json(&again)?;
+    assert_eq!(report["outcome"]["type"], "already-recorded");
+    assert_eq!(report["outcome"]["by"]["holder"], "person");
+    assert_eq!(
+        report["outcome"]["acknowledgement"]["reason"],
+        "Comment on #72 stands; label it by hand."
+    );
+
+    let after = apply_refinement(&store, &forge, &["ready", "cli"])?;
+    assert_eq!(after.outcome, DraftOutcome::Completed);
+
+    // Only draft tasks can be acknowledged.
+    let facts = setup.file("facts.json", ISSUE)?;
+    let work = setup.run(
+        &[
+            "work",
+            "17",
+            "--facts",
+            facts.to_str().ok_or("path")?,
+            "--json",
+        ],
+        Some("person"),
+    )?;
+    let pickup = json(&work)?["plan"]["task"]
+        .as_str()
+        .ok_or("task")?
+        .to_owned();
+    let refused = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        .current_dir(&setup.consumer)
+        .args(["issue", "acknowledge", &pickup, "--registry"])
+        .arg(setup.registry.root())
+        .arg("--store")
+        .arg(&setup.store)
+        .args(["--holder", "person", "--reason", "Done."])
+        .output()?;
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
     Ok(())
 }

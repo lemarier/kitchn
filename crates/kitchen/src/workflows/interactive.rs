@@ -50,10 +50,12 @@ use crate::{
 mod draft;
 
 pub use draft::{
-    DRAFT_TASK_PREFIX, DRAFT_WORKFLOW, DraftApproval, DraftDigest, DraftOptions, DraftOutcome,
-    DraftReport, DraftTarget, DraftWriter, ForgeWriter, IssueDraft, MAX_DRAFT_BLOCKERS,
-    MAX_DRAFT_LABELS, MAX_DRAFT_QUESTIONS, PlannedWrite, Preview, Written, apply_draft,
-    draft_preview, draft_task_id,
+    AcknowledgeOutcome, AcknowledgeReason, AcknowledgeReport, Acknowledgement, DRAFT_TASK_PREFIX,
+    DRAFT_WORKFLOW, DraftAcknowledgement, DraftApproval, DraftDigest, DraftOptions, DraftOutcome,
+    DraftReport, DraftTarget, DraftWriter, ForgeWriter, IssueDraft, MAX_ACKNOWLEDGE_REASON_BYTES,
+    MAX_DRAFT_BLOCKERS, MAX_DRAFT_LABELS, MAX_DRAFT_QUESTIONS, PlannedWrite, Preview, ReadBack,
+    RecordedAcknowledgement, WriteReadBack, Written, acknowledge_draft, apply_draft, draft_preview,
+    draft_task_id,
 };
 
 type Result<T> = std::result::Result<T, crate::Error>;
@@ -82,6 +84,12 @@ pub enum InteractiveError {
     /// A draft could not be encoded for its digest.
     #[error("issue draft could not be encoded")]
     Encoding,
+    /// An acknowledgement named a task that is not an issue draft.
+    #[error("only issue draft tasks can be acknowledged")]
+    NotADraft,
+    /// An acknowledgement reason is empty, multi-line, or too long.
+    #[error("invalid acknowledgement reason")]
+    InvalidReason,
     /// Sub-issue creation is not connected in this build.
     #[error("sub-issue creation is not available; it needs the decomposition workflow (#47)")]
     DecompositionUnavailable,
@@ -108,7 +116,9 @@ impl InteractiveError {
             | Self::HouseMismatch
             | Self::DecompositionUnavailable
             | Self::BudgetAboveHouse { .. } => ErrorClass::Refused,
-            Self::InvalidDraft(_) | Self::RoundOverflow => ErrorClass::InvalidInput,
+            Self::InvalidDraft(_) | Self::RoundOverflow | Self::NotADraft | Self::InvalidReason => {
+                ErrorClass::InvalidInput
+            }
             Self::UnreadableReceipt | Self::Encoding => ErrorClass::Execution,
         }
     }

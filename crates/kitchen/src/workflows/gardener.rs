@@ -3,29 +3,37 @@
 //! separate house grants.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
     num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{ClaimState, Precheck, WorkflowError, known, valid_label};
 use crate::{
-    BackendId, ConsumerId, CredentialId, HouseId, WorkflowId,
+    BackendId, ConsumerId, CredentialId, HouseId, TaskId, WorkflowId,
     contracts::{
-        Capability, Claimant, CloseReason, ContractError, Effect, ExternalRef, GitHubAction, Grant,
-        GrantScope, HouseGrants, IssueNumber, Permission, Repository, ScheduleEffect, Text,
-        Timestamp,
+        AttemptOutcome, Capability, CapabilityRequirements, Claimant, Clock, CloseReason,
+        ContractError, Effect, ExternalRef, Fence, GitHubAction, GitHubMutation, Grant, GrantScope,
+        HouseGrants, IssueNumber, LeaseTtl, Permission, Provenance, Repository, RetryPolicy, Role,
+        ScheduleEffect, TaskAuthority, TaskSpec, Text, Timestamp,
     },
-    integrations::github::{GitHubClient, GitHubReadTransport, Issue as GitHubIssue, IssueState},
+    id::EffectName,
+    integrations::github::{
+        GitHubClient, GitHubExecutor, GitHubMutationTransport, GitHubReadTransport,
+        Issue as GitHubIssue, IssueState,
+    },
     scheduling::{
         self, PrecheckTimeout, Recurrence, ScheduleSpec, TimeOfDay, Timezone, WorkflowName,
     },
     selection::ResolvedSelection,
     state::{
-        HouseStore, MarkerFact, MarkerKey, MarkerRecording, MarkerSchema, MarkerSubject, WorkItem,
+        EffectPlan, EffectRecord, EffectState, HouseStore, MarkerFact, MarkerKey, MarkerRecording,
+        MarkerSchema, MarkerSubject, StateError, TaskState, WorkItem,
     },
 };
 
@@ -191,7 +199,7 @@ pub fn install(
     )
     .map_err(invalid)?;
     let prompt = Text::new(&format!(
-        "Run the Kitchen gardener hygiene pass for {} in house {}. Preview findings only; every label change, dependency link, or close needs its own house grant.",
+        "Run the Kitchen gardener hygiene pass for {} in house {}. Preview findings only; every label change, dependency link, or close needs its own house grant. Post each stale-issue report only with `kitchn gardener report-stale`, which records the issue as handled once GitHub shows the post.",
         precheck.repository, precheck.house
     ))
     .map_err(|_| WorkflowError::IncompleteEvidence)?;
@@ -369,15 +377,29 @@ const STALE_SUBJECT: &str = "stale-handled";
 
 /// The handled-stale marker payload: the issue's last update as read after
 /// the pass reported it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StaleHandled {
     revision: Timestamp,
+    /// The applied report that handled the issue; absent for a marker
+    /// recorded without one through [`StaleMarkers::record`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report: Option<ReportBinding>,
+}
+
+/// The applied report effect a handled-stale marker was recorded from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReportBinding {
+    /// The report task holding the applied post.
+    task: TaskId,
+    /// The applied comment's URL from the post's receipt.
+    receipt: ExternalRef,
 }
 
 impl StaleHandled {
-    fn fact(self) -> Result<MarkerFact, WorkflowError> {
-        MarkerFact::workflow(stale_schema()?, &self).map_err(|_| WorkflowError::IncompleteEvidence)
+    fn fact(&self) -> Result<MarkerFact, WorkflowError> {
+        MarkerFact::workflow(stale_schema()?, self).map_err(|_| WorkflowError::IncompleteEvidence)
     }
 
     fn decode(fact: &MarkerFact) -> Result<Self, WorkflowError> {
@@ -502,12 +524,41 @@ impl<'a> StaleMarkers<'a> {
         recorded_by: &Claimant,
         now: Timestamp,
     ) -> crate::Result<MarkerRecording> {
+        let handled = StaleHandled {
+            revision,
+            report: None,
+        };
+        self.record_report(repository, issue, handled, recorded_by, now)
+    }
+
+    /// The revision `issue` was last recorded as handled at, if any.
+    fn revision(
+        &self,
+        repository: &Repository,
+        issue: IssueNumber,
+    ) -> Result<Option<Timestamp>, WorkflowError> {
         let key = self.key(repository, issue)?;
-        let fact = StaleHandled { revision }.fact()?;
+        self.store
+            .marker(&key)
+            .map_err(|_| WorkflowError::PrecheckFailed)?
+            .map(|marker| StaleHandled::decode(marker.fact()).map(|handled| handled.revision))
+            .transpose()
+    }
+
+    fn record_report(
+        &self,
+        repository: &Repository,
+        issue: IssueNumber,
+        handled: StaleHandled,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> crate::Result<MarkerRecording> {
+        let key = self.key(repository, issue)?;
+        let fact = handled.fact()?;
         let Some(current) = self.store.marker(&key)? else {
             return self.store.record_marker(key, fact, recorded_by, now);
         };
-        if StaleHandled::decode(current.fact())?.revision > revision {
+        if StaleHandled::decode(current.fact())?.revision > handled.revision {
             return Err(WorkflowError::DecisionMismatch.into());
         }
         self.store
@@ -515,64 +566,296 @@ impl<'a> StaleMarkers<'a> {
     }
 }
 
-/// A stale-issue report the gardener posted, to be confirmed on the forge.
-#[derive(Debug, Clone, Copy)]
-pub struct StaleReport<'a> {
-    /// Repository of the stale issue.
-    pub repository: &'a Repository,
-    /// The stale issue the report is about.
-    pub issue: IssueNumber,
-    /// Provider id of the report comment.
-    pub comment: u64,
-    /// The house identity that posted the report.
-    pub reporter: &'a ExternalRef,
+/// What one stale report acts under: the house store, GitHub reads and
+/// writes for the stale issue's repository, and the scheduled claimant.
+pub struct StaleReportPass<'a, R, M> {
+    /// The house's state store.
+    pub store: &'a HouseStore,
+    /// Reads of the stale issue.
+    pub client: &'a GitHubClient<R>,
+    /// The executor the report comment is posted through.
+    pub executor: &'a GitHubExecutor<M>,
+    /// The house's grants.
+    pub grants: &'a HouseGrants,
+    /// The comment grant each report task is delegated. Keep it the same for
+    /// an issue; a changed grant is refused as a changed task.
+    pub authority: Grant,
+    /// Kitchen and house guidance revisions recorded on each task.
+    pub provenance: Provenance,
+    /// The claimant posting the report.
+    pub claimant: &'a Claimant,
+    /// The claim's lease.
+    pub ttl: LeaseTtl,
+    /// Time source.
+    pub clock: &'a dyn Clock,
 }
 
-/// Record stale `issue` as handled once its report is confirmed on the forge.
+/// The result of [`report_stale`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaleReportOutcome {
+    /// The report is applied and the issue is recorded as handled at
+    /// `revision`.
+    Recorded {
+        /// The applied comment's URL.
+        receipt: ExternalRef,
+        /// The issue's last update, read after the report.
+        revision: Timestamp,
+    },
+    /// The issue is already recorded as handled at its current revision;
+    /// nothing was posted.
+    AlreadyHandled,
+    /// The report did not apply, so nothing was recorded and the issue keeps
+    /// waking the schedule. An uncertain post is looked up on the next run,
+    /// never posted twice.
+    NotPosted(Box<EffectRecord>),
+}
+
+/// Bound on report attempts for one issue revision; each run claims one.
+const REPORT_ATTEMPTS: u32 = 16;
+/// Bound on the time one issue revision's report task keeps retrying.
+const REPORT_ELAPSED: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Name of the report effect, one per report task.
+const REPORT_EFFECT: &str = "gardener-stale-report";
+
+/// Post the gardener's stale report on `issue` and record the issue as
+/// handled once the post is applied.
 ///
-/// The worker's word is not evidence. The report comment must be read back
-/// on the issue and authored by `reporter`, the house
-/// identity that posted it; only then is the issue read again and its
-/// `updated_at` recorded, which covers the report's own update. A missing
-/// or foreign comment, a closed issue, or an incomplete read records
-/// nothing, so the issue keeps waking the schedule. Running it again after
-/// a restart records the same revision again (no change) or a newer one.
+/// The report is a comment posted through the house's persisted-effect path
+/// ([`crate::state::run_effect`]) under one task per issue and previously
+/// handled revision, so its intent is stored before the post and GitHub is
+/// read back before it counts as applied. Only that applied effect records
+/// the marker, which keeps the task and the comment URL; no other comment on
+/// the issue counts. The issue is read again after the post and its last
+/// update is recorded, covering the report's own update.
+///
+/// A run is restart-safe: a run after a crash finds the same task, looks an
+/// unresolved post up instead of posting again, and records the marker from
+/// an applied post it finds. A run after the marker was recorded finds the
+/// issue handled and posts nothing. A post that did not apply records
+/// nothing ([`StaleReportOutcome::NotPosted`]).
 ///
 /// # Errors
-/// [`WorkflowError::IncompleteEvidence`] when the comment is absent or the
-/// issue read is incomplete, [`WorkflowError::DecisionMismatch`] when the
-/// comment has another author or the issue is not open,
-/// [`WorkflowError::PrecheckFailed`] when a read fails, plus every error of
-/// [`StaleMarkers::record`].
-pub fn record_reported<T: GitHubReadTransport>(
-    client: &GitHubClient<T>,
-    markers: &StaleMarkers<'_>,
-    house: &HouseId,
-    report: &StaleReport<'_>,
-    recorded_by: &Claimant,
-    now: Timestamp,
-) -> crate::Result<MarkerRecording> {
-    let StaleReport {
+/// [`WorkflowError::DecisionMismatch`] for a closed issue,
+/// [`WorkflowError::IncompleteEvidence`] and [`WorkflowError::PrecheckFailed`]
+/// for incomplete or failed reads, integration refusals of the comment,
+/// and task creation, claim, effect, and marker refusals, such as a claim
+/// another run holds.
+pub fn report_stale<R: GitHubReadTransport, M: GitHubMutationTransport>(
+    pass: &StaleReportPass<'_, R, M>,
+    repository: &Repository,
+    issue: IssueNumber,
+    body: Text,
+) -> crate::Result<StaleReportOutcome> {
+    let markers = StaleMarkers::new(pass.store)?;
+    let house = pass.grants.house();
+    let current = open_issue(pass.client, house, repository, issue)?;
+    if markers.handled(repository, issue, current.updated_at)? {
+        return Ok(StaleReportOutcome::AlreadyHandled);
+    }
+    let prior = markers.revision(repository, issue)?;
+    let task = report_task(repository, issue, prior)?;
+    // An existing task is continued as created, so a later guidance
+    // revision cannot strand an unfinished report.
+    let existing = match pass.store.task(&task) {
+        Err(crate::Error::State(StateError::TaskNotFound(_))) => {
+            pass.store.create_task(
+                TaskSpec {
+                    id: task.clone(),
+                    role: Role::Gardener,
+                    repository: Some(repository.clone()),
+                    authority: TaskAuthority::delegate(pass.grants, [pass.authority.clone()])?,
+                    retry: RetryPolicy::new(REPORT_ATTEMPTS, REPORT_ELAPSED)?,
+                    provenance: pass.provenance.clone(),
+                    requires: CapabilityRequirements::new(),
+                    resources: BTreeSet::new(),
+                    agent: None,
+                },
+                pass.claimant,
+                pass.clock.now(),
+            )?;
+            pass.store.task(&task)?
+        }
+        other => other?,
+    };
+    let record = match existing.state() {
+        // A report task settles only after its post applied; the marker may
+        // still be due after a crash.
+        TaskState::Settled { .. } => {
+            applied_report(existing.effects()).ok_or(WorkflowError::DecisionMismatch)?
+        }
+        TaskState::Open | TaskState::Claimed { .. } => {
+            let fence = claim(pass, &task)?;
+            let posted = post(pass, &task, fence, repository, issue, body);
+            let settled = matches!(pass.store.task(&task)?.state(), TaskState::Settled { .. });
+            if !settled {
+                pass.store.relinquish(&task, fence, pass.clock.now())?;
+            }
+            let record = posted?;
+            if !is_applied(&record) {
+                return Ok(StaleReportOutcome::NotPosted(Box::new(record)));
+            }
+            record
+        }
+    };
+    let EffectState::Applied { receipt, .. } = record.state() else {
+        return Err(WorkflowError::IncompleteEvidence.into());
+    };
+    let receipt = receipt.reference().clone();
+    // The report's own update is covered; a closed issue needs no marker.
+    let reported = open_issue(pass.client, house, repository, issue)?;
+    markers.record_report(
         repository,
         issue,
-        comment: report_comment,
-        reporter,
-    } = *report;
-    let comments = known(client.comments(house, repository, issue))?;
-    let comment = comments
-        .iter()
-        .find(|comment| comment.id == report_comment)
-        .ok_or(WorkflowError::IncompleteEvidence)?;
-    if comment.user.login != reporter.as_str() {
-        return Err(WorkflowError::DecisionMismatch.into());
-    }
+        StaleHandled {
+            revision: reported.updated_at,
+            report: Some(ReportBinding {
+                task,
+                receipt: receipt.clone(),
+            }),
+        },
+        pass.claimant,
+        pass.clock.now(),
+    )?;
+    Ok(StaleReportOutcome::Recorded {
+        receipt,
+        revision: reported.updated_at,
+    })
+}
+
+fn open_issue<R: GitHubReadTransport>(
+    client: &GitHubClient<R>,
+    house: &HouseId,
+    repository: &Repository,
+    issue: IssueNumber,
+) -> Result<GitHubIssue, WorkflowError> {
     let current = known(client.issue(house, repository, issue))?;
     match current.state {
-        IssueState::Open => {}
-        IssueState::Closed => return Err(WorkflowError::DecisionMismatch.into()),
-        IssueState::Unknown => return Err(WorkflowError::IncompleteEvidence.into()),
+        IssueState::Open => Ok(current),
+        IssueState::Closed => Err(WorkflowError::DecisionMismatch),
+        IssueState::Unknown => Err(WorkflowError::IncompleteEvidence),
     }
-    markers.record(repository, issue, current.updated_at, recorded_by, now)
+}
+
+/// The report task for `issue` since its `prior` handled revision. It stays
+/// the same until a report is recorded, so a restarted run continues it.
+fn report_task(
+    repository: &Repository,
+    issue: IssueNumber,
+    prior: Option<Timestamp>,
+) -> crate::Result<TaskId> {
+    let mut digest = Sha256::new();
+    let prior = prior.map_or(0, Timestamp::as_unix_millis).to_string();
+    let issue = issue.get().to_string();
+    for part in [repository.as_str(), &issue, &prior] {
+        // Length-prefixed, so no two part lists share a digest input.
+        digest.update(part.len().to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    let mut id = String::from("gardener-stale-");
+    for byte in digest.finalize().iter().take(16) {
+        let _ = write!(id, "{byte:02x}");
+    }
+    Ok(TaskId::new(&id)?)
+}
+
+/// Claim `task`, taking over a claim whose lease expired, and continue its
+/// attempt or start the next.
+fn claim<R, M>(pass: &StaleReportPass<'_, R, M>, task: &TaskId) -> crate::Result<Fence> {
+    let now = pass.clock.now();
+    let lease = match pass.store.claim(task, pass.claimant, pass.ttl, now) {
+        Err(crate::Error::State(StateError::LeaseExpired { .. })) => {
+            pass.store.take_over(task, pass.claimant, pass.ttl, now)?
+        }
+        other => other?,
+    };
+    let fence = lease.fence();
+    let started = pass
+        .store
+        .continue_attempt(task, fence, now)
+        .and_then(|running| match running {
+            Some(_) => Ok(()),
+            None => pass.store.start_attempt(task, fence, now).map(|_| ()),
+        });
+    if let Err(error) = started {
+        pass.store.relinquish(task, fence, now)?;
+        return Err(error);
+    }
+    Ok(fence)
+}
+
+/// Post the report under the claimed `task`, or find the post an earlier
+/// run applied, and settle the task once it is applied.
+fn post<R, M: GitHubMutationTransport>(
+    pass: &StaleReportPass<'_, R, M>,
+    task: &TaskId,
+    fence: Fence,
+    repository: &Repository,
+    issue: IssueNumber,
+    body: Text,
+) -> crate::Result<EffectRecord> {
+    crate::state::reconcile(pass.store, pass.executor, task, fence, pass.clock)?;
+    let record = pass.store.task(task)?;
+    let record = match applied_report(record.effects()) {
+        Some(applied) => applied,
+        None => {
+            // An earlier post is resubmitted as recorded, so a changed body
+            // cannot post a second, different report.
+            let effect = match record
+                .effects()
+                .iter()
+                .rev()
+                .find(|effect| effect.name().as_str() == REPORT_EFFECT)
+            {
+                Some(earlier) => earlier.request().effect().clone(),
+                None => Effect::GitHub(pass.executor.effect(GitHubMutation {
+                    repository: repository.clone(),
+                    action: GitHubAction::PostComment { issue, body },
+                })?),
+            };
+            crate::state::run_effect(
+                pass.store,
+                pass.executor,
+                pass.grants,
+                EffectPlan {
+                    task: task.clone(),
+                    fence,
+                    name: EffectName::new(REPORT_EFFECT)?,
+                    decided_at: record.evidence().revision(),
+                    effect,
+                    consent: None,
+                    basis: None,
+                },
+                pass.clock,
+            )?
+        }
+    };
+    if is_applied(&record) {
+        let now = pass.clock.now();
+        if let Some(attempt) = pass.store.continue_attempt(task, fence, now)? {
+            pass.store
+                .finish_attempt(task, fence, attempt, AttemptOutcome::Succeeded, now)?;
+        }
+    }
+    Ok(record)
+}
+
+/// The task's applied report post, if any.
+fn applied_report(effects: &[EffectRecord]) -> Option<EffectRecord> {
+    effects
+        .iter()
+        .find(|effect| effect.name().as_str() == REPORT_EFFECT && is_applied(effect))
+        .cloned()
+}
+
+const fn is_applied(record: &EffectRecord) -> bool {
+    match record.state() {
+        EffectState::Applied { .. } => true,
+        EffectState::Intended
+        | EffectState::Uncertain { .. }
+        | EffectState::NotApplied { .. }
+        | EffectState::Unresolvable { .. }
+        | EffectState::Waived { .. } => false,
+    }
 }
 
 /// Evidence that the house holds a standing [`Permission::CloseIssue`] grant

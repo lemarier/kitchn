@@ -228,6 +228,24 @@ kitchn gardener precheck --house <id> --repository <owner/name> --requester <log
   --ready-label <label> --working-label <label> --lookback-hours <1-168> --stale-days <1-365> [--store <dir>]
 ```
 
+## `kitchn gardener report-stale`
+
+Post the gardener's stale-issue report and record the issue as handled, so the
+daily precheck stays idle for it until someone updates the issue again.
+
+```sh
+kitchn gardener report-stale --registry <dir> --house <id> --store <dir> \
+  --repository <owner/name> --issue <n> --body <text> \
+  --github-backend <id> --requester <login> --credential <name> --credential-file <path> --gh <path>
+```
+
+The repository must be a house posting destination with a comment grant. The
+issue is marked handled only after GitHub shows the posted comment. Exits `0`
+when recorded or already handled, `1` when the post did not apply (nothing is
+recorded; run it again later), `2` for invalid input and `3` when GitHub, the
+house or its store refuse or cannot be read. Running it again after a crash
+looks the earlier post up instead of posting twice.
+
 ## `kitchn budget`
 
 The schedule budget tick: pause schedules that exhausted their usage budget and

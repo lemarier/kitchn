@@ -2,17 +2,20 @@ use std::{
     io::{self, Write},
     path::PathBuf,
     process::ExitCode,
+    time::Duration,
 };
 
 use clap::{Args, Subcommand};
 use kitchen::{
-    CredentialId, HolderId, HouseId,
+    BackendId, CredentialId, HolderId, HouseId,
+    adoption::HouseRegistry,
     contracts::{
-        Claimant, Clock, ExternalRef, IssueNumber, Permission, PostingBudget, Repository,
-        SystemClock,
+        Claimant, Clock, ExternalRef, Grant, IssueNumber, LeaseTtl, Permission, PostingBudget,
+        Provenance, Repository, SystemClock, Text,
     },
     integrations::github::{
-        CredentialFile, CredentialRef, GhCli, GitHubClient, HouseScope, ReadLimits,
+        CredentialFile, CredentialRef, GhCli, GitHubClient, GitHubExecutor, HouseScope,
+        IntegrationError, ReadLimits,
     },
     scheduling::PrecheckOutcome,
     state::{HouseStore, StoreOptions},
@@ -31,41 +34,49 @@ enum GardenerCommand {
     /// 1 when it does not, 2 for invalid arguments, and 3 when the inventory
     /// or the house store cannot be read. Only reads GitHub and the store.
     Precheck(PrecheckArgs),
-    /// After the gardener reported a stale issue: confirm the report comment
-    /// on GitHub and record the issue as handled at its current revision.
-    /// Exits 0 when recorded, 2 for invalid arguments, and 3 when the report
-    /// is not confirmed or GitHub or the house store cannot be read or
-    /// written; nothing is recorded then.
-    RecordHandled(RecordHandledArgs),
+    /// Post the gardener's stale report on an issue and record the issue
+    /// as handled once GitHub shows the post applied. Exits 0 when recorded
+    /// or already handled at the issue's current revision, 1 when the post
+    /// did not apply (nothing is recorded), 2 for invalid arguments, and 3
+    /// when GitHub, the house, or its store refuse or cannot be read; nothing
+    /// is recorded then. Running it again after a crash never posts twice.
+    ReportStale(ReportStaleArgs),
 }
 
 #[derive(Args)]
-struct RecordHandledArgs {
+struct ReportStaleArgs {
+    /// The house registry holding the house configuration.
+    #[arg(long)]
+    registry: PathBuf,
     #[arg(long)]
     house: HouseId,
+    /// Absolute path of the house's initialized state store.
+    #[arg(long)]
+    store: PathBuf,
+    /// The stale issue's repository, one of the house's posting destinations.
     #[arg(long)]
     repository: Repository,
-    /// The GitHub login the credential must authenticate as; it must also be
-    /// the report comment's author.
+    /// The stale issue.
+    #[arg(long)]
+    issue: u64,
+    /// The report comment's text.
+    #[arg(long)]
+    body: String,
+    /// The GitHub backend namespace the house's comment grant names.
+    #[arg(long)]
+    github_backend: BackendId,
+    /// The GitHub login the credential must authenticate as.
     #[arg(long)]
     requester: ExternalRef,
+    /// The house credential the comment grant names.
     #[arg(long)]
     credential: CredentialId,
-    /// Absolute path of the private file holding the read token.
+    /// Absolute path of the private file holding that credential's token.
     #[arg(long)]
     credential_file: PathBuf,
     /// Absolute path of the GitHub CLI.
     #[arg(long)]
     gh: PathBuf,
-    /// Absolute path of the house's initialized state store.
-    #[arg(long)]
-    store: PathBuf,
-    /// The stale issue the gardener reported.
-    #[arg(long)]
-    issue: u64,
-    /// GitHub's id of the comment carrying the stale report.
-    #[arg(long)]
-    report_comment: u64,
 }
 
 #[derive(Args)]
@@ -102,15 +113,20 @@ struct PrecheckArgs {
     stale_days: u16,
 }
 
-/// The claimant recording handled stale issues.
-const RECORDER: &str = "gardener-record-handled";
+/// The claimant posting stale reports.
+const REPORTER: &str = "gardener-report-stale";
+/// Lease of one report run: two issue reads, a lookup, a post, and its
+/// read-back, each bounded by the client's timeouts.
+const REPORT_LEASE: Duration = Duration::from_secs(15 * 60);
+/// Posts one report run may make.
+const REPORT_POSTS: u32 = 1;
 
 /// Where a precheck failed: exit 2 before any read, 3 after.
 enum Failure {
     Invalid,
     Read(WorkflowError),
-    /// Recording failed after the arguments were accepted.
-    Recorded(kitchen::Error),
+    /// Reporting failed after the arguments were accepted.
+    Reported(kitchen::Error),
 }
 
 fn invalid<E>(_: E) -> Failure {
@@ -120,7 +136,7 @@ fn invalid<E>(_: E) -> Failure {
 pub fn run(args: GardenerArgs) -> ExitCode {
     match args.command {
         GardenerCommand::Precheck(args) => report(precheck(args)),
-        GardenerCommand::RecordHandled(args) => report_recorded(record_handled(args)),
+        GardenerCommand::ReportStale(args) => report_stale_outcome(report_stale(args)),
     }
 }
 
@@ -193,52 +209,102 @@ fn read_client(
     Ok(GitHubClient::new(scope, gh, ReadLimits::default()))
 }
 
-fn record_handled(args: RecordHandledArgs) -> Result<(), Failure> {
+fn report_stale(args: ReportStaleArgs) -> Result<gardener::StaleReportOutcome, Failure> {
     if !args.store.is_absolute() {
         return Err(Failure::Invalid);
     }
     let issue = IssueNumber::new(args.issue).map_err(invalid)?;
-    let holder = HolderId::new(RECORDER).map_err(invalid)?;
+    let body = Text::new(&args.body).map_err(invalid)?;
+    let claimant = Claimant::scheduled(HolderId::new(REPORTER).map_err(invalid)?);
+    let ttl = LeaseTtl::new(REPORT_LEASE).map_err(invalid)?;
     let client = read_client(
         &args.house,
         &args.repository,
         args.requester.clone(),
-        args.credential,
-        args.credential_file,
-        args.gh,
+        args.credential.clone(),
+        args.credential_file.clone(),
+        args.gh.clone(),
     )?;
-    let store = HouseStore::open(args.store, args.house.clone(), StoreOptions::default())
-        .map_err(|_| Failure::Read(WorkflowError::PrecheckFailed))?;
-    let markers = gardener::StaleMarkers::new(&store).map_err(Failure::Read)?;
-    gardener::record_reported(
-        &client,
-        &markers,
-        &args.house,
-        &gardener::StaleReport {
-            repository: &args.repository,
-            issue,
-            comment: args.report_comment,
-            reporter: &args.requester,
-        },
-        &Claimant::scheduled(holder),
-        SystemClock.now(),
+    let reference = CredentialRef::new(
+        args.house.clone(),
+        args.credential.clone(),
+        args.requester.clone(),
+    );
+    let scope = HouseScope::new(
+        args.house.clone(),
+        [args.repository.clone()],
+        args.requester,
+        reference.clone(),
+        PostingBudget::new(REPORT_POSTS).map_err(invalid)?,
+        [Permission::PostComment],
     )
-    .map(drop)
-    .map_err(Failure::Recorded)
+    .map_err(invalid)?;
+    let credential = CredentialFile::new(reference, args.credential_file).map_err(invalid)?;
+    let executor = GitHubExecutor::new(
+        args.github_backend.clone(),
+        scope,
+        GhCli::new(args.gh, credential).map_err(invalid)?,
+        ReadLimits::default(),
+    );
+    let reported = Failure::Reported;
+    let config = HouseRegistry::new(&args.registry)
+        .and_then(|registry| registry.load(&args.house))
+        .map_err(|error| reported(error.into()))?;
+    // The destination comes from house policy; the flag only picks an issue
+    // in one of its declared destinations.
+    if !config.posting_destinations.contains(&args.repository) {
+        return Err(reported(IntegrationError::PermissionDenied.into()));
+    }
+    let grants = config.authority().map_err(|error| reported(error.into()))?;
+    let store =
+        HouseStore::open(args.store, args.house, StoreOptions::default()).map_err(reported)?;
+    let pass = gardener::StaleReportPass {
+        store: &store,
+        client: &client,
+        executor: &executor,
+        grants: &grants,
+        authority: Grant::repository(
+            Permission::PostComment,
+            args.repository.clone(),
+            args.github_backend,
+            args.credential,
+        ),
+        provenance: Provenance {
+            kitchen: config.kitchen.clone(),
+            house_guidance: config.guidance.clone(),
+            repository_instructions: None,
+        },
+        claimant: &claimant,
+        ttl,
+        clock: &SystemClock,
+    };
+    gardener::report_stale(&pass, &args.repository, issue, body).map_err(reported)
 }
 
-fn report_recorded(result: Result<(), Failure>) -> ExitCode {
+fn report_stale_outcome(result: Result<gardener::StaleReportOutcome, Failure>) -> ExitCode {
     let (written, code) = match result {
-        Ok(()) => (writeln!(io::stdout().lock(), "recorded"), 0),
+        Ok(gardener::StaleReportOutcome::Recorded { receipt, .. }) => {
+            (writeln!(io::stdout().lock(), "recorded {receipt}"), 0)
+        }
+        Ok(gardener::StaleReportOutcome::AlreadyHandled) => {
+            (writeln!(io::stdout().lock(), "already handled"), 0)
+        }
+        Ok(gardener::StaleReportOutcome::NotPosted(_)) => (
+            writeln!(
+                io::stdout().lock(),
+                "not posted; nothing recorded, run again later"
+            ),
+            1,
+        ),
         Err(Failure::Invalid) => (
             writeln!(
                 io::stderr().lock(),
-                "error: invalid gardener record-handled input"
+                "error: invalid gardener report-stale input"
             ),
             2,
         ),
         Err(Failure::Read(error)) => (writeln!(io::stderr().lock(), "error: {error}"), 3),
-        Err(Failure::Recorded(error)) => (writeln!(io::stderr().lock(), "error: {error}"), 3),
+        Err(Failure::Reported(error)) => (writeln!(io::stderr().lock(), "error: {error}"), 3),
     };
     if written.is_err() {
         return ExitCode::from(3);
@@ -259,7 +325,7 @@ fn report(result: Result<Precheck, Failure>) -> ExitCode {
             2,
         ),
         Err(Failure::Read(error)) => (writeln!(io::stderr().lock(), "error: {error}"), 3),
-        Err(Failure::Recorded(error)) => (writeln!(io::stderr().lock(), "error: {error}"), 3),
+        Err(Failure::Reported(error)) => (writeln!(io::stderr().lock(), "error: {error}"), 3),
     };
     // A result that could not be reported is an error, never idle.
     if written.is_err() {

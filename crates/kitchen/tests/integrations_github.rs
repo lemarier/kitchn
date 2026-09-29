@@ -694,6 +694,63 @@ fn triage_reads_detail_timeline_comments_and_linked_pr() -> Result {
 }
 
 #[test]
+fn timeline_timestamps_are_parsed_at_the_boundary() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![Ok(json!([
+            {"event":"labeled","created_at":"2026-09-28T16:00:00+02:00","label":{"name":"ready"}},
+            {"event":"labeled","created_at":"1970-01-01T00:00:00Z","label":{"name":"ready"}},
+            {"event":"committed"}
+        ]))])?,
+        ReadLimits::default(),
+    );
+    let Observation::Known(events) = client.timeline(&house, &repo, IssueNumber::new(1)?) else {
+        return Err("timeline was not known".into());
+    };
+    let times: Vec<_> = events.iter().map(|event| event.created_at).collect();
+    assert_eq!(
+        times,
+        vec![
+            Some(kitchen::contracts::Timestamp::from_unix_millis(
+                1_790_604_000_000
+            )),
+            Some(kitchen::contracts::Timestamp::from_unix_millis(0)),
+            None,
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn malformed_timeline_timestamps_make_the_timeline_unknown() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    for created_at in [
+        json!("yesterday"),
+        json!("2025-02-29T00:00:00Z"),
+        json!("1969-12-31T23:59:59Z"),
+        json!(1_790_604_000),
+    ] {
+        let client = GitHubClient::new(
+            scope()?,
+            Fake::new(vec![Ok(json!([
+                {"event":"labeled","created_at":"2026-01-01T00:00:00Z","label":{"name":"ready"}},
+                {"event":"unlabeled","created_at":created_at,"label":{"name":"ready"}}
+            ]))])?,
+            ReadLimits::default(),
+        );
+        assert_eq!(
+            client.timeline(&house, &repo, IssueNumber::new(1)?),
+            Observation::Unknown,
+            "{created_at}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn triage_partial_timeline_is_unavailable() -> Result {
     let house = HouseId::new("sample")?;
     let repo = Repository::new("sample/project")?;

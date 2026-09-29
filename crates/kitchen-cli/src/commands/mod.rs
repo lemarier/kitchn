@@ -10,3 +10,4 @@ pub mod interactive;
 pub mod pickup;
 pub mod scaffold;
 pub mod store;
+pub mod trust;

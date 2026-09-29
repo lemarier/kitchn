@@ -447,6 +447,28 @@ impl<S: Snapshot> SnapshotStore<S> {
         self.write_file(self.layout.snapshot, bytes)
     }
 
+    /// Append `bytes` to the file `name` beside the snapshot and sync it,
+    /// creating it owner-only. Call inside [`Self::transact`], so appends
+    /// are serialized by the store lock. A redirected file, or a nonprivate
+    /// one in a private store, is refused before anything is written.
+    pub(crate) fn append_private(&self, name: &str, bytes: &[u8]) -> Result<(), StateError> {
+        let io = |error| StateError::io(StorageOperation::Write, error);
+        let path = self.dir.join(name);
+        refuse_redirected(&path)?;
+        if self.layout.require_private && exists(&path)? {
+            require_private(&path)?;
+        }
+        let created = !exists(&path)?;
+        let mut file = open_append_file(&path).map_err(io)?;
+        file.write_all(bytes).map_err(io)?;
+        file.sync_all().map_err(io)?;
+        drop(file);
+        if created {
+            sync_dir(&self.dir).map_err(io)?;
+        }
+        Ok(())
+    }
+
     /// Atomically replace `name` with `bytes` through the temporary file.
     fn write_file(&self, name: &str, bytes: &[u8]) -> Result<(), StateError> {
         let io = |error| StateError::io(StorageOperation::Write, error);
@@ -521,6 +543,21 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
         .create(true)
         .truncate(false)
         .open(path)
+}
+
+#[cfg(unix)]
+fn open_append_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_append_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().append(true).create(true).open(path)
 }
 
 /// Create the store directory (and missing parents) readable only by the owner.

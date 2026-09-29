@@ -8,7 +8,7 @@ use crate::{
         snapshot::{Snapshot, SnapshotStore, StoreLayout},
     },
     trust::{
-        AutonomyGrant, AutonomyProposal, GrantAudit, MAX_HISTORY, MAX_ITEMS, Measurement,
+        Archival, AutonomyGrant, AutonomyProposal, GrantAudit, MAX_HISTORY, MAX_ITEMS, Measurement,
         Observation, StationScope, TaskBinding, TrustError,
     },
     workflows::inspector::Inspection,
@@ -71,15 +71,19 @@ pub(crate) struct Document {
     nonce: u64,
     pub(crate) observations: Vec<Observation>,
     #[serde(default)]
-    bindings: Vec<TaskBinding>,
-    grants: Vec<GrantAudit>,
+    pub(crate) bindings: Vec<TaskBinding>,
+    pub(crate) grants: Vec<GrantAudit>,
     pub(crate) inspections: Vec<Inspection>,
+    /// Summaries of applied archivals; absent until the first one, so a
+    /// ledger that was never archived keeps its schema-4 encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) archivals: Vec<Archival>,
 }
 
 impl Document {
     /// Checks every entry once against hash indexes, so a full ledger
     /// validates in time linear in its entries and evidence references.
-    fn validate(&self, house: &HouseId) -> Result<(), TrustError> {
+    pub(super) fn validate(&self, house: &HouseId) -> Result<(), TrustError> {
         if &self.house != house {
             return Err(TrustError::Refused);
         }
@@ -164,12 +168,23 @@ impl Document {
                 return Err(TrustError::Conflict);
             }
         }
+        let mut digests = HashSet::with_capacity(self.archivals.len());
+        for archival in &self.archivals {
+            if archival.records() == 0 || !digests.insert(&archival.digest) {
+                return Err(TrustError::Corrupt);
+            }
+        }
         Ok(())
     }
 
-    /// History entries counted against [`MAX_HISTORY`].
-    fn entries(&self) -> usize {
-        self.observations.len() + self.bindings.len() + self.grants.len() + self.inspections.len()
+    /// History entries counted against [`MAX_HISTORY`]. Each archival
+    /// summary counts as one entry.
+    pub(super) fn entries(&self) -> usize {
+        self.observations.len()
+            + self.bindings.len()
+            + self.grants.len()
+            + self.inspections.len()
+            + self.archivals.len()
     }
 
     pub(crate) fn latest(
@@ -200,6 +215,7 @@ impl Snapshot for Document {
             bindings: Vec::new(),
             grants: Vec::new(),
             inspections: Vec::new(),
+            archivals: Vec::new(),
         }
     }
 
@@ -217,13 +233,16 @@ impl Snapshot for Document {
     }
 }
 
-/// How full a ledger is. History is never discarded: once either limit is
-/// reached, `record`, `bind_task`, and other ordinary writes fail and earned
-/// standing stops applying to new tasks. Revocation stays possible because it
-/// uses a byte reserve outside [`Self::max_bytes`] and adds no entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How full a ledger is. History is never discarded silently: once either
+/// limit is reached, `record`, `bind_task`, and other ordinary writes fail and
+/// earned standing stops applying to new tasks until an operator archives
+/// records no grant needs ([`Ledger::archive`]). Revocation stays possible
+/// because it uses a byte reserve outside [`Self::max_bytes`] and adds no entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Capacity {
-    /// Stored observations, task bindings, grant audits, and inspections.
+    /// Stored observations, task bindings, grant audits, inspections, and
+    /// archival summaries.
     pub entries: usize,
     /// Entry limit for ordinary writes.
     pub max_entries: usize,
@@ -257,7 +276,7 @@ impl Capacity {
 /// store.
 #[derive(Debug, Clone)]
 pub struct Ledger {
-    engine: SnapshotStore<Document>,
+    pub(super) engine: SnapshotStore<Document>,
 }
 impl Ledger {
     /// Initialize a new ledger in `path`, creating the directory and missing

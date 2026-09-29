@@ -10,10 +10,18 @@
 //! Earned standing is tied to the exact instruction pins of the evidence tasks:
 //! changing any pin voids it until new evidence is earned. Re-evaluating trust
 //! per guidance revision by policy is planned in #44.
+//!
+//! History stays until an operator archives records no grant needs; see
+//! [`Ledger::archive`].
+mod archive;
 mod error;
 mod model;
 mod store;
 
+pub use archive::{
+    ARCHIVE_FILE, ARCHIVE_SCHEMA, Archival, ArchiveBatch, ArchiveDigest, ArchiveReport,
+    ArchivedStream, KeptRecords,
+};
 pub use error::TrustError;
 pub use model::*;
 pub use store::EARNED_AUTONOMY_PERMISSIONS;

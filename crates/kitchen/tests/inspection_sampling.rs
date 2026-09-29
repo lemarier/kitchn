@@ -354,19 +354,24 @@ fn budget_exhaustion_defers_a_pick_and_is_reported_without_lowering_the_rate() -
         s.select(&always, &merge(1)?, &fresh, &open_budget(), day(1000)),
         Err(SamplingError::StaleBudget)
     ));
-    // A skipped merge spends nothing, so exhaustion does not matter.
+    // A skipped merge spends nothing, so exhaustion does not matter. The
+    // draw is random per house key, so a rare head may still be selected;
+    // that one alone needs budget evidence and is refused for lacking it.
     let rare = flat(1)?;
-    let skipped = (1..=50)
-        .map(|number| {
-            s.select(&rare, &merge(number)?, &fresh, &budget(None, false), at(0))
-                .map_err(Into::into)
-        })
-        .collect::<TestResult<Vec<_>>>()?;
-    assert!(
-        skipped
-            .iter()
-            .all(|d| d.record.outcome == Outcome::Skipped && d.report().is_none())
-    );
+    let mut skipped = 0;
+    for number in 1..=50 {
+        match s.select(&rare, &merge(number)?, &fresh, &budget(None, false), at(0)) {
+            Ok(decision) => {
+                assert_eq!(decision.record.outcome, Outcome::Skipped);
+                assert!(decision.report().is_none());
+                skipped += 1;
+            }
+            Err(SamplingError::IncompleteBudget) => {}
+            Err(other) => return Err(format!("unexpected refusal: {other:?}").into()),
+        }
+    }
+    // At a 1 in 1000 rate, 50 heads are all selected with probability 1e-150.
+    assert!(skipped > 0);
     Ok(())
 }
 

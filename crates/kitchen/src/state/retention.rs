@@ -33,6 +33,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
+    ops::Bound,
     time::Duration,
 };
 
@@ -110,6 +111,7 @@ pub enum Presence {
 pub struct Inventory {
     items: BTreeMap<WorkItem, Presence>,
     listings: BTreeMap<BackendId, BTreeSet<ResourceRef>>,
+    last_lookup: Option<WorkItem>,
 }
 
 impl Inventory {
@@ -120,6 +122,7 @@ impl Inventory {
         Self {
             items: BTreeMap::new(),
             listings: BTreeMap::new(),
+            last_lookup: None,
         }
     }
 
@@ -139,20 +142,26 @@ impl Inventory {
         self.listings.insert(backend, listed.into_iter().collect());
     }
 
-    /// Look up each issue and pull request in `items` through the house's
-    /// forge client, at most `limit` of them, and record every answer the
+    /// Look up the issues and pull requests of `subjects` through the
+    /// house's forge client, at most `limit` of them in
+    /// [`RetentionSubjects::lookup_order`], and record every answer the
     /// forge gave completely. An unavailable, partial, or unrecognized
-    /// answer records nothing, so its item keeps everything. Returns how
-    /// many items were recorded.
+    /// answer records nothing, so its item keeps everything. The last item
+    /// looked up becomes the store's cursor when [`HouseStore::retain`]
+    /// applies this inventory, so the next pass continues after it. Returns
+    /// how many items were recorded.
+    ///
+    /// [`HouseStore::retain`]: crate::state::HouseStore::retain
     pub fn observe_forge<T: GitHubReadTransport>(
         &mut self,
         client: &GitHubClient<T>,
         house: &HouseId,
-        items: &BTreeSet<WorkItem>,
+        subjects: &RetentionSubjects,
         limit: usize,
     ) -> usize {
         let mut observed = 0;
-        for item in items.iter().take(limit) {
+        for item in subjects.lookup_order().take(limit) {
+            self.last_lookup = Some(item.clone());
             let state = match item {
                 WorkItem::Issue { repository, number } => {
                     let Ok(number) = IssueNumber::new(number.get()) else {
@@ -185,6 +194,12 @@ impl Inventory {
             observed += 1;
         }
         observed
+    }
+
+    /// The last item [`Self::observe_forge`] looked up, answered or not.
+    #[must_use]
+    pub const fn last_lookup(&self) -> Option<&WorkItem> {
+        self.last_lookup.as_ref()
     }
 
     fn presence(&self, item: &WorkItem) -> Option<Presence> {
@@ -321,7 +336,7 @@ pub struct RetiredTask {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetentionReport {
-    /// Whether anything was written.
+    /// Whether any record was removed or compacted.
     pub applied: bool,
     /// Markers removed.
     pub markers: Vec<RetiredMarker>,
@@ -424,14 +439,39 @@ pub struct RetentionSubjects {
     pub items: BTreeSet<WorkItem>,
     /// Backends whose complete listing would let tasks and approvals retire.
     pub backends: BTreeSet<BackendId>,
+    /// The last item the latest applied pass looked up. It need not be in
+    /// `items` any more.
+    pub cursor: Option<WorkItem>,
 }
 
 impl RetentionSubjects {
+    /// `items` starting after the cursor and wrapping around, so bounded
+    /// passes take turns: open items that stay subjects cannot hold every
+    /// pass's lookups while later items are never checked.
+    pub fn lookup_order(&self) -> impl Iterator<Item = &WorkItem> {
+        let (after, through) = match &self.cursor {
+            Some(cursor) => (
+                self.items
+                    .range::<WorkItem, _>((Bound::Excluded(cursor), Bound::Unbounded)),
+                Some(
+                    self.items
+                        .range::<WorkItem, _>((Bound::Unbounded, Bound::Included(cursor))),
+                ),
+            ),
+            None => (self.items.range::<WorkItem, _>(..), None),
+        };
+        after.chain(through.into_iter().flatten())
+    }
+
     pub(super) fn collect<'a>(
         tasks: impl Iterator<Item = &'a TaskRecord>,
         markers: impl Iterator<Item = &'a WorkflowMarker>,
+        cursor: Option<&WorkItem>,
     ) -> Self {
-        let mut subjects = Self::default();
+        let mut subjects = Self {
+            cursor: cursor.cloned(),
+            ..Self::default()
+        };
         let mut add = |item: &WorkItem| match item {
             WorkItem::Resource { resource } => {
                 subjects.backends.insert(resource.backend.clone());

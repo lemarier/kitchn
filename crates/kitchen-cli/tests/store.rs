@@ -273,12 +273,19 @@ fn retain_previews_by_default_and_removes_only_with_apply() -> TestResult {
     assert_eq!(json["retention"]["applied"], false);
     assert_eq!(json["retention"]["markers"][0]["reason"], "superseded");
     assert_eq!(json["observed"], 0);
+    // Without --gh the pull request is a subject no lookup reached.
+    assert_eq!(json["subjects"], 1);
+    assert_eq!(json["notLookedUp"], 1);
     assert!(kitchen.store()?.marker(&ready_key('a')?)?.is_some());
 
     let applied = kitchen.retain(&["--apply"])?;
     assert!(applied.status.success());
     let text = String::from_utf8(applied.stdout)?;
     assert!(text.starts_with("Removed 1 marker(s)"), "{text}");
+    assert!(
+        text.contains("1 issue(s) and pull request(s) were not looked up this pass"),
+        "{text}"
+    );
     assert_eq!(kitchen.store()?.marker(&ready_key('a')?)?, None);
     assert!(kitchen.store()?.marker(&ready_key('b')?)?.is_some());
     Ok(())

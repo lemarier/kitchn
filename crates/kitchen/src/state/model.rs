@@ -23,7 +23,7 @@ use crate::{
     },
     state::{
         ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerAttempt, MarkerFact,
-        MarkerKey, MarkerRecording, StateError, WorkflowMarker,
+        MarkerKey, MarkerRecording, StateError, WorkItem, WorkflowMarker,
         effects::{Found, SettledLookup},
         marker::{MarkerRefusal, MarkerWrite, Markers, PairPlan},
         retention::{
@@ -1086,6 +1086,10 @@ pub(crate) struct StoreState {
     consumers: BTreeMap<ConsumerId, ConsumerRecord>,
     #[serde(default)]
     markers: Markers,
+    /// The last item a retention pass looked up, so the next bounded pass
+    /// continues after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retention_cursor: Option<WorkItem>,
 }
 
 /// Deserialize a map, rejecting a repeated key instead of letting a later
@@ -1134,6 +1138,7 @@ impl StoreState {
             tasks: BTreeMap::new(),
             consumers: BTreeMap::new(),
             markers: Markers::new(),
+            retention_cursor: None,
         }
     }
 
@@ -2393,7 +2398,11 @@ impl StoreState {
     }
 
     pub(crate) fn retention_subjects(&self) -> RetentionSubjects {
-        RetentionSubjects::collect(self.tasks.values(), self.markers.iter())
+        RetentionSubjects::collect(
+            self.tasks.values(),
+            self.markers.iter(),
+            self.retention_cursor.as_ref(),
+        )
     }
 
     pub(crate) fn retention_plan(
@@ -2439,6 +2448,9 @@ impl StoreState {
         self.markers.remove_all(&keys);
         for retired in &report.tasks {
             self.tasks.remove(&retired.task);
+        }
+        if let Some(item) = inventory.last_lookup() {
+            self.retention_cursor = Some(item.clone());
         }
         report.applied = compacted || !keys.is_empty() || !report.tasks.is_empty();
         Ok(report)

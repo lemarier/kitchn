@@ -261,7 +261,10 @@ kitchn store retain   --house <id> --store <dir> [--registry <dir> --gh <path>] 
 previews unless `--apply` is given. With `--registry` and `--gh` it asks the
 forge, through the house's forge binding, which issues and pull requests are
 closed. Records about an issue or pull request the forge did not answer
-completely are kept. It never removes asked questions, deliberation threads,
+completely are kept. A pass looks up at most `--max-lookups` of them; each
+applied pass continues after the last one the previous applied pass looked up,
+wrapping around, so every item is reached within a few passes. A preview does
+not move that position. The output reports how many were not looked up. It never removes asked questions, deliberation threads,
 or a task whose write failed and no person has acknowledged. Settled tasks stay
 at least 31 days.
 

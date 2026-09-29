@@ -73,8 +73,9 @@ struct RetainArgs {
     /// Days a settled task stays, at least 31.
     #[arg(long, default_value_t = 31)]
     window_days: u16,
-    /// Issues and pull requests to look up, at most 1000; the rest keep
-    /// their records until a later pass.
+    /// Issues and pull requests to look up, at most 1000. Each applied pass
+    /// continues after the last item the previous one looked up, wrapping
+    /// around; the rest keep their records until a later pass.
     #[arg(long, default_value_t = 200)]
     max_lookups: usize,
     /// Remove what the preview lists. Without it nothing is written.
@@ -106,6 +107,8 @@ pub fn run(args: StoreArgs) -> Result<(String, bool), kitchen::Error> {
 struct RetainOutput {
     /// Issues and pull requests the pass depends on.
     subjects: usize,
+    /// How many of them this pass did not look up.
+    not_looked_up: usize,
     /// How many of them the forge answered completely.
     observed: usize,
     retention: RetentionReport,
@@ -125,7 +128,7 @@ fn retain(args: RetainArgs) -> Result<(String, bool), kitchen::Error> {
     let store = open(&args.store, args.house.clone())?;
     let subjects = store.retention_subjects()?;
     let mut inventory = Inventory::new();
-    let observed = match &args.gh {
+    let (looked_up, observed) = match &args.gh {
         Some(gh) => {
             let registry = args.registry.ok_or(HouseError::InvalidInput)?;
             let registry = HouseRegistry::new(super::house::canonical_root(registry)?)?;
@@ -141,9 +144,11 @@ fn retain(args: RetainArgs) -> Result<(String, bool), kitchen::Error> {
                 GhCli::new(gh.clone(), credential)?,
                 ReadLimits::default(),
             );
-            inventory.observe_forge(&client, &args.house, &subjects.items, args.max_lookups)
+            let observed =
+                inventory.observe_forge(&client, &args.house, &subjects, args.max_lookups);
+            (subjects.items.len().min(args.max_lookups), observed)
         }
-        None => 0,
+        None => (0, 0),
     };
     let now = SystemClock.now();
     let retention = if args.apply {
@@ -154,6 +159,7 @@ fn retain(args: RetainArgs) -> Result<(String, bool), kitchen::Error> {
     };
     let output = RetainOutput {
         subjects: subjects.items.len(),
+        not_looked_up: subjects.items.len().saturating_sub(looked_up),
         observed,
         retention,
         capacity: store.capacity()?,
@@ -209,6 +215,18 @@ fn retain_text(output: &RetainOutput, apply: bool) -> String {
         output.observed,
         output.subjects,
     );
+    if output.not_looked_up > 0 {
+        let _ = writeln!(
+            text,
+            "{} issue(s) and pull request(s) were not looked up this pass; {}",
+            output.not_looked_up,
+            if apply {
+                "the next applied pass continues after the last one looked up."
+            } else {
+                "a preview does not move the lookup cursor."
+            }
+        );
+    }
     for marker in &retention.markers {
         let _ = writeln!(
             text,

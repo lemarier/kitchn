@@ -4,7 +4,12 @@
 
 mod common;
 
-use std::{fs, num::NonZeroU64, time::Duration};
+use std::{
+    fs,
+    num::NonZeroU64,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use common::{Fixture, TestResult, at, creator, grants, launch, plan, scheduled, ttl};
 use kitchen::{
@@ -20,7 +25,8 @@ use kitchen::{
     state::{
         CAPACITY_WARNING_PERCENT, EffectOutcome, EffectStart, Inventory, MAX_MARKERS,
         MIN_TASK_WINDOW, MarkerFact, MarkerKey, MarkerRecording, MarkerRetirement, MarkerSubject,
-        Presence, RetentionPolicy, StateError, TableUsage, TaskRetirement, WorkItem,
+        Presence, RetentionPolicy, RetentionSubjects, StateError, TableUsage, TaskRetirement,
+        WorkItem,
     },
     workflows::{
         pickup::{IssueRef, issue_task_id},
@@ -630,7 +636,7 @@ fn pull_json(value: u64, state: &str) -> serde_json::Value {
     serde_json::json!({"number":value,"state":state,"draft":false,"merged":state == "closed","head":{"sha":"a".repeat(40),"ref":"topic","repo":{"full_name":"origin89hq/km43"}},"base":{"sha":"b".repeat(40),"ref":"main"},"mergeable":null,"user":{"login":"author"}})
 }
 
-fn forge_client(forge: Forge) -> TestResult<GitHubClient<Forge>> {
+fn forge_client<T: GitHubReadTransport>(forge: T) -> TestResult<GitHubClient<T>> {
     let requester = ExternalRef::new("kitchen-bot")?;
     let scope = HouseScope::new(
         common::house()?,
@@ -674,7 +680,7 @@ fn only_complete_forge_answers_let_markers_retire() -> TestResult {
     // The lookup bound is honored: only issues 1 and 2 are read.
     let mut bounded = Inventory::new();
     assert_eq!(
-        bounded.observe_forge(&client, &common::house()?, &subjects.items, 2),
+        bounded.observe_forge(&client, &common::house()?, &subjects, 2),
         2
     );
     let report = fixture
@@ -687,7 +693,7 @@ fn only_complete_forge_answers_let_markers_retire() -> TestResult {
     // Open, closed, and merged answers count; the unavailable issue and the
     // unrecognized pull-request state do not.
     assert_eq!(
-        inventory.observe_forge(&client, &common::house()?, &subjects.items, 100),
+        inventory.observe_forge(&client, &common::house()?, &subjects, 100),
         3
     );
     let report =
@@ -700,5 +706,151 @@ fn only_complete_forge_answers_let_markers_retire() -> TestResult {
         .map(|marker| marker.key.item)
         .collect();
     assert_eq!(retired, vec![issue(1)?, pull_request(4)?]);
+    Ok(())
+}
+
+/// A [`Forge`] that also records each endpoint's last two segments, such as
+/// `issues/1`, in the order they were read.
+struct RecordingForge {
+    forge: Forge,
+    reads: Arc<Mutex<Vec<String>>>,
+}
+
+impl GitHubReadTransport for RecordingForge {
+    fn read(
+        &self,
+        credential: &CredentialRef,
+        request: &ReadRequest,
+        timeout: Duration,
+        limit: usize,
+    ) -> Result<Vec<u8>, IntegrationError> {
+        let mut segments = request.endpoint().rsplit('/');
+        let number = segments.next().unwrap_or_default();
+        let kind = segments.next().unwrap_or_default();
+        self.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("{kind}/{number}"));
+        self.forge.read(credential, request, timeout, limit)
+    }
+}
+
+fn take_reads(reads: &Mutex<Vec<String>>) -> Vec<String> {
+    std::mem::take(
+        &mut *reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+#[test]
+fn bounded_passes_take_turns_until_a_closed_pull_request_retires() -> TestResult {
+    let fixture = Fixture::new()?;
+    // Five open issues that stay subjects, and one closed pull request that
+    // sorts after them.
+    for value in 1..=5 {
+        record(
+            &fixture,
+            &key("triage", issue(value)?, 'a')?,
+            fact("triage.resolution/2")?,
+            1,
+        )?;
+    }
+    let verdict = key("merge-gate", pull_request(6)?, 'a')?;
+    record(&fixture, &verdict, fact("gate.verdict/1")?, 1)?;
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let client = forge_client(RecordingForge {
+        forge: Forge(vec![
+            ("/issues/1", Some(issue_json(1, "open"))),
+            ("/issues/2", Some(issue_json(2, "open"))),
+            // Issue 3 is unavailable; the cursor still moves past it.
+            ("/issues/4", Some(issue_json(4, "open"))),
+            ("/issues/5", Some(issue_json(5, "open"))),
+            ("/pulls/6", Some(pull_json(6, "closed"))),
+        ]),
+        reads: Arc::clone(&reads),
+    })?;
+    let policy = RetentionPolicy::default();
+    let limit = 2;
+
+    // A preview looks up the same first items and leaves the cursor alone,
+    // so previews cannot shift which items the applied passes cover.
+    for _ in 0..2 {
+        let subjects = fixture.store.retention_subjects()?;
+        let mut inventory = Inventory::new();
+        inventory.observe_forge(&client, &common::house()?, &subjects, limit);
+        fixture
+            .store
+            .preview_retention(&policy, &inventory, at(2))?;
+        assert_eq!(take_reads(&reads), ["issues/1", "issues/2"]);
+        assert_eq!(fixture.store.retention_subjects()?.cursor, None);
+    }
+
+    // Six subjects at two lookups per pass: the pull request is reached,
+    // and its verdict retired, by the third applied pass.
+    let expected = [
+        (["issues/1", "issues/2"], true),
+        (["issues/3", "issues/4"], true),
+        (["issues/5", "pulls/6"], false),
+    ];
+    for (pass, (looked_up, verdict_stays)) in expected.into_iter().enumerate() {
+        let subjects = fixture.store.retention_subjects()?;
+        let mut inventory = Inventory::new();
+        inventory.observe_forge(&client, &common::house()?, &subjects, limit);
+        fixture
+            .store
+            .retain(&policy, &inventory, &creator()?, at(2))?;
+        assert_eq!(take_reads(&reads), looked_up, "pass {pass}");
+        assert_eq!(
+            fixture.store.marker(&verdict)?.is_some(),
+            verdict_stays,
+            "pass {pass}"
+        );
+    }
+
+    // The cursor names the retired pull request, no longer a subject; the
+    // next pass wraps around to the first issue.
+    let subjects = fixture.store.retention_subjects()?;
+    assert_eq!(subjects.cursor, Some(pull_request(6)?));
+    assert!(!subjects.items.contains(&pull_request(6)?));
+    let mut inventory = Inventory::new();
+    inventory.observe_forge(&client, &common::house()?, &subjects, limit);
+    fixture
+        .store
+        .retain(&policy, &inventory, &creator()?, at(2))?;
+    assert_eq!(take_reads(&reads), ["issues/1", "issues/2"]);
+    assert_eq!(fixture.store.retention_subjects()?.cursor, Some(issue(2)?));
+
+    // A pass without lookups keeps the cursor.
+    fixture
+        .store
+        .retain(&policy, &Inventory::new(), &creator()?, at(2))?;
+    assert_eq!(fixture.store.retention_subjects()?.cursor, Some(issue(2)?));
+    Ok(())
+}
+
+#[test]
+fn lookup_order_resumes_after_the_cursor_and_wraps() -> TestResult {
+    let mut subjects = RetentionSubjects {
+        items: [issue(1)?, issue(3)?, pull_request(4)?].into(),
+        ..RetentionSubjects::default()
+    };
+    let order = |subjects: &RetentionSubjects| -> Vec<WorkItem> {
+        subjects.lookup_order().cloned().collect()
+    };
+    // No cursor yet: from the start.
+    assert_eq!(order(&subjects), [issue(1)?, issue(3)?, pull_request(4)?]);
+    // A present cursor comes last.
+    subjects.cursor = Some(issue(3)?);
+    assert_eq!(order(&subjects), [pull_request(4)?, issue(1)?, issue(3)?]);
+    // A vanished cursor resumes at the next item that remains.
+    subjects.cursor = Some(issue(2)?);
+    assert_eq!(order(&subjects), [issue(3)?, pull_request(4)?, issue(1)?]);
+    // A cursor past every item wraps to the first.
+    subjects.cursor = Some(pull_request(9)?);
+    assert_eq!(order(&subjects), [issue(1)?, issue(3)?, pull_request(4)?]);
+    // No items: nothing to look up.
+    subjects.items.clear();
+    assert!(order(&subjects).is_empty());
     Ok(())
 }

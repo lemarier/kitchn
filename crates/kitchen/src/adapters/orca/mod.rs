@@ -100,6 +100,7 @@ mod branch;
 mod error;
 mod inspect;
 mod process;
+mod recovery;
 mod redact;
 mod reserve;
 mod runtime;

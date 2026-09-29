@@ -71,6 +71,9 @@ impl ProviderInterruption {
 /// How far the agent's transcript has come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TranscriptProgress {
+    /// Whether the backend returned the whole transcript. A truncated one
+    /// may hide an earlier agent message, so its silence proves nothing.
+    pub complete: bool,
     /// Whether any message came from the agent or its tools.
     pub agent_spoke: bool,
     /// When the newest message was written; progress is this advancing.
@@ -96,8 +99,8 @@ pub struct RecoverySignals {
 }
 
 impl RecoverySignals {
-    /// Positive proof that the first turn never started: the transcript was
-    /// read and the agent never spoke, the backend saw no turn, and the agent
+    /// Positive proof that the first turn never started: the whole transcript
+    /// was read and the agent never spoke, the backend saw no turn, and the agent
     /// sits idle at its prompt in a terminal known to be the agent's. Anything
     /// less keeps waiting.
     #[must_use]
@@ -107,7 +110,7 @@ impl RecoverySignals {
             && self.prompt == PromptState::Idle
             && self
                 .transcript
-                .is_some_and(|transcript| !transcript.agent_spoke)
+                .is_some_and(|transcript| transcript.complete && !transcript.agent_spoke)
     }
 
     /// When the agent last made progress, if it now sits idle at its prompt

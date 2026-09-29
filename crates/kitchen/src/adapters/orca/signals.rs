@@ -177,6 +177,10 @@ pub struct TranscriptProgress {
     /// When the newest message was written. Progress between two
     /// observations is this advancing.
     pub last_activity: Option<Timestamp>,
+    /// When the newest message from the agent or its tools was written. The
+    /// prompt sender's messages do not move it, so it is `None` until the
+    /// agent has spoken.
+    pub last_agent_activity: Option<Timestamp>,
     /// Whether any message came from the agent or its tools, as opposed to
     /// the prompt sender.
     pub agent_spoke: bool,
@@ -272,6 +276,12 @@ impl WorkerRead {
             return None;
         }
         let transcript = self.transcript.as_ref()?;
+        let agent_messages = || {
+            transcript
+                .messages
+                .iter()
+                .filter(|message| matches!(message.role.as_deref(), Some("assistant" | "tool")))
+        };
         Some(TranscriptProgress {
             messages: transcript.messages.len(),
             complete: self.content_complete == Some(true) && transcript.limited != Some(true),
@@ -281,10 +291,11 @@ impl WorkerRead {
                 .filter_map(|message| message.timestamp)
                 .max()
                 .map(Timestamp::from_unix_millis),
-            agent_spoke: transcript
-                .messages
-                .iter()
-                .any(|message| matches!(message.role.as_deref(), Some("assistant" | "tool"))),
+            last_agent_activity: agent_messages()
+                .filter_map(|message| message.timestamp)
+                .max()
+                .map(Timestamp::from_unix_millis),
+            agent_spoke: agent_messages().next().is_some(),
         })
     }
 
@@ -1264,6 +1275,7 @@ mod tests {
                 messages: 3,
                 complete: true,
                 last_activity: Some(at(3_000)),
+                last_agent_activity: Some(at(3_000)),
                 agent_spoke: true,
             })
         );
@@ -1281,6 +1293,7 @@ mod tests {
                 messages: 1,
                 complete: false,
                 last_activity: Some(at(1_000)),
+                last_agent_activity: None,
                 agent_spoke: false,
             })
         );
@@ -1292,6 +1305,7 @@ mod tests {
                 messages: 0,
                 complete: false,
                 last_activity: None,
+                last_agent_activity: None,
                 agent_spoke: false,
             })
         );

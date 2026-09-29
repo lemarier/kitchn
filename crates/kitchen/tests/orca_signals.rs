@@ -124,6 +124,7 @@ fn a_worker_that_took_its_launch_shows_a_turn_and_its_progress() -> TestResult {
             messages: 3,
             complete: true,
             last_activity: Some(Timestamp::from_unix_millis(3_000)),
+            last_agent_activity: Some(Timestamp::from_unix_millis(3_000)),
             agent_spoke: true,
         })
     );
@@ -574,6 +575,7 @@ fn transcript_progress_is_a_lower_bound_when_the_window_clips() -> TestResult {
             messages: 50,
             complete: false,
             last_activity: Some(Timestamp::from_unix_millis(60_000)),
+            last_agent_activity: Some(Timestamp::from_unix_millis(60_000)),
             agent_spoke: true,
         })
     );
@@ -591,6 +593,7 @@ fn transcript_progress_is_a_lower_bound_when_the_window_clips() -> TestResult {
             messages: 1,
             complete: true,
             last_activity: Some(Timestamp::from_unix_millis(1_000)),
+            last_agent_activity: None,
             agent_spoke: false,
         })
     );

@@ -5,16 +5,21 @@
 //! runtime evidence.
 
 mod common;
+mod orca_sim;
 mod workflows_support;
 
-use common::{TestResult, at, ttl};
+use std::time::Duration;
+
+use common::{TestResult, at, house, ttl};
 use kitchen::{
-    TaskId,
+    BackendId, CredentialId, TaskId,
+    adapters::orca::{OrcaBackend, OrcaConfig, StartWindow},
     contracts::{
-        Disposition, Effect, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef,
-        Fence, Operation, ResourceRef, Settlement, Text, Timestamp, WorkerBackend, WorkerOutcome,
-        WorkerState, Workspace, fake::ExecuteFault,
+        BranchName, Disposition, Effect, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
+        ExternalRef, Fence, Operation, ResourceRef, Settlement, Text, Timestamp, WorkerBackend,
+        WorkerOutcome, WorkerState, Workspace, fake::ExecuteFault,
     },
+    scheduling::AgentFamily,
     state::AttemptState,
     workflows::{
         coordination::{
@@ -31,6 +36,7 @@ use kitchen::{
         },
     },
 };
+use orca_sim::{SimMessage, SimOrca, SimOutput, SimWorker};
 use workflows_support::{
     World, branch, brief, issue, never_started, signals, supervision, template_with, under_consumer,
 };
@@ -156,8 +162,18 @@ fn a_start_is_retried_only_on_proof_it_never_began() -> TestResult {
             start: StartEvidence::Unknown,
             ..proof.clone()
         },
+        // A truncated transcript's silence may hide an earlier agent turn.
         RecoverySignals {
             transcript: Some(TranscriptProgress {
+                complete: false,
+                agent_spoke: false,
+                last_activity: None,
+            }),
+            ..proof.clone()
+        },
+        RecoverySignals {
+            transcript: Some(TranscriptProgress {
+                complete: true,
                 agent_spoke: true,
                 last_activity: None,
             }),
@@ -302,6 +318,106 @@ fn an_idle_worker_is_stopped_only_after_the_bound_without_progress() -> TestResu
     assert_eq!(
         world.backend.observe_worker(&worker)?,
         WorkerState::Settled(WorkerOutcome::Cancelled)
+    );
+    Ok(())
+}
+
+/// What Orca reports for a live worker at its prompt whose transcript holds
+/// `messages`, mapped by the adapter, as recovery evidence about `worker`.
+/// The first-turn window is 300 s from `launched`.
+fn orca_evidence(
+    worker: &ResourceRef,
+    messages: Vec<SimMessage>,
+    launched: Timestamp,
+    now: Timestamp,
+) -> TestResult<RecoverySignals> {
+    const DISPATCH: &str = "ctx_idle";
+    let sim = SimOrca::default();
+    sim.set_worker(
+        DISPATCH,
+        SimWorker {
+            activity: "idle",
+            output: Some(SimOutput::Transcript {
+                messages,
+                complete: true,
+            }),
+            ..SimWorker::new("ready", "in_progress", "live", false)
+        },
+    );
+    let config = OrcaConfig {
+        backend: BackendId::new("orca-local")?,
+        house: house()?,
+        credential: CredentialId::new("orca-host-session")?,
+        run: ExternalRef::new("run_sim")?,
+        coordinator: ExternalRef::new("term_coordinator")?,
+        repo: ExternalRef::new("id:repo-1")?,
+        base_branch: Some(ExternalRef::new("main")?),
+        branch_prefix: Some(BranchName::new("lemarier")?),
+        agent: AgentFamily::Claude,
+        call_timeout: Duration::from_secs(5),
+        launch_timeout: Duration::from_secs(60),
+        runtime_dir: sim.runtime_dir()?,
+        reservation_timeout: Duration::from_secs(10),
+    };
+    let backend = OrcaBackend::connect(config, &sim)?;
+    let observed = ResourceRef {
+        backend: BackendId::new("orca-local")?,
+        handle: ExternalRef::new(DISPATCH)?,
+        ..worker.clone()
+    };
+    let window = StartWindow::new(launched, now, Duration::from_secs(300));
+    let signals = backend
+        .observe_signals(&observed, &window)?
+        .ok_or("Orca has no record of the worker")?
+        .recovery()
+        .ok_or("no recovery evidence")?;
+    Ok(RecoverySignals {
+        worker: worker.clone(),
+        ..signals
+    })
+}
+
+fn orca_message(role: &'static str, text: &str, at: Timestamp) -> SimMessage {
+    SimMessage {
+        role,
+        text: text.to_owned(),
+        at: at.as_unix_millis(),
+    }
+}
+
+#[test]
+fn only_an_agent_that_has_spoken_can_go_idle() -> TestResult {
+    let world = World::new()?;
+    let (task, fence) = claim(&world, 3)?;
+    let worker = launched(&world, &task, fence)?;
+    world.backend.set_worker_state(&worker, WorkerState::Ready);
+    let launched_at = world.now();
+    let prompt = orca_message("user", "do the task", launched_at);
+
+    // Past the idle bound, inside the first-turn window: the agent got the
+    // prompt and has not answered. That is not a stall.
+    world.clock.advance(241);
+    let unanswered = orca_evidence(&worker, vec![prompt.clone()], launched_at, world.now())?;
+    assert_eq!(
+        step(&world, &task, fence, &with_signals(&unanswered))?,
+        Supervision::Running(WorkerState::Ready)
+    );
+    assert_eq!(
+        world.backend.observe_worker(&worker)?,
+        WorkerState::Ready,
+        "the worker was left running"
+    );
+
+    // It answered at 10 s and has sat at its prompt past the bound since.
+    world.clock.advance(10);
+    let spoke_at = Timestamp::from_unix_millis(launched_at.as_unix_millis() + 10_000);
+    let answered = vec![prompt, orca_message("assistant", "on it", spoke_at)];
+    let within = orca_evidence(&worker, answered.clone(), launched_at, world.now())?;
+    assert_eq!(
+        step(&world, &task, fence, &with_signals(&within))?,
+        Supervision::IdleStopped {
+            disposition: Disposition::RetryAvailable { remaining: 2 }
+        },
     );
     Ok(())
 }

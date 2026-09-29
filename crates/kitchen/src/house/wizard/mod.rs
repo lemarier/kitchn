@@ -590,6 +590,7 @@ pub fn plan_house_init(
             review_requests,
         }),
         backend: Some(default_binding(worker_backend)?),
+        graduation: BTreeMap::new(),
     };
     config.validate()?;
     bundle.validate(&config)?;

@@ -7,7 +7,8 @@ use crate::{
     HouseId,
     contracts::{CommitId, Grant, HouseGrants, Repository, Text},
     scheduling::{BudgetError, SchedulePolicy},
-    selection::{AgentPolicy, SelectionError},
+    selection::{AgentPolicy, SelectionError, WorkType},
+    trust::GraduationPolicy,
     workflows::{
         cleanup::DiskPressurePolicy,
         pickup::{DEFAULT_FIX_ROUNDS, DEFAULT_REVIEW_REQUESTS, FollowUpBudget},
@@ -136,6 +137,10 @@ pub struct HouseConfig {
     /// write its Orca binding explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<BackendBinding>,
+    /// Thresholds a work type must meet before its owner may graduate it to
+    /// unattended runs. Meeting them never grants anything by itself.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub graduation: BTreeMap<WorkType, GraduationPolicy>,
 }
 
 impl HouseConfig {
@@ -155,6 +160,7 @@ impl HouseConfig {
             || self.grants.len() > 256
             || self.policy_limits.len() > 256
             || self.merge_readiness.len() > super::MAX_WORK_TYPES
+            || self.graduation.len() > super::MAX_WORK_TYPES
         {
             return Err(HouseError::InvalidInput);
         }
@@ -165,6 +171,9 @@ impl HouseConfig {
         validate_names(&self.required_checks)?;
         for work_type in self.merge_readiness.keys() {
             validate_work_type(work_type)?;
+        }
+        for policy in self.graduation.values() {
+            policy.validate().map_err(|_| HouseError::InvalidInput)?;
         }
         if let Some(agents) = &self.agents {
             agents.validate(&self.repositories).map_err(|error| {

@@ -74,6 +74,7 @@ fn house_config() -> TestResult<HouseConfig> {
         disk_pressure: None,
         follow_up: None,
         backend: None,
+        graduation: std::collections::BTreeMap::new(),
     })
 }
 

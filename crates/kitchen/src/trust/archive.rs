@@ -25,8 +25,12 @@
 //!   repeated [`start_inspection`](Ledger::start_inspection) return it
 //!   instead of starting over with fresh samples and budgets.
 //!
-//! Grant audits and archival summaries never leave, so revocation never
-//! needs the archive.
+//! - Never a stream a graduation decision cites, or one in the scope of an
+//!   unrevoked decision observed after it: demotion after a regression reads
+//!   those, so archiving them would restore the decision.
+//!
+//! Grant audits, graduation decisions, and archival summaries never leave, so
+//! revocation never needs the archive.
 //!
 //! The batch is appended and synced before the ledger commits, under the
 //! ledger's exclusive lock. Each summary records its line's length, so the
@@ -53,7 +57,7 @@ use crate::{
     contracts::{ExternalRef, Timestamp},
     state::{Corruption, StateError, StorageOperation},
     trust::{
-        GrantAudit, Ledger, Observation, TaskBinding, TrustError,
+        GraduationAudit, GrantAudit, Ledger, Observation, TaskBinding, TrustError,
         store::{Document, MAX_STATE_BYTES},
     },
     workflows::inspector::Inspection,
@@ -197,8 +201,11 @@ pub struct ArchivedStream {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeptRecords {
-    /// Streams a grant audit cites, with their tasks' bindings.
+    /// Streams a grant audit or graduation decision cites, with their tasks'
+    /// bindings.
     pub streams_cited_by_grants: usize,
+    /// Streams in an unrevoked graduation decision's scope observed after it.
+    pub streams_after_graduation: usize,
     /// Uncited streams with an inspection that must stay.
     pub streams_under_inspection: usize,
     /// Bindings of tasks with no recorded stream: not known to be settled.
@@ -247,7 +254,8 @@ impl Ledger {
     /// [`Archival`] summary, in one ledger transaction:
     ///
     /// - each observation stream, with all its revisions, that no grant audit
-    ///   (proposed, issued, or revoked) cites and that has no inspection
+    ///   (proposed, issued, or revoked) or graduation decision cites, that is
+    ///   not in an unrevoked decision's scope after it, and that has no inspection
     ///   which must stay, together with its task's binding;
     /// - each inspection past its deadline whose every sample has a result,
     ///   once its stream leaves too or is no longer recorded.
@@ -446,7 +454,26 @@ fn select(doc: &Document, now: Timestamp) -> Selection {
             }
             GrantAudit::Issued(grant) | GrantAudit::Revoked { grant, .. } => &grant.evidence,
         })
+        .chain(
+            doc.graduations
+                .iter()
+                .flat_map(|audit| &audit.decision().evidence),
+        )
         .map(|(stream, _)| stream)
+        .collect();
+    let after_graduation: HashSet<&ExternalRef> = doc
+        .observations
+        .iter()
+        .filter(|observation| {
+            doc.graduations.iter().any(|audit| match audit {
+                GraduationAudit::Decided(decision) => {
+                    decision.scope == observation.attribution.scope
+                        && observation.observed_at > decision.at
+                }
+                GraduationAudit::Revoked { .. } => false,
+            })
+        })
+        .map(|observation| &observation.id)
         .collect();
     let finished = |inspection: &Inspection| {
         now >= inspection.plan().deadline
@@ -480,6 +507,8 @@ fn select(doc: &Document, now: Timestamp) -> Selection {
         }
         if cited.contains(&observation.id) {
             kept.streams_cited_by_grants += 1;
+        } else if after_graduation.contains(&observation.id) {
+            kept.streams_after_graduation += 1;
         } else if inspected.contains(&observation.id) {
             kept.streams_under_inspection += 1;
         } else {

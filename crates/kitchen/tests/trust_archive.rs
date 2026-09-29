@@ -719,3 +719,76 @@ fn an_archive_shorter_than_its_summaries_is_refused() -> TestResult {
     assert_eq!(fs::read(ledger_path(&f))?, before);
     Ok(())
 }
+
+/// A summary whose length or digest was altered still loads, but the next
+/// archival reads the committed lines back and refuses before it cuts off or
+/// appends anything. Otherwise a shortened length would cut the last byte of
+/// a committed batch and join it to the next one.
+#[test]
+fn committed_lines_that_differ_from_their_summaries_are_refused_unchanged() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    delivered(&f, &l, "first")?;
+    l.archive(at(100))?;
+    delivered(&f, &l, "second")?;
+    l.archive(at(200))?;
+    delivered(&f, &l, "third")?;
+    let archive = fs::read(archive_path(&f))?;
+    let original: serde_json::Value = serde_json::from_slice(&fs::read(ledger_path(&f))?)?;
+    let lengths: Vec<u64> = original["archivals"]
+        .as_array()
+        .ok_or("archivals")?
+        .iter()
+        .map(|a| a["bytes"].as_u64().ok_or("bytes"))
+        .collect::<Result<_, _>>()?;
+    let [first, second] = lengths[..] else {
+        return Err("two summaries".into());
+    };
+    assert_eq!(first + second, u64::try_from(archive.len())?);
+
+    let cases = [
+        // The first batch's last byte would read as an uncommitted tail.
+        ("first shortened", Some((first - 1, second)), None),
+        // Same total length, so only per-line framing catches it.
+        ("byte moved to second", Some((first - 1, second + 1)), None),
+        ("byte moved to first", Some((first + 1, second - 1)), None),
+        ("second digest", None, Some("0".repeat(64))),
+    ];
+    for (case, bytes, digest) in cases {
+        let mut document = original.clone();
+        if let Some((a, b)) = bytes {
+            document["archivals"][0]["bytes"] = serde_json::json!(a);
+            document["archivals"][1]["bytes"] = serde_json::json!(b);
+        }
+        if let Some(digest) = digest {
+            document["archivals"][1]["digest"] = serde_json::json!(digest);
+        }
+        let altered = serde_json::to_vec(&document)?;
+        fs::write(ledger_path(&f), &altered)?;
+        let reopened = reopen(&f)?;
+        assert!(
+            matches!(
+                reopened.archive(at(300)),
+                Err(TrustError::Storage(StateError::CorruptState(
+                    Corruption::AppendMismatch
+                )))
+            ),
+            "{case} must be refused"
+        );
+        assert_eq!(fs::read(archive_path(&f))?, archive, "{case}: archive");
+        assert_eq!(fs::read(ledger_path(&f))?, altered, "{case}: ledger");
+    }
+
+    // With the true summaries back, the next batch lands after the others.
+    fs::write(ledger_path(&f), serde_json::to_vec(&original)?)?;
+    reopen(&f)?.archive(at(300))?;
+    let tasks: Vec<_> = archived(&f)?
+        .iter()
+        .flat_map(|(_, b)| b.observations.iter().map(|o| o.task.clone()))
+        .collect();
+    assert_eq!(
+        tasks,
+        vec![task_id("first")?, task_id("second")?, task_id("third")?]
+    );
+    Ok(())
+}

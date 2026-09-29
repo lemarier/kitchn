@@ -113,6 +113,9 @@ pub enum Corruption {
     /// An append-only file beside the snapshot is shorter than the length
     /// the snapshot records as committed.
     TruncatedAppend,
+    /// The committed bytes of an append-only file differ from the records
+    /// the snapshot keeps for them.
+    AppendMismatch,
 }
 
 impl fmt::Display for Corruption {
@@ -137,6 +140,9 @@ impl fmt::Display for Corruption {
             Self::DuplicateWorkflowMarker => formatter.write_str("workflow markers share a key"),
             Self::TruncatedAppend => {
                 formatter.write_str("append-only file is shorter than its committed length")
+            }
+            Self::AppendMismatch => {
+                formatter.write_str("append-only file differs from its committed records")
             }
             Self::StoreIdentity => {
                 formatter.write_str("snapshot belongs to a different store than its marker")

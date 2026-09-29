@@ -328,8 +328,10 @@ observation stay, so revoking a grant never needs the archive. The records go
 to `archive.jsonl` in the ledger directory, owner-only like the ledger, and the
 ledger keeps the batch's SHA-256 digest, counts, and length as one entry.
 Bytes past the committed length, left by an archival that failed partway, are
-cut off before the next batch. A symlinked, hard-linked, or shortened archive
-file is refused. An archived stream no longer supports new grant proposals.
+cut off before the next batch. First, every committed line is checked against
+its entry's length and digest. A symlinked, hard-linked, or shortened archive
+file, or a committed line that does not match, is refused without changing
+either file. An archived stream no longer supports new grant proposals.
 
 ## `kitchn pickup`
 

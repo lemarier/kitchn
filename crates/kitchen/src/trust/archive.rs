@@ -29,13 +29,17 @@
 //! ledger knows how long the committed file is. Bytes past that length were
 //! written by an archival whose append or ledger write failed: it was never
 //! applied, and its records are still live. The next archival cuts them off
-//! before appending, so every line in the file is one committed batch. A file
-//! shorter than its committed length is refused as corrupt. Recording an archived stream
+//! before appending, so every line in the file is one committed batch. Before
+//! cutting or appending anything, it reads the committed part once and checks
+//! every line's length, final newline, and digest against its summary; a file
+//! shorter than its committed length, or any mismatch, is refused as corrupt
+//! and changes nothing. Recording an archived stream
 //! again adds it back to the live ledger; a correction to an archived stream
 //! leaves a revision gap, so it reads as incomplete and supports no grant.
 use crate::{
     HouseId, TaskId,
     contracts::{ExternalRef, Timestamp},
+    state::{Corruption, StateError, StorageOperation},
     trust::{GrantAudit, Ledger, Observation, TaskBinding, TrustError, store::Document},
     workflows::inspector::Inspection,
 };
@@ -44,6 +48,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    io::{ErrorKind, Read},
 };
 
 /// Archive file beside the ledger snapshot, one [`ArchiveBatch`] per line.
@@ -58,8 +63,12 @@ pub struct ArchiveDigest(String);
 
 impl ArchiveDigest {
     fn of(bytes: &[u8]) -> Self {
+        Self::from_hasher(Sha256::new_with_prefix(bytes))
+    }
+
+    fn from_hasher(hasher: Sha256) -> Self {
         let mut hex = String::with_capacity(64);
-        for byte in Sha256::digest(bytes) {
+        for byte in hasher.finalize() {
             hex.push(char::from(HEX[usize::from(byte >> 4)]));
             hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
@@ -228,8 +237,11 @@ impl Ledger {
     ///
     /// # Errors
     /// A redirected, hard-linked, or nonprivate archive file, an archive
-    /// shorter than its committed batches, and I/O failures are `Storage`;
-    /// the live ledger is then unchanged.
+    /// shorter than its committed batches
+    /// ([`Corruption::TruncatedAppend`]), committed lines that differ from
+    /// their summaries in length, framing, or digest
+    /// ([`Corruption::AppendMismatch`]), and I/O failures are `Storage`;
+    /// the live ledger and the archive are then unchanged.
     pub fn archive(&self, now: Timestamp) -> Result<ArchiveReport, TrustError> {
         let house = self.house();
         self.transact(|doc| {
@@ -265,9 +277,8 @@ impl Ledger {
                 bindings,
                 inspections: moved,
             };
-            let mut line = serde_json::to_vec(&batch).map_err(|error| {
-                crate::state::StateError::io(crate::state::StorageOperation::Write, error.into())
-            })?;
+            let mut line = serde_json::to_vec(&batch)
+                .map_err(|error| StateError::io(StorageOperation::Write, error.into()))?;
             let digest = ArchiveDigest::of(&line);
             line.push(b'\n');
             let committed = Archival::committed_bytes(&doc.archivals).ok_or(TrustError::Corrupt)?;
@@ -283,7 +294,13 @@ impl Ledger {
             // Check before the append, so a batch is written only for a
             // ledger that will commit.
             doc.validate(house)?;
-            self.engine.append_private(ARCHIVE_FILE, committed, &line)?;
+            let (_, prior) = doc.archivals.split_last().ok_or(TrustError::Corrupt)?;
+            self.engine.append_private(
+                ARCHIVE_FILE,
+                committed,
+                |file| verify_committed(prior, file),
+                &line,
+            )?;
             report.archival = Some(archival);
             Ok(report)
         })
@@ -302,6 +319,40 @@ struct Selection {
     report: ArchiveReport,
     streams: HashSet<ExternalRef>,
     inspections: HashSet<ExternalRef>,
+}
+
+/// Check that `file`, the committed part of [`ARCHIVE_FILE`], holds exactly
+/// the lines `archivals` describe: each has its recorded length, ends in a
+/// newline there, and hashes to its digest. Reads the file once, in chunks.
+fn verify_committed(archivals: &[Archival], file: &mut dyn Read) -> Result<(), StateError> {
+    let mismatch = || StateError::CorruptState(Corruption::AppendMismatch);
+    let io = |error| StateError::io(StorageOperation::Read, error);
+    let mut chunk = [0_u8; 8192];
+    for archival in archivals {
+        let mut remaining = archival.bytes.checked_sub(1).ok_or_else(mismatch)?;
+        let mut hasher = Sha256::new();
+        while remaining > 0 {
+            let want = usize::try_from(remaining).map_or(chunk.len(), |r| r.min(chunk.len()));
+            let buffer = chunk.get_mut(..want).ok_or_else(mismatch)?;
+            let read = file.read(buffer).map_err(io)?;
+            let content = buffer.get(..read).ok_or_else(mismatch)?;
+            if content.is_empty() || content.contains(&b'\n') {
+                return Err(mismatch());
+            }
+            hasher.update(content);
+            remaining -= u64::try_from(read).map_err(|_| mismatch())?;
+        }
+        let mut newline = [0_u8; 1];
+        file.read_exact(&mut newline)
+            .map_err(|error| match error.kind() {
+                ErrorKind::UnexpectedEof => mismatch(),
+                _ => io(error),
+            })?;
+        if newline != *b"\n" || ArchiveDigest::from_hasher(hasher) != archival.digest {
+            return Err(mismatch());
+        }
+    }
+    Ok(())
 }
 
 fn select(doc: &Document, now: Timestamp) -> Selection {

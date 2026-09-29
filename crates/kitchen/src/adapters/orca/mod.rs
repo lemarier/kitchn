@@ -41,7 +41,8 @@
 //! - Launch readiness is positive evidence: `worker-start` succeeds only for
 //!   a ready worker, and `Ready` also needs a `live` fleet verdict. A failed
 //!   start is a failed launch. For schedules, Orca's `completed` run only
-//!   means the launch step finished: [`OrcaBackend::inspect_schedule`] joins
+//!   means the launch step finished:
+//!   [`ScheduleBackend::inspect_schedule`](crate::contracts::ScheduleBackend::inspect_schedule) joins
 //!   each run with Kitchen's own [`crate::scheduling::ReadinessSignal`]s and
 //!   a deadline, so a swallowed launch is reported as
 //!   [`crate::scheduling::RunVerdict::LaunchFailed`].
@@ -81,7 +82,8 @@
 //! - The adapter sends a worker whose terminal a person took over no
 //!   messages, replies, or stops.
 //! - Mailbox waits return whole batches, heartbeats included; heartbeats are
-//!   liveness only ([`Delivery::actionable`]).
+//!   liveness only
+//!   ([`Delivery::actionable`](crate::contracts::Delivery::actionable)).
 //! - Settlement comes from an accepted worker report or an explicit stop.
 //!   Orca projects a stopped worker's outcome as `failed`; the worker state
 //!   `stopped` makes it a cancellation. Liveness `exited` without a report,
@@ -89,8 +91,10 @@
 //! - Coordinator transfer. Orca records no relinquish. After Kitchen's store
 //!   records a relinquish and an adoption, the adopting coordinator builds a
 //!   backend with its own terminal handle and calls
-//!   [`OrcaBackend::adopt_run`]; the previous terminal is then fenced from the
-//!   mailbox (`consumer_fenced`). Workers keep running.
+//!   [`CoordinatorMailbox::adopt_run`](crate::contracts::CoordinatorMailbox::adopt_run);
+//!   the previous terminal is then fenced from the mailbox (`consumer_fenced`,
+//!   reported as [`crate::contracts::MailboxError::Fenced`]). Workers keep
+//!   running.
 //! - Released terminals. `worker-release` is idempotent and archives output;
 //!   a released worker stays observable and keeps its settled state. Orca
 //!   reads an archive from its oldest message forward, so signals follow its
@@ -136,10 +140,7 @@ pub use backend::{
     WORKER_SELECTION, launch_marker, verify_branch,
 };
 pub use error::OrcaError;
-pub use inspect::{
-    Delivery, MAX_INVENTORY_PAGES, MAX_MAILBOX_WAIT, MailMessage, MessageKind, RetainedReason,
-    TerminalAccounting, WorkerRecord,
-};
+pub use inspect::{MAX_INVENTORY_PAGES, RetainedReason, TerminalAccounting, WorkerRecord};
 pub use process::{
     DEFAULT_MAX_STDOUT, ENV_ALLOWLIST, Invocation, OrcaRunner, RawOutput, SystemRunner,
 };

@@ -6,7 +6,10 @@
 mod common;
 mod orca_sim;
 
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    time::Duration,
+};
 
 use common::{
     Fixture, ManualClock, TestResult, at, commit, creator, house, other_house, scheduled, task_id,
@@ -19,16 +22,17 @@ use kitchen::selection::{
 use kitchen::{
     BackendId, ConsumerId, CredentialId, EffectName,
     adapters::orca::{
-        BranchCollision, MAX_INVENTORY_PAGES, MAX_REPO_WORKTREES, MessageKind, OrcaBackend,
-        OrcaConfig, OrcaError, RetainedReason, TerminalAccounting, launch_marker, verify_branch,
+        BranchCollision, MAX_INVENTORY_PAGES, MAX_REPO_WORKTREES, OrcaBackend, OrcaConfig,
+        OrcaError, RetainedReason, TerminalAccounting, launch_marker, verify_branch,
     },
     contracts::{
-        AttemptNumber, BackendUnavailable, BranchName, Capability, CapabilityRequirements, Effect,
-        EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, Grant,
-        HouseGrants, IdempotencyKey, Liveness, Lookup, NotAppliedReason, Operation, Permission,
-        Provenance, Receipt, Repository, ResourceKind, ResourceRef, RetryPolicy, Role,
-        ScheduleEffect, TaskAuthority, TaskSpec, Text, Timestamp, UncertainReason, WorkerBackend,
-        WorkerOutcome, WorkerState, Workspace,
+        AttemptNumber, BackendUnavailable, BranchName, Capability, CapabilityRequirements,
+        CoordinatorMailbox, Effect, EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision,
+        ExternalRef, Grant, HouseGrants, IdempotencyKey, Liveness, Lookup, MailboxError,
+        MessageKind, NotAppliedReason, Operation, Permission, Provenance, Receipt, Repository,
+        ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleBackend, ScheduleEffect,
+        TaskAuthority, TaskSpec, Text, Timestamp, UncertainReason, WorkerBackend, WorkerOutcome,
+        WorkerState, Workspace,
         conformance::{self, Check, CheckResult, ConformanceFixture},
     },
     scheduling::{
@@ -1084,7 +1088,7 @@ fn mailbox_messages_are_typed_and_acknowledged_explicitly() -> TestResult {
     let sim = SimOrca::default();
     let backend = connect(&sim)?;
     assert_eq!(backend.next_delivery()?, None);
-    sim.state().mail = json!({
+    sim.state().mail = VecDeque::from([json!({
         "deliveryId": "delivery_1",
         "messages": [
             {"id": "msg_q", "type": "question", "subject": "Which parser?", "body": "A or B?", "payload": {"dispatchId": "ctx_1"}},
@@ -1092,7 +1096,7 @@ fn mailbox_messages_are_typed_and_acknowledged_explicitly() -> TestResult {
             {"id": "msg_h", "type": "heartbeat", "subject": "alive", "payload": {"dispatchId": "ctx_1", "outcome": "succeeded"}},
             {"id": "has space", "type": "status", "subject": "x"},
         ],
-    });
+    })]);
     let delivery = backend.next_delivery()?.ok_or("a delivery")?;
     assert_eq!(delivery.id.as_str(), "delivery_1");
     assert_eq!(delivery.unreadable, 1);
@@ -1156,8 +1160,79 @@ fn adoption_moves_the_mailbox_to_the_new_coordinator() -> TestResult {
     );
     assert_eq!(adopting.next_delivery()?, None);
     assert!(
-        matches!(old.next_delivery(), Err(OrcaError::Refused { code, .. }) if code == "consumer_fenced"),
+        old.next_delivery() == Err(MailboxError::Fenced),
         "the previous coordinator no longer reads the mailbox"
+    );
+    Ok(())
+}
+
+/// The mailbox contract on the simulated runtime: two unacknowledged batches,
+/// a second coordinator terminal that adopts the Run, and the conformance
+/// checks. Simulated evidence only; `orca_live.rs` covers the live runtime.
+#[test]
+fn mailbox_conforms_on_the_simulated_runtime() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().mail = VecDeque::from([
+        json!({"deliveryId": "delivery_1", "messages": [
+            {"id": "msg_q", "type": "question", "subject": "Which parser?", "payload": {"dispatchId": "ctx_1"}},
+        ]}),
+        json!({"deliveryId": "delivery_2", "messages": [
+            {"id": "msg_d", "type": "worker_done", "payload": {"dispatchId": "ctx_1", "outcome": "succeeded"}},
+            {"id": "msg_e", "type": "escalation", "payload": {"dispatchId": "ctx_2"}},
+        ]}),
+    ]);
+    let coordinator = connect(&sim)?;
+    let restarted = OrcaBackend::connect(
+        OrcaConfig {
+            coordinator: ExternalRef::new("term_restarted")?,
+            ..config(&sim)?
+        },
+        &sim,
+    )?;
+    let sent = ["msg_q", "msg_d", "msg_e"]
+        .into_iter()
+        .map(ExternalRef::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    let report = conformance::run_mailbox(&coordinator, &restarted, &sent)?;
+    for check in [
+        Check::DeliveryReplayed,
+        Check::AdoptionReplays,
+        Check::DuplicateAcknowledgement,
+        Check::DeliveryOrder,
+    ] {
+        assert_eq!(report.result(check), Some(CheckResult::Passed), "{check}");
+    }
+    assert!(sim.state().mail.is_empty(), "every batch was acknowledged");
+    Ok(())
+}
+
+#[test]
+fn mailbox_failures_keep_their_meaning() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    sim.fault_on(&["orchestration", "check"], Fault::TimeoutBeforeEffect);
+    assert_eq!(
+        backend.next_delivery(),
+        Err(MailboxError::Unavailable(BackendUnavailable::Timeout))
+    );
+    sim.fault_on(&["orchestration", "check"], Fault::Refuse("run_not_found"));
+    assert_eq!(
+        backend.acknowledge(&ExternalRef::new("delivery_1")?),
+        Err(MailboxError::Unavailable(BackendUnavailable::Transport)),
+        "only consumer_fenced means another coordinator took the Run"
+    );
+    sim.fault_on(&["orchestration", "run-use"], Fault::Garbage);
+    assert_eq!(
+        backend.adopt_run(),
+        Err(MailboxError::Unavailable(BackendUnavailable::Transport))
+    );
+    sim.fault_on(
+        &["orchestration", "check"],
+        Fault::Refuse("consumer_fenced"),
+    );
+    assert_eq!(
+        backend.await_delivery(Duration::from_secs(1)),
+        Err(MailboxError::Fenced)
     );
     Ok(())
 }
@@ -1765,13 +1840,13 @@ fn a_terminal_a_person_took_over_is_retained_and_left_alone() -> TestResult {
 fn heartbeats_do_not_end_a_wait() -> TestResult {
     let sim = SimOrca::default();
     let backend = connect(&sim)?;
-    sim.state().mail = json!({
+    sim.state().mail = VecDeque::from([json!({
         "deliveryId": "delivery_h",
         "messages": [
             {"id": "msg_h1", "type": "heartbeat", "subject": "alive", "payload": {"dispatchId": "ctx_1"}},
             {"id": "msg_s", "type": "status", "subject": "note"},
         ],
-    });
+    })]);
     let delivery = backend
         .await_delivery(Duration::from_secs(60))?
         .ok_or("a batch")?;
@@ -1798,13 +1873,13 @@ fn heartbeats_do_not_end_a_wait() -> TestResult {
         "waits are bounded"
     );
 
-    sim.state().mail = json!({
+    sim.state().mail = VecDeque::from([json!({
         "deliveryId": "delivery_d",
         "messages": [
             {"id": "msg_h2", "type": "heartbeat", "subject": "alive"},
             {"id": "msg_d", "type": "worker_done", "subject": "done", "payload": {"dispatchId": "ctx_1", "outcome": "failed"}},
         ],
-    });
+    })]);
     let delivery = backend
         .await_delivery(Duration::from_secs(60))?
         .ok_or("a batch")?;

@@ -8,6 +8,9 @@
 //! run is evidence about the executor it ran against, and only for the paths
 //! it exercised.
 //!
+//! [`run_mailbox`] checks the coordinator mailbox against batches the caller
+//! seeded; it acknowledges them, so it consumes the seeded messages.
+//!
 //! The worker launch requests a branch. [`run_worker`] uses
 //! `kitchen/<run_tag>`; a backend that can only create branches under a
 //! host-chosen prefix passes a branch it can obtain to
@@ -19,11 +22,12 @@ use crate::{
     BackendId, ConsumerId, CredentialId, HouseId, TaskId,
     contracts::{
         AskKind, AskRisk, AttemptNumber, BackendUnavailable, BranchName, Capability,
-        DecisionBinding, DecisionOwner, Effect, EffectExecutor, EffectFailure, EffectRequest,
-        EvidenceRevision, ExternalRef, GitHubAction, GitHubEffect, GitHubMutation, IdempotencyKey,
-        LabelDefinition, Liveness, Lookup, MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation,
-        Permission, PostingBudget, Receipt, Repository, ResourceKind, ResourceRef, RogerAsk,
-        RogerEffect, Role, ScheduleEffect, Text, WorkerBackend, WorkerState, Workspace,
+        CoordinatorMailbox, DecisionBinding, DecisionOwner, Delivery, Effect, EffectExecutor,
+        EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, GitHubAction, GitHubEffect,
+        GitHubMutation, IdempotencyKey, LabelDefinition, Liveness, Lookup, MAX_INVENTORY_RESOURCES,
+        MailboxError, NotAppliedReason, Operation, Permission, PostingBudget, Receipt, Repository,
+        ResourceKind, ResourceRef, RogerAsk, RogerEffect, Role, ScheduleEffect, Text,
+        WorkerBackend, WorkerState, Workspace,
     },
     scheduling::{AgentFamily, Recurrence, ScheduleSpec, Timezone, WorkflowName},
     selection::{AgentSelection, ResolvedSelection},
@@ -70,6 +74,17 @@ pub enum Check {
     /// branch the inventory listed before is still listed after. Without a
     /// declared inventory, only the receipt is checked.
     ReleaseKeepsBranch,
+    /// Without declared deliveries, mailbox reads are refused as unsupported.
+    DeliveriesUndeclared,
+    /// An unacknowledged batch is delivered again on every read.
+    DeliveryReplayed,
+    /// After a restart, the adopting coordinator receives the unacknowledged
+    /// batch and the previous one is fenced; undeclared adoption is refused.
+    AdoptionReplays,
+    /// Repeating an acknowledgement succeeds and consumes no later batch.
+    DuplicateAcknowledgement,
+    /// Every seeded message arrives once, in the order it was sent.
+    DeliveryOrder,
 }
 
 impl fmt::Display for Check {
@@ -91,6 +106,11 @@ impl fmt::Display for Check {
             Self::MessageRecovery => "message recovery as declared",
             Self::CancelObserved => "cancel observed",
             Self::ReleaseKeepsBranch => "release keeps the branch",
+            Self::DeliveriesUndeclared => "undeclared deliveries refused",
+            Self::DeliveryReplayed => "unacknowledged delivery replayed",
+            Self::AdoptionReplays => "adoption after restart replays the mailbox",
+            Self::DuplicateAcknowledgement => "duplicate acknowledgement",
+            Self::DeliveryOrder => "delivery order",
         })
     }
 }
@@ -221,6 +241,187 @@ pub fn run_worker_on_branch(
     branch: &BranchName,
 ) -> Result<ConformanceReport, ConformanceFailure> {
     worker_checks(backend, fixture, Some(branch))
+}
+
+/// Check the coordinator mailbox of `coordinator`, whose unacknowledged
+/// batches hold exactly the messages `sent`, in the order workers sent them.
+/// `restarted` is a second instance for the same run, standing for the
+/// coordinator after a restart: where run transfer is declared it adopts the
+/// run and finishes the checks. Both instances must serve the same house and
+/// backend namespace.
+///
+/// # Errors
+/// Returns the first [`ConformanceFailure`].
+pub fn run_mailbox(
+    coordinator: &dyn CoordinatorMailbox,
+    restarted: &dyn CoordinatorMailbox,
+    sent: &[ExternalRef],
+) -> Result<ConformanceReport, ConformanceFailure> {
+    let mut report = ConformanceReport::default();
+    let descriptor = coordinator.descriptor();
+    if sent.is_empty()
+        || restarted.descriptor().house != descriptor.house
+        || restarted.descriptor().backend != descriptor.backend
+    {
+        return fail(
+            Check::Fixture,
+            "mailbox fixture needs seeded messages on one backend",
+        );
+    }
+    let declared = |capability| descriptor.capabilities.support(capability).is_some();
+    if !declared(Capability::WorkerDeliveries) {
+        let unsupported = Err(MailboxError::Unavailable(BackendUnavailable::Unsupported(
+            Capability::WorkerDeliveries,
+        )));
+        if coordinator.next_delivery() != unsupported {
+            return fail(
+                Check::DeliveriesUndeclared,
+                "undeclared deliveries were read",
+            );
+        }
+        report
+            .results
+            .push((Check::DeliveriesUndeclared, CheckResult::Passed));
+        for check in [
+            Check::DeliveryReplayed,
+            Check::AdoptionReplays,
+            Check::DuplicateAcknowledgement,
+            Check::DeliveryOrder,
+        ] {
+            report.results.push((
+                check,
+                CheckResult::NotApplicable {
+                    requires: Capability::WorkerDeliveries,
+                },
+            ));
+        }
+        return Ok(report);
+    }
+    report
+        .results
+        .push((Check::DeliveriesUndeclared, CheckResult::NothingUndeclared));
+
+    let first = match coordinator.next_delivery() {
+        Ok(Some(first)) => first,
+        Ok(None) => {
+            return fail(
+                Check::DeliveryReplayed,
+                "the seeded messages were not delivered",
+            );
+        }
+        Err(_) => return fail(Check::DeliveryReplayed, "the mailbox could not be read"),
+    };
+    if coordinator.next_delivery() != Ok(Some(first.clone())) {
+        return fail(
+            Check::DeliveryReplayed,
+            "an unacknowledged batch was not replayed",
+        );
+    }
+    report
+        .results
+        .push((Check::DeliveryReplayed, CheckResult::Passed));
+
+    let consumer = if declared(Capability::RunTransfer) {
+        if restarted.adopt_run().is_err() {
+            return fail(
+                Check::AdoptionReplays,
+                "the restarted coordinator could not adopt the run",
+            );
+        }
+        if restarted.next_delivery() != Ok(Some(first.clone())) {
+            return fail(
+                Check::AdoptionReplays,
+                "the adopting coordinator did not receive the unacknowledged batch",
+            );
+        }
+        if coordinator.next_delivery() != Err(MailboxError::Fenced) {
+            return fail(
+                Check::AdoptionReplays,
+                "the previous coordinator still reads the mailbox",
+            );
+        }
+        report
+            .results
+            .push((Check::AdoptionReplays, CheckResult::Passed));
+        restarted
+    } else {
+        let unsupported = Err(MailboxError::Unavailable(BackendUnavailable::Unsupported(
+            Capability::RunTransfer,
+        )));
+        if restarted.adopt_run() != unsupported {
+            return fail(
+                Check::AdoptionReplays,
+                "undeclared adoption was not refused",
+            );
+        }
+        report.results.push((
+            Check::AdoptionReplays,
+            CheckResult::NotApplicable {
+                requires: Capability::RunTransfer,
+            },
+        ));
+        coordinator
+    };
+
+    let received = drain(consumer, first, sent.len())?;
+    report
+        .results
+        .push((Check::DuplicateAcknowledgement, CheckResult::Passed));
+    if received != sent {
+        return fail(
+            Check::DeliveryOrder,
+            "messages arrived out of order, missing, or more than once",
+        );
+    }
+    report
+        .results
+        .push((Check::DeliveryOrder, CheckResult::Passed));
+    Ok(report)
+}
+
+/// Acknowledge batches from `first` until none is left, repeating the first
+/// acknowledgement once, and return every message id in delivery order.
+fn drain(
+    consumer: &dyn CoordinatorMailbox,
+    first: Delivery,
+    sent: usize,
+) -> Result<Vec<ExternalRef>, ConformanceFailure> {
+    let mut received = Vec::with_capacity(sent);
+    let mut current = first;
+    let mut repeated = false;
+    // Each seeded batch holds at least one message, so a mailbox still
+    // delivering past this bound is not draining.
+    for _ in 0..=sent {
+        received.extend(current.messages.iter().map(|message| message.id.clone()));
+        let Ok(next) = consumer.acknowledge(&current.id) else {
+            return fail(
+                Check::DeliveryOrder,
+                "an acknowledgement of the current batch failed",
+            );
+        };
+        if !repeated {
+            repeated = true;
+            if consumer.acknowledge(&current.id) != Ok(next.clone())
+                || consumer.next_delivery() != Ok(next.clone())
+            {
+                return fail(
+                    Check::DuplicateAcknowledgement,
+                    "a repeated acknowledgement failed or consumed a later batch",
+                );
+            }
+        }
+        match next {
+            None => return Ok(received),
+            Some(next) if next.id == current.id => {
+                return fail(
+                    Check::DeliveryOrder,
+                    "an acknowledged batch was delivered again",
+                );
+            }
+            Some(next) => current = next,
+        }
+    }
+    fail(Check::DeliveryOrder, "the mailbox did not drain")
 }
 
 fn worker_checks(

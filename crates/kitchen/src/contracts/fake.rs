@@ -3,22 +3,27 @@
 //! It follows the [`EffectExecutor`] and [`WorkerBackend`] contracts for
 //! every effect family its capabilities declare and can inject faults (lost
 //! responses, timeouts, refusals, lookup outages) so recovery paths can be
-//! tested without a live orchestrator. Results from it are simulated
-//! evidence, never live runtime evidence.
+//! tested without a live orchestrator. It also keeps a coordinator mailbox
+//! ([`CoordinatorMailbox`]): tests post worker messages with
+//! [`FakeBackend::post`] and simulate a coordinator restart with
+//! [`FakeBackend::restarted`]. Results from it are simulated evidence, never
+//! live runtime evidence.
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::Duration,
 };
 
 use crate::{
     BackendId, HouseId,
     contracts::{
-        BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, ContractError, Effect,
-        EffectExecutor, EffectFailure, EffectRequest, ExternalRef, IdempotencyKey, Liveness,
-        Lookup, MAX_INVENTORY_RESOURCES, NotAppliedReason, Operation, Receipt, ResourceKind,
-        ResourceObservation, ResourceRef, ScheduleEffect, UncertainReason, WorkerBackend,
-        WorkerOutcome, WorkerState, Workspace,
+        BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, ContractError,
+        CoordinatorMailbox, Delivery, Effect, EffectExecutor, EffectFailure, EffectRequest,
+        ExternalRef, IdempotencyKey, Liveness, Lookup, MAX_INVENTORY_RESOURCES, MailMessage,
+        MailboxError, NotAppliedReason, Operation, Receipt, ResourceKind, ResourceObservation,
+        ResourceRef, ScheduleEffect, UncertainReason, WorkerBackend, WorkerOutcome, WorkerState,
+        Workspace,
     },
     scheduling::AgentFamily,
     selection::{AgentSelection, EffortSupport, SelectionSupport},
@@ -46,13 +51,20 @@ struct FakeState {
     launched_agents: Vec<Option<AgentSelection>>,
     execute_calls: usize,
     next_id: u64,
+    /// Unacknowledged batches, oldest first.
+    mailbox: VecDeque<Delivery>,
+    /// The coordinator instance that adopted the run, once one did.
+    adopted_by: Option<u64>,
+    coordinators: u64,
 }
 
 /// An in-memory execution backend.
 #[derive(Debug)]
 pub struct FakeBackend {
     descriptor: BackendDescriptor,
-    state: Mutex<FakeState>,
+    state: Arc<Mutex<FakeState>>,
+    /// Which coordinator instance this handle is, for run adoption.
+    coordinator: u64,
 }
 
 impl FakeBackend {
@@ -66,7 +78,8 @@ impl FakeBackend {
                 worker_selection: None,
                 capabilities,
             },
-            state: Mutex::new(FakeState::default()),
+            state: Arc::new(Mutex::new(FakeState::default())),
+            coordinator: 0,
         }
     }
 
@@ -126,6 +139,61 @@ impl FakeBackend {
     /// Set a worker's observed state, simulating agent progress.
     pub fn set_worker_state(&self, worker: &ResourceRef, state: WorkerState) {
         self.lock().workers.insert(worker.handle.clone(), state);
+    }
+
+    /// Queue one mailbox batch holding `messages`, as workers sending them
+    /// in order, and return its delivery id.
+    ///
+    /// # Errors
+    /// [`ContractError::InvalidValue`] when the id cannot be formed.
+    pub fn post(&self, messages: Vec<MailMessage>) -> Result<ExternalRef, ContractError> {
+        let mut state = self.lock();
+        state.next_id = state.next_id.saturating_add(1);
+        let id = ExternalRef::new(&format!(
+            "delivery-{}-{}",
+            self.descriptor.backend, state.next_id
+        ))?;
+        state.mailbox.push_back(Delivery {
+            id: id.clone(),
+            messages,
+            unreadable: 0,
+        });
+        Ok(id)
+    }
+
+    /// Another coordinator instance of this backend, as after a restart: it
+    /// shares every worker and the mailbox, and reads the mailbox once it
+    /// adopts the run.
+    #[must_use]
+    pub fn restarted(&self) -> Self {
+        let coordinator = {
+            let mut state = self.lock();
+            state.coordinators = state.coordinators.saturating_add(1);
+            state.coordinators
+        };
+        Self {
+            descriptor: self.descriptor.clone(),
+            state: Arc::clone(&self.state),
+            coordinator,
+        }
+    }
+
+    /// The mailbox, for this coordinator instance, when the fake declares
+    /// deliveries and no other instance adopted the run.
+    fn mailbox(&self) -> Result<MutexGuard<'_, FakeState>, MailboxError> {
+        self.declared(Capability::WorkerDeliveries)?;
+        let state = self.lock();
+        match state.adopted_by {
+            Some(adopter) if adopter != self.coordinator => Err(MailboxError::Fenced),
+            Some(_) | None => Ok(state),
+        }
+    }
+
+    fn declared(&self, capability: Capability) -> Result<(), MailboxError> {
+        match self.descriptor.capabilities.support(capability) {
+            Some(_) => Ok(()),
+            None => Err(BackendUnavailable::Unsupported(capability).into()),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, FakeState> {
@@ -369,5 +437,36 @@ impl WorkerBackend for FakeBackend {
                 },
             })
             .collect())
+    }
+}
+
+impl CoordinatorMailbox for FakeBackend {
+    fn adopt_run(&self) -> Result<(), MailboxError> {
+        self.declared(Capability::RunTransfer)?;
+        self.lock().adopted_by = Some(self.coordinator);
+        Ok(())
+    }
+
+    fn next_delivery(&self) -> Result<Option<Delivery>, MailboxError> {
+        Ok(self.mailbox()?.mailbox.front().cloned())
+    }
+
+    fn acknowledge(&self, delivery: &ExternalRef) -> Result<Option<Delivery>, MailboxError> {
+        let mut state = self.mailbox()?;
+        // Only the oldest batch is consumed, and only when named: a repeated
+        // acknowledgement names a batch already gone and changes nothing.
+        if state
+            .mailbox
+            .front()
+            .is_some_and(|oldest| &oldest.id == delivery)
+        {
+            state.mailbox.pop_front();
+        }
+        Ok(state.mailbox.front().cloned())
+    }
+
+    fn await_delivery(&self, _wait: Duration) -> Result<Option<Delivery>, MailboxError> {
+        // Nothing arrives while a test waits, so the wait ends at once.
+        self.next_delivery()
     }
 }

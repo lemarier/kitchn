@@ -64,8 +64,10 @@ mod effects;
 mod error;
 mod evidence;
 pub mod fake;
+mod mailbox;
 mod resource;
 mod role;
+mod schedules;
 mod task;
 mod trigger;
 mod value;
@@ -87,8 +89,12 @@ pub use effects::{
 };
 pub use error::ContractError;
 pub use evidence::{Evidence, EvidenceKind, EvidenceRevision, EvidenceSubject, EvidenceVerdict};
+pub use mailbox::{
+    CoordinatorMailbox, Delivery, MAX_MAILBOX_WAIT, MailMessage, MailboxError, MessageKind,
+};
 pub use resource::{ResourceKind, ResourceRef};
 pub use role::Role;
+pub use schedules::ScheduleBackend;
 pub use task::{
     AttemptNumber, AttemptOutcome, AttemptStart, CapabilityRequirements, Disposition, EffectSeq,
     FailureClass, Fence, Provenance, RetryPolicy, Settlement, TaskSpec,

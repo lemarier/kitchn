@@ -10,8 +10,8 @@
 //! its post applied. [`run`] can also run as a step of another workflow that
 //! holds a claimed task with
 //! [`Permission::ManageSchedule`](crate::contracts::Permission::ManageSchedule).
-//! The caller observes the house's schedules through its adapter, such as
-//! [`OrcaBackend::schedule_evidence`](crate::adapters::orca::OrcaBackend::schedule_evidence),
+//! The caller observes the house's schedules through the backend contract,
+//! [`ScheduleBackend::schedule_evidence`](crate::contracts::ScheduleBackend::schedule_evidence),
 //! and passes that one observation to every step.
 //!
 //! Each pause is a [`ScheduleEffect::SetState`]
@@ -460,8 +460,8 @@ fn absolute(path: &Path) -> Result<&str> {
 }
 
 /// The house's budget schedule under the consumer [`WORKFLOW`], for the
-/// backend's schedule installer, such as
-/// [`OrcaBackend::install_schedule`](crate::adapters::orca::OrcaBackend::install_schedule),
+/// backend's schedule installer,
+/// [`ScheduleBackend::install_schedule`](crate::contracts::ScheduleBackend::install_schedule),
 /// which installs it paused, refuses it unless the backend supports
 /// [`REQUIRED_CAPABILITIES`], and counts its allocation against the house
 /// budget. It is budgeted like any other schedule, so an exhausted house

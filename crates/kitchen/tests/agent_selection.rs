@@ -19,7 +19,8 @@ use kitchen::{
         AttemptNumber, AttemptOutcome, BranchName, Capability, CapabilityRequirements, Effect,
         EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, FailureClass,
         Fence, Grant, HouseGrants, IdempotencyKey, NotAppliedReason, Operation, Permission,
-        Provenance, Repository, RetryPolicy, Role, TaskAuthority, TaskSpec, Text, Workspace,
+        Provenance, Repository, RetryPolicy, Role, ScheduleBackend, TaskAuthority, TaskSpec, Text,
+        Workspace,
     },
     contracts::{CapabilitySet, ContractError, Support, fake::FakeBackend},
     house::{

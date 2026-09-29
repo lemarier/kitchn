@@ -291,7 +291,9 @@ pub struct SimState {
     pub automations: Vec<SimAutomation>,
     pub runs: Vec<Value>,
     pub worker_pages: Vec<Value>,
-    pub mail: Value,
+    /// Unacknowledged mailbox batches, oldest first. `check` returns the
+    /// oldest; `--ack` consumes it only when it names that batch.
+    pub mail: VecDeque<Value>,
     pub faults: VecDeque<(Option<Vec<String>>, Fault)>,
     pub calls: Vec<Vec<String>>,
     pub deadlines: Vec<Duration>,
@@ -357,7 +359,7 @@ impl Default for SimOrca {
                 automations: Vec::new(),
                 runs: Vec::new(),
                 worker_pages: Vec::new(),
-                mail: json!({"deliveryId": null, "messages": [], "count": 0}),
+                mail: VecDeque::new(),
                 faults: VecDeque::new(),
                 calls: Vec::new(),
                 deadlines: Vec::new(),
@@ -887,7 +889,21 @@ impl SimState {
                 if self.bound.as_ref().is_some_and(|bound| bound != &caller) {
                     return refuse("consumer_fenced");
                 }
-                ok(self.mail.clone())
+                let ack = flags.get("ack").map(String::as_str);
+                if ack.is_some()
+                    && self
+                        .mail
+                        .front()
+                        .and_then(|batch| batch["deliveryId"].as_str())
+                        == ack
+                {
+                    self.mail.pop_front();
+                }
+                ok(self
+                    .mail
+                    .front()
+                    .cloned()
+                    .unwrap_or_else(|| json!({"deliveryId": null, "messages": [], "count": 0})))
             }
             ["automations", "list"] => ok(json!({
                 "automations": self.automations.iter().map(SimAutomation::listing).collect::<Vec<_>>()

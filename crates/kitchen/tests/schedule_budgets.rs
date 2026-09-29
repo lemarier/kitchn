@@ -24,8 +24,8 @@ use kitchen::{
         CapabilitySet, Clock, ContractError, Effect, EffectExecutor, EffectFailure, EffectRequest,
         EvidenceRevision, ExternalRef, GitHubAction, GitHubEffect, GitHubMutation, Grant,
         HouseGrants, IssueNumber, Lookup, Permission, PostingBudget, Provenance, Receipt,
-        Repository, ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleEffect, TaskAuthority,
-        TaskSpec, Text, Timestamp, UncertainReason,
+        Repository, ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleBackend, ScheduleEffect,
+        TaskAuthority, TaskSpec, Text, Timestamp, UncertainReason,
         fake::{ExecuteFault, FakeBackend},
     },
     house::{

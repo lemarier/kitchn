@@ -1,8 +1,8 @@
 //! Backend-neutral recovery evidence for one worker, and the classification
 //! of environment failures during validation.
 //!
-//! A backend adapter reads what it can about a worker (for Orca,
-//! `OrcaBackend::observe_signals`) and maps it to [`RecoverySignals`].
+//! A backend adapter reads what it can about a worker (for Orca, its
+//! signal reader in `adapters::orca`) and maps it to [`RecoverySignals`].
 //! Supervision acts only on positive evidence: every field has an explicit
 //! "cannot tell", and silence is never promoted to a stall.
 

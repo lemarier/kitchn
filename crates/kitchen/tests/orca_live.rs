@@ -42,9 +42,10 @@ use kitchen::{
         SystemRunner, TerminalOwner, launch_marker, redact, verify_branch,
     },
     contracts::{
-        AttemptNumber, BranchName, Clock, EffectExecutor, EffectFailure, EffectRequest,
-        ExternalRef, IdempotencyKey, Lookup, NotAppliedReason, Operation, Repository, ResourceKind,
-        Role, SystemClock, Text, WorkerBackend, WorkerOutcome, WorkerState, Workspace,
+        AttemptNumber, BranchName, Clock, CoordinatorMailbox, EffectExecutor, EffectFailure,
+        EffectRequest, ExternalRef, IdempotencyKey, Lookup, NotAppliedReason, Operation,
+        Repository, ResourceKind, Role, SystemClock, Text, WorkerBackend, WorkerOutcome,
+        WorkerState, Workspace,
         conformance::{self, ConformanceFixture},
     },
     scheduling::AgentFamily,

@@ -274,10 +274,25 @@ impl GitHubReadTransport for GhCli {
         };
         let output = self.call(credential, &args, &input, timeout, max_bytes)?;
         if output.code != Some(0) {
-            return Err(IntegrationError::Unavailable);
+            return Err(if reports_not_found(&output.stdout) {
+                IntegrationError::NotFound
+            } else {
+                IntegrationError::Unavailable
+            });
         }
         Ok(output.stdout)
     }
+}
+
+/// Whether a failed `gh api` call printed GitHub's 404 error body. Any other
+/// failure, including an unparsable body, stays a possibly transient outage.
+fn reports_not_found(stdout: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct ErrorBody {
+        status: Option<String>,
+    }
+    serde_json::from_slice::<ErrorBody>(stdout)
+        .is_ok_and(|body| body.status.as_deref() == Some("404"))
 }
 
 pub(crate) struct ProcessOutput {

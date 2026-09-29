@@ -4,7 +4,7 @@ use clap::Args;
 use kitchen::{
     CredentialId, HouseId,
     adoption::{checkout_remotes, decode},
-    contracts::{CommitId, ExternalRef, Permission, PostingBudget, Repository},
+    contracts::{BranchName, CommitId, ExternalRef, Permission, PostingBudget, Repository},
     house::{
         HouseError, HouseInitError, InitAnswers, InitDecision, InitFacts, InstalledAgents,
         NoGitHubAccess, ObservedChecks, Prompter, RequiredCheckSource, plan_house_init,
@@ -303,8 +303,11 @@ impl RequiredCheckSource for HouseGitHub {
         let Observation::Known(info) = client.repository(house, repository) else {
             return ObservedChecks::Unavailable;
         };
+        let Ok(default_branch) = BranchName::new(&info.default_branch) else {
+            return ObservedChecks::Unavailable;
+        };
         let Observation::Known(required) =
-            client.required_checks(house, repository, &info.default_branch)
+            client.required_checks(house, repository, &default_branch)
         else {
             return ObservedChecks::Unavailable;
         };

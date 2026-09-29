@@ -39,6 +39,7 @@ fn ready() -> TestResult<GateEvidence> {
         head_branch: Some("feature/gate".into()),
         base: commit('b')?,
         base_branch: Some(BranchName::new("main")?),
+        base_tip: BaseTipRead::Read,
         head_age: Some(Duration::from_secs(3600)),
         open: Some(true),
         draft: Some(false),
@@ -426,6 +427,7 @@ struct FakeMarkers {
     fail: bool,
     crash_before_marker: bool,
     interloper: Option<GateVerdictRecord>,
+    base_read_failures: std::collections::BTreeMap<String, u8>,
 }
 impl FakeMarkers {
     /// Record that the admitted submission applied.
@@ -540,6 +542,24 @@ impl GateMarkerStore for FakeMarkers {
             .find(|e| &e.1 == key)
             .map(|e| e.2.clone())
             .ok_or_else(|| std::io::Error::other("unknown effect key"))
+    }
+    fn record_base_read_failure(
+        &mut self,
+        house: &HouseId,
+        repository: &Repository,
+        number: IssueNumber,
+        head: &kitchen::contracts::CommitId,
+        _: Timestamp,
+    ) -> Result<u8, Self::Error> {
+        if self.fail {
+            return Err(std::io::Error::other("fake persistence failure"));
+        }
+        let count = self
+            .base_read_failures
+            .entry(format!("{house}/{repository}#{number:?}@{head}"))
+            .or_insert(0);
+        *count = count.saturating_add(1);
+        Ok(*count)
     }
     fn record(
         &mut self,
@@ -817,11 +837,19 @@ impl kitchen::integrations::github::GitHubReadTransport for ForgeFake {
         _: std::time::Duration,
         _: usize,
     ) -> Result<Vec<u8>, kitchen::integrations::github::IntegrationError> {
+        use kitchen::integrations::github::IntegrationError;
         let next = self
             .responses
             .borrow_mut()
             .pop_front()
-            .ok_or(kitchen::integrations::github::IntegrationError::Unavailable)?;
+            .ok_or(IntegrationError::Unavailable)?;
+        // String sentinels stand for transport failures.
+        match next.as_str() {
+            Some("not-found") => return Err(IntegrationError::NotFound),
+            Some("timeout") => return Err(IntegrationError::Timeout),
+            Some("unavailable") => return Err(IntegrationError::Unavailable),
+            _ => {}
+        }
         serde_json::to_vec(&next)
             .map_err(|_| kitchen::integrations::github::IntegrationError::Unknown)
     }
@@ -2439,6 +2467,62 @@ fn durable_marker_writes_compare_and_supersede() -> TestResult {
     Ok(())
 }
 #[test]
+fn durable_base_read_failures_count_per_head_then_hand_over() -> TestResult {
+    let d = durable()?;
+    let mut e = durable_evidence()?;
+    e.base_tip = BaseTipRead::Retry;
+    let mut gate = d.gate(&d.fixture.store)?;
+    for pass in 1..gate::MAX_BASE_READ_FAILURES {
+        let recorded =
+            gate::evaluate_and_record(&mut gate, &e, dgrants()?, GateMode::Active, secs(100))?;
+        assert_eq!(recorded.decision.verdict, Verdict::Skip, "pass {pass}");
+        assert_eq!(recorded.admission, Admission::None);
+    }
+    assert!(d.marker('a')?.is_none());
+    assert!(d.effects()?.is_empty());
+    // The count survives a restart; the limit hands over with the reason.
+    let reopened = d.fixture.reopen()?;
+    let mut restarted = d.gate(&reopened)?;
+    let recorded =
+        gate::evaluate_and_record(&mut restarted, &e, dgrants()?, GateMode::Active, secs(200))?;
+    assert!(matches!(
+        &recorded.decision.verdict,
+        Verdict::HandOver { gaps } if gaps.contains(&Gap::BaseUnreadable)
+    ));
+    assert!(matches!(recorded.admission, Admission::Submit(_)));
+    // The count stops at the limit, and another head starts its own.
+    let (house, repo, number) = (e.house.clone(), e.repository.clone(), e.number);
+    let head = e.head.clone();
+    assert_eq!(
+        restarted.record_base_read_failure(&house, &repo, number, &head, secs(300))?,
+        gate::MAX_BASE_READ_FAILURES
+    );
+    assert_eq!(
+        restarted.record_base_read_failure(&house, &repo, number, &commit('e')?, secs(300))?,
+        1
+    );
+    let counted = reopened.markers(&WorkflowId::new(GATE_BASE_READ_WORKFLOW)?)?;
+    assert_eq!(counted.len(), 2);
+    // Only the counting passes superseded a count; the capped call wrote nothing.
+    let superseded: usize = counted.iter().map(|marker| marker.history().len()).sum();
+    assert_eq!(superseded, usize::from(gate::MAX_BASE_READ_FAILURES - 1));
+    // Verdict history still reads only verdicts.
+    restarted.history(&house, &repo, number, &head, &e.base, secs(300))?;
+    // Another house is refused before anything is written.
+    assert!(
+        restarted
+            .record_base_read_failure(&HouseId::new("elsewhere")?, &repo, number, &head, secs(300))
+            .is_err()
+    );
+    assert_eq!(
+        reopened
+            .markers(&WorkflowId::new(GATE_BASE_READ_WORKFLOW)?)?
+            .len(),
+        2
+    );
+    Ok(())
+}
+#[test]
 fn durable_history_counts_records_and_fails_closed() -> TestResult {
     let d = durable()?;
     let mut e = durable_evidence()?;
@@ -3143,6 +3227,199 @@ fn base_tip_comes_from_the_branch_ref_not_the_pr_object() -> TestResult {
         gate::merge_request_from_forge(&recorded, &granted(&recorded)?, &unreadable, 0),
         Err(kitchen::integrations::github::IntegrationError::Unavailable)
     );
+    Ok(())
+}
+#[test]
+fn unreadable_base_ref_hands_over_with_the_reason() -> TestResult {
+    use serde_json::json;
+    let e = ready()?;
+    let policy = ForgeGatePolicy {
+        authors: vec!["allowed".into()],
+        expected_reviewers: vec!["reviewer".into()],
+    };
+    let collect = |client| {
+        gate::collect_forge_evidence(
+            client,
+            &e.house,
+            &e.repository,
+            e.number,
+            &policy,
+            supplement(&e),
+            secs(1_790_607_600),
+        )
+    };
+    // A readable ref leaves no gap.
+    let client = forge_client(e.head.as_str(), false)?;
+    let readable = collect(&client)?;
+    assert_eq!(readable.base_tip, BaseTipRead::Read);
+    assert_eq!(
+        gate::evaluate(&readable, grants()?, GateHistory::default()).verdict,
+        Verdict::Merge
+    );
+    // The provider answers for another branch: the PR is handed over with
+    // the reason instead of never getting a verdict.
+    let ambiguous = forge_client(e.head.as_str(), false)?;
+    ambiguous.transport().responses.borrow_mut()[1] =
+        json!({"name":"release","commit":{"sha":commit('c')?.as_str()}});
+    let observed = collect(&ambiguous)?;
+    assert_eq!(observed.base_tip, BaseTipRead::Unreadable);
+    assert_eq!(
+        observed.base, e.base,
+        "the PR's recorded base names the subject"
+    );
+    let Verdict::HandOver { gaps } =
+        gate::evaluate(&observed, grants()?, GateHistory::default()).verdict
+    else {
+        return Err("an unreadable base must hand over".into());
+    };
+    assert!(gaps.contains(&Gap::BaseUnreadable), "{gaps:?}");
+    // A malformed ref answer is handled the same way.
+    let malformed = forge_client(e.head.as_str(), false)?;
+    malformed.transport().responses.borrow_mut()[1] = json!({"name":"main"});
+    assert_eq!(collect(&malformed)?.base_tip, BaseTipRead::Unreadable);
+    // A missing ref cannot come back by retrying either.
+    let missing = forge_client(e.head.as_str(), false)?;
+    missing.transport().responses.borrow_mut()[1] = json!("not-found");
+    let observed = collect(&missing)?;
+    assert_eq!(observed.base_tip, BaseTipRead::Unreadable);
+    assert!(matches!(
+        gate::evaluate(&observed, grants()?, GateHistory::default()).verdict,
+        Verdict::HandOver { gaps } if gaps.contains(&Gap::BaseUnreadable)
+    ));
+    // A timeout or outage may clear, so it is marked for a bounded retry.
+    let timeout = forge_client(e.head.as_str(), false)?;
+    let outage = forge_client(e.head.as_str(), false)?;
+    for (failure, offline) in [("timeout", &timeout), ("unavailable", &outage)] {
+        offline.transport().responses.borrow_mut()[1] = json!(failure);
+        let observed = collect(offline)?;
+        assert_eq!(observed.base_tip, BaseTipRead::Retry, "{failure}");
+        assert_eq!(observed.base, e.base);
+    }
+    // The pull request read itself still fails the pass.
+    let offline = forge_client(e.head.as_str(), false)?;
+    offline.transport().responses.borrow_mut()[0] = json!("unavailable");
+    assert_eq!(
+        collect(&offline).err(),
+        Some(kitchen::integrations::github::IntegrationError::Unavailable)
+    );
+    Ok(())
+}
+#[test]
+fn pending_work_does_not_defer_an_unreadable_base_handover() -> TestResult {
+    let mut e = ready()?;
+    e.head_age = Some(gate::SETTLE_TIME + std::time::Duration::from_secs(60));
+    e.checks = Checks::Pending;
+    // With a readable base, pending checks wait for the next pass.
+    assert_eq!(
+        gate::evaluate(&e, grants()?, GateHistory::default()).verdict,
+        Verdict::Skip
+    );
+    // Waiting cannot make the base readable, so the handover is not deferred.
+    e.base_tip = BaseTipRead::Unreadable;
+    assert!(matches!(
+        gate::evaluate(&e, grants()?, GateHistory::default()).verdict,
+        Verdict::HandOver { gaps } if gaps.contains(&Gap::BaseUnreadable)
+    ));
+    // A head that has not settled still waits: it may be replaced.
+    e.head_age = Some(std::time::Duration::from_secs(60));
+    assert_eq!(
+        gate::evaluate(&e, grants()?, GateHistory::default()).verdict,
+        Verdict::Skip
+    );
+    Ok(())
+}
+#[test]
+fn transient_base_ref_failures_retry_then_hand_over() -> TestResult {
+    let mut store = FakeMarkers::default();
+    let mut e = ready()?;
+    e.base_tip = BaseTipRead::Retry;
+    // Below the limit the pass records nothing and admits no effect.
+    for pass in 1..gate::MAX_BASE_READ_FAILURES {
+        let recorded =
+            gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100))?;
+        assert_eq!(recorded.decision.verdict, Verdict::Skip, "pass {pass}");
+        assert_eq!(recorded.admission, Admission::None);
+        assert!(store.current.is_empty());
+        assert!(store.effects.is_empty());
+    }
+    // At the limit the PR is handed over with the reason.
+    let recorded =
+        gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100))?;
+    assert!(matches!(
+        &recorded.decision.verdict,
+        Verdict::HandOver { gaps } if gaps.contains(&Gap::BaseUnreadable)
+    ));
+    assert!(matches!(recorded.admission, Admission::Submit(_)));
+    assert_eq!(store.current.len(), 1);
+    // A new head starts a fresh count.
+    e.head = commit('e')?;
+    let moved = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100))?;
+    assert_eq!(moved.decision.verdict, Verdict::Skip);
+    assert_eq!(store.current.len(), 1);
+    // A readable base neither counts nor waits.
+    e.base_tip = BaseTipRead::Read;
+    let readable =
+        gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100))?;
+    assert_ne!(readable.decision.verdict, Verdict::Skip);
+    assert_eq!(
+        store.base_read_failures.values().sum::<u8>(),
+        gate::MAX_BASE_READ_FAILURES + 1
+    );
+    Ok(())
+}
+#[test]
+fn skipped_passes_do_not_consume_the_base_ref_retry_budget() -> TestResult {
+    let mut store = FakeMarkers::default();
+    let mut e = ready()?;
+    e.base_tip = BaseTipRead::Retry;
+    // An unsettled head waits without counting, however many passes it takes.
+    e.head_age = Some(std::time::Duration::from_secs(60));
+    for _ in 0..=gate::MAX_BASE_READ_FAILURES {
+        let waiting =
+            gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100))?;
+        assert_eq!(waiting.decision.verdict, Verdict::Skip);
+    }
+    assert!(store.base_read_failures.is_empty());
+    // Once the head settles it still gets the full budget before a hand-over.
+    e.head_age = Some(gate::SETTLE_TIME);
+    for pass in 1..gate::MAX_BASE_READ_FAILURES {
+        let retry =
+            gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(200))?;
+        assert_eq!(retry.decision.verdict, Verdict::Skip, "pass {pass}");
+        assert_eq!(retry.admission, Admission::None);
+    }
+    assert_eq!(
+        store.base_read_failures.values().sum::<u8>(),
+        gate::MAX_BASE_READ_FAILURES - 1
+    );
+    let handed = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(300))?;
+    assert!(matches!(
+        &handed.decision.verdict,
+        Verdict::HandOver { gaps } if gaps.contains(&Gap::BaseUnreadable)
+    ));
+    // Once the hand-over lands, later passes are skips that do not count.
+    store.apply(&handed)?;
+    let counted = store.base_read_failures.values().sum::<u8>();
+    for now in [400, 500] {
+        let quiet =
+            gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(now))?;
+        assert_eq!(quiet.decision.verdict, Verdict::Skip);
+    }
+    assert_eq!(store.base_read_failures.values().sum::<u8>(), counted);
+    Ok(())
+}
+#[test]
+fn uncountable_base_ref_failure_stops_the_pass() -> TestResult {
+    let mut store = FakeMarkers {
+        fail: true,
+        ..FakeMarkers::default()
+    };
+    let mut e = ready()?;
+    e.base_tip = BaseTipRead::Retry;
+    assert!(
+        gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100)).is_err()
+    );
+    assert!(store.current.is_empty() && store.effects.is_empty());
     Ok(())
 }
 /// A finding whose text tries to act as gate instructions.

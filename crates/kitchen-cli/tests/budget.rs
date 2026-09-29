@@ -67,6 +67,7 @@ impl Kitchen {
             kind: BackendKind::Orca.into(),
             backend: orca()?,
             credential: credential()?,
+            endpoint: None,
         });
         house.schedules = Some(serde_json::from_value(serde_json::json!({
             "windowHours": 24,

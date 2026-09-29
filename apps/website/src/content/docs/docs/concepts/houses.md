@@ -49,11 +49,14 @@ installation, and place the app's private key where the token would go.
 
 ## The worker backend
 
-`backend` names the worker backend a house runs on: its `kind` (`orca` is the
-only one), the backend namespace its grants name, and the credential that
-backend acts under. It holds names, never a credential value. Guided
+`backend` names the worker backend a house runs on: its `kind` (`orca`, or
+`http` for a service implementing the [HTTP worker
+protocol](/docs/reference/http-backend/)), the backend namespace its grants
+name, and the credential that backend acts under. It holds names, never a
+credential value; an `http` binding also holds the service's `endpoint`, and
+its token stays in the house's private registry directory. Guided
 `kitchn house init` writes `{"kind": "orca", "backend": "orca", "credential":
-"orca"}` unless `--worker-backend` names another supported backend.
+"orca"}`; it does not set up an HTTP backend yet.
 
 Every command that needs a backend, such as `kitchn budget`, builds it from
 this binding and refuses a backend that lacks a capability the workflow

@@ -97,6 +97,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #174 user-facing repository links | — | `repository` in root `Cargo.toml`, README, and website links and clone commands; test fixtures keep `lemarier/kitchen` as sample data |
 | #194 attempt usage records | `state/usage.rs` | The usage and pull-request fields on `AttemptRecord` and `TaskRecord` and their `HouseStore` methods in `state/model.rs` and `state/store.rs` (with #4); the usage count on retired tasks in `state/retention.rs` (with #85); tests in `crates/kitchen/tests/attempt_usage.rs` |
 | #208 reply and usage recording from coordination | `AnswerSource`, the reply recording in `handle_question`, and `record_worker_usage` in `workflows/coordination.rs` (with #8) | Tests in `crates/kitchen/tests/workflows_coordination.rs` |
+| #195 HTTP worker backend | `adapters/http/` | `BackendKind::Http`, `HttpEndpoint`, and the binding's `endpoint` in `house/backend.rs` and `resolve_http_backend` in `adapters/resolve.rs` (with #191); the shared credential opener in `house/forge.rs` (with #140); tests in `crates/kitchen/tests/http_backend.rs` and the fake service in `crates/kitchen/tests/http_sim/`; the protocol reference `docs/reference/http-backend` on the website |
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.

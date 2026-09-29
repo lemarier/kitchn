@@ -50,6 +50,7 @@ use crate::{
         Provenance, Repository, RetryPolicy, Role, Settlement, TaskAuthority, TaskSpec, Text,
         Timestamp,
     },
+    house::ApprovedWrite,
     integrations::github::{GitHubExecutor, GitHubMutationTransport},
     state::{
         EffectPlan, EffectRecord, EffectState, HouseStore, Lease, StateError, TaskRecord,
@@ -1097,6 +1098,52 @@ fn run_write(
         basis: Some(ExternalRef::new(approval.digest.as_str())?),
     };
     run_effect(store, writer.forge, writer.grants, plan, writer.clock)
+}
+
+/// An issue draft to write through [`crate::house::apply_approved`], which
+/// checks the house's forge binding and the approved digest and then calls
+/// [`apply_draft`] with the person's approval: given by the claimant of that
+/// call, for the digest passed there.
+pub struct ApprovedDraft<'a> {
+    /// The draft.
+    pub draft: &'a IssueDraft,
+    /// The house's durable store.
+    pub store: &'a HouseStore,
+    /// The house's current grants.
+    pub grants: &'a HouseGrants,
+    /// Time source.
+    pub clock: &'a dyn Clock,
+    /// Bounds for the draft task.
+    pub options: &'a DraftOptions,
+}
+
+impl ApprovedWrite for ApprovedDraft<'_> {
+    type Digest = DraftDigest;
+    type Report = DraftReport;
+
+    fn digest(&self) -> Result<DraftDigest> {
+        Ok(draft_preview(self.draft)?.digest)
+    }
+
+    fn apply<T: GitHubMutationTransport>(
+        &self,
+        forge: &GitHubExecutor<T>,
+        approved: &DraftDigest,
+        claimant: &Claimant,
+    ) -> Result<DraftReport> {
+        let writer = DraftWriter {
+            store: self.store,
+            forge,
+            grants: self.grants,
+            clock: self.clock,
+        };
+        let approval = DraftApproval {
+            id: ExternalRef::new(approved.as_str())?,
+            given_by: claimant.holder.clone(),
+            digest: approved.clone(),
+        };
+        apply_draft(&writer, self.draft, Some(&approval), claimant, self.options)
+    }
 }
 
 /// Longest acknowledgement reason, in bytes.

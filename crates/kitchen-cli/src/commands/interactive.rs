@@ -6,11 +6,12 @@
 //! themselves with `--holder`; claims are taken as an interactive claimant
 //! on the same durable tasks scheduled pickup and repair use. The commands
 //! cannot tell a person from a script, so scheduled jobs must not run them.
-//! Nothing here posts to the forge or launches a worker: `issue` commands
-//! print the preview and digest a person approves, and `work`/`pr` print the
-//! plan the session follows. `issue acknowledge` records a person's release
-//! of a settled draft in the house store; this build has no forge
-//! credentials (#140), so it cannot re-read the forge.
+//! Nothing here launches a worker: `work`/`pr` print the plan the session
+//! follows, and `issue new`/`issue refine` print the preview and digest a
+//! person approves. Only `issue apply --approve <digest>` posts, through the
+//! house's forge binding and only that exact preview. `issue acknowledge`
+//! records a person's release of a settled draft in the house store, after
+//! re-reading the forge when the house has a forge binding.
 
 use std::{fmt::Write as _, path::PathBuf, time::Duration};
 
@@ -19,19 +20,20 @@ use kitchen::{
     HolderId, TaskId,
     adoption::{HouseRegistry, RepositoryMatch, decode, encode},
     contracts::{
-        Claimant, Clock, CommitId, ExecutorKind, IssueNumber, LeaseTtl, Repository, RetryPolicy,
-        SystemClock, TaskAuthority,
+        Claimant, Clock, CommitId, ExecutorKind, IssueNumber, LeaseTtl, Provenance, Repository,
+        RetryPolicy, SystemClock, TaskAuthority,
     },
-    house::HouseError,
+    house::{HouseError, apply_approved},
     state::{HouseStore, Lease, StoreOptions},
     workflows::{
         coordination::REQUIRED_WORKER_CAPABILITIES,
         interactive::{
-            AcknowledgeOutcome, AcknowledgeReason, Acknowledgement, DraftTarget, Entrypoint,
-            ExecutionMode, HouseResolution, IssueDraft, IssueFacts, MAX_ORCA_OUTPUT_BYTES,
-            Orchestrator, PrFacts, PrIntent, PrPlan, PrRequest, ReadBack, ResolvedHouse,
-            ReviewState, Unavailable, WorkPlan, WorkRequest, acknowledge_draft, draft_preview,
-            execution_mode, hand_back, pull_request, work,
+            AcknowledgeOutcome, AcknowledgeReason, Acknowledgement, ApprovedDraft, DraftDigest,
+            DraftOptions, DraftOutcome, DraftReport, DraftTarget, Entrypoint, ExecutionMode,
+            HouseResolution, IssueDraft, IssueFacts, MAX_ORCA_OUTPUT_BYTES, Orchestrator, PrFacts,
+            PrIntent, PrPlan, PrRequest, ReadBack, ResolvedHouse, ReviewState, Unavailable,
+            WorkPlan, WorkRequest, acknowledge_draft, draft_preview, execution_mode, hand_back,
+            pull_request, work,
         },
         pickup::{IssueRef, TaskTemplate},
         repair::{Mergeability, PullRequestState, PullRequestView},
@@ -39,6 +41,10 @@ use kitchen::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::forge::{Reread, connect_gh, not_applied};
+
+/// Lease on a draft task while one `issue apply` call writes.
+const APPLY_LEASE: Duration = Duration::from_secs(15 * 60);
 /// Attempts an interactively created task may use.
 const ATTEMPTS: u32 = 3;
 /// Longest an interactively created task keeps retrying.
@@ -51,7 +57,7 @@ pub enum InteractiveCommand {
     Work(WorkArgs),
     /// Review, follow up, repair, or judge one pull request at its exact head.
     Pr(PrArgs),
-    /// Draft or refine an issue. Prints the preview to approve; posts nothing.
+    /// Draft or refine an issue and preview it, or post an approved draft.
     Issue(IssueArgs),
     /// Give your interactive claim back so the next claimant adopts it.
     HandBack(HandBackArgs),
@@ -178,9 +184,27 @@ enum IssueCommand {
         #[command(flatten)]
         session: Session,
     },
+    /// Post an approved draft with the house's forge binding, as the person
+    /// present. Exits 0 once every write is applied and 1 when the run
+    /// stopped early; rerun the same command to resume without duplicates.
+    Apply(ApplyArgs),
     /// Release the subject of a draft that settled after writing, or
     /// possibly writing, to the forge. Check those writes first.
     Acknowledge(AcknowledgeArgs),
+}
+
+#[derive(Args)]
+struct ApplyArgs {
+    /// The draft (JSON) whose preview you approved.
+    #[arg(long)]
+    draft: PathBuf,
+    /// The digest of the preview you approved.
+    #[arg(long)]
+    approve: DraftDigest,
+    #[command(flatten)]
+    store: StoreArgs,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -193,6 +217,9 @@ struct AcknowledgeArgs {
     /// Release it even though a write's outcome is still unknown.
     #[arg(long)]
     accept_unknown: bool,
+    /// Do not re-read the forge even though the house has a binding.
+    #[arg(long)]
+    without_forge: bool,
     #[command(flatten)]
     store: StoreArgs,
     #[arg(long)]
@@ -216,19 +243,34 @@ struct StoreArgs {
     holder: HolderId,
 }
 
+/// The registry, the checkout's bound house and repository, and the
+/// house's store.
+struct BoundStore {
+    registry: HouseRegistry,
+    house: kitchen::HouseId,
+    repository: Repository,
+    store: HouseStore,
+}
+
 impl StoreArgs {
     /// Open the store of the house the checkout is bound to.
-    fn open(&self) -> Result<HouseStore, kitchen::Error> {
+    fn open(&self) -> Result<BoundStore, kitchen::Error> {
         let registry = HouseRegistry::new(absolute(self.registry.clone())?)?;
-        let house = match registry.resolve_repository(&absolute(self.repository_path.clone())?)? {
-            RepositoryMatch::Bound(binding) => binding.house,
+        let binding = match registry.resolve_repository(&absolute(self.repository_path.clone())?)? {
+            RepositoryMatch::Bound(binding) => binding,
             RepositoryMatch::Unbound { .. } => return Err(HouseError::HouseSelection.into()),
         };
-        HouseStore::open(
+        let store = HouseStore::open(
             absolute(self.store.clone())?,
-            house,
+            binding.house.clone(),
             StoreOptions::default(),
-        )
+        )?;
+        Ok(BoundStore {
+            registry,
+            house: binding.house,
+            repository: binding.repository,
+            store,
+        })
     }
 }
 
@@ -647,6 +689,7 @@ fn render_pr(plan: &PrPlan) -> String {
 fn run_issue(args: IssueArgs) -> Result<(String, bool), kitchen::Error> {
     let (entrypoint, draft, session) = match args.command {
         IssueCommand::Acknowledge(args) => return run_acknowledge(args),
+        IssueCommand::Apply(args) => return run_apply(args),
         IssueCommand::New { draft, session } => (Entrypoint::IssueNew, draft, session),
         IssueCommand::Refine {
             issue,
@@ -692,13 +735,126 @@ fn run_issue(args: IssueArgs) -> Result<(String, bool), kitchen::Error> {
     Ok((output, ready))
 }
 
+fn run_apply(args: ApplyArgs) -> Result<(String, bool), kitchen::Error> {
+    let draft: IssueDraft = decode(&args.draft)?;
+    let bound = args.store.open()?;
+    if !draft
+        .repository
+        .as_str()
+        .eq_ignore_ascii_case(bound.repository.as_str())
+    {
+        return Err(HouseError::HouseSelection.into());
+    }
+    let config = bound.registry.load(&bound.house)?;
+    let grants = config.authority()?;
+    let options = DraftOptions {
+        provenance: Provenance {
+            kitchen: config.kitchen.clone(),
+            house_guidance: config.guidance.clone(),
+            repository_instructions: None,
+        },
+        lease: LeaseTtl::new(APPLY_LEASE)?,
+    };
+    let write = ApprovedDraft {
+        draft: &draft,
+        store: &bound.store,
+        grants: &grants,
+        clock: &SystemClock,
+        options: &options,
+    };
+    let report = apply_approved(
+        &bound.registry,
+        &bound.house,
+        &write,
+        &args.approve,
+        &Claimant::interactive(args.store.holder),
+        connect_gh,
+    )?;
+    let done = matches!(report.outcome, DraftOutcome::Completed);
+    let output = if args.json {
+        json_text(&report)?
+    } else {
+        render_apply(&report)
+    };
+    Ok((output, done))
+}
+
+fn render_apply(report: &DraftReport) -> String {
+    let mut text = String::new();
+    for written in &report.written {
+        let how = if written.reused { " (earlier run)" } else { "" };
+        let _ = writeln!(text, "{}: {}{how}", written.effect, written.reference);
+    }
+    let task = report
+        .task
+        .as_ref()
+        .map_or_else(String::new, |task| format!(" (task {task})"));
+    let _ = match &report.outcome {
+        DraftOutcome::Completed => write!(
+            text,
+            "Every write of digest {} is applied{task}.",
+            report.preview.digest
+        ),
+        DraftOutcome::StaleApproval => write!(
+            text,
+            "The approval does not name this preview; its digest is {}. Nothing was written.",
+            report.preview.digest
+        ),
+        DraftOutcome::NotReady => write!(
+            text,
+            "Open questions remain; decide them and approve the new preview. Nothing was written."
+        ),
+        DraftOutcome::OverBudget { needed, limit } => write!(
+            text,
+            "The draft needs {needed} writes; the house allows {limit} per task. Nothing was written."
+        ),
+        DraftOutcome::EarlierUnfinished { task } => write!(
+            text,
+            "Draft task {task} for the same issue is unfinished. Rerun its approved draft first. Nothing was written."
+        ),
+        DraftOutcome::EarlierSettledWithWrites {
+            task,
+            settlement,
+            writes,
+        } => write!(
+            text,
+            "Draft task {task} for the same issue settled ({settlement}) after writing {}. Check those writes on the forge, then run `kitchn issue acknowledge {task}`. Nothing was written.",
+            writes
+                .iter()
+                .map(kitchen::EffectName::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        DraftOutcome::HeldElsewhere => write!(
+            text,
+            "Another session is writing this issue{task}. Nothing was written."
+        ),
+        DraftOutcome::Uncertain { effect } => write!(
+            text,
+            "The outcome of write {effect} is unknown{task}; nothing after it was submitted. Rerun to reconcile it."
+        ),
+        DraftOutcome::NotApplied { effect, reason } => write!(
+            text,
+            "The forge refused write {effect} ({}){task}. Rerun to retry the remaining writes.",
+            not_applied(*reason)
+        ),
+        DraftOutcome::Settled { settlement } => {
+            write!(text, "The draft had already settled ({settlement}){task}.")
+        }
+        DraftOutcome::Declined => write!(text, "Not approved. Nothing was written."),
+        // An outcome this build does not know wrote nothing it can report.
+        _ => write!(text, "The draft stopped{task}."),
+    };
+    text
+}
+
 fn run_acknowledge(args: AcknowledgeArgs) -> Result<(String, bool), kitchen::Error> {
-    let store = args.store.open()?;
-    // No forge credentials are bound in this build (#140): nothing is
-    // re-read, so a write without a recorded receipt stays unknown.
+    let bound = args.store.open()?;
+    let reread = Reread::open(&bound.registry, &bound.house, args.without_forge)?;
+    let store = bound.store;
     let report = acknowledge_draft(
         &store,
-        None,
+        reread.executor(),
         &args.task,
         &Acknowledgement {
             reason: args.reason,
@@ -729,9 +885,12 @@ fn run_acknowledge(args: AcknowledgeArgs) -> Result<(String, bool), kitchen::Err
     let _ = match &report.outcome {
         AcknowledgeOutcome::Recorded(recorded) => write!(
             text,
-            "Acknowledged task {task} for {}: {}\nIts subject is released; a revised draft may proceed.",
+            "Acknowledged task {task} for {}: {}\nIts subject is released; a revised draft may proceed.{}",
             recorded.by,
-            recorded.reason.as_str()
+            recorded.reason.as_str(),
+            reread
+                .skipped(&bound.house)
+                .map_or_else(String::new, |skipped| format!("\n{skipped}"))
         ),
         AcknowledgeOutcome::AlreadyRecorded(recorded) => write!(
             text,
@@ -742,7 +901,10 @@ fn run_acknowledge(args: AcknowledgeArgs) -> Result<(String, bool), kitchen::Err
         ),
         AcknowledgeOutcome::Unknown { .. } => write!(
             text,
-            "Kitchen cannot re-read the forge in this build (#140). Check those writes on the forge yourself, then rerun with --accept-unknown to release the subject.\nNothing was recorded."
+            "{} Check those writes on the forge yourself, then rerun with --accept-unknown to release the subject.\nNothing was recorded.",
+            reread
+                .skipped(&bound.house)
+                .unwrap_or_else(|| "The forge could not prove those writes either way.".to_owned())
         ),
         AcknowledgeOutcome::Unsettled => write!(
             text,
@@ -760,7 +922,7 @@ fn run_acknowledge(args: AcknowledgeArgs) -> Result<(String, bool), kitchen::Err
 
 fn run_hand_back(args: HandBackArgs) -> Result<(String, bool), kitchen::Error> {
     use kitchen::workflows::interactive::HandBack;
-    let store = args.store.open()?;
+    let store = args.store.open()?.store;
     let result = hand_back(&store, &args.task, &args.store.holder, SystemClock.now())?;
     let released = result == HandBack::Released;
     let text = if released {

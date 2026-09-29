@@ -188,19 +188,27 @@ releases it even when a write's outcome is unknown.
 
 ## `kitchn decompose`
 
-Preview a project split into dependency-linked issues. Writes nothing.
+Preview a project split into dependency-linked issues, then write the approved
+preview to the forge.
 
 ```sh
 kitchn decompose preview --proposal <proposal.json> [--json]
-kitchn decompose acknowledge --store <dir> --house <id> --task <task> --holder <you> --reason <text>
+kitchn decompose apply --proposal <proposal.json> --approve <sha256:...> --registry <dir> --house <id> --store <dir> --holder <you> [--json]
+kitchn decompose acknowledge --store <dir> --house <id> --task <task> --holder <you> --reason <text> [--registry <dir>] [--without-forge] [--accept-unknown] [--json]
 ```
 
-`preview` prints a digest and exits 0 when the proposal can be approved, 1 while
-ownership overlaps are unordered, and 2 for an invalid proposal such as a
-dependency cycle. `acknowledge` releases the repository from an earlier
-decomposition that settled without success after writing, or possibly writing,
-to the forge. Check the forge for that task's issues first: kitchn cannot
-re-read it, so every write not proven applied is recorded as unproven.
+`preview` writes nothing. It prints a digest and exits 0 when the proposal can
+be approved, 1 while ownership overlaps are unordered, and 2 for an invalid
+proposal such as a dependency cycle. `apply` writes the preview whose digest you
+approved, using the house's forge binding. It exits 0 once every write is
+applied and 1 when the run stopped early; rerun the same command to resume.
+`acknowledge` releases the repository from an earlier decomposition that settled
+without success after writing, or possibly writing, to the forge. With
+`--registry`, it first re-reads the forge through the house's binding;
+`--without-forge` skips that. Check the forge for that task's issues first. A
+write still not proven after the forge re-read, including every such write when
+the forge is not read, refuses the release unless you pass `--accept-unknown`;
+the write is then recorded as unproven.
 
 ## `kitchn cleanup`
 

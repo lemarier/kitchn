@@ -27,6 +27,7 @@ use crate::{
     trust::{Document, Finding, Ledger, Measurement, TrustError, store_error},
 };
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 /// Inspections that may be open at once in one ledger. An inspection is open
 /// until it is cancelled, passes its deadline, or has every sample reserved
@@ -248,23 +249,35 @@ impl Inspection {
 }
 
 impl Ledger {
-    /// Read `clock` once, then run `apply` with that instant in one ledger
-    /// transaction while holding the core store's shared lock, so the claim
-    /// `apply` checks with [`check_inspector`] stays current until the ledger
-    /// write commits. The clock is read before either lock is taken: caller
-    /// code never runs while a takeover is blocked.
+    /// Read `clock` once, then run `apply` in one ledger transaction while
+    /// holding the core store's shared lock, so the claim `apply` checks with
+    /// [`check_inspector`] stays current until the ledger write commits. The
+    /// clock is read before either lock is taken: caller code never runs while
+    /// a takeover is blocked.
+    ///
+    /// `apply` gets two instants. `now` is the clock reading, for what the
+    /// ledger records. `live` is `now` plus the monotonic time spent waiting
+    /// for the locks, saturating, so a lease that expired during the wait is
+    /// not accepted on the stale reading; use it for every liveness and
+    /// deadline check.
     fn fenced<T>(
         &self,
         store: &HouseStore,
         clock: &dyn Clock,
-        apply: impl FnOnce(&StoreState, &mut Document, Timestamp) -> Result<T, TrustError>,
+        apply: impl FnOnce(&StoreState, &mut Document, Timestamp, Timestamp) -> Result<T, TrustError>,
     ) -> Result<T, TrustError> {
         if store.house() != self.house() {
             return Err(TrustError::Refused);
         }
         let now = clock.now();
+        let read_at = Instant::now();
         store
-            .read_holding(|core| self.transact(|doc| apply(core, doc, now)))
+            .read_holding(|core| {
+                self.transact(|doc| {
+                    let live = now.saturating_add(read_at.elapsed());
+                    apply(core, doc, now, live)
+                })
+            })
             .map_err(store_error)?
     }
 
@@ -284,8 +297,8 @@ impl Ledger {
         fence: Fence,
         clock: &dyn Clock,
     ) -> Result<Inspection, TrustError> {
-        self.fenced(store, clock, |core, doc, now| {
-            check_inspector(core, &plan, fence, now)?;
+        self.fenced(store, clock, |core, doc, now, live| {
+            check_inspector(core, &plan, fence, live)?;
             if let Some(old) = doc.inspections.iter_mut().find(|i| i.id() == &plan.id) {
                 if old.plan != plan {
                     return Err(TrustError::Conflict);
@@ -348,13 +361,13 @@ impl Ledger {
         tokens: u64,
         clock: &dyn Clock,
     ) -> Result<SampleReservation, TrustError> {
-        self.fenced(store, clock, |core, doc, now| {
+        self.fenced(store, clock, |core, doc, now, live| {
             let index = doc
                 .inspections
                 .iter()
                 .position(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
-            check_inspector(core, &doc.inspections[index].plan, fence, now)?;
+            check_inspector(core, &doc.inspections[index].plan, fence, live)?;
             doc.inspections[index].advance_fence(fence)?;
             let inspection = &doc.inspections[index];
             if let Some(old) = inspection.samples.iter().find(|s| s.number == number) {
@@ -374,7 +387,7 @@ impl Ledger {
             if now < earliest {
                 return Err(TrustError::Invalid);
             }
-            if now >= inspection.plan.deadline {
+            if live >= inspection.plan.deadline {
                 return Err(TrustError::Exhausted);
             }
             let current = doc.latest(&inspection.plan.observation)?;
@@ -426,13 +439,13 @@ impl Ledger {
         result: SampleResult,
         clock: &dyn Clock,
     ) -> Result<bool, TrustError> {
-        self.fenced(store, clock, |core, doc, now| {
+        self.fenced(store, clock, |core, doc, _, live| {
             let inspection = doc
                 .inspections
                 .iter_mut()
                 .find(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
-            check_inspector(core, &inspection.plan, fence, now)?;
+            check_inspector(core, &inspection.plan, fence, live)?;
             inspection.advance_fence(fence)?;
             let sample = inspection
                 .samples
@@ -463,13 +476,13 @@ impl Ledger {
         fence: Fence,
         clock: &dyn Clock,
     ) -> Result<(), TrustError> {
-        self.fenced(store, clock, |core, doc, now| {
+        self.fenced(store, clock, |core, doc, _, live| {
             let inspection = doc
                 .inspections
                 .iter_mut()
                 .find(|i| i.id() == id)
                 .ok_or(TrustError::Incomplete)?;
-            check_inspector(core, &inspection.plan, fence, now)?;
+            check_inspector(core, &inspection.plan, fence, live)?;
             inspection.advance_fence(fence)?;
             inspection.cancelled = true;
             Ok(())
@@ -492,12 +505,12 @@ impl Ledger {
 }
 
 /// Refuse unless `plan.inspector` holds a live claim on the inspector task
-/// with `fence` at `now` in `core`, as held by [`Ledger::fenced`].
+/// with `fence` at `live` in `core`, as held by [`Ledger::fenced`].
 fn check_inspector(
     core: &StoreState,
     plan: &InspectionPlan,
     fence: Fence,
-    now: Timestamp,
+    live: Timestamp,
 ) -> Result<(), TrustError> {
     let task = core.task(&plan.task).map_err(store_error)?;
     match task.state() {
@@ -505,7 +518,7 @@ fn check_inspector(
             if task.spec().role == Role::Inspector
                 && lease.fence() == fence
                 && lease.holder() == &plan.inspector
-                && lease.is_live(now) =>
+                && lease.is_live(live) =>
         {
             #[cfg(feature = "test-hooks")]
             test_hooks::after_claim_check();

@@ -2761,6 +2761,109 @@ fn a_takeover_cannot_commit_between_the_claim_check_and_the_ledger_write() -> Te
     Ok(())
 }
 
+/// A clock stopped at `millis`.
+struct AtMillis(u64);
+
+impl kitchen::contracts::Clock for AtMillis {
+    fn now(&self) -> kitchen::contracts::Timestamp {
+        kitchen::contracts::Timestamp::from_unix_millis(self.0)
+    }
+}
+
+#[test]
+fn a_lease_that_expires_while_waiting_for_the_core_lock_is_refused() -> TestResult {
+    use kitchen::{
+        WorkflowId,
+        state::{MarkerFact, MarkerKey, MarkerSubject, WorkItem},
+    };
+    use std::{
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+    let operations: [(&str, Operation); 4] = [
+        ("start", |l, s, fence, clock| {
+            Ok(matches!(
+                l.start_inspection(s, plan()?, fence, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("reserve", |l, s, fence, clock| {
+            Ok(matches!(
+                l.reserve_sample(s, &plan()?.id, fence, 2, 1, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("finish", |l, s, fence, clock| {
+            Ok(matches!(
+                l.finish_sample(s, &plan()?.id, fence, 1, SampleResult::Unavailable, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+        ("cancel", |l, s, fence, clock| {
+            Ok(matches!(
+                l.cancel_inspection(s, &plan()?.id, fence, clock),
+                Err(TrustError::Refused)
+            ))
+        }),
+    ];
+    for (name, operation) in operations {
+        let f = Fixture::new()?;
+        let l = inspectable(&f)?;
+        let inspector = task_id("inspector")?;
+        let reviewer = scheduled("independent-reviewer")?;
+        let first = f.store.claim(&inspector, &reviewer, ttl(10)?, at(0))?;
+        if name != "start" {
+            l.start_inspection(&f.store, plan()?, first.fence(), &clock(5))?;
+            l.reserve_sample(&f.store, &plan()?.id, first.fence(), 1, 1, &clock(6))?;
+        }
+        let holder = f.reopen()?;
+        let recorder = scheduled("guard-tick")?;
+        let marker = MarkerKey {
+            workflow: WorkflowId::new("gate")?,
+            item: WorkItem::PullRequest {
+                repository: Repository::new("origin89hq/km43")?,
+                number: std::num::NonZeroU64::new(20).ok_or("zero")?,
+            },
+            subject: MarkerSubject::Git(EvidenceSubject {
+                head: commit('a')?,
+                base: None,
+            }),
+        };
+        let (held, is_held) = mpsc::channel();
+        // Another writer holds the core write lock for 300 ms of real time.
+        let writer = thread::spawn(move || {
+            holder.record_marker_unless(
+                marker,
+                MarkerFact::Verdict {
+                    verdict: EvidenceVerdict::Pass,
+                },
+                &recorder,
+                at(1),
+                |_| {
+                    let _ = held.send(());
+                    thread::sleep(Duration::from_millis(300));
+                    Ok(None::<()>)
+                },
+            )
+        });
+        is_held.recv_timeout(Duration::from_secs(10))?;
+        // The clock reads 9.95 s and the lease expires at 10 s: live when the
+        // clock is read, expired by the time the lock is released.
+        let before = fs::read(ledger_path(&f))?;
+        let started = Instant::now();
+        let refused = operation(&l, &f.store, first.fence(), &AtMillis(9_950))?;
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "{name}: did not wait for the lock"
+        );
+        writer.join().map_err(|_| "writer panicked")??;
+        assert!(refused, "{name}: an expired lease was accepted");
+        assert_eq!(fs::read(ledger_path(&f))?, before, "{name}");
+    }
+    Ok(())
+}
+
 /// A clock that runs `on_read` whenever it is read.
 struct ReadHook<F: Fn()>(ManualClock, F);
 

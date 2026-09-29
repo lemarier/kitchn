@@ -710,3 +710,47 @@ fn a_store_written_before_usage_records_reads_as_not_reported() -> TestResult {
     ));
     Ok(())
 }
+
+#[test]
+fn a_session_taken_over_leaves_only_the_attempts_it_could_overlap_incomplete() -> TestResult {
+    let fixture = Fixture::new()?;
+    let mut spec = common::spec("usage-takeover")?;
+    spec.repository = Some(repo()?);
+    let id = spec.id.clone();
+    fixture.store.create_task(spec, &creator()?, at(0))?;
+    let first = fixture
+        .store
+        .claim(&id, &interactive("david")?, ttl(60)?, at(0))?
+        .fence();
+    fixture.store.start_attempt(&id, first, at(0))?;
+    fixture.store.finish_attempt(
+        &id,
+        first,
+        AttemptNumber::FIRST,
+        AttemptOutcome::Failed(FailureClass::Retryable),
+        at(30),
+    )?;
+    // The interactive lease expires with no recorded end; a scheduled claim
+    // takes over at 100, so that session ended at 100 at the latest.
+    let second = fixture
+        .store
+        .take_over(&id, &scheduled("worker")?, ttl(600)?, at(100))?
+        .fence();
+    fixture.store.start_attempt(&id, second, at(200))?;
+    fixture.store.finish_attempt(
+        &id,
+        second,
+        AttemptNumber::new(2).ok_or("attempt")?,
+        AttemptOutcome::Succeeded,
+        at(300),
+    )?;
+
+    let complete: Vec<bool> = fixture
+        .store
+        .attempt_usage()?
+        .into_iter()
+        .map(|entry| entry.human.complete)
+        .collect();
+    assert_eq!(complete, [false, true]);
+    Ok(())
+}

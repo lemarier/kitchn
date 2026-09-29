@@ -287,6 +287,9 @@ struct Session {
     start: Timestamp,
     /// `None` when no end was recorded.
     end: Option<Timestamp>,
+    /// With no recorded end, the latest it can have ended: when a later
+    /// claim replaced it. `None` while it may still be open.
+    ended_by: Option<Timestamp>,
 }
 
 /// Replay the ownership history into claim spans.
@@ -306,13 +309,17 @@ fn sessions(history: &[OwnershipEvent]) -> Vec<Session> {
             } => {
                 // A takeover follows an expired lease whose end was not
                 // recorded; so does any claim that replaces an open one.
-                spans.extend(open.take().map(|(_, session)| session));
+                spans.extend(open.take().map(|(_, mut session)| {
+                    session.ended_by = Some(*at);
+                    session
+                }));
                 open = Some((
                     *fence,
                     Session {
                         interactive: *trigger == Trigger::Interactive,
                         start: *at,
                         end: None,
+                        ended_by: None,
                     },
                 ));
             }
@@ -355,7 +362,12 @@ fn human_time(task: &TaskRecord, index: usize) -> HumanTime {
         .filter(|session| session.interactive)
     {
         let Some(until) = session.end else {
-            if end.is_none_or(|end| session.start < end) {
+            // Its end is unknown somewhere before `ended_by` (or now, while
+            // it may still be open); only a window that uncertain span
+            // overlaps is incomplete.
+            let overlaps = end.is_none_or(|end| session.start < end)
+                && session.ended_by.is_none_or(|bound| bound > start);
+            if overlaps {
                 complete = false;
             }
             continue;

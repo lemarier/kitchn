@@ -56,9 +56,10 @@ const LAYOUT: StoreLayout = StoreLayout {
     priority_intent: Some("revoke.pending"),
     priority_reserve_bytes: REVOCATION_RESERVE,
 };
-// Version 2 added the inspector task and fence to inspections. Older stores
-// are refused as unsupported before decoding; there is no migration.
-const SCHEMA: u64 = 2;
+// Older stores are refused as unsupported before decoding; there is no
+// migration. Version 2 added the inspector task and fence to inspections;
+// version 3 requires every binding's model to come from its agent selection.
+const SCHEMA: u64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -112,6 +113,7 @@ impl Document {
             if binding.spec.authority.house() != house
                 || binding.spec.repository.as_ref() != Some(&binding.scope.project)
                 || !role_matches_station(binding.spec.role, &binding.scope)
+                || selected_model(&binding.spec).as_ref() != Some(&binding.model)
                 || bindings.insert(&binding.spec.id, binding).is_some()
             {
                 return Err(TrustError::Corrupt);
@@ -288,19 +290,22 @@ impl Ledger {
         self.engine.house()
     }
 
-    /// Bind a prospective task to one station, work type, and selected model.
-    /// Bind before delegating earned standing grants, then create the task.
-    /// Repeating the same binding is idempotent; it cannot be edited. `model`
-    /// is only the resolved identity trust compares against observations; it
-    /// does not select a model.
+    /// Bind a prospective task to one station and work type. The model trust
+    /// compares against observations is derived from the task's resolved
+    /// agent selection ([`AgentSelection::attribution_model`]); the station
+    /// and work type are still declared by the caller. Bind before delegating
+    /// earned standing grants, then create the task. Repeating the same
+    /// binding is idempotent; it cannot be edited.
+    ///
+    /// [`AgentSelection::attribution_model`]: crate::selection::AgentSelection::attribution_model
     ///
     /// # Errors
-    /// Rejects cross-house, project, role, or identity mismatches.
+    /// Rejects cross-house, project, role, or identity mismatches, and a task
+    /// without a resolved agent selection.
     pub fn bind_task(
         &self,
         spec: &TaskSpec,
         scope: StationScope,
-        model: crate::contracts::Text,
         source: crate::contracts::ExternalRef,
     ) -> Result<bool, TrustError> {
         if spec.authority.house() != self.house()
@@ -309,6 +314,7 @@ impl Ledger {
         {
             return Err(TrustError::Refused);
         }
+        let model = selected_model(spec).ok_or(TrustError::Refused)?;
         let binding = TaskBinding {
             spec: spec.clone(),
             scope,
@@ -710,6 +716,12 @@ fn audit_identity(audit: &GrantAudit) -> (&crate::contracts::ExternalRef, &House
         GrantAudit::Issued(g) => (&g.id, &g.house),
         GrantAudit::Revoked { grant, .. } => (&grant.id, &grant.house),
     }
+}
+/// The model identity a task's resolved agent selection is attributed to.
+fn selected_model(spec: &TaskSpec) -> Option<crate::contracts::Text> {
+    spec.agent
+        .as_ref()
+        .and_then(|agent| agent.selection.attribution_model().ok())
 }
 /// A station named after a role binds only tasks of that role. Any other
 /// station name is a house-defined domain that accepts every role; earned

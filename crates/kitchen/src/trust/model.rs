@@ -341,18 +341,18 @@ pub struct AutonomyProposal {
     pub at: Timestamp,
 }
 
-/// Write-once adapter attribution for a prospective task. Core authority is
+/// Write-once attribution for a prospective task. Core authority is
 /// delegated after this binding and is checked separately at execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskBinding {
     /// Prospective task specification before earned authority is delegated.
     pub spec: TaskSpec,
-    /// Station and work category declared by the house adapter.
+    /// Station and work category declared by the house adapter; the task
+    /// contract does not record them.
     pub scope: StationScope,
-    /// The model identity the adapter resolved, compared verbatim with the
-    /// observed model. Trust only matches it; choosing a model per role and
-    /// work type belongs to house agent-selection policy (issue #42).
+    /// The model identity derived from the task's resolved agent selection,
+    /// compared verbatim with the observed model.
     pub model: Text,
     /// Auditable source for the adapter decision.
     pub source: ExternalRef,
@@ -367,6 +367,7 @@ impl TaskBinding {
             && self.spec.provenance == spec.provenance
             && self.spec.resources == spec.resources
             && self.spec.requires == spec.requires
+            && self.spec.agent == spec.agent
     }
 }
 

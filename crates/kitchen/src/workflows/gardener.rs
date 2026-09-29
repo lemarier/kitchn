@@ -447,6 +447,7 @@ impl<'a> StaleMarkers<'a> {
                 } if owner == repository => Some((number.get(), marker.fact())),
                 WorkItem::Issue { .. }
                 | WorkItem::PullRequest { .. }
+                | WorkItem::Repository { .. }
                 | WorkItem::Resource { .. } => None,
             })
             .map(|(number, fact)| Ok((number, StaleHandled::decode(fact)?.revision)))

@@ -1620,13 +1620,14 @@ fn a_coordinator_answer_records_no_person_time() -> TestResult {
     };
     assert_eq!(handle(&answer)?, QuestionRoute::Replied);
     assert!(replies(&world, &task)?.is_empty());
-    // Claiming a person answered after a coordinator's reply went out does
-    // not match the delivered body, so nothing is recorded.
-    assert_eq!(
-        handle(&person("A different answer.")?)?,
-        QuestionRoute::Duplicate
-    );
-    assert!(replies(&world, &task)?.is_empty());
+    // Repeating the delivered answer as a person's cannot relabel it: the
+    // source recorded with the delivery wins, whatever the body.
+    world.clock.advance(30);
+    for body in ["Proceed.", "A different answer."] {
+        assert_eq!(handle(&person(body)?)?, QuestionRoute::Duplicate);
+        assert!(replies(&world, &task)?.is_empty());
+    }
+    assert_eq!(world.backend.effects_performed(), 2);
     let usage = world.fixture.store.attempt_usage()?;
     assert_eq!(
         usage.first().map(|entry| entry.human.replies),
@@ -1710,6 +1711,43 @@ fn an_uncertain_reply_is_recorded_only_once_reconciled_as_applied() -> TestResul
 }
 
 #[test]
+fn a_restart_records_a_persons_reply_from_its_recorded_source() -> TestResult {
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    let worker = launched(&world, &task, fence, 1)?;
+    let asked = question("msg-recovered", 1_000)?;
+    let policy = supervision()?;
+    world.clock.advance(20);
+    world.backend.inject(ExecuteFault::ApplyThenLoseResponse);
+    assert_eq!(
+        handle_question(
+            &world.ctx(),
+            &task,
+            fence,
+            &policy,
+            &asked,
+            &person("Use the existing SPI helper.")?,
+            None
+        )?,
+        QuestionRoute::Uncertain
+    );
+    world.backend.set_worker_state(&worker, WorkerState::Ready);
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Running(WorkerState::Ready)
+    );
+    // The restarted caller no longer knows who answered; the person's
+    // reply is still recorded from the source stored with its delivery.
+    let pending = Response::Pending;
+    assert_eq!(
+        handle_question(&world.ctx(), &task, fence, &policy, &asked, &pending, None)?,
+        QuestionRoute::Duplicate
+    );
+    assert_eq!(replies(&world, &task)?.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn an_adopted_task_does_not_record_a_persons_reply_twice() -> TestResult {
     let policy = supervision()?;
     let world = World::new()?;
@@ -1740,11 +1778,11 @@ fn an_adopted_task_does_not_record_a_persons_reply_twice() -> TestResult {
     Ok(())
 }
 
-fn usage_report() -> TestResult<kitchen::state::UsageReport> {
-    Ok(kitchen::state::UsageReport {
-        source: ExternalRef::new("run:42")?,
+fn usage_report(worker: &ResourceRef) -> kitchen::state::UsageReport {
+    kitchen::state::UsageReport {
+        source: worker.handle.clone(),
         agent: Some(AgentFamily::Claude),
-        model: Some(AgentModel::new("claude-opus-5-5")?),
+        model: AgentModel::new("claude-opus-5-5").ok(),
         tokens: kitchen::state::TokenCounts {
             input: Some(1_200),
             output: Some(800),
@@ -1752,7 +1790,7 @@ fn usage_report() -> TestResult<kitchen::state::UsageReport> {
             cache_write: None,
         },
         cost: None,
-    })
+    }
 }
 
 fn attempt_usage(world: &World, task: &TaskId) -> TestResult<Vec<kitchen::state::AttemptUsage>> {
@@ -1772,14 +1810,10 @@ fn a_usage_report_is_recorded_on_the_ended_attempt_once() -> TestResult {
     use kitchen::workflows::coordination::{UsageRoute, record_worker_usage};
     let world = World::new()?;
     let (task, fence) = claim(&world, "coordinator", 1, 1)?;
-    assert_eq!(
-        record_worker_usage(&world.ctx(), &task, fence, usage_report()?)?,
-        UsageRoute::NoWorker
-    );
     let worker = launched(&world, &task, fence, 1)?;
     // While the attempt runs, a report is not recorded.
     assert_eq!(
-        record_worker_usage(&world.ctx(), &task, fence, usage_report()?)?,
+        record_worker_usage(&world.ctx(), &task, fence, &worker, usage_report(&worker))?,
         UsageRoute::AttemptOpen
     );
     assert_eq!(
@@ -1798,27 +1832,25 @@ fn a_usage_report_is_recorded_on_the_ended_attempt_once() -> TestResult {
     // after a restart changes nothing.
     let attempt = kitchen::contracts::AttemptNumber::FIRST;
     assert_eq!(
-        record_worker_usage(&world.ctx(), &task, fence, usage_report()?)?,
+        record_worker_usage(&world.ctx(), &task, fence, &worker, usage_report(&worker))?,
         UsageRoute::Recorded(attempt)
     );
     world.clock.advance(60);
     assert_eq!(
-        record_worker_usage(&world.ctx(), &task, fence, usage_report()?)?,
+        record_worker_usage(&world.ctx(), &task, fence, &worker, usage_report(&worker))?,
         UsageRoute::Recorded(attempt)
     );
     let usage = attempt_usage(&world, &task)?;
     let [AttemptUsage::Reported { report, at, .. }] = usage.as_slice() else {
         return Err(format!("expected one report, got {usage:?}").into());
     };
-    assert_eq!(report, &usage_report()?);
+    assert_eq!(report, &usage_report(&worker));
     assert_eq!(*at, common::at(1_000));
 
     // A different report for the same attempt is refused, not overwritten.
-    let other = kitchen::state::UsageReport {
-        source: ExternalRef::new("run:43")?,
-        ..usage_report()?
-    };
-    let refused = record_worker_usage(&world.ctx(), &task, fence, other);
+    let mut other = usage_report(&worker);
+    other.tokens.output = Some(900);
+    let refused = record_worker_usage(&world.ctx(), &task, fence, &worker, other);
     assert!(
         matches!(
             refused,
@@ -1827,6 +1859,142 @@ fn a_usage_report_is_recorded_on_the_ended_attempt_once() -> TestResult {
             ))
         ),
         "{refused:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_late_report_lands_on_its_own_attempt_after_a_retry() -> TestResult {
+    use kitchen::contracts::AttemptNumber;
+    use kitchen::state::AttemptUsage;
+    use kitchen::workflows::coordination::{UsageRoute, record_worker_usage};
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 2)?;
+    let first = launched(&world, &task, fence, 1)?;
+    world
+        .backend
+        .set_worker_state(&first, WorkerState::Settled(WorkerOutcome::Failed));
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Retry { remaining: 1 }
+    );
+    let second = launched(&world, &task, fence, 1)?;
+
+    // Attempt 1's report arrives while attempt 2 runs.
+    assert_eq!(
+        record_worker_usage(&world.ctx(), &task, fence, &first, usage_report(&first))?,
+        UsageRoute::Recorded(AttemptNumber::FIRST)
+    );
+    assert_eq!(
+        record_worker_usage(&world.ctx(), &task, fence, &second, usage_report(&second))?,
+        UsageRoute::AttemptOpen
+    );
+    assert_eq!(
+        attempt_usage(&world, &task)?,
+        vec![
+            AttemptUsage::Reported {
+                backend: common::backend_id()?,
+                report: usage_report(&first),
+                at: world.now(),
+            },
+            AttemptUsage::NotReported,
+        ]
+    );
+
+    // Once attempt 2 ends, its own report lands on it; attempt 1 keeps its.
+    world
+        .backend
+        .set_worker_state(&second, WorkerState::Settled(WorkerOutcome::Failed));
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Settled(Settlement::Exhausted)
+    );
+    let second_attempt = world
+        .fixture
+        .store
+        .task(&task)?
+        .attempts()
+        .last()
+        .map(kitchen::state::AttemptRecord::number)
+        .ok_or("no attempt")?;
+    assert_eq!(second_attempt.get(), 2);
+    assert_eq!(
+        record_worker_usage(&world.ctx(), &task, fence, &second, usage_report(&second))?,
+        UsageRoute::Recorded(second_attempt)
+    );
+    let usage = attempt_usage(&world, &task)?;
+    let reports: Vec<_> = usage
+        .iter()
+        .map(|entry| match entry {
+            AttemptUsage::Reported { report, .. } => Some(report.source.clone()),
+            AttemptUsage::NotReported => None,
+        })
+        .collect();
+    assert_eq!(
+        reports,
+        vec![Some(first.handle.clone()), Some(second.handle.clone())]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_report_for_another_worker_or_source_is_not_recorded() -> TestResult {
+    use kitchen::state::AttemptUsage;
+    use kitchen::workflows::coordination::{UsageRoute, record_worker_usage};
+    let mut world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 2)?;
+    let first = launched(&world, &task, fence, 1)?;
+    world
+        .backend
+        .set_worker_state(&first, WorkerState::Settled(WorkerOutcome::Failed));
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Retry { remaining: 1 }
+    );
+    let second = launched(&world, &task, fence, 1)?;
+
+    // Attempt 2's report named as attempt 1's worker is refused.
+    assert_eq!(
+        record_worker_usage(&world.ctx(), &task, fence, &first, usage_report(&second))?,
+        UsageRoute::SourceMismatch
+    );
+    // A worker this task never launched is unknown.
+    let stranger = ResourceRef {
+        handle: ExternalRef::new("worker-not-launched")?,
+        ..first.clone()
+    };
+    assert_eq!(
+        record_worker_usage(
+            &world.ctx(),
+            &task,
+            fence,
+            &stranger,
+            usage_report(&stranger)
+        )?,
+        UsageRoute::UnknownWorker
+    );
+    // A worker named with another backend is not this task's worker.
+    let foreign = ResourceRef {
+        backend: kitchen::BackendId::new("other-backend")?,
+        ..first.clone()
+    };
+    assert_eq!(
+        record_worker_usage(&world.ctx(), &task, fence, &foreign, usage_report(&first))?,
+        UsageRoute::UnknownWorker
+    );
+    // Another backend cannot report for this backend's worker.
+    world.backend = FakeBackend::new(
+        kitchen::BackendId::new("other-backend")?,
+        common::house()?,
+        CapabilitySet::supporting(Capability::ALL),
+    );
+    assert_eq!(
+        record_worker_usage(&world.ctx(), &task, fence, &first, usage_report(&first))?,
+        UsageRoute::SourceMismatch
+    );
+    assert_eq!(
+        attempt_usage(&world, &task)?,
+        vec![AttemptUsage::NotReported, AttemptUsage::NotReported]
     );
     Ok(())
 }
@@ -1857,7 +2025,7 @@ fn without_a_usage_report_or_capability_the_attempt_stays_not_reported() -> Test
         vec![AttemptUsage::NotReported]
     );
     // A backend without usage attribution cannot report.
-    let refused = record_worker_usage(&world.ctx(), &task, fence, usage_report()?);
+    let refused = record_worker_usage(&world.ctx(), &task, fence, &worker, usage_report(&worker));
     assert!(
         matches!(
             refused,

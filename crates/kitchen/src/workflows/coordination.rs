@@ -197,6 +197,25 @@ impl Context<'_> {
         effect: Effect,
         revision: EvidenceRevision,
     ) -> Result<EffectRecord> {
+        self.run_on(executor, task, fence, name, effect, revision, None)
+    }
+
+    /// Run an effect recording `basis` with it; the store keeps the basis
+    /// immutable for the effect's name.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the effect plan's fields plus its executor"
+    )]
+    fn run_on(
+        &self,
+        executor: &dyn EffectExecutor,
+        task: &TaskId,
+        fence: Fence,
+        name: &str,
+        effect: Effect,
+        revision: EvidenceRevision,
+        basis: Option<ExternalRef>,
+    ) -> Result<EffectRecord> {
         let consent = self.consent.consent(task, &effect, revision);
         let plan = EffectPlan {
             task: task.clone(),
@@ -205,7 +224,7 @@ impl Context<'_> {
             decided_at: revision,
             effect,
             consent,
-            basis: None,
+            basis,
         };
         run_effect(self.store, executor, self.grants, plan, self.clock)
     }
@@ -1628,6 +1647,30 @@ pub enum AnswerSource {
     Person,
 }
 
+impl AnswerSource {
+    const COORDINATOR_BASIS: &'static str = "answer-source:coordinator";
+    const PERSON_BASIS: &'static str = "answer-source:person";
+
+    /// The basis recorded with the reply effect that delivers the answer.
+    fn basis(self) -> Result<ExternalRef> {
+        Ok(ExternalRef::new(match self {
+            Self::Coordinator => Self::COORDINATOR_BASIS,
+            Self::Person => Self::PERSON_BASIS,
+        })?)
+    }
+
+    /// The source recorded with a delivered reply, or `None` when the
+    /// reply carries none, such as one delivered before sources were
+    /// recorded.
+    fn recorded(reply: &EffectRecord) -> Option<Self> {
+        match reply.basis().map(ExternalRef::as_str) {
+            Some(Self::COORDINATOR_BASIS) => Some(Self::Coordinator),
+            Some(Self::PERSON_BASIS) => Some(Self::Person),
+            Some(_) | None => None,
+        }
+    }
+}
+
 /// How a question should be handled, from the coordinator or a scoped agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
@@ -1699,23 +1742,23 @@ fn named_effect<'r>(record: &'r TaskRecord, name: &str) -> Option<&'r EffectReco
 }
 
 /// Record a person's reply once its delivery applied, dated when it
-/// applied. A coordinator's answer records nothing.
+/// applied. The source is the one recorded with the reply effect, never a
+/// later caller's claim; a coordinator's answer, or a reply without a
+/// recorded source, records nothing.
 fn record_reply(
     ctx: &Context<'_>,
     task: &TaskId,
     fence: Fence,
     question: &WorkerQuestion,
-    source: AnswerSource,
     reply: &EffectRecord,
 ) -> Result<()> {
-    match (source, reply.state()) {
-        (AnswerSource::Person, EffectState::Applied { at, .. }) => {
-            ctx.store
-                .record_human_reply(task, fence, &question.id, question.asked_at, *at)
-        }
-        (AnswerSource::Coordinator, _)
+    match (AnswerSource::recorded(reply), reply.state()) {
+        (Some(AnswerSource::Person), EffectState::Applied { at, .. }) => ctx
+            .store
+            .record_human_reply(task, fence, &question.id, question.asked_at, *at),
+        (Some(AnswerSource::Coordinator) | None, _)
         | (
-            AnswerSource::Person,
+            Some(AnswerSource::Person),
             EffectState::Intended
             | EffectState::Uncertain { .. }
             | EffectState::NotApplied { .. }
@@ -1754,17 +1797,15 @@ pub fn handle_question(
             EffectState::Applied { .. } => {
                 ctx.store.consume_message(task, fence, &question.id, now)?;
                 // A restart between delivery and recording lost the
-                // person's reply; record it now for the answer delivered.
-                if let Response::Answer { body, source } = response
+                // person's reply; record it now from the source recorded
+                // with the delivery. The repeat's own response is not
+                // trusted: it cannot relabel a coordinator's answer.
+                if AnswerSource::recorded(existing) == Some(AnswerSource::Person)
                     && open_worker(&record)
                         .is_some_and(|view| view.attempt == existing.request().attempt())
-                    && matches!(
-                        existing.request().effect(),
-                        Effect::Worker(Operation::ReplyToWorker { body: sent, .. }) if sent == body
-                    )
                 {
                     running_attempt(ctx, task, fence)?;
-                    record_reply(ctx, task, fence, question, *source, existing)?;
+                    record_reply(ctx, task, fence, question, existing)?;
                 }
                 QuestionRoute::Duplicate
             }
@@ -1806,11 +1847,19 @@ pub fn handle_question(
                 question: question.id.clone(),
                 body: body.clone(),
             });
-            let reply = ctx.run(ctx.backend, task, fence, &reply_name, effect, revision)?;
+            let reply = ctx.run_on(
+                ctx.backend,
+                task,
+                fence,
+                &reply_name,
+                effect,
+                revision,
+                Some(source.basis()?),
+            )?;
             Ok(match reply.state() {
                 EffectState::Applied { .. } => {
                     ctx.store.consume_message(task, fence, &question.id, now)?;
-                    record_reply(ctx, task, fence, question, *source, &reply)?;
+                    record_reply(ctx, task, fence, question, &reply)?;
                     QuestionRoute::Replied
                 }
                 EffectState::NotApplied { .. } => {
@@ -1893,17 +1942,23 @@ pub fn handle_question(
 /// What happened to a worker backend's usage report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageRoute {
-    /// The report is on the attempt that ran the task's latest worker.
+    /// The report is on the attempt that launched the named worker.
     Recorded(AttemptNumber),
     /// That attempt has not ended; a report is recorded only after it does.
     AttemptOpen,
-    /// No worker was launched for the task.
-    NoWorker,
+    /// No applied launch of this task created the named worker.
+    UnknownWorker,
+    /// The report's source is not the named worker's handle, or the worker
+    /// belongs to another backend than the one reporting; nothing is
+    /// recorded.
+    SourceMismatch,
 }
 
-/// Record the usage report the worker backend returned for the task's
-/// latest worker, once that worker's attempt has ended: finished,
-/// cancelled, or settling the task. The owner that settled the task may
+/// Record the usage report the worker backend returned for `worker`, on
+/// the attempt whose applied launch created it, once that attempt has
+/// ended: finished, cancelled, or settling the task. A late report for an
+/// earlier attempt lands on that attempt, not on a retry's. The report's
+/// source must be the worker's handle. The owner that settled the task may
 /// still record it. Repeating the same report changes nothing. Without a
 /// report the attempt stays [`crate::state::AttemptUsage::NotReported`].
 ///
@@ -1915,12 +1970,17 @@ pub fn record_worker_usage(
     ctx: &Context<'_>,
     task: &TaskId,
     fence: Fence,
+    worker: &ResourceRef,
     report: UsageReport,
 ) -> Result<UsageRoute> {
     let record = ctx.store.task(task)?;
-    let Some(view) = current_worker(&record) else {
-        return Ok(UsageRoute::NoWorker);
+    let Some(view) = launched_workers(&record).find(|view| &view.worker == worker) else {
+        return Ok(UsageRoute::UnknownWorker);
     };
+    let descriptor = ctx.backend.descriptor();
+    if report.source != view.worker.handle || view.worker.backend != descriptor.backend {
+        return Ok(UsageRoute::SourceMismatch);
+    }
     // A missing attempt falls through to the store, which refuses it.
     if let Some(attempt) = record
         .attempts()
@@ -1938,7 +1998,7 @@ pub fn record_worker_usage(
         task,
         fence,
         view.attempt,
-        ctx.backend.descriptor(),
+        descriptor,
         report,
         ctx.clock.now(),
     )?;

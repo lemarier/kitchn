@@ -93,6 +93,8 @@ fn flags(registry: &Path) -> InitAnswers {
         expediter: Some("claude".to_owned()),
         required_checks: Some("test,lint".to_owned()),
         required_reviewers: Some("expediter".to_owned()),
+        fix_rounds: Some("2".to_owned()),
+        review_requests: Some("1".to_owned()),
         forge_requester: Some("none".to_owned()),
         forge_credential: None,
         kitchen: Some(KITCHEN.to_owned()),
@@ -122,6 +124,7 @@ fn expected_config() -> TestResult<HouseConfig> {
             "requiredChecks": ["lint", "test"],
             "policyLimits": [],
             "grants": [],
+            "followUp": {{"fixRounds": 2, "reviewRequests": 1}},
             "agents": {{
                 "default": {{"agent": "codex"}},
                 "rules": [
@@ -138,9 +141,24 @@ fn blank_answers_take_the_checkout_remote_and_station_defaults() -> TestResult {
     let temp = tempfile::tempdir()?;
     let home = temp.path().canonicalize()?;
     // Registry, house, repositories, destinations, three stations, checks,
-    // reviewers, forge requester, confirmation. The commit is this build's,
+    // reviewers, fix rounds, review requests, forge requester, confirmation. The
+    // commit is this build's,
     // so it is not asked.
-    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test, lint", "", "", "y"]);
+    let mut script = Script::new(&[
+        "",
+        "acme",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "test, lint",
+        "",
+        "",
+        "",
+        "",
+        "y",
+    ]);
     let plan = confirmed(plan_house_init(
         &InitAnswers::default(),
         &facts(&home)?,
@@ -593,7 +611,7 @@ fn embedded_guidance_needs_this_builds_commit() -> TestResult {
         plan_house_init(&unanswered, &unknown, &NoGitHubAccess, None),
         Err(HouseInitError::MissingAnswers(missing)) if missing == [InitQuestion::House]
     ));
-    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test", "", ""]);
+    let mut script = Script::new(&["", "acme", "", "", "", "", "", "test", "", "", "", ""]);
     let prompted = plan_house_init(
         &InitAnswers::default(),
         &unknown,
@@ -661,5 +679,61 @@ fn a_failed_pin_is_reported_and_a_rerun_resumes() -> TestResult {
     register_house(&plan)?;
     let registry = HouseRegistry::new(root.join("registry"))?;
     resolve_instructions(registry.root(), &registry.load(&"acme".parse()?)?, None)?;
+    Ok(())
+}
+
+#[test]
+fn the_follow_up_budget_is_offered_with_its_default_and_takes_an_answer() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let home = temp.path().canonicalize()?;
+    let answers = InitAnswers {
+        fix_rounds: None,
+        review_requests: None,
+        ..flags(&home.join("registry"))
+    };
+    // Blank answers take the library defaults.
+    let mut script = Script::new(&["", ""]);
+    let plan = confirmed(plan_house_init(
+        &answers,
+        &facts(&home)?,
+        &NoGitHubAccess,
+        Some(&mut script),
+    )?)?;
+    assert!(script.said("Review-fix rounds per pull request [2]: "));
+    assert!(script.said("Review requests per pull request head [1]: "));
+    assert_eq!(plan.config.follow_up_budget().fix_rounds, 2);
+    assert_eq!(plan.config.follow_up_budget().review_requests, 1);
+    // Typed answers set the policy; the ceiling itself is allowed.
+    let mut script = Script::new(&["4", "10"]);
+    let plan = confirmed(plan_house_init(
+        &answers,
+        &facts(&home)?,
+        &NoGitHubAccess,
+        Some(&mut script),
+    )?)?;
+    assert_eq!(plan.config.follow_up_budget().fix_rounds, 4);
+    assert_eq!(plan.config.follow_up_budget().review_requests, 10);
+    // Over the ceiling is asked again, then refused; flags are refused unprompted.
+    let mut script = Script::new(&["11", "-1", "many"]);
+    assert!(matches!(
+        plan_house_init(&answers, &facts(&home)?, &NoGitHubAccess, Some(&mut script)),
+        Err(HouseInitError::InvalidAnswer(InitQuestion::FixRounds))
+    ));
+    let flagged = InitAnswers {
+        review_requests: Some("11".to_owned()),
+        ..flags(&home.join("registry"))
+    };
+    assert!(matches!(
+        plan_house_init(&flagged, &facts(&home)?, &NoGitHubAccess, None),
+        Err(HouseInitError::InvalidAnswer(InitQuestion::ReviewRequests))
+    ));
+    // Without a prompter, unanswered questions take the defaults too.
+    let plan = confirmed(plan_house_init(
+        &answers,
+        &facts(&home)?,
+        &NoGitHubAccess,
+        None,
+    )?)?;
+    assert_eq!(plan.config.follow_up_budget().fix_rounds, 2);
     Ok(())
 }

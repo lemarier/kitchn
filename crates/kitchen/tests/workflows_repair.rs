@@ -557,3 +557,44 @@ fn a_repair_task_carries_the_selection_the_house_policy_resolves() -> TestResult
     );
     Ok(())
 }
+
+#[test]
+fn repair_takes_its_round_budget_from_the_house() -> TestResult {
+    let base: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/house/origin89.json"))?;
+    let house = |follow_up: Option<serde_json::Value>| -> TestResult<kitchen::house::HouseConfig> {
+        let mut json = base.clone();
+        if let Some(follow_up) = follow_up {
+            json["followUp"] = follow_up;
+        }
+        Ok(serde_json::from_value(json)?)
+    };
+    let after_two_rounds = |policy: &RepairPolicy| -> TestResult<RepairDecision> {
+        let mut candidate = conflicting(1)?;
+        candidate.rounds_used = 2;
+        Ok(assess(policy, &candidate))
+    };
+    // Without a policy the library default of two rounds is spent.
+    let default = RepairPolicy::for_house(&house(None)?, 2);
+    assert_eq!(default.budget.fix_rounds, 2);
+    assert_eq!(default.max_unknown_rechecks, 2);
+    assert_eq!(
+        after_two_rounds(&default)?,
+        RepairDecision::HandOver(HandOver::BudgetExhausted)
+    );
+    // A house that allows three keeps repairing after two.
+    let generous = RepairPolicy::for_house(&house(Some(json!({ "fixRounds": 3 })))?, 2);
+    assert_eq!(
+        after_two_rounds(&generous)?,
+        RepairDecision::Repair(RepairKind::Conflict)
+    );
+    // A house that allows none hands over before the first round.
+    let none = RepairPolicy::for_house(&house(Some(json!({ "fixRounds": 0 })))?, 2);
+    let mut fresh = conflicting(1)?;
+    fresh.rounds_used = 0;
+    assert_eq!(
+        assess(&none, &fresh),
+        RepairDecision::HandOver(HandOver::BudgetExhausted)
+    );
+    Ok(())
+}

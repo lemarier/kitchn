@@ -284,6 +284,17 @@ pub struct RepairPolicy {
     pub budget: FollowUpBudget,
 }
 
+impl RepairPolicy {
+    /// Repair policy with the house's follow-up budget.
+    #[must_use]
+    pub fn for_house(house: &crate::house::HouseConfig, max_unknown_rechecks: u8) -> Self {
+        Self {
+            max_unknown_rechecks,
+            budget: house.follow_up_budget(),
+        }
+    }
+}
+
 /// Decide what to do about one pull request, ignoring slots and stacks.
 #[must_use]
 pub fn assess(policy: &RepairPolicy, candidate: &RepairCandidate) -> RepairDecision {

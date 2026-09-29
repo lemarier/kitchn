@@ -72,6 +72,7 @@ fn house_config() -> TestResult<HouseConfig> {
         schedules: None,
         merge_readiness: std::collections::BTreeMap::new(),
         disk_pressure: None,
+        follow_up: None,
     })
 }
 

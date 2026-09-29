@@ -71,6 +71,7 @@ fn ready() -> TestResult<GateEvidence> {
         writer_working: false,
         supporting_subject: Some((head.clone(), commit('b')?)),
         reopen_event: None,
+        fix_rounds: 2,
     })
 }
 /// The grants a fix request needs: push on the forge and worker launch and
@@ -216,6 +217,35 @@ fn settled_behind_head_requests_bounded_fix() -> TestResult {
     );
     assert!(
         matches!(gate::evaluate(&e,grants()?,GateHistory{fix_rounds:2,..GateHistory::default()}).verdict,Verdict::HandOver{gaps} if gaps.contains(&Gap::FixBudget))
+    );
+    Ok(())
+}
+#[test]
+fn the_gate_hands_over_at_the_house_fix_round_budget() -> TestResult {
+    let mut e = ready()?;
+    e.contains_base = Some(false);
+    e.merge_state = Some(MergeStatusValue::Behind);
+    let history = |fix_rounds| GateHistory {
+        fix_rounds,
+        ..GateHistory::default()
+    };
+    // A house that allows three rounds still requests a fix after two.
+    e.fix_rounds = 3;
+    assert!(
+        matches!(gate::evaluate(&e, grants()?, history(2)).verdict, Verdict::FixRequest { gaps } if gaps == vec![Gap::BaseBehind])
+    );
+    assert!(
+        matches!(gate::evaluate(&e, grants()?, history(3)).verdict, Verdict::HandOver { gaps } if gaps.contains(&Gap::FixBudget))
+    );
+    // A house that allows one hands over after the first, and one that
+    // allows none never requests a fix.
+    e.fix_rounds = 1;
+    assert!(
+        matches!(gate::evaluate(&e, grants()?, history(1)).verdict, Verdict::HandOver { gaps } if gaps.contains(&Gap::FixBudget))
+    );
+    e.fix_rounds = 0;
+    assert!(
+        matches!(gate::evaluate(&e, grants()?, history(0)).verdict, Verdict::HandOver { gaps } if gaps.contains(&Gap::FixBudget))
     );
     Ok(())
 }
@@ -934,6 +964,7 @@ fn scoped_forge_reads_feed_exact_head_gate() -> TestResult {
         &ForgeGatePolicy {
             authors: vec!["allowed".into()],
             expected_reviewers: vec!["reviewer".into()],
+            fix_rounds: 2,
         },
         supplement(&e),
         secs(1_790_607_600),
@@ -965,6 +996,7 @@ fn forge_behind_state_requests_a_bounded_fix() -> TestResult {
         &ForgeGatePolicy {
             authors: vec!["allowed".into()],
             expected_reviewers: vec!["reviewer".into()],
+            fix_rounds: 2,
         },
         supplement(&e),
         secs(1_790_607_600),
@@ -987,6 +1019,7 @@ fn required_check_absence_from_forge_refuses_merge() -> TestResult {
         &ForgeGatePolicy {
             authors: vec!["allowed".into()],
             expected_reviewers: vec!["reviewer".into()],
+            fix_rounds: 2,
         },
         supplement(&e),
         secs(1_790_607_600),
@@ -1011,6 +1044,7 @@ fn unreadable_branch_protection_hands_over_without_a_worker() -> TestResult {
         &ForgeGatePolicy {
             authors: vec!["allowed".into()],
             expected_reviewers: vec!["reviewer".into()],
+            fix_rounds: 2,
         },
         supplement(&e),
         secs(1_790_607_600),
@@ -1161,6 +1195,7 @@ fn comment_after_change_request_does_not_clear_it() -> TestResult {
         &ForgeGatePolicy {
             authors: vec!["allowed".into()],
             expected_reviewers: vec!["reviewer".into()],
+            fix_rounds: 2,
         },
         supplement(&e),
         secs(1_790_607_600),
@@ -1229,6 +1264,7 @@ fn quota_review_from_forge_is_unavailable() -> TestResult {
         &ForgeGatePolicy {
             authors: vec!["allowed".into()],
             expected_reviewers: vec!["reviewer".into()],
+            fix_rounds: 2,
         },
         supplement(&e),
         secs(1_790_607_600),
@@ -1300,6 +1336,7 @@ fn invalid_forge_branch_cannot_target_fix_worker() -> TestResult {
         &ForgeGatePolicy {
             authors: vec!["allowed".into()],
             expected_reviewers: vec!["reviewer".into()],
+            fix_rounds: 2,
         },
         supplement(&e),
         secs(1_790_607_600),
@@ -1378,6 +1415,7 @@ fn risk_approval_requires_scoped_write_permission() -> TestResult {
     let policy = ForgeGatePolicy {
         authors: vec!["allowed".into()],
         expected_reviewers: vec!["reviewer".into()],
+        fix_rounds: 2,
     };
     let write = forge_client(e.head.as_str(), false)?;
     if let Some(reviews) = write.transport().responses.borrow_mut().get_mut(8) {
@@ -1457,6 +1495,7 @@ fn write_permission_without_current_head_approval_is_insufficient() -> TestResul
         &ForgeGatePolicy {
             authors: vec!["allowed".into()],
             expected_reviewers: vec!["reviewer".into()],
+            fix_rounds: 2,
         },
         supplement(&e),
         secs(1_790_607_600),
@@ -1496,6 +1535,7 @@ fn forge_label_removal_requires_actor_write_access() -> TestResult {
     let policy = ForgeGatePolicy {
         authors: vec!["allowed".into()],
         expected_reviewers: vec!["reviewer".into()],
+        fix_rounds: 2,
     };
     let write = forge_client(e.head.as_str(), false)?;
     if let Some(timeline) = write.transport().responses.borrow_mut().get_mut(11) {
@@ -3230,6 +3270,7 @@ fn forge_blocked_state_with_a_failed_check_requests_a_fix() -> TestResult {
         &ForgeGatePolicy {
             authors: vec!["allowed".into()],
             expected_reviewers: vec!["reviewer".into()],
+            fix_rounds: 2,
         },
         supplement(&e),
         secs(1_790_607_600),
@@ -3268,6 +3309,7 @@ fn forge_statuses_use_the_newest_state_of_each_context() -> TestResult {
             &ForgeGatePolicy {
                 authors: vec!["allowed".into()],
                 expected_reviewers: vec!["reviewer".into()],
+                fix_rounds: 2,
             },
             supplement(&e),
             secs(1_790_607_600),
@@ -3293,6 +3335,7 @@ fn base_tip_comes_from_the_branch_ref_not_the_pr_object() -> TestResult {
         &ForgeGatePolicy {
             authors: vec!["allowed".into()],
             expected_reviewers: vec!["reviewer".into()],
+            fix_rounds: 2,
         },
         supplement(&e),
         secs(1_790_607_600),
@@ -3331,6 +3374,7 @@ fn unreadable_base_ref_hands_over_with_the_reason() -> TestResult {
     let policy = ForgeGatePolicy {
         authors: vec!["allowed".into()],
         expected_reviewers: vec!["reviewer".into()],
+        fix_rounds: 2,
     };
     let collect = |client| {
         gate::collect_forge_evidence(

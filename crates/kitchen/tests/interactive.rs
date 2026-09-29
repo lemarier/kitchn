@@ -33,7 +33,7 @@ use kitchen::{
             acknowledge_draft, apply_draft, draft_preview, draft_task_id, execution_mode,
             hand_back, pull_request, resolve_house, work,
         },
-        pickup::{ClaimOutcome, DEFAULT_FIX_ROUNDS, claim_issue, issue_task_id},
+        pickup::{ClaimOutcome, DEFAULT_FIX_ROUNDS, FollowUpBudget, claim_issue, issue_task_id},
         repair::{Mergeability, PullRequestState, PullRequestView, repair_task_id},
     },
 };
@@ -683,6 +683,14 @@ fn run_pr(
     run_pr_within(world, facts, intent, claimant, None)
 }
 
+/// The budget of a house whose policy sets none.
+fn house_budget() -> FollowUpBudget {
+    FollowUpBudget {
+        fix_rounds: DEFAULT_FIX_ROUNDS,
+        review_requests: 1,
+    }
+}
+
 fn run_pr_within(
     world: &World,
     facts: &PrFacts,
@@ -690,12 +698,24 @@ fn run_pr_within(
     claimant: &kitchen::contracts::Claimant,
     fix_rounds: Option<u8>,
 ) -> TestResult<(PrPlan, Option<kitchen::state::Lease>)> {
+    run_pr_with_house(world, facts, intent, claimant, fix_rounds, house_budget())
+}
+
+fn run_pr_with_house(
+    world: &World,
+    facts: &PrFacts,
+    intent: Option<PrIntent>,
+    claimant: &kitchen::contracts::Claimant,
+    fix_rounds: Option<u8>,
+    follow_up: FollowUpBudget,
+) -> TestResult<(PrPlan, Option<kitchen::state::Lease>)> {
     Ok(pull_request(&PrRequest {
         store: &world.fixture.store,
         template: &template()?,
         repository: &repo()?,
         facts,
         intent,
+        follow_up,
         fix_rounds,
         claimant,
         ttl: ttl(600)?,
@@ -836,6 +856,7 @@ fn pr_repair_round_carries_the_house_policy_agent() -> TestResult {
         repository: &repo()?,
         facts: &facts,
         intent: None,
+        follow_up: house_budget(),
         fix_rounds: None,
         claimant: &interactive("person")?,
         ttl: ttl(600)?,
@@ -894,6 +915,7 @@ fn pr_idle_budget_and_refusal_paths() -> TestResult {
         repository: &repo()?,
         facts: &clean,
         intent: None,
+        follow_up: house_budget(),
         fix_rounds: None,
         claimant: &scheduled("repair-tick")?,
         ttl: ttl(600)?,
@@ -1017,6 +1039,50 @@ fn pr_fix_rounds_can_only_lower_the_house_budget() -> TestResult {
         world.fixture.store.tasks()?.len(),
         usize::from(DEFAULT_FIX_ROUNDS)
     );
+    Ok(())
+}
+
+#[test]
+fn pr_reads_the_house_fix_round_budget() -> TestResult {
+    let world = World::new()?;
+    let person = interactive("person")?;
+    let facts = pr_facts(
+        PullRequestState::Open,
+        Mergeability::Clean,
+        ReviewState::ChangesRequested,
+    )?;
+    let house = |fix_rounds| FollowUpBudget {
+        fix_rounds,
+        review_requests: 1,
+    };
+    // A session cannot raise the house's own budget, only the default's.
+    let raised = run_pr_with_house(&world, &facts, None, &person, Some(4), house(3));
+    let Err(error) = raised else {
+        return Err("a budget above the house's must be refused".into());
+    };
+    assert_eq!(
+        error.downcast_ref::<Error>().map(Error::class),
+        Some(ErrorClass::Refused)
+    );
+    assert!(world.fixture.store.tasks()?.is_empty());
+
+    // Rounds beyond the library default stay open while the house allows them.
+    for round in 1..=DEFAULT_FIX_ROUNDS {
+        scheduled_round(&world, round, true)?;
+    }
+    let (plan, lease) = run_pr_with_house(&world, &facts, None, &person, None, house(3))?;
+    assert!(
+        matches!(plan, PrPlan::FollowUp { round: 3, .. }),
+        "{plan:?}"
+    );
+    assert!(lease.is_some());
+
+    // A house that allows fewer rounds than the default is spent earlier.
+    let strict = World::new()?;
+    scheduled_round(&strict, 1, true)?;
+    let (plan, lease) = run_pr_with_house(&strict, &facts, None, &person, None, house(1))?;
+    assert_eq!(plan, PrPlan::BudgetExhausted { rounds_used: 1 });
+    assert!(lease.is_none());
     Ok(())
 }
 

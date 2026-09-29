@@ -641,6 +641,7 @@ fn run_pr(args: PrArgs) -> Result<(String, bool), kitchen::Error> {
         repository: &opened.house.binding.repository,
         facts: &facts,
         intent: args.intent.map(PrIntent::from),
+        follow_up: opened.house.config.follow_up_budget(),
         fix_rounds: args.fix_rounds,
         claimant: &claimant,
         ttl: ttl(&args.claim)?,

@@ -11,7 +11,6 @@ use crate::{
     },
     house::{HouseError, IssuedAuthority, MergeSubject},
     integrations::github::MergeStatusValue,
-    workflows::pickup::DEFAULT_FIX_ROUNDS,
 };
 
 mod store;
@@ -100,6 +99,8 @@ pub struct GateEvidence {
     pub supporting_subject: Option<(CommitId, CommitId)>,
     /// Verified removal of the handover label by a person, if observed.
     pub reopen_event: Option<GateReopenEvent>,
+    /// Fix requests the house allows on this PR before the gate hands over.
+    pub fix_rounds: u8,
 }
 /// Scoped evidence that a person removed the handover label after a verdict.
 #[derive(Debug, Clone)]
@@ -810,7 +811,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
                 | Gap::ReviewerStale
         )
     }) && grants.fix_request.covers(&e.house, &e.repository)
-        && history.fix_rounds < DEFAULT_FIX_ROUNDS
+        && history.fix_rounds < e.fix_rounds
         && !history.requested_this_head
         && (!gaps.contains(&Gap::ReviewerStale) || can_invoke_missing(e, &grants))
     {
@@ -820,7 +821,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     {
         Verdict::Skip
     } else {
-        if history.fix_rounds >= DEFAULT_FIX_ROUNDS {
+        if history.fix_rounds >= e.fix_rounds {
             gaps.push(Gap::FixBudget);
         }
         Verdict::HandOver { gaps }
@@ -1957,6 +1958,9 @@ pub struct ForgeGatePolicy {
     pub authors: Vec<String>,
     /// Reviewer logins required at the current head.
     pub expected_reviewers: Vec<String>,
+    /// Fix requests the house allows per PR, from
+    /// [`crate::house::HouseConfig::follow_up_budget`].
+    pub fix_rounds: u8,
 }
 /// Non-forge evidence supplied by independent house-scoped reviewers and workers.
 #[derive(Debug, Clone)]
@@ -2221,6 +2225,7 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
         writer_working: supplement.writer_working,
         supporting_subject: supplement.subject,
         reopen_event,
+        fix_rounds: policy.fix_rounds,
     })
 }
 fn known<T>(observation: crate::integrations::github::Observation<T>) -> Option<T> {

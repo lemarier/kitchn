@@ -820,6 +820,51 @@ fn pr_repair_claims_the_round_scheduled_repair_would_use() -> TestResult {
 }
 
 #[test]
+fn pr_repair_round_carries_the_house_policy_agent() -> TestResult {
+    let world = World::new()?;
+    let facts = pr_facts(
+        PullRequestState::Open,
+        Mergeability::Conflicting,
+        ReviewState::Reviewed,
+    )?;
+    let policy = workflows_support::agent_policy()?;
+    let mut with_policy = template()?;
+    with_policy.agents = Some(policy.clone());
+    let (plan, _) = pull_request(&PrRequest {
+        store: &world.fixture.store,
+        template: &with_policy,
+        repository: &repo()?,
+        facts: &facts,
+        intent: None,
+        fix_rounds: None,
+        claimant: &interactive("person")?,
+        ttl: ttl(600)?,
+        now: world.now(),
+        take_over: false,
+    })?;
+    let PrPlan::Repair { task, .. } = plan else {
+        return Err(format!("expected a repair round, got {plan:?}").into());
+    };
+    let expected = policy.resolve(&kitchen::selection::SelectionRequest {
+        repository: Some(repo()?),
+        ..kitchen::selection::SelectionRequest::new(kitchen::contracts::Role::StationCook)
+    });
+    let recorded = world.fixture.store.task(&task)?;
+    assert_eq!(recorded.spec().agent.as_ref(), Some(&expected));
+    // A house without a policy still records no selection.
+    let bare = World::new()?;
+    let (bare_plan, _) = run_pr(&bare, &facts, None, &interactive("person")?)?;
+    let PrPlan::Repair {
+        task: bare_task, ..
+    } = bare_plan
+    else {
+        return Err("expected a repair round".into());
+    };
+    assert_eq!(bare.fixture.store.task(&bare_task)?.spec().agent, None);
+    Ok(())
+}
+
+#[test]
 fn pr_idle_budget_and_refusal_paths() -> TestResult {
     let world = World::new()?;
     let person = interactive("person")?;

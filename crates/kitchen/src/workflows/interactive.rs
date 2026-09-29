@@ -1111,7 +1111,11 @@ pub fn pull_request(request: &PrRequest<'_>) -> Result<(PrPlan, Option<Lease>)> 
         provenance: template.provenance.clone(),
         resources: BTreeSet::new(),
         requires: crate::contracts::CapabilityRequirements::new(),
-        agent: None,
+        agent: crate::workflows::pickup::resolve_agent(
+            template.agents.as_ref(),
+            crate::contracts::Role::StationCook,
+            request.repository,
+        ),
     };
     let lease = match claim_task(
         request.store,

@@ -20,8 +20,8 @@ use crate::{
     integrations::github::{
         GitHubClient, GitHubReadTransport, IssueState, MergeState, Observation, PullRequest,
     },
-    selection::{AgentPolicy, SelectionRequest},
-    workflows::pickup::{FollowUpBudget, derived_task_id},
+    selection::AgentPolicy,
+    workflows::pickup::{FollowUpBudget, derived_task_id, resolve_agent},
 };
 
 type Result<T> = std::result::Result<T, crate::Error>;
@@ -420,12 +420,7 @@ pub fn repair_spec(
     agents: Option<&AgentPolicy>,
 ) -> TaskSpec {
     let role = Role::StationCook;
-    let agent = agents.map(|policy| {
-        policy.resolve(&SelectionRequest {
-            repository: Some(repository.clone()),
-            ..SelectionRequest::new(role)
-        })
-    });
+    let agent = resolve_agent(agents, role, &repository);
     TaskSpec {
         id,
         role,

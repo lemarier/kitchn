@@ -65,6 +65,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #106, #134 schedule budget pass and tick | `workflows/budget.rs`, `kitchen-cli/src/commands/budget.rs` | Budget tests in `crates/kitchen/tests/schedule_budgets.rs`, `crates/kitchen-cli/tests/budget.rs` |
 | #13 end-to-end validation and operations | — | End-to-end harness in `crates/kitchen/tests/e2e_*`; operational docs in `docs/` |
 | #16 house repository templates and scaffold/adopt flow | `scaffold/` | Template assets in root `templates/`; template rendering and repository scaffolding through #5's installer |
+| #17 interactive entrypoints | `workflows/interactive.rs`, `workflows/interactive/` | The `/kitchn` skill in root `skills/kitchn/`; `work`, `pr`, `issue`, and `hand-back` in `crates/kitchen-cli/src/commands/interactive.rs`; interactive tests |
 | #42 agent selection | `selection/` | House `agents` policy, the selection recorded on a task, and its launch check; backends map it to their own flags |
 | #48 repository readiness | `house/readiness.rs`; readiness findings in `house/doctor.rs` | Readiness tests in `crates/kitchen/tests/house_readiness.rs`; check history comes from #7 and #9, grants from #12 |
 | #50 deliberation threads and context records | `workflows/deliberation.rs`, `workflows/deliberation/` | Threads, records, and task pins as workflow markers in the house store; `crates/kitchen/tests/deliberation.rs` |

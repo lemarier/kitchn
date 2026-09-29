@@ -10,6 +10,7 @@ use crate::{
     },
     house::{HouseError, IssuedAuthority, MergeSubject},
     integrations::github::MergeStatusValue,
+    workflows::pickup::DEFAULT_FIX_ROUNDS,
 };
 
 mod store;
@@ -770,7 +771,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
                 | Gap::ReviewerStale
         )
     }) && grants.fix_request.covers(&e.house, &e.repository)
-        && history.fix_rounds < 2
+        && history.fix_rounds < DEFAULT_FIX_ROUNDS
         && !history.requested_this_head
         && (!gaps.contains(&Gap::ReviewerStale) || can_invoke_missing(e, &grants))
     {
@@ -780,7 +781,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
     {
         Verdict::Skip
     } else {
-        if history.fix_rounds >= 2 {
+        if history.fix_rounds >= DEFAULT_FIX_ROUNDS {
             gaps.push(Gap::FixBudget);
         }
         Verdict::HandOver { gaps }

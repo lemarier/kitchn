@@ -17,7 +17,7 @@ use crate::{
         Provenance, Repository, RetryPolicy, Role, Settlement, TaskAuthority, TaskSpec, Text,
         Timestamp, Trigger,
     },
-    selection::{AgentPolicy, SelectionRequest},
+    selection::{AgentPolicy, ResolvedSelection, SelectionRequest},
     state::{HouseStore, Lease, OwnershipEvent, StateError, TaskRecord, TaskState},
     workflows::{coordination::CoordinationError, recovery::QueuedFollowUp},
 };
@@ -520,6 +520,24 @@ pub struct TaskTemplate {
     pub agents: Option<AgentPolicy>,
 }
 
+/// The selection `agents` resolves for `role` in `repository`, or `None` for
+/// a house without an agent policy. Every path that creates a task spec
+/// resolves through this, so a pickup, a scheduled repair and an interactive
+/// repair round pick the same agent for the same house.
+#[must_use]
+pub fn resolve_agent(
+    agents: Option<&AgentPolicy>,
+    role: Role,
+    repository: &Repository,
+) -> Option<ResolvedSelection> {
+    agents.map(|policy| {
+        policy.resolve(&SelectionRequest {
+            repository: Some(repository.clone()),
+            ..SelectionRequest::new(role)
+        })
+    })
+}
+
 impl TaskTemplate {
     /// The task spec for `issue`, carrying the selection the house policy
     /// resolves for the task's role and repository.
@@ -528,12 +546,7 @@ impl TaskTemplate {
     /// Propagates task-id derivation failures.
     pub fn spec_for(&self, issue: &IssueRef) -> Result<TaskSpec> {
         let role = Role::StationCook;
-        let agent = self.agents.as_ref().map(|policy| {
-            policy.resolve(&SelectionRequest {
-                repository: Some(issue.repository.clone()),
-                ..SelectionRequest::new(role)
-            })
-        });
+        let agent = resolve_agent(self.agents.as_ref(), role, &issue.repository);
         Ok(TaskSpec {
             id: issue_task_id(issue)?,
             role,
@@ -635,6 +648,11 @@ pub struct PinnedInstructions {
     /// plain single-line path.
     pub entrypoint: Text,
 }
+
+/// Review-fix and repair rounds a house allows per pull request. The merge
+/// gate hands over at this count, and an interactive `pr` session may only
+/// lower it.
+pub const DEFAULT_FIX_ROUNDS: u8 = 2;
 
 /// Review and fix budgets carried into the brief and enforced by repair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

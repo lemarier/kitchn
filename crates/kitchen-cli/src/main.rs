@@ -46,6 +46,8 @@ enum Command {
     Pickup(commands::pickup::PickupArgs),
     /// Bind a house to the forge account it writes as, or show its binding.
     Forge(commands::forge::ForgeArgs),
+    #[command(flatten)]
+    Interactive(commands::interactive::InteractiveCommand),
 }
 
 fn main() -> ExitCode {
@@ -85,6 +87,7 @@ fn main() -> ExitCode {
         },
         Some(Command::Pickup(args)) => commands::pickup::run(args).map(|output| (output, true)),
         Some(Command::Forge(args)) => commands::forge::run(args),
+        Some(Command::Interactive(command)) => commands::interactive::run(command),
         None => return output_status(Cli::command().print_help()),
     };
     match result {

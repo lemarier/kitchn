@@ -218,6 +218,7 @@ impl HouseGateStore<'_> {
                 &record.base,
                 gaps,
                 &decision.verified_findings,
+                decision.merged_elsewhere.as_ref(),
             )?,
             Verdict::FixRequest { gaps } => {
                 return self
@@ -416,14 +417,14 @@ fn find_key<'a>(tasks: &'a [TaskRecord], key: &IdempotencyKey) -> Option<&'a Eff
         .find(|effect| effect.request().key() == key)
 }
 
-const fn gate_state(state: &EffectState) -> GateEffectState {
+fn gate_state(state: &EffectState) -> GateEffectState {
     match state {
         EffectState::Intended => GateEffectState::Intended,
         EffectState::Uncertain { .. } => GateEffectState::Uncertain,
-        EffectState::Applied { receipt, .. } if receipt.retarget().is_some() => {
-            GateEffectState::AppliedElsewhere
-        }
-        EffectState::Applied { .. } => GateEffectState::Applied,
+        EffectState::Applied { receipt, .. } => match receipt.retarget() {
+            Some(retarget) => GateEffectState::AppliedElsewhere(retarget.clone()),
+            None => GateEffectState::Applied,
+        },
         EffectState::NotApplied { .. } => GateEffectState::NotApplied,
         EffectState::Unresolvable { .. } | EffectState::Waived { .. } => {
             GateEffectState::HandedOver

@@ -1767,7 +1767,8 @@ fn reconcile_lost_merge(landed: Value) -> TestResult<(ReconcileReport, usize)> {
         scope,
         provider(&fixture, &task, remote.clone())?,
         ReadLimits::default(),
-    );
+    )
+    .with_merge_grant(granted()?);
     let clock = ManualClock::starting_at(1);
     let lost = run_effect(
         &fixture.store,
@@ -1908,7 +1909,8 @@ fn already_merged_retargeted_pull_request_is_applied_without_submission() -> Tes
         scope,
         provider(&fixture, &task, remote.clone())?,
         ReadLimits::default(),
-    );
+    )
+    .with_merge_grant(granted()?);
     let effect = backend.effect(mutation(merge(HEAD, Some(BASE))?)?)?;
     let record = run_effect(
         &fixture.store,

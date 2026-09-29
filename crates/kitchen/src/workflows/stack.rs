@@ -10,6 +10,19 @@
 //! boundary's pull-request and remote-head checks before anything reaches
 //! the remote, and never rewrites layers another writer is working on, as
 //! derived from the tool's own view of the stack and the house's tasks.
+//! Before a stack push or submission, every unmerged layer below the task's
+//! branch must still be an open pull request on the same base chain whose
+//! remote and pull-request heads are the head the checkout holds
+//! ([`LowerLayerFault`]); a lower layer someone else moved, merged, closed,
+//! or retargeted refuses the command with that layer named. Every unmerged
+//! layer above it must hold no remote commit the checkout has not
+//! integrated, and one with a pull request must still be open with its
+//! branch on the remote ([`UpperLayerFault`]). The boundary
+//! then pushes the layers itself in one atomic update leased to the heads it
+//! checked, so a layer moved after the check fails the whole push, and uses
+//! the tool only to link pull requests that already exist, named by number.
+//! A submission with a layer that has no pull request is refused before any
+//! push ([`StackRefusal::NoPullRequest`]).
 //! [`GhStack`] runs `gh stack` with non-interactive flags and an explicit
 //! remote.
 //!
@@ -34,11 +47,11 @@ use crate::{
         coordination::{CoordinationError, held_branches, task_branch},
         pickup::is_shell_safe,
         push::{
-            Decision, GitRemote, IsolatedGitConfig, PullRequests, PushIntent, PushRefusal,
-            RefUpdater, RemoteBranches, bind, decide, git_environment, observe, record_landed,
-            run_bounded,
+            Binding, Decision, GitRemote, IsolatedGitConfig, LayerUpdate, LayersPermit,
+            PullRequests, PushIntent, PushRefusal, RefUpdater, RemoteBranches, UpdateFailure, bind,
+            decide, git_environment, observe, record_landed, run_bounded,
         },
-        repair::Observed,
+        repair::{Observed, PullRequestState},
     },
 };
 
@@ -103,6 +116,75 @@ pub enum StackRefusal {
     /// request, or its remote head.
     #[error("the push boundary refused the stack command")]
     Push(PushRefusal),
+    /// A layer below the task's branch is not in the state the push builds
+    /// on.
+    #[error("lower stack layer {branch} is not in the state this push builds on")]
+    LowerLayer {
+        /// The lower layer.
+        branch: BranchName,
+        /// What is wrong with it.
+        fault: LowerLayerFault,
+    },
+    /// A layer above the task's branch is not in a state the push may
+    /// replace.
+    #[error("upper stack layer {branch} is not in a state this push may replace")]
+    UpperLayer {
+        /// The upper layer.
+        branch: BranchName,
+        /// What is wrong with it.
+        fault: UpperLayerFault,
+    },
+    /// A submission reached a layer at or above the task's branch that has
+    /// no pull request. The stack tool opens one only by pushing the branch
+    /// itself, outside the boundary's leased push, so nothing is pushed.
+    #[error("stack layer {branch} has no pull request to link")]
+    NoPullRequest {
+        /// The layer.
+        branch: BranchName,
+    },
+}
+
+/// Why a layer below the task's branch refuses a stack push or submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LowerLayerFault {
+    /// The layer has no pull request to check.
+    NoPullRequest,
+    /// Its pull request merged or closed, though the stack tool still holds
+    /// the layer as unmerged.
+    NotOpen(PullRequestState),
+    /// Its pull request's head branch is not the layer.
+    WrongBranch,
+    /// Its pull request is based on neither the layer below it nor a merged
+    /// layer between them (or the trunk, for the bottom layer).
+    BaseChanged,
+    /// Its remote head or pull-request head is not the head the checkout
+    /// holds, or its remote branch is gone.
+    HeadMoved,
+    /// The pull request, the remote head, or the checkout's head could not be
+    /// read.
+    Unknown,
+}
+
+/// Why a layer above the task's branch refuses a stack push or submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UpperLayerFault {
+    /// Its pull request merged or closed, though the stack tool still holds
+    /// the layer as unmerged.
+    NotOpen(PullRequestState),
+    /// Its pull request's head branch is not the layer.
+    WrongBranch,
+    /// It has a pull request but its remote branch is gone, such as after
+    /// the forge deleted a merged branch: the push would recreate it.
+    BranchDeleted,
+    /// Its remote head is neither in the checkout's branch history nor in
+    /// that branch's reflog: the push would drop commits the checkout never
+    /// integrated.
+    NotIntegrated,
+    /// Its pull request, remote head, or checkout head could not be read,
+    /// or the checkout lacks the layer.
+    Unknown,
 }
 
 /// Check a plain branch operation. With a configured stack tool, a
@@ -239,12 +321,101 @@ pub enum StackResult {
     Rejected,
     /// The command may or may not have changed branches or pull requests.
     Uncertain,
+    /// A layer changed between the boundary's check and its push, so the
+    /// push updated no branch. Check again before another attempt.
+    Stale,
+}
+
+/// Link a stack's existing pull requests on the forge after the boundary
+/// pushed the layers itself. Every layer is named by its pull-request
+/// number: `gh stack link` pushes a layer it is given by branch name, so the
+/// type cannot express one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackLink {
+    /// The branch the bottom layer is based on.
+    pub trunk: BranchName,
+    /// The unmerged layers' pull requests, bottom to top.
+    pub pull_requests: Vec<IssueNumber>,
+    /// Mark the pull requests ready for review.
+    pub ready: bool,
+}
+
+/// Reads branch heads in the checkout the stack tool runs in.
+pub trait LocalBranches {
+    /// The head of the local `branch`, `Known(None)` when it does not exist,
+    /// and `Unknown` when it could not be read.
+    fn local_head(&self, branch: &BranchName) -> Observed<Option<CommitId>>;
+
+    /// Whether the local `branch` integrated `commit`: `commit` is in the
+    /// branch's current history, or is an entry of its reflog, as a rebase
+    /// leaves the replaced head. Git's `--force-if-includes` also accepts a
+    /// commit reachable only from an older reflog entry; this refuses it.
+    /// `Known(false)` when the checkout lacks `commit`.
+    fn includes(&self, branch: &BranchName, commit: &CommitId) -> Observed<bool>;
+}
+
+/// Most reflog entries [`LocalBranches::includes`] reads for one branch. A
+/// replaced head older than that is not found, so the push is refused unless
+/// the head is still in the branch's history.
+const MAX_REFLOG_ENTRIES: &str = "256";
+
+impl LocalBranches for GitRemote {
+    fn local_head(&self, branch: &BranchName) -> Observed<Option<CommitId>> {
+        let reference = format!("refs/heads/{branch}^{{commit}}");
+        match self.run(&["rev-parse", "--verify", "--quiet", &reference]) {
+            Some((Some(0), stdout)) => String::from_utf8(stdout)
+                .ok()
+                .and_then(|text| CommitId::new(text.trim()).ok())
+                .map_or(Observed::Unknown, |id| Observed::Known(Some(id))),
+            // `--verify --quiet` exits 1 without output for a missing ref.
+            Some((Some(1), stdout)) if stdout.is_empty() => Observed::Known(None),
+            Some(_) | None => Observed::Unknown,
+        }
+    }
+
+    fn includes(&self, branch: &BranchName, commit: &CommitId) -> Observed<bool> {
+        let reference = format!("refs/heads/{branch}");
+        let reflog = self.run(&[
+            "log",
+            "--walk-reflogs",
+            "--max-count",
+            MAX_REFLOG_ENTRIES,
+            "--format=%H",
+            &reference,
+            "--",
+        ]);
+        match reflog {
+            Some((Some(0), stdout)) => {
+                if stdout
+                    .split(|byte| *byte == b'\n')
+                    .any(|line| line == commit.as_str().as_bytes())
+                {
+                    return Observed::Known(true);
+                }
+            }
+            Some(_) | None => return Observed::Unknown,
+        }
+        // `cat-file -e` exits 1 without output for a missing object.
+        match self.run(&["cat-file", "-e", commit.as_str()]) {
+            Some((Some(0), _)) => {}
+            Some((Some(1), _)) => return Observed::Known(false),
+            Some(_) | None => return Observed::Unknown,
+        }
+        match self.run(&["merge-base", "--is-ancestor", commit.as_str(), &reference]) {
+            Some((Some(0), _)) => Observed::Known(true),
+            Some((Some(1), _)) => Observed::Known(false),
+            Some(_) | None => Observed::Unknown,
+        }
+    }
 }
 
 /// Runs stack-tool commands in one checkout.
 pub trait StackRunner {
     /// Run `command`.
     fn run(&self, command: &StackCommand) -> StackResult;
+
+    /// Link the stack's pull requests as `link` describes.
+    fn link(&self, link: &StackLink) -> StackResult;
 }
 
 /// The `gh stack` extension of the GitHub CLI, run in one checkout against
@@ -355,9 +526,45 @@ impl GhStack {
         args
     }
 
+    /// The exact arguments for `link`: every layer by pull-request number,
+    /// which the tool does not push.
+    #[must_use]
+    pub fn link_args(&self, link: &StackLink) -> Vec<String> {
+        let mut args = vec![
+            "stack".to_owned(),
+            "link".to_owned(),
+            "--base".to_owned(),
+            link.trunk.to_string(),
+        ];
+        if link.ready {
+            args.push("--open".to_owned());
+        }
+        args.extend(["--remote".to_owned(), self.remote.clone()]);
+        args.extend(
+            link.pull_requests
+                .iter()
+                .map(|number| number.get().to_string()),
+        );
+        args
+    }
+
+    /// Run `args` under [`Self::env`]; `None` when the tool did not finish.
+    fn call(&self, args: &[String]) -> Option<(Option<i32>, Vec<u8>)> {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        // `gh stack` runs Git in the worker's checkout: pin what its
+        // configuration may change about a push or rebase.
+        let env = self.env();
+        let env: Vec<(&str, &str)> = env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        run_bounded(&self.gh, &self.checkout, &args, &env, self.deadline)
+    }
+
     /// A [`GitRemote`] for the same checkout, remote name, and Git
-    /// configuration this tool pushes with, so the boundary's checks read
-    /// the configuration the tool's Git uses.
+    /// configuration the tool runs with, so the boundary's checks read the
+    /// configuration the tool's Git uses, and the boundary pushes the layers
+    /// through it.
     ///
     /// # Errors
     /// Returns [`CoordinationError::InvalidGitRemote`] for a relative `git`
@@ -411,21 +618,9 @@ const NO_PROMPTS: [(&str, &str); 6] = [
 
 impl StackRunner for GhStack {
     fn run(&self, command: &StackCommand) -> StackResult {
-        let args = self.args(command);
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        // `gh stack` runs Git in the worker's checkout: pin what its
-        // configuration may change about a push or rebase.
-        let env = self.env();
-        let env: Vec<(&str, &str)> = env
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
-        let Some((code, stdout)) =
-            run_bounded(&self.gh, &self.checkout, &args, &env, self.deadline)
-        else {
+        let Some((code, stdout)) = self.call(&self.args(command)) else {
             return StackResult::Uncertain;
         };
-        // Exit codes documented by gh-stack.
         match code {
             Some(0) => match command {
                 StackCommand::View => serde_json::from_slice(&stdout)
@@ -436,15 +631,30 @@ impl StackRunner for GhStack {
                 | StackCommand::Push
                 | StackCommand::Submit { .. } => StackResult::Done,
             },
-            Some(2) => StackResult::NotInStack,
-            Some(3) => StackResult::Conflict,
-            Some(7) => StackResult::RebaseInProgress,
-            Some(8) => StackResult::Locked,
-            Some(5 | 6 | 9) => StackResult::Rejected,
-            // A generic or API failure may follow a partial push.
-            _ if command.touches_upstack() => StackResult::Uncertain,
-            _ => StackResult::Rejected,
+            code => exit_result(code, command.touches_upstack()),
         }
+    }
+
+    fn link(&self, link: &StackLink) -> StackResult {
+        // Linking pushes nothing for layers named by number, but it can
+        // change pull-request bases before failing.
+        self.call(&self.link_args(link))
+            .map_or(StackResult::Uncertain, |(code, _)| exit_result(code, true))
+    }
+}
+
+/// A `gh stack` exit code, as documented by gh-stack.
+const fn exit_result(code: Option<i32>, touches: bool) -> StackResult {
+    match code {
+        Some(0) => StackResult::Done,
+        Some(2) => StackResult::NotInStack,
+        Some(3) => StackResult::Conflict,
+        Some(7) => StackResult::RebaseInProgress,
+        Some(8) => StackResult::Locked,
+        Some(5 | 6 | 9) => StackResult::Rejected,
+        // A generic or API failure may follow a partial remote change.
+        _ if touches => StackResult::Uncertain,
+        _ => StackResult::Rejected,
     }
 }
 
@@ -527,12 +737,15 @@ pub struct StackBoundary<'a> {
     pub runner: &'a dyn StackRunner,
     /// Pull request reads.
     pub pull_requests: &'a dyn PullRequests,
-    /// Remote head reads, through the remote the tool pushes to.
+    /// Remote head reads, through the remote the layers are pushed to.
     pub remote: &'a dyn RemoteBranches,
-    /// The push side of that same remote: only its
-    /// [`RefUpdater::redirect`] and [`RefUpdater::pushes_to`] are used, to
-    /// check the checkout's configuration and the effective push URL.
+    /// The push side of that same remote: its [`RefUpdater::redirect`] and
+    /// [`RefUpdater::pushes_to`] check the checkout's configuration and the
+    /// effective push URL, and a stack push or submission pushes every layer
+    /// through its [`RefUpdater::update_layers`].
     pub updater: &'a dyn RefUpdater,
+    /// Branch heads in the checkout the layers are pushed from.
+    pub local: &'a dyn LocalBranches,
 }
 
 /// What a stack-tool command through the boundary did.
@@ -556,7 +769,24 @@ impl StackBoundary<'_> {
     /// checks them against `intent`: a merged or closed pull request, a
     /// deleted or moved branch, or an unreadable state refuses. Such a
     /// command also needs every layer above free of other writers, derived
-    /// through [`upstack`] from the tool's view of the stack.
+    /// through [`upstack`] from the tool's view of the stack. A push or
+    /// submission also needs every unmerged layer below to be as the checkout
+    /// holds it ([`LowerLayerFault`]), and every unmerged layer above to
+    /// hold no remote commit the checkout has not integrated and, with a pull
+    /// request, to be open with its branch on the remote
+    /// ([`UpperLayerFault`]).
+    ///
+    /// The tool never pushes a push or submission's layers. The boundary
+    /// pushes every unmerged layer in one atomic update
+    /// ([`RefUpdater::update_layers`]), each leased to the head it checked:
+    /// a lower layer is held at its checked head, and the task's branch and
+    /// the layers above move from their checked remote heads to the
+    /// checkout's. A branch that moved after the check fails the whole
+    /// update ([`StackResult::Stale`]) and nothing changes. A submission then
+    /// runs [`StackRunner::link`] with every layer's pull-request number, so
+    /// the tool pushes nothing. A submission with an unmerged layer that has
+    /// no pull request is refused before the push
+    /// ([`StackRefusal::NoPullRequest`]).
     ///
     /// # Errors
     /// Returns [`crate::state::StateError::StaleFence`] without a live claim
@@ -596,42 +826,71 @@ impl StackBoundary<'_> {
             Ok((observed, _)) => observed,
             Err(refusal) => return Ok(refused(refusal)),
         };
-        match decide(&binding, intent, &observed, None) {
-            Ok(Decision::Update(_) | Decision::Current) => {}
+        // Without a commit to compare, the check never finds the branch
+        // current: it yields the head a push may replace.
+        let replaces = match decide(&binding, intent, &observed, None) {
+            Ok(Decision::Update(permit)) => permit.replaces().cloned(),
+            Ok(Decision::Current) => return Ok(refused(PushRefusal::Unknown)),
             Err(refusal) => return Ok(refused(refusal)),
-        }
-        let above = match self.runner.run(&StackCommand::View) {
-            StackResult::Viewed(view) => upstack(self.store, &view, &binding.branch)?,
+        };
+        let view = match self.runner.run(&StackCommand::View) {
+            StackResult::Viewed(view) => view,
             StackResult::Done
             | StackResult::Conflict
             | StackResult::RebaseInProgress
             | StackResult::Locked
             | StackResult::NotInStack
             | StackResult::Rejected
-            | StackResult::Uncertain => Upstack::Unknown,
+            | StackResult::Uncertain
+            | StackResult::Stale => {
+                return Ok(StackOutcome::Refused(StackRefusal::UpstackBusy));
+            }
         };
-        match above {
+        match upstack(self.store, &view, &binding.branch)? {
             Upstack::Top | Upstack::Idle => {}
             Upstack::Busy | Upstack::Unknown => {
                 return Ok(StackOutcome::Refused(StackRefusal::UpstackBusy));
             }
         }
-        // The tool takes the remote by name, so it resolves the URLs itself
-        // and this check cannot bind them: check the checkout's
-        // configuration and read the URLs again as late as possible. The
-        // tool's Git reads no user or system configuration, so what remains
-        // is a worker writing its checkout's configuration between this
-        // read and the tool's own.
+        // Check the checkout's configuration and read the URLs again as
+        // late as possible. A rebase's tool takes the remote by name, so it
+        // resolves the URLs itself and this check cannot bind them; its Git
+        // reads no user or system configuration, so what remains is a worker
+        // writing its checkout's configuration between this read and the
+        // tool's own. A push checks once more and sends to the verified URL.
         if let Some(refusal) = self.remote_refusal(&binding.repository) {
             return Ok(refused(refusal));
         }
-        let result = self.runner.run(command);
-        if result == StackResult::Done
-            && matches!(command, StackCommand::Push | StackCommand::Submit { .. })
-        {
-            record_landed(self.store, self.clock, task, fence, &binding, intent)?;
+        let Some(publish) = publish(command) else {
+            return Ok(StackOutcome::Ran(self.runner.run(command)));
+        };
+        // The push moves the task's branch to the checkout's head.
+        let Observed::Known(Some(local)) = self.local.local_head(&binding.branch) else {
+            return Ok(refused(PushRefusal::Unknown));
+        };
+        let permit = match self.plan_push(&view, &binding, replaces, local) {
+            Ok(permit) => permit,
+            Err(refusal) => return Ok(StackOutcome::Refused(refusal)),
+        };
+        let link = match publish {
+            Publish::Push => None,
+            Publish::Submit { ready } => match link(&view, ready) {
+                Ok(link) => Some(link),
+                Err(refusal) => return Ok(StackOutcome::Refused(refusal)),
+            },
+        };
+        match self.updater.update_layers(&permit) {
+            Ok(()) => {}
+            Err(UpdateFailure::Rejected) => return Ok(StackOutcome::Ran(StackResult::Stale)),
+            Err(UpdateFailure::Redirected(key)) => {
+                return Ok(refused(PushRefusal::CheckoutRedirect(key)));
+            }
+            Err(UpdateFailure::Uncertain) => return Ok(StackOutcome::Ran(StackResult::Uncertain)),
         }
-        Ok(StackOutcome::Ran(result))
+        record_landed(self.store, self.clock, task, fence, &binding, intent)?;
+        Ok(StackOutcome::Ran(
+            link.map_or(StackResult::Done, |link| self.runner.link(&link)),
+        ))
     }
 }
 
@@ -657,6 +916,219 @@ impl StackBoundary<'_> {
             (Observed::Unknown, _) | (_, Observed::Unknown) => Some(PushRefusal::Unknown),
         }
     }
+}
+
+impl StackBoundary<'_> {
+    /// Check every unmerged layer below `branch`, bottom to top: its pull
+    /// request is open, is the layer's, and is based on the layer below it,
+    /// a merged layer between them, or the trunk; and its
+    /// remote and pull-request heads are the checkout's head of the layer.
+    ///
+    /// Returns each one held at its checked head, bottom to top.
+    fn check_lower(
+        &self,
+        lower: &[StackLayerView],
+        trunk: &BranchName,
+    ) -> std::result::Result<Vec<LayerUpdate>, StackRefusal> {
+        let mut held = Vec::with_capacity(lower.len());
+        let mut bases: Vec<&BranchName> = vec![trunk];
+        for layer in lower {
+            if layer.is_merged {
+                bases.push(&layer.name);
+                continue;
+            }
+            let head =
+                self.check_layer(layer, &bases)
+                    .map_err(|fault| StackRefusal::LowerLayer {
+                        branch: layer.name.clone(),
+                        fault,
+                    })?;
+            held.push(LayerUpdate::new(
+                layer.name.clone(),
+                Some(head.clone()),
+                head,
+            ));
+            bases = vec![&layer.name];
+        }
+        Ok(held)
+    }
+
+    /// Every unmerged layer's update, bottom to top: lower layers held at
+    /// their checked heads ([`Self::check_lower`]), the task's branch moved
+    /// from `replaces` to `local`, and each layer above moved from its
+    /// remote head to the checkout's ([`Self::check_upper`]).
+    fn plan_push(
+        &self,
+        view: &StackView,
+        binding: &Binding,
+        replaces: Option<CommitId>,
+        local: CommitId,
+    ) -> std::result::Result<LayersPermit, StackRefusal> {
+        let Some(position) = view
+            .branches
+            .iter()
+            .position(|layer| layer.name == binding.branch)
+        else {
+            return Err(StackRefusal::InvalidLayers);
+        };
+        let unmerged = view
+            .branches
+            .iter()
+            .filter(|layer| !layer.is_merged)
+            .count();
+        if unmerged > MAX_STACK_LAYERS {
+            return Err(StackRefusal::InvalidLayers);
+        }
+        let (lower, rest) = view.branches.split_at(position);
+        let mut updates = self.check_lower(lower, &view.trunk)?;
+        updates.push(LayerUpdate::new(binding.branch.clone(), replaces, local));
+        for layer in rest.iter().skip(1).filter(|layer| !layer.is_merged) {
+            let update = self
+                .check_upper(layer)
+                .map_err(|fault| StackRefusal::UpperLayer {
+                    branch: layer.name.clone(),
+                    fault,
+                })?;
+            updates.push(update);
+        }
+        Ok(LayersPermit::new(binding.repository.clone(), updates))
+    }
+
+    /// Check a layer above the task's branch and return its update, from
+    /// its remote head to the checkout's. The lease alone only guards
+    /// against a change during the push; this check refuses a remote head the
+    /// checkout never integrated, and, for a layer with a pull request, a
+    /// merged or closed pull request or a deleted branch.
+    fn check_upper(
+        &self,
+        layer: &StackLayerView,
+    ) -> std::result::Result<LayerUpdate, UpperLayerFault> {
+        let (Observed::Known(Some(local)), Observed::Known(remote)) = (
+            self.local.local_head(&layer.name),
+            self.remote.head(&layer.name),
+        ) else {
+            return Err(UpperLayerFault::Unknown);
+        };
+        if let Some(pr) = layer.pr {
+            let Observed::Known(Some(pull_request)) = self.pull_requests.pull_request(pr.number)
+            else {
+                return Err(UpperLayerFault::Unknown);
+            };
+            if pull_request.number != pr.number || pull_request.head_branch != layer.name.as_str() {
+                return Err(UpperLayerFault::WrongBranch);
+            }
+            match pull_request.state {
+                PullRequestState::Open => {}
+                state @ (PullRequestState::Merged | PullRequestState::Closed) => {
+                    return Err(UpperLayerFault::NotOpen(state));
+                }
+            }
+            if remote.is_none() {
+                return Err(UpperLayerFault::BranchDeleted);
+            }
+        }
+        if let Some(remote) = &remote
+            && remote != &local
+        {
+            match self.local.includes(&layer.name, remote) {
+                Observed::Known(true) => {}
+                Observed::Known(false) => return Err(UpperLayerFault::NotIntegrated),
+                Observed::Unknown => return Err(UpperLayerFault::Unknown),
+            }
+        }
+        Ok(LayerUpdate::new(layer.name.clone(), remote, local))
+    }
+
+    fn check_layer(
+        &self,
+        layer: &StackLayerView,
+        bases: &[&BranchName],
+    ) -> std::result::Result<CommitId, LowerLayerFault> {
+        let Some(pr) = layer.pr else {
+            return Err(LowerLayerFault::NoPullRequest);
+        };
+        let pull_request = match self.pull_requests.pull_request(pr.number) {
+            Observed::Known(Some(pull_request)) => pull_request,
+            Observed::Known(None) => return Err(LowerLayerFault::NoPullRequest),
+            Observed::Unknown => return Err(LowerLayerFault::Unknown),
+        };
+        if pull_request.number != pr.number || pull_request.head_branch != layer.name.as_str() {
+            return Err(LowerLayerFault::WrongBranch);
+        }
+        match pull_request.state {
+            PullRequestState::Open => {}
+            state @ (PullRequestState::Merged | PullRequestState::Closed) => {
+                return Err(LowerLayerFault::NotOpen(state));
+            }
+        }
+        if !bases
+            .iter()
+            .any(|base| pull_request.base_branch == base.as_str())
+        {
+            return Err(LowerLayerFault::BaseChanged);
+        }
+        let Observed::Known(local) = self.local.local_head(&layer.name) else {
+            return Err(LowerLayerFault::Unknown);
+        };
+        // A layer the checkout lacks cannot be compared.
+        let Some(local) = local else {
+            return Err(LowerLayerFault::Unknown);
+        };
+        match self.remote.head(&layer.name) {
+            Observed::Known(Some(remote)) if remote == local && pull_request.head == local => {
+                Ok(local)
+            }
+            Observed::Known(_) => Err(LowerLayerFault::HeadMoved),
+            Observed::Unknown => Err(LowerLayerFault::Unknown),
+        }
+    }
+}
+
+/// A command that pushes the stack's layers.
+#[derive(Debug, Clone, Copy)]
+enum Publish {
+    /// Push them.
+    Push,
+    /// Push them, then link their pull requests.
+    Submit { ready: bool },
+}
+
+/// Whether and how `command` pushes the stack's layers.
+const fn publish(command: &StackCommand) -> Option<Publish> {
+    match command {
+        StackCommand::Push => Some(Publish::Push),
+        StackCommand::Submit { ready } => Some(Publish::Submit { ready: *ready }),
+        StackCommand::Adopt { .. }
+        | StackCommand::Add { .. }
+        | StackCommand::RebaseUpstack
+        | StackCommand::View => None,
+    }
+}
+
+/// The link for `view`'s unmerged layers, by pull-request number.
+///
+/// # Errors
+/// Returns [`StackRefusal::NoPullRequest`] naming the lowest unmerged layer
+/// without a pull request.
+fn link(view: &StackView, ready: bool) -> std::result::Result<StackLink, StackRefusal> {
+    let pull_requests = view
+        .branches
+        .iter()
+        .filter(|layer| !layer.is_merged)
+        .map(|layer| {
+            layer
+                .pr
+                .map(|pr| pr.number)
+                .ok_or_else(|| StackRefusal::NoPullRequest {
+                    branch: layer.name.clone(),
+                })
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(StackLink {
+        trunk: view.trunk.clone(),
+        pull_requests,
+        ready,
+    })
 }
 
 const fn refused(refusal: PushRefusal) -> StackOutcome {
@@ -814,8 +1286,9 @@ pub struct RetargetPlan {
 /// each dependent pull request is retargeted before the merged branch is
 /// deleted and each branch's writer gets its own `rebase --onto`
 /// instruction; Kitchen rewrites no branch. With a stack tool, the lowest
-/// dependent's writer runs the tool, which retargets and rebases the layers
-/// in one pass through [`StackBoundary`].
+/// dependent's writer rebases the layers with the tool and submits them
+/// through [`StackBoundary`], which pushes them and relinks their pull
+/// requests.
 ///
 /// Dependents that are not on the merged branch's chain are ignored.
 ///

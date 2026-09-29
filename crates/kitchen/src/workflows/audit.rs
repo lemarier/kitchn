@@ -290,9 +290,11 @@ pub struct Publication<'a> {
     /// The forge the house's binding names, if any. Without one no source
     /// is a public forge link.
     pub forge: Option<ForgeKind>,
-    /// The repositories drafts are posted to (the house's posting
-    /// destinations); only links into these are published.
-    pub destinations: &'a BTreeSet<Repository>,
+    /// The one repository the drafts will be posted to, one of the house's
+    /// posting destinations. Only links into it are published, so a link
+    /// never reaches a reader who cannot already see its repository;
+    /// without it no forge link is published.
+    pub destination: Option<&'a Repository>,
 }
 
 impl Publication<'_> {
@@ -302,7 +304,8 @@ impl Publication<'_> {
             evidence.total = evidence.total.saturating_add(1);
             match self
                 .forge
-                .and_then(|forge| EvidenceLink::forge(forge, self.destinations, source))
+                .zip(self.destination)
+                .and_then(|(forge, destination)| EvidenceLink::forge(forge, destination, source))
             {
                 Some(link) if evidence.links.len() < MAX_LISTED => evidence.links.push(link),
                 Some(_) => evidence.unlisted = evidence.unlisted.saturating_add(1),
@@ -347,19 +350,15 @@ pub enum EvidenceLink {
 
 impl EvidenceLink {
     /// `source` as a forge link when it is safe to publish with a draft: for
-    /// GitHub, `https://github.com/<owner>/<repo>` with `<owner>/<repo>` one
-    /// of `destinations` (the repositories drafts are posted to, so a link
-    /// never reaches a reader who cannot already see its repository),
+    /// GitHub, `https://github.com/<owner>/<repo>` with `<owner>/<repo>` the
+    /// `destination` the draft is posted to (so a link never reaches a reader
+    /// who cannot already see its repository),
     /// optionally followed by exactly `issues/<number>`, `pull/<number>`, or
     /// `commit/<7-40 hex>`, and an optional `#` fragment of letters, digits,
     /// `-`, and `_`. Any other path (a transcript or file locator, for
     /// example), a query, port, credential, or other host is private.
     #[must_use]
-    pub fn forge(
-        forge: ForgeKind,
-        destinations: &BTreeSet<Repository>,
-        source: &ExternalRef,
-    ) -> Option<Self> {
+    pub fn forge(forge: ForgeKind, destination: &Repository, source: &ExternalRef) -> Option<Self> {
         match forge {
             ForgeKind::GitHub => {
                 let rest = source.as_str().strip_prefix("https://github.com/")?;
@@ -381,10 +380,8 @@ impl EvidenceLink {
                 };
                 let mut segments = path.split('/');
                 let (owner, name) = (segments.next()?, segments.next()?);
-                let own = destinations.iter().any(|repository| {
-                    repository.owner().eq_ignore_ascii_case(owner)
-                        && repository.name().eq_ignore_ascii_case(name)
-                });
+                let own = destination.owner().eq_ignore_ascii_case(owner)
+                    && destination.name().eq_ignore_ascii_case(name);
                 let resource = match (segments.next(), segments.next(), segments.next()) {
                     (None, None, None) => true,
                     (Some("issues" | "pull"), Some(number), None) => {

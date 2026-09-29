@@ -351,7 +351,7 @@ fn audit_with(
             open,
             publication: Publication {
                 forge: Some(ForgeKind::GitHub),
-                destinations: &repositories,
+                destination: repositories.first(),
             },
         },
     ))
@@ -887,7 +887,7 @@ fn the_audit_refuses_to_read_another_house() -> TestResult {
     let (schedules, repositories) = (schedules()?, repositories()?);
     let publication = Publication {
         forge: Some(ForgeKind::GitHub),
-        destinations: &repositories,
+        destination: repositories.first(),
     };
     let cases = [
         (&foreign_ledger, &f.store, &ours),
@@ -1047,9 +1047,11 @@ fn an_unknown_house_budget_reports_without_proposing() -> TestResult {
 
 #[test]
 fn only_resource_links_into_the_posting_destinations_are_public() -> TestResult {
-    let repositories = repositories()?;
+    // The draft's own destination; another posting destination of the same
+    // house (say a private one) is not a place its links may appear.
+    let destination = project()?;
     let public = |value: &str| -> TestResult<bool> {
-        Ok(EvidenceLink::forge(ForgeKind::GitHub, &repositories, &source(value)?).is_some())
+        Ok(EvidenceLink::forge(ForgeKind::GitHub, &destination, &source(value)?).is_some())
     };
     for listed in [
         "https://github.com/example/project/pull/7",
@@ -1064,6 +1066,7 @@ fn only_resource_links_into_the_posting_destinations_are_public() -> TestResult 
         "fixture:inspection-finding",
         "http://github.com/example/project/pull/7",
         "https://github.com/example/other/pull/7",
+        "https://github.com/example/other/issues/42",
         "https://github.com/example/project.git/pull/7",
         "https://github.com/example/project/../other/pull/7",
         "https://github.com/example/project/pull/7/",
@@ -1133,7 +1136,7 @@ fn evidence_beyond_the_listing_limit_is_counted() -> TestResult {
             open: Some(&BTreeSet::new()),
             publication: Publication {
                 forge: None,
-                destinations: &repositories,
+                destination: repositories.first(),
             },
         },
     )?;

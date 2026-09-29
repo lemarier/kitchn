@@ -375,7 +375,7 @@ filed, and no guidance, grant, or schedule changes.
 ```sh
 kitchn audit --registry <dir> --house <id> [--store <dir>] --ledger <dir> \
   (--orca <path> --runtime-dir <dir> | --schedule-evidence <file>) \
-  [--open-proposal <key>... | --no-open-proposals] [--json]
+  [--open-proposal <key>... | --no-open-proposals] [--destination <owner/name>] [--json]
 ```
 
 The report lists repeated confirmed findings per station and work type,
@@ -402,7 +402,9 @@ known; otherwise the report says why and lists the withheld proposal keys.
 At most 10 drafts come out of one run; the rest are listed as deferred. The
 ledger, store, and schedules must all belong to `--house`. Reports and drafts
 hold typed names, counts, and public-safe links only: an `https` link on the
-house's bound forge into one of its repositories, or a schedule consumer.
+house's bound forge to an issue, pull request, or commit in `--destination`,
+the posting destination the drafts will be filed in, or a schedule consumer.
+Without `--destination` no forge link is published.
 Other sources, finding text, transcripts, and backend handles stay in the
 house.
 

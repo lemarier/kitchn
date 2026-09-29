@@ -294,6 +294,11 @@ fn invalid_input_and_another_house_are_refused() -> TestResult {
         assert!(refused.stdout.is_empty());
     }
 
+    // A draft destination must be one of the house's posting destinations.
+    let elsewhere = kitchen.listed(&["--no-open-proposals", "--destination", "someone/else"])?;
+    assert_eq!(elsewhere.status.code(), Some(2), "{elsewhere:?}");
+    assert!(elsewhere.stdout.is_empty());
+
     let foreign = Kitchen::new(true, "crabnebula")?;
     let refused = foreign.unproven(&[])?;
     assert_eq!(refused.status.code(), Some(1), "{refused:?}");

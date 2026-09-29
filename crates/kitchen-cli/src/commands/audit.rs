@@ -76,6 +76,11 @@ pub struct AuditArgs {
     /// No proposal is open on the forge.
     #[arg(long, conflicts_with = "open")]
     no_open_proposals: bool,
+    /// The posting destination (`owner/name`) the drafts will be filed in;
+    /// only evidence links into it are published. Without it every source
+    /// stays private.
+    #[arg(long)]
+    destination: Option<kitchen::contracts::Repository>,
     /// Print the full report, with each draft's body, as JSON.
     #[arg(long)]
     json: bool,
@@ -146,6 +151,14 @@ pub fn run(args: AuditArgs) -> Result<(String, bool), kitchen::Error> {
         // Clap requires one source, and `--orca` with `--runtime-dir`.
         _ => return Err(HouseError::InvalidInput.into()),
     };
+    // A draft goes only to one of the house's posting destinations.
+    if args
+        .destination
+        .as_ref()
+        .is_some_and(|destination| !config.posting_destinations.contains(destination))
+    {
+        return Err(HouseError::InvalidInput.into());
+    }
     let report = audit::audit(
         &AuditPolicy::default(),
         &AuditInputs {
@@ -157,7 +170,7 @@ pub fn run(args: AuditArgs) -> Result<(String, bool), kitchen::Error> {
             open: open.as_ref(),
             publication: Publication {
                 forge,
-                destinations: &config.posting_destinations,
+                destination: args.destination.as_ref(),
             },
         },
     )?;

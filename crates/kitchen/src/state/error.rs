@@ -28,6 +28,8 @@ pub enum Limit {
     Decisions,
     /// Workflow markers per house store.
     Markers,
+    /// Bytes in the reason of a write acknowledgement.
+    AcknowledgementReason,
 }
 
 impl fmt::Display for Limit {
@@ -41,6 +43,7 @@ impl fmt::Display for Limit {
             Self::ConsumedMessages => "consumed messages per task",
             Self::Decisions => "risk decisions per effect",
             Self::Markers => "workflow markers per house",
+            Self::AcknowledgementReason => "bytes in an acknowledgement reason",
         })
     }
 }
@@ -264,6 +267,17 @@ pub enum StateError {
     /// A reported outcome contradicts the recorded one.
     #[error("effect {0} already has a contradicting recorded outcome")]
     ConflictingOutcome(EffectSeq),
+    /// A backend lookup was for a different effect.
+    #[error("the lookup does not name effect {0}")]
+    LookupScope(EffectSeq),
+    /// Only a person in an interactive session may acknowledge a settled
+    /// task's writes.
+    #[error("acknowledging a settled task's writes needs a person in an interactive session")]
+    AcknowledgementNeedsPerson,
+    /// The settled task has no write that reached, or may have reached, the
+    /// backend, so there is nothing to acknowledge.
+    #[error("task {0} has no write to acknowledge")]
+    NothingToAcknowledge(TaskId),
     /// An attempt outcome contradicts the recorded one.
     #[error("attempt outcome contradicts the recorded outcome")]
     ConflictingAttemptOutcome,
@@ -338,7 +352,9 @@ impl StateError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
-            Self::SubmissionBudgetExhausted(_) | Self::ConsentReused => ErrorClass::Refused,
+            Self::SubmissionBudgetExhausted(_)
+            | Self::ConsentReused
+            | Self::AcknowledgementNeedsPerson => ErrorClass::Refused,
             Self::MarkerSchemaInvalid | Self::MarkerPayloadInvalid => ErrorClass::InvalidInput,
             Self::TaskNotFound(_)
             | Self::TaskConflict(_)
@@ -365,6 +381,8 @@ impl StateError {
             | Self::NotHandedOver(_)
             | Self::DecisionScope(_)
             | Self::ConflictingOutcome(_)
+            | Self::LookupScope(_)
+            | Self::NothingToAcknowledge(_)
             | Self::ConflictingAttemptOutcome
             | Self::StaleDecision { .. }
             | Self::NotInitialized

@@ -24,6 +24,7 @@ use crate::{
     state::{
         ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerAttempt, MarkerFact,
         MarkerKey, MarkerRecording, StateError, WorkflowMarker,
+        effects::{Found, SettledLookup},
         marker::{MarkerRefusal, Markers},
     },
 };
@@ -46,6 +47,8 @@ pub const MAX_DECISIONS_PER_EFFECT: usize = 16;
 pub const MAX_OWNERSHIP_HISTORY: usize = 256;
 /// Consumed message ids remembered per task.
 pub const MAX_CONSUMED_MESSAGES: usize = 1024;
+/// Bytes in the reason of a [`WriteAcknowledgement`].
+pub const MAX_ACKNOWLEDGEMENT_REASON_BYTES: usize = 4096;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -1797,14 +1800,14 @@ impl StoreState {
         Ok(effect.clone())
     }
 
-    /// Record what a forge re-read proved about one write of a task that has
-    /// settled. Needs no lease, since a settled task has none; only the
-    /// person-driven acknowledgement path calls it.
-    pub(crate) fn record_settled_outcome(
+    /// Record what a backend lookup proved about one write of a task that
+    /// has settled. Needs no lease, since a settled task has none; only
+    /// [`crate::state::reread_settled`] builds the lookup.
+    pub(crate) fn record_settled_lookup(
         &mut self,
         id: &TaskId,
         seq: EffectSeq,
-        outcome: EffectOutcome,
+        lookup: SettledLookup,
         now: Timestamp,
     ) -> Result<EffectRecord> {
         let task = self.task_mut(id)?;
@@ -1816,17 +1819,58 @@ impl StoreState {
             .iter_mut()
             .find(|effect| effect.seq == seq)
             .ok_or(Error::State(StateError::EffectNotFound(seq)))?;
-        apply_outcome(effect, seq, outcome, now)?;
+        if lookup.key() != effect.request.key() {
+            return fail(StateError::LookupScope(seq));
+        }
+        let next = match (&effect.state, lookup.into_found()) {
+            (
+                EffectState::Intended
+                | EffectState::Uncertain { .. }
+                | EffectState::Unresolvable { .. }
+                | EffectState::Waived { .. },
+                Found::Applied(receipt),
+            ) => Some(EffectState::Applied { receipt, at: now }),
+            (
+                EffectState::Intended
+                | EffectState::Uncertain { .. }
+                | EffectState::Unresolvable { .. }
+                | EffectState::Waived { .. },
+                Found::Absent,
+            ) => Some(EffectState::NotApplied {
+                reason: NotAppliedReason::ConfirmedAbsent,
+                at: now,
+            }),
+            (EffectState::Applied { receipt, .. }, Found::Applied(found)) if *receipt == found => {
+                None
+            }
+            (EffectState::NotApplied { .. }, Found::Absent) => None,
+            (EffectState::Applied { .. }, Found::Applied(_) | Found::Absent)
+            | (EffectState::NotApplied { .. }, Found::Applied(_)) => {
+                return fail(StateError::ConflictingOutcome(seq));
+            }
+        };
+        if let Some(next) = next {
+            effect.state = next;
+        }
         Ok(effect.clone())
     }
 
-    /// Record that a person reviewed the forge writes of a settled task that
-    /// did not succeed. Repeating the call keeps the first acknowledgement.
+    /// Record that a person reviewed the writes of a settled task that did
+    /// not succeed. Repeating the call keeps the first acknowledgement and
+    /// reports it as already recorded.
     pub(crate) fn acknowledge_settled_writes(
         &mut self,
         id: &TaskId,
-        acknowledgement: WriteAcknowledgement,
-    ) -> Result<TaskRecord> {
+        claimant: &Claimant,
+        reason: &Text,
+        now: Timestamp,
+    ) -> Result<(WriteAcknowledgement, bool)> {
+        match claimant.trigger {
+            Trigger::Interactive => {}
+            Trigger::Scheduled | Trigger::Event(_) => {
+                return fail(StateError::AcknowledgementNeedsPerson);
+            }
+        }
         let task = self.task_mut(id)?;
         match task.settlement() {
             None => return fail(StateError::TaskNotSettled(id.clone())),
@@ -1836,12 +1880,41 @@ impl StoreState {
                     settlement: Settlement::Succeeded,
                 });
             }
-            Some(_) => {}
+            Some(Settlement::Failed | Settlement::Cancelled | Settlement::Exhausted) => {}
         }
-        if task.acknowledgement.is_none() {
-            task.acknowledgement = Some(acknowledgement);
+        let wrote = task
+            .effects
+            .iter()
+            .any(|effect| !matches!(effect.state, EffectState::NotApplied { .. }));
+        if !wrote {
+            return fail(StateError::NothingToAcknowledge(id.clone()));
         }
-        Ok(task.clone())
+        if reason.as_str().len() > MAX_ACKNOWLEDGEMENT_REASON_BYTES {
+            return fail(StateError::CapacityExceeded {
+                limit: Limit::AcknowledgementReason,
+            });
+        }
+        if let Some(recorded) = &task.acknowledgement {
+            return Ok((recorded.clone(), true));
+        }
+        let mut unresolved: Vec<EffectName> = Vec::new();
+        for effect in task
+            .effects
+            .iter()
+            .filter(|effect| !effect.state.is_resolved())
+        {
+            if !unresolved.contains(&effect.name) {
+                unresolved.push(effect.name.clone());
+            }
+        }
+        let acknowledgement = WriteAcknowledgement {
+            by: claimant.holder.clone(),
+            at: now,
+            reason: reason.clone(),
+            unresolved,
+        };
+        task.acknowledgement = Some(acknowledgement.clone());
+        Ok((acknowledgement, false))
     }
 
     pub(crate) fn accept_risk(
@@ -2290,6 +2363,10 @@ impl StoreState {
             || task.consumed.len() > MAX_CONSUMED_MESSAGES
             || task.attempts.len()
                 > usize::try_from(task.spec.retry.max_attempts()).unwrap_or(usize::MAX)
+            || task.acknowledgement.as_ref().is_some_and(|recorded| {
+                recorded.reason.as_str().len() > MAX_ACKNOWLEDGEMENT_REASON_BYTES
+                    || recorded.unresolved.len() > MAX_EFFECTS_PER_TASK
+            })
         {
             return Err(Corruption::LimitExceeded);
         }

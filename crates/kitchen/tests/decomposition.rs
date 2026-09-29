@@ -7,13 +7,16 @@ use kitchen::{
     contracts::{
         Clock, EffectFailure, ExternalRef, Grant, HouseGrants, IssueNumber, NotAppliedReason,
         Permission, PostingBudget, Provenance, Repository, Settlement, Text, Timestamp,
-        UncertainReason,
+        UncertainReason, fake::FakeBackend,
     },
     integrations::github::{
         CredentialRef, GitHubExecutor, GitHubMutationTransport, GitHubReadTransport, HouseScope,
         IntegrationError, MutationRequest, ReadLimits, ReadRequest,
     },
-    state::{EffectOutcome, EffectRecord, EffectState, RiskAction, RiskDecision, TaskState},
+    state::{
+        EffectOutcome, EffectRecord, EffectState, Limit, MAX_ACKNOWLEDGEMENT_REASON_BYTES,
+        RiskAction, RiskDecision, StateError, TaskState,
+    },
     workflows::decomposition::{
         AcknowledgeReport, ApplyOptions, ApplyOutcome, Approval, Blocker, DecompositionError,
         IssueKey, OverlapResolution, OwnedPath, Preview, Proposal, ProposedIssue, WriteKind,
@@ -1379,24 +1382,145 @@ fn only_a_settled_unsuccessful_decomposition_can_be_acknowledged() -> TestResult
     });
     let other = House::new(20)?;
     other.apply(&pending, &proposal, &approval)?;
-    assert!(other.acknowledge(&pending, &id, &person, true).is_err());
     let unsettled = other
-        .fixture
-        .store
-        .acknowledge_settled_writes(
-            &id,
-            kitchen::state::WriteAcknowledgement {
-                by: person.holder.clone(),
-                at: other.clock.now(),
-                reason: Text::new("too early")?,
-                unresolved: Vec::new(),
-            },
-        )
+        .acknowledge(&pending, &id, &person, true)
         .err()
         .ok_or("an unsettled task was acknowledged")?;
     assert!(matches!(
-        unsettled,
-        Error::State(kitchen::state::StateError::TaskNotSettled(_))
+        unsettled
+            .downcast_ref::<Error>()
+            .and_then(decomposition_error),
+        Some(DecompositionError::NotHeld(_))
     ));
+    assert_eq!(other.fixture.store.task(&id)?.write_acknowledgement(), None);
+    Ok(())
+}
+
+#[test]
+fn an_overlong_reason_is_refused_before_the_forge_is_read() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge::seeded());
+    let (_, id) = settled_with_an_unknown_write(&house, &forge, Fault::LoseAfterApply)?;
+    let executor = GitHubExecutor::new(
+        BackendId::new("github")?,
+        house.scope.clone(),
+        Transport(&forge),
+        ReadLimits::default(),
+    );
+    let long = Text::new(&"r".repeat(MAX_ACKNOWLEDGEMENT_REASON_BYTES + 1))?;
+    let error = acknowledge(
+        &house.fixture.store,
+        Some(&executor),
+        &id,
+        &interactive("owner-session")?,
+        &long,
+        &house.clock,
+    )
+    .err()
+    .ok_or("an overlong reason was accepted")?;
+    assert!(matches!(
+        error,
+        Error::State(StateError::CapacityExceeded {
+            limit: Limit::AcknowledgementReason
+        })
+    ));
+    // The re-read did not run: the forge proved the write applied, yet the
+    // store still holds it as waived, and nothing was acknowledged.
+    let after = house.fixture.store.task(&id)?;
+    assert!(matches!(
+        after.effects().first().map(EffectRecord::state),
+        Some(EffectState::Waived { .. })
+    ));
+    assert_eq!(after.write_acknowledgement(), None);
+    Ok(())
+}
+
+#[test]
+fn a_reread_that_proves_every_write_absent_leaves_nothing_to_acknowledge() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge::seeded());
+    let (proposal, id) = settled_with_an_unknown_write(&house, &forge, Fault::LoseBeforeApply)?;
+    // A backend that can prove absence; the GitHub issue lookup cannot.
+    let prover = FakeBackend::fully_capable(
+        BackendId::new("github")?,
+        kitchen::HouseId::new(common::HOUSE)?,
+    );
+    let error = acknowledge(
+        &house.fixture.store,
+        Some(&prover),
+        &id,
+        &interactive("owner-session")?,
+        &Text::new("checked by hand")?,
+        &house.clock,
+    )
+    .err()
+    .ok_or("a task without writes was acknowledged")?;
+    assert!(matches!(
+        decomposition_error(&error),
+        Some(DecompositionError::NotHeld(_))
+    ));
+    let after = house.fixture.store.task(&id)?;
+    assert!(matches!(
+        after.effects().first().map(EffectRecord::state),
+        Some(EffectState::NotApplied {
+            reason: NotAppliedReason::ConfirmedAbsent,
+            ..
+        })
+    ));
+    assert_eq!(after.write_acknowledgement(), None);
+    // The waiver that let the task settle stays in the write's history.
+    assert_eq!(
+        after
+            .effects()
+            .first()
+            .map(|effect| effect.decisions().len()),
+        Some(1)
+    );
+
+    // Proven absence released the repository on its own.
+    let (next, next_approval) = revised(&proposal)?;
+    let released = house.apply(&forge, &next, &next_approval)?;
+    assert_eq!(released.outcome, ApplyOutcome::Completed);
+    Ok(())
+}
+
+#[test]
+fn a_snapshot_without_an_acknowledgement_still_loads() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge::seeded());
+    let (_, id) = settled_with_an_unknown_write(&house, &forge, Fault::LoseAfterApply)?;
+    let path = house.fixture.state_path();
+    let key = id.as_str();
+
+    // Before any acknowledgement the field is not written at all.
+    let before: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    assert!(before["tasks"][key].get("acknowledgement").is_none());
+
+    house.acknowledge(&forge, &id, &interactive("owner-session")?, true)?;
+    let mut state: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    assert!(state["tasks"][key].get("acknowledgement").is_some());
+
+    // A snapshot written before the field existed loads as unacknowledged.
+    state["tasks"][key]
+        .as_object_mut()
+        .ok_or("task is not an object")?
+        .remove("acknowledgement");
+    std::fs::write(&path, serde_json::to_vec_pretty(&state)?)?;
+    let reopened = house.fixture.reopen()?;
+    assert_eq!(reopened.task(&id)?.write_acknowledgement(), None);
+
+    // A stored reason beyond the bound is refused as corrupt.
+    state["tasks"][key]["acknowledgement"] = json!({
+        "by": "owner-session",
+        "at": 0,
+        "reason": "r".repeat(MAX_ACKNOWLEDGEMENT_REASON_BYTES + 1),
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&state)?)?;
+    let error = house
+        .fixture
+        .reopen()
+        .err()
+        .ok_or("an overlong stored reason loaded")?;
+    assert!(error.to_string().contains("persisted state is invalid"));
     Ok(())
 }

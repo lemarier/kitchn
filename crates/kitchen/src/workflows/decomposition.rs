@@ -59,8 +59,9 @@ use crate::{
     },
     integrations::github::{GitHubExecutor, GitHubMutationTransport},
     state::{
-        EffectPlan, EffectRecord, EffectState, HouseStore, Reservation, StateError, TaskRecord,
-        TaskState, WriteAcknowledgement, reconcile, reread_settled, run_effect,
+        EffectPlan, EffectRecord, EffectState, HouseStore, Limit, MAX_ACKNOWLEDGEMENT_REASON_BYTES,
+        Reservation, StateError, TaskRecord, TaskState, WriteAcknowledgement, reconcile,
+        reread_settled, run_effect,
     },
 };
 
@@ -1339,7 +1340,10 @@ pub struct AcknowledgeReport {
 /// [`DecompositionError::AcknowledgementNeedsPerson`] for a non-interactive
 /// claimant; [`DecompositionError::NotHeld`] unless `task` is a settled,
 /// unsuccessful decomposition with a write that reached or may have reached
-/// the forge; contract errors for an executor of another house; store errors.
+/// the forge, including after a re-read that proved every write absent and so
+/// released the repository itself; [`StateError::CapacityExceeded`] for a
+/// `reason` longer than [`MAX_ACKNOWLEDGEMENT_REASON_BYTES`], before anything
+/// is read; contract errors for an executor of another house; store errors.
 pub fn acknowledge(
     store: &HouseStore,
     executor: Option<&dyn EffectExecutor>,
@@ -1380,50 +1384,49 @@ pub fn acknowledge(
             already_acknowledged: true,
         });
     }
-    let mut report = AcknowledgeReport {
-        task: task.clone(),
-        settlement,
-        reread: executor.is_some(),
-        applied: Vec::new(),
-        absent: Vec::new(),
-        unresolved: Vec::new(),
-        acknowledgement: WriteAcknowledgement {
-            by: claimant.holder.clone(),
-            at: clock.now(),
-            reason: reason.clone(),
-            unresolved: Vec::new(),
-        },
-        already_acknowledged: false,
-    };
+    if reason.as_str().len() > MAX_ACKNOWLEDGEMENT_REASON_BYTES {
+        return Err(StateError::CapacityExceeded {
+            limit: Limit::AcknowledgementReason,
+        }
+        .into());
+    }
+    let mut applied = Vec::new();
+    let mut absent = Vec::new();
     if let Some(executor) = executor {
         let reread = reread_settled(store, executor, task, clock)?;
         for effect in &reread.resolved {
             let names = match effect.state() {
-                EffectState::Applied { .. } => &mut report.applied,
-                _ => &mut report.absent,
+                EffectState::Applied { .. } => &mut applied,
+                EffectState::NotApplied { .. } => &mut absent,
+                EffectState::Intended
+                | EffectState::Uncertain { .. }
+                | EffectState::Unresolvable { .. }
+                | EffectState::Waived { .. } => continue,
             };
             if !names.contains(effect.name()) {
                 names.push(effect.name().clone());
             }
         }
     }
-    let record = store.task(task)?;
-    for effect in record
-        .effects()
-        .iter()
-        .filter(|effect| !effect.state().is_resolved())
-    {
-        if !report.unresolved.contains(effect.name()) {
-            report.unresolved.push(effect.name().clone());
-        }
-    }
-    report.acknowledgement.unresolved = report.unresolved.clone();
-    let stored = store.acknowledge_settled_writes(task, report.acknowledgement.clone())?;
-    if let Some(recorded) = stored.write_acknowledgement() {
-        report.already_acknowledged = recorded != &report.acknowledgement;
-        report.acknowledgement = recorded.clone();
-    }
-    Ok(report)
+    // A re-read that proved every write absent left nothing to hold the
+    // repository, so there is nothing to acknowledge either.
+    let (acknowledgement, already_acknowledged) =
+        match store.acknowledge_settled_writes(task, claimant, reason, clock.now()) {
+            Err(Error::State(StateError::NothingToAcknowledge(_))) => {
+                return Err(DecompositionError::NotHeld(task.clone()).into());
+            }
+            other => other?,
+        };
+    Ok(AcknowledgeReport {
+        task: task.clone(),
+        settlement,
+        reread: executor.is_some(),
+        applied,
+        absent,
+        unresolved: acknowledgement.unresolved.clone(),
+        acknowledgement,
+        already_acknowledged,
+    })
 }
 
 /// Give the claim back after a retryable failure unless the task settled.

@@ -38,8 +38,8 @@ use kitchen::{
         CACHEDIR_SIGNATURE, CleanupError, ConsentSource, Decision, EXTERNAL_CACHE_SUGGESTIONS,
         Exclusion, GitLimits, GitOperation, GitReadError, InspectionTrigger, Inspector, NoConsent,
         ObservationDigest, Ownership, Precheck, Preview, ReleaseConsent, ReleaseOutcome,
-        RemoteName, Step, TASK_PREFIX, apply, approve, inspect, inspect_worktree,
-        reclaim_build_output,
+        RemoteName, RetireReport, Step, TASK_PREFIX, apply, approve, inspect, inspect_worktree,
+        reclaim_build_output, retire,
     },
 };
 
@@ -335,6 +335,7 @@ struct Harness {
 }
 
 const PREVIEW_AGE: Duration = Duration::from_secs(3600);
+const RETENTION: Duration = Duration::from_secs(2 * 3600);
 
 impl Harness {
     fn new() -> TestResult<Self> {
@@ -547,6 +548,7 @@ fn options() -> TestResult<ApplyOptions> {
         lease: ttl(300)?,
         max_approval_age: PREVIEW_AGE,
         max_releases: 16,
+        retention: RETENTION,
     })
 }
 
@@ -1864,10 +1866,10 @@ fn an_owner_change_just_before_the_effect_refuses_the_release() -> TestResult {
     let owned = harness.owner("task-1", true)?;
     harness.approve_all()?;
     harness.clock.advance(60);
-    // After apply's first inventory read, the backend reassigns the worktree
-    // while the worker is being released.
+    // After apply's retirement and inspection reads, the backend reassigns
+    // the worktree while the worker is being released.
     let worktree = owned.worktree.clone();
-    harness.backend.change_after(1, move |extra| {
+    harness.backend.change_after(2, move |extra| {
         for observation in extra.iter_mut() {
             if observation.resource == worktree {
                 observation.owner = ExternalRef::new("reassigned").ok();
@@ -3436,5 +3438,277 @@ fn disk_pressure_suggests_commands_for_external_caches_and_runs_none() -> TestRe
     assert!(harness.inspect()?.suggestions.is_empty());
     let json = serde_json::to_value(&pressured)?;
     assert_eq!(json["suggestions"][0]["command"], "cargo cache --autoclean");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Retirement of spent approvals and release tasks
+
+impl Harness {
+    fn retire(&self) -> Result<RetireReport, Error> {
+        retire(&self.inspector(), RETENTION, PREVIEW_AGE, &self.clock)
+    }
+
+    /// The dishwasher's release tasks in the store.
+    fn release_tasks(&self) -> TestResult<Vec<TaskId>> {
+        Ok(self
+            .store()
+            .tasks()?
+            .into_iter()
+            .map(|task| task.spec().id.clone())
+            .filter(|id| id.as_str().starts_with(TASK_PREFIX))
+            .collect())
+    }
+
+    /// The resources the dishwasher's approval markers name.
+    fn approved_resources(&self) -> TestResult<Vec<ResourceRef>> {
+        Ok(self
+            .markers()?
+            .iter()
+            .filter_map(|marker| match &marker.key().item {
+                WorkItem::Resource { resource } => Some(resource.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+}
+
+/// Settle a task, approve its two resources, and release them.
+fn released(harness: &mut Harness, name: &str) -> TestResult<Owned> {
+    let owned = harness.owner(name, true)?;
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    let report = harness.apply()?;
+    assert_eq!(outcome(&report, &owned.worker)?, ReleaseOutcome::Released);
+    assert_eq!(outcome(&report, &owned.worktree)?, ReleaseOutcome::Released);
+    Ok(owned)
+}
+
+fn sorted(mut resources: Vec<ResourceRef>) -> Vec<ResourceRef> {
+    resources.sort();
+    resources
+}
+
+#[test]
+fn approvals_of_resources_that_left_the_inventory_are_retired() -> TestResult {
+    let mut harness = Harness::new()?;
+    let gone = released(&mut harness, "task-1")?;
+    // Another task's approved resources are still listed.
+    let kept = harness.owner("task-2", true)?;
+    harness.approve_all()?;
+    assert_eq!(harness.markers()?.len(), 4);
+    let report = harness.retire()?;
+    assert_eq!(
+        sorted(report.markers),
+        sorted(vec![gone.worker.clone(), gone.worktree.clone()])
+    );
+    assert_eq!(
+        sorted(harness.approved_resources()?),
+        sorted(vec![kept.worker.clone(), kept.worktree.clone()])
+    );
+    // Retiring again finds nothing, and the kept approvals still authorize.
+    assert!(harness.retire()?.markers.is_empty());
+    harness.clock.advance(60);
+    let report = harness.apply()?;
+    assert_eq!(outcome(&report, &kept.worker)?, ReleaseOutcome::Released);
+    Ok(())
+}
+
+#[test]
+fn release_tasks_are_retired_only_after_the_retention() -> TestResult {
+    let mut harness = Harness::new()?;
+    released(&mut harness, "task-1")?;
+    let tasks = harness.release_tasks()?;
+    assert_eq!(tasks.len(), 2);
+    // At exactly the retention they are kept.
+    harness.clock.advance(RETENTION.as_secs());
+    assert!(harness.retire()?.tasks.is_empty());
+    assert_eq!(harness.release_tasks()?, tasks);
+    // Past it they are removed; the owning task is not a release task.
+    harness.clock.advance(1);
+    let mut retired = harness.retire()?.tasks;
+    retired.sort();
+    assert_eq!(retired, tasks);
+    assert!(harness.release_tasks()?.is_empty());
+    assert!(harness.store().task(&TaskId::new("task-1")?).is_ok());
+    Ok(())
+}
+
+#[test]
+fn an_unresolved_release_task_is_never_retired() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    harness
+        .backend
+        .fake
+        .inject(ExecuteFault::TimeoutWithoutApplying);
+    let report = harness.apply()?;
+    assert_eq!(outcome(&report, &owned.worker)?, ReleaseOutcome::Uncertain);
+    let uncertain = report
+        .results
+        .iter()
+        .find(|result| result.resource == owned.worker)
+        .and_then(|result| result.task.clone())
+        .ok_or("no release task")?;
+    harness.clock.advance(RETENTION.as_secs() * 10);
+    // Only the worktree's settled release is retired.
+    let retired = harness.retire()?.tasks;
+    assert_eq!(retired.len(), 1);
+    assert!(!retired.contains(&uncertain));
+    assert_eq!(harness.release_tasks()?, [uncertain]);
+    Ok(())
+}
+
+#[test]
+fn a_settled_dishwasher_task_without_a_release_effect_is_never_retired() -> TestResult {
+    let mut harness = Harness::new()?;
+    let owned = harness.owner("task-1", true)?;
+    // Role and prefix match a release task, but nothing records a release.
+    let name = format!("{TASK_PREFIX}lookalike");
+    let lookalike = TaskId::new(&name)?;
+    let mut lookalike_spec = spec(&name)?;
+    lookalike_spec.role = kitchen::contracts::Role::Dishwasher;
+    lookalike_spec.resources.insert(owned.worktree.clone());
+    let store = harness.store();
+    store.create_task(lookalike_spec, &scheduled("pickup")?, harness.clock.now())?;
+    let fence = store
+        .claim(
+            &lookalike,
+            &scheduled("pickup")?,
+            ttl(600)?,
+            harness.clock.now(),
+        )?
+        .fence();
+    store.settle_cancelled(&lookalike, fence, harness.clock.now())?;
+    harness.clock.advance(RETENTION.as_secs() * 10);
+    assert!(harness.retire()?.tasks.is_empty());
+    assert!(harness.store().task(&lookalike).is_ok());
+    Ok(())
+}
+
+#[test]
+fn retirement_refuses_a_retention_shorter_than_the_approval_age() -> TestResult {
+    let mut harness = Harness::new()?;
+    released(&mut harness, "task-1")?;
+    harness.clock.advance(RETENTION.as_secs() * 10);
+    let error = retire(
+        &harness.inspector(),
+        PREVIEW_AGE - Duration::from_secs(1),
+        PREVIEW_AGE,
+        &harness.clock,
+    )
+    .err()
+    .ok_or("a short retention was accepted")?;
+    assert!(matches!(
+        error,
+        Error::Cleanup(CleanupError::RetentionTooShort)
+    ));
+    assert_eq!(error.class(), ErrorClass::InvalidInput);
+    assert_eq!(harness.release_tasks()?.len(), 2);
+    assert_eq!(harness.markers()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn an_unreadable_inventory_retires_nothing() -> TestResult {
+    let mut harness = Harness::new()?;
+    released(&mut harness, "task-1")?;
+    harness.clock.advance(RETENTION.as_secs() * 10);
+    harness.backend.outage.set(true);
+    assert!(matches!(
+        harness.retire(),
+        Err(Error::Cleanup(CleanupError::Backend(_)))
+    ));
+    assert_eq!(harness.release_tasks()?.len(), 2);
+    assert_eq!(harness.markers()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_full_marker_table_of_spent_approvals_is_freed_by_the_next_run() -> TestResult {
+    let mut harness = Harness::new()?;
+    released(&mut harness, "task-1")?;
+    // Spent approvals of resources the backend no longer lists fill the
+    // house's shared marker table.
+    let path = harness.fixture.state_path();
+    let mut state: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let template = state["markers"][0].clone();
+    if let Some(list) = state["markers"].as_array_mut() {
+        for number in 0..(kitchen::state::MAX_MARKERS - list.len()) {
+            let mut marker = template.clone();
+            marker["key"]["item"]["resource"]["handle"] = format!("gone-{number}").into();
+            list.push(marker);
+        }
+    }
+    fs::write(&path, serde_json::to_vec(&state)?)?;
+    let next = harness.owner("task-2", true)?;
+    harness.clock.advance(60);
+    let error = harness
+        .approve_all()
+        .err()
+        .ok_or("approved into a full table")?;
+    assert!(error.to_string().contains("limit reached"), "{error}");
+    // The next run retires every spent approval, so a person can approve.
+    let report = harness.apply()?;
+    assert_eq!(report.retired.markers.len(), kitchen::state::MAX_MARKERS);
+    assert_eq!(outcome(&report, &next.worker)?, ReleaseOutcome::NotApproved);
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    let report = harness.apply()?;
+    assert_eq!(outcome(&report, &next.worker)?, ReleaseOutcome::Released);
+    Ok(())
+}
+
+#[test]
+fn a_full_task_table_of_settled_releases_is_freed_after_the_retention() -> TestResult {
+    let mut harness = Harness::new()?;
+    // A full table of release tasks is larger than the default snapshot
+    // bound, which would stop the store before the task limit does.
+    harness.fixture.store = HouseStore::open(
+        harness.fixture.dir.path().join("house"),
+        house()?,
+        kitchen::state::StoreOptions {
+            max_state_bytes: 64 * 1024 * 1024,
+            ..kitchen::state::StoreOptions::default()
+        },
+    )?;
+    released(&mut harness, "task-1")?;
+    let next = harness.owner("task-2", true)?;
+    // Copies of a settled release task fill the house's shared task table.
+    let path = harness.fixture.state_path();
+    let mut state: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let template_id = harness
+        .release_tasks()?
+        .first()
+        .ok_or("no release task")?
+        .clone();
+    let template = serde_json::to_string(&state["tasks"][template_id.as_str()])?;
+    let tasks = state["tasks"].as_object_mut().ok_or("tasks")?;
+    for number in 0..(kitchen::state::MAX_TASKS - tasks.len()) {
+        let id = format!("{TASK_PREFIX}filler-{number}");
+        tasks.insert(
+            id.clone(),
+            serde_json::from_str(&template.replace(template_id.as_str(), &id))?,
+        );
+    }
+    fs::write(&path, serde_json::to_vec(&state)?)?;
+    // Within the retention nothing is retired, so no release task can start.
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    let error = harness
+        .apply()
+        .err()
+        .ok_or("a release started in a full task table")?;
+    assert!(error.to_string().contains("limit reached"), "{error}");
+    assert_eq!(harness.store().tasks()?.len(), kitchen::state::MAX_TASKS);
+    // Past it the next run retires them and releases after a new approval.
+    harness.clock.advance(RETENTION.as_secs() + 1);
+    harness.approve_all()?;
+    harness.clock.advance(60);
+    let report = harness.apply()?;
+    assert!(report.retired.tasks.len() >= kitchen::state::MAX_TASKS - 4);
+    assert_eq!(outcome(&report, &next.worker)?, ReleaseOutcome::Released);
     Ok(())
 }

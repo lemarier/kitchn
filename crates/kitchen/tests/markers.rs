@@ -1017,3 +1017,77 @@ fn a_guarded_record_refuses_a_stale_consumer_and_propagates_guard_errors() -> Te
     assert_eq!(fixture.store.marker(&gate)?, None);
     Ok(())
 }
+
+#[test]
+fn retiring_removes_only_markers_whose_fact_is_unchanged() -> TestResult {
+    let fixture = Fixture::new()?;
+    let recorder = scheduled("gate")?;
+    let spent = key("merge-gate", pull_request(20)?, 'a', None)?;
+    let renewed = key("merge-gate", pull_request(21)?, 'a', None)?;
+    let absent = key("merge-gate", pull_request(22)?, 'a', None)?;
+    for marker in [&spent, &renewed] {
+        fixture.store.record_marker(
+            marker.clone(),
+            verdict(EvidenceVerdict::Pass),
+            &recorder,
+            at(1),
+        )?;
+    }
+    // A renewal after the caller read the marker keeps it.
+    fixture.store.supersede_marker(
+        &renewed,
+        &verdict(EvidenceVerdict::Pass),
+        verdict(EvidenceVerdict::Fail),
+        &recorder,
+        at(2),
+    )?;
+    let retired = fixture.store.retire_markers(&[
+        (spent.clone(), verdict(EvidenceVerdict::Pass)),
+        (renewed.clone(), verdict(EvidenceVerdict::Pass)),
+        (absent, verdict(EvidenceVerdict::Pass)),
+    ])?;
+    assert_eq!(retired, std::slice::from_ref(&spent));
+    assert_eq!(fixture.store.marker(&spent)?, None);
+    assert!(fixture.store.marker(&renewed)?.is_some());
+    // Retiring again is harmless.
+    assert!(
+        fixture
+            .store
+            .retire_markers(&[(spent, verdict(EvidenceVerdict::Pass))])?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn an_asked_question_is_never_retired() -> TestResult {
+    let fixture = Fixture::new()?;
+    let question = issue_key(7, 1, None)?;
+    let asked = MarkerFact::QuestionAsked {
+        question: ExternalRef::new("decision-1")?,
+    };
+    let spent = key("merge-gate", pull_request(20)?, 'a', None)?;
+    fixture.store.record_marker(
+        question.clone(),
+        asked.clone(),
+        &scheduled("triage")?,
+        at(1),
+    )?;
+    fixture.store.record_marker(
+        spent.clone(),
+        verdict(EvidenceVerdict::Pass),
+        &scheduled("gate")?,
+        at(1),
+    )?;
+    assert!(matches!(
+        fixture.store.retire_markers(&[
+            (spent.clone(), verdict(EvidenceVerdict::Pass)),
+            (question.clone(), asked),
+        ]),
+        Err(Error::State(StateError::MarkerNotSupersedable))
+    ));
+    // The refusal removed nothing, not even the marker before it.
+    assert!(fixture.store.marker(&question)?.is_some());
+    assert!(fixture.store.marker(&spent)?.is_some());
+    Ok(())
+}

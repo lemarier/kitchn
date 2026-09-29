@@ -516,6 +516,92 @@ fn a_snapshot_written_before_effect_bases_still_loads() -> TestResult {
 }
 
 #[test]
+fn only_settled_tasks_with_resolved_effects_are_retired() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    // A settled task whose launch applied.
+    let fence = claimed_attempt(&fixture, "done", at(0))?;
+    let done = task_id("done")?;
+    let EffectStart::Execute(intent) = store.begin_effect(
+        plan(&done, fence, "launch", launch()?)?,
+        &grants()?,
+        &common::refusing()?,
+        at(1),
+    )?
+    else {
+        return Err("expected a new effect".into());
+    };
+    store.record_effect_outcome(
+        &done,
+        fence,
+        intent.seq(),
+        EffectOutcome::Applied(receipt("request-1")?),
+        at(2),
+    )?;
+    store.finish_attempt(
+        &done,
+        fence,
+        AttemptNumber::FIRST,
+        AttemptOutcome::Succeeded,
+        at(3),
+    )?;
+    // A claimed, unsettled task.
+    claimed_attempt(&fixture, "running", at(0))?;
+    let running = task_id("running")?;
+
+    // One unretirable task refuses the whole batch.
+    assert!(matches!(
+        store.retire_tasks(&[done.clone(), running.clone()]),
+        Err(Error::State(StateError::TaskNotRetirable(id))) if id == running
+    ));
+    assert!(store.task(&done).is_ok());
+    // An absent task is skipped; the settled one is removed.
+    let absent = task_id("absent")?;
+    assert_eq!(
+        store.retire_tasks(&[done.clone(), absent])?,
+        std::slice::from_ref(&done)
+    );
+    assert!(matches!(
+        store.task(&done),
+        Err(Error::State(StateError::TaskNotFound(_)))
+    ));
+    assert!(store.task(&running).is_ok());
+    // Its identity is free again.
+    store.create_task(spec("done")?, &creator()?, at(4))?;
+    Ok(())
+}
+
+#[test]
+fn a_task_with_an_uncertain_effect_is_not_retired() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let fence = claimed_attempt(&fixture, "task-1", at(0))?;
+    let task = task_id("task-1")?;
+    let EffectStart::Execute(intent) = store.begin_effect(
+        plan(&task, fence, "launch", launch()?)?,
+        &grants()?,
+        &common::refusing()?,
+        at(1),
+    )?
+    else {
+        return Err("expected a new effect".into());
+    };
+    store.record_effect_outcome(
+        &task,
+        fence,
+        intent.seq(),
+        EffectOutcome::Uncertain(UncertainReason::Timeout),
+        at(2),
+    )?;
+    assert!(matches!(
+        store.retire_tasks(std::slice::from_ref(&task)),
+        Err(Error::State(StateError::TaskNotRetirable(_)))
+    ));
+    assert!(store.task(&task).is_ok());
+    Ok(())
+}
+
+#[test]
 fn retry_budget_bounds_attempt_count_and_elapsed_time() -> TestResult {
     let fixture = Fixture::new()?;
     let store = &fixture.store;

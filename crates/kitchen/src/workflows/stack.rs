@@ -20,9 +20,11 @@
 //! branch on the remote ([`UpperLayerFault`]). The boundary
 //! then pushes the layers itself in one atomic update leased to the heads it
 //! checked, so a layer moved after the check fails the whole push, and uses
-//! the tool only to link pull requests that already exist, named by number.
-//! A submission with a layer that has no pull request is refused before any
-//! push ([`StackRefusal::NoPullRequest`]).
+//! the tool only to link pull requests, named by number. A layer at or above
+//! the task's branch without a pull request gets one opened after the push,
+//! through the forge's persisted-intent path ([`LayerOpener`]); without an
+//! opener such a submission is refused before any push
+//! ([`StackRefusal::NoPullRequest`]).
 //! [`GhStack`] runs `gh stack` with non-interactive flags and an explicit
 //! remote.
 //!
@@ -30,21 +32,25 @@
 //! dependents need, addressed to each branch's own writer.
 
 use std::{
+    fmt::Write as _,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::{
-    BackendId, TaskId,
+    BackendId, EffectName, TaskId,
     contracts::{
-        BranchName, Clock, CommitId, Fence, HouseGrants, IssueNumber, Permission, Repository,
+        BranchName, Clock, CommitId, Effect, ExternalRef, Fence, GitHubAction, GitHubMutation,
+        HouseGrants, IssueNumber, NotAppliedReason, Permission, Repository, Text,
     },
     house::{StackTool, StackToolStatus},
-    state::{HouseStore, TaskRecord, TaskState},
+    state::{EffectPlan, EffectState, HouseStore, TaskRecord, TaskState, run_effect},
     workflows::{
-        coordination::{CoordinationError, held_branches, task_branch},
+        coordination::{BranchFact, ConsentSource, CoordinationError, held_branches, task_branch},
+        interactive::ForgeWriter,
         pickup::is_shell_safe,
         push::{
             Binding, Decision, GitRemote, IsolatedGitConfig, LayerUpdate, LayersPermit,
@@ -134,11 +140,19 @@ pub enum StackRefusal {
         /// What is wrong with it.
         fault: UpperLayerFault,
     },
-    /// A submission reached a layer at or above the task's branch that has
-    /// no pull request. The stack tool opens one only by pushing the branch
-    /// itself, outside the boundary's leased push, so nothing is pushed.
+    /// A submission without a [`LayerOpener`] reached a layer at or above
+    /// the task's branch that has no pull request. The stack tool opens one
+    /// only by pushing the branch itself, outside the boundary's leased
+    /// push, so nothing is pushed.
     #[error("stack layer {branch} has no pull request to link")]
     NoPullRequest {
+        /// The layer.
+        branch: BranchName,
+    },
+    /// The checkout gave no title and body for a layer whose pull request
+    /// the submission would open, so nothing is pushed.
+    #[error("stack layer {branch} has no pull request text")]
+    PullRequestText {
         /// The layer.
         branch: BranchName,
     },
@@ -324,6 +338,22 @@ pub enum StackResult {
     /// A layer changed between the boundary's check and its push, so the
     /// push updated no branch. Check again before another attempt.
     Stale,
+    /// The layers were pushed, but the forge definitely did not open the
+    /// named layer's pull request; nothing was linked.
+    NotOpened {
+        /// The layer.
+        branch: BranchName,
+        /// Why the forge did not open it.
+        reason: NotAppliedReason,
+    },
+    /// The layers were pushed, but whether the named layer's pull request
+    /// opened is unknown; nothing was linked. Reconcile the task's effects
+    /// ([`crate::state::reconcile`]) before submitting again: a retry finds
+    /// the pull request instead of opening another.
+    OpenUncertain {
+        /// The layer.
+        branch: BranchName,
+    },
 }
 
 /// Link a stack's existing pull requests on the forge after the boundary
@@ -338,6 +368,78 @@ pub struct StackLink {
     pub pull_requests: Vec<IssueNumber>,
     /// Mark the pull requests ready for review.
     pub ready: bool,
+}
+
+/// The title and body of a layer's new pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestText {
+    /// The title: one line of at most [`MAX_TITLE_BYTES`].
+    pub title: Text,
+    /// The body.
+    pub body: Text,
+}
+
+/// Longest pull-request title the forge contract accepts, in bytes.
+pub const MAX_TITLE_BYTES: usize = 256;
+
+impl PullRequestText {
+    /// Text from a commit message given as its subject, a NUL byte, and its
+    /// body (`git log --format=%s%x00%b`), as the stack tool generates it:
+    /// the subject, cut to [`MAX_TITLE_BYTES`] on a character boundary, is
+    /// the title; the body, or the subject when the body is empty, is the
+    /// body. `None` for an empty subject or an over-long body.
+    #[must_use]
+    pub fn from_commit_message(message: &str) -> Option<Self> {
+        let (subject, body) = message.split_once('\0').unwrap_or((message, ""));
+        let subject = subject.trim();
+        let mut end = subject.len().min(MAX_TITLE_BYTES);
+        while !subject.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        let title = subject.get(..end)?.trim_end();
+        let body = match body.trim() {
+            "" => subject,
+            body => body,
+        };
+        Some(Self {
+            title: Text::new(title).ok()?,
+            body: Text::new(body).ok()?,
+        })
+    }
+}
+
+/// Reads the text for a layer's new pull request from the checkout.
+pub trait LayerText {
+    /// The text for `branch`'s pull request, from its head commit;
+    /// `Unknown` when it could not be read or is empty.
+    fn pull_request_text(&self, branch: &BranchName) -> Observed<PullRequestText>;
+}
+
+impl LayerText for GitRemote {
+    fn pull_request_text(&self, branch: &BranchName) -> Observed<PullRequestText> {
+        let reference = format!("refs/heads/{branch}");
+        match self.run(&["log", "-1", "--format=%s%x00%b", &reference, "--"]) {
+            Some((Some(0), stdout)) => String::from_utf8(stdout)
+                .ok()
+                .and_then(|message| PullRequestText::from_commit_message(&message))
+                .map_or(Observed::Unknown, Observed::Known),
+            Some(_) | None => Observed::Unknown,
+        }
+    }
+}
+
+/// Opens the pull request of a stack layer that has none, through the
+/// forge's persisted-intent path ([`run_effect`]) under the task's
+/// [`Permission::OpenPullRequest`] grant. Opening never pushes.
+#[derive(Clone, Copy)]
+pub struct LayerOpener<'a> {
+    /// The house-scoped forge executor.
+    pub forge: &'a dyn ForgeWriter,
+    /// Consent for interactive claims; scheduled work uses
+    /// [`crate::workflows::coordination::Standing`].
+    pub consent: &'a dyn ConsentSource,
+    /// Titles and bodies for the new pull requests.
+    pub text: &'a dyn LayerText,
 }
 
 /// Reads branch heads in the checkout the stack tool runs in.
@@ -746,6 +848,9 @@ pub struct StackBoundary<'a> {
     pub updater: &'a dyn RefUpdater,
     /// Branch heads in the checkout the layers are pushed from.
     pub local: &'a dyn LocalBranches,
+    /// Opens a submitted layer's missing pull request. Without it, a
+    /// submission with such a layer is refused before any push.
+    pub opener: Option<LayerOpener<'a>>,
 }
 
 /// What a stack-tool command through the boundary did.
@@ -784,15 +889,26 @@ impl StackBoundary<'_> {
     /// checkout's. A branch that moved after the check fails the whole
     /// update ([`StackResult::Stale`]) and nothing changes. A submission then
     /// runs [`StackRunner::link`] with every layer's pull-request number, so
-    /// the tool pushes nothing. A submission with an unmerged layer that has
-    /// no pull request is refused before the push
-    /// ([`StackRefusal::NoPullRequest`]).
+    /// the tool pushes nothing.
+    ///
+    /// A submitted layer at or above the task's branch without a pull
+    /// request reuses one the task already opened for that branch, or gets
+    /// one opened after the push by the [`LayerOpener`], bottom to top, based
+    /// on the unmerged layer below it or the trunk, at the head the push
+    /// moved it to, and as a draft unless `ready`. An open the forge refused
+    /// ([`StackResult::NotOpened`]) or whose outcome is unknown
+    /// ([`StackResult::OpenUncertain`]) stops the submission before linking.
+    /// Without an opener, or without text for a new pull request, the
+    /// submission is refused before the push ([`StackRefusal::NoPullRequest`],
+    /// [`StackRefusal::PullRequestText`]).
     ///
     /// # Errors
     /// Returns [`crate::state::StateError::StaleFence`] without a live claim
     /// at `fence`, [`crate::state::StateError::CancelRequested`] while
     /// cancellation is pending, contract errors when the task lacks a grant
-    /// or the house revoked it, and store read failures.
+    /// or the house revoked it, store read failures, and errors from
+    /// [`run_effect`] when opening a pull request, such as unresolved
+    /// earlier effects.
     pub fn run(
         &self,
         task: &TaskId,
@@ -800,7 +916,7 @@ impl StackBoundary<'_> {
         command: &StackCommand,
         intent: &PushIntent,
     ) -> Result<StackOutcome> {
-        let (_, binding) = bind(
+        let (record, binding) = bind(
             self.store,
             self.grants,
             self.destination,
@@ -842,7 +958,9 @@ impl StackBoundary<'_> {
             | StackResult::NotInStack
             | StackResult::Rejected
             | StackResult::Uncertain
-            | StackResult::Stale => {
+            | StackResult::Stale
+            | StackResult::NotOpened { .. }
+            | StackResult::OpenUncertain { .. } => {
                 return Ok(StackOutcome::Refused(StackRefusal::UpstackBusy));
             }
         };
@@ -874,10 +992,12 @@ impl StackBoundary<'_> {
         };
         let link = match publish {
             Publish::Push => None,
-            Publish::Submit { ready } => match link(&view, ready) {
-                Ok(link) => Some(link),
-                Err(refusal) => return Ok(StackOutcome::Refused(refusal)),
-            },
+            Publish::Submit { ready } => {
+                match self.plan_link(&record, &view, &binding.repository, &permit, ready) {
+                    Ok(link) => Some(link),
+                    Err(refusal) => return Ok(StackOutcome::Refused(refusal)),
+                }
+            }
         };
         match self.updater.update_layers(&permit) {
             Ok(()) => {}
@@ -888,10 +1008,244 @@ impl StackBoundary<'_> {
             Err(UpdateFailure::Uncertain) => return Ok(StackOutcome::Ran(StackResult::Uncertain)),
         }
         record_landed(self.store, self.clock, task, fence, &binding, intent)?;
-        Ok(StackOutcome::Ran(
-            link.map_or(StackResult::Done, |link| self.runner.link(&link)),
-        ))
+        let Some(link) = link else {
+            return Ok(StackOutcome::Ran(StackResult::Done));
+        };
+        let mut pull_requests = Vec::with_capacity(link.layers.len());
+        for layer in link.layers {
+            let open = match layer {
+                PlannedLayer::Existing(number) => {
+                    pull_requests.push(number);
+                    continue;
+                }
+                PlannedLayer::Open(open) => open,
+            };
+            match self.open(task, fence, &binding.repository, &open, link.ready)? {
+                Opened::Number(number) => {
+                    // Later pushes of the task's branch must name its pull
+                    // request, as for any other bound branch.
+                    if open.branch == binding.branch && !binding.pull_request_bound {
+                        BranchFact::PullRequestBound.record(
+                            self.store,
+                            task,
+                            fence,
+                            &binding.branch,
+                            self.clock.now(),
+                        )?;
+                    }
+                    pull_requests.push(number);
+                }
+                Opened::NotApplied(reason) => {
+                    return Ok(StackOutcome::Ran(StackResult::NotOpened {
+                        branch: open.branch,
+                        reason,
+                    }));
+                }
+                Opened::Uncertain => {
+                    return Ok(StackOutcome::Ran(StackResult::OpenUncertain {
+                        branch: open.branch,
+                    }));
+                }
+            }
+        }
+        Ok(StackOutcome::Ran(self.runner.link(&StackLink {
+            trunk: link.trunk,
+            pull_requests,
+            ready: link.ready,
+        })))
     }
+
+    /// Every unmerged layer's pull request for a submission, bottom to top:
+    /// its existing one, one the task already opened for its branch, or one
+    /// to open at the head `permit` moves it to.
+    fn plan_link(
+        &self,
+        record: &TaskRecord,
+        view: &StackView,
+        repository: &Repository,
+        permit: &LayersPermit,
+        ready: bool,
+    ) -> std::result::Result<LinkPlan<'_>, StackRefusal> {
+        let mut layers = Vec::with_capacity(view.branches.len());
+        let mut base = &view.trunk;
+        for layer in view.branches.iter().filter(|layer| !layer.is_merged) {
+            let missing = || StackRefusal::NoPullRequest {
+                branch: layer.name.clone(),
+            };
+            let planned = match (layer.pr, self.opener) {
+                (Some(pr), _) => PlannedLayer::Existing(pr.number),
+                (None, None) => return Err(missing()),
+                (None, Some(opener)) => match opened(record, repository, &layer.name) {
+                    Some(number) => PlannedLayer::Existing(number),
+                    None => {
+                        // Every layer below the task's branch has a pull
+                        // request, so each missing one is pushed here.
+                        let head = permit
+                            .updates()
+                            .iter()
+                            .find(|update| update.branch() == &layer.name)
+                            .map(|update| update.commit().clone())
+                            .ok_or_else(missing)?;
+                        let Observed::Known(text) = opener.text.pull_request_text(&layer.name)
+                        else {
+                            return Err(StackRefusal::PullRequestText {
+                                branch: layer.name.clone(),
+                            });
+                        };
+                        PlannedLayer::Open(OpenLayer {
+                            opener,
+                            branch: layer.name.clone(),
+                            base: base.clone(),
+                            head,
+                            text,
+                        })
+                    }
+                },
+            };
+            layers.push(planned);
+            base = &layer.name;
+        }
+        Ok(LinkPlan {
+            trunk: view.trunk.clone(),
+            layers,
+            ready,
+        })
+    }
+
+    /// Open `layer`'s pull request through the forge's persisted-intent
+    /// path. A same-name retry after an uncertain open is refused by the
+    /// store until the effect is reconciled, which finds the pull request
+    /// by its marker instead of opening another.
+    fn open(
+        &self,
+        task: &TaskId,
+        fence: Fence,
+        repository: &Repository,
+        layer: &OpenLayer<'_>,
+        ready: bool,
+    ) -> Result<Opened> {
+        let opener = layer.opener;
+        let revision = self.store.task(task)?.evidence().revision();
+        let effect: Effect = opener
+            .forge
+            .github_effect(GitHubMutation {
+                repository: repository.clone(),
+                action: GitHubAction::OpenPullRequest {
+                    head: layer.branch.clone(),
+                    expected_head: layer.head.clone(),
+                    base: layer.base.clone(),
+                    title: layer.text.title.clone(),
+                    body: layer.text.body.clone(),
+                    draft: !ready,
+                },
+            })?
+            .into();
+        let consent = opener.consent.consent(task, &effect, revision);
+        let plan = EffectPlan {
+            task: task.clone(),
+            fence,
+            name: open_name(&layer.branch, &layer.head)?,
+            decided_at: revision,
+            effect,
+            consent,
+            basis: None,
+        };
+        let record = run_effect(self.store, opener.forge, self.grants, plan, self.clock)?;
+        Ok(match record.state() {
+            EffectState::Applied { receipt, .. } => {
+                pull_request_number(repository, receipt.reference())
+                    .map_or(Opened::Uncertain, Opened::Number)
+            }
+            EffectState::NotApplied { reason, .. } => Opened::NotApplied(*reason),
+            EffectState::Intended
+            | EffectState::Uncertain { .. }
+            | EffectState::Unresolvable { .. }
+            | EffectState::Waived { .. } => Opened::Uncertain,
+        })
+    }
+}
+
+/// A submission's pull requests, bottom to top, before any is opened.
+struct LinkPlan<'a> {
+    trunk: BranchName,
+    layers: Vec<PlannedLayer<'a>>,
+    ready: bool,
+}
+
+/// One unmerged layer's pull request in a [`LinkPlan`].
+enum PlannedLayer<'a> {
+    /// It has one.
+    Existing(IssueNumber),
+    /// It needs one opened.
+    Open(OpenLayer<'a>),
+}
+
+/// A pull request to open for a layer, and what opens it.
+struct OpenLayer<'a> {
+    opener: LayerOpener<'a>,
+    branch: BranchName,
+    base: BranchName,
+    head: CommitId,
+    text: PullRequestText,
+}
+
+/// What opening a layer's pull request did.
+enum Opened {
+    /// It is open, with this number.
+    Number(IssueNumber),
+    /// The forge definitely did not open it.
+    NotApplied(NotAppliedReason),
+    /// Unknown, or opened without a readable number.
+    Uncertain,
+}
+
+/// The newest pull request the task opened for `branch` in `repository`.
+fn opened(
+    record: &TaskRecord,
+    repository: &Repository,
+    branch: &BranchName,
+) -> Option<IssueNumber> {
+    record.effects().iter().rev().find_map(|effect| {
+        if let EffectState::Applied { receipt, .. } = effect.state()
+            && let Effect::GitHub(github) = effect.request().effect()
+            && let GitHubAction::OpenPullRequest { head, .. } = &github.mutation.action
+            && &github.mutation.repository == repository
+            && head == branch
+        {
+            pull_request_number(repository, receipt.reference())
+        } else {
+            None
+        }
+    })
+}
+
+/// The number in a pull request's URL in `repository`.
+fn pull_request_number(repository: &Repository, reference: &ExternalRef) -> Option<IssueNumber> {
+    let prefix = format!("https://github.com/{repository}/pull/");
+    let value = reference.as_str();
+    value
+        .get(..prefix.len())
+        .filter(|actual| actual.eq_ignore_ascii_case(&prefix))
+        .and_then(|_| value.get(prefix.len()..))
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .and_then(|number| IssueNumber::new(number).ok())
+}
+
+/// The effect name for opening `branch`'s pull request at `head`: a branch
+/// name exceeds an effect name's length and alphabet, so a digest of both.
+fn open_name(branch: &BranchName, head: &CommitId) -> Result<EffectName> {
+    let mut digest = Sha256::new();
+    for part in [branch.as_str(), head.as_str()] {
+        // Length-prefixed, so no two part lists share a digest input.
+        digest.update(part.len().to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    let mut name = String::from("open-pull-request-");
+    for byte in digest.finalize().iter().take(16) {
+        let _ = write!(name, "{byte:02x}");
+    }
+    Ok(EffectName::new(&name)?)
 }
 
 impl StackBoundary<'_> {
@@ -1103,32 +1457,6 @@ const fn publish(command: &StackCommand) -> Option<Publish> {
         | StackCommand::RebaseUpstack
         | StackCommand::View => None,
     }
-}
-
-/// The link for `view`'s unmerged layers, by pull-request number.
-///
-/// # Errors
-/// Returns [`StackRefusal::NoPullRequest`] naming the lowest unmerged layer
-/// without a pull request.
-fn link(view: &StackView, ready: bool) -> std::result::Result<StackLink, StackRefusal> {
-    let pull_requests = view
-        .branches
-        .iter()
-        .filter(|layer| !layer.is_merged)
-        .map(|layer| {
-            layer
-                .pr
-                .map(|pr| pr.number)
-                .ok_or_else(|| StackRefusal::NoPullRequest {
-                    branch: layer.name.clone(),
-                })
-        })
-        .collect::<std::result::Result<_, _>>()?;
-    Ok(StackLink {
-        trunk: view.trunk.clone(),
-        pull_requests,
-        ready,
-    })
 }
 
 const fn refused(refusal: PushRefusal) -> StackOutcome {

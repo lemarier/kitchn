@@ -421,6 +421,17 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                     LabelSetup::Conflict => Inspection::Conflict,
                 })
             }
+            GitHubAction::OpenPullRequest {
+                head,
+                expected_head,
+                body,
+                ..
+            } => self.pull_request(
+                &mutation.repository,
+                head,
+                expected_head,
+                &marked(body.as_str(), key),
+            ),
             GitHubAction::LinkSubIssue { parent, child } => self.relationship(
                 &format!("{root}/issues/{}/sub_issues", parent.get()),
                 child.get(),
@@ -434,6 +445,82 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                 reference,
             ),
         }
+    }
+    /// Find the pull request `expected` marks among `head`'s pull requests.
+    /// Only the requester's marker counts; once found it is applied whatever
+    /// the head or base became later. Without it, another open pull request
+    /// from `head`, a missing remote branch, or a remote head other than
+    /// `expected_head` is a conflict: a branch gets one open pull request,
+    /// and opening never pushes.
+    fn pull_request(
+        &mut self,
+        repository: &crate::contracts::Repository,
+        head: &crate::contracts::BranchName,
+        expected_head: &crate::contracts::CommitId,
+        expected: &str,
+    ) -> Result<Inspection, IntegrationError> {
+        let root = format!("repos/{repository}");
+        let entries = self.pages(&format!(
+            "{root}/pulls?state=all&head={}",
+            encode_segment(&format!("{}:{head}", repository.owner()))
+        ))?;
+        let requester = self.scope.requester().as_str();
+        let mut found = None;
+        let mut occupied = false;
+        for entry in &entries {
+            let field = |pointer: &str| {
+                entry
+                    .pointer(pointer)
+                    .and_then(Value::as_str)
+                    .ok_or(IntegrationError::Unknown)
+            };
+            // The filter names the head; anything else is not an answer to it.
+            if field("/head/ref")? != head.as_str() {
+                return Err(IntegrationError::Unknown);
+            }
+            let marked = entry.get("body").and_then(Value::as_str) == Some(expected);
+            if marked && field("/user/login")?.eq_ignore_ascii_case(requester) {
+                if found.is_some() {
+                    return Err(IntegrationError::Unknown);
+                }
+                let url = field("/html_url")?;
+                if !url.starts_with(&format!("https://github.com/{repository}/pull/")) {
+                    return Err(IntegrationError::Unknown);
+                }
+                found = Some(Receipt::new(ExternalRef::new(url)?, vec![], vec![])?);
+            } else if field("/state")? == "open" {
+                occupied = true;
+            }
+        }
+        if let Some(receipt) = found {
+            return Ok(Inspection::Applied(receipt));
+        }
+        if occupied {
+            return Ok(Inspection::Conflict);
+        }
+        let reference = head
+            .as_str()
+            .split('/')
+            .map(encode_segment)
+            .collect::<Vec<_>>()
+            .join("/");
+        let branch = match self.read(format!("{root}/git/ref/heads/{reference}")) {
+            Ok(branch) => branch,
+            Err(IntegrationError::NotFound) => return Ok(Inspection::Conflict),
+            Err(error) => return Err(error),
+        };
+        if branch.get("ref").and_then(Value::as_str) != Some(&format!("refs/heads/{head}")) {
+            return Err(IntegrationError::Unknown);
+        }
+        let sha = branch
+            .pointer("/object/sha")
+            .and_then(Value::as_str)
+            .ok_or(IntegrationError::Unknown)?;
+        Ok(if sha == expected_head.as_str() {
+            Inspection::Missing
+        } else {
+            Inspection::Conflict
+        })
     }
     fn relationship(
         &mut self,
@@ -543,6 +630,24 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                 "POST",
                 format!("{root}/labels"),
                 json!({"name":label.name,"color":label.color,"description":label.description}),
+            ),
+            GitHubAction::OpenPullRequest {
+                head,
+                base,
+                title,
+                body,
+                draft,
+                ..
+            } => (
+                "POST",
+                format!("{root}/pulls"),
+                json!({
+                    "title": title.as_str(),
+                    "head": head.as_str(),
+                    "base": base.as_str(),
+                    "body": marked(body.as_str(), key),
+                    "draft": draft,
+                }),
             ),
             GitHubAction::LinkSubIssue { parent, child } => {
                 let id = self.issue_id(&root, child.get())?;

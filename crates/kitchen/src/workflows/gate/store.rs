@@ -380,7 +380,8 @@ fn targets(effect: &EffectRecord, record: &GateVerdictRecord) -> bool {
                     | GitHubAction::CreateIssue { .. }
                     | GitHubAction::LinkSubIssue { .. }
                     | GitHubAction::LinkDependency { .. }
-                    | GitHubAction::CreateLabel { .. } => false,
+                    | GitHubAction::CreateLabel { .. }
+                    | GitHubAction::OpenPullRequest { .. } => false,
                 }
         }
         Effect::Worker(

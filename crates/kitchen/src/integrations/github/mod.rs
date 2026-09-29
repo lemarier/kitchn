@@ -38,6 +38,13 @@
 //! grant; its PATCH field `duplicate_issue_id` and GraphQL `duplicateOf`
 //! read-back are not yet verified against the live API, and a wrong shape
 //! reads back as unknown or conflicting, never as applied.
+//! `OpenPullRequest` requires [`Permission::OpenPullRequest`](crate::contracts::Permission)
+//! and never pushes: it lists the head branch's pull requests and reads the
+//! remote branch, and opens one only when the requester's marker is absent,
+//! no other open pull request comes from that head, and the
+//! remote branch holds `expected_head`. A marked pull request reads back as
+//! applied with its URL, even after its head moved or its base changed, so
+//! reconciling an uncertain open finds it instead of opening another.
 
 mod mutation;
 pub(crate) mod process;

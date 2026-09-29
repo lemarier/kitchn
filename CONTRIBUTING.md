@@ -78,6 +78,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #98 guided house init | `house/wizard/` | `kitchn house init` without `--config` in `crates/kitchen-cli/src/commands/house_init.rs`; `tests/house_init.rs` in both crates |
 | #140 house forge binding | `house/forge.rs` | The forge questions in `house/wizard/`; `kitchn forge` in `crates/kitchen-cli/src/commands/forge.rs`; `tests/forge_binding.rs` and `crates/kitchen-cli/tests/forge.rs` |
 | #85 house store retention | `state/retention.rs` | The retention policy and capacity report; `kitchn store` in `crates/kitchen-cli/src/commands/store.rs`; tests in `crates/kitchen/tests/state_retention.rs` and `crates/kitchen-cli/tests/store.rs`. Intake compaction and the doctor capacity finding stay with #46 and #48 |
+| #161 open pull request effect | `GitHubAction::OpenPullRequest` in `contracts/effects/github.rs` and its provider arms in `integrations/github/`; layer opening in `workflows/stack.rs` | Effect tests in `crates/kitchen/tests/integrations_effects.rs`; opening tests in `crates/kitchen/tests/workflows_stack.rs` |
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.

@@ -46,9 +46,9 @@ earned, never assumed.
 — [David Lemarier](https://lemarier.ca)
 
 > [!NOTE]
-> kitchn is early. You can register a house, bind repositories and work issues
-> and pull requests from your session today. Unattended runs are still being
-> validated ([#1](https://github.com/lemarier/kitchen/issues/1)). The binary is
+> kitchn is early. You can register a house, bind repositories and draft issues
+> from your session today. Working issues and pull requests needs a house state
+> store that no command creates yet. Unattended runs are still being validated ([#1](https://github.com/lemarier/kitchen/issues/1)). The binary is
 > still named `kitchen` until
 > [#18](https://github.com/lemarier/kitchen/issues/18) ships the rename and the
 > install script.
@@ -84,75 +84,58 @@ can't cross.
 
 ## Quick start
 
-Build from source. You need rustup (it installs the pinned toolchain) and
-[just](https://just.systems).
+**1. Install.** Build from source for now. You need rustup (it installs the
+pinned toolchain) and [just](https://just.systems).
 
 ```sh
-git clone https://github.com/lemarier/kitchen
-cd kitchen
+git clone https://github.com/lemarier/kitchen && cd kitchen
 just install
 ```
 
-`just install` records the built commit so `house init` can pin kitchn's
-default guidance. It does so only from a clean tree whose commit is on a
-remote-tracking branch; otherwise it says why, and `house init` then needs
-`--bundle <path>`.
-
-Register a house and bind a repository. Run these inside a checkout of that
-repository:
+**2. Set up your house.** Run this once, inside one of your repositories. It
+asks for a name, infers the rest, and shows you everything before saving it.
 
 ```sh
-kitchen house init      # asks for the house name, infers the rest, pins guidance
-kitchen house setup --registry ~/.kitchn   # binds this repository; choose workflows or `none`
-kitchen house doctor --registry ~/.kitchn  # lists what is still missing
+kitchen house init
 ```
 
-`house init` prints the configuration before registering it. Every prompt has
-a flag, and `--config <file>` registers a policy you wrote and reviewed
-instead. The [quickstart](https://getkitchn.com/docs/start/quickstart/) walks
+**3. Give your agent the skill.** Copy or link `skills/kitchn` into your
+agent's skills directory, for example `~/.claude/skills/kitchn` for Claude Code.
+
+**4. Talk to your agent.** That's it. From here on, you work in your session.
+
+The [two-minute setup](https://getkitchn.com/docs/start/quickstart/) walks
 through each step with its output.
 
-## Working with agents
+## Working with kitchn
 
-The [`/kitchn` skill](skills/kitchn/SKILL.md) lets an agent session act as you
-in a bound repository. Copy or link `skills/kitchn` into your agent's skills
-directory (for Claude Code, `~/.claude/skills/kitchn`). Then hand it:
+You talk to kitchn through your agent. Open a session in any repository your
+house covers and hand it work:
 
-- an issue: `/kitchn work #42`
-- a pull request to review, follow up, repair, or gate: `/kitchn pr #57`
-- a rough idea or issue: `/kitchn issue new`, `/kitchn issue refine #61`
-
-The skill resolves the house from the repository's remotes, follows that
-house's pinned rules, and asks for your approval before each external action.
-It drives these CLI entrypoints:
-
-| Command | What it does |
+| You say | kitchn does |
 | --- | --- |
-| `kitchen work <issue>` | Plan one issue: coordinate sub-issues, propose a split, or implement it. Takes a durable claim. |
-| `kitchen pr <number>` | Plan a review, follow-up, repair, or merge-gate pass at one exact head. Follow-up and repair take a durable claim. |
-| `kitchen issue new` / `refine` | Preview an issue draft for approval. Posts nothing. |
-| `kitchen hand-back <task>` | Release your claim so a scheduled run or another session can adopt it. |
+| `/kitchn work #42` | Reads the issue and its sub-issues, shows what's ready and what's blocked, and proposes a plan. With Orca, it offers to start a cook per ready sub-issue and asks before each one. |
+| `/kitchn pr #57` | Reviews, follows up, repairs or gates the pull request at its exact head. If the head moves, it starts over. |
+| `/kitchn issue new` | Drafts an issue with you (outcome, acceptance criteria, dependencies) and shows the full preview before anything is posted. |
+| `/kitchn issue refine #61` | Does the same for an existing issue. |
 
-Interactive and scheduled work share the same claims, so they never work the
-same item at once. Claims live in the house's state store (`--store`), and no
-command creates that store yet. The
-[sessions guide](https://getkitchn.com/docs/guides/sessions/) covers each
-entrypoint.
+The first time you use it in a repository, it asks which house the repository
+belongs to and which workflows to turn on, then shows you what's still missing.
+It never guesses a house.
 
-## Other commands
+Every comment, label, push or worker launch needs your yes, for that exact
+action, in that session. A yes never carries over to the next action.
 
-Run `kitchen <command> --help` for flags and exit codes.
+## The CLI
 
-| Command | What it does |
-| --- | --- |
-| `house init`, `setup`, `sync`, `update`, `import`, `doctor` | Register houses, bind repositories, install or update guidance pins, and diagnose readiness. |
-| `forge bind`, `forge show` | Bind a house to the GitHub account it writes as. The token stays in a file you place; kitchn stores no credential. |
-| `init`, `adopt` | Preview a new or existing repository from a house template. Only missing files are installed; conflicts are left alone. See [templates](templates/README.md). |
-| `decompose preview` | Preview a project split into dependency-linked issues. Writes nothing. |
-| `cleanup preview`, `approve` | Show what the dishwasher would release and why everything else is kept, and record your approval by digest. Releases nothing. |
-| `gardener precheck` | Scheduled read-only check for issue hygiene. |
-| `budget precheck`, `run`, `install` | Pause schedules that exhausted their usage budget and report them. `install` adds the tick paused. |
-| `pickup task-id`, `check-branch` | Offline pickup diagnostics. |
+`kitchen` is the engine behind the skill. Your agent runs it and reads its
+JSON; you rarely type anything beyond `house init`. The commands are precise
+and verbose on purpose, because agents and schedules call them, not people.
+
+If you want to look under the hood, `kitchen --help` lists every command and
+the [CLI reference](https://getkitchn.com/docs/reference/cli/) documents
+their flags and exit codes. One current gap: commands that track claims need a
+house state store, and no command creates one yet.
 
 ## Repository layout
 

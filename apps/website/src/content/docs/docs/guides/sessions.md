@@ -27,9 +27,9 @@ The skill asks for your registry path the first time it needs it.
 | `/kitchn issue new` | The session drafts an issue with you and prints a preview to approve. |
 | `/kitchn issue refine #61` | The same, for an existing issue. |
 
-Each of these runs the matching CLI command (`kitchn work`, `kitchn pr`,
-`kitchn issue new`, `kitchn issue refine`) with the facts the session read from
-the forge. The session reads the house rules the plan points to before it does
+You don't type CLI commands. The session runs the matching one (`kitchn work`,
+`kitchn pr`, `kitchn issue new`, `kitchn issue refine`) with the facts it read
+from the forge, and reads its JSON. The session reads the house rules the plan points to before it does
 anything else. Repository instructions such as `AGENTS.md` apply too, but they
 cannot relax house rules.
 
@@ -50,18 +50,15 @@ fan-out is unavailable.
 `work` and the `pr` writer rounds (`follow-up` and `repair`) take a durable
 claim on the issue or pull request, the same claim scheduled runs use, so a session and a scheduled run never work the same
 item at once. If someone else holds it, the session tells you who and stops.
-A claim lasts 120 minutes unless you pass `--lease-minutes`. `--take-over` takes
-a claim only after its lease expired without a hand-back.
+A claim lasts 120 minutes by default. The session takes over a claim only when
+its lease expired without a hand-back and you ask it to.
 
-When you stop before the work is done, give the claim back so a scheduled run
-or another session can adopt it:
+When you stop before the work is done, tell the session to hand the claim back.
+A scheduled run or another session can then adopt it. Under the hood the
+session runs `kitchn hand-back`.
 
-```sh
-kitchn hand-back <task> --registry ~/.kitchn --store <store> --holder <you>
-```
-
-Claims live in the house's state store, passed as `--store`. The store must
-already exist; kitchn has no command that creates one yet.
+Claims live in the house's state store. The store must already exist, and
+kitchn has no command that creates one yet.
 
 ## Pull request plans
 
@@ -69,7 +66,7 @@ A `pr` plan names the exact head. If the head moves, the plan is void and the
 session reads the facts again. `review` and `gate` only read; merging is always
 your decision. `follow-up` and `repair` claim the writer round, so scheduled
 repair skips the pull request until you hand it back. The house's fix-round
-budget applies, and `--fix-rounds` can only lower it.
+budget applies. You can ask for fewer rounds in a session, never more.
 
 ## Issue drafts
 
@@ -81,15 +78,11 @@ session tells you the approved text is ready and posts nothing unless you
 approve that exact post.
 
 If an earlier draft on the same subject settled after writing, or possibly
-writing, to the forge, new drafts are refused until you check those writes and
-release the subject:
-
-```sh
-kitchn issue acknowledge <task> --reason "<what you found>" --registry ~/.kitchn --store <store> --holder <you>
-```
-
-`--accept-unknown` releases it even when a write's outcome is unknown. Use it
-only after you checked the forge yourself.
+writing, to the forge, new drafts are refused until you release the subject.
+The session shows you that task and its writes. Check them on the forge, then
+tell the session what you found; it records your reason with
+`kitchn issue acknowledge`. A write whose outcome is unknown is released only
+after you checked the forge yourself and say so.
 
 ## What the session never does
 

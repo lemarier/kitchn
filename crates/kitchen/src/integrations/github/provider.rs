@@ -136,6 +136,11 @@ pub(crate) enum Inspection {
     /// one since: the approved merge may have completed before the branch
     /// advanced, so this is neither a new merge's target nor absence evidence.
     MergedAtOtherHead,
+    /// Pull requests carry this request's marker, but not exactly one of
+    /// them at the expected head and base: the create may have landed and
+    /// then moved, so this is neither the requested pull request nor a
+    /// reason to open another.
+    MarkedElsewhere,
 }
 
 /// Per-operation read budget; an exhausted page budget is never absence evidence.
@@ -424,12 +429,14 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             GitHubAction::OpenPullRequest {
                 head,
                 expected_head,
+                base,
                 body,
                 ..
             } => self.pull_request(
                 &mutation.repository,
                 head,
                 expected_head,
+                base,
                 &marked(body.as_str(), key),
             ),
             GitHubAction::LinkSubIssue { parent, child } => self.relationship(
@@ -447,16 +454,18 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
         }
     }
     /// Find the pull request `expected` marks among `head`'s pull requests.
-    /// Only the requester's marker counts; once found it is applied whatever
-    /// the head or base became later. Without it, another open pull request
-    /// from `head`, a missing remote branch, or a remote head other than
-    /// `expected_head` is a conflict: a branch gets one open pull request,
-    /// and opening never pushes.
+    /// Only the requester's marker counts, and it is applied only while it is
+    /// the one marked pull request and still holds `expected_head` on `base`;
+    /// otherwise it is [`Inspection::MarkedElsewhere`]. Without a marker,
+    /// another open pull request from `head`, a missing remote branch, or a
+    /// remote head other than `expected_head` is a conflict: a branch gets one
+    /// open pull request, and opening never pushes.
     fn pull_request(
         &mut self,
         repository: &crate::contracts::Repository,
         head: &crate::contracts::BranchName,
         expected_head: &crate::contracts::CommitId,
+        base: &crate::contracts::BranchName,
         expected: &str,
     ) -> Result<Inspection, IntegrationError> {
         let root = format!("repos/{repository}");
@@ -466,6 +475,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
         ))?;
         let requester = self.scope.requester().as_str();
         let mut found = None;
+        let mut marks = 0_usize;
         let mut occupied = false;
         for entry in &entries {
             let field = |pointer: &str| {
@@ -480,20 +490,24 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             }
             let marked = entry.get("body").and_then(Value::as_str) == Some(expected);
             if marked && field("/user/login")?.eq_ignore_ascii_case(requester) {
-                if found.is_some() {
-                    return Err(IntegrationError::Unknown);
-                }
+                marks = marks.saturating_add(1);
                 let url = field("/html_url")?;
                 if !url.starts_with(&format!("https://github.com/{repository}/pull/")) {
                     return Err(IntegrationError::Unknown);
                 }
-                found = Some(Receipt::new(ExternalRef::new(url)?, vec![], vec![])?);
+                if field("/head/sha")? == expected_head.as_str()
+                    && field("/base/ref")? == base.as_str()
+                {
+                    found = Some(Receipt::new(ExternalRef::new(url)?, vec![], vec![])?);
+                }
             } else if field("/state")? == "open" {
                 occupied = true;
             }
         }
-        if let Some(receipt) = found {
-            return Ok(Inspection::Applied(receipt));
+        match (marks, found) {
+            (0, _) => {}
+            (1, Some(receipt)) => return Ok(Inspection::Applied(receipt)),
+            _ => return Ok(Inspection::MarkedElsewhere),
         }
         if occupied {
             return Ok(Inspection::Conflict);

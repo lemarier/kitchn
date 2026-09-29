@@ -2347,3 +2347,61 @@ fn open_pull_request_refuses_a_self_based_branch_and_a_multiline_title() -> Test
     );
     Ok(())
 }
+/// A named change to the remote after a lost create.
+type RemoteChange = (&'static str, fn(&mut Remote));
+#[test]
+fn a_marked_pull_request_at_another_head_or_base_is_not_the_one_requested() -> TestResult {
+    let cases: [RemoteChange; 3] = [
+        // The head advanced after the lost create.
+        ("head moved", |remote| {
+            remote.pulls[0]["head"]["sha"] = json!("c".repeat(40));
+        }),
+        // The pull request was retargeted after the lost create.
+        ("base retargeted", |remote| {
+            remote.pulls[0]["base"]["ref"] = json!("release");
+        }),
+        // Two pull requests carry the marker: neither is evidence.
+        ("marked twice", |remote| {
+            let mut copy = remote.pulls[0].clone();
+            copy["number"] = json!(8);
+            copy["html_url"] = json!("https://github.com/sample/project/pull/8");
+            remote.pulls.push(copy);
+        }),
+    ];
+    for (name, change) in cases {
+        let fixture = Fixture::new()?;
+        let (scope, grants, task, fence) =
+            setup(&fixture, 3, &[Permission::OpenPullRequest], "github")?;
+        let remote = open_remote(Some(Fault::LoseAfterApply));
+        let backend = GitHubExecutor::new(
+            BackendId::new("github")?,
+            scope,
+            provider(&fixture, &task, remote.clone())?,
+            ReadLimits::default(),
+        );
+        let effect = backend.effect(mutation(open_action("Add x")?)?)?;
+        let record = run_effect(
+            &fixture.store,
+            &backend,
+            &grants,
+            plan(&task, fence, "open", effect)?,
+            &ManualClock::starting_at(1),
+        )?;
+        assert!(
+            matches!(record.state(), EffectState::Uncertain { .. }),
+            "{name}"
+        );
+        change(&mut remote.borrow_mut());
+        let report = kitchen::state::reconcile(
+            &fixture.reopen()?,
+            &backend,
+            &task,
+            fence,
+            &ManualClock::starting_at(2),
+        )?;
+        assert!(report.resolved.is_empty(), "{name} resolved");
+        assert_eq!(report.unresolved.len(), 1, "{name}");
+        assert_eq!(remote.borrow().calls.len(), 1, "{name} opened another");
+    }
+    Ok(())
+}

@@ -3443,7 +3443,7 @@ fn every_missing_layer_is_opened_bottom_to_top_on_the_layer_below() -> TestResul
 #[test]
 fn an_uncertain_open_is_reconciled_to_the_existing_pull_request_not_a_second_one() -> TestResult {
     let setup = stacking()?;
-    let layers = Layers::consistent()?;
+    let mut layers = Layers::consistent()?;
     let forge = Forge::new(&layers.updated)?
         .failing(EffectFailure::Uncertain(UncertainReason::ResponseLost));
     let titles = Titles(Vec::new());
@@ -3470,6 +3470,16 @@ fn an_uncertain_open_is_reconciled_to_the_existing_pull_request_not_a_second_one
         &setup.world.clock,
     )?;
     assert_eq!(report.resolved.len(), 1);
+    // Linked again only because the forge shows it open where it belongs.
+    layers.pull_requests.insert(
+        7,
+        Observed::Known(Some(layer_pr(
+            7,
+            "lemarier/issue-5",
+            "lemarier/issue-4",
+            'd',
+        )?)),
+    );
     let (outcome, runner) =
         run_opening(&setup, &new_top_layer()?, &layers, &forge, &titles, &submit)?;
     assert_eq!(outcome, StackOutcome::Ran(StackResult::Done));
@@ -3569,4 +3579,190 @@ fn pull_request_text_comes_from_the_head_commit_message() -> TestResult {
     // No subject, no pull request.
     assert_eq!(PullRequestText::from_commit_message("  \0body"), None);
     Ok(())
+}
+
+#[test]
+fn a_pull_request_opened_earlier_is_linked_again_only_while_it_still_matches() -> TestResult {
+    use kitchen::workflows::stack::OpenedFault;
+    // Each case changes #8, which an earlier submission opened for the layer
+    // above the task's branch, before a submission whose view lacks it.
+    let cases: [ReadsChange; 6] = [
+        ("still open", |_| {}, None),
+        (
+            "closed",
+            |layers| {
+                edit_pr(layers, 8, |pr| pr.state = PullRequestState::Closed);
+            },
+            Some(OpenedFault::NotOpen(PullRequestState::Closed)),
+        ),
+        (
+            "retargeted",
+            |layers| edit_pr(layers, 8, |pr| pr.base_branch = "main".to_owned()),
+            Some(OpenedFault::BaseChanged),
+        ),
+        (
+            "replaced",
+            |layers| {
+                edit_pr(layers, 8, |pr| pr.state = PullRequestState::Closed);
+                if let Ok(replacement) = layer_pr(9, "lemarier/issue-7", "lemarier/issue-5", 'e') {
+                    layers.insert(9, Observed::Known(Some(replacement)));
+                }
+            },
+            Some(OpenedFault::NotOpen(PullRequestState::Closed)),
+        ),
+        (
+            "gone",
+            |layers| {
+                layers.insert(8, Observed::Known(None));
+            },
+            Some(OpenedFault::Missing),
+        ),
+        (
+            "unreadable",
+            |layers| {
+                layers.insert(8, Observed::Unknown);
+            },
+            Some(OpenedFault::Unreadable),
+        ),
+    ];
+    for (name, change, fault) in cases {
+        let setup = stacking()?;
+        settled_layer(&setup, 7, "lemarier/issue-7")?;
+        let mut layers = Layers::consistent()?;
+        layers
+            .local
+            .insert("lemarier/issue-7", Observed::Known(Some(commit('e')?)));
+        let forge = Forge::new(&layers.updated)?;
+        let titles = Titles(Vec::new());
+        let submit = StackCommand::Submit { ready: false };
+        let view = stack_with_prs(&[
+            ("lemarier/issue-3", false, Some(3)),
+            ("lemarier/issue-4", false, Some(4)),
+            ("lemarier/issue-5", false, None),
+            ("lemarier/issue-7", false, None),
+        ])?;
+        let (outcome, _) = run_opening(&setup, &view, &layers, &forge, &titles, &submit)?;
+        assert_eq!(outcome, StackOutcome::Ran(StackResult::Done), "{name}");
+        // Both are open where the first submission put them.
+        for (number_, pr) in [
+            (7, layer_pr(7, "lemarier/issue-5", "lemarier/issue-4", 'd')?),
+            (8, layer_pr(8, "lemarier/issue-7", "lemarier/issue-5", 'e')?),
+        ] {
+            layers
+                .pull_requests
+                .insert(number_, Observed::Known(Some(pr)));
+        }
+        layers
+            .remote
+            .insert("lemarier/issue-7", Observed::Known(Some(commit('e')?)));
+        change(&mut layers.pull_requests);
+        let view = stack_with_prs(&[
+            ("lemarier/issue-3", false, Some(3)),
+            ("lemarier/issue-4", false, Some(4)),
+            ("lemarier/issue-5", false, Some(7)),
+            ("lemarier/issue-7", false, None),
+        ])?;
+        let (outcome, runner) =
+            run_opening_with(&setup, &view, &layers, &forge, &titles, &submit, Some(7))?;
+        match fault {
+            None => {
+                assert_eq!(outcome, StackOutcome::Ran(StackResult::Done), "{name}");
+                assert_eq!(runner.linked(), vec![link_of(&[3, 4, 7, 8], false)?]);
+                assert_eq!(layers.updated.borrow().len(), 2, "{name}");
+            }
+            Some(fault) => {
+                assert_eq!(
+                    outcome,
+                    StackOutcome::Refused(StackRefusal::OpenedPullRequest {
+                        branch: branch("lemarier/issue-7")?,
+                        number: number(8)?,
+                        fault,
+                    }),
+                    "{name}"
+                );
+                assert!(runner.linked().is_empty(), "{name} linked");
+                assert_eq!(layers.updated.borrow().len(), 1, "{name} pushed");
+            }
+        }
+        assert_eq!(forge.opened.borrow().len(), 2, "{name} opened another");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_reused_pull_request_not_at_the_pushed_head_is_not_linked() -> TestResult {
+    use kitchen::workflows::stack::OpenedFault;
+    let setup = stacking()?;
+    settled_layer(&setup, 7, "lemarier/issue-7")?;
+    let mut layers = Layers::consistent()?;
+    layers
+        .local
+        .insert("lemarier/issue-7", Observed::Known(Some(commit('e')?)));
+    let forge = Forge::new(&layers.updated)?;
+    let titles = Titles(Vec::new());
+    let submit = StackCommand::Submit { ready: false };
+    let view = stack_with_prs(&[
+        ("lemarier/issue-3", false, Some(3)),
+        ("lemarier/issue-4", false, Some(4)),
+        ("lemarier/issue-5", false, None),
+        ("lemarier/issue-7", false, None),
+    ])?;
+    run_opening(&setup, &view, &layers, &forge, &titles, &submit)?;
+    layers.pull_requests.insert(
+        7,
+        Observed::Known(Some(layer_pr(
+            7,
+            "lemarier/issue-5",
+            "lemarier/issue-4",
+            'd',
+        )?)),
+    );
+    // Someone else's commit reached the layer's pull request after the push.
+    layers.pull_requests.insert(
+        8,
+        Observed::Known(Some(layer_pr(
+            8,
+            "lemarier/issue-7",
+            "lemarier/issue-5",
+            'f',
+        )?)),
+    );
+    layers
+        .remote
+        .insert("lemarier/issue-7", Observed::Known(Some(commit('e')?)));
+    let view = stack_with_prs(&[
+        ("lemarier/issue-3", false, Some(3)),
+        ("lemarier/issue-4", false, Some(4)),
+        ("lemarier/issue-5", false, Some(7)),
+        ("lemarier/issue-7", false, None),
+    ])?;
+    let (outcome, runner) =
+        run_opening_with(&setup, &view, &layers, &forge, &titles, &submit, Some(7))?;
+    assert_eq!(
+        outcome,
+        StackOutcome::Ran(StackResult::OpenedPullRequest {
+            branch: branch("lemarier/issue-7")?,
+            number: number(8)?,
+            fault: OpenedFault::HeadMoved,
+        })
+    );
+    assert_eq!(layers.updated.borrow().len(), 2);
+    assert!(runner.linked().is_empty());
+    assert_eq!(forge.opened.borrow().len(), 2);
+    Ok(())
+}
+
+type PullRequestReads = BTreeMap<u64, Observed<Option<PullRequestView>>>;
+
+/// A named change to pull-request reads and the fault it must cause, if any.
+type ReadsChange = (
+    &'static str,
+    fn(&mut PullRequestReads),
+    Option<kitchen::workflows::stack::OpenedFault>,
+);
+
+fn edit_pr(reads: &mut PullRequestReads, number_: u64, change: impl FnOnce(&mut PullRequestView)) {
+    if let Some(Observed::Known(Some(view))) = reads.get_mut(&number_) {
+        change(view);
+    }
 }

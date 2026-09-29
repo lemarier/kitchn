@@ -156,6 +156,36 @@ pub enum StackRefusal {
         /// The layer.
         branch: BranchName,
     },
+    /// The stack tool's view lacks the pull request the task opened for a
+    /// layer, and the forge no longer shows it open for that branch on the
+    /// planned base. Nothing is pushed, opened, or linked.
+    #[error("stack layer {branch}'s earlier pull request no longer matches it")]
+    OpenedPullRequest {
+        /// The layer.
+        branch: BranchName,
+        /// The pull request the task opened for it.
+        number: IssueNumber,
+        /// What no longer matches.
+        fault: OpenedFault,
+    },
+}
+
+/// Why a pull request the task opened for a layer is not linked again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OpenedFault {
+    /// The forge could not be read.
+    Unreadable,
+    /// The forge has no such pull request.
+    Missing,
+    /// It merged or closed.
+    NotOpen(PullRequestState),
+    /// Its head branch is not the layer.
+    WrongBranch,
+    /// It targets a base other than the layer below it (or the trunk).
+    BaseChanged,
+    /// It is not at the head the push moved the layer to.
+    HeadMoved,
 }
 
 /// Why a layer below the task's branch refuses a stack push or submission.
@@ -353,6 +383,16 @@ pub enum StackResult {
     OpenUncertain {
         /// The layer.
         branch: BranchName,
+    },
+    /// The layers were pushed, but the pull request the task opened earlier
+    /// for the named layer no longer matches it; nothing was linked.
+    OpenedPullRequest {
+        /// The layer.
+        branch: BranchName,
+        /// The pull request the task opened for it.
+        number: IssueNumber,
+        /// What no longer matches.
+        fault: OpenedFault,
     },
 }
 
@@ -895,9 +935,13 @@ impl StackBoundary<'_> {
     /// request reuses one the task already opened for that branch, or gets
     /// one opened after the push by the [`LayerOpener`], bottom to top, based
     /// on the unmerged layer below it or the trunk, at the head the push
-    /// moved it to, and as a draft unless `ready`. An open the forge refused
-    /// ([`StackResult::NotOpened`]) or whose outcome is unknown
-    /// ([`StackResult::OpenUncertain`]) stops the submission before linking.
+    /// moved it to, and as a draft unless `ready`. A reused one must still
+    /// be open for that branch on that base before the push
+    /// ([`StackRefusal::OpenedPullRequest`]) and at the pushed head after it
+    /// ([`StackResult::OpenedPullRequest`]), or nothing is linked. An open
+    /// the forge refused ([`StackResult::NotOpened`]) or whose outcome is
+    /// unknown ([`StackResult::OpenUncertain`]) stops the submission before
+    /// linking.
     /// Without an opener, or without text for a new pull request, the
     /// submission is refused before the push ([`StackRefusal::NoPullRequest`],
     /// [`StackRefusal::PullRequestText`]).
@@ -960,7 +1004,8 @@ impl StackBoundary<'_> {
             | StackResult::Uncertain
             | StackResult::Stale
             | StackResult::NotOpened { .. }
-            | StackResult::OpenUncertain { .. } => {
+            | StackResult::OpenUncertain { .. }
+            | StackResult::OpenedPullRequest { .. } => {
                 return Ok(StackOutcome::Refused(StackRefusal::UpstackBusy));
             }
         };
@@ -1018,6 +1063,18 @@ impl StackBoundary<'_> {
                     pull_requests.push(number);
                     continue;
                 }
+                PlannedLayer::Reused(reused) => {
+                    // Read again now that the push moved the layer.
+                    if let Err(fault) = self.matches(&reused, Some(&reused.head)) {
+                        return Ok(StackOutcome::Ran(StackResult::OpenedPullRequest {
+                            branch: reused.branch,
+                            number: reused.number,
+                            fault,
+                        }));
+                    }
+                    pull_requests.push(reused.number);
+                    continue;
+                }
                 PlannedLayer::Open(open) => open,
             };
             match self.open(task, fence, &binding.repository, &open, link.ready)? {
@@ -1056,8 +1113,9 @@ impl StackBoundary<'_> {
     }
 
     /// Every unmerged layer's pull request for a submission, bottom to top:
-    /// its existing one, one the task already opened for its branch, or one
-    /// to open at the head `permit` moves it to.
+    /// its existing one, one the task already opened for its branch while
+    /// the forge still shows it open on the planned base, or one to open at
+    /// the head `permit` moves it to.
     fn plan_link(
         &self,
         record: &TaskRecord,
@@ -1075,17 +1133,32 @@ impl StackBoundary<'_> {
             let planned = match (layer.pr, self.opener) {
                 (Some(pr), _) => PlannedLayer::Existing(pr.number),
                 (None, None) => return Err(missing()),
-                (None, Some(opener)) => match opened(record, repository, &layer.name) {
-                    Some(number) => PlannedLayer::Existing(number),
-                    None => {
-                        // Every layer below the task's branch has a pull
-                        // request, so each missing one is pushed here.
-                        let head = permit
-                            .updates()
-                            .iter()
-                            .find(|update| update.branch() == &layer.name)
-                            .map(|update| update.commit().clone())
-                            .ok_or_else(missing)?;
+                (None, Some(opener)) => {
+                    // Every layer below the task's branch has a pull
+                    // request, so each missing one is pushed here.
+                    let head = permit
+                        .updates()
+                        .iter()
+                        .find(|update| update.branch() == &layer.name)
+                        .map(|update| update.commit().clone())
+                        .ok_or_else(missing)?;
+                    if let Some(number) = opened(record, repository, &layer.name) {
+                        let reused = ReusedLayer {
+                            number,
+                            branch: layer.name.clone(),
+                            base: base.clone(),
+                            head,
+                        };
+                        // The push has not moved it yet, so not its head.
+                        self.matches(&reused, None).map_err(|fault| {
+                            StackRefusal::OpenedPullRequest {
+                                branch: layer.name.clone(),
+                                number,
+                                fault,
+                            }
+                        })?;
+                        PlannedLayer::Reused(reused)
+                    } else {
                         let Observed::Known(text) = opener.text.pull_request_text(&layer.name)
                         else {
                             return Err(StackRefusal::PullRequestText {
@@ -1100,7 +1173,7 @@ impl StackBoundary<'_> {
                             text,
                         })
                     }
-                },
+                }
             };
             layers.push(planned);
             base = &layer.name;
@@ -1110,6 +1183,36 @@ impl StackBoundary<'_> {
             layers,
             ready,
         })
+    }
+
+    /// Whether the forge shows `reused` open for its branch on its base and,
+    /// given `head`, at that head.
+    fn matches(
+        &self,
+        reused: &ReusedLayer,
+        head: Option<&CommitId>,
+    ) -> std::result::Result<(), OpenedFault> {
+        let view = match self.pull_requests.pull_request(reused.number) {
+            Observed::Known(Some(view)) => view,
+            Observed::Known(None) => return Err(OpenedFault::Missing),
+            Observed::Unknown => return Err(OpenedFault::Unreadable),
+        };
+        match view.state {
+            PullRequestState::Open => {}
+            state @ (PullRequestState::Closed | PullRequestState::Merged) => {
+                return Err(OpenedFault::NotOpen(state));
+            }
+        }
+        if view.head_branch != reused.branch.as_str() {
+            return Err(OpenedFault::WrongBranch);
+        }
+        if view.base_branch != reused.base.as_str() {
+            return Err(OpenedFault::BaseChanged);
+        }
+        match head {
+            Some(head) if &view.head != head => Err(OpenedFault::HeadMoved),
+            Some(_) | None => Ok(()),
+        }
     }
 
     /// Open `layer`'s pull request through the forge's persisted-intent
@@ -1176,8 +1279,20 @@ struct LinkPlan<'a> {
 enum PlannedLayer<'a> {
     /// It has one.
     Existing(IssueNumber),
+    /// The task opened one earlier that the tool's view lacks; linked only
+    /// if it still matches after the push.
+    Reused(ReusedLayer),
     /// It needs one opened.
     Open(OpenLayer<'a>),
+}
+
+/// A pull request the task opened earlier for a layer, and where the
+/// submission expects it.
+struct ReusedLayer {
+    number: IssueNumber,
+    branch: BranchName,
+    base: BranchName,
+    head: CommitId,
 }
 
 /// A pull request to open for a layer, and what opens it.

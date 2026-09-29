@@ -14,12 +14,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConsumerId, CredentialId, EffectName, Error, HolderId, HouseId, TaskId, WorkflowId,
     contracts::{
-        AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Claimant,
-        Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext, EffectRequest,
-        EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef, FailureClass, Fence,
-        HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef,
-        RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Text, Timestamp, Trigger,
-        UncertainReason,
+        AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Capability,
+        Claimant, Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext,
+        EffectRequest, EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef,
+        FailureClass, Fence, HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation,
+        Receipt, ResourceKind, ResourceRef, RetryPolicy, ScheduleEffect, ScheduleRequirements,
+        Settlement, SubmittedEffects, TaskSpec, Text, Timestamp, Trigger, UncertainReason,
     },
     state::{
         ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerAttempt, MarkerFact,
@@ -1086,6 +1086,10 @@ pub(crate) struct StoreState {
     consumers: BTreeMap<ConsumerId, ConsumerRecord>,
     #[serde(default)]
     markers: Markers,
+    /// The workflow requirements of each schedule a Kitchen install created
+    /// or reused, kept apart from tasks so retention cannot drop them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    schedules: Vec<InstalledRequirements>,
     /// The last item a retention pass looked up, so the next bounded pass
     /// continues after it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1128,6 +1132,15 @@ where
     deserializer.deserialize_map(UniqueMap(std::marker::PhantomData))
 }
 
+/// The workflow requirements recorded for one installed schedule. Activating
+/// or trying it rechecks them against the executor; removing it forgets them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InstalledRequirements {
+    schedule: ResourceRef,
+    requires: BTreeSet<Capability>,
+}
+
 impl StoreState {
     pub(crate) const fn new(house: HouseId, nonce: u64) -> Self {
         Self {
@@ -1138,6 +1151,7 @@ impl StoreState {
             tasks: BTreeMap::new(),
             consumers: BTreeMap::new(),
             markers: Markers::new(),
+            schedules: Vec::new(),
             retention_cursor: None,
         }
     }
@@ -1635,13 +1649,37 @@ impl StoreState {
         {
             self.check_consumer(consumer, now)?;
         }
-        let task = self.task_mut(&plan.task)?;
+        let scheduled = match plan.effect.schedule_requirements() {
+            ScheduleRequirements::None => None,
+            ScheduleRequirements::Declared(requires) => Some(requires),
+            ScheduleRequirements::Unrecorded => {
+                return fail(StateError::ScheduleRequirementsUnknown);
+            }
+            ScheduleRequirements::Installed { schedule, requires } => {
+                let recorded = self
+                    .schedules
+                    .iter()
+                    .find(|installed| &installed.schedule == schedule)
+                    .map(|installed| &installed.requires)
+                    .ok_or(StateError::ScheduleRequirementsUnknown)?;
+                match requires {
+                    None => return fail(StateError::ScheduleRequirementsUnknown),
+                    Some(requires) if requires != recorded => {
+                        return fail(StateError::ScheduleRequirementsMismatch);
+                    }
+                    Some(_) => Some(recorded),
+                }
+            }
+        };
         backend.capabilities.require(
-            task.spec
+            self.task(&plan.task)?
+                .spec
                 .requires
                 .for_executor(plan.effect.executor())
-                .chain([plan.effect.required_capability()]),
+                .chain([plan.effect.required_capability()])
+                .chain(scheduled.into_iter().flatten().copied()),
         )?;
+        let task = self.task_mut(&plan.task)?;
         let trigger = task.owned_lease(plan.fence, now, true)?.trigger.clone();
         // Every launch uses the selection fixed when the task was created.
         if let Effect::Worker(Operation::LaunchWorker { agent, .. }) = &plan.effect
@@ -1838,7 +1876,9 @@ impl StoreState {
             .find(|effect| effect.seq == seq)
             .ok_or(Error::State(StateError::EffectNotFound(seq)))?;
         apply_outcome(effect, seq, outcome, now)?;
-        Ok(effect.clone())
+        let record = effect.clone();
+        self.note_schedule(&record);
+        Ok(record)
     }
 
     /// Record what a backend lookup proved about one write of a task that
@@ -1893,7 +1933,53 @@ impl StoreState {
         if let Some(next) = next {
             effect.state = next;
         }
-        Ok(effect.clone())
+        let record = effect.clone();
+        self.note_schedule(&record);
+        Ok(record)
+    }
+
+    /// Keep an applied schedule install's workflow requirements with the
+    /// schedule it created or reused, and forget them once it is removed.
+    fn note_schedule(&mut self, effect: &EffectRecord) {
+        let EffectState::Applied { receipt, .. } = &effect.state else {
+            return;
+        };
+        match effect.request.effect() {
+            Effect::Schedule(ScheduleEffect::InstallDisabled { schedule: spec }) => {
+                // A spec without recorded requirements leaves the schedule
+                // unrecorded, so it is never started.
+                let Some(requires) = spec.requires() else {
+                    return;
+                };
+                for schedule in receipt
+                    .created()
+                    .iter()
+                    .chain(receipt.touched())
+                    .filter(|resource| resource.kind == ResourceKind::Schedule)
+                {
+                    match self
+                        .schedules
+                        .iter_mut()
+                        .find(|installed| &installed.schedule == schedule)
+                    {
+                        // Reinstalling never narrows what was recorded.
+                        Some(installed) => installed.requires.extend(requires),
+                        None => self.schedules.push(InstalledRequirements {
+                            schedule: schedule.clone(),
+                            requires: requires.clone(),
+                        }),
+                    }
+                }
+            }
+            Effect::Schedule(ScheduleEffect::Remove { schedule }) => {
+                self.schedules
+                    .retain(|installed| &installed.schedule != schedule);
+            }
+            Effect::Schedule(ScheduleEffect::SetState { .. } | ScheduleEffect::Trial { .. })
+            | Effect::Worker(_)
+            | Effect::GitHub(_)
+            | Effect::Roger(_) => {}
+        }
     }
 
     /// Record that a person reviewed the writes of a settled task that did
@@ -2565,7 +2651,10 @@ impl StoreState {
 
     /// Check invariants that the type system cannot express.
     pub(crate) fn validate(&self) -> std::result::Result<(), Corruption> {
-        if self.tasks.len() > MAX_TASKS || self.consumers.len() > MAX_CONSUMERS {
+        if self.tasks.len() > MAX_TASKS
+            || self.consumers.len() > MAX_CONSUMERS
+            || self.schedules.len() > MAX_TASKS
+        {
             return Err(Corruption::LimitExceeded);
         }
         self.markers.validate()?;

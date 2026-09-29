@@ -1000,6 +1000,13 @@ fn gardener_installs_a_disabled_daily_schedule_with_its_own_precheck() -> common
         return Err("expected a disabled install".into());
     };
     assert_eq!(schedule.workflow().as_str(), "gardener");
+    assert_eq!(
+        schedule.requires(),
+        Some(&std::collections::BTreeSet::from(
+            gardener::REQUIRED_CAPABILITIES
+        )),
+        "an installing backend must support the gardener's requirements"
+    );
     assert_eq!(schedule.consumer(), &consumer);
     assert_eq!(schedule.recurrence(), &Recurrence::Daily(at));
     assert_eq!(schedule.timezone(), &zone);

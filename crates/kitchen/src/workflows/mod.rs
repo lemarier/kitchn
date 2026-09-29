@@ -23,7 +23,84 @@ pub mod repair;
 pub mod stack;
 pub mod triage;
 
-use crate::{integrations::github::Observation, scheduling::PrecheckOutcome};
+use crate::{
+    ConsumerId,
+    contracts::Capability,
+    integrations::github::Observation,
+    scheduling::{PrecheckOutcome, WorkflowName},
+};
+
+/// A workflow Kitchen installs as a schedule, with the capabilities its
+/// definition requires of the backend that runs it. A backend that can only
+/// name the workflow a schedule runs, such as Orca through the automation
+/// name, derives the requirements from here; a workflow not listed has none
+/// Kitchen can establish, so its schedule is never started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledWorkflow {
+    /// The house budget tick ([`budget`]).
+    Budget,
+    /// The daily hygiene pass ([`gardener`]).
+    Gardener,
+}
+
+impl ScheduledWorkflow {
+    /// Every scheduled workflow.
+    pub const ALL: [Self; 2] = [Self::Budget, Self::Gardener];
+
+    /// The workflow named `workflow`, or `None` when Kitchen defines no
+    /// schedule for it.
+    #[must_use]
+    pub fn find(workflow: &WorkflowName) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|scheduled| scheduled.as_str() == workflow.as_str())
+    }
+
+    /// The workflow name its schedules carry.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Budget => budget::WORKFLOW,
+            Self::Gardener => gardener::WORKFLOW,
+        }
+    }
+
+    /// What its definition requires of the backend for scheduled execution.
+    #[must_use]
+    pub const fn required_capabilities(self) -> &'static [Capability] {
+        match self {
+            Self::Budget => &budget::REQUIRED_CAPABILITIES,
+            Self::Gardener => &gardener::REQUIRED_CAPABILITIES,
+        }
+    }
+
+    /// The one consumer this workflow's schedule serves, or `None` when the
+    /// installer chooses it.
+    const fn fixed_consumer(self) -> Option<&'static str> {
+        match self {
+            Self::Budget => Some(budget::WORKFLOW),
+            Self::Gardener => None,
+        }
+    }
+
+    /// Whether a schedule of this workflow may serve `consumer`: its fixed
+    /// consumer, or for a chosen one, any consumer no other workflow fixes.
+    #[must_use]
+    pub fn serves(self, consumer: &ConsumerId) -> bool {
+        match self.fixed_consumer() {
+            Some(fixed) => consumer.as_str() == fixed,
+            None => !Self::ALL
+                .into_iter()
+                .any(|other| other.fixed_consumer() == Some(consumer.as_str())),
+        }
+    }
+}
+
+impl std::fmt::Display for ScheduledWorkflow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 fn valid_label(label: &str) -> bool {
     !label.is_empty() && label.len() <= 50 && !label.chars().any(char::is_control)

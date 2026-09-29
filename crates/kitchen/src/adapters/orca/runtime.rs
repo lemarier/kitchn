@@ -184,7 +184,10 @@ pub fn capabilities() -> CapabilitySet {
     .with(C::IdempotentSetScheduleState, Support::Supported)
     .with(C::LookupRemoveSchedule, Support::Supported)
     .with(C::IdempotentRemoveSchedule, Support::Supported)
-    // A non-zero precheck exit is recorded as a skip: idle and error look alike.
+    // Orca skips the run on any non-zero precheck exit and reports no
+    // failure. Only the run history's recorded exit code, timeout, and error
+    // tell idle from an error, after the fact; a run without that record
+    // stays unknown.
     .with(C::SchedulePrecheck, Support::Partial)
     // `run-use` binds a terminal but records no relinquish; Kitchen owns the checkpoint.
     .with(C::RunTransfer, Support::Partial)

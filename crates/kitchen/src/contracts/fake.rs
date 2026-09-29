@@ -236,7 +236,7 @@ impl FakeBackend {
             Effect::Schedule(
                 ScheduleEffect::SetState { schedule, .. }
                 | ScheduleEffect::Remove { schedule }
-                | ScheduleEffect::Trial { schedule },
+                | ScheduleEffect::Trial { schedule, .. },
             ) => (Vec::new(), vec![schedule.clone()]),
         };
         let reference = self.handle(state, "request")?;

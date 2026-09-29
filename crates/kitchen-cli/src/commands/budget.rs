@@ -463,8 +463,8 @@ fn install(
     let report = Report::from_flags(flags, &opened.config)?;
     // Installing needs the standing grants every tick delegates: the
     // schedule grant it pauses under and the comment grant it reports under,
-    // or every tick would fail before its first pause. The backend must run
-    // a precheck-gated schedule.
+    // or every tick would fail before its first pause. The backend refuses
+    // the install unless it supports the tick's required capabilities.
     let grants = opened.config.authority()?;
     if !grants.covers(&opened.schedule_grant(&source)) {
         return Err(kitchen::contracts::ContractError::PermissionDenied {
@@ -480,13 +480,6 @@ fn install(
             permission: Permission::PostComment,
         }
         .into());
-    }
-    let capabilities = &opened.backend.descriptor().capabilities;
-    if !budget::REQUIRED_CAPABILITIES
-        .iter()
-        .all(|capability| capabilities.supports(*capability))
-    {
-        return Err(WorkflowError::IncompleteEvidence.into());
     }
     let args = TickArgs {
         kitchen,

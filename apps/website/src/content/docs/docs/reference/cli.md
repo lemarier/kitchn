@@ -273,7 +273,17 @@ Report options (`--report-issue owner/repo#n`, `--github-backend`,
 `--requester`, `--github-credential`, `--credential-file`, `--gh`) name where
 and as whom the owner report is posted. `run` exits 1 when a pause or report
 did not go through. `install` adds the tick's schedule paused; activating it is
-the owner's separate decision.
+the owner's separate decision. The backend must fully support the tick's
+required capabilities (no overlapping runs, an enforced run timeout, and typed
+idle and error precheck results); otherwise `install` exits 1 naming the missing
+and partial ones, and nothing is created. Orca does not provide the first two
+and reports precheck errors only in its run history, so the install is refused
+there. Activating or trying an installed schedule checks its workflow's
+requirements again. On Orca they come from Kitchen's definition of the workflow
+the automation's name records; a schedule installed before Kitchen recorded the
+workflow, or renamed in Orca to another workflow or consumer, is refused until
+it is removed and installed again. Pausing and removing such a schedule still
+work.
 
 ## `kitchn store`
 

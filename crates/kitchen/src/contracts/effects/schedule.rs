@@ -5,12 +5,37 @@
 //! [`Permission::ManageSchedule`], and turning a schedule on needs the
 //! separate [`Permission::ActivateSchedule`].
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
     contracts::{Capability, ContractError, EffectContext, GrantScope, Permission, ResourceRef},
     scheduling::{ScheduleSpec, ScheduleState},
 };
+
+/// The workflow requirements an effect must meet before it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleRequirements<'a> {
+    /// The effect starts no scheduled run: pausing, removing, or not a
+    /// schedule effect.
+    None,
+    /// An install, carrying its workflow's declared requirements.
+    Declared(&'a BTreeSet<Capability>),
+    /// An install of a spec stored before requirements were recorded, which
+    /// cannot show what its workflow needs and is refused.
+    Unrecorded,
+    /// Activating or trying this installed schedule starts runs, so the
+    /// requirements recorded when it was installed apply. `requires` is what
+    /// the effect carries from Kitchen's record; the effect is refused when
+    /// it or the record is missing, or when they differ.
+    Installed {
+        /// The schedule.
+        schedule: &'a ResourceRef,
+        /// The requirements the effect carries.
+        requires: Option<&'a BTreeSet<Capability>>,
+    },
+}
 
 /// A schedule change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +60,13 @@ pub enum ScheduleEffect {
         schedule: ResourceRef,
         /// The requested state.
         state: ScheduleState,
+        /// The capabilities Kitchen recorded for the schedule's workflow when
+        /// it was installed. The store refuses activation without them, or
+        /// when they differ from its record; pausing ignores them. An
+        /// executor that can establish the workflow's requirements itself,
+        /// such as Orca, relies on its own instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requires: Option<BTreeSet<Capability>>,
     },
     /// Remove an installed schedule and its run history.
     #[serde(rename_all = "camelCase")]
@@ -49,6 +81,10 @@ pub enum ScheduleEffect {
     Trial {
         /// The schedule.
         schedule: ResourceRef,
+        /// The capabilities Kitchen recorded for the schedule's workflow, as
+        /// for activating it with [`Self::SetState`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requires: Option<BTreeSet<Capability>>,
     },
 }
 
@@ -61,6 +97,32 @@ impl ScheduleEffect {
             | Self::SetState { .. }
             | Self::Remove { .. }
             | Self::Trial { .. } => Capability::ScheduleManage,
+        }
+    }
+
+    /// Where the capabilities the scheduled workflow requires of the
+    /// executor, beyond [`Self::required_capability`], come from.
+    #[must_use]
+    pub const fn schedule_requirements(&self) -> ScheduleRequirements<'_> {
+        match self {
+            Self::InstallDisabled { schedule } => match schedule.requires() {
+                Some(requires) => ScheduleRequirements::Declared(requires),
+                None => ScheduleRequirements::Unrecorded,
+            },
+            Self::SetState {
+                schedule,
+                state: ScheduleState::Active,
+                requires,
+            }
+            | Self::Trial { schedule, requires } => ScheduleRequirements::Installed {
+                schedule,
+                requires: requires.as_ref(),
+            },
+            Self::SetState {
+                state: ScheduleState::Paused,
+                ..
+            }
+            | Self::Remove { .. } => ScheduleRequirements::None,
         }
     }
 

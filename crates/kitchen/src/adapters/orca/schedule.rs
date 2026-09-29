@@ -1,9 +1,18 @@
 //! Schedules as Orca automations.
 //!
-//! Kitchen names each automation `kitchen:<house>:<consumer>`, after the
-//! workflow consumer scope it serves, and acts only on
-//! automations whose name decodes for its own house, so existing automations
-//! are never touched. Orca's automation commands take no request key, so:
+//! Kitchen names each automation `kitchen:<house>:<consumer>:workflow=<workflow>`,
+//! after the workflow consumer scope it serves and the workflow it runs, and
+//! acts only on automations whose name decodes for its own house, so existing
+//! automations are never touched. The name is only an identity: activating
+//! or trying a schedule derives its requirements from Kitchen's definition
+//! of that workflow ([`ScheduledWorkflow`]), never from anything a caller or
+//! the editable name supplies. A name recording no workflow, as for installs
+//! before it was recorded, or one Kitchen defines no schedule for is refused
+//! ([`OrcaError::ScheduleRequirementsUnknown`]), as is a workflow the named
+//! consumer cannot serve ([`OrcaError::ScheduleRequirementsMismatch`]), such
+//! as a gardener renamed onto the budget consumer. The derived requirements
+//! are then checked against Orca's support. Pausing and removing check no
+//! requirements. Orca's automation commands take no request key, so:
 //!
 //! - an install holds a reservation for the house and consumer, so two
 //!   installers cannot both list, find nothing, and both create;
@@ -34,35 +43,78 @@ use crate::{
     ConsumerId, HouseId,
     adapters::orca::{OrcaBackend, OrcaError, OrcaRunner, backend, wire},
     contracts::{
-        EffectFailure, ExternalRef, Lookup, NotAppliedReason, Receipt, ResourceKind, ResourceRef,
-        ScheduleEffect, Timestamp, UncertainReason,
+        Capability, EffectExecutor, EffectFailure, ExternalRef, Lookup, NotAppliedReason, Receipt,
+        ResourceKind, ResourceRef, ScheduleEffect, Timestamp, UncertainReason,
     },
     scheduling::{
         InstallPlan, InstalledSchedule, MAX_SCHEDULE_RUNS, ObservedScheduleState, PrecheckOutcome,
         Readiness, RunOutcome, ScheduleEvidence, ScheduleField, ScheduleObservation, ScheduleRun,
-        ScheduleSpec, ScheduleState, ScheduleUsage, ScheduleWorkspace, plan_install,
+        ScheduleSpec, ScheduleState, ScheduleUsage, ScheduleWorkspace, WorkflowName, plan_install,
     },
     trust::Measurement,
+    workflows::ScheduledWorkflow,
 };
 
 /// Most automations one listing may hold before it is refused as incomplete.
 pub const MAX_AUTOMATIONS: usize = 500;
 
 const NAME_PREFIX: &str = "kitchen";
+const WORKFLOW_PREFIX: &str = "workflow=";
 
-/// The Orca automation name Kitchen uses for `consumer` in `house`.
+/// The Orca automation name Kitchen uses for `consumer` in `house`, running
+/// `workflow`.
 #[must_use]
-pub fn native_schedule_name(house: &HouseId, consumer: &ConsumerId) -> String {
-    format!("{NAME_PREFIX}:{house}:{consumer}")
+pub fn native_schedule_name(
+    house: &HouseId,
+    consumer: &ConsumerId,
+    workflow: &WorkflowName,
+) -> String {
+    format!(
+        "{NAME_PREFIX}:{house}:{consumer}:{WORKFLOW_PREFIX}{}",
+        workflow.as_str()
+    )
 }
 
-fn decode_name(house: &HouseId, native: &str) -> Option<ConsumerId> {
+/// What an automation name of this house records.
+#[derive(Debug, PartialEq, Eq)]
+struct KitchenName {
+    consumer: ConsumerId,
+    /// The workflow it runs, or `None` for an install from before it was
+    /// recorded or a name that is not a valid workflow name.
+    workflow: Option<WorkflowName>,
+}
+
+fn decode_name(house: &HouseId, native: &str) -> Option<KitchenName> {
     let rest = native
         .strip_prefix(NAME_PREFIX)?
         .strip_prefix(':')?
         .strip_prefix(house.as_str())?
         .strip_prefix(':')?;
-    ConsumerId::new(rest).ok()
+    let (consumer, workflow) = match rest.split_once(':') {
+        None => (rest, None),
+        Some((consumer, recorded)) => (
+            consumer,
+            WorkflowName::new(recorded.strip_prefix(WORKFLOW_PREFIX)?).ok(),
+        ),
+    };
+    Some(KitchenName {
+        consumer: ConsumerId::new(consumer).ok()?,
+        workflow,
+    })
+}
+
+/// The requirements Kitchen defines for the schedule `name` records: its
+/// workflow's, provided that workflow may serve the named consumer.
+fn derived_requirements(name: &KitchenName) -> Result<&'static [Capability], OrcaError> {
+    let workflow = name
+        .workflow
+        .as_ref()
+        .and_then(ScheduledWorkflow::find)
+        .ok_or(OrcaError::ScheduleRequirementsUnknown)?;
+    if !workflow.serves(&name.consumer) {
+        return Err(OrcaError::ScheduleRequirementsMismatch);
+    }
+    Ok(workflow.required_capabilities())
 }
 
 /// Quote an argument vector for the POSIX shell Orca runs prechecks in on
@@ -265,10 +317,10 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         automations
             .iter()
             .filter_map(|automation| {
-                decode_name(house, &automation.name).map(|consumer| {
+                decode_name(house, &automation.name).map(|name| {
                     Ok(InstalledSchedule {
                         resource: self.schedule_ref(&automation.id)?,
-                        consumer,
+                        consumer: name.consumer,
                         state: state_of(automation.enabled),
                     })
                 })
@@ -376,6 +428,12 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 automation.reuse_session == Some(spec.reuse_session()),
                 ScheduleField::SessionReuse,
             ),
+            (
+                decode_name(&config.house, &automation.name)
+                    .and_then(|name| name.workflow)
+                    .is_some_and(|recorded| &recorded == spec.workflow()),
+                ScheduleField::Workflow,
+            ),
         ]
         .into_iter()
         .filter_map(|(matches, field)| (!matches).then_some(field))
@@ -403,7 +461,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         let mut args = wire::Args::command(&["automations", "create"])
             .value(
                 "name",
-                &native_schedule_name(&config.house, spec.consumer()),
+                &native_schedule_name(&config.house, spec.consumer(), spec.workflow()),
             )
             .value("prompt", spec.prompt().as_str())
             .value("provider", spec.agent().selection.agent.as_str())
@@ -454,12 +512,23 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// A selection naming a model or effort is refused before anything is
     /// read or reserved: Orca automations take only a provider
     /// ([`SCHEDULE_SELECTION`](super::SCHEDULE_SELECTION)).
+    /// A schedule requiring a capability Orca does not fully support is
+    /// refused the same way: the spec's own [`ScheduleSpec::requires`] and,
+    /// for a workflow Kitchen defines a schedule for, that definition's
+    /// ([`ScheduledWorkflow`]). So is a spec stored before requirements were
+    /// recorded, and a defined workflow on a consumer it cannot serve.
     ///
     /// Concurrent installers for one house and consumer take turns: the
     /// listing, the create, and the read-back happen under a reservation, so
     /// a second installer finds the schedule the first created.
     ///
     /// # Errors
+    /// [`OrcaError::Contract`] with
+    /// [`ContractError::UnsupportedCapabilities`](crate::contracts::ContractError::UnsupportedCapabilities)
+    /// naming every required capability Orca lacks or supports only in part,
+    /// [`OrcaError::ScheduleRequirementsUnknown`] for a spec without them,
+    /// and [`OrcaError::ScheduleRequirementsMismatch`] for a workflow on a
+    /// consumer it cannot serve.
     /// [`OrcaError::Selection`] naming every part of the selection Orca
     /// cannot launch. [`OrcaError::ScheduleActive`] when the consumer's
     /// schedule is firing and [`OrcaError::ScheduleDiffers`] when it is not
@@ -477,6 +546,19 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// [`OrcaBackend::install_schedule`], and whether this call created the
     /// schedule or reused one already installed.
     fn install(&self, spec: &ScheduleSpec) -> Result<(ResourceRef, Install), OrcaError> {
+        let declared = spec
+            .requires()
+            .ok_or(OrcaError::ScheduleRequirementsUnknown)?;
+        let defined = match ScheduledWorkflow::find(spec.workflow()) {
+            Some(workflow) if !workflow.serves(spec.consumer()) => {
+                return Err(OrcaError::ScheduleRequirementsMismatch);
+            }
+            Some(workflow) => workflow.required_capabilities(),
+            None => &[],
+        };
+        EffectExecutor::descriptor(self)
+            .capabilities
+            .require(declared.iter().chain(defined).copied())?;
         backend::SCHEDULE_SELECTION.check(&spec.agent().selection)?;
         let consumer = spec.consumer();
         let mut reservation = self.reserve(format!(
@@ -596,12 +678,22 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// Pause or activate a Kitchen schedule and read the state back.
     ///
     /// Activation starts a live consumer; the caller must hold that authority.
-    /// With a schedule policy, activation is refused while the schedule's or
-    /// the house's budget is exhausted in the current window, or cannot be
-    /// shown to hold, before anything is edited. Pausing is never refused.
+    /// Activation is refused before anything is edited unless the workflow
+    /// the automation's name records is one Kitchen defines a schedule for,
+    /// may serve the named consumer, and requires only capabilities Orca
+    /// fully supports ([`ScheduledWorkflow`]). The requirements come from
+    /// that definition alone, so renaming the automation cannot lower them.
+    /// With a schedule policy, activation is also refused while the
+    /// schedule's or the house's budget is exhausted in the current window,
+    /// or cannot be shown to hold. Pausing is never refused.
     ///
     /// # Errors
     /// [`OrcaError::NotKitchenOwned`], [`OrcaError::ScheduleNotFound`],
+    /// [`OrcaError::ScheduleRequirementsUnknown`],
+    /// [`OrcaError::ScheduleRequirementsMismatch`], and
+    /// [`OrcaError::Contract`] with
+    /// [`ContractError::UnsupportedCapabilities`](crate::contracts::ContractError::UnsupportedCapabilities)
+    /// for unestablished or unsupported requirements,
     /// [`OrcaError::ScheduleLimit`] for a refused activation,
     /// [`OrcaError::StateMismatch`] when the read-back differs, and call failures.
     pub fn set_schedule_state(
@@ -612,6 +704,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         let automation = self.owned(schedule)?;
         if state == ScheduleState::Active {
             self.check_activation(&automation)?;
+            self.check_requirements(&automation)?;
         }
         let switch = match state {
             ScheduleState::Paused => "disabled",
@@ -670,11 +763,22 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             return Ok(());
         };
         let house = &self.config().house;
-        let Some(consumer) = decode_name(house, &automation.name) else {
+        let Some(name) = decode_name(house, &automation.name) else {
             return Err(OrcaError::NotKitchenOwned);
         };
         let evidence = self.schedule_evidence()?;
-        policy.check_activation(house, &evidence, &consumer)?;
+        policy.check_activation(house, &evidence, &name.consumer)?;
+        Ok(())
+    }
+
+    /// Refuse starting runs of `automation` unless Orca fully supports what
+    /// Kitchen defines for the workflow its name records.
+    fn check_requirements(&self, automation: &Automation) -> Result<(), OrcaError> {
+        let name = decode_name(&self.config().house, &automation.name)
+            .ok_or(OrcaError::NotKitchenOwned)?;
+        EffectExecutor::descriptor(self)
+            .capabilities
+            .require(derived_requirements(&name)?.iter().copied())?;
         Ok(())
     }
 
@@ -702,18 +806,21 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     }
 
     /// Run a paused Kitchen schedule once now, without enabling it.
+    /// Its requirements are derived and checked as for activation.
     ///
     /// Orca's `automations run` takes no request key: a lost response must be
     /// resolved with [`Self::inspect_schedule`] before another trial.
     ///
     /// # Errors
-    /// [`OrcaError::TrialRequiresPaused`] for an active schedule, ownership
+    /// [`OrcaError::TrialRequiresPaused`] for an active schedule, the
+    /// requirement refusals of [`Self::set_schedule_state`], ownership
     /// errors, and call failures.
     pub fn trial_schedule(&self, schedule: &ResourceRef) -> Result<(), OrcaError> {
         let automation = self.owned(schedule)?;
         if automation.enabled {
             return Err(OrcaError::TrialRequiresPaused);
         }
+        self.check_requirements(&automation)?;
         let args = wire::Args::command(&["automations", "run"])
             .value("id", &automation.id)
             .json();
@@ -733,6 +840,8 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::DuplicateSchedules { .. }
         | OrcaError::BranchMismatch { .. }
         | OrcaError::TrialRequiresPaused
+        | OrcaError::ScheduleRequirementsUnknown
+        | OrcaError::ScheduleRequirementsMismatch
         | OrcaError::ScheduleActive
         | OrcaError::ScheduleDiffers { .. }
         | OrcaError::ReservationRedirected
@@ -801,7 +910,11 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                     .map_err(|error| schedule_failure(&error))?;
                 schedule_receipt(&installed, Some(install))
             }
-            ScheduleEffect::SetState { schedule, state } => {
+            // The requirements an effect carries are the store's to check;
+            // Orca derives its own from the workflow definition.
+            ScheduleEffect::SetState {
+                schedule, state, ..
+            } => {
                 self.set_schedule_state(schedule, *state)
                     .map_err(|error| schedule_failure(&error))?;
                 schedule_receipt(schedule, None)
@@ -811,7 +924,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                     .map_err(|error| schedule_failure(&error))?;
                 schedule_receipt(schedule, None)
             }
-            ScheduleEffect::Trial { schedule } => {
+            ScheduleEffect::Trial { schedule, .. } => {
                 self.trial_schedule(schedule)
                     .map_err(|error| schedule_failure(&error))?;
                 schedule_receipt(schedule, None)
@@ -858,7 +971,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                     Err(error) => Err(unavailable(error)),
                 }
             }
-            ScheduleEffect::SetState { schedule, state } => match self.owned(schedule) {
+            ScheduleEffect::SetState {
+                schedule, state, ..
+            } => match self.owned(schedule) {
                 Ok(automation) if automation.enabled == matches!(state, ScheduleState::Active) => {
                     applied(schedule, None)
                 }
@@ -887,13 +1002,75 @@ mod tests {
         let home = HouseId::new("home")?;
         let other = HouseId::new("other")?;
         let name = ConsumerId::new("pickup")?;
-        let native = native_schedule_name(&home, &name);
-        assert_eq!(native, "kitchen:home:pickup");
-        assert_eq!(decode_name(&home, &native), Some(name));
+        let gardener = WorkflowName::new("gardener")?;
+        let native = native_schedule_name(&home, &name, &gardener);
+        assert_eq!(native, "kitchen:home:pickup:workflow=gardener");
+        let decoded = |workflow| KitchenName {
+            consumer: name.clone(),
+            workflow,
+        };
+        assert_eq!(
+            decode_name(&home, &native),
+            Some(decoded(Some(gardener.clone())))
+        );
+        // Named before the workflow was recorded, or naming no valid
+        // workflow: still this house's, workflow unknown.
+        assert_eq!(
+            decode_name(&home, "kitchen:home:pickup"),
+            Some(decoded(None))
+        );
+        assert_eq!(
+            decode_name(&home, "kitchen:home:pickup:workflow="),
+            Some(decoded(None))
+        );
+        assert_eq!(
+            decode_name(&home, "kitchen:home:pickup:workflow=gar dener"),
+            Some(decoded(None))
+        );
         assert_eq!(decode_name(&other, &native), None);
         assert_eq!(decode_name(&home, "Origin89 issue coordinator"), None);
         assert_eq!(decode_name(&home, "kitchen:home:"), None);
         assert_eq!(decode_name(&home, "kitchen:homely:pickup"), None);
+        assert_eq!(decode_name(&home, "kitchen:home:pickup:other=x"), None);
+        assert_eq!(decode_name(&home, "kitchen:home::workflow=gardener"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn requirements_come_from_the_named_workflow_definition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let named = |consumer: &str,
+                     workflow: Option<&str>|
+         -> Result<KitchenName, Box<dyn std::error::Error>> {
+            Ok(KitchenName {
+                consumer: ConsumerId::new(consumer)?,
+                workflow: workflow.map(WorkflowName::new).transpose()?,
+            })
+        };
+        assert_eq!(
+            derived_requirements(&named("budget", Some("budget"))?)?,
+            &crate::workflows::budget::REQUIRED_CAPABILITIES
+        );
+        assert_eq!(
+            derived_requirements(&named("nightly", Some("gardener"))?)?,
+            &crate::workflows::gardener::REQUIRED_CAPABILITIES
+        );
+        for unknown in [named("pickup", None)?, named("pickup", Some("pickup"))?] {
+            assert!(matches!(
+                derived_requirements(&unknown),
+                Err(OrcaError::ScheduleRequirementsUnknown)
+            ));
+        }
+        // The budget consumer is the budget workflow's alone, both ways.
+        for crossed in [
+            named("budget", Some("gardener"))?,
+            named("nightly", Some("budget"))?,
+        ] {
+            assert!(matches!(
+                derived_requirements(&crossed),
+                Err(OrcaError::ScheduleRequirementsMismatch)
+            ));
+        }
         Ok(())
     }
 

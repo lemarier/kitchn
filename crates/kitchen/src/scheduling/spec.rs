@@ -1,12 +1,12 @@
 //! Validated schedule definitions.
 
-use std::{fmt, time::Duration};
+use std::{collections::BTreeSet, fmt, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     ConsumerId,
-    contracts::{ResourceRef, Text},
+    contracts::{Capability, ResourceRef, Text},
     selection::{AgentSelection, ResolvedSelection},
 };
 
@@ -564,7 +564,8 @@ pub enum ScheduleState {
 /// It names the workflow it runs and the consumer scope that workflow claims
 /// through Kitchen's single-consumer lease; at most one schedule serves a
 /// consumer. Backends install every schedule paused; activation is a
-/// separate step with its own authority.
+/// separate step with its own authority. A backend refuses to install a
+/// schedule whose workflow requires a capability it does not fully support.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawScheduleSpec", into = "RawScheduleSpec")]
 pub struct ScheduleSpec {
@@ -578,6 +579,8 @@ pub struct ScheduleSpec {
     workspace: ScheduleWorkspace,
     missed_run_grace: GraceMinutes,
     reuse_session: bool,
+    /// `None` for a spec stored before requirements were recorded.
+    requires: Option<BTreeSet<Capability>>,
 }
 
 impl ScheduleSpec {
@@ -608,7 +611,18 @@ impl ScheduleSpec {
             workspace: ScheduleWorkspace::NewPerRun,
             missed_run_grace: GraceMinutes(0),
             reuse_session: false,
+            requires: Some(BTreeSet::new()),
         }
+    }
+
+    /// Require `capabilities` of the backend that installs this schedule:
+    /// the workflow's declared requirements for scheduled execution.
+    #[must_use]
+    pub fn requiring(mut self, capabilities: impl IntoIterator<Item = Capability>) -> Self {
+        self.requires
+            .get_or_insert_with(BTreeSet::new)
+            .extend(capabilities);
+        self
     }
 
     /// Run `precheck` before each run.
@@ -708,6 +722,14 @@ impl ScheduleSpec {
     pub const fn reuse_session(&self) -> bool {
         self.reuse_session
     }
+
+    /// The capabilities an installing backend must fully support, or `None`
+    /// for a spec stored before they were recorded. Such a spec cannot show
+    /// what its workflow needs, so it is not installed.
+    #[must_use]
+    pub const fn requires(&self) -> Option<&BTreeSet<Capability>> {
+        self.requires.as_ref()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -724,6 +746,9 @@ struct RawScheduleSpec {
     workspace: ScheduleWorkspace,
     missed_run_grace: GraceMinutes,
     reuse_session: bool,
+    /// Always written; absent only from specs stored before it existed.
+    #[serde(default)]
+    requires: Option<BTreeSet<Capability>>,
 }
 
 /// A schedule's agent as stored. Schedules persisted before selections were
@@ -760,6 +785,7 @@ impl TryFrom<RawScheduleSpec> for ScheduleSpec {
             workspace: raw.workspace,
             missed_run_grace: raw.missed_run_grace,
             reuse_session: false,
+            requires: raw.requires,
         };
         if raw.reuse_session {
             spec.with_session_reuse()
@@ -782,6 +808,7 @@ impl From<ScheduleSpec> for RawScheduleSpec {
             workspace: spec.workspace,
             missed_run_grace: spec.missed_run_grace,
             reuse_session: spec.reuse_session,
+            requires: spec.requires,
         }
     }
 }

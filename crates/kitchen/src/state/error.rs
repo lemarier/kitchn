@@ -223,6 +223,18 @@ pub enum StateError {
     /// The target resource was not reported by an applied effect of this task.
     #[error("the task does not own the target resource")]
     ResourceNotOwned,
+    /// The schedule, or the stored spec being installed, has no recorded
+    /// workflow requirements, so the executor cannot be shown to meet them.
+    #[error(
+        "the schedule's workflow requirements were not recorded; install it again from its current workflow before installing, activating, or trying it"
+    )]
+    ScheduleRequirementsUnknown,
+    /// An activation or trial carried other workflow requirements than the
+    /// ones recorded when the schedule was installed.
+    #[error(
+        "the effect's workflow requirements differ from those recorded when the schedule was installed"
+    )]
+    ScheduleRequirementsMismatch,
     /// A worker launch named another agent selection than the task's own.
     #[error("the launch does not use the agent selection recorded for its task")]
     AgentSelectionMismatch,
@@ -383,6 +395,8 @@ impl StateError {
         match self {
             Self::SubmissionBudgetExhausted(_)
             | Self::ConsentReused
+            | Self::ScheduleRequirementsUnknown
+            | Self::ScheduleRequirementsMismatch
             | Self::AcknowledgementNeedsPerson => ErrorClass::Refused,
             Self::MarkerSchemaInvalid | Self::MarkerPayloadInvalid => ErrorClass::InvalidInput,
             Self::TaskNotFound(_)

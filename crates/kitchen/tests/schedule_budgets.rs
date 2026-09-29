@@ -21,7 +21,7 @@ use kitchen::{
     adoption::{HouseRegistry, InstructionBundle},
     contracts::{
         BackendDescriptor, BackendUnavailable, BranchName, Capability, CapabilityRequirements,
-        CapabilitySet, Clock, Effect, EffectExecutor, EffectFailure, EffectRequest,
+        CapabilitySet, Clock, ContractError, Effect, EffectExecutor, EffectFailure, EffectRequest,
         EvidenceRevision, ExternalRef, GitHubAction, GitHubEffect, GitHubMutation, Grant,
         HouseGrants, IssueNumber, Lookup, Permission, PostingBudget, Provenance, Receipt,
         Repository, ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleEffect, TaskAuthority,
@@ -408,6 +408,7 @@ fn budget_exhaustion_mid_window_pauses_once_and_reports_once() -> TestResult {
         Some(Effect::Schedule(ScheduleEffect::SetState {
             schedule: schedule_ref("pickup")?,
             state: ScheduleState::Paused,
+            requires: None,
         }))
     );
     assert!(exhausted.report().contains("schedule run budget"));
@@ -1490,6 +1491,7 @@ fn orca_refuses_activating_an_exhausted_schedule_before_editing_it() -> TestResu
         Effect::Schedule(ScheduleEffect::SetState {
             schedule: installed.clone(),
             state: ScheduleState::Active,
+            requires: Some(BTreeSet::new()),
         }),
     );
     assert_eq!(
@@ -1518,15 +1520,22 @@ fn orca_refuses_activating_an_exhausted_schedule_before_editing_it() -> TestResu
     ));
     assert!(sim.calls_to(&["automations", "edit"]).is_empty());
 
-    // Headroom, or the next window, activates it.
+    // With headroom, or in the next window, the budget allows it; Kitchen
+    // defines no scheduled `pickup` workflow, so its requirements are unknown
+    // and it is still not activated.
     sim.state().runs = full(3);
-    backend.set_schedule_state(&installed, ScheduleState::Active)?;
-    assert!(enabled(&sim, installed.handle.as_str()));
-    backend.set_schedule_state(&installed, ScheduleState::Paused)?;
+    assert_eq!(
+        backend.set_schedule_state(&installed, ScheduleState::Active),
+        Err(OrcaError::ScheduleRequirementsUnknown)
+    );
     sim.state().runs = full(4);
     let next = connect(&sim)?.with_clock(noon_on_day_twenty_one);
-    next.set_schedule_state(&installed, ScheduleState::Active)?;
-    assert!(enabled(&sim, installed.handle.as_str()));
+    assert_eq!(
+        next.set_schedule_state(&installed, ScheduleState::Active),
+        Err(OrcaError::ScheduleRequirementsUnknown)
+    );
+    assert!(sim.calls_to(&["automations", "edit"]).is_empty());
+    assert!(!enabled(&sim, installed.handle.as_str()));
 
     // Pausing is never refused.
     backend.set_schedule_state(&installed, ScheduleState::Paused)?;
@@ -2257,8 +2266,9 @@ fn budget_beside_pickup(
     backend: &OrcaBackend<&SimOrca>,
 ) -> TestResult<(ResourceRef, ResourceRef)> {
     let pickup = exhausted_pickup(sim, backend)?;
-    let own = backend.install_schedule(&budget_tick("15 * * * *")?)?;
-    enable(sim, &own);
+    // Orca refuses to install the tick (it lacks the tick's required
+    // capabilities), so its automation is placed in Orca directly.
+    let own = direct_budget_automation(sim)?;
     Ok((pickup, own))
 }
 
@@ -2354,8 +2364,7 @@ fn a_tick_whose_own_report_is_refused_still_pauses_itself() -> TestResult {
     let sim = SimOrca::default();
     let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
     sim.state().runs = day_twenty_runs(4);
-    let own = backend.install_schedule(&budget_tick("15 * * * *")?)?;
-    enable(&sim, &own);
+    let own = direct_budget_automation(&sim)?;
     let reporter = reporter()?;
     reporter.inject(ExecuteFault::Reject);
     let channel = ReportChannel {
@@ -2540,7 +2549,7 @@ fn a_tick_in_a_later_window_settles_the_earlier_windows_task() -> TestResult {
 }
 
 #[test]
-fn the_budget_schedule_installs_paused_with_its_precheck() -> TestResult {
+fn orca_refuses_the_budget_schedule_naming_the_capabilities_it_lacks() -> TestResult {
     let sim = SimOrca::default();
     let backend = connect(&sim)?;
     let args = tick_args()?;
@@ -2551,28 +2560,26 @@ fn the_budget_schedule_installs_paused_with_its_precheck() -> TestResult {
         Some(["/opt/kitchen/bin/kitchen", "budget", "precheck"].as_slice())
     );
     let tick = budget_tick("15 * * * *")?;
-    // The general installer installs it, under the house policy.
-    let installed = backend.install_schedule(&tick)?;
-    assert!(
-        !enabled(&sim, installed.handle.as_str()),
-        "installed paused"
+    assert_eq!(
+        tick.requires(),
+        Some(&BTreeSet::from(budget::REQUIRED_CAPABILITIES))
     );
-    assert_eq!(activations(&sim), 0);
-    // Installing again reuses the paused schedule.
-    assert_eq!(backend.install_schedule(&tick)?, installed);
-    assert_eq!(sim.calls_to(&["automations", "create"]).len(), 1);
-    // Its allocation counts: with the house budget spent, it is refused.
-    let full = SchedulePolicy {
-        house_budget: budget(4, Some(400))?,
-        ..policy()?
-    };
-    let other = SimOrca::default();
-    let backend = connect(&other)?.with_schedule_policy(full);
-    backend.install_schedule(&spec("pickup", "0 * * * *")?)?;
-    assert!(matches!(
+    // Orca cannot prevent overlapping runs or enforce a run timeout, and
+    // tells a failed precheck from an idle one only after the fact.
+    assert_eq!(
         backend.install_schedule(&tick),
-        Err(OrcaError::ScheduleLimit(BudgetError::Overcommitted { .. }))
-    ));
+        Err(OrcaError::Contract(
+            ContractError::UnsupportedCapabilities {
+                missing: vec![
+                    Capability::ScheduleSingleConsumer,
+                    Capability::ScheduleRunTimeout,
+                ],
+                partial: vec![Capability::SchedulePrecheck],
+            }
+        ))
+    );
+    // Refused before anything is read, reserved, or created.
+    assert!(sim.calls_to(&["automations"]).is_empty());
 
     // A relative path cannot be recorded in a schedule.
     let relative = TickArgs {

@@ -266,6 +266,8 @@ pub enum ScheduleField {
     MissedRunGrace,
     /// Whether runs reuse the previous session.
     SessionReuse,
+    /// The workflow it runs.
+    Workflow,
 }
 
 /// A schedule a backend reports as installed for this house.

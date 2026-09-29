@@ -1,4 +1,5 @@
-//! Schedule intervals and usage budgets per house (#40).
+//! Schedule intervals and usage budgets per house (#40), and the budget
+//! pass that applies them to live schedules (#106).
 //!
 //! Policy decisions run on constructed observations. Adapter behavior runs
 //! against the simulated Orca runtime (`orca_sim`); none of this is live
@@ -7,7 +8,7 @@
 mod common;
 mod orca_sim;
 
-use std::{collections::BTreeSet, num::NonZeroU32, time::Duration};
+use std::{cell::RefCell, collections::BTreeSet, num::NonZeroU32, time::Duration};
 
 use common::{
     Fixture, ManualClock, TestResult, at, commit, creator, house, other_house, scheduled, task_id,
@@ -19,23 +20,34 @@ use kitchen::{
     adapters::orca::{OrcaBackend, OrcaConfig, OrcaError},
     adoption::{HouseRegistry, InstructionBundle},
     contracts::{
-        BranchName, Capability, CapabilityRequirements, CapabilitySet, Effect, EffectExecutor,
-        EvidenceRevision, ExternalRef, Grant, HouseGrants, Permission, Provenance, ResourceKind,
-        ResourceRef, RetryPolicy, Role, ScheduleEffect, TaskAuthority, TaskSpec, Text, Timestamp,
+        BackendDescriptor, BackendUnavailable, BranchName, Capability, CapabilityRequirements,
+        CapabilitySet, Clock, Effect, EffectExecutor, EffectFailure, EffectRequest,
+        EvidenceRevision, ExternalRef, GitHubAction, GitHubEffect, GitHubMutation, Grant,
+        HouseGrants, IssueNumber, Lookup, Permission, PostingBudget, Provenance, Receipt,
+        Repository, ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleEffect, TaskAuthority,
+        TaskSpec, Text, Timestamp,
+        fake::{ExecuteFault, FakeBackend},
     },
     house::{
         AccessStatus, DoctorCode, DoctorEvidence, HouseConfig, HouseError, RepositoryConfig,
         RepositoryLabel, Workflow, doctor,
     },
     scheduling::{
-        AgentFamily, Budget, BudgetError, CronExpr, InstalledSchedule, IntervalMinutes, JudgedRun,
-        ObservedScheduleState, Readiness, Recurrence, RunOutcome, RunVerdict, ScheduleEvidence,
-        ScheduleLimit, ScheduleLimits, ScheduleObservation, SchedulePolicy, ScheduleRun,
-        ScheduleSpec, ScheduleState, ScheduleUsage, Timezone, TokenUsage, WindowHours,
-        WorkflowName,
+        AgentFamily, Budget, BudgetError, BudgetExhaustion, CronExpr, Exhausted, InstalledSchedule,
+        IntervalMinutes, JudgedRun, ObservedScheduleState, Readiness, Recurrence, RunOutcome,
+        RunVerdict, ScheduleEvidence, ScheduleLimit, ScheduleLimits, ScheduleObservation,
+        SchedulePolicy, ScheduleRun, ScheduleSpec, ScheduleState, ScheduleUsage, Timezone,
+        TokenUsage, UndeliveredReport, WindowHours, WorkflowName,
     },
-    state::{EffectPlan, EffectState, run_effect},
+    state::{EffectPlan, EffectState, StateError, TaskState, run_effect},
     trust::Measurement,
+    workflows::{
+        Precheck, WorkflowError,
+        budget::{
+            self, BudgetPass, Delivery, PassAction, PassClaim, ReportChannel, Tick, TickArgs,
+            TickCommand,
+        },
+    },
 };
 use orca_sim::SimOrca;
 use serde_json::json;
@@ -449,6 +461,123 @@ fn budget_exhaustion_mid_window_pauses_once_and_reports_once() -> TestResult {
     assert!(repause.pause);
     assert!(!repause.report_due);
     assert_eq!(repause.pause_effect(), exhausted.pause_effect());
+    Ok(())
+}
+
+#[test]
+fn the_budget_schedule_counts_toward_budgets_like_any_other() -> TestResult {
+    let policy = policy()?;
+    let house = house()?;
+    let day = 100 * DAY_MS;
+    let noon = day + 12 * HOUR_MS;
+    // Two pickups of three runs and the tick's four: ten in all is the house
+    // budget, and four is the tick's default schedule budget.
+    let all = evidence(
+        house.clone(),
+        noon,
+        vec![
+            usage(
+                "pickup",
+                ObservedScheduleState::Active,
+                started(day, 3, 10)?,
+            )?,
+            usage(
+                "triage",
+                ObservedScheduleState::Active,
+                started(day, 3, 10)?,
+            )?,
+            usage(
+                "budget",
+                ObservedScheduleState::Active,
+                started(day, 4, 10)?,
+            )?,
+        ],
+    );
+    let assessment = policy.assess(&house, &all)?;
+    assert_eq!(assessment.house.runs, 10, "the tick's runs are the house's");
+    assert_eq!(
+        assessment.house_exhausted.map(|exhausted| exhausted.limit),
+        Some(ScheduleLimit::HouseRuns)
+    );
+    let planned = policy.plan_exhaustion(&house, &all, |_| false)?;
+    let consumers: Vec<String> = planned
+        .iter()
+        .map(|item| item.consumer.to_string())
+        .collect();
+    assert_eq!(consumers, ["pickup", "triage", "budget"]);
+    assert!(matches!(
+        policy.check_activation(&house, &all, &consumer("budget")?),
+        Err(BudgetError::Exhausted { .. })
+    ));
+
+    // Within the house budget, the tick exhausts its own budget alone.
+    let alone = evidence(
+        house.clone(),
+        noon,
+        vec![
+            usage(
+                "pickup",
+                ObservedScheduleState::Active,
+                started(day, 1, 10)?,
+            )?,
+            usage(
+                "budget",
+                ObservedScheduleState::Active,
+                started(day, 4, 10)?,
+            )?,
+        ],
+    );
+    let planned = policy.plan_exhaustion(&house, &alone, |_| false)?;
+    let [only] = planned.as_slice() else {
+        return Err(format!("expected the tick alone, got {planned:?}").into());
+    };
+    assert_eq!(only.consumer.as_str(), "budget");
+    assert_eq!(only.exhausted.limit, ScheduleLimit::ScheduleRuns);
+    Ok(())
+}
+
+/// Arguments for the house's budget schedule in these tests.
+fn tick_args() -> TestResult<TickArgs> {
+    Ok(TickArgs {
+        kitchen: "/opt/kitchen/bin/kitchen".into(),
+        registry: "/var/kitchen/registry".into(),
+        house: house()?,
+        store: "/var/kitchen/store".into(),
+        orca: "/opt/orca/bin/orca".into(),
+        backend: orca_id()?,
+        credential: credential()?,
+        runtime_dir: "/var/kitchen/orca".into(),
+        report: None,
+    })
+}
+
+fn budget_tick(cron: &str) -> TestResult<ScheduleSpec> {
+    Ok(budget::install(
+        Recurrence::Cron(CronExpr::new(cron)?),
+        Timezone::new("America/Toronto")?,
+        ResolvedSelection::owner(AgentSelection::agent_default(AgentFamily::Claude)),
+        &tick_args()?,
+    )?)
+}
+
+#[test]
+fn the_budget_schedule_holds_an_allocation_and_keeps_the_interval() -> TestResult {
+    let policy = policy()?;
+    // Two 4-run schedules leave 2 of the 10 house runs: the tick's default
+    // allocation of 4 does not fit, as for any other schedule.
+    let two = [
+        installed("pickup", ObservedScheduleState::Paused)?,
+        installed("triage", ObservedScheduleState::Paused)?,
+    ];
+    assert!(matches!(
+        policy.check_install(&budget_tick("15 * * * *")?, &two),
+        Err(BudgetError::Overcommitted { .. })
+    ));
+    policy.check_install(&budget_tick("15 * * * *")?, &two[..1])?;
+    assert!(matches!(
+        policy.check_install(&budget_tick("*/5 * * * *")?, &[]),
+        Err(BudgetError::IntervalTooShort { .. })
+    ));
     Ok(())
 }
 
@@ -1020,6 +1149,7 @@ fn registry_with(
         stack_tool: None,
         schedules: None,
         readiness: None,
+        undelivered_budget_reports: Vec::new(),
     };
     Ok((temp, registry, repository, evidence))
 }
@@ -1102,6 +1232,48 @@ fn doctor_reports_idle_schedules_as_recommendations_and_unenforceable_budgets() 
         doctor(&registry, &repository, Some(&doctor_evidence)),
         Err(HouseError::HouseSelection)
     ));
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_an_exhaustion_whose_owner_was_never_told() -> TestResult {
+    let (_temp, registry, repository, mut doctor_evidence) = registry_with(Some(policy()?))?;
+    let day = 9 * DAY_MS;
+    doctor_evidence.schedules = Some(evidence(
+        house()?,
+        day + 12 * HOUR_MS,
+        vec![usage(
+            "gardener",
+            ObservedScheduleState::Paused,
+            started(day, 1, 10)?,
+        )?],
+    ));
+    let quiet = doctor(&registry, &repository, Some(&doctor_evidence))?;
+    assert!(quiet.healthy());
+
+    let window = policy()?
+        .window_hours
+        .containing(Timestamp::from_unix_millis(day));
+    doctor_evidence.undelivered_budget_reports = vec![UndeliveredReport {
+        consumer: consumer("pickup")?,
+        window,
+        exhausted: Exhausted {
+            limit: ScheduleLimit::ScheduleRuns,
+            used: 4,
+            allowed: 4,
+        },
+    }];
+    let told = doctor(&registry, &repository, Some(&doctor_evidence))?;
+    assert!(!told.healthy(), "an unreported pause is a setup gap");
+    let [finding] = told
+        .findings
+        .iter()
+        .filter(|finding| finding.code == DoctorCode::BudgetReport)
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| "one budget report finding")?;
+    assert!(finding.message.contains("pickup"), "{}", finding.message);
+    assert!(finding.next_step.contains("--report-issue"));
     Ok(())
 }
 
@@ -1260,6 +1432,10 @@ fn orca_refuses_an_install_that_breaks_a_limit_before_creating_anything() -> Tes
 
 fn noon_on_day_twenty() -> Timestamp {
     Timestamp::from_unix_millis(20 * DAY_MS + 12 * HOUR_MS)
+}
+
+fn one_pm_on_day_twenty() -> Timestamp {
+    Timestamp::from_unix_millis(20 * DAY_MS + 13 * HOUR_MS)
 }
 
 fn noon_on_day_twenty_one() -> Timestamp {
@@ -1505,5 +1681,1021 @@ fn an_exhausted_schedule_is_paused_through_the_adapter() -> TestResult {
             .collect::<Vec<_>>(),
         [ObservedScheduleState::Paused]
     );
+    Ok(())
+}
+
+// --- The budget pass on live schedules (#106), against the simulator. ---
+
+fn enable(sim: &SimOrca, schedule: &ResourceRef) {
+    for automation in &mut sim.state().automations {
+        if automation.id == schedule.handle.as_str() {
+            automation.enabled = true;
+        }
+    }
+}
+
+/// `count` completed agent runs on day twenty, one per hour from midnight.
+fn day_twenty_runs(count: u64) -> Vec<serde_json::Value> {
+    let day = 20 * DAY_MS;
+    (0..count)
+        .map(|index| {
+            json!({"id": format!("run-{index}"), "status": "completed",
+                "scheduledFor": day + index * HOUR_MS})
+        })
+        .collect()
+}
+
+fn activations(sim: &SimOrca) -> usize {
+    sim.calls_to(&["automations", "edit"])
+        .iter()
+        .filter(|call| call.iter().any(|arg| arg == "--enabled"))
+        .count()
+}
+
+#[test]
+fn the_budget_pass_pauses_an_exhausted_live_schedule_and_reports_once() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = backend.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    // The owner activated it; four agent runs today reach its budget.
+    enable(&sim, &installed);
+    sim.state().runs = day_twenty_runs(4);
+    let policy = policy()?;
+    let evidence = backend.schedule_evidence()?;
+    assert_eq!(
+        budget::precheck(&fixture.store, &house()?, &policy, &evidence)?,
+        Precheck::Actionable
+    );
+
+    let (task, fence) = schedule_task(&fixture)?;
+    let grants = house_grants()?;
+    let claim = PassClaim {
+        task: &task,
+        fence,
+        grants: &grants,
+    };
+    let clock = ManualClock::starting_at(1);
+    let pass = budget::run(&fixture.store, &backend, claim, &policy, &evidence, &clock)?;
+    let BudgetPass::Acted(actions) = pass else {
+        return Err("an exhausted schedule is not idle".into());
+    };
+    let [PassAction::Report(exhausted)] = actions.as_slice() else {
+        return Err(format!("expected one report, got {actions:?}").into());
+    };
+    assert!(!enabled(&sim, installed.handle.as_str()), "paused on Orca");
+    assert_eq!(exhausted.exhausted.limit, ScheduleLimit::ScheduleRuns);
+    assert!(exhausted.report().starts_with("Paused schedule pickup"));
+    let edits = sim.calls_to(&["automations", "edit"]).len();
+
+    // The same observation again reuses the recorded pause, and the report
+    // stays due until its delivery is confirmed.
+    let again = budget::run(&fixture.store, &backend, claim, &policy, &evidence, &clock)?;
+    assert_eq!(again, BudgetPass::Acted(actions.clone()));
+    assert_eq!(sim.calls_to(&["automations", "edit"]).len(), edits);
+    let unreported = backend.schedule_evidence()?;
+    assert_eq!(
+        budget::precheck(&fixture.store, &house()?, &policy, &unreported)?,
+        Precheck::Actionable
+    );
+
+    budget::confirm_reported(&fixture.store, &scheduled("budget-pass")?, exhausted, at(2))?;
+    budget::confirm_reported(&fixture.store, &scheduled("budget-pass")?, exhausted, at(3))?;
+    let settled = backend.schedule_evidence()?;
+    assert_eq!(
+        budget::precheck(&fixture.store, &house()?, &policy, &settled)?,
+        Precheck::Idle
+    );
+    assert_eq!(
+        budget::run(&fixture.store, &backend, claim, &policy, &settled, &clock)?,
+        BudgetPass::Idle
+    );
+    assert_eq!(activations(&sim), 0, "the pass never activates a schedule");
+    Ok(())
+}
+
+#[test]
+fn a_budget_pass_with_no_exhausted_schedule_stays_idle() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = backend.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    enable(&sim, &installed);
+    // Three of four runs used: within budget.
+    sim.state().runs = day_twenty_runs(3);
+    let policy = policy()?;
+    let evidence = backend.schedule_evidence()?;
+    assert_eq!(
+        budget::precheck(&fixture.store, &house()?, &policy, &evidence)?,
+        Precheck::Idle
+    );
+    let (task, fence) = schedule_task(&fixture)?;
+    let grants = house_grants()?;
+    let claim = PassClaim {
+        task: &task,
+        fence,
+        grants: &grants,
+    };
+    let clock = ManualClock::starting_at(1);
+    assert_eq!(
+        budget::run(&fixture.store, &backend, claim, &policy, &evidence, &clock)?,
+        BudgetPass::Idle
+    );
+    assert!(sim.calls_to(&["automations", "edit"]).is_empty());
+    assert!(enabled(&sim, installed.handle.as_str()));
+    // No schedules at all is idle as well.
+    let empty = SimOrca::default();
+    let none = connect(&empty)?.with_clock(noon_on_day_twenty);
+    assert_eq!(
+        budget::precheck(
+            &fixture.store,
+            &house()?,
+            &policy,
+            &none.schedule_evidence()?
+        )?,
+        Precheck::Idle
+    );
+    Ok(())
+}
+
+#[test]
+fn a_pause_that_does_not_apply_is_not_reported_and_the_next_pass_recovers() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = backend.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    enable(&sim, &installed);
+    sim.state().runs = day_twenty_runs(4);
+    let policy = policy()?;
+    let evidence = backend.schedule_evidence()?;
+    // The owner removes the schedule after it was observed.
+    sim.state().automations.clear();
+
+    let (task, fence) = schedule_task(&fixture)?;
+    let grants = house_grants()?;
+    let claim = PassClaim {
+        task: &task,
+        fence,
+        grants: &grants,
+    };
+    let clock = ManualClock::starting_at(1);
+    let pass = budget::run(&fixture.store, &backend, claim, &policy, &evidence, &clock)?;
+    let BudgetPass::Acted(actions) = pass else {
+        return Err("the stale observation is still exhausted".into());
+    };
+    let [PassAction::PauseNotApplied { exhaustion, record }] = actions.as_slice() else {
+        return Err(format!("expected an unapplied pause, got {actions:?}").into());
+    };
+    assert!(matches!(record.state(), EffectState::NotApplied { .. }));
+    assert_eq!(
+        fixture.store.marker(&exhaustion.marker_key()?)?,
+        None,
+        "nothing is recorded as reported"
+    );
+    // The next observation no longer lists the schedule: nothing to do.
+    let next = backend.schedule_evidence()?;
+    assert!(next.schedules.is_empty());
+    assert_eq!(
+        budget::run(&fixture.store, &backend, claim, &policy, &next, &clock)?,
+        BudgetPass::Idle
+    );
+    Ok(())
+}
+
+#[test]
+fn a_budget_pass_refuses_another_house_or_missing_authority() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = backend.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    enable(&sim, &installed);
+    sim.state().runs = day_twenty_runs(4);
+    let policy = policy()?;
+    let evidence = backend.schedule_evidence()?;
+
+    // Evidence observed for this house is never judged for another.
+    assert!(matches!(
+        budget::precheck(&fixture.store, &other_house()?, &policy, &evidence),
+        Err(kitchen::Error::Budget(_))
+    ));
+
+    // Without a standing schedule grant the pause is refused before Orca.
+    let (task, fence) = schedule_task(&fixture)?;
+    let without = HouseGrants::new(house()?, []);
+    let claim = PassClaim {
+        task: &task,
+        fence,
+        grants: &without,
+    };
+    let clock = ManualClock::starting_at(1);
+    let refused = budget::run(&fixture.store, &backend, claim, &policy, &evidence, &clock);
+    assert!(matches!(
+        refused,
+        Err(kitchen::Error::Contract(
+            kitchen::contracts::ContractError::AuthorityExpansion {
+                permission: Permission::ManageSchedule,
+                ..
+            }
+        ))
+    ));
+    assert!(sim.calls_to(&["automations", "edit"]).is_empty());
+    assert!(enabled(&sim, installed.handle.as_str()));
+    Ok(())
+}
+
+#[test]
+fn reordered_evidence_at_one_instant_pauses_each_schedule_under_its_own_effect() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let pickup = backend.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    let gate = backend.install_schedule(&spec("gate", "30 * * * *")?)?;
+    enable(&sim, &pickup);
+    enable(&sim, &gate);
+    sim.state().runs = day_twenty_runs(4);
+    let policy = policy()?;
+    let observed = backend.schedule_evidence()?;
+    // Two observations taken in the same millisecond: the first lists only
+    // pickup, the second lists gate first.
+    let mut first = observed.clone();
+    first.schedules.retain(|usage| usage.schedule == pickup);
+    let mut second = observed;
+    second.schedules.sort_by_key(|usage| usage.schedule != gate);
+    assert_eq!(first.observed_at, second.observed_at);
+    assert_eq!(
+        second.schedules.first().map(|usage| &usage.schedule),
+        Some(&gate)
+    );
+
+    let (task, fence) = schedule_task(&fixture)?;
+    let grants = house_grants()?;
+    let claim = PassClaim {
+        task: &task,
+        fence,
+        grants: &grants,
+    };
+    let clock = ManualClock::starting_at(1);
+    budget::run(&fixture.store, &backend, claim, &policy, &first, &clock)?;
+    assert!(!enabled(&sim, pickup.handle.as_str()));
+    assert!(enabled(&sim, gate.handle.as_str()));
+
+    let pass = budget::run(&fixture.store, &backend, claim, &policy, &second, &clock)?;
+    let BudgetPass::Acted(actions) = pass else {
+        return Err("both schedules are exhausted".into());
+    };
+    let reported: Vec<&ResourceRef> = actions
+        .iter()
+        .map(|action| match action {
+            PassAction::Report(exhaustion) => Ok(&exhaustion.schedule),
+            other => Err(format!("expected reports, got {other:?}")),
+        })
+        .collect::<Result<_, _>>()?;
+    assert_eq!(reported, [&gate, &pickup]);
+    assert!(!enabled(&sim, gate.handle.as_str()), "gate paused too");
+    assert!(!enabled(&sim, pickup.handle.as_str()));
+    Ok(())
+}
+
+#[test]
+fn a_schedule_reactivated_after_it_was_observed_paused_is_paused_before_reporting() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = backend.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    // Exhausted and paused, with this window's report still due.
+    sim.state().runs = day_twenty_runs(4);
+    let policy = policy()?;
+    let evidence = backend.schedule_evidence()?;
+    let [usage] = evidence.schedules.as_slice() else {
+        return Err("one schedule".into());
+    };
+    assert_eq!(usage.observation.state, ObservedScheduleState::Paused);
+    // The owner re-activates it between the observation and the pass.
+    enable(&sim, &installed);
+
+    let (task, fence) = schedule_task(&fixture)?;
+    let grants = house_grants()?;
+    let claim = PassClaim {
+        task: &task,
+        fence,
+        grants: &grants,
+    };
+    let clock = ManualClock::starting_at(1);
+    let pass = budget::run(&fixture.store, &backend, claim, &policy, &evidence, &clock)?;
+    let BudgetPass::Acted(actions) = pass else {
+        return Err("an unreported exhaustion is not idle".into());
+    };
+    let [PassAction::Report(exhaustion)] = actions.as_slice() else {
+        return Err(format!("expected one report, got {actions:?}").into());
+    };
+    assert!(
+        !enabled(&sim, installed.handle.as_str()),
+        "the report is true when it is delivered"
+    );
+    assert_eq!(exhaustion.schedule, installed);
+    assert_eq!(activations(&sim), 0);
+    Ok(())
+}
+
+// --- The budget tick (#134): claim, pass, report, against the simulator. ---
+
+fn github_id() -> TestResult<BackendId> {
+    Ok(BackendId::new("github")?)
+}
+
+fn report_repository() -> TestResult<Repository> {
+    Ok(Repository::new("sample/ops")?)
+}
+
+fn comment_grant() -> TestResult<Grant> {
+    Ok(Grant::repository(
+        Permission::PostComment,
+        report_repository()?,
+        github_id()?,
+        CredentialId::new("github-bot")?,
+    ))
+}
+
+fn tick_grants() -> TestResult<HouseGrants> {
+    Ok(HouseGrants::new(
+        house()?,
+        [
+            Grant::house(Permission::ManageSchedule, orca_id()?, credential()?),
+            comment_grant()?,
+        ],
+    ))
+}
+
+fn report_effect(exhaustion: &BudgetExhaustion) -> kitchen::Result<Effect> {
+    Ok(Effect::GitHub(GitHubEffect {
+        requester: ExternalRef::new("kitchen-bot")?,
+        mutation: GitHubMutation {
+            repository: Repository::new("sample/ops")?,
+            action: GitHubAction::PostComment {
+                issue: IssueNumber::new(7)?,
+                body: Text::new(&exhaustion.report())?,
+            },
+        },
+        posting_budget: PostingBudget::new(100)?,
+    }))
+}
+
+fn reporter() -> TestResult<FakeBackend> {
+    Ok(FakeBackend::fully_capable(github_id()?, house()?))
+}
+
+fn tick_with<'a>(
+    fixture: &'a Fixture,
+    backend: &'a OrcaBackend<&'a SimOrca>,
+    reports: Option<ReportChannel<'a>>,
+    grants: &'a HouseGrants,
+    claimant: &'a kitchen::contracts::Claimant,
+    clock: &'a ManualClock,
+) -> TestResult<Tick<'a>> {
+    let mut authority = vec![Grant::house(
+        Permission::ManageSchedule,
+        orca_id()?,
+        credential()?,
+    )];
+    authority.push(comment_grant()?);
+    Ok(Tick {
+        store: &fixture.store,
+        schedules: backend,
+        reports,
+        grants,
+        authority,
+        provenance: Provenance {
+            kitchen: commit('a')?,
+            house_guidance: commit('b')?,
+            repository_instructions: None,
+        },
+        claimant,
+        ttl: ttl(300)?,
+        clock,
+    })
+}
+
+fn exhausted_pickup(sim: &SimOrca, backend: &OrcaBackend<&SimOrca>) -> TestResult<ResourceRef> {
+    let installed = backend.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    enable(sim, &installed);
+    sim.state().runs = day_twenty_runs(4);
+    Ok(installed)
+}
+
+#[test]
+fn a_budget_tick_pauses_posts_the_report_once_and_then_idles() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = exhausted_pickup(&sim, &backend)?;
+    let policy = policy()?;
+    let reporter = reporter()?;
+    let channel = ReportChannel {
+        executor: &reporter,
+        effect: &report_effect,
+    };
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+    let clock = ManualClock::starting_at(1);
+    let tick = tick_with(
+        &fixture,
+        &backend,
+        Some(channel),
+        &grants,
+        &claimant,
+        &clock,
+    )?;
+
+    let report = budget::tick(&tick, &policy, &backend.schedule_evidence()?)?;
+    let [Delivery::Delivered(delivered)] = report.deliveries.as_slice() else {
+        return Err(format!("expected one delivered report, got {report:?}").into());
+    };
+    assert_eq!(delivered.schedule, installed);
+    assert!(!enabled(&sim, installed.handle.as_str()), "paused on Orca");
+    assert_eq!(reporter.effects_performed(), 1, "one comment posted");
+    assert!(fixture.store.marker(&delivered.marker_key()?)?.is_some());
+    // The window's task is given back for the next tick.
+    let task = fixture.store.task(&task_id(&format!(
+        "budget-{}",
+        delivered.window.start.as_unix_millis()
+    ))?)?;
+    assert!(matches!(task.state(), TaskState::Open));
+
+    // The next tick finds the schedule paused and reported: idle, no post.
+    let next = backend.schedule_evidence()?;
+    assert_eq!(
+        budget::precheck(&fixture.store, &house()?, &policy, &next)?,
+        Precheck::Idle
+    );
+    let idle = budget::tick(&tick, &policy, &next)?;
+    assert_eq!(idle.pass, BudgetPass::Idle);
+    assert!(idle.deliveries.is_empty());
+    assert_eq!(reporter.effects_performed(), 1);
+    assert_eq!(activations(&sim), 0, "the tick never activates a schedule");
+    Ok(())
+}
+
+#[test]
+fn an_undeliverable_report_is_recorded_once_per_window_and_the_precheck_goes_idle() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = exhausted_pickup(&sim, &backend)?;
+    let policy = policy()?;
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+    let clock = ManualClock::starting_at(1);
+    let tick = tick_with(&fixture, &backend, None, &grants, &claimant, &clock)?;
+
+    let report = budget::tick(&tick, &policy, &backend.schedule_evidence()?)?;
+    let [Delivery::Undeliverable(exhaustion)] = report.deliveries.as_slice() else {
+        return Err(format!("expected an undeliverable report, got {report:?}").into());
+    };
+    assert!(!enabled(&sim, installed.handle.as_str()), "paused anyway");
+    assert_eq!(
+        fixture.store.marker(&exhaustion.marker_key()?)?,
+        None,
+        "it was not reported"
+    );
+    assert!(
+        fixture
+            .store
+            .marker(&exhaustion.undeliverable_key()?)?
+            .is_some(),
+        "the window's undeliverable report is recorded"
+    );
+    let undelivered = budget::undelivered_reports(&fixture.store)?;
+    assert_eq!(undelivered.len(), 1);
+    assert_eq!(
+        undelivered.first().map(|r| &r.consumer),
+        Some(&exhaustion.consumer)
+    );
+
+    // Later ticks in the window neither start an agent nor repeat the line.
+    let evidence = backend.schedule_evidence()?;
+    assert_eq!(
+        budget::precheck(&fixture.store, &house()?, &policy, &evidence)?,
+        Precheck::Idle
+    );
+    let again = budget::tick(&tick, &policy, &evidence)?;
+    assert_eq!(again.pass, BudgetPass::Idle);
+    assert!(again.deliveries.is_empty());
+    assert_eq!(budget::undelivered_reports(&fixture.store)?.len(), 1);
+
+    // The owner re-activating the schedule is still paused again, without
+    // a second undeliverable report.
+    enable(&sim, &installed);
+    let an_hour_later = connect(&sim)?.with_clock(one_pm_on_day_twenty);
+    let evidence = an_hour_later.schedule_evidence()?;
+    assert_eq!(
+        budget::precheck(&fixture.store, &house()?, &policy, &evidence)?,
+        Precheck::Actionable,
+        "an active exhausted schedule still needs its pause"
+    );
+    let repaused = budget::tick(&tick, &policy, &evidence)?;
+    assert!(repaused.deliveries.is_empty());
+    assert!(!enabled(&sim, installed.handle.as_str()));
+
+    // A new window is a new exhaustion: due again, and undeliverable again.
+    let next_day = connect(&sim)?.with_clock(noon_on_day_twenty_one);
+    enable(&sim, &installed);
+    sim.state().runs = (0..4)
+        .map(|index| {
+            json!({"id": format!("next-{index}"), "status": "completed",
+                "scheduledFor": 21 * DAY_MS + index * HOUR_MS})
+        })
+        .collect();
+    let evidence = next_day.schedule_evidence()?;
+    assert_eq!(
+        budget::precheck(&fixture.store, &house()?, &policy, &evidence)?,
+        Precheck::Actionable
+    );
+    let later = budget::tick(&tick, &policy, &evidence)?;
+    assert!(matches!(
+        later.deliveries.as_slice(),
+        [Delivery::Undeliverable(_)]
+    ));
+    assert_eq!(budget::undelivered_reports(&fixture.store)?.len(), 2);
+    Ok(())
+}
+
+/// Reports go through `inner` and note, at each post, whether the pickup and
+/// the budget schedule were still enabled on Orca.
+struct PostSpy<'a> {
+    inner: &'a FakeBackend,
+    sim: &'a SimOrca,
+    watched: [String; 2],
+    seen: RefCell<Vec<[bool; 2]>>,
+}
+
+impl EffectExecutor for PostSpy<'_> {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        let [first, second] = &self.watched;
+        self.seen
+            .borrow_mut()
+            .push([enabled(self.sim, first), enabled(self.sim, second)]);
+        self.inner.execute(request)
+    }
+
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.inner.lookup(request)
+    }
+}
+
+/// The budget schedule installed as any schedule is, and enabled beside an
+/// exhausted pickup. Every schedule the sim lists shows the same four runs,
+/// so both exhaust their default budget. Returns the pickup and the tick.
+fn budget_beside_pickup(
+    sim: &SimOrca,
+    backend: &OrcaBackend<&SimOrca>,
+) -> TestResult<(ResourceRef, ResourceRef)> {
+    let pickup = exhausted_pickup(sim, backend)?;
+    let own = backend.install_schedule(&budget_tick("15 * * * *")?)?;
+    enable(sim, &own);
+    Ok((pickup, own))
+}
+
+#[test]
+fn at_exhaustion_the_tick_reports_then_pauses_every_exhausted_schedule_including_itself()
+-> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let (pickup, own) = budget_beside_pickup(&sim, &backend)?;
+    let policy = policy()?;
+    let evidence = backend.schedule_evidence()?;
+    let assessment = policy.assess(&house()?, &evidence)?;
+    assert!(
+        assessment
+            .schedules
+            .iter()
+            .all(|schedule| schedule.exhausted.is_some()),
+        "the tick's runs count like the pickup's"
+    );
+
+    let inner = reporter()?;
+    let spy = PostSpy {
+        inner: &inner,
+        sim: &sim,
+        watched: [
+            pickup.handle.as_str().to_owned(),
+            own.handle.as_str().to_owned(),
+        ],
+        seen: RefCell::new(Vec::new()),
+    };
+    let channel = ReportChannel {
+        executor: &spy,
+        effect: &report_effect,
+    };
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+    let clock = ManualClock::starting_at(1);
+    let tick = tick_with(
+        &fixture,
+        &backend,
+        Some(channel),
+        &grants,
+        &claimant,
+        &clock,
+    )?;
+
+    let report = budget::tick(&tick, &policy, &evidence)?;
+    let BudgetPass::Acted(actions) = &report.pass else {
+        return Err(format!("expected the pass to act, got {report:?}").into());
+    };
+    let acted: Vec<&str> = actions
+        .iter()
+        .map(|action| match action {
+            PassAction::Report(exhaustion) | PassAction::Repaused(exhaustion) => {
+                exhaustion.consumer.as_str()
+            }
+            PassAction::PauseNotApplied { exhaustion, .. } => exhaustion.consumer.as_str(),
+        })
+        .collect();
+    assert_eq!(acted, ["pickup", "budget"], "the tick's own pause is last");
+    assert!(
+        report
+            .deliveries
+            .iter()
+            .all(|delivery| matches!(delivery, Delivery::Delivered(_))),
+        "{report:?}"
+    );
+    assert_eq!(report.deliveries.len(), 2);
+    // The pickup is already paused when its report posts; the tick is still
+    // running when its own report posts, and paused after it.
+    assert_eq!(*spy.seen.borrow(), [[false, true], [false, true]]);
+    assert_eq!(inner.effects_performed(), 2);
+    assert!(!enabled(&sim, pickup.handle.as_str()));
+    assert!(
+        !enabled(&sim, own.handle.as_str()),
+        "the tick paused itself"
+    );
+    assert_eq!(activations(&sim), 0, "the pass never unpauses anything");
+
+    // Both are reported and paused: the next pass has nothing to do.
+    let next = backend.schedule_evidence()?;
+    assert_eq!(
+        budget::precheck(&fixture.store, &house()?, &policy, &next)?,
+        Precheck::Idle
+    );
+    Ok(())
+}
+
+#[test]
+fn a_tick_whose_own_report_is_refused_still_pauses_itself() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    sim.state().runs = day_twenty_runs(4);
+    let own = backend.install_schedule(&budget_tick("15 * * * *")?)?;
+    enable(&sim, &own);
+    let reporter = reporter()?;
+    reporter.inject(ExecuteFault::Reject);
+    let channel = ReportChannel {
+        executor: &reporter,
+        effect: &report_effect,
+    };
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+    let clock = ManualClock::starting_at(1);
+    let tick = tick_with(
+        &fixture,
+        &backend,
+        Some(channel),
+        &grants,
+        &claimant,
+        &clock,
+    )?;
+
+    let report = budget::tick(&tick, &policy()?, &backend.schedule_evidence()?)?;
+    let [Delivery::NotDelivered { record, .. }] = report.deliveries.as_slice() else {
+        return Err(format!("expected a refused post, got {report:?}").into());
+    };
+    assert!(matches!(record.state(), EffectState::NotApplied { .. }));
+    assert!(
+        !enabled(&sim, own.handle.as_str()),
+        "the tick stops spending even though its report did not post"
+    );
+    assert_eq!(activations(&sim), 0);
+    Ok(())
+}
+
+#[test]
+fn an_uncertain_report_is_looked_up_by_the_next_tick_and_never_posted_twice() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    exhausted_pickup(&sim, &backend)?;
+    let policy = policy()?;
+    let reporter = reporter()?;
+    reporter.inject(ExecuteFault::ApplyThenLoseResponse);
+    let channel = ReportChannel {
+        executor: &reporter,
+        effect: &report_effect,
+    };
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+    let clock = ManualClock::starting_at(1);
+    let tick = tick_with(
+        &fixture,
+        &backend,
+        Some(channel),
+        &grants,
+        &claimant,
+        &clock,
+    )?;
+
+    let first = budget::tick(&tick, &policy, &backend.schedule_evidence()?)?;
+    let [Delivery::NotDelivered { exhaustion, record }] = first.deliveries.as_slice() else {
+        return Err(format!("expected an uncertain post, got {first:?}").into());
+    };
+    assert!(matches!(record.state(), EffectState::Uncertain { .. }));
+    assert_eq!(
+        fixture.store.marker(&exhaustion.marker_key()?)?,
+        None,
+        "an uncertain post is never recorded as delivered"
+    );
+
+    // Another run lands before the next tick; the retried report is the same.
+    sim.state().runs = day_twenty_runs(5);
+    clock.advance(60);
+    let second = budget::tick(&tick, &policy, &backend.schedule_evidence()?)?;
+    assert!(
+        matches!(second.deliveries.as_slice(), [Delivery::Delivered(_)]),
+        "{second:?}"
+    );
+    assert_eq!(
+        reporter.effects_performed(),
+        1,
+        "found by lookup, not reposted"
+    );
+    assert!(fixture.store.marker(&exhaustion.marker_key()?)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn a_budget_tick_refuses_while_another_tick_holds_the_window() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = exhausted_pickup(&sim, &backend)?;
+    let policy = policy()?;
+    let grants = tick_grants()?;
+    let clock = ManualClock::starting_at(1);
+    let evidence = backend.schedule_evidence()?;
+    let other = scheduled("budget-other")?;
+    let holder = tick_with(&fixture, &backend, None, &grants, &other, &clock)?;
+    // Another tick created and claimed this window's task and is still running.
+    budget::tick(&holder, &policy, &evidence)?;
+    let window = evidence_window(&fixture, &policy, &evidence)?;
+    let task = task_id(&format!("budget-{window}"))?;
+    fixture.store.claim(&task, &other, ttl(300)?, clock.now())?;
+    enable(&sim, &installed);
+    let edits = sim.calls_to(&["automations", "edit"]).len();
+
+    let claimant = scheduled("budget-tick")?;
+    let tick = tick_with(&fixture, &backend, None, &grants, &claimant, &clock)?;
+    let refused = budget::tick(&tick, &policy, &backend.schedule_evidence()?);
+    assert!(
+        matches!(
+            refused,
+            Err(kitchen::Error::State(StateError::ClaimHeld { .. }))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(sim.calls_to(&["automations", "edit"]).len(), edits);
+    Ok(())
+}
+
+/// The start of the budget window `evidence` falls in, in Unix ms.
+fn evidence_window(
+    fixture: &Fixture,
+    policy: &SchedulePolicy,
+    evidence: &ScheduleEvidence,
+) -> TestResult<u64> {
+    let _ = fixture;
+    let assessment = policy.assess(&house()?, evidence)?;
+    Ok(assessment.window.start.as_unix_millis())
+}
+
+#[test]
+fn a_tick_in_a_later_window_settles_the_earlier_windows_task() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let installed = exhausted_pickup(&sim, &backend)?;
+    let policy = policy()?;
+    let reporter = reporter()?;
+    let channel = ReportChannel {
+        executor: &reporter,
+        effect: &report_effect,
+    };
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+    let clock = ManualClock::starting_at(1);
+    let tick = tick_with(
+        &fixture,
+        &backend,
+        Some(channel),
+        &grants,
+        &claimant,
+        &clock,
+    )?;
+    let first = budget::tick(&tick, &policy, &backend.schedule_evidence()?)?;
+    let [Delivery::Delivered(earlier)] = first.deliveries.as_slice() else {
+        return Err(format!("expected a delivered report, got {first:?}").into());
+    };
+    let earlier_task = task_id(&format!("budget-{}", earlier.window.start.as_unix_millis()))?;
+
+    // Next day: the owner re-activated it and it ran out again.
+    let next_day = connect(&sim)?.with_clock(noon_on_day_twenty_one);
+    enable(&sim, &installed);
+    sim.state().runs = (0..4)
+        .map(|index| {
+            json!({"id": format!("next-{index}"), "status": "completed",
+                "scheduledFor": 21 * DAY_MS + index * HOUR_MS})
+        })
+        .collect();
+    clock.advance(DAY_MS / 1000);
+    let later = budget::tick(&tick, &policy, &next_day.schedule_evidence()?)?;
+    assert_eq!(later.settled, std::slice::from_ref(&earlier_task));
+    assert!(matches!(
+        fixture.store.task(&earlier_task)?.state(),
+        TaskState::Settled { .. }
+    ));
+    assert!(matches!(
+        later.deliveries.as_slice(),
+        [Delivery::Delivered(_)]
+    ));
+    assert!(!enabled(&sim, installed.handle.as_str()));
+    assert_eq!(reporter.effects_performed(), 2, "one report per window");
+    Ok(())
+}
+
+#[test]
+fn the_budget_schedule_installs_paused_with_its_precheck() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let args = tick_args()?;
+    let precheck = args.argv(TickCommand::Precheck)?;
+    let precheck: Vec<&str> = precheck.iter().map(Text::as_str).collect();
+    assert_eq!(
+        precheck.get(..3),
+        Some(["/opt/kitchen/bin/kitchen", "budget", "precheck"].as_slice())
+    );
+    let tick = budget_tick("15 * * * *")?;
+    // The general installer installs it, under the house policy.
+    let installed = backend.install_schedule(&tick)?;
+    assert!(
+        !enabled(&sim, installed.handle.as_str()),
+        "installed paused"
+    );
+    assert_eq!(activations(&sim), 0);
+    // Installing again reuses the paused schedule.
+    assert_eq!(backend.install_schedule(&tick)?, installed);
+    assert_eq!(sim.calls_to(&["automations", "create"]).len(), 1);
+    // Its allocation counts: with the house budget spent, it is refused.
+    let full = SchedulePolicy {
+        house_budget: budget(4, Some(400))?,
+        ..policy()?
+    };
+    let other = SimOrca::default();
+    let backend = connect(&other)?.with_schedule_policy(full);
+    backend.install_schedule(&spec("pickup", "0 * * * *")?)?;
+    assert!(matches!(
+        backend.install_schedule(&tick),
+        Err(OrcaError::ScheduleLimit(BudgetError::Overcommitted { .. }))
+    ));
+
+    // A relative path cannot be recorded in a schedule.
+    let relative = TickArgs {
+        store: "store".into(),
+        ..args
+    };
+    assert!(matches!(
+        relative.argv(TickCommand::Run),
+        Err(kitchen::Error::Workflow(WorkflowError::IncompleteEvidence))
+    ));
+    Ok(())
+}
+
+/// An automation named for the house's budget schedule, created directly in
+/// Orca with its own prompt and no precheck, enabled.
+fn direct_budget_automation(sim: &SimOrca) -> TestResult<ResourceRef> {
+    let flags = [
+        ("name", format!("kitchen:{}:budget", house()?)),
+        ("prompt", "Refactor the whole repository.".to_owned()),
+        ("provider", "claude".to_owned()),
+        ("timezone", "UTC".to_owned()),
+        ("trigger", "15 * * * *".to_owned()),
+    ];
+    sim.state().automations.push(orca_sim::SimAutomation {
+        id: "auto-direct".into(),
+        name: format!("kitchen:{}:budget", house()?),
+        enabled: true,
+        flags: flags
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect(),
+    });
+    schedule_ref("auto-direct")
+}
+
+#[test]
+fn an_orca_automation_named_budget_is_budgeted_like_any_schedule() -> TestResult {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    let direct = direct_budget_automation(&sim)?;
+    sim.state().runs = day_twenty_runs(4);
+    let policy = policy()?;
+    let evidence = backend.schedule_evidence()?;
+    let plan = policy.plan_exhaustion(&house()?, &evidence, |_| false)?;
+    assert_eq!(
+        plan.iter().map(|item| &item.schedule).collect::<Vec<_>>(),
+        [&direct],
+        "four runs exhaust its default budget like any schedule's"
+    );
+
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+    let clock = ManualClock::starting_at(1);
+    let tick = tick_with(&fixture, &backend, None, &grants, &claimant, &clock)?;
+    budget::tick(&tick, &policy, &evidence)?;
+    assert!(!enabled(&sim, direct.handle.as_str()), "paused by the pass");
+    Ok(())
+}
+
+/// A tick over an exhausted pickup whose first report post meets `fault`,
+/// then a second tick under `next_policy`. Returns both ticks' deliveries
+/// and the posts the reporter performed.
+fn report_retry(
+    fault: ExecuteFault,
+    next_policy: &SchedulePolicy,
+) -> TestResult<(Vec<Delivery>, Vec<Delivery>, usize)> {
+    let fixture = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    exhausted_pickup(&sim, &backend)?;
+    let reporter = reporter()?;
+    reporter.inject(fault);
+    let channel = ReportChannel {
+        executor: &reporter,
+        effect: &report_effect,
+    };
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+    let clock = ManualClock::starting_at(1);
+    let tick = tick_with(
+        &fixture,
+        &backend,
+        Some(channel),
+        &grants,
+        &claimant,
+        &clock,
+    )?;
+    let first = budget::tick(&tick, &policy()?, &backend.schedule_evidence()?)?;
+    clock.advance(60);
+    let second = budget::tick(&tick, next_policy, &backend.schedule_evidence()?)?;
+    Ok((
+        first.deliveries,
+        second.deliveries,
+        reporter.effects_performed(),
+    ))
+}
+
+#[test]
+fn a_lost_report_is_not_posted_again_when_the_exhausted_limit_changes() -> TestResult {
+    // The owner lowers the schedule budget while the first post is uncertain.
+    let lowered = SchedulePolicy {
+        schedule_budget: budget(3, Some(400))?,
+        ..policy()?
+    };
+    let (first, second, posts) = report_retry(ExecuteFault::ApplyThenLoseResponse, &lowered)?;
+    assert!(matches!(first.as_slice(), [Delivery::NotDelivered { .. }]));
+    assert!(
+        matches!(second.as_slice(), [Delivery::Delivered(_)]),
+        "{second:?}"
+    );
+    assert_eq!(posts, 1, "the lost post is found, not posted again");
+    Ok(())
+}
+
+#[test]
+fn a_refused_report_is_posted_by_the_next_tick() -> TestResult {
+    let (first, second, posts) = report_retry(ExecuteFault::Reject, &policy()?)?;
+    let [Delivery::NotDelivered { record, .. }] = first.as_slice() else {
+        return Err(format!("expected a refused post, got {first:?}").into());
+    };
+    assert!(matches!(record.state(), EffectState::NotApplied { .. }));
+    assert!(
+        matches!(second.as_slice(), [Delivery::Delivered(_)]),
+        "{second:?}"
+    );
+    assert_eq!(posts, 1);
     Ok(())
 }

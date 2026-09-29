@@ -622,6 +622,7 @@ fn doctor_reports_readiness_and_flags_policy_below_the_required_level() -> TestR
         stack_tool: None,
         schedules: None,
         readiness: Some(complete()?),
+        undelivered_budget_reports: Vec::new(),
     };
     let observed = doctor(&registry, &repository, Some(&evidence))?;
     assert_eq!(

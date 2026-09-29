@@ -6,9 +6,7 @@
 // checkout whose origin remote is github.com/acme/app. Typed answers are shown
 // on their prompt lines and the printed configuration is abridged. Paths are
 // shortened to ~/.kitchn, the 40-character pins to 7, and long reports are
-// trimmed; the wording is otherwise the CLI's own, except that commands, hints
-// and prompts say `kitchn`: the binary is still named
-// `kitchen` until #18 renames it.
+// trimmed; the wording is otherwise the CLI's own.
 //
 // Blocks marked `planned: true` show the intended behavior of features that
 // are still being built. Replace each with captured output when its feature
@@ -92,8 +90,8 @@ export const steps: Step[] = [
           cmd("git clone https://github.com/lemarier/kitchen && cd kitchen"),
           cmd("just install"),
           ok("recording commit <sha>"),
-          cmd("kitchen --version"),
-          ok("kitchen 0.1.0"),
+          cmd("kitchn --version"),
+          ok("kitchn 0.1.0"),
         ],
       },
     ],

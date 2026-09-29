@@ -227,7 +227,7 @@ fn a_missing_binding_is_refused_by_name() -> TestResult {
     assert_eq!(error.class(), ErrorClass::Refused);
     assert_eq!(
         error.to_string(),
-        "house acme has no forge binding, so kitchen cannot write to its forge; bind one with `kitchen forge bind --house acme` or `kitchen house init`"
+        "house acme has no forge binding, so kitchn cannot write to its forge; bind one with `kitchn forge bind --house acme` or `kitchn house init`"
     );
     Ok(())
 }
@@ -678,11 +678,9 @@ fn guided_init_offers_the_logged_in_gh_account_and_binds_it() -> TestResult {
     };
     assert!(script.answers.is_empty());
     assert!(
-        script
-            .transcript
-            .iter()
-            .any(|line| line
-                == "GitHub account kitchen writes as [octo-cat, logged-in gh account]: ")
+        script.transcript.iter().any(
+            |line| line == "GitHub account kitchn writes as [octo-cat, logged-in gh account]: "
+        )
     );
     assert!(
         script
@@ -735,7 +733,7 @@ fn guided_init_without_a_login_binds_nothing_by_default() -> TestResult {
         return Err("declined".into());
     };
     assert_eq!(plan.forge, None);
-    assert!(plan.forge_text().contains("kitchen forge bind"));
+    assert!(plan.forge_text().contains("kitchn forge bind"));
     let report = register_house(&plan)?;
     assert_eq!(report.forge, None);
     assert!(!registry.join("private").exists());

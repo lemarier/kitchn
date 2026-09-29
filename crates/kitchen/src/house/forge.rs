@@ -194,7 +194,7 @@ pub enum CredentialStatus {
 pub enum ForgeError {
     /// The house has no forge binding. Nothing was written.
     #[error(
-        "house {house} has no forge binding, so kitchen cannot write to its forge; bind one with `kitchen forge bind --house {house}` or `kitchen house init`"
+        "house {house} has no forge binding, so kitchn cannot write to its forge; bind one with `kitchn forge bind --house {house}` or `kitchn house init`"
     )]
     MissingBinding {
         /// The house.
@@ -202,7 +202,7 @@ pub enum ForgeError {
     },
     /// A different binding is already stored; it was kept.
     #[error(
-        "house {house} already has a different forge binding; it was kept (see `kitchen forge show --house {house}`)"
+        "house {house} already has a different forge binding; it was kept (see `kitchn forge show --house {house}`)"
     )]
     BindingConflict {
         /// The house.
@@ -228,7 +228,7 @@ pub enum ForgeError {
     },
     /// The credential file is not usable. Nothing was read or written.
     #[error(
-        "credential {credential} of house {house} is {status}; `kitchen forge show --house {house}` prints where its token file belongs"
+        "credential {credential} of house {house} is {status}; `kitchn forge show --house {house}` prints where its token file belongs"
     )]
     CredentialUnavailable {
         /// The house.

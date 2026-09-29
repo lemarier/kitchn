@@ -55,7 +55,7 @@ security:
     cargo deny check
     zizmor --min-severity medium .github/
 
-# Installs kitchen-cli. The build records KITCHEN_COMMIT (which lets guided
+# Installs the kitchn CLI. The build records KITCHEN_COMMIT (which lets guided
 # `house init` pin the built-in guidance) only from a clean tree whose commit is
 # on a remote-tracking branch; otherwise it installs without it and says why.
 install:

@@ -1,4 +1,4 @@
-//! `kitchen house init` without `--config`, through the real CLI in disposable
+//! `kitchn house init` without `--config`, through the real CLI in disposable
 //! roots. Standard input is piped, so these cover the non-interactive path;
 //! the prompts are covered through the library's prompter in
 //! `crates/kitchen/tests/house_init.rs`.
@@ -52,7 +52,7 @@ fn bundle(root: &Path, house: &str) -> TestResult<String> {
 }
 
 fn init(checkout: &Path, home: &Path, args: &[&str]) -> TestResult<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .current_dir(checkout)
         .env("HOME", home)
         .args(["house", "init"])

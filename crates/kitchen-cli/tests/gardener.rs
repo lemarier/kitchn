@@ -57,7 +57,7 @@ fn scheduled_argv(root: &Path, gh: PathBuf) -> TestResult<Vec<String>> {
     std::fs::write(&token, "sanitized-fixture-token")?;
     house_store(root)?;
     let args = gardener::PrecheckArgs {
-        kitchen: env!("CARGO_BIN_EXE_kitchen").into(),
+        kitchen: env!("CARGO_BIN_EXE_kitchn").into(),
         house: HouseId::new("sample")?,
         repository: Repository::new("sample/project")?,
         requester: ExternalRef::new("sample-bot")?,
@@ -162,7 +162,7 @@ fn pre_store_argv(root: &Path, gh: &Path) -> TestResult<Vec<String>> {
     std::fs::write(&token, "sanitized-fixture-token")?;
     let path = |path: &Path| path.to_str().map(str::to_owned).ok_or("non-UTF-8 path");
     Ok(vec![
-        env!("CARGO_BIN_EXE_kitchen").into(),
+        env!("CARGO_BIN_EXE_kitchn").into(),
         "gardener".into(),
         "precheck".into(),
         "--house".into(),

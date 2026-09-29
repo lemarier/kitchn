@@ -561,7 +561,7 @@ pub enum DraftOutcome {
     /// writing, or possibly writing, to the forge. A revision could post the
     /// same issue or comment again, so the draft keeps the subject until a
     /// person checks those writes and releases it with [`acknowledge_draft`]
-    /// (`kitchen issue acknowledge <task> --reason <why>`), which re-reads
+    /// (`kitchn issue acknowledge <task> --reason <why>`), which re-reads
     /// the forge first. Nothing was written.
     EarlierSettledWithWrites {
         /// The settled task.

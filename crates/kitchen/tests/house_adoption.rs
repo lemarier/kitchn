@@ -335,7 +335,7 @@ fn doctor_unknown_is_not_success_and_scoped_evidence_can_complete_it() -> TestRe
                 .any(|finding| finding.code == code && !finding.next_step.is_empty())
         );
     }
-    assert!(unknown.human_readable().contains("kitchen house sync"));
+    assert!(unknown.human_readable().contains("kitchn house sync"));
     registry.sync(&house.house, &bundle("origin89")?)?;
     let labels = unknown
         .labels
@@ -652,7 +652,7 @@ fn doctor_reports_a_store_table_near_its_limit() -> TestResult {
     assert_eq!(near.len(), 1);
     assert!(near[0].message.contains("workflow markers"));
     assert!(near[0].message.contains("merge-gate"));
-    assert!(near[0].next_step.contains("kitchen store retain"));
+    assert!(near[0].next_step.contains("kitchn store retain"));
     Ok(())
 }
 

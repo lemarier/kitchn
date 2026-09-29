@@ -1,4 +1,4 @@
-//! `kitchen store`: how full the house store is, and its retention pass.
+//! `kitchn store`: how full the house store is, and its retention pass.
 //!
 //! Retention previews by default. Issue and pull-request state comes from
 //! the forge through the house's forge binding, never from a file; items the

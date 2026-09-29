@@ -36,10 +36,9 @@ just install
 `just install` runs `cargo install` and records the commit you built, which guided `house init` needs to pin its built-in guidance. It records it only from a clean checkout whose commit is on a remote branch; otherwise it prints why and installs without it. That binary still works, but `house init` then needs `--bundle <path>`.
 
 :::note
-The rename from `kitchen` to `kitchn` is in progress
-([#18](https://github.com/lemarier/kitchen/issues/18)). Until it lands, a
-source build installs the binary as `kitchen`, and the install script and
-crate are not published yet.
+The install script and the `kitchn` crate are not published yet
+([#18](https://github.com/lemarier/kitchen/issues/18)). A source build
+installs the `kitchn` binary today.
 :::
 
 ## Check the install

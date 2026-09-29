@@ -529,7 +529,7 @@ impl HouseInitPlan {
                 binding.posting_budget.limit(),
                 self.credential_file(binding).display(),
             ),
-            None => "Forge: none; kitchen cannot write to a forge until one is bound with `kitchen forge bind`.".to_owned(),
+            None => "Forge: none; kitchn cannot write to a forge until one is bound with `kitchn forge bind`.".to_owned(),
         }
     }
 
@@ -830,7 +830,7 @@ impl Session<'_> {
         let requester = self.answer(
             InitQuestion::ForgeRequester,
             answers.forge_requester.as_deref(),
-            "GitHub account kitchen writes as",
+            "GitHub account kitchn writes as",
             Some(match login {
                 Some(login) => Offer {
                     value: login.as_str().to_owned(),

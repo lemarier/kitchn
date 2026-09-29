@@ -134,7 +134,7 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             registry.initialize(&config)?;
             Ok((
                 format!(
-                    "Registered house {}. No authority or workflows activated.\nNext: from a checkout of an allowed repository, run kitchen house setup --registry '{}'",
+                    "Registered house {}. No authority or workflows activated.\nNext: from a checkout of an allowed repository, run kitchn house setup --registry '{}'",
                     config.house,
                     registry.root().display()
                 ),
@@ -186,11 +186,11 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
                     let root = registry.root().display();
                     let next = match &legacy {
                         Some(legacy) => format!(
-                            "kitchen house import --registry '{root}' to keep the settings in {}",
+                            "kitchn house import --registry '{root}' to keep the settings in {}",
                             legacy.display()
                         ),
                         None => format!(
-                            "kitchen house setup --registry '{root}' --repository {repository} --house {house}"
+                            "kitchn house setup --registry '{root}' --repository {repository} --house {house}"
                         ),
                     };
                     Ok((
@@ -204,7 +204,7 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
                     if let Some(legacy) = legacy {
                         writeln!(
                             io::stderr().lock(),
-                            "Found legacy binding {}; import it with kitchen house import --registry '{}'.",
+                            "Found legacy binding {}; import it with kitchn house import --registry '{}'.",
                             legacy.display(),
                             registry.root().display()
                         )
@@ -250,7 +250,7 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
                     "The registry already holds {binding}\nNext: delete {source} yourself; Kitchen does not delete repository files."
                 ),
                 LegacyImportStatus::Conflict => format!(
-                    "The registry holds a different binding for {}; nothing imported.\nNext: compare it with {source} and change the registry binding with kitchen house setup.",
+                    "The registry holds a different binding for {}; nothing imported.\nNext: compare it with {source} and change the registry binding with kitchn house setup.",
                     import.binding.repository
                 ),
             };

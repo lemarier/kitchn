@@ -71,7 +71,7 @@ pub struct InitArgs {
     /// Comma-separated required reviewers, or none (default: expediter).
     #[arg(long)]
     required_reviewers: Option<String>,
-    /// GitHub login kitchen writes as, or none (default: the logged-in gh
+    /// GitHub login kitchn writes as, or none (default: the logged-in gh
     /// account, else none). Stores a forge binding, never a credential.
     #[arg(long)]
     forge_requester: Option<String>,
@@ -191,7 +191,7 @@ pub fn run(
     };
     Ok((
         format!(
-            "Registered house {} in {} and pinned {} guidance at {}.\nNo authority or workflows activated.{forge}\nSaved your answers as {}. Review it any time.\nNext: from a checkout of an allowed repository, run kitchen house setup --registry '{}'",
+            "Registered house {} in {} and pinned {} guidance at {}.\nNo authority or workflows activated.{forge}\nSaved your answers as {}. Review it any time.\nNext: from a checkout of an allowed repository, run kitchn house setup --registry '{}'",
             plan.config.house,
             plan.registry.display(),
             if answers.bundle.is_some() {

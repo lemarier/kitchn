@@ -1,4 +1,4 @@
-//! The `kitchen store` process contract against a temporary house store. No
+//! The `kitchn store` process contract against a temporary house store. No
 //! forge is contacted: without --gh nothing that depends on an issue or pull
 //! request is removed, so these runs cover only store-local retention.
 
@@ -43,7 +43,7 @@ impl Kitchen {
     }
 
     fn run(&self, args: &[&str]) -> TestResult<Output> {
-        Ok(Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
             .args(args)
             .output()?)
     }

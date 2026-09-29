@@ -3,3 +3,6 @@ packages:
 allowBuilds:
   esbuild: true
   workerd: true
+overrides:
+  # GHSA: undici < 7.29.1 WebSocket permessage-deflate DoS (Dependabot alert #1), via wrangler > miniflare.
+  undici@<7.29.1: ^7.29.1

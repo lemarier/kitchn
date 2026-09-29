@@ -313,7 +313,7 @@ fn non_interactive_input_names_every_missing_answer() -> TestResult {
     assert_eq!(error.class(), ErrorClass::InvalidInput);
     assert_eq!(
         error.to_string(),
-        "standard input is not a terminal, so kitchen cannot ask; pass --house, --required-checks, --yes (or register a reviewed file with --config)"
+        "standard input is not a terminal, so kitchn cannot ask; pass --house, --required-checks, --yes (or register a reviewed file with --config)"
     );
     assert!(!home.join(".kitchn").exists());
 

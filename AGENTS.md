@@ -14,7 +14,7 @@ work to another organization. Product roles and house rules must remain separate
 from the standards used to develop this repository.
 
 - `crates/kitchen`: reusable Rust domain contracts and workflow policy.
-- `crates/kitchen-cli`: thin executable boundary.
+- `crates/kitchen-cli`: thin executable boundary (package and binary `kitchn`).
 - `.origin89/`: temporary engineering bootstrap and its notices.
 - `crates/*/tests/`: Rust integration tests.
 - `.origin89/tests/`: temporary upstream bootstrap regression tests.

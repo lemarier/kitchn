@@ -1,4 +1,4 @@
-//! `kitchen budget`: the schedule budget tick on the house's Orca schedules.
+//! `kitchn budget`: the schedule budget tick on the house's Orca schedules.
 //!
 //! `precheck` reads only and reports through its exit status. `run` claims
 //! the window's task, pauses exhausted schedules, and posts each due report
@@ -72,7 +72,7 @@ enum BudgetCommand {
         source: Source,
         #[command(flatten)]
         report: ReportFlags,
-        /// Absolute path of the installed kitchen executable the schedule runs.
+        /// Absolute path of the installed kitchn executable the schedule runs.
         #[arg(long)]
         kitchen: PathBuf,
         /// Cron expression for the tick, such as `15 * * * *`.

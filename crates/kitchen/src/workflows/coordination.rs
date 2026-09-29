@@ -54,7 +54,7 @@ use crate::{
     state::{
         AttemptRecord, AttemptState, ConsumerState, Consumption, EffectPlan, EffectRecord,
         EffectState, HouseStore, Lease, OwnershipEvent, StateError, TaskRecord, TaskState,
-        reconcile, run_effect,
+        UsageReport, reconcile, run_effect,
     },
     workflows::{
         deliberation, follow_up,
@@ -1617,11 +1617,27 @@ pub struct HumanDecision {
     pub body: Text,
 }
 
+/// Who gave an answer to a worker question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerSource {
+    /// The coordinator or a scoped agent answered on its own; no person's
+    /// time is recorded.
+    Coordinator,
+    /// A person answered, through Roger or in a session. The caller states
+    /// this only on evidence that a person gave the answer.
+    Person,
+}
+
 /// How a question should be handled, from the coordinator or a scoped agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     /// Answer the worker with this text.
-    Answer(Text),
+    Answer {
+        /// The answer.
+        body: Text,
+        /// Who gave it.
+        source: AnswerSource,
+    },
     /// Only a person can decide.
     Human(HumanDecision),
     /// No answer yet.
@@ -1682,12 +1698,43 @@ fn named_effect<'r>(record: &'r TaskRecord, name: &str) -> Option<&'r EffectReco
         .find(|effect| effect.name().as_str() == name)
 }
 
+/// Record a person's reply once its delivery applied, dated when it
+/// applied. A coordinator's answer records nothing.
+fn record_reply(
+    ctx: &Context<'_>,
+    task: &TaskId,
+    fence: Fence,
+    question: &WorkerQuestion,
+    source: AnswerSource,
+    reply: &EffectRecord,
+) -> Result<()> {
+    match (source, reply.state()) {
+        (AnswerSource::Person, EffectState::Applied { at, .. }) => {
+            ctx.store
+                .record_human_reply(task, fence, &question.id, question.asked_at, *at)
+        }
+        (AnswerSource::Coordinator, _)
+        | (
+            AnswerSource::Person,
+            EffectState::Intended
+            | EffectState::Uncertain { .. }
+            | EffectState::NotApplied { .. }
+            | EffectState::Unresolvable { .. }
+            | EffectState::Waived { .. },
+        ) => Ok(()),
+    }
+}
+
 /// Handle one worker question. Answers are delivered once per question
 /// across retries, restarts, and adoption; a human decision goes through
-/// Roger only when installed, at most once per question.
+/// Roger only when installed, at most once per question. A person's answer
+/// ([`AnswerSource::Person`]) is recorded with
+/// [`HouseStore::record_human_reply`] once its delivery applied, also when
+/// a restart repeats the question after delivery.
 ///
 /// # Errors
-/// Returns store and authority failures.
+/// Returns store and authority failures, and the reply's recording errors
+/// such as [`crate::state::UsageError::ReplyBeforeQuestion`].
 pub fn handle_question(
     ctx: &Context<'_>,
     task: &TaskId,
@@ -1706,6 +1753,19 @@ pub fn handle_question(
         return Ok(match existing.state() {
             EffectState::Applied { .. } => {
                 ctx.store.consume_message(task, fence, &question.id, now)?;
+                // A restart between delivery and recording lost the
+                // person's reply; record it now for the answer delivered.
+                if let Response::Answer { body, source } = response
+                    && open_worker(&record)
+                        .is_some_and(|view| view.attempt == existing.request().attempt())
+                    && matches!(
+                        existing.request().effect(),
+                        Effect::Worker(Operation::ReplyToWorker { body: sent, .. }) if sent == body
+                    )
+                {
+                    running_attempt(ctx, task, fence)?;
+                    record_reply(ctx, task, fence, question, *source, existing)?;
+                }
                 QuestionRoute::Duplicate
             }
             EffectState::NotApplied { .. } => {
@@ -1739,7 +1799,7 @@ pub fn handle_question(
     let asked = named_effect(&record, &ask_name).map(EffectRecord::state);
     let overdue = now.saturating_since(question.asked_at) > policy.question_deadline;
     match response {
-        Response::Answer(body) => {
+        Response::Answer { body, source } => {
             running_attempt(ctx, task, fence)?;
             let effect = Effect::Worker(Operation::ReplyToWorker {
                 worker: view.worker,
@@ -1750,6 +1810,7 @@ pub fn handle_question(
             Ok(match reply.state() {
                 EffectState::Applied { .. } => {
                     ctx.store.consume_message(task, fence, &question.id, now)?;
+                    record_reply(ctx, task, fence, question, *source, &reply)?;
                     QuestionRoute::Replied
                 }
                 EffectState::NotApplied { .. } => {
@@ -1827,6 +1888,59 @@ pub fn handle_question(
             })
         }
     }
+}
+
+/// What happened to a worker backend's usage report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageRoute {
+    /// The report is on the attempt that ran the task's latest worker.
+    Recorded(AttemptNumber),
+    /// That attempt has not ended; a report is recorded only after it does.
+    AttemptOpen,
+    /// No worker was launched for the task.
+    NoWorker,
+}
+
+/// Record the usage report the worker backend returned for the task's
+/// latest worker, once that worker's attempt has ended: finished,
+/// cancelled, or settling the task. The owner that settled the task may
+/// still record it. Repeating the same report changes nothing. Without a
+/// report the attempt stays [`crate::state::AttemptUsage::NotReported`].
+///
+/// # Errors
+/// Returns [`HouseStore::record_attempt_usage`] failures, including
+/// [`ContractError::UnsupportedCapabilities`] when the backend does not
+/// declare usage attribution, and a stale fence.
+pub fn record_worker_usage(
+    ctx: &Context<'_>,
+    task: &TaskId,
+    fence: Fence,
+    report: UsageReport,
+) -> Result<UsageRoute> {
+    let record = ctx.store.task(task)?;
+    let Some(view) = current_worker(&record) else {
+        return Ok(UsageRoute::NoWorker);
+    };
+    let ended = record
+        .attempts()
+        .iter()
+        .find(|attempt| attempt.number() == view.attempt)
+        .is_some_and(|attempt| match attempt.state() {
+            AttemptState::Running | AttemptState::Interrupted { .. } => false,
+            AttemptState::Finished { .. } | AttemptState::Cancelled { .. } => true,
+        });
+    if !ended {
+        return Ok(UsageRoute::AttemptOpen);
+    }
+    ctx.store.record_attempt_usage(
+        task,
+        fence,
+        view.attempt,
+        ctx.backend.descriptor(),
+        report,
+        ctx.clock.now(),
+    )?;
+    Ok(UsageRoute::Recorded(view.attempt))
 }
 
 /// The result of starting a coordinator for a consumer scope.

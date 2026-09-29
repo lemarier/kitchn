@@ -1718,9 +1718,10 @@ impl GateRun {
 /// decision becomes a handover, and a refused handover stops at that subject.
 /// For a new active decision, effect intent is persisted first and the marker
 /// then references its key, so a crash between the two finds the same intent.
-/// A base tip read marked [`BaseTipRead::Retry`] is counted per head first;
-/// below [`MAX_BASE_READ_FAILURES`] the pass records nothing and admits no
-/// effect, and at the limit the PR is handed over.
+/// A base tip read marked [`BaseTipRead::Retry`] is counted per head when the
+/// decision would otherwise act; below [`MAX_BASE_READ_FAILURES`] the pass
+/// records nothing and admits no effect, and at the limit the PR is handed
+/// over. Passes that skip do not count.
 ///
 /// # Errors
 /// Returns storage errors without admitting an effect.
@@ -1768,20 +1769,6 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
             GateEffectState::Applied => refused = record.refused,
         }
     }
-    // A base read that may clear waits for a later pass, but only a bounded
-    // number of times at one head; then the PR is handed over.
-    if evidence.base_tip == BaseTipRead::Retry
-        && store.record_base_read_failure(house, repository, number, &evidence.head, now)?
-            < MAX_BASE_READ_FAILURES
-    {
-        let mut decision = evaluate(evidence, grants, GateHistory::default());
-        decision.verdict = Verdict::Skip;
-        return Ok(RecordedDecision {
-            decision,
-            mode,
-            admission: Admission::None,
-        });
-    }
     let mut history = store.history(
         house,
         repository,
@@ -1826,6 +1813,16 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
         mode,
         admission: Admission::None,
     };
+    // A base read that may clear waits for a later pass, but only a bounded
+    // number of times at one head; then the PR is handed over. Only a pass
+    // that would act counts: a skip does not use up the head's budget.
+    if decision.verdict != Verdict::Skip
+        && evidence.base_tip == BaseTipRead::Retry
+        && store.record_base_read_failure(house, repository, number, &evidence.head, now)?
+            < MAX_BASE_READ_FAILURES
+    {
+        decision.verdict = Verdict::Skip;
+    }
     if decision.verdict == Verdict::Skip {
         return Ok(skip(decision));
     }

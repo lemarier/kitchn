@@ -3368,6 +3368,47 @@ fn transient_base_ref_failures_retry_then_hand_over() -> TestResult {
     Ok(())
 }
 #[test]
+fn skipped_passes_do_not_consume_the_base_ref_retry_budget() -> TestResult {
+    let mut store = FakeMarkers::default();
+    let mut e = ready()?;
+    e.base_tip = BaseTipRead::Retry;
+    // An unsettled head waits without counting, however many passes it takes.
+    e.head_age = Some(std::time::Duration::from_secs(60));
+    for _ in 0..=gate::MAX_BASE_READ_FAILURES {
+        let waiting =
+            gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100))?;
+        assert_eq!(waiting.decision.verdict, Verdict::Skip);
+    }
+    assert!(store.base_read_failures.is_empty());
+    // Once the head settles it still gets the full budget before a hand-over.
+    e.head_age = Some(gate::SETTLE_TIME);
+    for pass in 1..gate::MAX_BASE_READ_FAILURES {
+        let retry =
+            gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(200))?;
+        assert_eq!(retry.decision.verdict, Verdict::Skip, "pass {pass}");
+        assert_eq!(retry.admission, Admission::None);
+    }
+    assert_eq!(
+        store.base_read_failures.values().sum::<u8>(),
+        gate::MAX_BASE_READ_FAILURES - 1
+    );
+    let handed = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(300))?;
+    assert!(matches!(
+        &handed.decision.verdict,
+        Verdict::HandOver { gaps } if gaps.contains(&Gap::BaseUnreadable)
+    ));
+    // Once the hand-over lands, later passes are skips that do not count.
+    store.apply(&handed)?;
+    let counted = store.base_read_failures.values().sum::<u8>();
+    for now in [400, 500] {
+        let quiet =
+            gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(now))?;
+        assert_eq!(quiet.decision.verdict, Verdict::Skip);
+    }
+    assert_eq!(store.base_read_failures.values().sum::<u8>(), counted);
+    Ok(())
+}
+#[test]
 fn uncountable_base_ref_failure_stops_the_pass() -> TestResult {
     let mut store = FakeMarkers {
         fail: true,

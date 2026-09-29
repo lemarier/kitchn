@@ -132,7 +132,13 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             let registry = HouseRegistry::new(canonical_root(registry)?)?;
             let config: HouseConfig = decode(&config)?;
             registry.initialize(&config)?;
-            let store = registry.initialize_store(&config.house)?;
+            // Registered already: say so, as the guided path does, so a rerun
+            // is known to resume rather than start over.
+            let store = registry.initialize_store(&config.house).map_err(|source| {
+                kitchen::house::HouseInitError::StoreNotInitialized {
+                    source: Box::new(source),
+                }
+            })?;
             Ok((
                 format!(
                     "Registered house {}. No authority or workflows activated.\n{}\nNext: from a checkout of an allowed repository, run kitchn house setup --registry '{}'",

@@ -260,6 +260,32 @@ fn init_creates_the_house_store_that_commands_default_to() -> TestResult {
         manual.join("private/acme/store").display()
     );
     assert!(String::from_utf8(config.stdout)?.contains(&created));
+
+    // When only the store step fails on a rerun, the message says the house
+    // is registered, so the operator knows a rerun resumes.
+    #[cfg(unix)]
+    {
+        let store = manual.join("private/acme/store");
+        let moved = manual.join("private/acme/store-real");
+        fs::rename(&store, &moved)?;
+        std::os::unix::fs::symlink(&moved, &store)?;
+        let rerun = init(
+            &checkout,
+            &home,
+            &[
+                "--registry",
+                &manual.display().to_string(),
+                "--config",
+                &reviewed,
+            ],
+        )?;
+        assert_ne!(rerun.status.code(), Some(0), "{rerun:?}");
+        let stderr = String::from_utf8(rerun.stderr)?;
+        assert!(
+            stderr.contains("registered the house, but its state store was not created"),
+            "{stderr}"
+        );
+    }
     Ok(())
 }
 

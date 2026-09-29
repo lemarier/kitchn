@@ -648,6 +648,7 @@ mod tests {
             stack_tool: None,
             schedules: None,
             merge_readiness: Default::default(),
+            disk_pressure: None,
         };
         let registry = HouseRegistry::new(root.join("registry"))?;
         registry.initialize(&config)?;

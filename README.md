@@ -32,7 +32,7 @@ everything around it:
 - a cleanup script one command away from deleting unpushed work,
 - and me, at midnight, being the only process there was.
 
-Then I heard Lauren Tan in [an interview about working with agents](https://x.com/poteto/status/2102050467505430555):
+Then I heard Lauren Tan in [an interview about working with agents](https://x.com/0xShoopy/status/2104537178571153664):
 *"I like to call it the Michelin kitchen because I think it's not a factory…
 how do we get quality at scale?"* And on trust: watch the agent work, correct
 it, turn what you corrected into a skill, and only then let it run on its own.

@@ -4,13 +4,16 @@
 //! system, a VM of another operating system, or a class of device. House or
 //! repository policy names the targets a work type must be verified on;
 //! [`VerificationPolicy::check_activation`] fails, naming every gap, when the
-//! backend lacks one. Verification evidence names its environment through
-//! [`EvidenceKind::Verification`] and counts only for the exact subject it was
-//! observed on; check and worker-report evidence never satisfies it.
+//! backend lacks one. Verification evidence records the [`VerificationAccess`]
+//! that produced it through [`EvidenceKind::AuthorizedVerification`], and
+//! counts only when that access matches one the evaluating task holds and
+//! only for the exact subject it was observed on. Check, worker-report, and
+//! unbound [`EvidenceKind::Verification`] evidence never satisfies it.
 //!
 //! A declared environment grants nothing. Using a VM or device needs
 //! [`Permission::UseVerificationEnvironment`] from the task's authority, and a
-//! device also needs [`Permission::OperateEquipment`]; see [`authorize_access`].
+//! device also needs [`Permission::OperateEquipment`], each from a grant that
+//! names the target; see [`authorize_access`].
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,7 +24,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CredentialId, ErrorClass,
+    BackendId, CredentialId, ErrorClass, HouseId,
     contracts::{
         ContractError, EffectExecutor, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
         GrantScope, HouseGrants, Permission, Repository, Support, TaskAuthority, Text, ValueKind,
@@ -462,14 +465,57 @@ fn add_requirement(
     Ok(())
 }
 
-/// Credentials selected for using one verification target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One task's authorized use of a verification target: the house, the
+/// executor namespace, the scope, the target, and the credential selected for
+/// each permission the target needs.
+///
+/// [`authorize_access`] builds one; deserializing reads a stored record.
+/// Verification evidence records it in
+/// [`EvidenceKind::AuthorizedVerification`]. A recorded copy authorizes
+/// nothing by itself: [`VerificationReport::evaluate`] counts it only when it
+/// equals an access the evaluating task obtained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[must_use]
 pub struct VerificationAccess {
+    house: HouseId,
+    backend: BackendId,
+    scope: GrantScope,
+    target: VerificationTarget,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    credentials: BTreeMap<Permission, CredentialId>,
+}
+
+impl VerificationAccess {
+    /// The house whose grants authorized the access.
+    #[must_use]
+    pub const fn house(&self) -> &HouseId {
+        &self.house
+    }
+
+    /// The executor namespace that runs the verification.
+    #[must_use]
+    pub const fn backend(&self) -> &BackendId {
+        &self.backend
+    }
+
+    /// The grant scope the access was authorized for.
+    #[must_use]
+    pub const fn scope(&self) -> &GrantScope {
+        &self.scope
+    }
+
     /// The authorized target.
-    pub target: VerificationTarget,
+    #[must_use]
+    pub const fn target(&self) -> &VerificationTarget {
+        &self.target
+    }
+
     /// The credential for each permission the target needs; empty for the host.
-    pub credentials: BTreeMap<Permission, CredentialId>,
+    #[must_use]
+    pub const fn credentials(&self) -> &BTreeMap<Permission, CredentialId> {
+        &self.credentials
+    }
 }
 
 /// Authorize a task to use `target` on `backend`. Call this before every use:
@@ -477,13 +523,13 @@ pub struct VerificationAccess {
 ///
 /// The backend's own [`EffectExecutor::verification_environments`] must fully
 /// support the target, and the task must hold each of the target's
-/// [`VerificationTarget::required_permissions`] on that backend. A declared
-/// environment grants nothing by itself.
+/// [`VerificationTarget::required_permissions`] on that backend from a grant
+/// naming the target. A declared environment grants nothing by itself.
 ///
 /// # Errors
 /// Returns [`VerificationError::UnsupportedTargets`] when the backend does not
 /// fully support the target, and a [`ContractError`] when the backend serves
-/// another house or the task lacks a permission.
+/// another house or the task lacks a permission for the target.
 pub fn authorize_access(
     authority: &TaskAuthority,
     current: &HouseGrants,
@@ -505,11 +551,14 @@ pub fn authorize_access(
         .iter()
         .map(|permission| {
             authority
-                .authorize(current, *permission, scope, &descriptor.backend)
+                .authorize_target(current, *permission, scope, &descriptor.backend, target)
                 .map(|credential| (*permission, credential))
         })
         .collect::<Result<_, ContractError>>()?;
     Ok(VerificationAccess {
+        house: descriptor.house.clone(),
+        backend: descriptor.backend.clone(),
+        scope: scope.clone(),
         target: target.clone(),
         credentials,
     })
@@ -527,6 +576,9 @@ pub enum TargetStatus {
     Unavailable,
     /// Verification evidence exists only for another revision.
     Stale,
+    /// Verification evidence names this target, but no access the task
+    /// holds produced it.
+    Unauthenticated,
     /// No verification evidence names this target.
     Missing,
 }
@@ -540,14 +592,19 @@ pub struct VerificationReport(BTreeMap<VerificationTarget, TargetStatus>);
 impl VerificationReport {
     /// Evaluate `evidence` against the `required` targets for `subject`.
     ///
-    /// Only [`EvidenceKind::Verification`] evidence for the exact subject
-    /// counts. A failure on the subject outweighs a pass, and a pass outweighs
-    /// an unavailable result. Check and worker-report evidence never verifies
-    /// a target.
+    /// `authorized` holds the task's current [`authorize_access`] results.
+    /// Only [`EvidenceKind::AuthorizedVerification`] evidence whose access
+    /// equals one of them counts: same house, executor namespace, scope,
+    /// target, and credentials. Other verification evidence for a target is
+    /// [`TargetStatus::Unauthenticated`]. Of the authenticated evidence, only
+    /// the exact subject counts; a failure outweighs a pass, and a pass
+    /// outweighs an unavailable result. Check and worker-report evidence never
+    /// verifies a target.
     pub fn evaluate(
         required: &BTreeSet<VerificationTarget>,
         subject: &EvidenceSubject,
         evidence: &[Evidence],
+        authorized: &[VerificationAccess],
     ) -> Self {
         Self(
             required
@@ -555,13 +612,19 @@ impl VerificationReport {
                 .map(|target| {
                     let mut status = TargetStatus::Missing;
                     for item in evidence {
-                        let EvidenceKind::Verification(observed) = &item.kind else {
-                            continue;
+                        let (observed, authenticated) = match &item.kind {
+                            EvidenceKind::AuthorizedVerification(access) => {
+                                (&access.target, authorized.contains(access))
+                            }
+                            EvidenceKind::Verification(observed) => (observed, false),
+                            EvidenceKind::Check | EvidenceKind::WorkerReport => continue,
                         };
                         if observed != target {
                             continue;
                         }
-                        let next = if &item.subject == subject {
+                        let next = if !authenticated {
+                            TargetStatus::Unauthenticated
+                        } else if &item.subject == subject {
                             match item.verdict {
                                 EvidenceVerdict::Fail => TargetStatus::Failed,
                                 EvidenceVerdict::Pass => TargetStatus::Verified,
@@ -606,10 +669,11 @@ impl VerificationReport {
 const fn precedence(status: TargetStatus) -> u8 {
     match status {
         TargetStatus::Missing => 0,
-        TargetStatus::Stale => 1,
-        TargetStatus::Unavailable => 2,
-        TargetStatus::Verified => 3,
-        TargetStatus::Failed => 4,
+        TargetStatus::Unauthenticated => 1,
+        TargetStatus::Stale => 2,
+        TargetStatus::Unavailable => 3,
+        TargetStatus::Verified => 4,
+        TargetStatus::Failed => 5,
     }
 }
 

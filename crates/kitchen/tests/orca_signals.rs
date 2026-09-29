@@ -641,6 +641,7 @@ fn a_released_worker_is_read_from_its_newest_archived_page() -> TestResult {
             messages: 50,
             complete: false,
             last_activity: Some(Timestamp::from_unix_millis(120_000)),
+            last_agent_activity: Some(Timestamp::from_unix_millis(120_000)),
             agent_spoke: true,
         })
     );
@@ -653,6 +654,7 @@ fn a_released_worker_is_read_from_its_newest_archived_page() -> TestResult {
             messages: 30,
             complete: true,
             last_activity: Some(Timestamp::from_unix_millis(30_000)),
+            last_agent_activity: Some(Timestamp::from_unix_millis(30_000)),
             agent_spoke: true,
         })
     );
@@ -724,6 +726,7 @@ fn an_archive_page_without_a_cursor_must_prove_the_archive_complete() -> TestRes
             messages: 30,
             complete: true,
             last_activity: Some(Timestamp::from_unix_millis(30_000)),
+            last_agent_activity: Some(Timestamp::from_unix_millis(30_000)),
             agent_spoke: true,
         })
     );

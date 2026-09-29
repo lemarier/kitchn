@@ -625,9 +625,7 @@ fn inspect_markers(
                     .get("html_url")
                     .and_then(Value::as_str)
                     .ok_or(IntegrationError::Unknown)?;
-                if !url.starts_with(&format!("https://github.com/{repository}/issues/"))
-                    && !url.starts_with(&format!("https://github.com/{repository}/pull/"))
-                {
+                if !names_item_in(url, repository) {
                     return Err(IntegrationError::Unknown);
                 }
                 found = Some(Receipt::new(ExternalRef::new(url)?, vec![], vec![])?);
@@ -638,6 +636,72 @@ fn inspect_markers(
         Some(receipt) => Inspection::Applied(receipt),
         None => Inspection::Missing,
     })
+}
+
+/// Whether `url` is an issue or pull request URL in `repository`. GitHub
+/// owner and repository names are case-insensitive and its `html_url` uses
+/// the repository's own casing, so the prefix is compared ignoring case.
+fn names_item_in(url: &str, repository: &str) -> bool {
+    ["issues", "pull"].iter().any(|kind| {
+        let prefix = format!("https://github.com/{repository}/{kind}/");
+        url.get(..prefix.len())
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(&prefix))
+    })
+}
+
+#[cfg(test)]
+mod casing_tests {
+    use super::*;
+
+    fn created(url: &str) -> Vec<Value> {
+        vec![serde_json::json!({
+            "title": "Task",
+            "user": {"login": "sample-bot"},
+            "html_url": url,
+        })]
+    }
+
+    #[test]
+    fn a_created_item_is_found_whatever_the_casing_of_its_url() -> Result<(), IntegrationError> {
+        for (configured, reported) in [
+            ("Sample/Project", "sample/project"),
+            ("sample/project", "Sample/Project"),
+            ("sample/project", "sample/project"),
+        ] {
+            let url = format!("https://github.com/{reported}/issues/3");
+            let found = inspect_markers(&created(&url), "title", "Task", "sample-bot", configured)?;
+            assert!(
+                matches!(&found, Inspection::Applied(receipt) if receipt.reference().as_str() == url),
+                "{configured} vs {reported}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn another_repository_or_kind_of_url_is_not_the_created_item() {
+        for url in [
+            "https://github.com/other/project/issues/3",
+            "https://github.com/sample/project-two/issues/3",
+            "https://github.com/sample/project/discussions/3",
+            "https://github.com/sample",
+            "",
+        ] {
+            let found = inspect_markers(
+                &created(url),
+                "title",
+                "Task",
+                "sample-bot",
+                "sample/project",
+            );
+            assert!(matches!(found, Err(IntegrationError::Unknown)), "{url:?}");
+        }
+        // A pull request URL in the repository is accepted, as before.
+        assert!(names_item_in(
+            "https://github.com/Sample/Project/pull/9",
+            "sample/project"
+        ));
+    }
 }
 
 #[cfg(all(test, unix))]

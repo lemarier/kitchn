@@ -1607,12 +1607,15 @@ fn action(run: &ApplyReport, step: &Step) -> Result<GitHubAction> {
 }
 
 /// The issue number in a receipt reference of the form
-/// `https://github.com/<repository>/issues/<number>`.
+/// `https://github.com/<repository>/issues/<number>`. GitHub repository
+/// names are case-insensitive, so the repository segment is too.
 fn issue_number(repository: &Repository, reference: &ExternalRef) -> Result<IssueNumber> {
     let prefix = format!("https://github.com/{}/issues/", repository.as_str());
-    reference
-        .as_str()
-        .strip_prefix(&prefix)
+    let value = reference.as_str();
+    value
+        .get(..prefix.len())
+        .filter(|actual| actual.eq_ignore_ascii_case(&prefix))
+        .and_then(|_| value.get(prefix.len()..))
         .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|digits| digits.parse::<u64>().ok())
         .and_then(|number| IssueNumber::new(number).ok())
@@ -1624,6 +1627,30 @@ mod tests {
     use super::*;
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn receipts_name_an_issue_in_the_repository_whatever_its_casing() -> TestResult {
+        let repo = Repository::new("Sample/Project")?;
+        for (url, number) in [
+            ("https://github.com/Sample/Project/issues/7", 7),
+            ("https://github.com/sample/project/issues/8", 8),
+        ] {
+            assert_eq!(issue_number(&repo, &ExternalRef::new(url)?)?.get(), number);
+        }
+        for bad in [
+            "https://github.com/other/project/issues/7",
+            "https://github.com/sample/project/pull/7",
+            "https://github.com/sample/project/issues/",
+            "https://github.com/sample/project/issues/7x",
+            "https://github.com/sample/proj",
+        ] {
+            assert!(
+                issue_number(&repo, &ExternalRef::new(bad)?).is_err(),
+                "{bad}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn owned_paths_overlap_only_at_segment_boundaries() -> TestResult {

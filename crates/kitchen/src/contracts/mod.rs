@@ -100,7 +100,8 @@ pub use value::{
 };
 pub use verification::{
     DeviceClass, MAX_DEVICE_CLASS_BYTES, MAX_POLICY_REPOSITORIES, MAX_POLICY_WORK_TYPES,
-    MAX_TARGETS_PER_WORK_TYPE, MAX_VERIFICATION_ENVIRONMENTS, OperatingSystem, TargetStatus,
-    VerificationAccess, VerificationEnvironments, VerificationError, VerificationPolicy,
-    VerificationReport, VerificationTarget, authorize_access,
+    MAX_TARGETS_PER_WORK_TYPE, MAX_VERIFICATION_ENVIRONMENTS, OperatingSystem, RecordedEvidence,
+    TargetStatus, VerificationAccess, VerificationEnvironments, VerificationError,
+    VerificationExecutor, VerificationPolicy, VerificationReport, VerificationResult,
+    VerificationTarget, authorize_access,
 };

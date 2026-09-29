@@ -3,7 +3,9 @@
 //! [`HouseStore`] records tasks, fenced claims, attempts, effect intents and
 //! outcomes, evidence revisions, consumed messages, and single-consumer
 //! leases in runtime storage the caller selects. [`run_effect`] and
-//! [`reconcile`] connect the store to an [`crate::contracts::EffectExecutor`].
+//! [`reconcile`] connect the store to an [`crate::contracts::EffectExecutor`];
+//! [`run_verification`] connects it to a
+//! [`crate::contracts::VerificationExecutor`].
 //!
 //! Ownership rules:
 //!
@@ -47,6 +49,7 @@ mod model;
 mod retention;
 pub(crate) mod snapshot;
 mod store;
+mod verification;
 
 pub use consumer::{ConsumerEvent, ConsumerRecord, ConsumerState, MAX_CONSUMER_HISTORY};
 pub use effects::{ReconcileReport, reconcile, reread_settled, run_effect};
@@ -73,3 +76,4 @@ pub use retention::{
 };
 pub use snapshot::StoreOptions;
 pub use store::HouseStore;
+pub use verification::{VerificationPlan, run_verification};

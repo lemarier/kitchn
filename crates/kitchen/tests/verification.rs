@@ -1,25 +1,35 @@
 //! Verification environments: target declarations, policy checks at
-//! activation, exact-revision evidence, and explicit access grants.
+//! activation, exact-revision evidence bound to authorized access, and
+//! explicit access grants scoped to named targets.
 //!
-//! Everything here runs against in-memory values and the fake backend. No VM
-//! or device is started or operated; these are not live verification evidence.
+//! Everything here runs against in-memory values, a temporary house store,
+//! and the fake backend, whose verdicts the tests script. No VM or device is
+//! started or operated; these are not live verification evidence.
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeSet, VecDeque},
+    sync::{Mutex, PoisonError},
+};
 
-use common::{TestResult, backend_id, commit, credential, grant, grants_for, house, other_house};
+use common::{
+    Fixture, ManualClock, TestResult, at, backend_id, commit, creator, credential, grant, house,
+    other_house, scheduled, spec, task_id, ttl,
+};
 use kitchen::{
-    Error, ErrorClass, HouseId,
+    CredentialId, Error, ErrorClass, HouseId, TaskId,
     contracts::{
-        BackendDescriptor, BackendUnavailable, ContractError, DeviceClass, EffectExecutor,
+        BackendDescriptor, BackendUnavailable, Clock, ContractError, DeviceClass, EffectExecutor,
         EffectFailure, EffectRequest, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
-        ExternalRef, GrantScope, HouseGrants, Lookup, MAX_DEVICE_CLASS_BYTES,
+        ExternalRef, Fence, Grant, GrantScope, HouseGrants, Lookup, MAX_DEVICE_CLASS_BYTES,
         MAX_TARGETS_PER_WORK_TYPE, MAX_VERIFICATION_ENVIRONMENTS, OperatingSystem, Permission,
-        Receipt, Repository, Support, TargetStatus, TaskAuthority, Text, ValueKind,
-        VerificationEnvironments, VerificationError, VerificationPolicy, VerificationReport,
+        Receipt, RecordedEvidence, Repository, Support, TargetStatus, TaskAuthority, Text,
+        ValueKind, VerificationAccess, VerificationEnvironments, VerificationError,
+        VerificationExecutor, VerificationPolicy, VerificationReport, VerificationResult,
         VerificationTarget, authorize_access, fake::FakeBackend,
     },
+    state::{StateError, VerificationPlan, run_verification},
 };
 
 fn target(value: &str) -> TestResult<VerificationTarget> {
@@ -42,10 +52,28 @@ fn environments(declared: &[(&str, Support)]) -> TestResult<VerificationEnvironm
     Ok(environments)
 }
 
-/// The fake backend, declaring `declared` verification environments.
+/// The fake backend, declaring `declared` verification environments and
+/// reporting scripted verdicts for runs.
 struct Declaring {
     inner: FakeBackend,
     environments: VerificationEnvironments,
+    verdicts: Mutex<VecDeque<EvidenceVerdict>>,
+    runs: Mutex<u32>,
+}
+
+impl Declaring {
+    /// Report `verdict` for the next run.
+    fn will_report(&self, verdict: EvidenceVerdict) {
+        self.verdicts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(verdict);
+    }
+
+    /// How many runs the backend was asked to perform.
+    fn runs(&self) -> u32 {
+        *self.runs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl EffectExecutor for Declaring {
@@ -66,11 +94,140 @@ impl EffectExecutor for Declaring {
     }
 }
 
+impl VerificationExecutor for Declaring {
+    /// Report the next scripted verdict; time out when none is scripted.
+    fn verify(
+        &self,
+        _access: &VerificationAccess,
+        _subject: &EvidenceSubject,
+    ) -> Result<VerificationResult, BackendUnavailable> {
+        let mut runs = self.runs.lock().unwrap_or_else(PoisonError::into_inner);
+        *runs += 1;
+        let verdict = self
+            .verdicts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .ok_or(BackendUnavailable::Timeout)?;
+        let source = ExternalRef::new(&format!("run:verification-{runs}"))
+            .map_err(|_| BackendUnavailable::Transport)?;
+        Ok(VerificationResult { verdict, source })
+    }
+}
+
 fn declaring(house: HouseId, declared: &[(&str, Support)]) -> TestResult<Declaring> {
     Ok(Declaring {
         inner: FakeBackend::fully_capable(backend_id()?, house),
         environments: environments(declared)?,
+        verdicts: Mutex::new(VecDeque::new()),
+        runs: Mutex::new(0),
     })
+}
+
+/// A target every [`verifying`] backend offers and no grant names.
+const UNGRANTED: &str = "vm:freebsd";
+
+/// A claimed task in a temporary store whose authority holds grants naming
+/// each target it can verify on, and a backend offering those targets.
+struct Verifying {
+    fixture: Fixture,
+    backend: Declaring,
+    current: HouseGrants,
+    task: TaskId,
+    fence: Fence,
+    clock: ManualClock,
+}
+
+fn verifying(on: &[&str]) -> TestResult<Verifying> {
+    let mut standing = Vec::new();
+    let mut declared = vec![(UNGRANTED, Support::Supported)];
+    for name in on {
+        for permission in target(name)?.required_permissions() {
+            standing.push(targeted(*permission, &[name])?);
+        }
+        declared.push((name, Support::Supported));
+    }
+    let (current, authority) = delegated(standing)?;
+    let fixture = Fixture::new()?;
+    let mut work = spec("verify")?;
+    work.authority = authority;
+    let task = task_id("verify")?;
+    fixture.store.create_task(work, &creator()?, at(0))?;
+    let fence = fixture
+        .store
+        .claim(&task, &scheduled("coordinator-a")?, ttl(600)?, at(0))?
+        .fence();
+    Ok(Verifying {
+        fixture,
+        backend: declaring(house()?, &declared)?,
+        current,
+        task,
+        fence,
+        clock: ManualClock::starting_at(1),
+    })
+}
+
+impl Verifying {
+    /// Run the task's subject on `on` through the store, with the backend
+    /// reporting `verdict`.
+    fn run(
+        &self,
+        on: &str,
+        verdict: EvidenceVerdict,
+        subject: &EvidenceSubject,
+    ) -> TestResult<Evidence> {
+        self.backend.will_report(verdict);
+        self.clock.advance(1);
+        let plan = VerificationPlan {
+            task: self.task.clone(),
+            fence: self.fence,
+            target: target(on)?,
+            subject: subject.clone(),
+        };
+        Ok(run_verification(
+            &self.fixture.store,
+            &self.backend,
+            &self.current,
+            &plan,
+            &self.clock,
+        )?)
+    }
+
+    /// Record `evidence` as a producer would.
+    fn record(&self, evidence: Evidence) -> Result<(), Error> {
+        self.fixture
+            .store
+            .record_evidence(&self.task, self.fence, evidence, self.clock.now())
+            .map(|_| ())
+    }
+
+    fn recorded(&self) -> TestResult<RecordedEvidence> {
+        Ok(self.fixture.store.recorded_evidence(&self.task)?)
+    }
+
+    /// The task's current access to `on`, as the gate would obtain it.
+    fn access(&self, on: &str) -> TestResult<VerificationAccess> {
+        let task = self.fixture.store.task(&self.task)?;
+        Ok(authorize_access(
+            &task.spec().authority,
+            &self.current,
+            &self.backend,
+            &target(on)?,
+            &GrantScope::House,
+        )?)
+    }
+
+    /// Access to `on` for a task delegated `standing` instead.
+    fn access_with(&self, on: &str, standing: Vec<Grant>) -> TestResult<VerificationAccess> {
+        let (current, authority) = delegated(standing)?;
+        Ok(authorize_access(
+            &authority,
+            &current,
+            &self.backend,
+            &target(on)?,
+            &GrantScope::House,
+        )?)
+    }
 }
 
 fn subject(head: char, base: Option<char>) -> TestResult<EvidenceSubject> {
@@ -80,18 +237,72 @@ fn subject(head: char, base: Option<char>) -> TestResult<EvidenceSubject> {
     })
 }
 
-fn verification(
-    on: &str,
+/// A house-wide grant of `permission` naming `targets`.
+fn targeted(permission: Permission, targets: &[&str]) -> TestResult<Grant> {
+    let targets = targets
+        .iter()
+        .map(|name| target(name))
+        .collect::<TestResult<Vec<_>>>()?;
+    Ok(grant(permission)?.with_targets(targets)?)
+}
+
+/// The house granting `standing`, and a task delegated all of it.
+fn delegated(standing: Vec<Grant>) -> TestResult<(HouseGrants, TaskAuthority)> {
+    let current = HouseGrants::new(house()?, standing.clone());
+    let authority = TaskAuthority::delegate(&current, standing)?;
+    Ok((current, authority))
+}
+
+/// House-wide access to `on` through a backend declaring it, authorized by
+/// grants naming `on`.
+fn access_to(on: &str) -> TestResult<VerificationAccess> {
+    let on_target = target(on)?;
+    let standing = on_target
+        .required_permissions()
+        .iter()
+        .map(|permission| targeted(*permission, &[on]))
+        .collect::<TestResult<Vec<_>>>()?;
+    let (current, authority) = delegated(standing)?;
+    let backend = declaring(house()?, &[(on, Support::Supported)])?;
+    Ok(authorize_access(
+        &authority,
+        &current,
+        &backend,
+        &on_target,
+        &GrantScope::House,
+    )?)
+}
+
+fn evidence(
+    kind: EvidenceKind,
     verdict: EvidenceVerdict,
     subject: EvidenceSubject,
 ) -> TestResult<Evidence> {
     Ok(Evidence {
-        kind: EvidenceKind::Verification(target(on)?),
+        kind,
         verdict,
         subject,
         source: ExternalRef::new("run:verification-1")?,
         observed_at: kitchen::contracts::Timestamp::from_unix_millis(1),
     })
+}
+
+/// Verification evidence recording the access that produced it.
+fn verification(
+    access: &VerificationAccess,
+    verdict: EvidenceVerdict,
+    subject: EvidenceSubject,
+) -> TestResult<Evidence> {
+    evidence(
+        EvidenceKind::AuthorizedVerification(access.clone()),
+        verdict,
+        subject,
+    )
+}
+
+/// Verification evidence naming only its target, as any producer can build.
+fn unbound(on: &str, verdict: EvidenceVerdict, subject: EvidenceSubject) -> TestResult<Evidence> {
+    evidence(EvidenceKind::Verification(target(on)?), verdict, subject)
 }
 
 fn invalid() -> ContractError {
@@ -381,34 +592,23 @@ fn policies_deserialize_strictly() -> TestResult {
 
 #[test]
 fn evidence_from_the_wrong_revision_does_not_verify() -> TestResult {
+    let run = verifying(&["vm:windows"])?;
     let current = subject('a', Some('b'))?;
     let required = BTreeSet::from([target("vm:windows")?]);
-    let evidence = [
-        verification(
-            "vm:windows",
-            EvidenceVerdict::Pass,
-            subject('c', Some('b'))?,
-        )?,
-        verification(
-            "vm:windows",
-            EvidenceVerdict::Pass,
-            subject('a', Some('d'))?,
-        )?,
-    ];
-    let report = VerificationReport::evaluate(&required, &current, &evidence);
-    assert_eq!(
-        report.status(&target("vm:windows")?),
-        Some(TargetStatus::Stale)
-    );
-    assert!(!report.is_satisfied());
+    let authorized = [run.access("vm:windows")?];
+    for other in [subject('c', Some('b'))?, subject('a', Some('d'))?] {
+        run.run("vm:windows", EvidenceVerdict::Pass, &other)?;
+        let report =
+            VerificationReport::evaluate(&required, &current, &run.recorded()?, &authorized);
+        assert_eq!(
+            report.status(&target("vm:windows")?),
+            Some(TargetStatus::Stale)
+        );
+        assert!(!report.is_satisfied());
+    }
 
-    let mut current_evidence = evidence.to_vec();
-    current_evidence.push(verification(
-        "vm:windows",
-        EvidenceVerdict::Pass,
-        current.clone(),
-    )?);
-    let report = VerificationReport::evaluate(&required, &current, &current_evidence);
+    run.run("vm:windows", EvidenceVerdict::Pass, &current)?;
+    let report = VerificationReport::evaluate(&required, &current, &run.recorded()?, &authorized);
     assert_eq!(
         report.status(&target("vm:windows")?),
         Some(TargetStatus::Verified)
@@ -419,21 +619,18 @@ fn evidence_from_the_wrong_revision_does_not_verify() -> TestResult {
 
 #[test]
 fn only_verification_on_the_named_environment_counts() -> TestResult {
+    let run = verifying(&["vm:linux", "host:linux"])?;
     let current = subject('a', None)?;
     let required = BTreeSet::from([target("device:phone")?, target("host:linux")?]);
-    let check = Evidence {
-        kind: EvidenceKind::Check,
-        ..verification("host:linux", EvidenceVerdict::Pass, current.clone())?
-    };
-    let worker_report = kitchen::contracts::Evidence {
-        kind: EvidenceKind::WorkerReport,
-        ..check.clone()
-    };
-    let other_environment = verification("vm:linux", EvidenceVerdict::Pass, current.clone())?;
+    for kind in [EvidenceKind::Check, EvidenceKind::WorkerReport] {
+        run.record(evidence(kind, EvidenceVerdict::Pass, current.clone())?)?;
+    }
+    run.run("vm:linux", EvidenceVerdict::Pass, &current)?;
     let evaluated = VerificationReport::evaluate(
         &required,
         &current,
-        &[check, worker_report, other_environment],
+        &run.recorded()?,
+        &[run.access("vm:linux")?, run.access("host:linux")?],
     );
     assert_eq!(
         evaluated.unsatisfied().collect::<Vec<_>>(),
@@ -444,7 +641,10 @@ fn only_verification_on_the_named_environment_counts() -> TestResult {
     );
     assert_eq!(evaluated.status(&target("vm:linux")?), None);
     // Nothing required is trivially satisfied.
-    assert!(VerificationReport::evaluate(&BTreeSet::new(), &current, &[]).is_satisfied());
+    assert!(
+        VerificationReport::evaluate(&BTreeSet::new(), &current, &run.recorded()?, &[])
+            .is_satisfied()
+    );
     Ok(())
 }
 
@@ -452,41 +652,344 @@ fn only_verification_on_the_named_environment_counts() -> TestResult {
 fn a_failure_on_the_subject_outweighs_a_pass() -> TestResult {
     let current = subject('a', None)?;
     let required = BTreeSet::from([target("host:macos")?]);
-    let status = |evidence: &[Evidence]| -> TestResult<Option<TargetStatus>> {
-        Ok(VerificationReport::evaluate(&required, &current, evidence)
-            .status(&target("host:macos")?))
+    let status_after = |run: &Verifying, verdict| -> TestResult<Option<TargetStatus>> {
+        run.run("host:macos", verdict, &current)?;
+        Ok(VerificationReport::evaluate(
+            &required,
+            &current,
+            &run.recorded()?,
+            &[run.access("host:macos")?],
+        )
+        .status(&target("host:macos")?))
     };
-    let pass = verification("host:macos", EvidenceVerdict::Pass, current.clone())?;
-    let fail = verification("host:macos", EvidenceVerdict::Fail, current.clone())?;
-    let unavailable = verification("host:macos", EvidenceVerdict::Unavailable, current.clone())?;
+
+    let run = verifying(&["host:macos"])?;
     assert_eq!(
-        status(&[pass.clone(), fail.clone()])?,
-        Some(TargetStatus::Failed)
-    );
-    assert_eq!(status(&[fail, pass.clone()])?, Some(TargetStatus::Failed));
-    assert_eq!(
-        status(std::slice::from_ref(&unavailable))?,
+        status_after(&run, EvidenceVerdict::Unavailable)?,
         Some(TargetStatus::Unavailable)
     );
-    assert_eq!(status(&[unavailable, pass])?, Some(TargetStatus::Verified));
+    assert_eq!(
+        status_after(&run, EvidenceVerdict::Pass)?,
+        Some(TargetStatus::Verified)
+    );
+    assert_eq!(
+        status_after(&run, EvidenceVerdict::Fail)?,
+        Some(TargetStatus::Failed)
+    );
+
+    // A later pass does not clear an earlier failure on the same subject.
+    let run = verifying(&["host:macos"])?;
+    assert_eq!(
+        status_after(&run, EvidenceVerdict::Fail)?,
+        Some(TargetStatus::Failed)
+    );
+    assert_eq!(
+        status_after(&run, EvidenceVerdict::Pass)?,
+        Some(TargetStatus::Failed)
+    );
     Ok(())
 }
 
 #[test]
-fn verification_evidence_names_its_environment_on_the_wire() -> TestResult {
-    let evidence = verification("vm:windows", EvidenceVerdict::Pass, subject('a', None)?)?;
+fn a_copied_access_with_a_pass_is_not_verification() -> TestResult {
+    let run = verifying(&["vm:windows"])?;
+    let current = subject('a', None)?;
+    let required = BTreeSet::from([target("vm:windows")?]);
+    let access = run.access("vm:windows")?;
+
+    // An exact copy of the task's current access, with a pass on the current
+    // subject, as any producer holding the access fields could build it.
+    let copied = verification(&access, EvidenceVerdict::Pass, current.clone())?;
+    assert!(matches!(
+        run.record(copied),
+        Err(Error::Verification(VerificationError::NotRun))
+    ));
+    // The same for records naming another executor, scope, or credential.
+    let recorded = serde_json::to_value(&access)?;
+    for (field, forged) in [
+        ("backend", serde_json::json!("other-executor")),
+        (
+            "scope",
+            serde_json::json!({ "type": "repository", "repository": "origin89hq/kitchen" }),
+        ),
+        (
+            "credentials",
+            serde_json::json!({ "use-verification-environment": "borrowed" }),
+        ),
+    ] {
+        let mut value = recorded.clone();
+        value[field] = forged;
+        let forged: VerificationAccess = serde_json::from_value(value)?;
+        let evidence = verification(&forged, EvidenceVerdict::Pass, current.clone())?;
+        assert!(
+            matches!(
+                run.record(evidence),
+                Err(Error::Verification(VerificationError::NotRun))
+            ),
+            "{field}"
+        );
+    }
+    let recorded = run.recorded()?;
+    assert!(recorded.items().is_empty());
+    let report = VerificationReport::evaluate(
+        &required,
+        &current,
+        &recorded,
+        std::slice::from_ref(&access),
+    );
+    assert_eq!(
+        report.status(&target("vm:windows")?),
+        Some(TargetStatus::Missing)
+    );
+    assert_eq!(run.backend.runs(), 0);
+
+    // A genuine run through the backend records the same access and verifies.
+    let genuine = run.run("vm:windows", EvidenceVerdict::Pass, &current)?;
+    assert_eq!(
+        genuine.kind,
+        EvidenceKind::AuthorizedVerification(access.clone())
+    );
+    assert_eq!(genuine.source, ExternalRef::new("run:verification-1")?);
+    assert_eq!(run.backend.runs(), 1);
+    let report = VerificationReport::evaluate(&required, &current, &run.recorded()?, &[access]);
+    assert_eq!(
+        report.status(&target("vm:windows")?),
+        Some(TargetStatus::Verified)
+    );
+    Ok(())
+}
+
+#[test]
+fn evidence_counts_only_under_an_access_the_task_holds() -> TestResult {
+    let run = verifying(&["vm:windows", "vm:linux"])?;
+    let current = subject('a', None)?;
+    let windows = target("vm:windows")?;
+    let required = BTreeSet::from([windows.clone()]);
+    let access = run.access("vm:windows")?;
+    run.run("vm:windows", EvidenceVerdict::Pass, &current)?;
+    let recorded = run.recorded()?;
+    let status = |authorized: &[VerificationAccess]| {
+        VerificationReport::evaluate(&required, &current, &recorded, authorized).status(&windows)
+    };
+    assert_eq!(
+        status(std::slice::from_ref(&access)),
+        Some(TargetStatus::Verified)
+    );
+
+    // The same record when the task no longer holds a matching access, for
+    // example after revocation or credential rotation.
+    assert_eq!(status(&[]), Some(TargetStatus::Unauthenticated));
+    assert_eq!(
+        status(&[run.access("vm:linux")?]),
+        Some(TargetStatus::Unauthenticated)
+    );
+    let rotated = run.access_with(
+        "vm:windows",
+        vec![
+            Grant::house(
+                Permission::UseVerificationEnvironment,
+                backend_id()?,
+                CredentialId::new("rotated")?,
+            )
+            .with_targets([windows.clone()])?,
+        ],
+    )?;
+    assert_eq!(status(&[rotated]), Some(TargetStatus::Unauthenticated));
+
+    // Unauthenticated evidence neither verifies nor blocks: an authenticated
+    // pass still verifies, and an unbound failure does not fail the target.
+    run.record(unbound(
+        "vm:windows",
+        EvidenceVerdict::Fail,
+        current.clone(),
+    )?)?;
+    let report = VerificationReport::evaluate(&required, &current, &run.recorded()?, &[access]);
+    assert_eq!(report.status(&windows), Some(TargetStatus::Verified));
+    Ok(())
+}
+
+#[test]
+fn evidence_bound_to_another_target_does_not_verify() -> TestResult {
+    let run = verifying(&["vm:windows", "vm:linux"])?;
+    let current = subject('a', None)?;
+    let windows = target("vm:windows")?;
+    run.run("vm:linux", EvidenceVerdict::Pass, &current)?;
+    let report = VerificationReport::evaluate(
+        &BTreeSet::from([windows.clone()]),
+        &current,
+        &run.recorded()?,
+        &[run.access("vm:linux")?, run.access("vm:windows")?],
+    );
+    assert_eq!(report.status(&windows), Some(TargetStatus::Missing));
+    Ok(())
+}
+
+#[test]
+fn unbound_verification_evidence_stays_readable_but_never_verifies() -> TestResult {
+    let run = verifying(&["vm:windows"])?;
+    let current = subject('a', None)?;
+    // The form written before evidence recorded its access.
+    let legacy = serde_json::json!({
+        "kind": { "verification": "vm:windows" },
+        "verdict": "pass",
+        "subject": { "head": commit('a')?.as_str() },
+        "source": "run:verification-1",
+        "observedAt": 1,
+    });
+    let read: Evidence = serde_json::from_value(legacy.clone())?;
+    assert_eq!(
+        read,
+        unbound("vm:windows", EvidenceVerdict::Pass, current.clone())?
+    );
+    assert_eq!(serde_json::to_value(&read)?, legacy);
+    run.record(read)?;
+    let report = VerificationReport::evaluate(
+        &BTreeSet::from([target("vm:windows")?]),
+        &current,
+        &run.recorded()?,
+        &[run.access("vm:windows")?],
+    );
+    assert_eq!(
+        report.status(&target("vm:windows")?),
+        Some(TargetStatus::Unauthenticated)
+    );
+    assert!(!report.is_satisfied());
+    Ok(())
+}
+
+#[test]
+fn a_verification_run_needs_a_live_claim_and_access_before_the_backend_runs() -> TestResult {
+    let run = verifying(&["vm:windows"])?;
+    let current = subject('a', None)?;
+    let attempt = |grants: &HouseGrants, on: &str, fence| -> TestResult<Result<Evidence, Error>> {
+        let plan = VerificationPlan {
+            task: run.task.clone(),
+            fence,
+            target: target(on)?,
+            subject: current.clone(),
+        };
+        Ok(run_verification(
+            &run.fixture.store,
+            &run.backend,
+            grants,
+            &plan,
+            &run.clock,
+        ))
+    };
+
+    // A target the backend offers but no grant names.
+    assert!(matches!(
+        attempt(&run.current, UNGRANTED, run.fence)?,
+        Err(Error::Verification(VerificationError::Contract(
+            ContractError::PermissionDenied {
+                permission: Permission::UseVerificationEnvironment,
+            }
+        )))
+    ));
+    // Grants revoked since the task was delegated.
+    assert!(matches!(
+        attempt(&HouseGrants::new(house()?, []), "vm:windows", run.fence)?,
+        Err(Error::Verification(VerificationError::Contract(
+            ContractError::AuthorityExpansion { .. }
+        )))
+    ));
+    // An expired claim, then the old fence after another owner takes over.
+    run.clock.advance(3600);
+    assert!(matches!(
+        attempt(&run.current, "vm:windows", run.fence)?,
+        Err(Error::State(StateError::LeaseExpired { .. }))
+    ));
+    let taken = run
+        .fixture
+        .store
+        .take_over(
+            &run.task,
+            &scheduled("coordinator-b")?,
+            ttl(600)?,
+            run.clock.now(),
+        )?
+        .fence();
+    assert!(matches!(
+        attempt(&run.current, "vm:windows", run.fence)?,
+        Err(Error::State(StateError::StaleFence { .. }))
+    ));
+    assert_eq!(run.backend.runs(), 0);
+    assert!(run.recorded()?.items().is_empty());
+
+    // The new owner can run it.
+    run.backend.will_report(EvidenceVerdict::Pass);
+    let evidence = attempt(&run.current, "vm:windows", taken)??;
+    assert_eq!(evidence.verdict, EvidenceVerdict::Pass);
+    assert_eq!(run.backend.runs(), 1);
+    Ok(())
+}
+
+#[test]
+fn an_unreachable_environment_records_nothing() -> TestResult {
+    let run = verifying(&["vm:windows"])?;
+    let current = subject('a', None)?;
+    // No verdict queued: the fake backend times out.
+    let result = run_verification(
+        &run.fixture.store,
+        &run.backend,
+        &run.current,
+        &VerificationPlan {
+            task: run.task.clone(),
+            fence: run.fence,
+            target: target("vm:windows")?,
+            subject: current.clone(),
+        },
+        &run.clock,
+    );
+    assert!(matches!(
+        result,
+        Err(Error::Verification(VerificationError::Unavailable(
+            BackendUnavailable::Timeout
+        )))
+    ));
+    assert_eq!(run.backend.runs(), 1);
+    assert!(run.recorded()?.items().is_empty());
+
+    // A retry that reaches the environment records its verdict.
+    run.run("vm:windows", EvidenceVerdict::Fail, &current)?;
+    let report = VerificationReport::evaluate(
+        &BTreeSet::from([target("vm:windows")?]),
+        &current,
+        &run.recorded()?,
+        &[run.access("vm:windows")?],
+    );
+    assert_eq!(
+        report.status(&target("vm:windows")?),
+        Some(TargetStatus::Failed)
+    );
+    Ok(())
+}
+
+#[test]
+fn verification_evidence_records_its_access_on_the_wire() -> TestResult {
+    let access = access_to("vm:windows")?;
+    let evidence = verification(&access, EvidenceVerdict::Pass, subject('a', None)?)?;
     let json = serde_json::to_value(&evidence)?;
     assert_eq!(
         json["kind"],
-        serde_json::json!({ "verification": "vm:windows" })
+        serde_json::json!({ "authorized-verification": {
+            "house": "origin89",
+            "backend": "fake",
+            "scope": { "type": "house" },
+            "target": "vm:windows",
+            "credentials": { "use-verification-environment": "origin89-orca" },
+        } })
     );
-    assert_eq!(serde_json::from_value::<Evidence>(json)?, evidence);
+    assert_eq!(serde_json::from_value::<Evidence>(json.clone())?, evidence);
     // Existing kinds keep their serialized form.
     assert_eq!(serde_json::to_value(EvidenceKind::Check)?, "check");
     assert!(
         serde_json::from_value::<EvidenceKind>(serde_json::json!({ "verification": "vm:beos" }))
             .is_err()
     );
+    let mut unknown = json["kind"]["authorized-verification"].clone();
+    unknown["granted"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<VerificationAccess>(unknown).is_err());
     Ok(())
 }
 
@@ -499,9 +1002,9 @@ fn a_device_target_without_a_grant_is_refused() -> TestResult {
     };
 
     // Nothing granted: the declared device grants nothing.
-    let none = grants_for(house()?, &[])?;
+    let (none, authority) = delegated(Vec::new())?;
     assert_eq!(
-        access(&TaskAuthority::delegate(&none, [])?, &none),
+        access(&authority, &none),
         Err(VerificationError::Contract(
             ContractError::PermissionDenied {
                 permission: Permission::UseVerificationEnvironment,
@@ -510,11 +1013,10 @@ fn a_device_target_without_a_grant_is_refused() -> TestResult {
     );
 
     // Using a verification environment never implies operating equipment.
-    let environment_only = grants_for(house()?, &[Permission::UseVerificationEnvironment])?;
-    let authority = TaskAuthority::delegate(
-        &environment_only,
-        [grant(Permission::UseVerificationEnvironment)?],
-    )?;
+    let (environment_only, authority) = delegated(vec![targeted(
+        Permission::UseVerificationEnvironment,
+        &["device:km43-controller"],
+    )?])?;
     assert_eq!(
         access(&authority, &environment_only),
         Err(VerificationError::Contract(
@@ -524,37 +1026,37 @@ fn a_device_target_without_a_grant_is_refused() -> TestResult {
         ))
     );
 
-    let both = [
-        Permission::UseVerificationEnvironment,
-        Permission::OperateEquipment,
-    ];
-    let granted = grants_for(house()?, &both)?;
-    let authority = TaskAuthority::delegate(
-        &granted,
-        both.iter()
-            .map(|permission| grant(*permission))
-            .collect::<TestResult<Vec<_>>>()?,
-    )?;
+    let (granted, authority) = delegated(vec![
+        targeted(
+            Permission::UseVerificationEnvironment,
+            &["device:km43-controller"],
+        )?,
+        targeted(Permission::OperateEquipment, &["device:km43-controller"])?,
+    ])?;
     let allowed = access(&authority, &granted)?;
-    assert_eq!(allowed.target, device);
+    assert_eq!(allowed.target(), &device);
+    assert_eq!(allowed.house(), &house()?);
+    assert_eq!(allowed.backend(), &backend_id()?);
+    assert_eq!(allowed.scope(), &GrantScope::House);
     assert_eq!(
-        allowed.credentials.keys().copied().collect::<Vec<_>>(),
+        allowed.credentials().keys().copied().collect::<Vec<_>>(),
         vec![
             Permission::OperateEquipment,
             Permission::UseVerificationEnvironment
         ]
     );
     let token = credential()?;
-    assert!(allowed.credentials.values().all(|used| used == &token));
+    assert!(allowed.credentials().values().all(|used| used == &token));
     Ok(())
 }
 
 #[test]
 fn vm_access_needs_a_grant_and_a_current_declaration() -> TestResult {
     let vm = target("vm:windows")?;
-    let permission = [Permission::UseVerificationEnvironment];
-    let granted = grants_for(house()?, &permission)?;
-    let authority = TaskAuthority::delegate(&granted, [grant(permission[0])?])?;
+    let (granted, authority) = delegated(vec![targeted(
+        Permission::UseVerificationEnvironment,
+        &["vm:windows"],
+    )?])?;
 
     // Granted, but the backend does not fully offer the VM.
     for declared in [&[][..], &[("vm:windows", Support::Partial)][..]] {
@@ -567,7 +1069,7 @@ fn vm_access_needs_a_grant_and_a_current_declaration() -> TestResult {
 
     let backend = declaring(house()?, &[("vm:windows", Support::Supported)])?;
     let access = authorize_access(&authority, &granted, &backend, &vm, &GrantScope::House)?;
-    assert_eq!(access.credentials.len(), 1);
+    assert_eq!(access.credentials().len(), 1);
 
     // Revoking the house grant refuses the next use.
     let revoked = HouseGrants::new(house()?, []);
@@ -587,8 +1089,7 @@ fn vm_access_needs_a_grant_and_a_current_declaration() -> TestResult {
 fn host_access_needs_no_extra_grant_but_stays_in_the_house() -> TestResult {
     let host = target("host:linux")?;
     let declared = [("host:linux", Support::Supported)];
-    let none = grants_for(house()?, &[])?;
-    let authority = TaskAuthority::delegate(&none, [])?;
+    let (none, authority) = delegated(Vec::new())?;
     let access = authorize_access(
         &authority,
         &none,
@@ -596,7 +1097,7 @@ fn host_access_needs_no_extra_grant_but_stays_in_the_house() -> TestResult {
         &host,
         &GrantScope::House,
     )?;
-    assert!(access.credentials.is_empty());
+    assert!(access.credentials().is_empty());
 
     assert_eq!(
         authorize_access(
@@ -610,6 +1111,195 @@ fn host_access_needs_no_extra_grant_but_stays_in_the_house() -> TestResult {
             expected: house()?,
             found: other_house()?,
         }))
+    );
+    Ok(())
+}
+
+#[test]
+fn grants_authorize_only_the_targets_they_name() -> TestResult {
+    let backend = declaring(
+        house()?,
+        &[
+            ("vm:windows", Support::Supported),
+            ("vm:linux", Support::Supported),
+            ("device:phone", Support::Supported),
+            ("device:km43-controller", Support::Supported),
+        ],
+    )?;
+    let (current, authority) = delegated(vec![
+        targeted(
+            Permission::UseVerificationEnvironment,
+            &["vm:windows", "device:phone", "device:km43-controller"],
+        )?,
+        targeted(Permission::OperateEquipment, &["device:phone"])?,
+    ])?;
+    let access = |on: &str| -> TestResult<Result<VerificationAccess, VerificationError>> {
+        Ok(authorize_access(
+            &authority,
+            &current,
+            &backend,
+            &target(on)?,
+            &GrantScope::House,
+        ))
+    };
+    assert_eq!(access("vm:windows")??.target(), &target("vm:windows")?);
+    assert_eq!(access("device:phone")??.credentials().len(), 2);
+
+    // A grant for one VM does not cover another.
+    assert_eq!(
+        access("vm:linux")?,
+        Err(VerificationError::Contract(
+            ContractError::PermissionDenied {
+                permission: Permission::UseVerificationEnvironment,
+            }
+        ))
+    );
+    // Equipment granted for one device class does not cover another.
+    assert_eq!(
+        access("device:km43-controller")?,
+        Err(VerificationError::Contract(
+            ContractError::PermissionDenied {
+                permission: Permission::OperateEquipment,
+            }
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn task_targets_stay_within_the_house_targets() -> TestResult {
+    let windows = targeted(Permission::UseVerificationEnvironment, &["vm:windows"])?;
+    let current = HouseGrants::new(house()?, [windows.clone()]);
+    let wider = targeted(
+        Permission::UseVerificationEnvironment,
+        &["vm:windows", "vm:linux"],
+    )?;
+    let expansion = ContractError::AuthorityExpansion {
+        permission: Permission::UseVerificationEnvironment,
+        scope: GrantScope::House,
+    };
+    assert_eq!(
+        TaskAuthority::delegate(&current, [wider.clone()]),
+        Err(expansion.clone())
+    );
+
+    // Narrowing the house grant after delegation refuses the next use.
+    let house_wide = HouseGrants::new(house()?, [wider.clone()]);
+    let authority = TaskAuthority::delegate(&house_wide, [wider])?;
+    let backend = declaring(house()?, &[("vm:windows", Support::Supported)])?;
+    assert_eq!(
+        authorize_access(
+            &authority,
+            &current,
+            &backend,
+            &target("vm:windows")?,
+            &GrantScope::House
+        ),
+        Err(VerificationError::Contract(expansion))
+    );
+    Ok(())
+}
+
+#[test]
+fn untargeted_legacy_grants_stay_readable_and_authorize_nothing() -> TestResult {
+    // A grant stored before grants named targets.
+    let legacy = serde_json::json!({
+        "permission": "use-verification-environment",
+        "scope": { "type": "house" },
+        "destination": "fake",
+        "credential": "origin89-orca",
+    });
+    let read: Grant = serde_json::from_value(legacy.clone())?;
+    assert_eq!(read, grant(Permission::UseVerificationEnvironment)?);
+    assert!(read.targets.is_empty());
+    assert_eq!(serde_json::to_value(&read)?, legacy);
+
+    let (current, authority) = delegated(vec![read])?;
+    let backend = declaring(house()?, &[("vm:windows", Support::Supported)])?;
+    let denied = ContractError::PermissionDenied {
+        permission: Permission::UseVerificationEnvironment,
+    };
+    assert_eq!(
+        authorize_access(
+            &authority,
+            &current,
+            &backend,
+            &target("vm:windows")?,
+            &GrantScope::House
+        ),
+        Err(VerificationError::Contract(denied.clone()))
+    );
+
+    // No path authorizes a target-scoped permission without a target, even
+    // from a grant that names one.
+    let (current, authority) = delegated(vec![targeted(
+        Permission::UseVerificationEnvironment,
+        &["vm:windows"],
+    )?])?;
+    assert_eq!(
+        authority.authorize(
+            &current,
+            Permission::UseVerificationEnvironment,
+            &GrantScope::House,
+            &backend_id()?
+        ),
+        Err(denied)
+    );
+    assert_eq!(
+        current.permitted(
+            Permission::UseVerificationEnvironment,
+            &GrantScope::House,
+            &backend_id()?
+        ),
+        Err(ContractError::AuthorityExpansion {
+            permission: Permission::UseVerificationEnvironment,
+            scope: GrantScope::House,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn grant_targets_are_validated() -> TestResult {
+    let invalid_targets = Err(invalid());
+    assert_eq!(
+        grant(Permission::Merge)?.with_targets([target("vm:windows")?]),
+        invalid_targets
+    );
+    let too_many = (0..=MAX_VERIFICATION_ENVIRONMENTS)
+        .map(|index| {
+            Ok(VerificationTarget::Device(DeviceClass::new(&format!(
+                "d{index}"
+            ))?))
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    assert_eq!(
+        grant(Permission::OperateEquipment)?.with_targets(too_many),
+        invalid_targets
+    );
+
+    // The same rules hold for stored grants.
+    let stored = |targets: serde_json::Value, permission: &str| {
+        serde_json::from_value::<Grant>(serde_json::json!({
+            "permission": permission,
+            "scope": { "type": "house" },
+            "destination": "fake",
+            "credential": "origin89-orca",
+            "targets": targets,
+        }))
+    };
+    assert!(stored(serde_json::json!(["vm:windows"]), "merge").is_err());
+    assert!(stored(serde_json::json!(["vm:beos"]), "operate-equipment").is_err());
+    let read = stored(serde_json::json!(["device:phone"]), "operate-equipment")?;
+    assert_eq!(
+        read,
+        targeted(Permission::OperateEquipment, &["device:phone"])?
+    );
+    // Grants without targets keep their stored form.
+    assert!(
+        serde_json::to_value(grant(Permission::Merge)?)?
+            .get("targets")
+            .is_none()
     );
     Ok(())
 }

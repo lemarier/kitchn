@@ -30,8 +30,8 @@ use crate::{
     ConsumerId, Error, HolderId, HouseId, TaskId, WorkflowId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, Claimant, Disposition, EffectExecutor,
-        EffectSeq, Evidence, EvidenceRevision, ExternalRef, Fence, HouseGrants, LeaseTtl, TaskSpec,
-        Text, Timestamp,
+        EffectSeq, Evidence, EvidenceKind, EvidenceRevision, ExternalRef, Fence, HouseGrants,
+        LeaseTtl, RecordedEvidence, TaskSpec, Text, Timestamp, VerificationError,
     },
     state::{
         CancelStatus, ConsumerRecord, Consumption, Creation, EffectOutcome, EffectPlan,
@@ -453,7 +453,10 @@ impl HouseStore {
     /// and drops superseded evidence, invalidating decisions made earlier.
     ///
     /// # Errors
-    /// Refuses a stale fence and a full evidence log.
+    /// Refuses a stale fence and a full evidence log, and refuses
+    /// [`EvidenceKind::AuthorizedVerification`] with
+    /// [`VerificationError::NotRun`]: only
+    /// [`crate::state::run_verification`] records that kind.
     pub fn record_evidence(
         &self,
         id: &TaskId,
@@ -461,7 +464,49 @@ impl HouseStore {
         evidence: Evidence,
         now: Timestamp,
     ) -> Result<EvidenceRevision> {
+        match evidence.kind {
+            EvidenceKind::AuthorizedVerification(_) => Err(VerificationError::NotRun.into()),
+            EvidenceKind::Check | EvidenceKind::WorkerReport | EvidenceKind::Verification(_) => {
+                self.transact(|state| state.record_evidence(id, fence, evidence, now))
+            }
+        }
+    }
+
+    /// Record the result of a verification run. Only
+    /// [`crate::state::run_verification`] calls this.
+    pub(crate) fn record_verification(
+        &self,
+        id: &TaskId,
+        fence: Fence,
+        evidence: Evidence,
+        now: Timestamp,
+    ) -> Result<EvidenceRevision> {
         self.transact(|state| state.record_evidence(id, fence, evidence, now))
+    }
+
+    /// The task `fence` owns with a live lease, for starting a verification
+    /// run.
+    pub(crate) fn verification_task(
+        &self,
+        id: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<TaskRecord> {
+        self.read(|state| state.verification_task(id, fence, now).cloned())?
+    }
+
+    /// A task's current evidence, for [`VerificationReport::evaluate`].
+    ///
+    /// # Errors
+    /// Returns [`StateError::TaskNotFound`] or a storage error.
+    ///
+    /// [`VerificationReport::evaluate`]: crate::contracts::VerificationReport::evaluate
+    pub fn recorded_evidence(&self, id: &TaskId) -> Result<RecordedEvidence> {
+        self.read(|state| {
+            state
+                .task(id)
+                .map(|task| RecordedEvidence::new(task.evidence().items().to_vec()))
+        })?
     }
 
     /// Mark an inbound message as consumed, reporting duplicates.

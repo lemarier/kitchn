@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::{CommitId, ExternalRef, Timestamp, VerificationTarget};
+use crate::contracts::{CommitId, ExternalRef, Timestamp, VerificationAccess, VerificationTarget};
 
 /// A per-task counter that increases whenever the evidence subject changes,
 /// for example when a pull-request head or its base moves. Decisions record the revision
@@ -46,9 +46,14 @@ pub enum EvidenceKind {
     Check,
     /// A worker's own completion report.
     WorkerReport,
-    /// A run of the changed software in the named verification environment.
-    /// Distinct from checks: CI, unit, and simulated results never use it.
+    /// A verification run that names its environment but not the access that
+    /// ran it. It never satisfies a verification requirement; it remains so
+    /// records written before [`Self::AuthorizedVerification`] stay readable.
     Verification(VerificationTarget),
+    /// A run of the changed software under the recorded authorized access to
+    /// a verification environment. Distinct from checks: CI, unit, and
+    /// simulated results never use it.
+    AuthorizedVerification(VerificationAccess),
 }
 
 /// The exact revision evidence is about: a head commit and, for a change

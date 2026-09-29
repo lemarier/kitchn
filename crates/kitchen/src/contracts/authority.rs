@@ -12,6 +12,10 @@
 //! Task authority is checked against the house's *current* standing grants
 //! before every external effect, so revocation takes effect immediately and a
 //! persisted record cannot expand authority on its own.
+//!
+//! Grants of a [target-scoped](Permission::is_target_scoped) permission also
+//! name the verification targets they cover. Such a grant with no targets,
+//! including one stored before targets existed, covers no target.
 
 use std::{collections::BTreeSet, fmt};
 
@@ -19,7 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BackendId, CredentialId, HouseId,
-    contracts::{ContractError, Repository, ValueKind},
+    contracts::{
+        ContractError, MAX_VERIFICATION_ENVIRONMENTS, Repository, ValueKind, VerificationTarget,
+    },
 };
 
 closed_names! {
@@ -70,6 +76,36 @@ closed_names! {
     }
 }
 
+impl Permission {
+    /// Whether grants of this permission name the verification targets they
+    /// cover. Only [`TaskAuthority::authorize_target`] authorizes these
+    /// permissions, and only for a target a grant names.
+    #[must_use]
+    pub const fn is_target_scoped(self) -> bool {
+        match self {
+            Self::OperateEquipment | Self::UseVerificationEnvironment => true,
+            Self::LaunchWorker
+            | Self::MessageWorker
+            | Self::CancelWorker
+            | Self::ReleaseResource
+            | Self::AskHuman
+            | Self::PostComment
+            | Self::EditLabels
+            | Self::CreateIssue
+            | Self::CloseIssue
+            | Self::EditIssueRelationships
+            | Self::PushBranch
+            | Self::OpenPullRequest
+            | Self::RequestReview
+            | Self::Merge
+            | Self::ManageSchedule
+            | Self::ActivateSchedule
+            | Self::TrialSchedule
+            | Self::Publish => false,
+        }
+    }
+}
+
 /// Where a grant applies.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "repository", rename_all = "camelCase")]
@@ -104,7 +140,7 @@ impl fmt::Display for GrantScope {
 /// One permission within one scope, on one destination backend, with one
 /// credential. There are no wildcard destinations or credential fallbacks.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", try_from = "RawGrant")]
 pub struct Grant {
     /// The permitted action.
     pub permission: Permission,
@@ -114,6 +150,38 @@ pub struct Grant {
     pub destination: BackendId,
     /// The house-owned credential the action uses.
     pub credential: CredentialId,
+    /// The verification targets a [target-scoped](Permission::is_target_scoped)
+    /// grant covers; empty for every other permission. Empty on a
+    /// target-scoped grant covers no target, so a stored grant from before
+    /// targets existed stays readable but authorizes nothing.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub targets: BTreeSet<VerificationTarget>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawGrant {
+    permission: Permission,
+    scope: GrantScope,
+    destination: BackendId,
+    credential: CredentialId,
+    #[serde(default)]
+    targets: BTreeSet<VerificationTarget>,
+}
+
+impl TryFrom<RawGrant> for Grant {
+    type Error = ContractError;
+
+    fn try_from(raw: RawGrant) -> Result<Self, ContractError> {
+        Self {
+            permission: raw.permission,
+            scope: raw.scope,
+            destination: raw.destination,
+            credential: raw.credential,
+            targets: BTreeSet::new(),
+        }
+        .with_targets(raw.targets)
+    }
 }
 
 impl Grant {
@@ -129,6 +197,7 @@ impl Grant {
             scope: GrantScope::House,
             destination,
             credential,
+            targets: BTreeSet::new(),
         }
     }
 
@@ -145,17 +214,41 @@ impl Grant {
             scope: GrantScope::Repository(repository),
             destination,
             credential,
+            targets: BTreeSet::new(),
         }
     }
 
+    /// Limit a [target-scoped](Permission::is_target_scoped) grant to
+    /// `targets`, replacing any it named.
+    ///
+    /// # Errors
+    /// Returns [`ContractError::InvalidValue`] when targets are named for a
+    /// permission that is not target-scoped, or when there are more than
+    /// [`MAX_VERIFICATION_ENVIRONMENTS`].
+    pub fn with_targets(
+        mut self,
+        targets: impl IntoIterator<Item = VerificationTarget>,
+    ) -> Result<Self, ContractError> {
+        self.targets = targets.into_iter().collect();
+        let misplaced = !self.targets.is_empty() && !self.permission.is_target_scoped();
+        if misplaced || self.targets.len() > MAX_VERIFICATION_ENVIRONMENTS {
+            return Err(ContractError::InvalidValue {
+                kind: ValueKind::VerificationTarget,
+            });
+        }
+        Ok(self)
+    }
+
     /// Whether this grant includes `other`: the same permission, destination,
-    /// and credential, in a scope that covers the other's.
+    /// and credential, in a scope that covers the other's, naming every
+    /// target the other names.
     #[must_use]
     pub fn covers(&self, other: &Self) -> bool {
         self.permission == other.permission
             && self.destination == other.destination
             && self.credential == other.credential
             && self.scope.covers(&other.scope)
+            && other.targets.is_subset(&self.targets)
     }
 }
 
@@ -236,7 +329,8 @@ impl HouseGrants {
 
     /// The credential house policy allows for `permission` in `scope` on
     /// `destination`, regardless of standing grants. Interactive consent is
-    /// bounded by this check.
+    /// bounded by this check. A [target-scoped](Permission::is_target_scoped)
+    /// permission is never permitted without a target.
     ///
     /// # Errors
     /// Returns [`ContractError::AuthorityExpansion`] when policy does not
@@ -248,7 +342,7 @@ impl HouseGrants {
         scope: &GrantScope,
         destination: &BackendId,
     ) -> Result<CredentialId, ContractError> {
-        select_credential(&self.limits, permission, scope, destination)?.ok_or_else(|| {
+        select_credential(&self.limits, permission, scope, destination, None)?.ok_or_else(|| {
             ContractError::AuthorityExpansion {
                 permission,
                 scope: scope.clone(),
@@ -296,7 +390,9 @@ impl TaskAuthority {
     }
 
     /// Check that `permission` on `destination` is delegated for `scope` and
-    /// still granted by `current`, and return the credential to use.
+    /// still granted by `current`, and return the credential to use. A
+    /// [target-scoped](Permission::is_target_scoped) permission is refused
+    /// here; use [`Self::authorize_target`].
     ///
     /// # Errors
     /// Returns [`ContractError::CrossHouse`] when `current` belongs to another house,
@@ -311,6 +407,36 @@ impl TaskAuthority {
         scope: &GrantScope,
         destination: &BackendId,
     ) -> Result<CredentialId, ContractError> {
+        self.authorize_for(current, permission, scope, destination, None)
+    }
+
+    /// [`Self::authorize`] for one verification target: a
+    /// [target-scoped](Permission::is_target_scoped) permission is authorized
+    /// only by a grant naming `target`. Other permissions carry no targets, so
+    /// for them `target` plays no part and this equals [`Self::authorize`].
+    ///
+    /// # Errors
+    /// As for [`Self::authorize`], with [`ContractError::PermissionDenied`]
+    /// when no delegated grant names `target`.
+    pub fn authorize_target(
+        &self,
+        current: &HouseGrants,
+        permission: Permission,
+        scope: &GrantScope,
+        destination: &BackendId,
+        target: &VerificationTarget,
+    ) -> Result<CredentialId, ContractError> {
+        self.authorize_for(current, permission, scope, destination, Some(target))
+    }
+
+    fn authorize_for(
+        &self,
+        current: &HouseGrants,
+        permission: Permission,
+        scope: &GrantScope,
+        destination: &BackendId,
+        target: Option<&VerificationTarget>,
+    ) -> Result<CredentialId, ContractError> {
         if current.house != self.house {
             return Err(ContractError::CrossHouse {
                 expected: self.house.clone(),
@@ -318,24 +444,30 @@ impl TaskAuthority {
             });
         }
         ensure_covered(&current.standing, &self.grants)?;
-        select_credential(&self.grants, permission, scope, destination)?
+        select_credential(&self.grants, permission, scope, destination, target)?
             .ok_or(ContractError::PermissionDenied { permission })
     }
 }
 
 /// The credential of the most specific grant covering the action. A
-/// repository grant is more specific than a house grant.
+/// repository grant is more specific than a house grant. A target-scoped
+/// permission matches only grants naming `target`.
 fn select_credential(
     grants: &BTreeSet<Grant>,
     permission: Permission,
     scope: &GrantScope,
     destination: &BackendId,
+    target: Option<&VerificationTarget>,
 ) -> Result<Option<CredentialId>, ContractError> {
+    let in_target = |grant: &Grant| {
+        !permission.is_target_scoped() || target.is_some_and(|named| grant.targets.contains(named))
+    };
     let matching = |specific: bool| {
         grants.iter().filter(move |grant| {
             grant.permission == permission
                 && &grant.destination == destination
                 && grant.scope.covers(scope)
+                && in_target(grant)
                 && matches!(grant.scope, GrantScope::Repository(_)) == specific
         })
     };

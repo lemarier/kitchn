@@ -4,13 +4,21 @@
 //! system, a VM of another operating system, or a class of device. House or
 //! repository policy names the targets a work type must be verified on;
 //! [`VerificationPolicy::check_activation`] fails, naming every gap, when the
-//! backend lacks one. Verification evidence names its environment through
-//! [`EvidenceKind::Verification`] and counts only for the exact subject it was
-//! observed on; check and worker-report evidence never satisfies it.
+//! backend lacks one. Verification evidence records the [`VerificationAccess`]
+//! that produced it through [`EvidenceKind::AuthorizedVerification`]. Only
+//! [`crate::state::run_verification`] records that kind: it runs the target
+//! through the backend's [`VerificationExecutor`] and stores the backend's
+//! verdict in the task's evidence. The house store refuses the kind from any
+//! other producer, and [`VerificationReport::evaluate`] reads only
+//! [`RecordedEvidence`] the store returns. Evidence counts only when its
+//! access matches one the evaluating task holds and only for the exact
+//! subject it was observed on. Check, worker-report, and unbound
+//! [`EvidenceKind::Verification`] evidence never satisfies it.
 //!
 //! A declared environment grants nothing. Using a VM or device needs
 //! [`Permission::UseVerificationEnvironment`] from the task's authority, and a
-//! device also needs [`Permission::OperateEquipment`]; see [`authorize_access`].
+//! device also needs [`Permission::OperateEquipment`], each from a grant that
+//! names the target; see [`authorize_access`].
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,10 +29,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CredentialId, ErrorClass,
+    BackendId, CredentialId, ErrorClass, HouseId,
     contracts::{
-        ContractError, EffectExecutor, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
-        GrantScope, HouseGrants, Permission, Repository, Support, TaskAuthority, Text, ValueKind,
+        BackendUnavailable, ContractError, EffectExecutor, Evidence, EvidenceKind, EvidenceSubject,
+        EvidenceVerdict, ExternalRef, GrantScope, HouseGrants, Permission, Repository, Support,
+        TaskAuthority, Text, ValueKind,
     },
 };
 
@@ -462,14 +471,58 @@ fn add_requirement(
     Ok(())
 }
 
-/// Credentials selected for using one verification target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One task's authorized use of a verification target: the house, the
+/// executor namespace, the scope, the target, and the credential selected for
+/// each permission the target needs.
+///
+/// [`authorize_access`] builds one; deserializing reads a stored record.
+/// Verification evidence records it in
+/// [`EvidenceKind::AuthorizedVerification`]. A copy authorizes nothing by
+/// itself: the store accepts that evidence only from
+/// [`crate::state::run_verification`], and [`VerificationReport::evaluate`]
+/// counts it only when it equals an access the evaluating task obtained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[must_use]
 pub struct VerificationAccess {
+    house: HouseId,
+    backend: BackendId,
+    scope: GrantScope,
+    target: VerificationTarget,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    credentials: BTreeMap<Permission, CredentialId>,
+}
+
+impl VerificationAccess {
+    /// The house whose grants authorized the access.
+    #[must_use]
+    pub const fn house(&self) -> &HouseId {
+        &self.house
+    }
+
+    /// The executor namespace that runs the verification.
+    #[must_use]
+    pub const fn backend(&self) -> &BackendId {
+        &self.backend
+    }
+
+    /// The grant scope the access was authorized for.
+    #[must_use]
+    pub const fn scope(&self) -> &GrantScope {
+        &self.scope
+    }
+
     /// The authorized target.
-    pub target: VerificationTarget,
+    #[must_use]
+    pub const fn target(&self) -> &VerificationTarget {
+        &self.target
+    }
+
     /// The credential for each permission the target needs; empty for the host.
-    pub credentials: BTreeMap<Permission, CredentialId>,
+    #[must_use]
+    pub const fn credentials(&self) -> &BTreeMap<Permission, CredentialId> {
+        &self.credentials
+    }
 }
 
 /// Authorize a task to use `target` on `backend`. Call this before every use:
@@ -477,13 +530,13 @@ pub struct VerificationAccess {
 ///
 /// The backend's own [`EffectExecutor::verification_environments`] must fully
 /// support the target, and the task must hold each of the target's
-/// [`VerificationTarget::required_permissions`] on that backend. A declared
-/// environment grants nothing by itself.
+/// [`VerificationTarget::required_permissions`] on that backend from a grant
+/// naming the target. A declared environment grants nothing by itself.
 ///
 /// # Errors
 /// Returns [`VerificationError::UnsupportedTargets`] when the backend does not
 /// fully support the target, and a [`ContractError`] when the backend serves
-/// another house or the task lacks a permission.
+/// another house or the task lacks a permission for the target.
 pub fn authorize_access(
     authority: &TaskAuthority,
     current: &HouseGrants,
@@ -505,14 +558,71 @@ pub fn authorize_access(
         .iter()
         .map(|permission| {
             authority
-                .authorize(current, *permission, scope, &descriptor.backend)
+                .authorize_target(current, *permission, scope, &descriptor.backend, target)
                 .map(|credential| (*permission, credential))
         })
         .collect::<Result<_, ContractError>>()?;
     Ok(VerificationAccess {
+        house: descriptor.house.clone(),
+        backend: descriptor.backend.clone(),
+        scope: scope.clone(),
         target: target.clone(),
         credentials,
     })
+}
+
+/// What a verification environment reported for one run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationResult {
+    /// The outcome of running the changed software on the target.
+    pub verdict: EvidenceVerdict,
+    /// The backend's reference for the run, where its output can be read.
+    pub source: ExternalRef,
+}
+
+/// A backend that can run changed software in the verification environments
+/// it declares.
+///
+/// Contract: `verify` runs the software at `subject` on the access's target,
+/// through the access's backend namespace and credentials, and reports that
+/// run's own result. It never reports a pass it did not observe, and it
+/// returns [`EvidenceVerdict::Unavailable`] or an error when it cannot
+/// establish one. The backend bounds every call with its own deadline and
+/// reports an expired one as [`BackendUnavailable::Timeout`], never a pass.
+pub trait VerificationExecutor: EffectExecutor {
+    /// Run the software at `subject` under `access`.
+    ///
+    /// # Errors
+    /// Returns [`BackendUnavailable`] when the environment cannot be reached
+    /// or the run exceeds its deadline.
+    fn verify(
+        &self,
+        access: &VerificationAccess,
+        subject: &EvidenceSubject,
+    ) -> Result<VerificationResult, BackendUnavailable>;
+}
+
+/// One task's evidence as the house store holds it.
+///
+/// Only the store builds one ([`crate::state::HouseStore::recorded_evidence`]),
+/// so [`EvidenceKind::AuthorizedVerification`] items in it were recorded by
+/// [`crate::state::run_verification`] from a backend's own result, never
+/// supplied by a producer. It cannot be deserialized or assembled from
+/// caller-built evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct RecordedEvidence(Vec<Evidence>);
+
+impl RecordedEvidence {
+    pub(crate) const fn new(items: Vec<Evidence>) -> Self {
+        Self(items)
+    }
+
+    /// The recorded items.
+    #[must_use]
+    pub fn items(&self) -> &[Evidence] {
+        &self.0
+    }
 }
 
 /// The verification state of one required target at the current subject.
@@ -527,41 +637,56 @@ pub enum TargetStatus {
     Unavailable,
     /// Verification evidence exists only for another revision.
     Stale,
+    /// Verification evidence names this target, but no access the task
+    /// holds produced it.
+    Unauthenticated,
     /// No verification evidence names this target.
     Missing,
 }
 
 /// Per-target verification state for one subject.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 #[must_use]
 pub struct VerificationReport(BTreeMap<VerificationTarget, TargetStatus>);
 
 impl VerificationReport {
-    /// Evaluate `evidence` against the `required` targets for `subject`.
+    /// Evaluate a task's recorded `evidence` against the `required` targets
+    /// for `subject`.
     ///
-    /// Only [`EvidenceKind::Verification`] evidence for the exact subject
-    /// counts. A failure on the subject outweighs a pass, and a pass outweighs
-    /// an unavailable result. Check and worker-report evidence never verifies
-    /// a target.
+    /// `authorized` holds the task's current [`authorize_access`] results.
+    /// Only [`EvidenceKind::AuthorizedVerification`] evidence whose access
+    /// equals one of them counts: same house, executor namespace, scope,
+    /// target, and credentials. Other verification evidence for a target is
+    /// [`TargetStatus::Unauthenticated`]. Of the authenticated evidence, only
+    /// the exact subject counts; a failure outweighs a pass, and a pass
+    /// outweighs an unavailable result. Check and worker-report evidence never
+    /// verifies a target.
     pub fn evaluate(
         required: &BTreeSet<VerificationTarget>,
         subject: &EvidenceSubject,
-        evidence: &[Evidence],
+        evidence: &RecordedEvidence,
+        authorized: &[VerificationAccess],
     ) -> Self {
         Self(
             required
                 .iter()
                 .map(|target| {
                     let mut status = TargetStatus::Missing;
-                    for item in evidence {
-                        let EvidenceKind::Verification(observed) = &item.kind else {
-                            continue;
+                    for item in evidence.items() {
+                        let (observed, authenticated) = match &item.kind {
+                            EvidenceKind::AuthorizedVerification(access) => {
+                                (&access.target, authorized.contains(access))
+                            }
+                            EvidenceKind::Verification(observed) => (observed, false),
+                            EvidenceKind::Check | EvidenceKind::WorkerReport => continue,
                         };
                         if observed != target {
                             continue;
                         }
-                        let next = if &item.subject == subject {
+                        let next = if !authenticated {
+                            TargetStatus::Unauthenticated
+                        } else if &item.subject == subject {
                             match item.verdict {
                                 EvidenceVerdict::Fail => TargetStatus::Failed,
                                 EvidenceVerdict::Pass => TargetStatus::Verified,
@@ -606,10 +731,11 @@ impl VerificationReport {
 const fn precedence(status: TargetStatus) -> u8 {
     match status {
         TargetStatus::Missing => 0,
-        TargetStatus::Stale => 1,
-        TargetStatus::Unavailable => 2,
-        TargetStatus::Verified => 3,
-        TargetStatus::Failed => 4,
+        TargetStatus::Unauthenticated => 1,
+        TargetStatus::Stale => 2,
+        TargetStatus::Unavailable => 3,
+        TargetStatus::Verified => 4,
+        TargetStatus::Failed => 5,
     }
 }
 
@@ -645,6 +771,13 @@ pub enum VerificationError {
     /// A declaration or policy exceeds its bound.
     #[error("verification declaration or policy exceeds its bound")]
     TooMany,
+    /// Authorized verification evidence was offered by a producer instead of
+    /// a verification run.
+    #[error("authorized verification evidence is recorded only by a verification run")]
+    NotRun,
+    /// The verification environment could not run the software.
+    #[error("verification environment unavailable: {0}")]
+    Unavailable(BackendUnavailable),
 }
 
 impl VerificationError {
@@ -653,10 +786,11 @@ impl VerificationError {
     pub const fn class(&self) -> ErrorClass {
         match self {
             Self::Contract(error) => error.class(),
-            Self::UnsupportedTargets { .. } | Self::RepositoryRequired { .. } => {
+            Self::UnsupportedTargets { .. } | Self::RepositoryRequired { .. } | Self::NotRun => {
                 ErrorClass::Refused
             }
             Self::EmptyRequirement | Self::TooMany => ErrorClass::InvalidInput,
+            Self::Unavailable(_) => ErrorClass::Execution,
         }
     }
 }

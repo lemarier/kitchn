@@ -2097,6 +2097,22 @@ impl StoreState {
         Ok(effect.clone())
     }
 
+    /// The task `fence` owns with a live lease and no cancellation request,
+    /// for starting a verification run.
+    pub(crate) fn verification_task(
+        &self,
+        id: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<&TaskRecord> {
+        let task = self.task(id)?;
+        task.owned_lease(fence, now, true)?;
+        if task.cancel.is_some() {
+            return fail(StateError::CancelRequested);
+        }
+        Ok(task)
+    }
+
     pub(crate) fn record_evidence(
         &mut self,
         id: &TaskId,

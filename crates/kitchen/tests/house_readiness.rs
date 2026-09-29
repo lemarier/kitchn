@@ -660,12 +660,12 @@ fn doctor_reports_readiness_and_flags_policy_below_the_required_level() -> TestR
 fn merge_house() -> TestResult<(HouseConfig, Grant)> {
     let mut house = house()?;
     let repository = house.repositories.first().ok_or("empty fixture")?.clone();
-    let grant = Grant {
-        permission: Permission::Merge,
-        scope: GrantScope::Repository(repository),
-        destination: kitchen::BackendId::new("github")?,
-        credential: kitchen::CredentialId::new("forge")?,
-    };
+    let grant = Grant::repository(
+        Permission::Merge,
+        repository,
+        kitchen::BackendId::new("github")?,
+        kitchen::CredentialId::new("forge")?,
+    );
     house.policy_limits.insert(grant.clone());
     house.grants.insert(grant.clone());
     Ok((house, grant))

@@ -21,8 +21,7 @@ built Tauri's updater. I was a founding member of Tauri's board and now build
 with Tauri at CrabNebula.
 
 In the ten months to September 2026, my agents merged 797 pull requests and
-3,500+ commits across 28 repositories. 610 of those pull requests landed in the
-last three weeks.
+3,500+ commits across 28 repositories.
 
 I watched every one of them. The agents could write the code. What broke was
 everything around it:

@@ -62,6 +62,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #10 triage and gardener | `workflows/triage.rs`, `workflows/gardener.rs` | Hygiene tests |
 | #11 dishwasher | `workflows/cleanup.rs` | Ownership and preservation tests |
 | #12 trust and inspector | `trust/`, `workflows/inspector.rs` | Evidence and autonomy tests |
+| #106, #134 schedule budget pass and tick | `workflows/budget.rs`, `kitchen-cli/src/commands/budget.rs` | Budget tests in `crates/kitchen/tests/schedule_budgets.rs`, `crates/kitchen-cli/tests/budget.rs` |
 | #13 end-to-end validation and operations | — | End-to-end harness in `crates/kitchen/tests/e2e_*`; operational docs in `docs/` |
 | #16 house repository templates and scaffold/adopt flow | `scaffold/` | Template assets in root `templates/`; template rendering and repository scaffolding through #5's installer |
 | #42 agent selection | `selection/` | House `agents` policy, the selection recorded on a task, and its launch check; backends map it to their own flags |

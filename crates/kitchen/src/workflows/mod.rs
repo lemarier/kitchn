@@ -5,6 +5,7 @@
 //! where effect authority comes from, and both triggers share the same
 //! durable claims.
 
+pub mod budget;
 pub mod cleanup;
 pub mod coordination;
 pub mod gardener;

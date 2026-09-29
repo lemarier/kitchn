@@ -631,20 +631,18 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }
     }
 
-    /// Judge the house's usage in the window containing now, from a fresh
-    /// observation of every schedule, and refuse activating `automation`
-    /// when its budget is exhausted or unverifiable.
-    fn check_activation(&self, automation: &Automation) -> Result<(), OrcaError> {
-        let Some(policy) = self.schedule_policy() else {
-            return Ok(());
-        };
-        let house = &self.config().house;
-        let Some(consumer) = decode_name(house, &automation.name) else {
-            return Err(OrcaError::NotKitchenOwned);
-        };
+    /// Observe every Kitchen schedule of this house and its recent runs now,
+    /// for judging budgets: an activation check or a budget pass
+    /// ([`crate::workflows::budget`]). Reads only.
+    ///
+    /// Runs are judged with no readiness signals, so budgets count every
+    /// launched run as a possible agent start. Every schedule is judged the
+    /// same way, the budget schedule included.
+    ///
+    /// # Errors
+    /// Call and parse failures, and [`OrcaError::ListingTooLong`].
+    pub fn schedule_evidence(&self) -> Result<ScheduleEvidence, OrcaError> {
         let now = self.now();
-        // Counting runs does not depend on readiness: only the verdicts of
-        // launched runs do, and every one of those counts as a possible start.
         let readiness = Readiness::new(&[], now, std::time::Duration::ZERO);
         let schedules = self
             .installed_schedules()?
@@ -657,11 +655,25 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 })
             })
             .collect::<Result<Vec<_>, OrcaError>>()?;
-        let evidence = ScheduleEvidence {
-            house: house.clone(),
+        Ok(ScheduleEvidence {
+            house: self.config().house.clone(),
             observed_at: now,
             schedules,
+        })
+    }
+
+    /// Judge the house's usage in the window containing now, from a fresh
+    /// observation of every schedule, and refuse activating `automation`
+    /// when its budget is exhausted or unverifiable.
+    fn check_activation(&self, automation: &Automation) -> Result<(), OrcaError> {
+        let Some(policy) = self.schedule_policy() else {
+            return Ok(());
         };
+        let house = &self.config().house;
+        let Some(consumer) = decode_name(house, &automation.name) else {
+            return Err(OrcaError::NotKitchenOwned);
+        };
+        let evidence = self.schedule_evidence()?;
         policy.check_activation(house, &evidence, &consumer)?;
         Ok(())
     }

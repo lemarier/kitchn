@@ -16,6 +16,13 @@
 //!   [`SchedulePolicy::check_activation`] refuses while the budget stays
 //!   exhausted.
 //!
+//! The house's budget schedule is an ordinary schedule: its runs count toward
+//! its own budget and the house budget, and it holds an allocation of the
+//! house budget. When the house budget is exhausted the budget pass reports
+//! first and then pauses every exhausted schedule, its own tick included. The
+//! owner reactivates the tick after the window resets; no pass ever
+//! reactivates a schedule.
+//!
 //! Budgets count agent runs and, where the backend reports them, tokens. Run
 //! counts come from the retained run history ([`MAX_SCHEDULE_RUNS`] runs per
 //! schedule), so a window that history does not reach back through holds lower
@@ -473,10 +480,10 @@ impl SchedulePolicy {
 
     /// Refuse installing or updating `spec` when it breaks a limit.
     ///
-    /// `installed` must be the complete inventory of the house's schedules;
-    /// an entry for the same consumer is the schedule being updated and is
-    /// not counted twice. Schedules the backend reports missing hold no
-    /// allocation.
+    /// `installed` must be the complete inventory of the house's schedules,
+    /// the budget schedule included; an entry for the same consumer is the
+    /// schedule being updated and is not counted twice. Schedules the backend
+    /// reports missing hold no allocation.
     ///
     /// # Errors
     /// [`BudgetError::IntervalTooShort`] naming the schedule or house
@@ -490,24 +497,7 @@ impl SchedulePolicy {
     ) -> Result<(), BudgetError> {
         self.validate()?;
         let consumer = spec.consumer();
-        let (limit, required) = match self
-            .schedules
-            .get(consumer)
-            .and_then(|limits| limits.min_interval_minutes)
-        {
-            Some(minutes) => (ScheduleLimit::ScheduleMinInterval, minutes),
-            None => (ScheduleLimit::HouseMinInterval, self.min_interval_minutes),
-        };
-        if let Some(actual) = shortest_interval_minutes(spec.recurrence())?
-            && actual < required.get()
-        {
-            return Err(BudgetError::IntervalTooShort {
-                consumer: consumer.clone(),
-                limit,
-                actual_minutes: actual,
-                required_minutes: required.get(),
-            });
-        }
+        self.check_interval(spec)?;
         let others: BTreeSet<&ConsumerId> = installed
             .iter()
             .filter(|schedule| {
@@ -517,8 +507,8 @@ impl SchedulePolicy {
             .collect();
         let allocations: Vec<Budget> = others
             .into_iter()
-            .map(|other| self.budget_for(other))
-            .chain(std::iter::once(self.budget_for(consumer)))
+            .chain(std::iter::once(consumer))
+            .map(|scheduled| self.budget_for(scheduled))
             .collect();
         let runs = allocations.iter().fold(0_u64, |sum, budget| {
             sum.saturating_add(budget.runs.get().into())
@@ -545,6 +535,29 @@ impl SchedulePolicy {
                     allowed: allowed.get(),
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn check_interval(&self, spec: &ScheduleSpec) -> Result<(), BudgetError> {
+        let consumer = spec.consumer();
+        let (limit, required) = match self
+            .schedules
+            .get(consumer)
+            .and_then(|limits| limits.min_interval_minutes)
+        {
+            Some(minutes) => (ScheduleLimit::ScheduleMinInterval, minutes),
+            None => (ScheduleLimit::HouseMinInterval, self.min_interval_minutes),
+        };
+        if let Some(actual) = shortest_interval_minutes(spec.recurrence())?
+            && actual < required.get()
+        {
+            return Err(BudgetError::IntervalTooShort {
+                consumer: consumer.clone(),
+                limit,
+                actual_minutes: actual,
+                required_minutes: required.get(),
+            });
         }
         Ok(())
     }
@@ -668,9 +681,12 @@ impl SchedulePolicy {
     /// Every pass pauses an exhausted schedule that is still active or whose
     /// state is unknown, including one re-activated after its report was
     /// recorded; a paused one is only reported. A missing one is neither.
-    /// The owner report is sent once per window: `reported` says whether one
-    /// was already recorded under a [`BudgetExhaustion::marker_key`], and
-    /// [`BudgetExhaustion::report_due`] is `false` when it was.
+    /// The owner report is sent once per window: `reported` says whether a
+    /// marker is recorded under a key, and [`BudgetExhaustion::report_due`] is
+    /// `false` when one is recorded under the report's
+    /// [`BudgetExhaustion::marker_key`] or, for a report that had nowhere to
+    /// go, its [`BudgetExhaustion::undeliverable_key`]. Either way the window
+    /// asks nothing more of the owner's channel.
     ///
     /// A run budget above the retained run history cannot be proven exhausted
     /// from an incomplete window; see [`WindowUsage::complete`].
@@ -706,7 +722,8 @@ impl SchedulePolicy {
                 pause,
                 report_due: true,
             };
-            item.report_due = !reported(&item.marker_key()?);
+            item.report_due =
+                !(reported(&item.marker_key()?) || reported(&item.undeliverable_key()?));
             if item.pause || item.report_due {
                 plan.push(item);
             }
@@ -1083,6 +1100,29 @@ pub struct ExhaustionReport {
     pub exhausted: Exhausted,
 }
 
+/// An exhausted budget whose owner report had no destination, recorded once
+/// per schedule and window. Doctor shows it until a report channel exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UndeliveredReport {
+    /// The schedule that was paused.
+    pub consumer: ConsumerId,
+    /// The window its budget ran out in.
+    pub window: UsageWindow,
+    /// The exhausted limit and usage.
+    pub exhausted: Exhausted,
+}
+
+/// The schema of the fact recorded under
+/// [`BudgetExhaustion::undeliverable_key`].
+///
+/// # Errors
+/// [`BudgetError::InvalidPolicy`] if the schema cannot be built.
+pub fn undeliverable_schema() -> Result<MarkerSchema, BudgetError> {
+    MarkerSchema::new("schedule-budget-undeliverable", NonZeroU32::MIN)
+        .map_err(|_| BudgetError::InvalidPolicy)
+}
+
 impl BudgetExhaustion {
     /// The effect that pauses the schedule, when it must be paused.
     #[must_use]
@@ -1101,15 +1141,31 @@ impl BudgetExhaustion {
     /// # Errors
     /// [`BudgetError::InvalidPolicy`] if a key part cannot be built.
     pub fn marker_key(&self) -> Result<MarkerKey, BudgetError> {
-        let invalid = |_| BudgetError::InvalidPolicy;
+        self.key_for("")
+    }
+
+    /// The key recorded when the window's report had no destination: one per
+    /// schedule and window, separate from [`Self::marker_key`], which stays
+    /// absent because the owner was not told.
+    ///
+    /// # Errors
+    /// [`BudgetError::InvalidPolicy`] if a key part cannot be built.
+    pub fn undeliverable_key(&self) -> Result<MarkerKey, BudgetError> {
+        self.key_for("-undeliverable")
+    }
+
+    fn key_for(&self, suffix: &str) -> Result<MarkerKey, BudgetError> {
         Ok(MarkerKey {
-            workflow: WorkflowId::new(BUDGET_WORKFLOW).map_err(invalid)?,
+            workflow: WorkflowId::new(BUDGET_WORKFLOW).map_err(|_| BudgetError::InvalidPolicy)?,
             item: WorkItem::Resource {
                 resource: self.schedule.clone(),
             },
             subject: MarkerSubject::Observation(
-                ExternalRef::new(&format!("window-{}", self.window.start.as_unix_millis()))
-                    .map_err(|_| BudgetError::InvalidPolicy)?,
+                ExternalRef::new(&format!(
+                    "window-{}{suffix}",
+                    self.window.start.as_unix_millis()
+                ))
+                .map_err(|_| BudgetError::InvalidPolicy)?,
             ),
         })
     }
@@ -1132,16 +1188,34 @@ impl BudgetExhaustion {
         .map_err(invalid)
     }
 
+    /// The fact to record under [`Self::undeliverable_key`].
+    ///
+    /// # Errors
+    /// [`BudgetError::InvalidPolicy`] if the fact cannot be encoded.
+    pub fn undeliverable_fact(&self) -> Result<MarkerFact, BudgetError> {
+        let invalid = |_| BudgetError::InvalidPolicy;
+        MarkerFact::workflow(undeliverable_schema()?, &self.undelivered()).map_err(invalid)
+    }
+
+    /// This exhaustion as an [`UndeliveredReport`].
+    #[must_use]
+    pub fn undelivered(&self) -> UndeliveredReport {
+        UndeliveredReport {
+            consumer: self.consumer.clone(),
+            window: self.window,
+            exhausted: self.exhausted,
+        }
+    }
+
     /// The owner-facing report: which schedule stopped, the exhausted limit,
-    /// and what resuming takes.
+    /// and what resuming takes. The text leaves out usage, which can grow
+    /// between passes, so a report retried later is the same report.
     #[must_use]
     pub fn report(&self) -> String {
-        let action = if self.pause { "Paused" } else { "Kept paused" };
         format!(
-            "{action} schedule {}: the {} is exhausted ({} of {}) for the window ending at {} (Unix ms). It stays paused until the owner activates it, which is refused until that window ends or the budget is raised.",
+            "Paused schedule {}: the {} of {} is exhausted for the window ending at {} (Unix ms). It stays paused until the owner activates it, which is refused until that window ends or the budget is raised.",
             self.consumer,
             self.exhausted.limit,
-            self.exhausted.used,
             self.exhausted.allowed,
             self.window.end.as_unix_millis(),
         )

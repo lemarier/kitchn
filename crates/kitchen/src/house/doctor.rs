@@ -7,7 +7,7 @@ use crate::{
     HouseId,
     adoption::{HouseRegistry, ResolvedInstructions, resolve_instructions},
     contracts::{Capability, CapabilitySet, Repository},
-    scheduling::{BudgetError, ScheduleEvidence, SchedulePolicy, TokenUsage},
+    scheduling::{BudgetError, ScheduleEvidence, SchedulePolicy, TokenUsage, UndeliveredReport},
     selection::OfferedModels,
 };
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,11 @@ pub struct DoctorEvidence {
     /// Repository readiness observations; `None` reports every fact as unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness: Option<ReadinessEvidence>,
+    /// Budget exhaustions whose owner report had no destination, as
+    /// recorded by the budget tick; empty when there are none or they were
+    /// not read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undelivered_budget_reports: Vec<UndeliveredReport>,
 }
 
 /// Whether the house's stack tool is usable on this host.
@@ -104,6 +109,9 @@ pub enum DoctorCode {
     IdleSchedule,
     /// A work type is below the readiness house policy requires for a merge grant.
     Readiness,
+    /// A budget exhaustion could not be reported to its owner because the
+    /// budget schedule has no report destination.
+    BudgetReport,
 }
 impl DoctorFinding {
     /// Report a leftover legacy binding file. Kitchen never deletes it.
@@ -366,6 +374,9 @@ pub fn doctor(
         if assessed < *required {
             findings.push(DoctorFinding { code: DoctorCode::Readiness, message: format!("Work type {} requires {} readiness before a merge grant; assessed {}.", work_type.as_str(), required.as_str(), assessed.as_str()), next_step: "Close the readiness gaps below and rerun doctor, or keep merges for this work type manual. Below the level, a merge needs an owner's Roger approval with a reason for that exact pull request; readiness never grants merge authority.".into() });
         }
+    }
+    for report in evidence.map_or(&[][..], |evidence| &evidence.undelivered_budget_reports) {
+        findings.push(DoctorFinding { code: DoctorCode::BudgetReport, message: format!("Schedule {} was paused for exhausting its {} ({} of {}) in the window ending at {} (Unix ms), but its owner was not told: the budget schedule has no report destination.", report.consumer, report.exhausted.limit, report.exhausted.used, report.exhausted.allowed, report.window.end.as_unix_millis()), next_step: "Reinstall the budget schedule with kitchen budget install --report-issue owner/repo#N naming a house posting destination, or tell the schedule's owner yourself; it stays paused until the owner activates it.".into() });
     }
     let access = evidence.map_or(AccessStatus::Unobserved, |evidence| evidence.access);
     if access != AccessStatus::Available {

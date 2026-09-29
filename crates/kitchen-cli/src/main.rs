@@ -38,6 +38,8 @@ enum Command {
     Cleanup(commands::cleanup::CleanupArgs),
     /// Daily issue hygiene: the scheduled precheck. Reads only.
     Gardener(commands::gardener::GardenerArgs),
+    /// Schedule budget tick: pause exhausted schedules and report them.
+    Budget(Box<commands::budget::BudgetArgs>),
     /// Offline issue pickup diagnostics.
     Pickup(commands::pickup::PickupArgs),
 }
@@ -71,6 +73,11 @@ fn main() -> ExitCode {
         Some(Command::Cleanup(args)) => commands::cleanup::run(args),
         // The precheck reports through its exit status, not the codes below.
         Some(Command::Gardener(args)) => return commands::gardener::run(args),
+        Some(Command::Budget(args)) => match commands::budget::run(*args) {
+            // The precheck reports through its exit status, not the codes below.
+            commands::budget::Outcome::Exit(code) => return code,
+            commands::budget::Outcome::Output(result) => result,
+        },
         Some(Command::Pickup(args)) => commands::pickup::run(args).map(|output| (output, true)),
         None => return output_status(Cli::command().print_help()),
     };

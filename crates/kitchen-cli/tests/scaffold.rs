@@ -688,3 +688,36 @@ fn adopt_in_a_checkout_reads_its_remote_and_adds_only_template_files() -> Result
     assert_eq!(names, [".git", "AGENTS.md", "README.md"]);
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_registry_omits_inexact_doctor_command() -> Result {
+    use std::os::unix::ffi::OsStringExt;
+
+    let f = Fixture::new()?;
+    let target = f.root.join("consumer");
+    let registry = f
+        .root
+        .join(std::ffi::OsString::from_vec(b"registry-\xff".to_vec()));
+    fs::rename(f.root.join("registry"), &registry)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        .arg("init")
+        .arg(&target)
+        .arg("--registry")
+        .arg(&registry)
+        .args(["--template", "test"])
+        .args([
+            "--house",
+            "crabnebula",
+            "--repository",
+            "crabnebula/tauri-fixture",
+            "--yes",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(target.join("AGENTS.md").exists());
+    let text = stdout(&output);
+    assert!(text.contains("an executable hint cannot represent a non-UTF-8 path"));
+    assert!(!text.contains("kitchen house doctor --registry"));
+    Ok(())
+}

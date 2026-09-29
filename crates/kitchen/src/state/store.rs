@@ -29,7 +29,7 @@ use std::path::Path;
 use crate::{
     ConsumerId, Error, HolderId, HouseId, TaskId, WorkflowId,
     contracts::{
-        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Claimant, Disposition,
+        AttemptNumber, AttemptOutcome, AttemptStart, Claimant, Disposition, EffectExecutor,
         EffectSeq, Evidence, EvidenceRevision, ExternalRef, Fence, HouseGrants, LeaseTtl, TaskSpec,
         Timestamp,
     },
@@ -260,14 +260,16 @@ impl HouseStore {
         self.transact(|state| state.settle_cancelled(id, fence, now))
     }
 
-    /// Persist the intent for one effect on `backend` before it is executed.
+    /// Persist the intent for one effect on `executor` before it is executed.
     ///
+    /// Every check uses the executor's own descriptor, so a caller cannot
+    /// pass a more permissive one than the executor that runs the effect.
     /// Checks, in one transaction: the grants' and backend's house, the
-    /// backend's capabilities, live ownership, no pending cancellation (after
-    /// one, only [`crate::contracts::Operation::CancelWorker`] for a worker an
-    /// applied effect of this task reported may start, even while other
-    /// effects are unresolved), a
-    /// running attempt, the decision's evidence revision, task authority
+    /// backend's capabilities and declared agent selections, live
+    /// ownership, no pending cancellation (after one, only
+    /// [`crate::contracts::Operation::CancelWorker`] for a worker an applied
+    /// effect of this task reported may start, even while other effects are
+    /// unresolved), a running attempt, the decision's evidence revision, task authority
     /// against the house's current grants, and that no other effect is
     /// unresolved. The intent records the backend namespace; a repeated
     /// request for the same logical effect must come from that backend.
@@ -281,9 +283,10 @@ impl HouseStore {
         &self,
         plan: EffectPlan,
         grants: &HouseGrants,
-        backend: &BackendDescriptor,
+        executor: &dyn EffectExecutor,
         now: Timestamp,
     ) -> Result<EffectStart> {
+        let backend = executor.descriptor();
         self.transact(|state| state.begin_effect(plan, grants, backend, now))
     }
 

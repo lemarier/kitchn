@@ -40,8 +40,7 @@ pub fn run_effect(
 ) -> Result<EffectRecord> {
     let task = plan.task.clone();
     let fence = plan.fence;
-    let descriptor = executor.descriptor();
-    let record = match store.begin_effect(plan.clone(), grants, descriptor, clock.now())? {
+    let record = match store.begin_effect(plan.clone(), grants, executor, clock.now())? {
         EffectStart::Resolved(record) => return Ok(record),
         EffectStart::Execute(record) => record,
         EffectStart::ReconcileFirst(pending) => {
@@ -55,7 +54,7 @@ pub fn run_effect(
                 outcome,
                 clock.now(),
             )?;
-            match store.begin_effect(plan, grants, descriptor, clock.now())? {
+            match store.begin_effect(plan, grants, executor, clock.now())? {
                 EffectStart::Execute(record) => record,
                 // Another handle changed the effect meanwhile; report it as is.
                 EffectStart::Resolved(record) | EffectStart::ReconcileFirst(record) => {

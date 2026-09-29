@@ -30,9 +30,9 @@ use std::{
 use crate::{
     BackendId, EffectName, HouseId, IdentifierError, TaskId, WorkflowId,
     contracts::{
-        BackendDescriptor, BackendUnavailable, BranchName, Claimant, CommitId, ContractError,
-        Effect, EvidenceSubject, ExternalRef, Fence, GitHubAction, GitHubEffect, GrantScope,
-        HouseGrants, IdempotencyKey, IssueNumber, Operation, Permission, PostingBudget, Repository,
+        BackendUnavailable, BranchName, Claimant, CommitId, ContractError, Effect, EffectExecutor,
+        EvidenceSubject, ExternalRef, Fence, GitHubAction, GitHubEffect, GrantScope, HouseGrants,
+        IdempotencyKey, IssueNumber, Operation, Permission, PostingBudget, Repository,
         ResourceKind, ResourceRef, Role, Timestamp, ValueKind, WorkerBackend, WorkerState,
         Workspace,
     },
@@ -125,8 +125,9 @@ pub struct HouseGateStore<'a> {
     /// The readiness-checked merge grant; a merge intent it does not cover
     /// is refused before anything is persisted.
     pub merge: &'a MergeGrant,
-    /// The forge backend that will perform the effects.
-    pub backend: &'a BackendDescriptor,
+    /// The forge executor that will perform the effects; intents are checked
+    /// against its own descriptor.
+    pub backend: &'a dyn EffectExecutor,
     /// Authenticated forge requester persisted with each intent.
     pub requester: ExternalRef,
     /// The house's per-task forge posting ceiling.
@@ -143,7 +144,7 @@ impl fmt::Debug for HouseGateStore<'_> {
             .field("task", &self.task)
             .field("fence", &self.fence)
             .field("claimant", &self.claimant)
-            .field("backend", &self.backend.backend)
+            .field("backend", &self.backend.descriptor().backend)
             .field(
                 "workers",
                 &self.workers.map(|workers| &workers.descriptor().backend),
@@ -539,7 +540,7 @@ impl GateMarkerStore for HouseGateStore<'_> {
                 self.grants,
                 Permission::PushBranch,
                 &GrantScope::Repository(record.repository.clone()),
-                &self.backend.backend,
+                &self.backend.descriptor().backend,
             )?;
         }
         let effect = self.effect(
@@ -562,7 +563,7 @@ impl GateMarkerStore for HouseGateStore<'_> {
         // Worker effects are authorized for and targeted at the worker
         // backend; forge effects at the forge.
         let backend = match (&effect, self.workers) {
-            (Effect::Worker(_), Some(workers)) => workers.descriptor(),
+            (Effect::Worker(_), Some(workers)) => workers as &dyn EffectExecutor,
             (Effect::Worker(_), None) => return Err(GateStoreError::NoWorkerBackend),
             (Effect::GitHub(_) | Effect::Roger(_) | Effect::Schedule(_), _) => self.backend,
         };

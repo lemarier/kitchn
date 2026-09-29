@@ -31,7 +31,7 @@ use kitchen::{
         OfferedModels, ResolvedSelection, RuleMatch, SelectionError, SelectionGap,
         SelectionRequest, SelectionRule, SelectionSource, SelectionSupport, TaskGroup, WorkType,
     },
-    state::{EffectPlan, EffectState, StateError, run_effect},
+    state::{EffectPlan, EffectStart, EffectState, StateError, run_effect},
 };
 use orca_sim::SimOrca;
 use serde_json::json;
@@ -925,6 +925,61 @@ fn the_store_refuses_a_selection_the_executor_does_not_declare() -> TestResult {
 }
 
 #[test]
+fn begin_effect_checks_the_selection_against_the_executor_it_is_given() -> TestResult {
+    let fixture = Fixture::new()?;
+    let pinned = ResolvedSelection::owner(selection(AgentFamily::Codex, Some("gpt-6-sol"), None)?);
+    let (task, fence) = started(&fixture, "task-bound", Some(pinned.clone()))?;
+    let effects = |fixture: &Fixture| -> TestResult<usize> {
+        Ok(fixture
+            .store
+            .tasks()?
+            .iter()
+            .map(|task| task.effects().len())
+            .sum())
+    };
+
+    // The executor that will run the launch declares only Claude; its own
+    // descriptor decides, so no intent is persisted for the Codex launch.
+    let claude_only = fake(Some(CLAUDE_ONLY))?;
+    let refused = fixture.store.begin_effect(
+        plan(
+            &task,
+            fence,
+            "launch",
+            launch(Some(pinned.selection.clone()))?,
+        )?,
+        &grants()?,
+        &claude_only,
+        at(1),
+    );
+    assert_eq!(
+        missing(refused),
+        Some(vec![
+            Capability::AgentSelectFamily,
+            Capability::AgentSelectModel
+        ])
+    );
+    assert_eq!(effects(&fixture)?, 0);
+    assert_eq!(claude_only.execute_calls(), 0);
+
+    // An executor that declares the selection gets an intent recorded under
+    // its own namespace.
+    let capable = FakeBackend::fully_capable(orca_id()?, house()?);
+    let EffectStart::Execute(intent) = fixture.store.begin_effect(
+        plan(&task, fence, "launch", launch(Some(pinned.selection))?)?,
+        &grants()?,
+        &capable,
+        at(2),
+    )?
+    else {
+        return Err("expected a new launch intent".into());
+    };
+    assert_eq!(intent.request().backend(), &capable.descriptor().backend);
+    assert_eq!(effects(&fixture)?, 1);
+    Ok(())
+}
+
+#[test]
 fn the_store_names_each_gap_of_a_partly_supported_selection() -> TestResult {
     let fixture = Fixture::new()?;
     let clock = ManualClock::starting_at(1);
@@ -1165,6 +1220,70 @@ fn a_repository_rule_without_a_role_does_not_replace_the_reviewer_default() -> T
     assert_eq!(
         review.selection,
         selection(AgentFamily::Codex, Some("gpt-6-sol"), None)?
+    );
+    Ok(())
+}
+
+#[test]
+fn a_repository_work_type_rule_applies_unless_the_house_names_role_and_work_type() -> TestResult {
+    let policy: AgentPolicy = serde_json::from_value(json!({
+        "default": {"agent": "codex", "model": "gpt-6-sol", "effort": "high"},
+        "rules": [
+            {"when": {"role": "inspector"}, "use": {"agent": "claude", "model": "sonnet"}},
+            {"when": {"role": "expediter", "workType": "docs"}, "use": {"agent": "claude", "model": "opus"}},
+            {"when": {"repository": "origin89hq/firmware", "workType": "docs"}, "use": {"agent": "codex", "model": "gpt-6-mini"}},
+            {"when": {"repository": "origin89hq/firmware"}, "use": {"agent": "codex", "model": "gpt-6-sol", "effort": "xhigh"}}
+        ]
+    }))?;
+    policy.validate(&BTreeSet::from([firmware()?]))?;
+    let request = |role, work_type: Option<&str>| -> TestResult<SelectionRequest> {
+        Ok(SelectionRequest {
+            role,
+            work_type: work_type.map(WorkType::new).transpose()?,
+            repository: Some(firmware()?),
+            task_group: None,
+        })
+    };
+    let lighter = selection(AgentFamily::Codex, Some("gpt-6-mini"), None)?;
+
+    // The house rule names only the role, so the repository's docs rule
+    // still applies to the reviewer's docs work.
+    let docs_review = policy.resolve(&request(Role::Inspector, Some("docs"))?);
+    assert_eq!(
+        docs_review.source,
+        SelectionSource::Repository {
+            repository: firmware()?
+        }
+    );
+    assert_eq!(docs_review.selection, lighter);
+    // A role the house does not name takes it too.
+    let docs_cook = policy.resolve(&request(Role::StationCook, Some("docs"))?);
+    assert_eq!(docs_cook.selection, lighter);
+
+    // Without the work type, the repository-wide rule still yields.
+    let review = policy.resolve(&request(Role::Inspector, None)?);
+    assert_eq!(review.source, SelectionSource::HouseRule);
+    assert_eq!(
+        review.selection,
+        selection(AgentFamily::Claude, Some("sonnet"), None)?
+    );
+    // Another work type falls through to the repository-wide rule, which
+    // still yields to the house's reviewer choice.
+    let fix_review = policy.resolve(&request(Role::Inspector, Some("fix"))?);
+    assert_eq!(fix_review.source, SelectionSource::HouseRule);
+
+    // A house rule naming the role and the same work type keeps precedence.
+    let docs_gate = policy.resolve(&request(Role::Expediter, Some("docs"))?);
+    assert_eq!(docs_gate.source, SelectionSource::HouseRule);
+    assert_eq!(
+        docs_gate.selection,
+        selection(AgentFamily::Claude, Some("opus"), None)?
+    );
+    // Its other work goes to the repository, as no house rule names it.
+    let gate = policy.resolve(&request(Role::Expediter, None)?);
+    assert_eq!(
+        gate.selection,
+        selection(AgentFamily::Codex, Some("gpt-6-sol"), Some("xhigh"))?
     );
     Ok(())
 }

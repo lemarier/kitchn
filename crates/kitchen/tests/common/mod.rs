@@ -13,7 +13,7 @@ use kitchen::{
     contracts::{
         BackendDescriptor, Capability, CapabilitySet, Claimant, Clock, CommitId, Effect,
         EvidenceRevision, Fence, Grant, HouseGrants, LeaseTtl, Operation, Permission, Provenance,
-        RetryPolicy, Role, TaskAuthority, TaskSpec, Text, Timestamp, Workspace,
+        RetryPolicy, Role, TaskAuthority, TaskSpec, Text, Timestamp, Workspace, fake::FakeBackend,
     },
     state::{EffectPlan, HouseStore, StoreOptions},
 };
@@ -207,20 +207,20 @@ impl Clock for ManualClock {
     }
 }
 
-pub fn descriptor_with(
+/// A fake executor declaring exactly `capabilities`.
+pub fn executor_with(
     capabilities: impl IntoIterator<Item = Capability>,
-) -> TestResult<BackendDescriptor> {
-    Ok(BackendDescriptor {
-        backend: backend_id()?,
-        house: house()?,
-        worker_selection: None,
-        capabilities: CapabilitySet::supporting(capabilities),
-    })
+) -> TestResult<FakeBackend> {
+    Ok(FakeBackend::new(
+        backend_id()?,
+        house()?,
+        CapabilitySet::supporting(capabilities),
+    ))
 }
 
 /// A worker backend with lookup but without provider-side idempotency.
-pub fn refusing() -> TestResult<BackendDescriptor> {
-    descriptor_with([
+pub fn refusing() -> TestResult<FakeBackend> {
+    executor_with([
         Capability::WorkerLaunchIsolated,
         Capability::WorkerMessaging,
         Capability::WorkerCancel,
@@ -231,8 +231,8 @@ pub fn refusing() -> TestResult<BackendDescriptor> {
 }
 
 /// A backend declaring every capability, including idempotent requests.
-pub fn idempotent() -> TestResult<BackendDescriptor> {
-    descriptor_with(Capability::ALL)
+pub fn idempotent() -> TestResult<FakeBackend> {
+    executor_with(Capability::ALL)
 }
 
 /// Roger's reference for the one Ask a [`AckRoger`] acknowledges.

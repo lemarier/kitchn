@@ -100,6 +100,9 @@ pub enum CheckResult {
         /// The undeclared capability.
         requires: Capability,
     },
+    /// Not exercised: the executor declares everything the check would
+    /// refuse, so there is nothing undeclared to try.
+    NothingUndeclared,
 }
 
 /// A contract violation.
@@ -370,12 +373,7 @@ impl<'a> Runner<'a> {
         };
         let Some(agent) = example else {
             // The descriptor claims every selection; nothing to refuse.
-            self.record(
-                Check::SelectionRefused,
-                CheckResult::NotApplicable {
-                    requires: Capability::AgentSelectFamily,
-                },
-            );
+            self.record(Check::SelectionRefused, CheckResult::NothingUndeclared);
             return Ok(());
         };
         let effect = Effect::Worker(Operation::LaunchWorker {

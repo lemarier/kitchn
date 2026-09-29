@@ -218,6 +218,8 @@ struct WorktreeRow {
 #[serde(rename_all = "camelCase")]
 struct WorktreeList {
     worktrees: Vec<WorktreeRow>,
+    /// Every worktree of the repository, returned or not.
+    total_count: usize,
     truncated: bool,
     host_scope: HostScope,
 }
@@ -1148,8 +1150,8 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     ///
     /// # Errors
     /// [`OrcaError::BranchTaken`] when a worktree has the branch, or the
-    /// listing is truncated, holds [`MAX_REPO_WORKTREES`] or more rows, or
-    /// leaves out a host. Other errors when Orca cannot be read.
+    /// listing is truncated, counts more worktrees than it returns, holds
+    /// [`MAX_REPO_WORKTREES`] or more rows, or leaves out a host. Other errors when Orca cannot be read.
     pub fn check_branch_free(&self, branch: &BranchName) -> Result<(), OrcaError> {
         let args = wire::Args::command(&["worktree", "list"])
             .value("repo", self.config.repo.as_str())
@@ -1161,6 +1163,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             requested: branch.as_str().to_owned(),
         };
         if list.truncated
+            || list.total_count > list.worktrees.len()
             || list.worktrees.len() >= MAX_REPO_WORKTREES
             || !list.host_scope.omitted_host_ids.is_empty()
         {

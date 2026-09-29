@@ -2256,8 +2256,11 @@ fn a_branch_an_orca_worktree_holds_is_refused_before_anything_is_created() -> Te
 #[test]
 fn a_listing_that_cannot_show_the_branch_free_refuses_the_launch() -> TestResult {
     type Setup = fn(&SimOrca);
-    let setups: [(&str, Setup); 5] = [
+    let setups: [(&str, Setup); 6] = [
         ("truncated", |sim| sim.state().listing_truncated = true),
+        ("counts more than it returns", |sim| {
+            sim.state().unlisted_worktrees = 1;
+        }),
         ("a host left out", |sim| {
             sim.state().omitted_hosts.push("remote-1")
         }),

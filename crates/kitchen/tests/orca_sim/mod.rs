@@ -285,6 +285,8 @@ pub struct SimState {
     pub git_branches: Vec<String>,
     /// Whether `worktree list` reports its listing truncated.
     pub listing_truncated: bool,
+    /// Worktrees `worktree list` counts in `totalCount` but does not return.
+    pub unlisted_worktrees: usize,
     /// Hosts `worktree list` reports it did not cover.
     pub omitted_hosts: Vec<&'static str>,
     /// When set, the worker settles in this state just before Orca handles
@@ -334,6 +336,7 @@ impl Default for SimOrca {
                 worktrees: Vec::new(),
                 git_branches: Vec::new(),
                 listing_truncated: false,
+                unlisted_worktrees: 0,
                 omitted_hosts: Vec::new(),
                 settle_before_stop: None,
                 gate: None,
@@ -755,7 +758,7 @@ impl SimState {
                 ok(json!({
                     "worktrees": rows,
                     "hostScope": {"hostIds": ["local"], "omittedHostIds": self.omitted_hosts},
-                    "totalCount": rows.len(),
+                    "totalCount": rows.len() + self.unlisted_worktrees,
                     "truncated": self.listing_truncated,
                 }))
             }

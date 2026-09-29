@@ -128,6 +128,14 @@ pub(crate) enum Inspection {
     Applied(Receipt),
     Missing,
     Conflict,
+    /// An unmerged pull request at the expected head now targets another
+    /// base. No new merge may start, but an earlier request carrying the
+    /// expected head can still merge it, so this is not absence evidence.
+    Retargeted,
+    /// The pull request was merged, but its head has moved from the expected
+    /// one since: the approved merge may have completed before the branch
+    /// advanced, so this is neither a new merge's target nor absence evidence.
+    MergedAtOtherHead,
 }
 
 /// Per-operation read budget; an exhausted page budget is never absence evidence.
@@ -303,27 +311,48 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                     .pointer("/head/sha")
                     .and_then(Value::as_str)
                     .ok_or(IntegrationError::Unknown)?;
-                if head != expected_head.as_str()
-                    || pr.pointer("/base/ref").and_then(Value::as_str)
-                        != Some(expected_base.as_str())
-                {
-                    return Ok(Inspection::Conflict);
+                // Read the merged state first: a merge of the expected head
+                // happened even if the base was retargeted before or after it.
+                let merged = pr
+                    .get("merged")
+                    .and_then(Value::as_bool)
+                    .ok_or(IntegrationError::Unknown)?;
+                if head != expected_head.as_str() {
+                    return Ok(if merged {
+                        Inspection::MergedAtOtherHead
+                    } else {
+                        Inspection::Conflict
+                    });
                 }
-                match pr.get("merged").and_then(Value::as_bool) {
-                    Some(true) => {
-                        let sha = pr
-                            .get("merge_commit_sha")
-                            .and_then(Value::as_str)
-                            .ok_or(IntegrationError::Unknown)?;
-                        let merge = crate::contracts::CommitId::new(sha)
-                            .map_err(|_| IntegrationError::Unknown)?;
-                        let receipt =
-                            Receipt::new(ExternalRef::new(merge.as_str())?, vec![], vec![])?;
-                        Ok(Inspection::Applied(receipt))
+                if merged {
+                    let sha = pr
+                        .get("merge_commit_sha")
+                        .and_then(Value::as_str)
+                        .ok_or(IntegrationError::Unknown)?;
+                    let merge = crate::contracts::CommitId::new(sha)
+                        .map_err(|_| IntegrationError::Unknown)?;
+                    let mut receipt =
+                        Receipt::new(ExternalRef::new(merge.as_str())?, vec![], vec![])?;
+                    // The merge of the approved head stays applied, but a
+                    // different actual base is carried so it is never taken
+                    // for the approved merge into the intended base.
+                    let actual = pr
+                        .pointer("/base/ref")
+                        .and_then(Value::as_str)
+                        .ok_or(IntegrationError::Unknown)?;
+                    if actual != expected_base.as_str() {
+                        receipt = receipt.with_retarget(crate::contracts::Retarget {
+                            expected: expected_base.clone(),
+                            actual: crate::contracts::BranchName::new(actual)
+                                .map_err(|_| IntegrationError::Unknown)?,
+                        });
                     }
-                    Some(false) => Ok(Inspection::Missing),
-                    None => Err(IntegrationError::Unknown),
+                    return Ok(Inspection::Applied(receipt));
                 }
+                if pr.pointer("/base/ref").and_then(Value::as_str) != Some(expected_base.as_str()) {
+                    return Ok(Inspection::Retargeted);
+                }
+                Ok(Inspection::Missing)
             }
             GitHubAction::PostComment { issue, body } => {
                 let expected = marked(body.as_str(), key);

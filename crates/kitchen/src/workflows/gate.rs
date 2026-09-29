@@ -6,7 +6,8 @@ use crate::{
     BackendId, CredentialId, HouseId,
     contracts::{
         BackendDescriptor, BranchName, Capability, CommitId, ExternalRef, Grant, GrantScope,
-        HouseGrants, IdempotencyKey, IssueNumber, Permission, Repository, Text, Timestamp,
+        HouseGrants, IdempotencyKey, IssueNumber, Permission, Repository, Retarget, Text,
+        Timestamp,
     },
     house::{HouseError, IssuedAuthority, MergeSubject},
     integrations::github::MergeStatusValue,
@@ -575,6 +576,9 @@ pub enum Gap {
     FixBudget,
     /// The destination refused this subject's effect repeatedly.
     EffectRefused,
+    /// The approved merge landed in a base other than the approved one, so a
+    /// person must resolve it.
+    MergedElsewhere,
 }
 /// One bounded decision at a pinned head and base.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -622,6 +626,9 @@ pub struct GateDecision {
     /// Reviewer invocations a fix request carries: the resolved triggers for
     /// this exact subject when a required review is stale, otherwise none.
     pub review_triggers: Vec<ReviewTrigger>,
+    /// The approved and actual base, when the approved merge landed in another
+    /// base and this decision hands it to the owner.
+    pub merged_elsewhere: Option<Retarget>,
 }
 
 /// Evaluate a fully supplied observation. Missing evidence always fails closed.
@@ -814,6 +821,7 @@ pub fn evaluate(e: &GateEvidence, grants: GateGrants, history: GateHistory) -> G
         verified_findings: e.verified_findings.clone(),
         disproved_findings: e.disproved_findings.clone(),
         review_triggers,
+        merged_elsewhere: None,
     }
 }
 
@@ -1115,6 +1123,8 @@ pub struct HandOverRequest {
     pub gaps: Vec<Gap>,
     /// Findings a person must inspect.
     pub findings: Vec<VerifiedFinding>,
+    /// The approved and actual base when the approved merge landed elsewhere.
+    pub merged_elsewhere: Option<Retarget>,
     /// Persisted intent key of the handover comment.
     pub key: IdempotencyKey,
 }
@@ -1137,6 +1147,7 @@ pub fn handover_request(recorded: &RecordedDecision) -> Result<HandOverRequest, 
         base: decision.base.clone(),
         gaps: gaps.clone(),
         findings: decision.verified_findings.clone(),
+        merged_elsewhere: decision.merged_elsewhere.clone(),
         key: key.clone(),
     })
 }
@@ -1169,6 +1180,7 @@ impl HandOverRequest {
             &self.base,
             &self.gaps,
             &self.findings,
+            self.merged_elsewhere.as_ref(),
         )?;
         Ok(vec![label, comment])
     }
@@ -1183,12 +1195,25 @@ fn handover_comment(
     base: &CommitId,
     gaps: &[Gap],
     findings: &[VerifiedFinding],
+    merged_elsewhere: Option<&Retarget>,
 ) -> Result<crate::contracts::GitHubMutation, crate::contracts::ContractError> {
     use std::fmt::Write as _;
     let mut body =
         format!("Gate handover for head {head} against base {base}.\nFailed conditions: {gaps:?}.");
-    if !findings.is_empty() {
+    if !findings.is_empty() || merged_elsewhere.is_some() {
         body.push_str(UNTRUSTED_NOTICE);
+    }
+    if let Some(retarget) = merged_elsewhere {
+        body.push_str(
+            "\nThe approved merge landed in a different base than the approved one. \
+             It is applied and is not repeated; the owner decides what to do with it.",
+        );
+        quote_untrusted(
+            &mut body,
+            "merge bases (approved, then actual)",
+            retarget.expected.as_str(),
+            retarget.actual.as_str(),
+        );
     }
     for (index, finding) in findings.iter().take(LISTED_FINDINGS).enumerate() {
         quote_untrusted(
@@ -1396,7 +1421,7 @@ impl GateVerdictRecord {
     }
 }
 /// What the effect store knows about a verdict's effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateEffectState {
     /// Intent persisted; no outcome was recorded (in flight or interrupted).
     Intended,
@@ -1406,6 +1431,9 @@ pub enum GateEffectState {
     HandedOver,
     /// Applied, with a receipt.
     Applied,
+    /// Applied, but the merge landed in a base other than the approved one.
+    /// It is not the approved merge, so the owner must resolve it.
+    AppliedElsewhere(Retarget),
     /// Definitely not applied, for example a refused submission.
     NotApplied,
 }
@@ -1644,6 +1672,9 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
         && let Some(key) = &record.effect
     {
         match store.effect_state(key)? {
+            GateEffectState::AppliedElsewhere(retarget) => {
+                return hand_over_applied_elsewhere(store, evidence, grants, record, retarget, now);
+            }
             GateEffectState::Intended
             | GateEffectState::Uncertain
             | GateEffectState::HandedOver => {
@@ -1653,6 +1684,18 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
                     decision,
                     mode: record.mode,
                     admission: Admission::Reconcile(key.clone()),
+                });
+            }
+            // A refused hand-over of a merge that landed elsewhere stops at
+            // this subject. Re-evaluating could admit a second merge.
+            GateEffectState::NotApplied if matches!(&record.verdict, Verdict::HandOver { gaps } if gaps.contains(&Gap::MergedElsewhere)) =>
+            {
+                let mut decision = evaluate(evidence, grants, GateHistory::default());
+                decision.verdict = Verdict::Skip;
+                return Ok(RecordedDecision {
+                    decision,
+                    mode: record.mode,
+                    admission: Admission::None,
                 });
             }
             GateEffectState::NotApplied => refused = record.refused.saturating_add(1),
@@ -1750,7 +1793,8 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
                     GateEffectState::NotApplied => Admission::None,
                     GateEffectState::Intended
                     | GateEffectState::Uncertain
-                    | GateEffectState::HandedOver => Admission::Reconcile(key),
+                    | GateEffectState::HandedOver
+                    | GateEffectState::AppliedElsewhere(_) => Admission::Reconcile(key),
                 }
             }
         },
@@ -1762,6 +1806,62 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
     Ok(RecordedDecision {
         decision,
         mode,
+        admission,
+    })
+}
+
+/// Route a merge that landed in another base to the owner. The merge effect
+/// keeps its key, so no second merge starts. A hand-over comment gets its own
+/// effect key and replaces the subject's marker, so reconciliation and later
+/// passes follow that hand-over and post it once per head.
+fn hand_over_applied_elsewhere<S: GateMarkerStore>(
+    store: &mut S,
+    evidence: &GateEvidence,
+    grants: GateGrants,
+    current: &GateVerdictRecord,
+    retarget: Retarget,
+    now: Timestamp,
+) -> Result<RecordedDecision, S::Error> {
+    let mut decision = evaluate(evidence, grants, GateHistory::default());
+    decision.verdict = Verdict::HandOver {
+        gaps: vec![Gap::MergedElsewhere],
+    };
+    decision.merged_elsewhere = Some(retarget);
+    let mut record = GateVerdictRecord {
+        verdict: decision.verdict.clone(),
+        recorded_at: now,
+        effect: None,
+        ..current.clone()
+    };
+    let (key, admission) = match store.begin_effect(&record, &decision)? {
+        GateIntent::Submit(key) => {
+            let admission = Admission::Submit(key.clone());
+            (key, admission)
+        }
+        GateIntent::Existing(key, state) => {
+            let admission = match state {
+                GateEffectState::Applied => Admission::Satisfied,
+                GateEffectState::NotApplied => Admission::None,
+                GateEffectState::Intended
+                | GateEffectState::Uncertain
+                | GateEffectState::HandedOver
+                | GateEffectState::AppliedElsewhere(_) => Admission::Reconcile(key.clone()),
+            };
+            (key, admission)
+        }
+    };
+    record.effect = Some(key);
+    if !store.record(Some(current), record)? {
+        decision.verdict = Verdict::Skip;
+        return Ok(RecordedDecision {
+            decision,
+            mode: current.mode,
+            admission: Admission::None,
+        });
+    }
+    Ok(RecordedDecision {
+        decision,
+        mode: current.mode,
         admission,
     })
 }

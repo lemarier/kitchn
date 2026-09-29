@@ -9,8 +9,8 @@ use kitchen::{
         BranchName, Capability, CapabilitySet, Effect, EffectExecutor, Evidence, EvidenceKind,
         EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, GitHubAction, GitHubEffect, Grant,
         HouseGrants, IdempotencyKey, IssueNumber, NotAppliedReason, Operation, Permission,
-        PostingBudget, Receipt, Repository, ResourceKind, ResourceRef, Role, TaskAuthority, Text,
-        Timestamp, WorkerOutcome, WorkerState, Workspace, fake::FakeBackend,
+        PostingBudget, Receipt, Repository, ResourceKind, ResourceRef, Retarget, Role,
+        TaskAuthority, Text, Timestamp, WorkerOutcome, WorkerState, Workspace, fake::FakeBackend,
     },
     state::{
         EffectOutcome, EffectRecord, EffectStart, EffectState, HouseStore, MarkerFact, MarkerKey,
@@ -439,7 +439,7 @@ impl FakeMarkers {
     fn settle(&mut self, key: &kitchen::contracts::IdempotencyKey, state: GateEffectState) {
         for effect in &mut self.effects {
             if &effect.1 == key {
-                effect.2 = state;
+                effect.2 = state.clone();
             }
         }
     }
@@ -523,7 +523,7 @@ impl GateMarkerStore for FakeMarkers {
             record.refused
         );
         if let Some((_, key, state)) = self.effects.iter().find(|e| e.0 == identity) {
-            return Ok(GateIntent::Existing(key.clone(), *state));
+            return Ok(GateIntent::Existing(key.clone(), state.clone()));
         }
         let key = key(u8::try_from(self.effects.len()).unwrap_or(u8::MAX))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -538,7 +538,7 @@ impl GateMarkerStore for FakeMarkers {
         self.effects
             .iter()
             .find(|e| &e.1 == key)
-            .map(|e| e.2)
+            .map(|e| e.2.clone())
             .ok_or_else(|| std::io::Error::other("unknown effect key"))
     }
     fn record(
@@ -1616,6 +1616,114 @@ fn uncertain_submission_reconciles_then_applied_is_satisfied() -> TestResult {
     Ok(())
 }
 #[test]
+fn merge_applied_into_another_base_is_never_satisfied() -> TestResult {
+    let mut store = FakeMarkers::default();
+    let e = ready()?;
+    let first = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100))?;
+    let key = submitted(&first)?;
+    store.settle(&key, GateEffectState::AppliedElsewhere(retarget()?));
+    let held = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(200))?;
+    // The owner must resolve it: no second merge and no silent satisfaction.
+    // The merge effect keeps its key and a distinct hand-over is admitted.
+    let Admission::Submit(handover_key) = &held.admission else {
+        return Err(format!("expected an owner hand-over, got {:?}", held.admission).into());
+    };
+    assert_ne!(handover_key, &key);
+    assert!(matches!(held.decision.verdict, Verdict::HandOver { .. }));
+    let request = gate::handover_request(&held)?;
+    assert_eq!(request.key, *handover_key);
+    assert_eq!(request.head, e.head);
+    assert_eq!(store.effects.len(), 2);
+    assert_eq!(store.effects[0].1, key);
+    Ok(())
+}
+/// A merge that landed in `release` instead of the approved `main`.
+fn retarget() -> TestResult<Retarget> {
+    Ok(Retarget {
+        expected: BranchName::new("main")?,
+        actual: BranchName::new("release")?,
+    })
+}
+#[test]
+fn retargeted_merge_hands_over_once_and_never_merges_again() -> TestResult {
+    let mut store = FakeMarkers::default();
+    let e = ready()?;
+    let first = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100))?;
+    assert_eq!(first.decision.verdict, Verdict::Merge);
+    let merge_key = submitted(&first)?;
+    store.settle(&merge_key, GateEffectState::AppliedElsewhere(retarget()?));
+    let handed = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(200))?;
+    assert_eq!(
+        handed.decision.verdict,
+        Verdict::HandOver {
+            gaps: vec![Gap::MergedElsewhere]
+        }
+    );
+    let request = gate::handover_request(&handed)?;
+    assert_eq!(request.merged_elsewhere, Some(retarget()?));
+    let comment = request
+        .mutations()?
+        .into_iter()
+        .find_map(|mutation| match mutation.action {
+            GitHubAction::PostComment { body, .. } => Some(body),
+            _ => None,
+        })
+        .ok_or("no hand-over comment")?;
+    for expected in ["MergedElsewhere", "> main", "> release", e.head.as_str()] {
+        assert!(comment.as_str().contains(expected), "missing {expected}");
+    }
+    // Repeated passes reconcile the one hand-over; none merges or posts again.
+    for now in [300, 400, 86_400] {
+        let repeat =
+            gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(now))?;
+        assert!(matches!(repeat.admission, Admission::Reconcile(_)));
+        assert_eq!(
+            gate::handover_request(&repeat),
+            Err(RequestRefusal::EffectsDisabled)
+        );
+    }
+    // Once the comment lands, the head stays quiet.
+    store.apply(&handed)?;
+    for now in [500, 86_400] {
+        let done =
+            gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(now))?;
+        assert_eq!(done.decision.verdict, Verdict::Skip);
+        assert_eq!(done.admission, Admission::None);
+    }
+    assert_eq!(store.effects.len(), 2);
+    assert_eq!(store.effects[0].1, merge_key);
+    assert_eq!(
+        store.effects[0].2,
+        GateEffectState::AppliedElsewhere(retarget()?)
+    );
+    Ok(())
+}
+#[test]
+fn refused_retarget_hand_over_stops_without_a_second_merge() -> TestResult {
+    let mut store = FakeMarkers::default();
+    let e = ready()?;
+    let first = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100))?;
+    store.settle(
+        &submitted(&first)?,
+        GateEffectState::AppliedElsewhere(retarget()?),
+    );
+    let handed = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(200))?;
+    store.settle(&submitted(&handed)?, GateEffectState::NotApplied);
+    for now in [300, 400, 500] {
+        let next =
+            gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(now))?;
+        assert_eq!(next.decision.verdict, Verdict::Skip);
+        assert_eq!(next.admission, Admission::None);
+    }
+    assert!(
+        store
+            .effects
+            .iter()
+            .all(|effect| !effect.0.contains("/merge/") || effect.1 == store.effects[0].1)
+    );
+    Ok(())
+}
+#[test]
 fn uncertain_submission_proven_absent_is_superseded() -> TestResult {
     let mut store = FakeMarkers::default();
     let mut e = ready()?;
@@ -2060,6 +2168,60 @@ fn durable_merge_intent_precedes_its_marker_and_survives_restart() -> TestResult
     assert_eq!(done.decision.verdict, Verdict::Skip);
     assert_eq!(done.admission, Admission::None);
     assert_eq!(d.effects()?.len(), 1);
+    Ok(())
+}
+#[test]
+fn durable_retargeted_merge_persists_one_owner_hand_over() -> TestResult {
+    let d = durable()?;
+    let e = durable_evidence()?;
+    let first = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &e,
+        dgrants()?,
+        GateMode::Active,
+        secs(100),
+    )?;
+    let Admission::Submit(merge_key) = first.admission.clone() else {
+        return Err(format!("expected a submission, got {:?}", first.admission).into());
+    };
+    d.settle(
+        &merge_key,
+        EffectOutcome::Applied(
+            Receipt::new(ExternalRef::new("merge-9")?, Vec::new(), Vec::new())?
+                .with_retarget(retarget()?),
+        ),
+    )?;
+    let reopened = d.fixture.reopen()?;
+    let handed = gate::evaluate_and_record(
+        &mut d.gate(&reopened)?,
+        &e,
+        dgrants()?,
+        GateMode::Active,
+        secs(200),
+    )?;
+    let Admission::Submit(handover_key) = handed.admission.clone() else {
+        return Err(format!("expected a hand-over, got {:?}", handed.admission).into());
+    };
+    assert_ne!(handover_key, merge_key);
+    let request = gate::handover_request(&handed)?;
+    assert_eq!(request.merged_elsewhere, Some(retarget()?));
+    let record: GateVerdictRecord = d
+        .marker('a')?
+        .ok_or("marker missing")?
+        .fact()
+        .decode(&schema()?)?;
+    assert_eq!(record.effect, Some(handover_key.clone()));
+    assert_eq!(d.effects()?.len(), 2);
+    // A restart reconciles the one hand-over; nothing merges or posts again.
+    let again = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.reopen()?)?,
+        &e,
+        dgrants()?,
+        GateMode::Active,
+        secs(300),
+    )?;
+    assert_eq!(again.admission, Admission::Reconcile(handover_key));
+    assert_eq!(d.effects()?.len(), 2);
     Ok(())
 }
 #[test]

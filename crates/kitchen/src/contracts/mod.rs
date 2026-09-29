@@ -75,7 +75,8 @@ pub use authority::{Grant, GrantScope, HouseGrants, Permission, TaskAuthority};
 pub use backend::{
     BackendUnavailable, EffectExecutor, EffectFailure, EffectRequest, IdempotencyKey, Liveness,
     Lookup, MAX_INVENTORY_RESOURCES, MAX_RECEIPT_RESOURCES, NotAppliedReason, Operation, Receipt,
-    ResourceObservation, UncertainReason, WorkerBackend, WorkerOutcome, WorkerState, Workspace,
+    ResourceObservation, Retarget, UncertainReason, WorkerBackend, WorkerOutcome, WorkerState,
+    Workspace,
 };
 pub use capability::{BackendDescriptor, Capability, CapabilitySet, Support};
 pub use effects::{

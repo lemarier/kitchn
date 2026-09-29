@@ -410,6 +410,22 @@ pub(crate) enum PairPlan<R> {
     Block(R),
 }
 
+/// One write of [`crate::state::HouseStore::compact_markers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MarkerWrite {
+    /// Record a new marker, or find the same fact already recorded.
+    Record(MarkerKey, MarkerFact),
+    /// Replace the fact under a key if it is still the expected one.
+    Supersede {
+        /// The key.
+        key: MarkerKey,
+        /// The fact read before compacting.
+        expected: MarkerFact,
+        /// The replacement.
+        fact: MarkerFact,
+    },
+}
+
 /// The persisted markers of one house.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -441,6 +457,15 @@ impl MarkerFact {
 impl Markers {
     pub(super) const fn new() -> Self {
         Self(Vec::new())
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &WorkflowMarker> {
+        self.0.iter()
+    }
+
+    /// Remove every marker whose key is in `keys`.
+    pub(super) fn remove_all(&mut self, keys: &std::collections::BTreeSet<MarkerKey>) {
+        self.0.retain(|marker| !keys.contains(&marker.key));
     }
 
     pub(super) fn get(&self, key: &MarkerKey) -> Option<&WorkflowMarker> {

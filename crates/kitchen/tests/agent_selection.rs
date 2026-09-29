@@ -418,6 +418,7 @@ fn doctor_reports_configured_models_the_agents_do_not_offer() -> TestResult {
         access: AccessStatus::Unobserved,
         schedules: None,
         undelivered_budget_reports: Vec::new(),
+        store_capacity: None,
         agent_models: Some(vec![
             OfferedModels {
                 agent: AgentFamily::Codex,
@@ -491,6 +492,7 @@ fn doctor_reports_scheduled_workflows_the_schedule_backend_cannot_select_for() -
             access: AccessStatus::Unobserved,
             schedules: None,
             undelivered_budget_reports: Vec::new(),
+            store_capacity: None,
             agent_models: None,
             stack_tool: None,
             readiness: None,

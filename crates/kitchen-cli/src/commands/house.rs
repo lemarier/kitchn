@@ -10,6 +10,7 @@ use kitchen::{
         DoctorEvidence, DoctorFinding, DoctorReport, HouseConfig, HouseError,
         REPOSITORY_BINDING_SCHEMA, RepositoryConfig, Workflow, doctor,
     },
+    state::{HouseStore, StoreOptions},
 };
 use std::{
     collections::BTreeSet,
@@ -105,6 +106,10 @@ enum HouseCommand {
         repository_path: PathBuf,
         #[arg(long)]
         evidence: Option<PathBuf>,
+        /// The house's initialized state store, read to report how full its
+        /// shared tables are. Replaces any store capacity in --evidence.
+        #[arg(long)]
+        store: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -161,6 +166,7 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             registry,
             repository_path,
             evidence,
+            store,
             json,
         } => {
             let registry = HouseRegistry::new(canonical_root(registry)?)?;
@@ -169,9 +175,13 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             // fails with that error instead.
             let legacy = legacy_binding(&start).ok().flatten();
             match registry.resolve_repository(&start) {
-                Ok(RepositoryMatch::Bound(config)) => {
-                    diagnose(&registry, &config, legacy.as_deref(), evidence, json)
-                }
+                Ok(RepositoryMatch::Bound(config)) => diagnose(
+                    &registry,
+                    &config,
+                    legacy.as_deref(),
+                    Observed { evidence, store },
+                    json,
+                ),
                 Ok(RepositoryMatch::Unbound { repository, house }) => {
                     let root = registry.root().display();
                     let next = match &legacy {
@@ -370,14 +380,30 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
         }
     }
 }
+/// What doctor reads besides the registry.
+struct Observed {
+    evidence: Option<PathBuf>,
+    store: Option<PathBuf>,
+}
+
 fn diagnose(
     registry: &HouseRegistry,
     config: &RepositoryConfig,
     legacy: Option<&std::path::Path>,
-    evidence: Option<PathBuf>,
+    observed: Observed,
     json: bool,
 ) -> Result<(String, bool), kitchen::Error> {
-    let evidence: Option<DoctorEvidence> = evidence.as_deref().map(decode).transpose()?;
+    let mut evidence: Option<DoctorEvidence> =
+        observed.evidence.as_deref().map(decode).transpose()?;
+    if let Some(store) = observed.store {
+        let capacity =
+            HouseStore::open(store, config.house.clone(), StoreOptions::default())?.capacity()?;
+        evidence
+            .get_or_insert_with(|| {
+                DoctorEvidence::unobserved(config.house.clone(), config.repository.clone())
+            })
+            .store_capacity = Some(capacity);
+    }
     let mut report = doctor(registry, config, evidence.as_ref())?;
     report
         .findings

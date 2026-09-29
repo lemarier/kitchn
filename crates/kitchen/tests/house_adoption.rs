@@ -357,6 +357,7 @@ fn doctor_unknown_is_not_success_and_scoped_evidence_can_complete_it() -> TestRe
         schedules: None,
         readiness: None,
         undelivered_budget_reports: Vec::new(),
+        store_capacity: None,
     };
     assert!(doctor(&registry, &repository, Some(&evidence))?.healthy());
     evidence.house = config("crabnebula")?.house;
@@ -598,11 +599,60 @@ fn label_metadata_drift_is_informational_in_preview_and_doctor() -> TestResult {
         schedules: None,
         readiness: None,
         undelivered_budget_reports: Vec::new(),
+        store_capacity: None,
     };
     let report = doctor(&registry, &repository, Some(&evidence))?;
     assert!(report.healthy());
     assert!(report.human_readable().contains("drift"));
     assert_eq!(evidence.labels, Some(labels));
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_a_store_table_near_its_limit() -> TestResult {
+    use kitchen::state::{MAX_MARKERS, MAX_TASKS, StoreCapacity, TableUsage};
+    let temp = tempfile::tempdir()?;
+    let registry = HouseRegistry::new(temp.path().canonicalize()?.join("registry"))?;
+    let house = config("origin89")?;
+    registry.initialize(&house)?;
+    registry.sync(&house.house, &bundle("origin89")?)?;
+    let repository = repo(&house)?;
+    let gate = kitchen::WorkflowId::new("merge-gate")?;
+    let capacity = |markers: usize| StoreCapacity {
+        tasks: TableUsage {
+            used: 10,
+            limit: MAX_TASKS,
+        },
+        markers: TableUsage {
+            used: markers,
+            limit: MAX_MARKERS,
+        },
+        consumers: TableUsage {
+            used: 0,
+            limit: 256,
+        },
+        markers_by_workflow: [(gate.clone(), markers)].into_iter().collect(),
+        settled_tasks: 4,
+    };
+    let findings = |store_capacity: Option<StoreCapacity>| -> Result<Vec<kitchen::house::DoctorFinding>, Box<dyn std::error::Error>> {
+        let mut evidence =
+            DoctorEvidence::unobserved(house.house.clone(), repository.repository.clone());
+        evidence.store_capacity = store_capacity;
+        Ok(doctor(&registry, &repository, Some(&evidence))?
+            .findings
+            .into_iter()
+            .filter(|finding| finding.code == DoctorCode::StoreCapacity)
+            .collect())
+    };
+    // Unread, or below the threshold: nothing to report.
+    assert!(findings(None)?.is_empty());
+    assert!(findings(Some(capacity(MAX_MARKERS * 79 / 100)))?.is_empty());
+    // At the threshold, before the limit, one finding names the table.
+    let near = findings(Some(capacity(MAX_MARKERS * 80 / 100 + 1)))?;
+    assert_eq!(near.len(), 1);
+    assert!(near[0].message.contains("workflow markers"));
+    assert!(near[0].message.contains("merge-gate"));
+    assert!(near[0].next_step.contains("kitchn store retain"));
     Ok(())
 }
 
@@ -707,6 +757,7 @@ fn doctor_reports_a_configured_stack_tool_that_is_missing() -> TestResult {
         schedules: None,
         readiness: None,
         undelivered_budget_reports: Vec::new(),
+        store_capacity: None,
     };
     let report = doctor(&registry, &repository, Some(&evidence))?;
     assert!(!report.healthy());

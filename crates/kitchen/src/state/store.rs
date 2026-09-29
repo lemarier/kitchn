@@ -38,8 +38,11 @@ use crate::{
         EffectRecord, EffectStart, Lease, MarkerAttempt, MarkerFact, MarkerKey, MarkerRecording,
         RecoveryItem, Reservation, RiskDecision, TaskRecord, WorkflowMarker, WriteAcknowledgement,
         effects::SettledLookup,
-        marker::PairPlan,
+        marker::{MarkerWrite, PairPlan},
         model::StoreState,
+        retention::{
+            Inventory, RetentionPolicy, RetentionReport, RetentionSubjects, StoreCapacity,
+        },
         snapshot::{SnapshotStore, StoreLayout, StoreOptions},
     },
 };
@@ -689,6 +692,80 @@ impl HouseStore {
     /// with an unresolved or waived effect; nothing is removed then.
     pub fn retire_tasks(&self, ids: &[TaskId]) -> Result<Vec<TaskId>> {
         self.transact(|state| state.retire_tasks(ids))
+    }
+
+    /// How full the store's shared tables are, for doctor and operators.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub fn capacity(&self) -> Result<StoreCapacity> {
+        self.read(StoreState::capacity)
+    }
+
+    /// The issues, pull requests, and backends whose observation would let
+    /// a retention pass remove something. Observe them into an
+    /// [`Inventory`] before calling [`Self::retain`].
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub fn retention_subjects(&self) -> Result<RetentionSubjects> {
+        self.read(StoreState::retention_subjects)
+    }
+
+    /// Preview a retention pass: what [`Self::retain`] would remove now.
+    /// Writes nothing.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub fn preview_retention(
+        &self,
+        policy: &RetentionPolicy,
+        inventory: &Inventory,
+        now: Timestamp,
+    ) -> Result<RetentionReport> {
+        self.read(|state| state.retention_plan(policy, inventory, now))
+    }
+
+    /// Apply the house retention policy in one transaction (see
+    /// [`crate::state::RetentionPolicy`]). Markers and settled tasks are
+    /// removed only on the positive evidence in `inventory`; anything a
+    /// claim, an unresolved effect, an unacknowledged failed write, a live
+    /// resource, or a remaining marker still needs is kept. In the same
+    /// transaction every repository's intake markers are compacted, recorded
+    /// by `recorded_by` (see [`crate::workflows::intake::IntakeLedger::compact`]);
+    /// a repository whose intake markers cannot be read is reported refused
+    /// and left unchanged.
+    ///
+    /// # Errors
+    /// Returns a storage error, or a consumer lease error for
+    /// `recorded_by`; nothing is changed then.
+    pub fn retain(
+        &self,
+        policy: &RetentionPolicy,
+        inventory: &Inventory,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<RetentionReport> {
+        self.transact(|state| state.retain(policy, inventory, recorded_by, now))
+    }
+
+    /// Replace markers with fewer ones in one transaction: remove each of
+    /// `retire`, whose facts must be unchanged, then apply `writes`. A
+    /// changed or missing marker, a conflicting write, or a full store
+    /// refuses the whole call.
+    ///
+    /// # Errors
+    /// [`StateError::MarkerConflict`] when a marker changed since it was
+    /// read, [`StateError::MarkerNotSupersedable`] for an asked question,
+    /// [`StateError::CapacityExceeded`], and consumer lease errors.
+    pub(crate) fn compact_markers(
+        &self,
+        retire: &[(MarkerKey, MarkerFact)],
+        writes: Vec<MarkerWrite>,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.transact(|state| state.compact_markers(retire, writes, recorded_by, now))
     }
 
     /// Read the marker recorded under `key`.

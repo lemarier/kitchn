@@ -9,6 +9,7 @@ use crate::{
     contracts::{Capability, CapabilitySet, Repository},
     scheduling::{BudgetError, ScheduleEvidence, SchedulePolicy, TokenUsage, UndeliveredReport},
     selection::OfferedModels,
+    state::{StoreCapacity, TableUsage},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,6 +58,31 @@ pub struct DoctorEvidence {
     /// not read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub undelivered_budget_reports: Vec<UndeliveredReport>,
+    /// How full the house store's shared tables are; `None` when the store
+    /// was not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_capacity: Option<StoreCapacity>,
+}
+
+impl DoctorEvidence {
+    /// Evidence for `house` and `repository` with nothing observed, the
+    /// same as running doctor without evidence.
+    #[must_use]
+    pub fn unobserved(house: HouseId, repository: Repository) -> Self {
+        Self {
+            house,
+            repository,
+            capabilities: CapabilitySet::new(),
+            labels: None,
+            access: AccessStatus::Unobserved,
+            agent_models: None,
+            stack_tool: None,
+            schedules: None,
+            readiness: None,
+            undelivered_budget_reports: Vec::new(),
+            store_capacity: None,
+        }
+    }
 }
 
 /// Whether the house's stack tool is usable on this host.
@@ -112,6 +138,9 @@ pub enum DoctorCode {
     /// A budget exhaustion could not be reported to its owner because the
     /// budget schedule has no report destination.
     BudgetReport,
+    /// A house store table is near its limit; at the limit every workflow
+    /// refuses new work.
+    StoreCapacity,
 }
 impl DoctorFinding {
     /// Report a leftover legacy binding file. Kitchen never deletes it.
@@ -378,6 +407,9 @@ pub fn doctor(
     for report in evidence.map_or(&[][..], |evidence| &evidence.undelivered_budget_reports) {
         findings.push(DoctorFinding { code: DoctorCode::BudgetReport, message: format!("Schedule {} was paused for exhausting its {} ({} of {}) in the window ending at {} (Unix ms), but its owner was not told: the budget schedule has no report destination.", report.consumer, report.exhausted.limit, report.exhausted.used, report.exhausted.allowed, report.window.end.as_unix_millis()), next_step: "Reinstall the budget schedule with kitchn budget install --report-issue owner/repo#N naming a house posting destination, or tell the schedule's owner yourself; it stays paused until the owner activates it.".into() });
     }
+    if let Some(capacity) = evidence.and_then(|evidence| evidence.store_capacity.as_ref()) {
+        findings.extend(store_capacity_findings(&house.house, capacity));
+    }
     let access = evidence.map_or(AccessStatus::Unobserved, |evidence| evidence.access);
     if access != AccessStatus::Available {
         findings.push(DoctorFinding { code: DoctorCode::Access, message: format!("House-scoped repository access: {access:?}."), next_step: format!("Configure {} access in the external credential provider, then probe {} through the house-scoped integration and rerun doctor; never put credential values in repository files.", house.house, repository.repository) });
@@ -393,6 +425,30 @@ pub fn doctor(
         findings,
         recommendations,
     })
+}
+
+/// One finding per store table at or above
+/// [`crate::state::CAPACITY_WARNING_PERCENT`] of its limit.
+fn store_capacity_findings(house: &HouseId, capacity: &StoreCapacity) -> Vec<DoctorFinding> {
+    let busiest = capacity
+        .markers_by_workflow
+        .iter()
+        .max_by_key(|(_, count)| **count)
+        .map(|(workflow, count)| format!(" Most markers belong to {workflow} ({count})."))
+        .unwrap_or_default();
+    [
+        ("tasks", capacity.tasks, format!(" {} of them settled.", capacity.settled_tasks)),
+        ("workflow markers", capacity.markers, busiest),
+        ("consumer leases", capacity.consumers, String::new()),
+    ]
+    .into_iter()
+    .filter(|(_, usage, _)| usage.near_limit())
+    .map(|(table, usage, detail): (&str, TableUsage, String)| DoctorFinding {
+        code: DoctorCode::StoreCapacity,
+        message: format!("House store holds {} of {} {table}; at the limit every workflow refuses new work.{detail}", usage.used, usage.limit),
+        next_step: format!("Preview retention with kitchn store retain --house {house} --store <path>, review what it would remove, then rerun it with --apply."),
+    })
+    .collect()
 }
 
 /// Workflows that create dependent branches and stacked pull requests.

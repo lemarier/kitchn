@@ -109,11 +109,13 @@ missing from the evidence are reported as unknown, never as passing. When branch
 (`requiredCheckApps`), only that app's runs count toward the check's history.
 
 ```sh
-kitchn house doctor --registry <dir> [--repository-path <dir>] [--evidence <file>] [--json]
+kitchn house doctor --registry <dir> [--repository-path <dir>] [--evidence <file>] [--store <dir>] [--json]
 ```
 
 Exits 0 when configuration is complete and 1 when findings remain. Readiness
 gaps become findings only for work types whose `mergeReadiness` level is not met.
+With `--store`, doctor reads the house store and reports any table at 80% of its
+limit or more, before new work is refused.
 
 ## `kitchn init` and `kitchn adopt`
 
@@ -264,6 +266,35 @@ Report options (`--report-issue owner/repo#n`, `--github-backend`,
 and as whom the owner report is posted. `run` exits 1 when a pause or report
 did not go through. `install` adds the tick's schedule paused; activating it is
 the owner's separate decision.
+
+## `kitchn store`
+
+How full the house store is, and the retention pass that removes markers and
+settled tasks no workflow still needs.
+
+```sh
+kitchn store capacity --house <id> --store <dir> [--json]
+kitchn store retain   --house <id> --store <dir> [--registry <dir> --gh <path>] [--window-days 31] [--max-lookups 200] [--apply] [--json]
+```
+
+`capacity` exits 1 when a table is at 80% of its limit or more. `retain` only
+previews unless `--apply` is given. With `--registry` and `--gh` it asks the
+forge, through the house's forge binding, which issues and pull requests are
+closed. Records about an issue or pull request the forge did not answer
+completely are kept. A pass looks up at most `--max-lookups` of them; each
+applied pass continues after the last one the previous applied pass looked up,
+wrapping around, so every item is reached within a few passes. A preview does
+not move that position. The output reports how many were not looked up. It never removes asked questions, deliberation threads,
+or a task whose write failed and no person has acknowledged. Settled tasks stay
+at least 31 days.
+
+The same pass compacts intake. Each repository's settled intake reservations
+fold into at most 32 counted-report markers; a reservation whose outcome is not
+yet known stays. When the markers are full, the oldest is evicted. Intake then
+posts nothing for an uncounted report received at or before the newest evicted
+one; it lists the report as late for a person to review. Source times are
+capped at the house time a report was reserved, so a source clock running ahead
+cannot move that cutoff.
 
 ## `kitchn pickup`
 

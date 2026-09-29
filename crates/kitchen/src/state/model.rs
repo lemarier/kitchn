@@ -23,10 +23,14 @@ use crate::{
     },
     state::{
         ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerAttempt, MarkerFact,
-        MarkerKey, MarkerRecording, StateError, WorkflowMarker,
+        MarkerKey, MarkerRecording, StateError, WorkItem, WorkflowMarker,
         effects::{Found, SettledLookup},
-        marker::{MarkerRefusal, Markers, PairPlan},
+        marker::{MarkerRefusal, MarkerWrite, Markers, PairPlan},
+        retention::{
+            self, Inventory, RetentionPolicy, RetentionReport, RetentionSubjects, StoreCapacity,
+        },
     },
+    workflows::intake,
 };
 
 /// The persisted schema version.
@@ -1082,6 +1086,10 @@ pub(crate) struct StoreState {
     consumers: BTreeMap<ConsumerId, ConsumerRecord>,
     #[serde(default)]
     markers: Markers,
+    /// The last item a retention pass looked up, so the next bounded pass
+    /// continues after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retention_cursor: Option<WorkItem>,
 }
 
 /// Deserialize a map, rejecting a repeated key instead of letting a later
@@ -1130,6 +1138,7 @@ impl StoreState {
             tasks: BTreeMap::new(),
             consumers: BTreeMap::new(),
             markers: Markers::new(),
+            retention_cursor: None,
         }
     }
 
@@ -2378,6 +2387,115 @@ impl StoreState {
             .filter(|id| self.tasks.remove(*id).is_some())
             .cloned()
             .collect())
+    }
+
+    pub(crate) fn capacity(&self) -> StoreCapacity {
+        StoreCapacity::measure(
+            self.tasks.values(),
+            self.markers.iter(),
+            self.consumers.len(),
+        )
+    }
+
+    pub(crate) fn retention_subjects(&self) -> RetentionSubjects {
+        RetentionSubjects::collect(
+            self.tasks.values(),
+            self.markers.iter(),
+            self.retention_cursor.as_ref(),
+        )
+    }
+
+    pub(crate) fn retention_plan(
+        &self,
+        policy: &RetentionPolicy,
+        inventory: &Inventory,
+        now: Timestamp,
+    ) -> RetentionReport {
+        let mut report = retention::plan(&self.tasks, self.markers.iter(), policy, inventory, now);
+        report.intake = intake::plan_house_compaction(self.markers.iter(), &self.tasks)
+            .into_iter()
+            .map(|(summary, _)| summary)
+            .collect();
+        report
+    }
+
+    /// Compact intake and remove what [`Self::retention_plan`] selects, in
+    /// this transaction. Both are planned from the same state: the generic
+    /// pass selects no intake marker and keeps intake tasks, whose family it
+    /// does not know.
+    pub(crate) fn retain(
+        &mut self,
+        policy: &RetentionPolicy,
+        inventory: &Inventory,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<RetentionReport> {
+        let mut report = retention::plan(&self.tasks, self.markers.iter(), policy, inventory, now);
+        let compactions = intake::plan_house_compaction(self.markers.iter(), &self.tasks);
+        let mut compacted = false;
+        for (summary, changes) in compactions {
+            if !changes.is_empty() {
+                compacted = true;
+                self.compact_markers(&changes.retire, changes.writes, recorded_by, now)?;
+            }
+            report.intake.push(summary);
+        }
+        let keys: BTreeSet<MarkerKey> = report
+            .markers
+            .iter()
+            .map(|retired| retired.key.clone())
+            .collect();
+        self.markers.remove_all(&keys);
+        for retired in &report.tasks {
+            self.tasks.remove(&retired.task);
+        }
+        if let Some(item) = inventory.last_lookup() {
+            self.retention_cursor = Some(item.clone());
+        }
+        report.applied = compacted || !keys.is_empty() || !report.tasks.is_empty();
+        Ok(report)
+    }
+
+    /// Remove every marker in `retire`, each of which must still hold its
+    /// expected fact, then apply `writes`. Any refusal discards the whole
+    /// transaction, so folded facts are never lost or counted twice.
+    pub(crate) fn compact_markers(
+        &mut self,
+        retire: &[(MarkerKey, MarkerFact)],
+        writes: Vec<MarkerWrite>,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.check_claimant(recorded_by, now)?;
+        for (key, expected) in retire {
+            self.markers
+                .retire(key, expected)
+                .or_else(|refusal| match refusal {
+                    MarkerRefusal::Missing => marker_refusal(MarkerRefusal::Conflict),
+                    refusal @ (MarkerRefusal::Conflict
+                    | MarkerRefusal::Full
+                    | MarkerRefusal::NotSupersedable) => marker_refusal(refusal),
+                })?;
+        }
+        for write in writes {
+            match write {
+                MarkerWrite::Record(key, fact) => {
+                    self.markers
+                        .record(key, fact, recorded_by, now)
+                        .or_else(marker_refusal)?;
+                }
+                MarkerWrite::Supersede {
+                    key,
+                    expected,
+                    fact,
+                } => {
+                    self.markers
+                        .supersede(&key, &expected, fact, recorded_by, now)
+                        .or_else(marker_refusal)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn marker(&self, key: &MarkerKey) -> Option<&WorkflowMarker> {

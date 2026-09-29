@@ -3,22 +3,29 @@
 //! separate house grants.
 
 use std::{
+    collections::BTreeMap,
+    num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::{ClaimState, Precheck, WorkflowError, known, valid_label};
 use crate::{
-    BackendId, ConsumerId, CredentialId, HouseId,
+    BackendId, ConsumerId, CredentialId, HouseId, WorkflowId,
     contracts::{
-        Capability, CloseReason, ContractError, Effect, ExternalRef, GitHubAction, Grant,
+        Capability, Claimant, CloseReason, ContractError, Effect, ExternalRef, GitHubAction, Grant,
         GrantScope, HouseGrants, IssueNumber, Permission, Repository, ScheduleEffect, Text,
         Timestamp,
     },
-    integrations::github::{GitHubClient, GitHubReadTransport, IssueState},
+    integrations::github::{GitHubClient, GitHubReadTransport, Issue as GitHubIssue, IssueState},
     scheduling::{
         self, AgentFamily, PrecheckTimeout, Recurrence, ScheduleSpec, TimeOfDay, Timezone,
         WorkflowName,
+    },
+    state::{
+        HouseStore, MarkerFact, MarkerKey, MarkerRecording, MarkerSchema, MarkerSubject, WorkItem,
     },
 };
 
@@ -102,6 +109,8 @@ pub struct PrecheckArgs {
     pub credential_file: PathBuf,
     /// The GitHub CLI executable.
     pub gh: PathBuf,
+    /// The house state store holding handled-stale markers.
+    pub store: PathBuf,
     /// House agent labels.
     pub labels: AgentLabels,
     /// Lookback and staleness bounds.
@@ -135,6 +144,8 @@ impl PrecheckArgs {
             absolute(&self.credential_file)?,
             "--gh",
             absolute(&self.gh)?,
+            "--store",
+            absolute(&self.store)?,
             "--ready-label",
             &self.labels.ready,
             "--working-label",
@@ -228,7 +239,8 @@ pub struct Issue {
     pub merged_work: bool,
     /// Duplicate of.
     pub duplicate_of: Option<IssueNumber>,
-    /// Stale.
+    /// Stale and not handled since its last update
+    /// ([`StaleMarkers::handled`]), matching what the precheck counts.
     pub stale: bool,
 }
 
@@ -262,9 +274,9 @@ fn labels_valid(labels: &AgentLabels) -> bool {
 /// Why the independent gardener should inspect a repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signal {
-    /// Daily changes.
+    /// An issue changed in the lookback and not handled since.
     pub daily_changes: bool,
-    /// Stale issue.
+    /// A stale issue not handled since its last update.
     pub stale_issue: bool,
     /// Closed agent label.
     pub closed_agent_label: bool,
@@ -295,14 +307,18 @@ impl Window {
     }
 }
 
-/// Read the changed and open issue inventory for the precheck. A partial or
-/// unrecognized read is an error, never an idle day.
+/// Read the changed and open issue inventory for the precheck. An issue the
+/// gardener handled and nobody updated since ([`StaleMarkers::handled`])
+/// counts neither as a change nor as stale, so its report does not wake the
+/// schedule every day. Without `handled` markers every issue counts. A
+/// partial or unrecognized read is an error, never an idle day.
 pub fn signal<T: GitHubReadTransport>(
     client: &GitHubClient<T>,
     house: &HouseId,
     repo: &Repository,
     labels: &AgentLabels,
     window: Window,
+    handled: Option<&StaleMarkers<'_>>,
 ) -> Result<Signal, WorkflowError> {
     let changed = known(client.issues_filtered(house, repo, None, Some(window.since)))?;
     let open = known(client.issues_filtered(house, repo, Some(IssueState::Open), None))?;
@@ -322,13 +338,177 @@ pub fn signal<T: GitHubReadTransport>(
     if open.iter().any(|issue| issue.state != IssueState::Open) {
         return Err(WorkflowError::IncompleteEvidence);
     }
+    // Every handled marker is read and checked, not only those of the
+    // issues looked at before the first unhandled one.
+    let revisions = match handled {
+        Some(markers) => markers.revisions(repo)?,
+        None => BTreeMap::new(),
+    };
+    let unhandled =
+        |issue: &&GitHubIssue| revisions.get(&issue.number.get()) != Some(&issue.updated_at);
+    let daily_changes = changed.iter().any(|issue| unhandled(&issue));
+    let stale_issue = open
+        .iter()
+        .filter(|issue| issue.updated_at < window.stale_before)
+        .any(|issue| unhandled(&issue));
     Ok(Signal {
-        daily_changes: !changed.is_empty(),
-        stale_issue: open
-            .iter()
-            .any(|issue| issue.updated_at < window.stale_before),
+        daily_changes,
+        stale_issue,
         closed_agent_label,
     })
+}
+
+/// Schema of the gardener marker recording a handled stale issue.
+const STALE_SCHEMA: &str = "gardener.stale-handled";
+/// Subject of each issue's one handled-stale marker; the revision is in the
+/// fact, so handling the issue again replaces it instead of adding a marker.
+const STALE_SUBJECT: &str = "stale-handled";
+
+/// The handled-stale marker payload: the issue's last update as read after
+/// the pass reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StaleHandled {
+    revision: Timestamp,
+}
+
+impl StaleHandled {
+    fn fact(self) -> Result<MarkerFact, WorkflowError> {
+        MarkerFact::workflow(stale_schema()?, &self).map_err(|_| WorkflowError::IncompleteEvidence)
+    }
+
+    fn decode(fact: &MarkerFact) -> Result<Self, WorkflowError> {
+        fact.decode(&stale_schema()?)
+            .map_err(|_| WorkflowError::IncompleteEvidence)
+    }
+}
+
+fn stale_subject() -> Result<MarkerSubject, WorkflowError> {
+    ExternalRef::new(STALE_SUBJECT)
+        .map(MarkerSubject::Observation)
+        .map_err(|_| WorkflowError::IncompleteEvidence)
+}
+
+fn stale_schema() -> Result<MarkerSchema, WorkflowError> {
+    MarkerSchema::new(STALE_SCHEMA, NonZeroU32::MIN).map_err(|_| WorkflowError::IncompleteEvidence)
+}
+
+/// Handled-stale markers in the house store: one per issue, holding the
+/// issue's revision after the gardener's report. The issue counts as handled
+/// only while its last update is still that revision, so the gardener's own
+/// report does not wake the schedule and any later update does.
+#[derive(Debug, Clone)]
+pub struct StaleMarkers<'a> {
+    store: &'a HouseStore,
+    workflow: WorkflowId,
+}
+
+impl<'a> StaleMarkers<'a> {
+    /// The gardener's markers in `store`.
+    ///
+    /// # Errors
+    /// None in practice; the workflow id is a validated constant.
+    pub fn new(store: &'a HouseStore) -> Result<Self, WorkflowError> {
+        Ok(Self {
+            store,
+            workflow: WorkflowId::new(WORKFLOW).map_err(|_| WorkflowError::IncompleteEvidence)?,
+        })
+    }
+
+    fn key(&self, repository: &Repository, issue: IssueNumber) -> Result<MarkerKey, WorkflowError> {
+        Ok(MarkerKey {
+            workflow: self.workflow.clone(),
+            item: WorkItem::Issue {
+                repository: repository.clone(),
+                number: NonZeroU64::new(issue.get()).ok_or(WorkflowError::IncompleteEvidence)?,
+            },
+            subject: stale_subject()?,
+        })
+    }
+
+    /// The handled revision of each issue number in `repository`, from one
+    /// store read. Every marker at a handled-stale key must decode; a
+    /// foreign fact there proves nothing and is
+    /// [`WorkflowError::IncompleteEvidence`].
+    fn revisions(
+        &self,
+        repository: &Repository,
+    ) -> Result<BTreeMap<u64, Timestamp>, WorkflowError> {
+        let subject = stale_subject()?;
+        self.store
+            .markers(&self.workflow)
+            .map_err(|_| WorkflowError::PrecheckFailed)?
+            .iter()
+            .filter(|marker| marker.key().subject == subject)
+            .filter_map(|marker| match &marker.key().item {
+                WorkItem::Issue {
+                    repository: owner,
+                    number,
+                } if owner == repository => Some((number.get(), marker.fact())),
+                WorkItem::Issue { .. }
+                | WorkItem::PullRequest { .. }
+                | WorkItem::Repository { .. }
+                | WorkItem::Resource { .. } => None,
+            })
+            .map(|(number, fact)| Ok((number, StaleHandled::decode(fact)?.revision)))
+            .collect()
+    }
+
+    /// Whether `issue` was handled and has not been updated since: its last
+    /// update is still the recorded revision.
+    ///
+    /// # Errors
+    /// A failed read is [`WorkflowError::PrecheckFailed`]; a marker of another
+    /// kind at this key proves nothing and is
+    /// [`WorkflowError::IncompleteEvidence`].
+    pub fn handled(
+        &self,
+        repository: &Repository,
+        issue: IssueNumber,
+        updated_at: Timestamp,
+    ) -> Result<bool, WorkflowError> {
+        let key = self.key(repository, issue)?;
+        let Some(marker) = self
+            .store
+            .marker(&key)
+            .map_err(|_| WorkflowError::PrecheckFailed)?
+        else {
+            return Ok(false);
+        };
+        Ok(StaleHandled::decode(marker.fact())?.revision == updated_at)
+    }
+
+    /// Record that the pass handled stale `issue`. `revision` is the issue's
+    /// last update read back after the pass reported its finding, so the
+    /// report itself is covered; an update after that read is not. Recording
+    /// the same revision again changes nothing, and a newer revision replaces
+    /// the issue's marker in place, which a full marker table still allows.
+    ///
+    /// # Errors
+    /// [`WorkflowError::DecisionMismatch`] for a revision older than the one
+    /// recorded, [`WorkflowError::IncompleteEvidence`] for a foreign fact at
+    /// the issue's key, [`crate::state::StateError::CapacityExceeded`] when
+    /// a first marker does not fit, [`crate::state::StateError::MarkerConflict`]
+    /// when a concurrent pass changed the marker, and other store errors.
+    pub fn record(
+        &self,
+        repository: &Repository,
+        issue: IssueNumber,
+        revision: Timestamp,
+        recorded_by: &Claimant,
+        now: Timestamp,
+    ) -> crate::Result<MarkerRecording> {
+        let key = self.key(repository, issue)?;
+        let fact = StaleHandled { revision }.fact()?;
+        let Some(current) = self.store.marker(&key)? else {
+            return self.store.record_marker(key, fact, recorded_by, now);
+        };
+        if StaleHandled::decode(current.fact())?.revision > revision {
+            return Err(WorkflowError::DecisionMismatch.into());
+        }
+        self.store
+            .supersede_marker(&key, current.fact(), fact, recorded_by, now)
+    }
 }
 
 /// Evidence that the house holds a standing [`Permission::CloseIssue`] grant

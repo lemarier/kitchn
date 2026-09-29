@@ -14,6 +14,31 @@ use; [Orca](https://github.com/stablyai/orca) is the first.
 
 [getkitchn.com](https://getkitchn.com) · [Two-minute setup](https://getkitchn.com/docs/start/quickstart/) · [Docs](https://getkitchn.com/docs/start/introduction/)
 
+## Why I built this
+
+I co-founded Popcorn Time, ran VPN.ht for 50,000 users on 150+ servers, built
+Tauri's updater, and have sat on Tauri's board since 2021.
+
+In the ten months to September 2026, my agents merged 797 pull requests and
+3,500+ commits across 28 repositories. 610 of those pull requests landed in the
+last three weeks.
+
+I watched every one of them. The agents could write the code. What broke was
+everything around it:
+
+- two agents pushing to the same branch,
+- an approval that still counted after the head moved,
+- a green pull request nobody independent had actually checked,
+- a cleanup script one command away from deleting unpushed work,
+- and me, at midnight, being the only process there was.
+
+[pstack](https://github.com/cursor/plugins/tree/main/pstack) by Lauren Tan
+showed me how to make one agent rigorous. kitchn is what I built to make a whole
+team of them trustworthy: one owner per task, an independent check at the exact
+commit, cleanup only with proof, and autonomy earned, never assumed.
+
+— [David Lemarier](https://lemarier.ca)
+
 > [!NOTE]
 > kitchn is early. You can register a house, bind repositories and work issues
 > and pull requests from your session today. Unattended runs are still being
@@ -161,6 +186,14 @@ To run them locally, install both and run `just security` with a repository-scop
 `GH_TOKEN`.
 
 Never commit credentials or private operational records.
+
+## Acknowledgements
+
+kitchn stands on [pstack](https://github.com/cursor/plugins/tree/main/pstack)
+by Lauren Tan ([@poteto](https://x.com/poteto)). Its core idea, *if you want to
+go fast, go deep first*, is the one kitchn is built on: rigor is what makes
+parallel agents safe to trust. pstack makes one agent work like a careful
+engineer; kitchn organizes many of them into a brigade.
 
 ## License
 

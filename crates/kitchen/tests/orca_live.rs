@@ -23,11 +23,16 @@
 //! (then messages the stopped worker to see Orca refuse it), and launches a
 //! third worker on its own requested branch whose agent terminal it closes,
 //! so the worker's process exits without a stop: its launch must still be
-//! found, and resubmitting it must start nothing. It then stops and releases
-//! the workers, removes the worktrees it created, and closes the terminals. Orca has no command to delete a Run, so each invocation leaves
-//! one empty Run whose objective marks it as a throwaway smoke test. It never
-//! reads or changes automations, or any Run, worker, worktree, or terminal it
-//! did not create. Without the gate it reports that it was skipped.
+//! found, and resubmitting it must start nothing. A second coordinator
+//! terminal then adopts the Run: the test sends a status note to the Run
+//! mailbox, checks that the adopter receives the unacknowledged batch and the
+//! first terminal is fenced, and acknowledges the batch twice. Finally it
+//! stops and releases the workers, removes the worktrees it created, and
+//! closes the terminals. Orca has no command to delete a Run, so each
+//! invocation leaves one empty Run whose objective marks it as a throwaway
+//! smoke test. It never reads or changes automations, or any Run, worker,
+//! worktree, or terminal it did not create. Without the gate it reports that
+//! it was skipped.
 
 use std::{
     env,
@@ -43,8 +48,8 @@ use kitchen::{
     },
     contracts::{
         AttemptNumber, BranchName, Clock, CoordinatorMailbox, EffectExecutor, EffectFailure,
-        EffectRequest, ExternalRef, IdempotencyKey, Lookup, NotAppliedReason, Operation,
-        Repository, ResourceKind, Role, SystemClock, Text, WorkerBackend, WorkerOutcome,
+        EffectRequest, ExternalRef, IdempotencyKey, Lookup, MailboxError, NotAppliedReason,
+        Operation, Repository, ResourceKind, Role, SystemClock, Text, WorkerBackend, WorkerOutcome,
         WorkerState, Workspace,
         conformance::{self, ConformanceFixture},
     },
@@ -749,14 +754,43 @@ fn exit_checks(
     Ok(())
 }
 
-/// A second coordinator terminal adopts the Run: it reads the mailbox, and
-/// the first terminal no longer can.
+/// A second coordinator terminal adopts the Run. The test first sends a
+/// status note to the Run mailbox so a batch is waiting. The adopter must
+/// receive the batch the first terminal read, and the first terminal's read,
+/// acknowledgement, and wait must all fail with [`MailboxError::Fenced`]
+/// while the batch stays with the adopter. The adopter then acknowledges the
+/// batch twice: the repeat must return the same next batch and consume
+/// nothing more.
 fn adoption(
     runner: &SystemRunner,
     settings: &LiveSettings,
     backend: &OrcaBackend<&SystemRunner>,
     terminals: &mut Vec<String>,
 ) -> TestResult {
+    let run = format!("--to=run:{}", backend.config().run.as_str());
+    let note = orca(
+        runner,
+        &[
+            "orchestration",
+            "send",
+            &run,
+            "--type=status",
+            "--subject=Kitchen smoke test mailbox note (throwaway)",
+            "--json",
+        ],
+    )?;
+    println!(
+        "LIVE sent mailbox note {:?}",
+        find(&note, "id", "msg_").unwrap_or_default()
+    );
+    let first = backend
+        .next_delivery()?
+        .ok_or("no batch reached the coordinator after the note")?;
+    println!(
+        "LIVE first coordinator holds batch {} of {} messages",
+        first.id,
+        first.messages.len()
+    );
     let adopter = create_terminal(runner, settings, terminals)?;
     let adopting = OrcaBackend::connect(
         OrcaConfig {
@@ -766,18 +800,56 @@ fn adoption(
         runner,
     )?;
     adopting.adopt_run()?;
-    let waited = adopting.await_delivery(std::time::Duration::from_secs(2))?;
+    let replayed = adopting.next_delivery()?;
+    println!(
+        "LIVE adopter reads batch {:?}",
+        replayed.as_ref().map(|delivery| delivery.id.as_str())
+    );
+    if replayed.as_ref() != Some(&first) {
+        return Err("the adopter did not receive the unacknowledged batch".into());
+    }
+    let read = backend.next_delivery();
+    let acknowledged = backend.acknowledge(&first.id);
+    let waited = backend.await_delivery(Duration::from_secs(2));
+    println!(
+        "LIVE previous coordinator after adoption: read {:?}, acknowledge {:?}, wait {:?}",
+        read.as_ref().map(Option::is_some),
+        acknowledged.as_ref().map(Option::is_some),
+        waited.as_ref().map(Option::is_some),
+    );
+    for (call, result) in [
+        ("read", read),
+        ("acknowledge", acknowledged),
+        ("wait", waited),
+    ] {
+        if result != Err(MailboxError::Fenced) {
+            return Err(format!("the previous coordinator's {call} was not fenced").into());
+        }
+    }
+    if adopting.next_delivery()?.as_ref() != Some(&first) {
+        return Err("the unacknowledged batch left the adopter".into());
+    }
+    let next = adopting.acknowledge(&first.id)?;
+    let repeated = adopting.acknowledge(&first.id)?;
+    let current = adopting.next_delivery()?;
+    println!(
+        "LIVE after acknowledging {}: next {:?}, repeat {:?}, current {:?}",
+        first.id,
+        next.as_ref().map(|delivery| delivery.id.as_str()),
+        repeated.as_ref().map(|delivery| delivery.id.as_str()),
+        current.as_ref().map(|delivery| delivery.id.as_str()),
+    );
+    if next.as_ref().is_some_and(|next| next.id == first.id) {
+        return Err("an acknowledged batch was delivered again".into());
+    }
+    if repeated != next || current != next {
+        return Err("a repeated acknowledgement failed or consumed a later batch".into());
+    }
+    let waited = adopting.await_delivery(Duration::from_secs(2))?;
     println!(
         "LIVE bounded wait returned {} actionable messages",
         waited.map_or(0, |delivery| delivery.actionable().count())
     );
-    let read = adopting.next_delivery();
-    println!("LIVE adopter reads the mailbox: {}", read.is_ok());
-    read?;
-    match backend.next_delivery() {
-        Ok(_) => println!("LIVE previous coordinator can still read the mailbox"),
-        Err(error) => println!("LIVE previous coordinator after adoption: {error}"),
-    }
     Ok(())
 }
 

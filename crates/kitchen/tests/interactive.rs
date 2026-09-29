@@ -305,6 +305,7 @@ fn missing_or_unusable_orchestrators_are_reported_not_faked() -> TestResult {
             Capability::WorkerLaunchReadiness,
             Capability::WorkerMessaging,
             Capability::WorkerStatusAndOutcome,
+            Capability::WorkerDeliveries,
         ]),
     };
     assert_eq!(
@@ -312,6 +313,25 @@ fn missing_or_unusable_orchestrators_are_reported_not_faked() -> TestResult {
         Some(ExecutionMode::Solo {
             reason: SoloReason::MissingCapabilities {
                 missing: vec![Capability::WorkerCancel]
+            }
+        })
+    );
+    // Nor can one whose coordinator never receives questions or reports.
+    let silent = Orchestrator::Orca {
+        project: Some(repo()?),
+        capabilities: CapabilitySet::supporting([
+            Capability::WorkerLaunchIsolated,
+            Capability::WorkerLaunchReadiness,
+            Capability::WorkerMessaging,
+            Capability::WorkerStatusAndOutcome,
+            Capability::WorkerCancel,
+        ]),
+    };
+    assert_eq!(
+        solo(&silent),
+        Some(ExecutionMode::Solo {
+            reason: SoloReason::MissingCapabilities {
+                missing: vec![Capability::WorkerDeliveries]
             }
         })
     );

@@ -9,6 +9,8 @@
 //! between reading and handling a batch loses nothing. A backend that
 //! declares [`Capability::RunTransfer`] lets a new coordinator adopt the run
 //! after a restart; the previous one is then fenced from the mailbox.
+//! Coordination requires deliveries
+//! ([`crate::workflows::coordination::REQUIRED_WORKER_CAPABILITIES`]).
 //!
 //! The contract says nothing about where the mailbox lives, so a backend
 //! may transport messages that Kitchen itself stores. Checked by

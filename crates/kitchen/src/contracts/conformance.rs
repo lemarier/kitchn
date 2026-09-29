@@ -10,13 +10,15 @@
 //!
 //! [`run_mailbox`] checks the coordinator mailbox against batches the caller
 //! seeded; it acknowledges them, so it consumes the seeded messages.
+//! Coordination cannot run without worker deliveries, so a backend that does
+//! not declare them fails it.
 //!
 //! The worker launch requests a branch. [`run_worker`] uses
 //! `kitchen/<run_tag>`; a backend that can only create branches under a
 //! host-chosen prefix passes a branch it can obtain to
 //! [`run_worker_on_branch`].
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use crate::{
     BackendId, ConsumerId, CredentialId, HouseId, TaskId,
@@ -74,12 +76,14 @@ pub enum Check {
     /// branch the inventory listed before is still listed after. Without a
     /// declared inventory, only the receipt is checked.
     ReleaseKeepsBranch,
-    /// Without declared deliveries, mailbox reads are refused as unsupported.
-    DeliveriesUndeclared,
+    /// The backend declares worker deliveries, which coordination requires.
+    DeliveriesDeclared,
     /// An unacknowledged batch is delivered again on every read.
     DeliveryReplayed,
     /// After a restart, the adopting coordinator receives the unacknowledged
-    /// batch and the previous one is fenced; undeclared adoption is refused.
+    /// batch; the previous one is fenced from reading, acknowledging, and
+    /// waiting, and the batch stays with the adopter. Undeclared adoption is
+    /// refused.
     AdoptionReplays,
     /// Repeating an acknowledgement succeeds and consumes no later batch.
     DuplicateAcknowledgement,
@@ -106,7 +110,7 @@ impl fmt::Display for Check {
             Self::MessageRecovery => "message recovery as declared",
             Self::CancelObserved => "cancel observed",
             Self::ReleaseKeepsBranch => "release keeps the branch",
-            Self::DeliveriesUndeclared => "undeclared deliveries refused",
+            Self::DeliveriesDeclared => "worker deliveries declared",
             Self::DeliveryReplayed => "unacknowledged delivery replayed",
             Self::AdoptionReplays => "adoption after restart replays the mailbox",
             Self::DuplicateAcknowledgement => "duplicate acknowledgement",
@@ -251,7 +255,8 @@ pub fn run_worker_on_branch(
 /// backend namespace.
 ///
 /// # Errors
-/// Returns the first [`ConformanceFailure`].
+/// Returns the first [`ConformanceFailure`]; a backend that does not declare
+/// [`Capability::WorkerDeliveries`] fails [`Check::DeliveriesDeclared`].
 pub fn run_mailbox(
     coordinator: &dyn CoordinatorMailbox,
     restarted: &dyn CoordinatorMailbox,
@@ -270,36 +275,14 @@ pub fn run_mailbox(
     }
     let declared = |capability| descriptor.capabilities.support(capability).is_some();
     if !declared(Capability::WorkerDeliveries) {
-        let unsupported = Err(MailboxError::Unavailable(BackendUnavailable::Unsupported(
-            Capability::WorkerDeliveries,
-        )));
-        if coordinator.next_delivery() != unsupported {
-            return fail(
-                Check::DeliveriesUndeclared,
-                "undeclared deliveries were read",
-            );
-        }
-        report
-            .results
-            .push((Check::DeliveriesUndeclared, CheckResult::Passed));
-        for check in [
-            Check::DeliveryReplayed,
-            Check::AdoptionReplays,
-            Check::DuplicateAcknowledgement,
-            Check::DeliveryOrder,
-        ] {
-            report.results.push((
-                check,
-                CheckResult::NotApplicable {
-                    requires: Capability::WorkerDeliveries,
-                },
-            ));
-        }
-        return Ok(report);
+        return fail(
+            Check::DeliveriesDeclared,
+            "coordination requires worker deliveries, which the backend does not declare",
+        );
     }
     report
         .results
-        .push((Check::DeliveriesUndeclared, CheckResult::NothingUndeclared));
+        .push((Check::DeliveriesDeclared, CheckResult::Passed));
 
     let first = match coordinator.next_delivery() {
         Ok(Some(first)) => first,
@@ -340,6 +323,24 @@ pub fn run_mailbox(
                 "the previous coordinator still reads the mailbox",
             );
         }
+        if coordinator.acknowledge(&first.id) != Err(MailboxError::Fenced) {
+            return fail(
+                Check::AdoptionReplays,
+                "the previous coordinator's acknowledgement was not fenced",
+            );
+        }
+        if restarted.next_delivery() != Ok(Some(first.clone())) {
+            return fail(
+                Check::AdoptionReplays,
+                "the unacknowledged batch left the adopting coordinator",
+            );
+        }
+        if coordinator.await_delivery(FENCED_WAIT) != Err(MailboxError::Fenced) {
+            return fail(
+                Check::AdoptionReplays,
+                "the previous coordinator still waits on the mailbox",
+            );
+        }
         report
             .results
             .push((Check::AdoptionReplays, CheckResult::Passed));
@@ -378,6 +379,11 @@ pub fn run_mailbox(
         .push((Check::DeliveryOrder, CheckResult::Passed));
     Ok(report)
 }
+
+/// How long a fenced coordinator's wait may take in [`run_mailbox`]. A fenced
+/// call returns at once and the adopter's batch is still waiting, so this
+/// only bounds a backend that wrongly blocks.
+const FENCED_WAIT: Duration = Duration::from_secs(1);
 
 /// Acknowledge batches from `first` until none is left, repeating the first
 /// acknowledgement once, and return every message id in delivery order.

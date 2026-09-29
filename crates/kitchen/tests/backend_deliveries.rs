@@ -63,13 +63,10 @@ fn the_fake_mailbox_conforms() -> TestResult {
     let fake = FakeBackend::fully_capable(backend_id()?, house()?);
     let sent = seed(&fake)?;
     let report = conformance::run_mailbox(&fake, &fake.restarted(), &sent)?;
-    assert_eq!(
-        report.result(Check::DeliveriesUndeclared),
-        Some(CheckResult::NothingUndeclared)
-    );
     passed(
         &report,
         &[
+            Check::DeliveriesDeclared,
             Check::DeliveryReplayed,
             Check::AdoptionReplays,
             Check::DuplicateAcknowledgement,
@@ -121,7 +118,7 @@ fn an_empty_mailbox_is_a_checkpoint() -> TestResult {
 }
 
 #[test]
-fn undeclared_deliveries_and_adoption_are_refused() -> TestResult {
+fn a_backend_without_deliveries_fails_the_mailbox_suite() -> TestResult {
     let silent = without(&[Capability::WorkerDeliveries])?;
     assert_eq!(
         silent.next_delivery(),
@@ -130,18 +127,17 @@ fn undeclared_deliveries_and_adoption_are_refused() -> TestResult {
         )))
     );
     let sent = seed(&silent)?;
-    let report = conformance::run_mailbox(&silent, &silent.restarted(), &sent)?;
-    assert_eq!(
-        report.result(Check::DeliveriesUndeclared),
-        Some(CheckResult::Passed)
-    );
-    assert_eq!(
-        report.result(Check::DeliveryOrder),
-        Some(CheckResult::NotApplicable {
-            requires: Capability::WorkerDeliveries
-        })
-    );
+    // Coordination cannot run without deliveries, so their absence is a
+    // failure, never a pass with the delivery checks skipped.
+    let failure = conformance::run_mailbox(&silent, &silent.restarted(), &sent)
+        .err()
+        .ok_or("a backend without deliveries passed")?;
+    assert_eq!(failure.check, Check::DeliveriesDeclared);
+    Ok(())
+}
 
+#[test]
+fn undeclared_adoption_is_refused() -> TestResult {
     // Deliveries without run transfer: one coordinator drains the mailbox.
     let fixed = without(&[Capability::RunTransfer])?;
     let sent = seed(&fixed)?;
@@ -185,6 +181,14 @@ enum Fault {
     AckConsumesOldest,
     /// Adoption succeeds without fencing the previous coordinator.
     NoFence,
+    /// A fenced coordinator's acknowledgement takes the run back and consumes
+    /// the batch.
+    FencedAckAccepted,
+    /// A fenced coordinator's acknowledgement reports `Fenced` but consumes
+    /// the batch anyway.
+    FencedAckConsumes,
+    /// A fenced coordinator still receives the batch while waiting.
+    FencedWaitReads,
     /// Messages within a batch come out reversed.
     Reorder,
 }
@@ -245,16 +249,33 @@ impl CoordinatorMailbox for Broken {
     }
 
     fn acknowledge(&self, delivery: &ExternalRef) -> Result<Option<Delivery>, MailboxError> {
-        let target = match (self.fault, self.inner.next_delivery()?) {
-            (Fault::AckConsumesOldest, Some(oldest)) => oldest.id,
-            _ => delivery.clone(),
+        let target = match (self.fault, self.inner.next_delivery()) {
+            (Fault::AckConsumesOldest, Ok(Some(oldest))) => oldest.id,
+            (Fault::FencedAckAccepted, Err(MailboxError::Fenced)) => {
+                self.inner.adopt_run()?;
+                let next = self.inner.acknowledge(delivery)?;
+                return Ok(self.shape(next));
+            }
+            (Fault::FencedAckConsumes, Err(MailboxError::Fenced)) => {
+                self.inner.adopt_run()?;
+                self.inner.acknowledge(delivery)?;
+                return Err(MailboxError::Fenced);
+            }
+            (_, Err(error)) => return Err(error),
+            (_, Ok(_)) => delivery.clone(),
         };
         let next = self.inner.acknowledge(&target)?;
         Ok(self.shape(next))
     }
 
     fn await_delivery(&self, wait: Duration) -> Result<Option<Delivery>, MailboxError> {
-        let delivery = self.inner.await_delivery(wait)?;
+        let delivery = match (self.fault, self.inner.await_delivery(wait)) {
+            (Fault::FencedWaitReads, Err(MailboxError::Fenced)) => {
+                self.inner.adopt_run()?;
+                self.inner.next_delivery()?
+            }
+            (_, delivery) => delivery?,
+        };
         Ok(self.shape(delivery))
     }
 }
@@ -277,13 +298,45 @@ fn broken_run(fault: Fault) -> TestResult<ConformanceFailure> {
 
 #[test]
 fn each_broken_rule_fails_its_check() -> TestResult {
-    for (fault, check) in [
-        (Fault::ConsumeOnRead, Check::DeliveryReplayed),
-        (Fault::NoFence, Check::AdoptionReplays),
-        (Fault::AckConsumesOldest, Check::DuplicateAcknowledgement),
-        (Fault::Reorder, Check::DeliveryOrder),
+    for (fault, check, problem) in [
+        (
+            Fault::ConsumeOnRead,
+            Check::DeliveryReplayed,
+            "an unacknowledged batch was not replayed",
+        ),
+        (
+            Fault::NoFence,
+            Check::AdoptionReplays,
+            "the previous coordinator still reads the mailbox",
+        ),
+        (
+            Fault::FencedAckAccepted,
+            Check::AdoptionReplays,
+            "the previous coordinator's acknowledgement was not fenced",
+        ),
+        (
+            Fault::FencedAckConsumes,
+            Check::AdoptionReplays,
+            "the unacknowledged batch left the adopting coordinator",
+        ),
+        (
+            Fault::FencedWaitReads,
+            Check::AdoptionReplays,
+            "the previous coordinator still waits on the mailbox",
+        ),
+        (
+            Fault::AckConsumesOldest,
+            Check::DuplicateAcknowledgement,
+            "a repeated acknowledgement failed or consumed a later batch",
+        ),
+        (
+            Fault::Reorder,
+            Check::DeliveryOrder,
+            "messages arrived out of order, missing, or more than once",
+        ),
     ] {
-        assert_eq!(broken_run(fault)?.check, check);
+        let failure = broken_run(fault)?;
+        assert_eq!((failure.check, failure.problem), (check, problem));
     }
     Ok(())
 }

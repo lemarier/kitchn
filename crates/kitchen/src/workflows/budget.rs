@@ -61,7 +61,7 @@ use crate::{
     id::EffectName,
     scheduling::{
         self, BudgetExhaustion, PrecheckTimeout, Recurrence, ScheduleEvidence, SchedulePolicy,
-        ScheduleSpec, ScheduleState, Timezone, UndeliveredReport, WorkflowName,
+        ScheduleSpec, ScheduleState, Timezone, UndeliveredReport, UsageWindow, WorkflowName,
     },
     selection::ResolvedSelection,
     state::{EffectPlan, EffectRecord, EffectState, HouseStore, MarkerFact, StateError, TaskState},
@@ -312,8 +312,19 @@ const PRECHECK_TIMEOUT: Duration = PrecheckTimeout::MAX;
 /// so only a lost or interrupted attempt spends one.
 const TICK_ATTEMPTS: u32 = 16;
 
-/// How long a window's task stays retryable, well past the longest window.
-const TICK_ELAPSED: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// The retry policy of a window's task. The task is created inside the
+/// window, so an elapsed budget of the window's length keeps it retryable
+/// until the window ends, whatever the policy's window length.
+fn tick_retry(window: UsageWindow) -> Result<RetryPolicy> {
+    let length = window
+        .end
+        .as_unix_millis()
+        .saturating_sub(window.start.as_unix_millis());
+    Ok(RetryPolicy::new(
+        TICK_ATTEMPTS,
+        Duration::from_millis(length),
+    )?)
+}
 
 /// Which budget command a schedule step runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,14 +594,32 @@ pub fn tick(
         role: Role::Expediter,
         repository: None,
         authority: TaskAuthority::delegate(tick.grants, tick.authority.iter().cloned())?,
-        retry: RetryPolicy::new(TICK_ATTEMPTS, TICK_ELAPSED)?,
+        retry: tick_retry(window)?,
         provenance: tick.provenance.clone(),
         requires: CapabilityRequirements::new(),
         resources: BTreeSet::new(),
         agent: None,
     };
-    tick.store
-        .create_task(spec, tick.claimant, tick.clock.now())?;
+    match tick
+        .store
+        .create_task(spec.clone(), tick.claimant, tick.clock.now())
+    {
+        Ok(_) => {}
+        // A window task an earlier release created keeps its stored retry
+        // policy; anything else that differs is still a conflict.
+        Err(Error::State(StateError::TaskConflict(_))) => {
+            let stored = tick.store.task(&task)?.spec().clone();
+            if stored
+                != (TaskSpec {
+                    retry: stored.retry,
+                    ..spec
+                })
+            {
+                return Err(Error::State(StateError::TaskConflict(task)));
+            }
+        }
+        Err(error) => return Err(error),
+    }
     let fence = claim(tick, &task)?;
     let result = act(tick, &task, fence, policy, evidence);
     let released = tick.store.relinquish(&task, fence, tick.clock.now());

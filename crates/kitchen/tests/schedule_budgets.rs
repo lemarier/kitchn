@@ -2700,3 +2700,118 @@ fn a_refused_report_is_posted_by_the_next_tick() -> TestResult {
     assert_eq!(posts, 1);
     Ok(())
 }
+
+#[test]
+fn a_windows_task_stays_retryable_for_the_longest_window() -> TestResult {
+    use kitchen::scheduling::MAX_WINDOW_HOURS;
+    let longest = Duration::from_secs(u64::from(MAX_WINDOW_HOURS) * 3600);
+    assert_eq!(MAX_WINDOW_HOURS, 744);
+    assert!(
+        RetryPolicy::new(1, longest).is_ok(),
+        "the contract admits it"
+    );
+
+    for hours in [24, MAX_WINDOW_HOURS] {
+        let fixture = Fixture::new()?;
+        let sim = SimOrca::default();
+        let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+        exhausted_pickup(&sim, &backend)?;
+        let policy = SchedulePolicy {
+            window_hours: WindowHours::new(hours)?,
+            ..policy()?
+        };
+        let grants = tick_grants()?;
+        let claimant = scheduled("budget-tick")?;
+        let clock = ManualClock::starting_at(1);
+        let tick = tick_with(&fixture, &backend, None, &grants, &claimant, &clock)?;
+        let evidence = backend.schedule_evidence()?;
+        let window = policy.window_hours.containing(evidence.observed_at);
+        budget::tick(&tick, &policy, &evidence)?;
+
+        // The task is created at the first exhaustion in the window and must
+        // be claimable until the window's last instant, however long it is.
+        let task = fixture.store.task(&task_id(&format!(
+            "budget-{}",
+            window.start.as_unix_millis()
+        ))?)?;
+        assert_eq!(
+            task.spec().retry.max_elapsed(),
+            Duration::from_secs(u64::from(hours) * 3600),
+            "{hours}h window"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_window_task_from_an_earlier_retry_policy_is_continued_not_refused() -> TestResult {
+    let policy = policy()?;
+    let grants = tick_grants()?;
+    let claimant = scheduled("budget-tick")?;
+
+    // The spec this release creates for the window.
+    let fresh = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    exhausted_pickup(&sim, &backend)?;
+    let evidence = backend.schedule_evidence()?;
+    let window = policy.window_hours.containing(evidence.observed_at);
+    let id = task_id(&format!("budget-{}", window.start.as_unix_millis()))?;
+    let clock = ManualClock::starting_at(1);
+    budget::tick(
+        &tick_with(&fresh, &backend, None, &grants, &claimant, &clock)?,
+        &policy,
+        &evidence,
+    )?;
+    let current = fresh.store.task(&id)?.spec().clone();
+
+    // An earlier release created the same window's task with another retry
+    // policy; the tick continues it and still acts.
+    let earlier = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    exhausted_pickup(&sim, &backend)?;
+    let old_retry = RetryPolicy::new(1, Duration::from_secs(3600))?;
+    earlier.store.create_task(
+        TaskSpec {
+            retry: old_retry,
+            ..current.clone()
+        },
+        &claimant,
+        Timestamp::from_unix_millis(1),
+    )?;
+    let report = budget::tick(
+        &tick_with(&earlier, &backend, None, &grants, &claimant, &clock)?,
+        &policy,
+        &backend.schedule_evidence()?,
+    )?;
+    assert!(matches!(report.pass, BudgetPass::Acted(_)), "{report:?}");
+    assert_eq!(earlier.store.task(&id)?.spec().retry, old_retry);
+
+    // Any other difference is still a conflict.
+    let other = Fixture::new()?;
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?.with_clock(noon_on_day_twenty);
+    exhausted_pickup(&sim, &backend)?;
+    other.store.create_task(
+        TaskSpec {
+            role: Role::SousChef,
+            ..current
+        },
+        &claimant,
+        Timestamp::from_unix_millis(1),
+    )?;
+    let refused = budget::tick(
+        &tick_with(&other, &backend, None, &grants, &claimant, &clock)?,
+        &policy,
+        &backend.schedule_evidence()?,
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(kitchen::Error::State(StateError::TaskConflict(_)))
+        ),
+        "{refused:?}"
+    );
+    Ok(())
+}

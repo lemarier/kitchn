@@ -31,9 +31,9 @@ use kitchen::{
     contracts::{
         AttemptNumber, BackendUnavailable, BranchName, Capability, CapabilitySet, ContractError,
         CoordinatorMailbox, Effect, EffectExecutor, EffectFailure, EffectRequest, ExternalRef,
-        IdempotencyKey, Lookup, MAX_MAILBOX_WAIT, MailMessage, MessageKind, NotAppliedReason,
-        Operation, Repository, ResourceKind, ResourceRef, Role, Support, Text, UncertainReason,
-        WorkerBackend, WorkerState, Workspace,
+        IdempotencyKey, Lookup, MAX_MAILBOX_WAIT, MailMessage, MailboxError, MessageKind,
+        NotAppliedReason, Operation, Repository, ResourceKind, ResourceRef, Role, Support, Text,
+        UncertainReason, WorkerBackend, WorkerState, Workspace,
         conformance::{self, Check, CheckResult, ConformanceFixture, ConformanceReport},
         fake::FakeBackend,
     },
@@ -57,6 +57,7 @@ fn config(sim: &SimHttp, coordinator: &str, timeout: Duration) -> TestResult<Htt
         endpoint: HttpEndpoint::new(&sim.endpoint())?,
         backend: backend_id()?,
         house: house()?,
+        credential: common::credential()?,
         run: ExternalRef::new("run-1")?,
         coordinator: ExternalRef::new(coordinator)?,
         curl: curl()?,
@@ -264,6 +265,103 @@ fn undeclared_effects_are_refused_before_anything_is_sent() -> TestResult {
             Capability::ResourceInventory
         ))
     );
+    Ok(())
+}
+
+#[test]
+fn adoption_needs_the_protocols_answer() -> TestResult {
+    let sim = capable()?;
+    let backend = connect(&sim)?;
+    backend.adopt_run()?;
+    sim.inject(Fault::Raw(200, r#"{"status":"fenced"}"#.into()));
+    assert_eq!(backend.adopt_run(), Err(MailboxError::Fenced));
+    for garbage in [r#"{"status":"adopted"}"#, "<html>proxy</html>", ""] {
+        sim.inject(Fault::Raw(200, garbage.into()));
+        assert_eq!(
+            backend.adopt_run(),
+            Err(MailboxError::Unavailable(BackendUnavailable::Transport)),
+            "{garbage}"
+        );
+    }
+    sim.inject(Fault::Status(503));
+    assert_eq!(
+        backend.adopt_run(),
+        Err(MailboxError::Unavailable(BackendUnavailable::Transport))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_request_for_another_credential_is_never_sent() -> TestResult {
+    let sim = capable()?;
+    let backend = connect(&sim)?;
+    let fresh = EffectRequest::new(
+        house()?,
+        backend_id()?,
+        CredentialId::new("other-token")?,
+        task_id("task-1")?,
+        AttemptNumber::FIRST,
+        IdempotencyKey::from_ref(ExternalRef::new("other-credential")?),
+        launch("kitchen/other")?,
+    );
+    // As the store reads it back after a restart.
+    let persisted: EffectRequest = serde_json::from_str(&serde_json::to_string(&fresh)?)?;
+    for request in [&fresh, &persisted] {
+        assert_eq!(
+            backend.execute(request),
+            Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+        );
+        // Not proof of absence: another executor may hold that credential.
+        assert_eq!(backend.lookup(request), Ok(Lookup::Unknown));
+    }
+    let paths: Vec<_> = sim.requests().into_iter().map(|call| call.path).collect();
+    assert_eq!(paths, ["/v1/descriptor"]);
+    assert_eq!(sim.backend().effects_performed(), 0);
+
+    // The bound credential still goes through.
+    backend.execute(&request("bound-credential", launch("kitchen/bound")?)?)?;
+    assert_eq!(sim.backend().effects_performed(), 1);
+    Ok(())
+}
+
+#[test]
+fn redirects_are_not_followed() -> TestResult {
+    let sim = capable()?;
+    let elsewhere = capable()?;
+    sim.inject(Fault::Redirect(format!(
+        "{}/v1/descriptor",
+        elsewhere.endpoint()
+    )));
+    let error = HttpBackend::connect(config(&sim, "c", Duration::from_secs(5))?, TOKEN)
+        .err()
+        .ok_or("a redirected descriptor was accepted")?;
+    assert!(matches!(
+        error,
+        HttpError::Unavailable {
+            source: BackendUnavailable::Transport,
+            ..
+        }
+    ));
+
+    let backend = connect(&sim)?;
+    let launch = request("redirected", launch("kitchen/redirected")?)?;
+    sim.inject(Fault::Redirect(format!(
+        "{}/v1/effects",
+        elsewhere.endpoint()
+    )));
+    // Not a typed answer, so the effect is reconciled by lookup.
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    );
+    sim.inject(Fault::Redirect(format!(
+        "{}/v1/effects/lookup",
+        elsewhere.endpoint()
+    )));
+    assert_eq!(backend.lookup(&launch), Err(BackendUnavailable::Transport));
+    // Neither the token nor any request reached the redirect target.
+    assert!(elsewhere.requests().is_empty());
+    assert_eq!(sim.backend().effects_performed(), 0);
     Ok(())
 }
 
@@ -655,11 +753,22 @@ fn the_resolver_builds_the_bound_http_backend() -> TestResult {
         ],
     )?;
     assert_eq!(backend.descriptor().house, house.house);
-    assert!(
-        backend
-            .execute(&request("resolved", launch("kitchen/resolved")?)?)
-            .is_ok()
+    let bound = EffectRequest::new(
+        house.house.clone(),
+        backend_id()?,
+        CredentialId::new("sandbox-token")?,
+        task_id("task-1")?,
+        AttemptNumber::FIRST,
+        IdempotencyKey::from_ref(ExternalRef::new("resolved")?),
+        launch("kitchen/resolved")?,
     );
+    assert!(backend.execute(&bound).is_ok());
+    // A request authorized under another credential is refused unsent.
+    assert_eq!(
+        backend.execute(&request("unbound", launch("kitchen/unbound")?)?),
+        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+    );
+    assert_eq!(sim.backend().effects_performed(), 1);
     Ok(())
 }
 

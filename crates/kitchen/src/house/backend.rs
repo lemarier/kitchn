@@ -142,18 +142,13 @@ impl HttpEndpoint {
     /// [`EndpointError`] for an endpoint outside the rules above.
     pub fn new(value: &str) -> Result<Self, EndpointError> {
         let value = value.strip_suffix('/').unwrap_or(value);
-        let rest = value
-            .strip_prefix("https://")
-            .or_else(|| {
-                value
-                    .strip_prefix("http://")
-                    .filter(|rest| Self::is_loopback(rest))
-            })
-            .ok_or(EndpointError)?;
-        let host = rest.split('/').next().unwrap_or_default();
+        let (secure, rest) = match value.strip_prefix("https://") {
+            Some(rest) => (true, rest),
+            None => (false, value.strip_prefix("http://").ok_or(EndpointError)?),
+        };
+        let host = Self::host(rest.split('/').next().unwrap_or_default()).ok_or(EndpointError)?;
         if value.len() > MAX_ENDPOINT_BYTES
-            || host.is_empty()
-            || host.contains('@')
+            || !(secure || matches!(host, "127.0.0.1" | "localhost" | "[::1]"))
             || value.contains(['?', '#', '"', '\\', '\''])
             || value.bytes().any(|byte| !byte.is_ascii_graphic())
         {
@@ -162,15 +157,42 @@ impl HttpEndpoint {
         Ok(Self(value.to_owned()))
     }
 
-    fn is_loopback(rest: &str) -> bool {
-        let authority = rest.split('/').next().unwrap_or_default();
-        let host = authority
-            .rsplit_once(':')
-            .filter(|(host, port)| {
-                !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
-            })
-            .map_or(authority, |(host, _)| host);
-        matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+    /// The host of `authority` (`host`, `host:port`, or `[v6]:port`), or
+    /// `None` for an empty or malformed host, or a port that is empty, not
+    /// decimal, zero, or above 65535.
+    fn host(authority: &str) -> Option<&str> {
+        let (host, port) = if authority.starts_with('[') {
+            let end = authority.find(']')?;
+            let (host, rest) = authority.split_at(end.checked_add(1)?);
+            let inner = host.get(1..host.len().checked_sub(1)?)?;
+            if inner.is_empty() || !inner.bytes().all(|b| b.is_ascii_hexdigit() || b == b':') {
+                return None;
+            }
+            match rest {
+                "" => (host, None),
+                _ => (host, Some(rest.strip_prefix(':')?)),
+            }
+        } else {
+            let (host, port) = authority
+                .split_once(':')
+                .map_or((authority, None), |(host, port)| (host, Some(port)));
+            let label = |part: &str| {
+                !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            };
+            if !host.split('.').all(label) {
+                return None;
+            }
+            (host, port)
+        };
+        match port {
+            None => Some(host),
+            Some(port) if port.bytes().all(|b| b.is_ascii_digit()) => port
+                .parse::<u16>()
+                .ok()
+                .filter(|&port| port != 0)
+                .map(|_| host),
+            Some(_) => None,
+        }
     }
 
     /// Whether the endpoint uses plain `http`, which only a loopback host may.
@@ -273,6 +295,8 @@ mod tests {
             "http://127.0.0.1:9000",
             "http://localhost/api",
             "http://[::1]:8080",
+            "https://sandbox.example.com:65535",
+            "https://[2001:db8::1]",
         ] {
             assert!(HttpEndpoint::new(accepted).is_ok(), "{accepted}");
         }
@@ -287,6 +311,18 @@ mod tests {
             "http://sandbox.example.com",
             "http://127.0.0.1.example.com",
             "http://localhost:x",
+            "https://:443",
+            "https://:443/kitchen",
+            "https://example.com:",
+            "https://example.com:0",
+            "https://example.com:65536",
+            "https://example.com:+80",
+            "https://example.com:80:80",
+            "https://exa_mple.com",
+            "https://example..com",
+            "https://[]:443",
+            "https://[::1",
+            "https://[::1]x",
             "ftp://example.com",
             "https://user:secret@example.com",
             "https://example.com/?token=secret",

@@ -313,6 +313,7 @@ pub fn resolve_http_backend(
             endpoint,
             backend: binding.backend.clone(),
             house: house.house.clone(),
+            credential: binding.credential.clone(),
             run: session.run,
             coordinator: session.coordinator,
             curl: session.curl,

@@ -30,8 +30,10 @@ namespace, the credential, and the endpoint:
 
 Guided `kitchn house init` only sets up Orca, so this binding is written into
 the house policy by hand for now. The endpoint must be `https`, or plain `http`
-to `127.0.0.1`, `localhost`, or `[::1]`. It may not contain user information, a
-query, or a fragment, so no credential can hide in it.
+to `127.0.0.1`, `localhost`, or `[::1]`. Its host must be a DNS name, an IPv4
+address, or a bracketed IPv6 address, and any port must be 1 to 65535. It may
+not contain user information, a query, or a fragment, so no credential can hide
+in it.
 
 The bearer token goes in `<registry>/private/<house>/credentials/<credential>`,
 owned by you and mode `600`, the same place a forge token goes. kitchn opens it
@@ -47,11 +49,13 @@ through a configuration on stdin, never in its arguments.
 - Bodies are JSON. Calls that name a worker or a batch use `POST` with a body,
   so handles never need URL encoding.
 - Only a `200` response carries an answer. For reads, any other status means
-  the call failed and nothing may be inferred.
+  the call failed and nothing may be inferred. Kitchen does not follow
+  redirects, so a `3xx` is such a status.
 - A service must never forward the `Authorization` header or any credential to
   a worker. Requests name credentials (`"credential": "sandbox-token"`); they
   never carry one. A service that injects credentials, for example at egress,
-  resolves the name itself.
+  resolves the name itself. Kitchen sends only requests that name the
+  binding's credential, the one whose token authenticates the call.
 
 Identifiers (`backend`, `house`, `task`, `credential`) are 1 to 64 ASCII
 letters, digits, `-`, or `_`. Handles, keys, and message ids are opaque strings
@@ -279,7 +283,7 @@ run and the coordinator instance:
 | `POST /v1/deliveries/next` | | Read the oldest unacknowledged batch without consuming it. |
 | `POST /v1/deliveries/acknowledge` | `delivery` | Consume the batch with that id if it is the oldest, then read the next. |
 | `POST /v1/deliveries/await` | `waitMs` | Like `next`, but hold up to `waitMs` until a batch with a question, report, or escalation waits. |
-| `POST /v1/runs/adopt` | | Make this coordinator the run's reader; answers `{}`. |
+| `POST /v1/runs/adopt` | | Make this coordinator the run's reader; answers `{}`, or `{ "status": "fenced" }` when another coordinator adopted the run since. Any other body is a failed call. |
 
 Mailbox calls answer one of:
 

@@ -30,7 +30,7 @@ use std::{
 };
 
 use crate::{
-    BackendId, ErrorClass, HouseId,
+    BackendId, CredentialId, ErrorClass, HouseId,
     contracts::{
         BackendDescriptor, BackendUnavailable, Capability, ContractError, CoordinatorMailbox,
         Delivery, Effect, EffectExecutor, EffectFailure, EffectRequest, ExternalRef, Lookup,
@@ -61,6 +61,9 @@ pub struct HttpConfig {
     pub backend: BackendId,
     /// The house; the service must report exactly this one.
     pub house: HouseId,
+    /// The credential the binding names, whose token authenticates every
+    /// call. Requests naming another credential are refused unsent.
+    pub credential: CredentialId,
     /// The supervised run workers report to.
     pub run: ExternalRef,
     /// This coordinator instance, which the service fences after another
@@ -140,6 +143,7 @@ impl HttpError {
 pub struct HttpBackend {
     descriptor: BackendDescriptor,
     transport: Transport,
+    credential: CredentialId,
     run: ExternalRef,
     coordinator: ExternalRef,
     call_timeout: Duration,
@@ -206,6 +210,7 @@ impl HttpBackend {
         Ok(Self {
             descriptor,
             transport,
+            credential: config.credential,
             run: config.run,
             coordinator: config.coordinator,
             call_timeout: config.call_timeout,
@@ -334,6 +339,11 @@ impl EffectExecutor for HttpBackend {
         if request.backend() != &descriptor.backend {
             return refused(NotAppliedReason::ForeignBackend);
         }
+        // Every call carries the bound credential's token, so a request
+        // authorized under another credential cannot be sent.
+        if request.credential() != &self.credential {
+            return refused(NotAppliedReason::Rejected);
+        }
         // Only worker operations are covered, so no other effect's
         // capability is ever declared.
         let capability = request.effect().required_capability();
@@ -396,9 +406,13 @@ impl EffectExecutor for HttpBackend {
                 request.effect().kind().lookup_capability(),
             ));
         }
-        if request.house() != &descriptor.house || request.backend() != &descriptor.backend {
-            // Never sent from here; whether another executor applied it is
-            // not this service's to say.
+        if request.house() != &descriptor.house
+            || request.backend() != &descriptor.backend
+            || request.credential() != &self.credential
+        {
+            // Never sent from here, and never sent under another credential;
+            // whether another executor applied it is not this service's to
+            // say.
             return Ok(Lookup::Unknown);
         }
         if !matches!(request.effect(), Effect::Worker(_)) {
@@ -446,7 +460,7 @@ impl WorkerBackend for HttpBackend {
 impl CoordinatorMailbox for HttpBackend {
     fn adopt_run(&self) -> Result<(), MailboxError> {
         self.declared(Capability::RunTransfer)?;
-        self.read(
+        let response = self.read(
             Method::Post,
             "/v1/runs/adopt",
             &wire::MailboxBody {
@@ -456,7 +470,12 @@ impl CoordinatorMailbox for HttpBackend {
                 wait_ms: None,
             },
         )?;
-        Ok(())
+        // Only the protocol's `{}` shows the adoption happened.
+        match wire::adoption(&response.body) {
+            Some(wire::Adoption::Adopted) => Ok(()),
+            Some(wire::Adoption::Fenced) => Err(MailboxError::Fenced),
+            None => Err(BackendUnavailable::Transport.into()),
+        }
     }
 
     fn next_delivery(&self) -> Result<Option<Delivery>, MailboxError> {

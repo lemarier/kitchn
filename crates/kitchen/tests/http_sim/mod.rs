@@ -46,6 +46,8 @@ pub enum Fault {
     DropAfterActing,
     /// Answer with this exact status and body, without acting.
     Raw(u16, String),
+    /// Answer `307 Temporary Redirect` to this URL, without acting.
+    Redirect(String),
 }
 
 /// One request as the service received it.
@@ -256,6 +258,7 @@ fn serve(stream: TcpStream, backend: &FakeBackend, state: &Mutex<State>) -> std:
     let answer = match &fault {
         Some(Fault::Status(status)) => Some((*status, String::new())),
         Some(Fault::Raw(status, body)) => Some((*status, body.clone())),
+        Some(Fault::Redirect(_)) => Some((307, String::new())),
         _ => None,
     };
     let (status, reply) = match answer {
@@ -268,6 +271,13 @@ fn serve(stream: TcpStream, backend: &FakeBackend, state: &Mutex<State>) -> std:
     match fault {
         Some(Fault::GarbageAfterActing) => respond(&mut stream, 200, "<html>proxy</html>"),
         Some(Fault::DropAfterActing) => Ok(()),
+        Some(Fault::Redirect(location)) => {
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )?;
+            stream.flush()
+        }
         _ => respond(&mut stream, status, &reply),
     }
 }

@@ -383,6 +383,43 @@ struct MessageBody {
     body: Option<String>,
 }
 
+/// The adoption answer: `{}`, or `{"status":"fenced"}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdoptionBody {
+    #[serde(default)]
+    status: Option<AdoptionStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum AdoptionStatus {
+    Fenced,
+}
+
+/// What a 200 adoption response says.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Adoption {
+    /// This coordinator now reads the run's mailbox.
+    Adopted,
+    /// Another coordinator adopted the run after this one.
+    Fenced,
+}
+
+/// Parse a 200 adoption response, or `None` for any body other than the two
+/// the protocol defines.
+pub(super) fn adoption(body: &[u8]) -> Option<Adoption> {
+    // Parsed through a map, since serde also reads a struct from `[]`.
+    let object = serde_json::from_slice::<serde_json::Map<String, Value>>(body).ok()?;
+    match serde_json::from_value::<AdoptionBody>(Value::Object(object))
+        .ok()?
+        .status
+    {
+        None => Some(Adoption::Adopted),
+        Some(AdoptionStatus::Fenced) => Some(Adoption::Fenced),
+    }
+}
+
 /// What a 200 mailbox response says.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Mailbox {
@@ -603,6 +640,27 @@ mod tests {
         );
         assert_eq!(mailbox(br#"{"status":"closed"}"#, &backend), None);
         Ok(())
+    }
+
+    #[test]
+    fn only_the_protocols_adoption_answers_parse() {
+        assert_eq!(adoption(b"{}"), Some(Adoption::Adopted));
+        assert_eq!(adoption(br#"{"status":"fenced"}"#), Some(Adoption::Fenced));
+        for refused in [
+            &br#"{"status":"adopted"}"#[..],
+            br#"{"status":null,"adopted":true}"#,
+            br#"{"status":"empty"}"#,
+            b"[]",
+            b"",
+            b"not json",
+        ] {
+            assert_eq!(
+                adoption(refused),
+                None,
+                "{}",
+                String::from_utf8_lossy(refused)
+            );
+        }
     }
 
     #[test]

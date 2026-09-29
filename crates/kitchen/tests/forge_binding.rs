@@ -48,6 +48,7 @@ fn house_config(policy_limits: BTreeSet<Grant>) -> TestResult<HouseConfig> {
         agents: None,
         stack_tool: None,
         schedules: None,
+        merge_readiness: Default::default(),
     })
 }
 

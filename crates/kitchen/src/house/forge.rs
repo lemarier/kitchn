@@ -647,6 +647,7 @@ mod tests {
             agents: None,
             stack_tool: None,
             schedules: None,
+            merge_readiness: Default::default(),
         };
         let registry = HouseRegistry::new(root.join("registry"))?;
         registry.initialize(&config)?;

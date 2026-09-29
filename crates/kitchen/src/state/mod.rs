@@ -46,7 +46,7 @@ pub(crate) mod snapshot;
 mod store;
 
 pub use consumer::{ConsumerEvent, ConsumerRecord, ConsumerState, MAX_CONSUMER_HISTORY};
-pub use effects::{ReconcileReport, reconcile, run_effect};
+pub use effects::{ReconcileReport, reconcile, reread_settled, run_effect};
 pub use error::{Corruption, Limit, StateError, StorageOperation};
 pub use marker::{
     IssueRevision, MAX_MARKER_HISTORY, MAX_MARKER_PAYLOAD_BYTES, MAX_MARKERS, MarkerAttempt,
@@ -56,10 +56,11 @@ pub use marker::{
 pub(crate) use model::StoreState;
 pub use model::{
     AttemptRecord, AttemptState, CancelRequest, CancelStatus, Consumption, Creation, EffectOutcome,
-    EffectPlan, EffectRecord, EffectStart, EffectState, EvidenceLog, Lease, MAX_CONSUMED_MESSAGES,
-    MAX_CONSUMERS, MAX_DECISIONS_PER_EFFECT, MAX_EFFECTS_PER_TASK, MAX_EVIDENCE_PER_REVISION,
-    MAX_OWNERSHIP_HISTORY, MAX_TASKS, OwnershipEvent, RecoveryItem, RiskAction, RiskDecision,
-    TaskRecord, TaskState,
+    EffectPlan, EffectRecord, EffectStart, EffectState, EvidenceLog, Lease,
+    MAX_ACKNOWLEDGEMENT_REASON_BYTES, MAX_CONSUMED_MESSAGES, MAX_CONSUMERS,
+    MAX_DECISIONS_PER_EFFECT, MAX_EFFECTS_PER_TASK, MAX_EVIDENCE_PER_REVISION,
+    MAX_OWNERSHIP_HISTORY, MAX_TASKS, OwnershipEvent, RecoveryItem, Reservation, RiskAction,
+    RiskDecision, TaskRecord, TaskState, WriteAcknowledgement,
 };
 pub use snapshot::StoreOptions;
 pub use store::HouseStore;

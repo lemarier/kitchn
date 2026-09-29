@@ -18,11 +18,13 @@ use crate::{
         Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext, EffectRequest,
         EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef, FailureClass, Fence,
         HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef,
-        RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Timestamp, Trigger, UncertainReason,
+        RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Text, Timestamp, Trigger,
+        UncertainReason,
     },
     state::{
         ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerAttempt, MarkerFact,
         MarkerKey, MarkerRecording, StateError, WorkflowMarker,
+        effects::{Found, SettledLookup},
         marker::{MarkerRefusal, Markers},
     },
 };
@@ -45,6 +47,8 @@ pub const MAX_DECISIONS_PER_EFFECT: usize = 16;
 pub const MAX_OWNERSHIP_HISTORY: usize = 256;
 /// Consumed message ids remembered per task.
 pub const MAX_CONSUMED_MESSAGES: usize = 1024;
+/// Bytes in the reason of a [`WriteAcknowledgement`].
+pub const MAX_ACKNOWLEDGEMENT_REASON_BYTES: usize = 4096;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -534,6 +538,24 @@ impl CancelRequest {
     }
 }
 
+/// A person's review of the forge writes of a settled task that did not
+/// succeed, recorded so that a guard that holds a subject because of those
+/// writes can release it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WriteAcknowledgement {
+    /// The person's session that acknowledged.
+    pub by: HolderId,
+    /// When.
+    pub at: Timestamp,
+    /// Why the person is satisfied to proceed.
+    pub reason: Text,
+    /// Writes whose outcome the forge could not prove at this time. The
+    /// person accepted that they may or may not exist.
+    #[serde(default)]
+    pub unresolved: Vec<EffectName>,
+}
+
 /// The durable record of one task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -549,9 +571,17 @@ pub struct TaskRecord {
     consumed: BTreeSet<ExternalRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cancel: Option<CancelRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acknowledgement: Option<WriteAcknowledgement>,
 }
 
 impl TaskRecord {
+    /// The person's review of this settled task's forge writes, if recorded.
+    #[must_use]
+    pub const fn write_acknowledgement(&self) -> Option<&WriteAcknowledgement> {
+        self.acknowledgement.as_ref()
+    }
+
     /// Whether `message` was consumed for this task
     /// ([`crate::state::HouseStore::consume_message`]).
     #[must_use]
@@ -883,6 +913,25 @@ pub enum Creation {
     AlreadyExists,
 }
 
+/// Result of [`crate::state::HouseStore::reserve_task`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Reservation<R> {
+    /// The task did not exist. It was created and claimed in one
+    /// transaction, so it already holds its slot.
+    Reserved(Lease),
+    /// An identical task already existed and was open or had an expired
+    /// claim. The guard passed and it was claimed (or taken over) in the same
+    /// transaction, so it holds its slot again.
+    Resumed(Lease),
+    /// An identical task already existed and nothing was written: it has
+    /// settled, or another claimant holds a live claim.
+    Existing,
+    /// The guard objected to the tasks as they were in the same transaction;
+    /// nothing was written.
+    Blocked(R),
+}
+
 /// Result of a cancellation request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelStatus {
@@ -1184,9 +1233,49 @@ impl StoreState {
             ownership: Vec::new(),
             consumed: BTreeSet::new(),
             cancel: None,
+            acknowledgement: None,
         };
         self.tasks.insert(spec.id, record);
         Ok(Creation::Created)
+    }
+
+    pub(crate) fn reserve_task<R>(
+        &mut self,
+        spec: TaskSpec,
+        claimant: &Claimant,
+        ttl: LeaseTtl,
+        now: Timestamp,
+        guard: impl FnOnce(&[&TaskRecord]) -> Result<Option<R>>,
+    ) -> Result<Reservation<R>> {
+        let id = spec.id.clone();
+        if self.tasks.contains_key(&id) {
+            // Validates that the existing task is identical.
+            self.create_task(spec, claimant, now)?;
+            // A settled task or one another claimant holds live is left
+            // alone. Resuming an unfinished one takes the slot again, so the
+            // guard runs against the other tasks in this transaction.
+            match &self.task(&id)?.state {
+                TaskState::Settled { .. } => return Ok(Reservation::Existing),
+                TaskState::Claimed { lease } if lease.is_live(now) => {
+                    return Ok(Reservation::Existing);
+                }
+                TaskState::Open | TaskState::Claimed { .. } => {}
+            }
+            let tasks: Vec<&TaskRecord> = self.tasks().collect();
+            if let Some(blocked) = guard(&tasks)? {
+                return Ok(Reservation::Blocked(blocked));
+            }
+            return self
+                .take_over(&id, claimant, ttl, now)
+                .map(Reservation::Resumed);
+        }
+        let tasks: Vec<&TaskRecord> = self.tasks().collect();
+        if let Some(blocked) = guard(&tasks)? {
+            return Ok(Reservation::Blocked(blocked));
+        }
+        self.create_task(spec, claimant, now)?;
+        self.claim(&id, claimant, ttl, now)
+            .map(Reservation::Reserved)
     }
 
     pub(crate) fn claim(
@@ -1726,42 +1815,125 @@ impl StoreState {
             .iter_mut()
             .find(|effect| effect.seq == seq)
             .ok_or(Error::State(StateError::EffectNotFound(seq)))?;
-        let next = match (&effect.state, outcome) {
-            (EffectState::Intended | EffectState::Uncertain { .. }, outcome) => {
-                Some(state_for(outcome, now))
-            }
+        apply_outcome(effect, seq, outcome, now)?;
+        Ok(effect.clone())
+    }
+
+    /// Record what a backend lookup proved about one write of a task that
+    /// has settled. Needs no lease, since a settled task has none; only
+    /// [`crate::state::reread_settled`] builds the lookup.
+    pub(crate) fn record_settled_lookup(
+        &mut self,
+        id: &TaskId,
+        seq: EffectSeq,
+        lookup: SettledLookup,
+        now: Timestamp,
+    ) -> Result<EffectRecord> {
+        let task = self.task_mut(id)?;
+        if task.settlement().is_none() {
+            return fail(StateError::TaskNotSettled(id.clone()));
+        }
+        let effect = task
+            .effects
+            .iter_mut()
+            .find(|effect| effect.seq == seq)
+            .ok_or(Error::State(StateError::EffectNotFound(seq)))?;
+        if lookup.key() != effect.request.key() {
+            return fail(StateError::LookupScope(seq));
+        }
+        let next = match (&effect.state, lookup.into_found()) {
             (
-                EffectState::Unresolvable { .. } | EffectState::Waived { .. },
-                EffectOutcome::Applied(receipt),
-            ) => Some(EffectState::Applied { receipt, at: now }),
-            (
-                EffectState::Unresolvable { .. } | EffectState::Waived { .. },
-                EffectOutcome::NotApplied(reason),
-            ) => Some(EffectState::NotApplied { reason, at: now }),
-            (EffectState::Applied { receipt, .. }, EffectOutcome::Applied(reported))
-                if *receipt != reported =>
-            {
-                return fail(StateError::ConflictingOutcome(seq));
-            }
-            (EffectState::Applied { .. }, EffectOutcome::NotApplied(_))
-            | (EffectState::NotApplied { .. }, EffectOutcome::Applied(_)) => {
-                return fail(StateError::ConflictingOutcome(seq));
-            }
-            (
-                EffectState::Applied { .. }
-                | EffectState::NotApplied { .. }
+                EffectState::Intended
+                | EffectState::Uncertain { .. }
                 | EffectState::Unresolvable { .. }
                 | EffectState::Waived { .. },
-                EffectOutcome::Applied(_)
-                | EffectOutcome::NotApplied(_)
-                | EffectOutcome::Uncertain(_)
-                | EffectOutcome::Unresolvable,
-            ) => None,
+                Found::Applied(receipt),
+            ) => Some(EffectState::Applied { receipt, at: now }),
+            (
+                EffectState::Intended
+                | EffectState::Uncertain { .. }
+                | EffectState::Unresolvable { .. }
+                | EffectState::Waived { .. },
+                Found::Absent,
+            ) => Some(EffectState::NotApplied {
+                reason: NotAppliedReason::ConfirmedAbsent,
+                at: now,
+            }),
+            (EffectState::Applied { receipt, .. }, Found::Applied(found)) if *receipt == found => {
+                None
+            }
+            (EffectState::NotApplied { .. }, Found::Absent) => None,
+            (EffectState::Applied { .. }, Found::Applied(_) | Found::Absent)
+            | (EffectState::NotApplied { .. }, Found::Applied(_)) => {
+                return fail(StateError::ConflictingOutcome(seq));
+            }
         };
         if let Some(next) = next {
             effect.state = next;
         }
         Ok(effect.clone())
+    }
+
+    /// Record that a person reviewed the writes of a settled task that did
+    /// not succeed. Repeating the call keeps the first acknowledgement and
+    /// reports it as already recorded.
+    pub(crate) fn acknowledge_settled_writes(
+        &mut self,
+        id: &TaskId,
+        claimant: &Claimant,
+        reason: &Text,
+        now: Timestamp,
+    ) -> Result<(WriteAcknowledgement, bool)> {
+        match claimant.trigger {
+            Trigger::Interactive => {}
+            Trigger::Scheduled | Trigger::Event(_) => {
+                return fail(StateError::AcknowledgementNeedsPerson);
+            }
+        }
+        let task = self.task_mut(id)?;
+        match task.settlement() {
+            None => return fail(StateError::TaskNotSettled(id.clone())),
+            Some(Settlement::Succeeded) => {
+                return fail(StateError::TaskSettled {
+                    task: id.clone(),
+                    settlement: Settlement::Succeeded,
+                });
+            }
+            Some(Settlement::Failed | Settlement::Cancelled | Settlement::Exhausted) => {}
+        }
+        let wrote = task
+            .effects
+            .iter()
+            .any(|effect| !matches!(effect.state, EffectState::NotApplied { .. }));
+        if !wrote {
+            return fail(StateError::NothingToAcknowledge(id.clone()));
+        }
+        if reason.as_str().len() > MAX_ACKNOWLEDGEMENT_REASON_BYTES {
+            return fail(StateError::CapacityExceeded {
+                limit: Limit::AcknowledgementReason,
+            });
+        }
+        if let Some(recorded) = &task.acknowledgement {
+            return Ok((recorded.clone(), true));
+        }
+        let mut unresolved: Vec<EffectName> = Vec::new();
+        for effect in task
+            .effects
+            .iter()
+            .filter(|effect| !effect.state.is_resolved())
+        {
+            if !unresolved.contains(&effect.name) {
+                unresolved.push(effect.name.clone());
+            }
+        }
+        let acknowledgement = WriteAcknowledgement {
+            by: claimant.holder.clone(),
+            at: now,
+            reason: reason.clone(),
+            unresolved,
+        };
+        task.acknowledgement = Some(acknowledgement.clone());
+        Ok((acknowledgement, false))
     }
 
     pub(crate) fn accept_risk(
@@ -2210,6 +2382,10 @@ impl StoreState {
             || task.consumed.len() > MAX_CONSUMED_MESSAGES
             || task.attempts.len()
                 > usize::try_from(task.spec.retry.max_attempts()).unwrap_or(usize::MAX)
+            || task.acknowledgement.as_ref().is_some_and(|recorded| {
+                recorded.reason.as_str().len() > MAX_ACKNOWLEDGEMENT_REASON_BYTES
+                    || recorded.unresolved.len() > MAX_EFFECTS_PER_TASK
+            })
         {
             return Err(Corruption::LimitExceeded);
         }
@@ -2399,6 +2575,52 @@ fn effect_key(
         seq.get()
     ))
     .map(IdempotencyKey::from_ref)
+}
+
+/// Move `effect` to the state `outcome` establishes, refusing an outcome that
+/// contradicts a recorded one.
+fn apply_outcome(
+    effect: &mut EffectRecord,
+    seq: EffectSeq,
+    outcome: EffectOutcome,
+    now: Timestamp,
+) -> Result<()> {
+    let next = match (&effect.state, outcome) {
+        (EffectState::Intended | EffectState::Uncertain { .. }, outcome) => {
+            Some(state_for(outcome, now))
+        }
+        (
+            EffectState::Unresolvable { .. } | EffectState::Waived { .. },
+            EffectOutcome::Applied(receipt),
+        ) => Some(EffectState::Applied { receipt, at: now }),
+        (
+            EffectState::Unresolvable { .. } | EffectState::Waived { .. },
+            EffectOutcome::NotApplied(reason),
+        ) => Some(EffectState::NotApplied { reason, at: now }),
+        (EffectState::Applied { receipt, .. }, EffectOutcome::Applied(reported))
+            if *receipt != reported =>
+        {
+            return fail(StateError::ConflictingOutcome(seq));
+        }
+        (EffectState::Applied { .. }, EffectOutcome::NotApplied(_))
+        | (EffectState::NotApplied { .. }, EffectOutcome::Applied(_)) => {
+            return fail(StateError::ConflictingOutcome(seq));
+        }
+        (
+            EffectState::Applied { .. }
+            | EffectState::NotApplied { .. }
+            | EffectState::Unresolvable { .. }
+            | EffectState::Waived { .. },
+            EffectOutcome::Applied(_)
+            | EffectOutcome::NotApplied(_)
+            | EffectOutcome::Uncertain(_)
+            | EffectOutcome::Unresolvable,
+        ) => None,
+    };
+    if let Some(next) = next {
+        effect.state = next;
+    }
+    Ok(())
 }
 
 fn state_for(outcome: EffectOutcome, at: Timestamp) -> EffectState {

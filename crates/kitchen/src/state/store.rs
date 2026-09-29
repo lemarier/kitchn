@@ -31,12 +31,13 @@ use crate::{
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, Claimant, Disposition, EffectExecutor,
         EffectSeq, Evidence, EvidenceRevision, ExternalRef, Fence, HouseGrants, LeaseTtl, TaskSpec,
-        Timestamp,
+        Text, Timestamp,
     },
     state::{
         CancelStatus, ConsumerRecord, Consumption, Creation, EffectOutcome, EffectPlan,
         EffectRecord, EffectStart, Lease, MarkerAttempt, MarkerFact, MarkerKey, MarkerRecording,
-        RecoveryItem, RiskDecision, TaskRecord, WorkflowMarker,
+        RecoveryItem, Reservation, RiskDecision, TaskRecord, WorkflowMarker, WriteAcknowledgement,
+        effects::SettledLookup,
         model::StoreState,
         snapshot::{SnapshotStore, StoreLayout, StoreOptions},
     },
@@ -63,6 +64,26 @@ const HOUSE_LAYOUT: StoreLayout = StoreLayout {
 /// Handles are cheap and hold no open files; separate handles and processes
 /// coordinate through the lock file. The directory must be house-scoped
 /// runtime storage outside any Git checkout.
+///
+/// A settled task's writes change only through checked paths:
+/// [`crate::state::reread_settled`] records what the backend's own lookup
+/// proved, and [`crate::workflows::decomposition::acknowledge`] records a
+/// person's acknowledgement. The store methods behind them are not public,
+/// so a caller cannot supply an outcome, receipt, or acknowledgement itself:
+///
+/// ```compile_fail,E0624
+/// # use kitchen::{TaskId, contracts::{Claimant, Text, Timestamp}, state::HouseStore};
+/// fn acknowledge(store: &HouseStore, id: &TaskId, who: &Claimant, why: &Text, now: Timestamp) {
+///     let _ = store.acknowledge_settled_writes(id, who, why, now);
+/// }
+/// ```
+///
+/// ```compile_fail,E0624
+/// # use kitchen::{TaskId, contracts::{EffectSeq, Timestamp}, state::HouseStore};
+/// fn record(store: &HouseStore, id: &TaskId, seq: EffectSeq, now: Timestamp) {
+///     let _ = store.record_settled_lookup(id, seq, unimplemented!(), now);
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct HouseStore {
     engine: SnapshotStore<StoreState>,
@@ -120,6 +141,32 @@ impl HouseStore {
         now: Timestamp,
     ) -> Result<Creation> {
         self.transact(|state| state.create_task(spec, created_by, now))
+    }
+
+    /// Create a task and claim it for `claimant` unless `guard` objects to
+    /// the tasks already stored. The guard reads them, and the task is
+    /// created and claimed, in one store transaction, so a concurrent
+    /// reservation cannot slip between the check and the write and the new
+    /// task never exists unclaimed. A task that already exists must be
+    /// identical. If it is open or its claim expired, the guard runs on the
+    /// tasks in the same transaction and it is claimed again
+    /// ([`Reservation::Resumed`]); if it has settled or is live-claimed by
+    /// someone else, it is reported as [`Reservation::Existing`] untouched.
+    /// The guard returns the reason to block, and
+    /// nothing is written then.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::create_task`] and [`Self::claim`], and
+    /// any the guard returns.
+    pub fn reserve_task<R>(
+        &self,
+        spec: TaskSpec,
+        claimant: &Claimant,
+        ttl: LeaseTtl,
+        now: Timestamp,
+        guard: impl FnOnce(&[&TaskRecord]) -> Result<Option<R>>,
+    ) -> Result<Reservation<R>> {
+        self.transact(|state| state.reserve_task(spec, claimant, ttl, now, guard))
     }
 
     /// Read one task.
@@ -346,6 +393,56 @@ impl HouseStore {
         now: Timestamp,
     ) -> Result<EffectRecord> {
         self.transact(|state| state.accept_risk(id, fence, seq, decision, now))
+    }
+
+    /// Record what a backend lookup proved about one write of a settled task.
+    /// A settled task has no lease, so this takes no fence. Only
+    /// [`crate::state::reread_settled`] can build a [`SettledLookup`], so the
+    /// outcome and any receipt come from the executor, never from a caller.
+    ///
+    /// An intended, uncertain, handed-over, or waived write becomes applied
+    /// or not applied; a waived write keeps its decision in the effect's
+    /// decision history. An established outcome is never rewritten: the same
+    /// answer is a no-op and a different one is refused.
+    ///
+    /// # Errors
+    /// [`StateError::TaskNotSettled`] while the task is unsettled,
+    /// [`StateError::EffectNotFound`] for an unknown write,
+    /// [`StateError::LookupScope`] for a lookup of another write, and
+    /// [`StateError::ConflictingOutcome`] when the answer contradicts a
+    /// recorded one.
+    pub(crate) fn record_settled_lookup(
+        &self,
+        id: &TaskId,
+        seq: EffectSeq,
+        lookup: SettledLookup,
+        now: Timestamp,
+    ) -> Result<EffectRecord> {
+        self.transact(|state| state.record_settled_lookup(id, seq, lookup, now))
+    }
+
+    /// Record a person's review of the writes of a settled task that did not
+    /// succeed. The record names `claimant`, `now`, `reason`, and the writes
+    /// whose outcome is still unknown, all taken here rather than from a
+    /// caller-built record. The first acknowledgement stays; repeating the
+    /// call returns it unchanged. Returns the stored record and whether it
+    /// was already there.
+    ///
+    /// # Errors
+    /// [`StateError::AcknowledgementNeedsPerson`] for a non-interactive
+    /// claimant, [`StateError::TaskNotSettled`] while the task is unsettled,
+    /// [`StateError::TaskSettled`] for a task that settled successfully,
+    /// [`StateError::NothingToAcknowledge`] when no write reached or may have
+    /// reached the backend, and [`StateError::CapacityExceeded`] for a reason
+    /// longer than [`crate::state::MAX_ACKNOWLEDGEMENT_REASON_BYTES`].
+    pub(crate) fn acknowledge_settled_writes(
+        &self,
+        id: &TaskId,
+        claimant: &Claimant,
+        reason: &Text,
+        now: Timestamp,
+    ) -> Result<(WriteAcknowledgement, bool)> {
+        self.transact(|state| state.acknowledge_settled_writes(id, claimant, reason, now))
     }
 
     /// Record evidence. A new subject (head or base) starts a new evidence revision

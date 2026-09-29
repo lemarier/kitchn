@@ -279,6 +279,12 @@ impl GraduationDecision {
         }
         Ok(())
     }
+
+    /// Whether the decision's term covers `now`: from its time, inclusive, to
+    /// its expiry, exclusive.
+    fn in_effect(&self, now: Timestamp) -> bool {
+        self.at <= now && now < self.expires_at
+    }
 }
 
 /// Decision state. Revocation keeps the original decision in place.
@@ -390,14 +396,18 @@ fn streams_in_scope<'a>(
         .collect()
 }
 
-/// The latest revision of every stream in a scope, compared before a write so
-/// a run recorded after the report was read cannot slip past it.
-type Revisions = BTreeMap<ExternalRef, Option<NonZeroU32>>;
+/// Every recorded revision in a scope, compared before a write so a run or
+/// correction recorded after the report was read cannot slip past it. Every
+/// revision counts, including one in a stream with a gap, whose report entry
+/// does not change when another revision arrives. Revisions are immutable, so
+/// the set identifies the scope's evidence.
+type Revisions = BTreeSet<(ExternalRef, NonZeroU32)>;
 
-fn revisions(streams: &BTreeMap<&ExternalRef, Option<&Observation>>) -> Revisions {
-    streams
+fn revisions(doc: &Document, scope: &StationScope) -> Revisions {
+    doc.observations
         .iter()
-        .map(|(id, latest)| ((*id).clone(), latest.map(|o| o.revision)))
+        .filter(|o| &o.attribution.scope == scope)
+        .map(|o| (o.id.clone(), o.revision))
         .collect()
 }
 
@@ -497,7 +507,7 @@ impl Ledger {
                 .iter()
                 .map(|(id, latest)| ((*id).clone(), latest.cloned()))
                 .collect();
-            Ok((owned, revisions(&streams)))
+            Ok((owned, revisions(doc, scope)))
         })?;
         let mut report = EligibilityReport {
             house: self.house().clone(),
@@ -578,29 +588,35 @@ impl Ledger {
         ))
     }
 
-    /// Record an owner's decision. The report at `decision.at` must be
-    /// eligible on the current guidance revision and `decision.evidence` must
-    /// be exactly its counted runs. Repeating an identical decision is a no-op.
+    /// Record an owner's decision at the caller's current time `now`. The
+    /// report at `decision.at` must be eligible on the current guidance
+    /// revision and `decision.evidence` must be exactly its counted runs.
+    /// Repeating an identical decision is a no-op.
     ///
     /// # Errors
     /// `Refused` for another house, stale guidance, an ineligible report,
-    /// different evidence, evidence in scope recorded while the report was
-    /// read, a claim beyond the house's interactive limits, or
+    /// different evidence, any evidence in scope recorded or removed while the
+    /// report was read, a claim beyond the house's interactive limits, or
     /// merge, publication, schedule, equipment, or cleanup authority;
     /// `Invalid` for an empty or unbounded decision, a schedule reference that
-    /// is not a schedule, or a term that is not positive and at most
-    /// [`MAX_DECISION_TERM`]; `Conflict` for a reused
+    /// is not a schedule, a decision time after `now`, or a term that is not
+    /// positive and at most [`MAX_DECISION_TERM`]; `Conflict` for a reused
     /// identity.
     pub fn graduate(
         &self,
         store: &HouseStore,
         config: &HouseConfig,
         decision: GraduationDecision,
+        now: Timestamp,
     ) -> Result<bool, TrustError> {
         if &decision.house != self.house() || decision.guidance != config.guidance {
             return Err(TrustError::Refused);
         }
         decision.validate()?;
+        // A future-dated decision would grant authority before it was made.
+        if decision.at > now {
+            return Err(TrustError::Invalid);
+        }
         let limits = interactive_limits(config)?;
         if !decision.claims.iter().all(|claim| within(&limits, claim)) {
             return Err(TrustError::Refused);
@@ -613,6 +629,8 @@ impl Ledger {
         {
             return Err(TrustError::Refused);
         }
+        #[cfg(feature = "test-hooks")]
+        test_hooks::before_graduation_write();
         self.transact(|doc| {
             if let Some(old) = doc
                 .graduations
@@ -626,8 +644,9 @@ impl Ledger {
                     }
                 };
             }
-            // A run or correction recorded since the report was read changes it.
-            if revisions(&streams_in_scope(doc, &decision.scope)) != seen {
+            // Any revision recorded or archived in scope since the report was
+            // read, including one in a stream with a gap, refuses the decision.
+            if revisions(doc, &decision.scope) != seen {
                 return Err(TrustError::Refused);
             }
             doc.graduations.push(GraduationAudit::Decided(decision));
@@ -676,9 +695,9 @@ impl Ledger {
 
     /// Add the unattended authority of current decisions to `current` for a
     /// bound task at `now`. A decision applies while it is recorded, not
-    /// revoked, not expired, not demoted by a later regression, its work type
-    /// still has a policy, and its guidance rule holds (see
-    /// [`GuidanceChange`]). Each claim must still be within the house's
+    /// revoked, in its term (`at <= now < expires_at`), not demoted by a later
+    /// regression, its work type still has a policy, and its guidance rule
+    /// holds (see [`GuidanceChange`]). Each claim must still be within the house's
     /// interactive limits and `current`'s limits. Call again before each effect.
     ///
     /// # Errors
@@ -717,7 +736,7 @@ impl Ledger {
                 })
                 .filter(|d| {
                     d.scope == binding.scope
-                        && now < d.expires_at
+                        && d.in_effect(now)
                         && regressions_after(doc, d).is_empty()
                 })
                 .cloned()
@@ -757,7 +776,7 @@ impl Ledger {
         Ok(current.with_added_standing(earned)?)
     }
 
-    /// Unexpired, unrevoked decisions with confirmed live reverts or
+    /// Unrevoked decisions in their term with confirmed live reverts or
     /// regressions observed after them. Each is demoted until the owner
     /// revokes it or records a new decision; under a
     /// [`RegressionResponse::PauseSchedule`] policy the review plans a pause
@@ -779,7 +798,7 @@ impl Ledger {
                 let GraduationAudit::Decided(decision) = audit else {
                     continue;
                 };
-                if now >= decision.expires_at {
+                if !decision.in_effect(now) {
                     continue;
                 }
                 let findings = regressions_after(doc, decision);
@@ -830,4 +849,33 @@ fn verdict(policy: Option<GraduationPolicy>, report: &EligibilityReport) -> Elig
         };
     }
     Eligibility::Eligible
+}
+
+/// Pause point for tests that need to act between the eligibility read and the
+/// ledger write in [`Ledger::graduate`]. Enabled only by the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static BEFORE_WRITE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once on this thread, after the next [`graduate`] reads its
+    /// eligibility report and before it takes the ledger write lock.
+    ///
+    /// [`graduate`]: crate::trust::Ledger::graduate
+    pub fn on_next_graduation_write(hook: impl FnOnce() + 'static) {
+        BEFORE_WRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn before_graduation_write() {
+        let hook = BEFORE_WRITE.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }

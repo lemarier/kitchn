@@ -11,7 +11,7 @@ use kitchen::{
     contracts::{
         AttemptNumber, AttemptOutcome, Claimant, EvidenceSubject, ExternalRef, Grant, HouseGrants,
         Permission, Repository, ResourceKind, ResourceRef, Role, ScheduleEffect, TaskAuthority,
-        TaskSpec, Text,
+        TaskSpec, Text, Timestamp,
     },
     house::{HouseConfig, HouseError},
     scheduling::{AgentFamily, ScheduleState},
@@ -20,12 +20,14 @@ use kitchen::{
     trust::{
         Attribution, Eligibility, EvidenceMode, ExclusionReason, Finding, GraduationAudit,
         GraduationDecision, GraduationPolicy, GuidanceChange, Ledger, Measurement, Observation,
-        PullRequestEvidence, RegressionResponse, StationScope, TrustError,
+        PullRequestEvidence, RegressionResponse, StationScope, TrustError, test_hooks,
     },
 };
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     num::{NonZeroU16, NonZeroU32},
+    rc::Rc,
 };
 
 const DAY: u64 = 86_400;
@@ -322,6 +324,7 @@ fn insufficient_samples_are_reported_and_cannot_graduate() -> TestResult {
         &f.store,
         &c,
         decision("grad:1", 'b', &[Permission::LaunchWorker], evidence)?,
+        at(NOW),
     );
     assert!(matches!(refused, Err(TrustError::Refused)));
     assert!(l.graduation_history()?.is_empty());
@@ -473,11 +476,11 @@ fn cross_house_evidence_and_decisions_are_refused() -> TestResult {
     let mut stolen = decision("grad:x", 'b', &[Permission::LaunchWorker], evidence.clone())?;
     stolen.house = other_house()?;
     assert!(matches!(
-        theirs.graduate(&other_store, &foreign, stolen.clone()),
+        theirs.graduate(&other_store, &foreign, stolen.clone(), at(NOW)),
         Err(TrustError::Refused)
     ));
     assert!(matches!(
-        l.graduate(&f.store, &c, stolen),
+        l.graduate(&f.store, &c, stolen, at(NOW)),
         Err(TrustError::Refused)
     ));
     // A project outside the house is refused rather than reported empty.
@@ -515,7 +518,7 @@ fn eligibility_never_grants_until_the_owner_decides() -> TestResult {
         evidence[..2].to_vec(),
     )?;
     assert!(matches!(
-        l.graduate(&f.store, &c, partial),
+        l.graduate(&f.store, &c, partial, at(NOW)),
         Err(TrustError::Refused)
     ));
     let mut doubled = evidence.clone();
@@ -524,23 +527,27 @@ fn eligibility_never_grants_until_the_owner_decides() -> TestResult {
         l.graduate(
             &f.store,
             &c,
-            decision("grad:1", 'b', &[Permission::LaunchWorker], doubled)?
+            decision("grad:1", 'b', &[Permission::LaunchWorker], doubled)?,
+            at(NOW)
         ),
         Err(TrustError::Refused)
     ));
     let stale = decision("grad:1", 'c', &[Permission::LaunchWorker], evidence.clone())?;
     assert!(matches!(
-        l.graduate(&f.store, &c, stale),
+        l.graduate(&f.store, &c, stale, at(NOW)),
         Err(TrustError::Refused)
     ));
 
     let owner = decision("grad:1", 'b', &[Permission::LaunchWorker], evidence.clone())?;
-    assert!(l.graduate(&f.store, &c, owner.clone())?);
-    assert!(!l.graduate(&f.store, &c, owner.clone())?, "idempotent");
+    assert!(l.graduate(&f.store, &c, owner.clone(), at(NOW))?);
+    assert!(
+        !l.graduate(&f.store, &c, owner.clone(), at(NOW))?,
+        "idempotent"
+    );
     let mut edited = owner.clone();
     edited.expires_at = at(NOW + DAY);
     assert!(matches!(
-        l.graduate(&f.store, &c, edited),
+        l.graduate(&f.store, &c, edited, at(NOW)),
         Err(TrustError::Conflict)
     ));
     let granted = standing(&f, &l, &c, &task, NOW)?;
@@ -579,7 +586,10 @@ fn unattended_claims_stay_within_interactive_scope() -> TestResult {
             evidence.clone(),
         )?;
         assert!(
-            matches!(l.graduate(&f.store, &c, d), Err(TrustError::Refused)),
+            matches!(
+                l.graduate(&f.store, &c, d, at(NOW)),
+                Err(TrustError::Refused)
+            ),
             "{permission} must not graduate"
         );
     }
@@ -590,7 +600,7 @@ fn unattended_claims_stay_within_interactive_scope() -> TestResult {
         credential()?,
     )]);
     assert!(matches!(
-        l.graduate(&f.store, &c, wide),
+        l.graduate(&f.store, &c, wide, at(NOW)),
         Err(TrustError::Refused)
     ));
     let mut not_a_schedule =
@@ -599,12 +609,12 @@ fn unattended_claims_stay_within_interactive_scope() -> TestResult {
         schedule.kind = ResourceKind::Worktree;
     }
     assert!(matches!(
-        l.graduate(&f.store, &c, not_a_schedule),
+        l.graduate(&f.store, &c, not_a_schedule, at(NOW)),
         Err(TrustError::Invalid)
     ));
     let empty = decision("grad:1", 'b', &[], evidence.clone())?;
     assert!(matches!(
-        l.graduate(&f.store, &c, empty),
+        l.graduate(&f.store, &c, empty, at(NOW)),
         Err(TrustError::Invalid)
     ));
     assert!(l.graduation_history()?.is_empty());
@@ -616,7 +626,7 @@ fn unattended_claims_stay_within_interactive_scope() -> TestResult {
         &[Permission::LaunchWorker, Permission::RequestReview],
         evidence,
     )?;
-    l.graduate(&f.store, &c, d)?;
+    l.graduate(&f.store, &c, d, at(NOW))?;
     let task = acting(&l, "next", 'b')?;
     let mut narrowed = c.clone();
     narrowed
@@ -638,13 +648,13 @@ fn decisions_expire_and_terms_are_bounded() -> TestResult {
         let mut d = decision("grad:1", 'b', &[Permission::LaunchWorker], evidence.clone())?;
         d.expires_at = expires;
         assert!(matches!(
-            l.graduate(&f.store, &c, d),
+            l.graduate(&f.store, &c, d, at(NOW)),
             Err(TrustError::Invalid)
         ));
     }
     let d = decision("grad:1", 'b', &[Permission::LaunchWorker], evidence)?;
     let expiry = d.expires_at.as_unix_millis() / 1000;
-    l.graduate(&f.store, &c, d)?;
+    l.graduate(&f.store, &c, d, at(NOW))?;
     let task = acting(&l, "next", 'b')?;
     // Within the term; outside the eligibility window no longer matters.
     assert!(holds(
@@ -659,6 +669,124 @@ fn decisions_expire_and_terms_are_bounded() -> TestResult {
     Ok(())
 }
 
+/// One millisecond before `t`.
+fn instant_before(t: Timestamp) -> TestResult<Timestamp> {
+    Ok(Timestamp::from_unix_millis(
+        t.as_unix_millis().checked_sub(1).ok_or("underflow")?,
+    ))
+}
+
+#[test]
+fn decisions_apply_only_within_their_term_and_are_never_future_dated() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let c = config(policy(3, 80)?)?;
+    let evidence = three_runs(&f, &l, "run", 'b')?;
+    let d = decision("grad:1", 'b', &[Permission::LaunchWorker], evidence)?;
+    let before = instant_before(d.at)?;
+    // Recorded an instant before its own time, the decision is refused.
+    assert!(matches!(
+        l.graduate(&f.store, &c, d.clone(), before),
+        Err(TrustError::Invalid)
+    ));
+    assert!(l.graduation_history()?.is_empty());
+    assert!(l.graduate(&f.store, &c, d.clone(), d.at)?);
+
+    let task = acting(&l, "next", 'b')?;
+    let held = |now| -> TestResult<bool> {
+        holds(
+            &l.graduated_standing(&f.store, &c, &task, &base(&c)?, now)?,
+            Permission::LaunchWorker,
+        )
+    };
+    assert!(!held(before)?, "not before the decision's time");
+    assert!(held(d.at)?, "from the decision's time");
+    assert!(held(instant_before(d.expires_at)?)?);
+    assert!(!held(d.expires_at)?, "not at expiry");
+    Ok(())
+}
+
+#[test]
+fn evidence_recorded_during_a_decision_refuses_it() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let c = config(policy(3, 80)?)?;
+    let evidence = three_runs(&f, &l, "run", 'b')?;
+    // A stream in scope that is already missing revision 1.
+    let id = settle(&f, "gap", 'b', &interactive("owner")?)?;
+    let mut gapped = observe(&f, &id, NOW - DAY, measured(true)?)?;
+    gapped.revision = NonZeroU32::new(2).ok_or("zero")?;
+    gapped.correction = Some(source("fixture:correction")?);
+    l.record(&f.store, gapped.clone())?;
+    // Its revision 3 reports a revert observed before the decision, which
+    // demotion does not look at, and leaves the stream incomplete.
+    let mut corrected = gapped;
+    corrected.revision = NonZeroU32::new(3).ok_or("zero")?;
+    corrected.correction = Some(source("fixture:second-correction")?);
+    if let Measurement::Observed { value, .. } = &mut corrected.pull_request {
+        value.reverts = measured(vec![Finding {
+            source: source("https://example.invalid/pull/11")?,
+            subject: subject()?,
+            consequence: Text::new("Reverted after merge.")?,
+        }])?;
+    }
+    let d = decision("grad:1", 'b', &[Permission::LaunchWorker], evidence)?;
+
+    // Revision 3 lands after the report is read and before the write.
+    let recorded = Rc::new(RefCell::new(None));
+    test_hooks::on_next_graduation_write({
+        let (path, house, store) = (f.dir.path().join("trust"), house()?, f.reopen()?);
+        let recorded = Rc::clone(&recorded);
+        move || {
+            recorded.replace(Some(
+                Ledger::open(path, house).and_then(|other| other.record(&store, corrected)),
+            ));
+        }
+    });
+    assert!(matches!(
+        l.graduate(&f.store, &c, d.clone(), at(NOW)),
+        Err(TrustError::Refused)
+    ));
+    assert!(recorded.take().ok_or("hook did not run")??);
+    assert!(l.graduation_history()?.is_empty());
+    // The report itself is unchanged, so an owner who has seen the new
+    // revision can record the same decision.
+    let report = l.eligibility(&f.store, &c, &scope()?, at(NOW))?;
+    assert_eq!(report.verdict, Eligibility::Eligible);
+    assert!(
+        report
+            .excluded
+            .iter()
+            .any(|e| e.reason == ExclusionReason::IncompleteStream)
+    );
+    assert!(l.graduate(&f.store, &c, d.clone(), at(NOW))?);
+
+    // A new complete run in scope refuses a decision the same way.
+    let id = settle(&f, "late", 'b', &interactive("owner")?)?;
+    let late = observe(&f, &id, NOW - DAY, measured(false)?)?;
+    let recorded = Rc::new(RefCell::new(None));
+    test_hooks::on_next_graduation_write({
+        let (path, house, store) = (f.dir.path().join("trust"), house()?, f.reopen()?);
+        let recorded = Rc::clone(&recorded);
+        move || {
+            recorded.replace(Some(
+                Ledger::open(path, house).and_then(|other| other.record(&store, late)),
+            ));
+        }
+    });
+    let second = GraduationDecision {
+        id: source("grad:2")?,
+        ..d
+    };
+    assert!(matches!(
+        l.graduate(&f.store, &c, second, at(NOW)),
+        Err(TrustError::Refused)
+    ));
+    assert!(recorded.take().ok_or("hook did not run")??);
+    assert_eq!(l.graduation_history()?.len(), 1);
+    Ok(())
+}
+
 #[test]
 fn revocation_is_immediate_and_audited() -> TestResult {
     let f = Fixture::new()?;
@@ -666,7 +794,7 @@ fn revocation_is_immediate_and_audited() -> TestResult {
     let c = config(policy(3, 80)?)?;
     let evidence = three_runs(&f, &l, "run", 'b')?;
     let d = decision("grad:1", 'b', &[Permission::LaunchWorker], evidence)?;
-    l.graduate(&f.store, &c, d.clone())?;
+    l.graduate(&f.store, &c, d.clone(), at(NOW))?;
     let task = acting(&l, "next", 'b')?;
     let id = source("grad:1")?;
     assert!(l.revoke_graduation(
@@ -695,7 +823,7 @@ fn revocation_is_immediate_and_audited() -> TestResult {
         Permission::LaunchWorker
     )?);
     assert!(matches!(
-        l.graduate(&f.store, &c, d.clone()),
+        l.graduate(&f.store, &c, d.clone(), at(NOW)),
         Err(TrustError::Conflict)
     ));
     assert!(matches!(
@@ -715,6 +843,7 @@ fn guidance_change_resets_or_re_evaluates_by_policy() -> TestResult {
         &f.store,
         &c,
         decision("grad:1", 'b', &[Permission::LaunchWorker], evidence)?,
+        at(NOW),
     )?;
     c.guidance = commit('c')?;
     let old_pin = acting(&l, "old-pin", 'b')?;
@@ -766,6 +895,7 @@ fn a_regression_after_graduation_demotes_and_plans_a_pause() -> TestResult {
         &f.store,
         &c,
         decision("grad:1", 'b', &[Permission::LaunchWorker], evidence)?,
+        at(NOW),
     )?;
     let task = acting(&l, "next", 'b')?;
     assert!(l.graduation_reviews(&c, at(NOW + 1))?.is_empty());
@@ -843,6 +973,7 @@ fn archiving_keeps_graduation_evidence_and_later_regressions() -> TestResult {
         &f.store,
         &c,
         decision("grad:1", 'b', &[Permission::LaunchWorker], evidence.clone())?,
+        at(NOW),
     )?;
     let id = settle(&f, "regressed", 'b', &scheduled("tick")?)?;
     let mut o = observe(&f, &id, NOW + DAY, measured(true)?)?;

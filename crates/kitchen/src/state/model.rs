@@ -2651,7 +2651,10 @@ impl StoreState {
 
     /// Check invariants that the type system cannot express.
     pub(crate) fn validate(&self) -> std::result::Result<(), Corruption> {
-        if self.tasks.len() > MAX_TASKS || self.consumers.len() > MAX_CONSUMERS {
+        if self.tasks.len() > MAX_TASKS
+            || self.consumers.len() > MAX_CONSUMERS
+            || self.schedules.len() > MAX_TASKS
+        {
             return Err(Corruption::LimitExceeded);
         }
         self.markers.validate()?;

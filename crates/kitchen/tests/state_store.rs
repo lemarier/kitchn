@@ -2181,3 +2181,39 @@ fn concurrent_reservations_admit_exactly_one() -> TestResult {
     assert_eq!(fixture.store.tasks()?.len(), 1);
     Ok(())
 }
+
+#[test]
+fn a_snapshot_with_too_many_recorded_schedules_is_rejected() -> TestResult {
+    let fixture = Fixture::new()?;
+    let path = fixture.dir.path().join("house");
+    let file = path.join("state.json");
+    let mut state: serde_json::Value = serde_json::from_str(&fs::read_to_string(&file)?)?;
+    let schedule = |n: usize| {
+        serde_json::json!({
+            "schedule": {"kind": "schedule", "backend": "orca", "handle": format!("s-{n}")},
+            "requires": [],
+        })
+    };
+    for (count, accepted) in [
+        (kitchen::state::MAX_TASKS, true),
+        (kitchen::state::MAX_TASKS + 1, false),
+    ] {
+        state["schedules"] = (0..count).map(schedule).collect();
+        fs::write(&file, serde_json::to_vec(&state)?)?;
+        let opened = HouseStore::open(&path, house()?, StoreOptions::default());
+        if accepted {
+            opened?;
+        } else {
+            assert!(
+                matches!(
+                    opened,
+                    Err(Error::State(StateError::CorruptState(
+                        Corruption::LimitExceeded
+                    )))
+                ),
+                "{opened:?}"
+            );
+        }
+    }
+    Ok(())
+}

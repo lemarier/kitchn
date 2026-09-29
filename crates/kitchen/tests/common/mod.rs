@@ -457,3 +457,15 @@ pub fn roger_answer(ask: &kitchen::contracts::RogerAsk, approve: bool) -> TestRe
         },
     }))?)
 }
+
+/// A house config from the shared fixture whose follow-up policy allows
+/// `fix_rounds` rounds, or whose policy is absent for `None`. The only way a
+/// test obtains a budget, as in production.
+pub fn house_with_fix_rounds(fix_rounds: Option<u8>) -> TestResult<kitchen::house::HouseConfig> {
+    let mut json: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/house/origin89.json"))?;
+    if let Some(fix_rounds) = fix_rounds {
+        json["followUp"] = serde_json::json!({ "fixRounds": fix_rounds });
+    }
+    Ok(serde_json::from_value(json)?)
+}

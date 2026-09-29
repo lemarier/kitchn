@@ -9,7 +9,10 @@ mod workflows_support;
 
 use std::{cell::RefCell, collections::BTreeSet, fs, path::Path, process::Command};
 
-use common::{TestResult, backend_id, credential, holder, house, interactive, scheduled, ttl};
+use common::{
+    TestResult, backend_id, credential, holder, house, house_with_fix_rounds, interactive,
+    scheduled, ttl,
+};
 use kitchen::{
     Error, ErrorClass,
     adoption::{HouseRegistry, InstructionBundle},
@@ -684,11 +687,14 @@ fn run_pr(
 }
 
 /// The budget of a house whose policy sets none.
-fn house_budget() -> FollowUpBudget {
-    FollowUpBudget {
-        fix_rounds: DEFAULT_FIX_ROUNDS,
-        review_requests: 1,
-    }
+fn house_budget() -> TestResult<FollowUpBudget> {
+    budget_of(None)
+}
+
+/// The budget of a house allowing `fix_rounds`, taken from its config as in
+/// production.
+fn budget_of(fix_rounds: Option<u8>) -> TestResult<FollowUpBudget> {
+    Ok(house_with_fix_rounds(fix_rounds)?.follow_up_budget())
 }
 
 fn run_pr_within(
@@ -698,7 +704,7 @@ fn run_pr_within(
     claimant: &kitchen::contracts::Claimant,
     fix_rounds: Option<u8>,
 ) -> TestResult<(PrPlan, Option<kitchen::state::Lease>)> {
-    run_pr_with_house(world, facts, intent, claimant, fix_rounds, house_budget())
+    run_pr_with_house(world, facts, intent, claimant, fix_rounds, house_budget()?)
 }
 
 fn run_pr_with_house(
@@ -856,7 +862,7 @@ fn pr_repair_round_carries_the_house_policy_agent() -> TestResult {
         repository: &repo()?,
         facts: &facts,
         intent: None,
-        follow_up: house_budget(),
+        follow_up: house_budget()?,
         fix_rounds: None,
         claimant: &interactive("person")?,
         ttl: ttl(600)?,
@@ -915,7 +921,7 @@ fn pr_idle_budget_and_refusal_paths() -> TestResult {
         repository: &repo()?,
         facts: &clean,
         intent: None,
-        follow_up: house_budget(),
+        follow_up: house_budget()?,
         fix_rounds: None,
         claimant: &scheduled("repair-tick")?,
         ttl: ttl(600)?,
@@ -1051,12 +1057,9 @@ fn pr_reads_the_house_fix_round_budget() -> TestResult {
         Mergeability::Clean,
         ReviewState::ChangesRequested,
     )?;
-    let house = |fix_rounds| FollowUpBudget {
-        fix_rounds,
-        review_requests: 1,
-    };
+    let house = |fix_rounds| budget_of(Some(fix_rounds));
     // A session cannot raise the house's own budget, only the default's.
-    let raised = run_pr_with_house(&world, &facts, None, &person, Some(4), house(3));
+    let raised = run_pr_with_house(&world, &facts, None, &person, Some(4), house(3)?);
     let Err(error) = raised else {
         return Err("a budget above the house's must be refused".into());
     };
@@ -1070,7 +1073,7 @@ fn pr_reads_the_house_fix_round_budget() -> TestResult {
     for round in 1..=DEFAULT_FIX_ROUNDS {
         scheduled_round(&world, round, true)?;
     }
-    let (plan, lease) = run_pr_with_house(&world, &facts, None, &person, None, house(3))?;
+    let (plan, lease) = run_pr_with_house(&world, &facts, None, &person, None, house(3)?)?;
     assert!(
         matches!(plan, PrPlan::FollowUp { round: 3, .. }),
         "{plan:?}"
@@ -1080,7 +1083,7 @@ fn pr_reads_the_house_fix_round_budget() -> TestResult {
     // A house that allows fewer rounds than the default is spent earlier.
     let strict = World::new()?;
     scheduled_round(&strict, 1, true)?;
-    let (plan, lease) = run_pr_with_house(&strict, &facts, None, &person, None, house(1))?;
+    let (plan, lease) = run_pr_with_house(&strict, &facts, None, &person, None, house(1)?)?;
     assert_eq!(plan, PrPlan::BudgetExhausted { rounds_used: 1 });
     assert!(lease.is_none());
     Ok(())

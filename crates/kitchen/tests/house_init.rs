@@ -701,8 +701,8 @@ fn the_follow_up_budget_is_offered_with_its_default_and_takes_an_answer() -> Tes
     )?)?;
     assert!(script.said("Review-fix rounds per pull request [2]: "));
     assert!(script.said("Review requests per pull request head [1]: "));
-    assert_eq!(plan.config.follow_up_budget().fix_rounds, 2);
-    assert_eq!(plan.config.follow_up_budget().review_requests, 1);
+    assert_eq!(plan.config.follow_up_budget().fix_rounds(), 2);
+    assert_eq!(plan.config.follow_up_budget().review_requests(), 1);
     // Typed answers set the policy; the ceiling itself is allowed.
     let mut script = Script::new(&["4", "10"]);
     let plan = confirmed(plan_house_init(
@@ -711,8 +711,8 @@ fn the_follow_up_budget_is_offered_with_its_default_and_takes_an_answer() -> Tes
         &NoGitHubAccess,
         Some(&mut script),
     )?)?;
-    assert_eq!(plan.config.follow_up_budget().fix_rounds, 4);
-    assert_eq!(plan.config.follow_up_budget().review_requests, 10);
+    assert_eq!(plan.config.follow_up_budget().fix_rounds(), 4);
+    assert_eq!(plan.config.follow_up_budget().review_requests(), 10);
     // Over the ceiling is asked again, then refused; flags are refused unprompted.
     let mut script = Script::new(&["11", "-1", "many"]);
     assert!(matches!(
@@ -734,6 +734,6 @@ fn the_follow_up_budget_is_offered_with_its_default_and_takes_an_answer() -> Tes
         &NoGitHubAccess,
         None,
     )?)?;
-    assert_eq!(plan.config.follow_up_budget().fix_rounds, 2);
+    assert_eq!(plan.config.follow_up_budget().fix_rounds(), 2);
     Ok(())
 }

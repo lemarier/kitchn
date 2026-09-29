@@ -281,7 +281,8 @@ pub struct RepairPolicy {
     /// Ticks of unknown mergeability before hand-over.
     pub max_unknown_rechecks: u8,
     /// Follow-up budgets; `fix_rounds` bounds repair plus review-fix rounds.
-    pub budget: FollowUpBudget,
+    /// Private: [`Self::for_house`] is the only constructor.
+    budget: FollowUpBudget,
 }
 
 impl RepairPolicy {
@@ -292,6 +293,12 @@ impl RepairPolicy {
             max_unknown_rechecks,
             budget: house.follow_up_budget(),
         }
+    }
+
+    /// The follow-up budget this policy enforces.
+    #[must_use]
+    pub const fn budget(&self) -> FollowUpBudget {
+        self.budget
     }
 }
 
@@ -351,7 +358,7 @@ pub fn assess(policy: &RepairPolicy, candidate: &RepairCandidate) -> RepairDecis
             return RepairDecision::HandOver(HandOver::WorktreeUnknown);
         }
     }
-    if candidate.rounds_used >= policy.budget.fix_rounds {
+    if candidate.rounds_used >= policy.budget.fix_rounds() {
         return RepairDecision::HandOver(HandOver::BudgetExhausted);
     }
     RepairDecision::Repair(kind)

@@ -37,10 +37,10 @@ impl StackTool {
     }
 }
 
-/// How many follow-up rounds a house allows per pull request. Scheduled
-/// repair, the merge gate, and interactive `pr` all read it through
-/// [`HouseConfig::follow_up_budget`]; a session may lower it, never raise it.
-/// A field left out keeps the library default.
+/// How many follow-up rounds a house allows per pull request. Repair, the
+/// merge gate, and interactive `pr` can only obtain a
+/// [`FollowUpBudget`] through [`HouseConfig::follow_up_budget`]; a session may
+/// lower it, never raise it. A field left out keeps the library default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FollowUpPolicy {
@@ -72,11 +72,8 @@ impl Default for FollowUpPolicy {
 impl FollowUpPolicy {
     /// The budget this policy grants.
     #[must_use]
-    pub const fn budget(self) -> FollowUpBudget {
-        FollowUpBudget {
-            fix_rounds: self.fix_rounds,
-            review_requests: self.review_requests,
-        }
+    pub(crate) const fn budget(self) -> FollowUpBudget {
+        FollowUpBudget::new(self.fix_rounds, self.review_requests)
     }
 
     fn validate(self) -> Result<(), HouseError> {

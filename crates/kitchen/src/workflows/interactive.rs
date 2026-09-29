@@ -1046,12 +1046,12 @@ fn current_round(store: &HouseStore, repository: &Repository, number: IssueNumbe
 pub fn pull_request(request: &PrRequest<'_>) -> Result<(PrPlan, Option<Lease>)> {
     require_person(request.claimant)?;
     let budget = match request.fix_rounds {
-        None => request.follow_up.fix_rounds,
-        Some(requested) if requested <= request.follow_up.fix_rounds => requested,
+        None => request.follow_up.fix_rounds(),
+        Some(requested) if requested <= request.follow_up.fix_rounds() => requested,
         Some(requested) => {
             return Err(InteractiveError::BudgetAboveHouse {
                 requested,
-                house: request.follow_up.fix_rounds,
+                house: request.follow_up.fix_rounds(),
             }
             .into());
         }

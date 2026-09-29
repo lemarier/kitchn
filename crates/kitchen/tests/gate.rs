@@ -1,6 +1,6 @@
 //! Exact-revision gate policy scenarios.
 mod common;
-use common::{TestResult, commit};
+use common::{TestResult, commit, house_with_fix_rounds};
 use kitchen::integrations::github::MergeStatusValue;
 use kitchen::workflows::gate::{self, *};
 use kitchen::{
@@ -27,6 +27,20 @@ use std::{num::NonZeroU64, time::Duration};
 
 const fn secs(seconds: u64) -> Timestamp {
     Timestamp::from_unix_millis(seconds * 1000)
+}
+
+/// The follow-up budget of a house allowing `fix_rounds` rounds, or of one
+/// with no policy for `None`. Budgets exist only through a house config.
+fn budget(fix_rounds: Option<u8>) -> TestResult<kitchen::workflows::pickup::FollowUpBudget> {
+    Ok(house_with_fix_rounds(fix_rounds)?.follow_up_budget())
+}
+
+fn forge_policy(fix_rounds: Option<u8>) -> TestResult<ForgeGatePolicy> {
+    Ok(ForgeGatePolicy::for_house(
+        &house_with_fix_rounds(fix_rounds)?,
+        vec!["allowed".into()],
+        vec!["reviewer".into()],
+    ))
 }
 
 fn ready() -> TestResult<GateEvidence> {
@@ -71,7 +85,7 @@ fn ready() -> TestResult<GateEvidence> {
         writer_working: false,
         supporting_subject: Some((head.clone(), commit('b')?)),
         reopen_event: None,
-        fix_rounds: 2,
+        follow_up: budget(None)?,
     })
 }
 /// The grants a fix request needs: push on the forge and worker launch and
@@ -230,7 +244,7 @@ fn the_gate_hands_over_at_the_house_fix_round_budget() -> TestResult {
         ..GateHistory::default()
     };
     // A house that allows three rounds still requests a fix after two.
-    e.fix_rounds = 3;
+    e.follow_up = budget(Some(3))?;
     assert!(
         matches!(gate::evaluate(&e, grants()?, history(2)).verdict, Verdict::FixRequest { gaps } if gaps == vec![Gap::BaseBehind])
     );
@@ -239,11 +253,11 @@ fn the_gate_hands_over_at_the_house_fix_round_budget() -> TestResult {
     );
     // A house that allows one hands over after the first, and one that
     // allows none never requests a fix.
-    e.fix_rounds = 1;
+    e.follow_up = budget(Some(1))?;
     assert!(
         matches!(gate::evaluate(&e, grants()?, history(1)).verdict, Verdict::HandOver { gaps } if gaps.contains(&Gap::FixBudget))
     );
-    e.fix_rounds = 0;
+    e.follow_up = budget(Some(0))?;
     assert!(
         matches!(gate::evaluate(&e, grants()?, history(0)).verdict, Verdict::HandOver { gaps } if gaps.contains(&Gap::FixBudget))
     );
@@ -961,11 +975,7 @@ fn scoped_forge_reads_feed_exact_head_gate() -> TestResult {
         &e.house,
         &e.repository,
         e.number,
-        &ForgeGatePolicy {
-            authors: vec!["allowed".into()],
-            expected_reviewers: vec!["reviewer".into()],
-            fix_rounds: 2,
-        },
+        &forge_policy(None)?,
         supplement(&e),
         secs(1_790_607_600),
     )?;
@@ -993,11 +1003,7 @@ fn forge_behind_state_requests_a_bounded_fix() -> TestResult {
         &e.house,
         &e.repository,
         e.number,
-        &ForgeGatePolicy {
-            authors: vec!["allowed".into()],
-            expected_reviewers: vec!["reviewer".into()],
-            fix_rounds: 2,
-        },
+        &forge_policy(None)?,
         supplement(&e),
         secs(1_790_607_600),
     )?;
@@ -1005,6 +1011,53 @@ fn forge_behind_state_requests_a_bounded_fix() -> TestResult {
         gate::evaluate(&observed, grants()?, GateHistory::default()).verdict,
         Verdict::FixRequest { gaps } if gaps.contains(&Gap::BaseBehind) && !gaps.contains(&Gap::Mergeability)
     ));
+    Ok(())
+}
+#[test]
+fn forge_evidence_carries_the_house_fix_budget_into_the_verdict() -> TestResult {
+    use serde_json::json;
+    let e = ready()?;
+    let history = |fix_rounds| GateHistory {
+        fix_rounds,
+        ..GateHistory::default()
+    };
+    // (house policy, rounds already used, whether one more fix is requested)
+    let cases = [
+        (None, 1, true),
+        (None, 2, false),
+        (Some(3), 2, true),
+        (Some(3), 3, false),
+        (Some(0), 0, false),
+    ];
+    for (house_rounds, used, requests_fix) in cases {
+        let client = forge_client(e.head.as_str(), false)?;
+        {
+            let mut responses = client.transport().responses.borrow_mut();
+            responses[3] = json!({"data":{"repository":{"pullRequest":{"headRefOid":e.head.as_str(),"mergeStateStatus":"BEHIND"}}}});
+            responses[4] = json!({"behind_by":1,"ahead_by":1});
+        }
+        let observed = gate::collect_forge_evidence(
+            &client,
+            &e.house,
+            &e.repository,
+            e.number,
+            &forge_policy(house_rounds)?,
+            supplement(&e),
+            secs(1_790_607_600),
+        )?;
+        let verdict = gate::evaluate(&observed, grants()?, history(used)).verdict;
+        if requests_fix {
+            assert!(
+                matches!(verdict, Verdict::FixRequest { .. }),
+                "house {house_rounds:?}, used {used}"
+            );
+        } else {
+            assert!(
+                matches!(&verdict, Verdict::HandOver { gaps } if gaps.contains(&Gap::FixBudget)),
+                "house {house_rounds:?}, used {used}: {verdict:?}"
+            );
+        }
+    }
     Ok(())
 }
 #[test]
@@ -1016,11 +1069,7 @@ fn required_check_absence_from_forge_refuses_merge() -> TestResult {
         &e.house,
         &e.repository,
         e.number,
-        &ForgeGatePolicy {
-            authors: vec!["allowed".into()],
-            expected_reviewers: vec!["reviewer".into()],
-            fix_rounds: 2,
-        },
+        &forge_policy(None)?,
         supplement(&e),
         secs(1_790_607_600),
     )?;
@@ -1041,11 +1090,7 @@ fn unreadable_branch_protection_hands_over_without_a_worker() -> TestResult {
         &e.house,
         &e.repository,
         e.number,
-        &ForgeGatePolicy {
-            authors: vec!["allowed".into()],
-            expected_reviewers: vec!["reviewer".into()],
-            fix_rounds: 2,
-        },
+        &forge_policy(None)?,
         supplement(&e),
         secs(1_790_607_600),
     )?;
@@ -1192,11 +1237,7 @@ fn comment_after_change_request_does_not_clear_it() -> TestResult {
         &e.house,
         &e.repository,
         e.number,
-        &ForgeGatePolicy {
-            authors: vec!["allowed".into()],
-            expected_reviewers: vec!["reviewer".into()],
-            fix_rounds: 2,
-        },
+        &forge_policy(None)?,
         supplement(&e),
         secs(1_790_607_600),
     )?;
@@ -1261,11 +1302,7 @@ fn quota_review_from_forge_is_unavailable() -> TestResult {
         &e.house,
         &e.repository,
         e.number,
-        &ForgeGatePolicy {
-            authors: vec!["allowed".into()],
-            expected_reviewers: vec!["reviewer".into()],
-            fix_rounds: 2,
-        },
+        &forge_policy(None)?,
         supplement(&e),
         secs(1_790_607_600),
     )?;
@@ -1333,11 +1370,7 @@ fn invalid_forge_branch_cannot_target_fix_worker() -> TestResult {
         &e.house,
         &e.repository,
         e.number,
-        &ForgeGatePolicy {
-            authors: vec!["allowed".into()],
-            expected_reviewers: vec!["reviewer".into()],
-            fix_rounds: 2,
-        },
+        &forge_policy(None)?,
         supplement(&e),
         secs(1_790_607_600),
     )?;
@@ -1412,11 +1445,7 @@ fn risk_approval_requires_scoped_write_permission() -> TestResult {
         write_access: true,
         approval_verified: true,
     });
-    let policy = ForgeGatePolicy {
-        authors: vec!["allowed".into()],
-        expected_reviewers: vec!["reviewer".into()],
-        fix_rounds: 2,
-    };
+    let policy = forge_policy(None)?;
     let write = forge_client(e.head.as_str(), false)?;
     if let Some(reviews) = write.transport().responses.borrow_mut().get_mut(8) {
         *reviews = serde_json::json!([
@@ -1492,11 +1521,7 @@ fn write_permission_without_current_head_approval_is_insufficient() -> TestResul
         &e.house,
         &e.repository,
         e.number,
-        &ForgeGatePolicy {
-            authors: vec!["allowed".into()],
-            expected_reviewers: vec!["reviewer".into()],
-            fix_rounds: 2,
-        },
+        &forge_policy(None)?,
         supplement(&e),
         secs(1_790_607_600),
     )?;
@@ -1532,11 +1557,7 @@ fn label_removal_allows_one_same_head_reevaluation() -> TestResult {
 #[test]
 fn forge_label_removal_requires_actor_write_access() -> TestResult {
     let e = ready()?;
-    let policy = ForgeGatePolicy {
-        authors: vec!["allowed".into()],
-        expected_reviewers: vec!["reviewer".into()],
-        fix_rounds: 2,
-    };
+    let policy = forge_policy(None)?;
     let write = forge_client(e.head.as_str(), false)?;
     if let Some(timeline) = write.transport().responses.borrow_mut().get_mut(11) {
         *timeline = serde_json::json!([{"event":"unlabeled","created_at":"2026-09-28T14:30:00Z","actor":{"login":"human"},"label":{"name":"needs-human-review"}}]);
@@ -3267,11 +3288,7 @@ fn forge_blocked_state_with_a_failed_check_requests_a_fix() -> TestResult {
         &e.house,
         &e.repository,
         e.number,
-        &ForgeGatePolicy {
-            authors: vec!["allowed".into()],
-            expected_reviewers: vec!["reviewer".into()],
-            fix_rounds: 2,
-        },
+        &forge_policy(None)?,
         supplement(&e),
         secs(1_790_607_600),
     )?;
@@ -3306,11 +3323,7 @@ fn forge_statuses_use_the_newest_state_of_each_context() -> TestResult {
             &e.house,
             &e.repository,
             e.number,
-            &ForgeGatePolicy {
-                authors: vec!["allowed".into()],
-                expected_reviewers: vec!["reviewer".into()],
-                fix_rounds: 2,
-            },
+            &forge_policy(None)?,
             supplement(&e),
             secs(1_790_607_600),
         )?;
@@ -3332,11 +3345,7 @@ fn base_tip_comes_from_the_branch_ref_not_the_pr_object() -> TestResult {
         &e.house,
         &e.repository,
         e.number,
-        &ForgeGatePolicy {
-            authors: vec!["allowed".into()],
-            expected_reviewers: vec!["reviewer".into()],
-            fix_rounds: 2,
-        },
+        &forge_policy(None)?,
         supplement(&e),
         secs(1_790_607_600),
     )?;
@@ -3371,11 +3380,7 @@ fn base_tip_comes_from_the_branch_ref_not_the_pr_object() -> TestResult {
 fn unreadable_base_ref_hands_over_with_the_reason() -> TestResult {
     use serde_json::json;
     let e = ready()?;
-    let policy = ForgeGatePolicy {
-        authors: vec!["allowed".into()],
-        expected_reviewers: vec!["reviewer".into()],
-        fix_rounds: 2,
-    };
+    let policy = forge_policy(None)?;
     let collect = |client| {
         gate::collect_forge_evidence(
             client,

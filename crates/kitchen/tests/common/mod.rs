@@ -219,6 +219,18 @@ pub fn executor_with(
     ))
 }
 
+/// A backend descriptor declaring exactly `capabilities`.
+pub fn descriptor_with(
+    capabilities: impl IntoIterator<Item = Capability>,
+) -> TestResult<BackendDescriptor> {
+    Ok(BackendDescriptor {
+        backend: backend_id()?,
+        house: house()?,
+        worker_selection: None,
+        capabilities: CapabilitySet::supporting(capabilities),
+    })
+}
+
 /// A worker backend with lookup but without provider-side idempotency.
 pub fn refusing() -> TestResult<FakeBackend> {
     executor_with([

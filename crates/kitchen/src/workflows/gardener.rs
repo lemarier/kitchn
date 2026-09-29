@@ -451,7 +451,8 @@ impl<'a> StaleMarkers<'a> {
                 WorkItem::Issue { .. }
                 | WorkItem::PullRequest { .. }
                 | WorkItem::Repository { .. }
-                | WorkItem::Resource { .. } => None,
+                | WorkItem::Resource { .. }
+                | WorkItem::Task { .. } => None,
             })
             .map(|(number, fact)| Ok((number, StaleHandled::decode(fact)?.revision)))
             .collect()

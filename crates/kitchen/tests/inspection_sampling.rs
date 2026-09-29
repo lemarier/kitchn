@@ -17,8 +17,8 @@ use kitchen::{
     },
     selection::{AgentModel, AgentSelection, ResolvedSelection, WorkType},
     state::{
-        HouseStore, Inventory, MAX_MARKERS, MarkerRecording, Presence, RetentionPolicy, StateError,
-        StoreOptions, WorkItem,
+        HouseStore, Inventory, MAX_MARKERS, MarkerRecording, MarkerSchema, Presence,
+        RetentionPolicy, StateError, StoreOptions, WorkItem,
     },
     trust::{
         Attribution, EvidenceMode, Finding, Ledger, Measurement, Observation, PullRequestEvidence,
@@ -282,6 +282,71 @@ fn a_confirmed_finding_raises_the_rate_and_restarts_the_clean_record() -> TestRe
     ));
     assert!(matches!(
         raise.record(&f.store, &recorder, day(111))?,
+        MarkerRecording::AlreadyRecorded(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_rerun_with_a_later_clock_and_changed_rates_is_already_recorded() -> TestResult {
+    let finding = source("https://example.invalid/revert/1")?;
+    let mut history = record(1..=60)?;
+    history.findings.push(RecordedFinding {
+        source: finding.clone(),
+        at: day(100),
+    });
+    let first = RateRaise::of(&policy()?, &history, &finding, day(110))?;
+    // Later clean deliveries and a later clock change at, from, and to.
+    history.clean.extend((101..=105).map(|n| at(n * DAY + 1)));
+    let rerun = RateRaise::of(&policy()?, &history, &finding, day(120))?;
+    assert_ne!(
+        (first.at, first.from, first.to),
+        (rerun.at, rerun.from, rerun.to)
+    );
+
+    let f = Fixture::new()?;
+    let recorder = scheduled("sampling")?;
+    assert!(matches!(
+        first.record(&f.store, &recorder, day(110))?,
+        MarkerRecording::Recorded(_)
+    ));
+    let MarkerRecording::AlreadyRecorded(kept) = rerun.record(&f.store, &recorder, day(120))?
+    else {
+        return Err("a recomputed raise for the same finding and scope was recorded again".into());
+    };
+    // The first report's values stand.
+    let schema = MarkerSchema::new("inspection-sampling.rate-raise", NonZeroU32::MIN)?;
+    assert_eq!(kept.fact().decode::<RateRaise>(&schema)?, first);
+    Ok(())
+}
+
+#[test]
+fn one_finding_attributed_to_two_scopes_records_both_raises() -> TestResult {
+    let finding = source("https://example.invalid/revert/1")?;
+    let raise_for = |work_type: &str| -> TestResult<RateRaise> {
+        let mut history = record(1..=60)?;
+        history.scope = scope_of(work_type)?;
+        history.findings.push(RecordedFinding {
+            source: finding.clone(),
+            at: day(100),
+        });
+        Ok(RateRaise::of(&policy()?, &history, &finding, day(110))?)
+    };
+    let (code, docs) = (raise_for("implementation")?, raise_for("documentation")?);
+    assert_ne!(code.scope, docs.scope);
+
+    let f = Fixture::new()?;
+    let recorder = scheduled("sampling")?;
+    assert!(matches!(
+        code.record(&f.store, &recorder, day(110))?,
+        MarkerRecording::Recorded(_)
+    ));
+    assert!(matches!(
+        docs.record(&f.store, &recorder, day(110))?,
+        MarkerRecording::Recorded(_)
+    ));
+    assert!(matches!(
+        docs.record(&f.store, &recorder, day(111))?,
         MarkerRecording::AlreadyRecorded(_)
     ));
     Ok(())

@@ -1086,35 +1086,65 @@ impl RateRaise {
         })
     }
 
-    /// Record this report once per finding in `store`. The caller delivers
-    /// [`OwnerReport::RateRaised`] when this returns
+    /// Record this report once per finding and scope in `store`. The key
+    /// holds the identity: the project, the station, the work type, and the
+    /// finding. The first report's values stay, so a later recomputation
+    /// with another clock, policy revision, or rates is
+    /// [`MarkerRecording::AlreadyRecorded`], not a conflict. The caller
+    /// delivers [`OwnerReport::RateRaised`] when this returns
     /// [`MarkerRecording::Recorded`], and not again on
-    /// [`MarkerRecording::AlreadyRecorded`].
+    /// [`MarkerRecording::AlreadyRecorded`]. One finding attributed to two
+    /// scopes records one report for each.
     ///
     /// # Errors
-    /// `StateError::MarkerConflict` when the finding was already reported
-    /// with other rates, and store failures.
+    /// [`SamplingError::MalformedRecord`] when the marker under the key does
+    /// not decode as a rate raise, and store failures.
     pub fn record(
         &self,
         store: &HouseStore,
         recorded_by: &Claimant,
         now: Timestamp,
     ) -> crate::Result<MarkerRecording> {
-        // A digest of the source, so no source can take the key or epoch
-        // markers' subjects.
-        let source = Sha256::digest(self.finding.as_str().as_bytes());
-        let key = MarkerKey {
+        let key = self.marker_key()?;
+        let fact = MarkerFact::workflow(raise_schema()?, self)?;
+        match store.record_marker(key.clone(), fact, recorded_by, now) {
+            // An earlier pass reported this finding for this scope; its
+            // values stand.
+            Err(crate::Error::State(StateError::MarkerConflict)) => {
+                let marker = store.marker(&key)?.ok_or(SamplingError::MalformedRecord)?;
+                marker
+                    .fact()
+                    .decode::<Self>(&raise_schema()?)
+                    .map_err(|_| SamplingError::MalformedRecord)?;
+                Ok(MarkerRecording::AlreadyRecorded(marker))
+            }
+            other => other,
+        }
+    }
+
+    fn marker_key(&self) -> crate::Result<MarkerKey> {
+        // A digest of the scope and source, so no source can take the key or
+        // epoch markers' subjects, and each length prefix keeps the fields
+        // from running together.
+        let mut digest = Sha256::new();
+        for part in [
+            self.scope.station.to_string(),
+            self.scope.work_type.to_string(),
+            self.finding.as_str().to_owned(),
+        ] {
+            digest.update(part.len().to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        Ok(MarkerKey {
             workflow: WorkflowId::new(WORKFLOW)?,
             item: WorkItem::Repository {
                 repository: self.scope.project.clone(),
             },
             subject: MarkerSubject::Observation(ExternalRef::new(&format!(
                 "finding:{}",
-                hex(&source)
+                hex(&digest.finalize())
             ))?),
-        };
-        let fact = MarkerFact::workflow(raise_schema()?, self)?;
-        store.record_marker(key, fact, recorded_by, now)
+        })
     }
 }
 

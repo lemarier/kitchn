@@ -18,7 +18,8 @@ use crate::{
         Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext, EffectRequest,
         EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef, FailureClass, Fence,
         HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation, Receipt, ResourceRef,
-        RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Timestamp, Trigger, UncertainReason,
+        RetryPolicy, Settlement, SubmittedEffects, TaskSpec, Text, Timestamp, Trigger,
+        UncertainReason,
     },
     state::{
         ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerAttempt, MarkerFact,
@@ -534,6 +535,24 @@ impl CancelRequest {
     }
 }
 
+/// A person's review of the forge writes of a settled task that did not
+/// succeed, recorded so that a guard that holds a subject because of those
+/// writes can release it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WriteAcknowledgement {
+    /// The person's session that acknowledged.
+    pub by: HolderId,
+    /// When.
+    pub at: Timestamp,
+    /// Why the person is satisfied to proceed.
+    pub reason: Text,
+    /// Writes whose outcome the forge could not prove at this time. The
+    /// person accepted that they may or may not exist.
+    #[serde(default)]
+    pub unresolved: Vec<EffectName>,
+}
+
 /// The durable record of one task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -549,9 +568,17 @@ pub struct TaskRecord {
     consumed: BTreeSet<ExternalRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cancel: Option<CancelRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acknowledgement: Option<WriteAcknowledgement>,
 }
 
 impl TaskRecord {
+    /// The person's review of this settled task's forge writes, if recorded.
+    #[must_use]
+    pub const fn write_acknowledgement(&self) -> Option<&WriteAcknowledgement> {
+        self.acknowledgement.as_ref()
+    }
+
     /// Whether `message` was consumed for this task
     /// ([`crate::state::HouseStore::consume_message`]).
     #[must_use]
@@ -1199,6 +1226,7 @@ impl StoreState {
             ownership: Vec::new(),
             consumed: BTreeSet::new(),
             cancel: None,
+            acknowledgement: None,
         };
         self.tasks.insert(spec.id, record);
         Ok(Creation::Created)
@@ -1765,42 +1793,55 @@ impl StoreState {
             .iter_mut()
             .find(|effect| effect.seq == seq)
             .ok_or(Error::State(StateError::EffectNotFound(seq)))?;
-        let next = match (&effect.state, outcome) {
-            (EffectState::Intended | EffectState::Uncertain { .. }, outcome) => {
-                Some(state_for(outcome, now))
-            }
-            (
-                EffectState::Unresolvable { .. } | EffectState::Waived { .. },
-                EffectOutcome::Applied(receipt),
-            ) => Some(EffectState::Applied { receipt, at: now }),
-            (
-                EffectState::Unresolvable { .. } | EffectState::Waived { .. },
-                EffectOutcome::NotApplied(reason),
-            ) => Some(EffectState::NotApplied { reason, at: now }),
-            (EffectState::Applied { receipt, .. }, EffectOutcome::Applied(reported))
-                if *receipt != reported =>
-            {
-                return fail(StateError::ConflictingOutcome(seq));
-            }
-            (EffectState::Applied { .. }, EffectOutcome::NotApplied(_))
-            | (EffectState::NotApplied { .. }, EffectOutcome::Applied(_)) => {
-                return fail(StateError::ConflictingOutcome(seq));
-            }
-            (
-                EffectState::Applied { .. }
-                | EffectState::NotApplied { .. }
-                | EffectState::Unresolvable { .. }
-                | EffectState::Waived { .. },
-                EffectOutcome::Applied(_)
-                | EffectOutcome::NotApplied(_)
-                | EffectOutcome::Uncertain(_)
-                | EffectOutcome::Unresolvable,
-            ) => None,
-        };
-        if let Some(next) = next {
-            effect.state = next;
-        }
+        apply_outcome(effect, seq, outcome, now)?;
         Ok(effect.clone())
+    }
+
+    /// Record what a forge re-read proved about one write of a task that has
+    /// settled. Needs no lease, since a settled task has none; only the
+    /// person-driven acknowledgement path calls it.
+    pub(crate) fn record_settled_outcome(
+        &mut self,
+        id: &TaskId,
+        seq: EffectSeq,
+        outcome: EffectOutcome,
+        now: Timestamp,
+    ) -> Result<EffectRecord> {
+        let task = self.task_mut(id)?;
+        if task.settlement().is_none() {
+            return fail(StateError::TaskNotSettled(id.clone()));
+        }
+        let effect = task
+            .effects
+            .iter_mut()
+            .find(|effect| effect.seq == seq)
+            .ok_or(Error::State(StateError::EffectNotFound(seq)))?;
+        apply_outcome(effect, seq, outcome, now)?;
+        Ok(effect.clone())
+    }
+
+    /// Record that a person reviewed the forge writes of a settled task that
+    /// did not succeed. Repeating the call keeps the first acknowledgement.
+    pub(crate) fn acknowledge_settled_writes(
+        &mut self,
+        id: &TaskId,
+        acknowledgement: WriteAcknowledgement,
+    ) -> Result<TaskRecord> {
+        let task = self.task_mut(id)?;
+        match task.settlement() {
+            None => return fail(StateError::TaskNotSettled(id.clone())),
+            Some(Settlement::Succeeded) => {
+                return fail(StateError::TaskSettled {
+                    task: id.clone(),
+                    settlement: Settlement::Succeeded,
+                });
+            }
+            Some(_) => {}
+        }
+        if task.acknowledgement.is_none() {
+            task.acknowledgement = Some(acknowledgement);
+        }
+        Ok(task.clone())
     }
 
     pub(crate) fn accept_risk(
@@ -2438,6 +2479,52 @@ fn effect_key(
         seq.get()
     ))
     .map(IdempotencyKey::from_ref)
+}
+
+/// Move `effect` to the state `outcome` establishes, refusing an outcome that
+/// contradicts a recorded one.
+fn apply_outcome(
+    effect: &mut EffectRecord,
+    seq: EffectSeq,
+    outcome: EffectOutcome,
+    now: Timestamp,
+) -> Result<()> {
+    let next = match (&effect.state, outcome) {
+        (EffectState::Intended | EffectState::Uncertain { .. }, outcome) => {
+            Some(state_for(outcome, now))
+        }
+        (
+            EffectState::Unresolvable { .. } | EffectState::Waived { .. },
+            EffectOutcome::Applied(receipt),
+        ) => Some(EffectState::Applied { receipt, at: now }),
+        (
+            EffectState::Unresolvable { .. } | EffectState::Waived { .. },
+            EffectOutcome::NotApplied(reason),
+        ) => Some(EffectState::NotApplied { reason, at: now }),
+        (EffectState::Applied { receipt, .. }, EffectOutcome::Applied(reported))
+            if *receipt != reported =>
+        {
+            return fail(StateError::ConflictingOutcome(seq));
+        }
+        (EffectState::Applied { .. }, EffectOutcome::NotApplied(_))
+        | (EffectState::NotApplied { .. }, EffectOutcome::Applied(_)) => {
+            return fail(StateError::ConflictingOutcome(seq));
+        }
+        (
+            EffectState::Applied { .. }
+            | EffectState::NotApplied { .. }
+            | EffectState::Unresolvable { .. }
+            | EffectState::Waived { .. },
+            EffectOutcome::Applied(_)
+            | EffectOutcome::NotApplied(_)
+            | EffectOutcome::Uncertain(_)
+            | EffectOutcome::Unresolvable,
+        ) => None,
+    };
+    if let Some(next) = next {
+        effect.state = next;
+    }
+    Ok(())
 }
 
 fn state_for(outcome: EffectOutcome, at: Timestamp) -> EffectState {

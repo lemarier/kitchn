@@ -154,6 +154,9 @@ pub enum StateError {
         /// Its settlement.
         settlement: Settlement,
     },
+    /// The task has not settled, so its writes cannot be acknowledged.
+    #[error("task {0} has not settled")]
+    TaskNotSettled(TaskId),
     /// Another holder has a live claim or lease.
     #[error("held by {holder} until {expires_at}")]
     ClaimHeld {
@@ -340,6 +343,7 @@ impl StateError {
             Self::TaskNotFound(_)
             | Self::TaskConflict(_)
             | Self::TaskSettled { .. }
+            | Self::TaskNotSettled(_)
             | Self::ClaimHeld { .. }
             | Self::LeaseExpired { .. }
             | Self::StaleFence { .. }

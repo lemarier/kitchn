@@ -100,3 +100,66 @@ fn a_cycle_or_malformed_proposal_exits_two() -> TestResult {
     assert_eq!(escaping.code, Some(2));
     Ok(())
 }
+
+fn acknowledge(store: &str, task: &str, reason: &str) -> TestResult<Run> {
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        .args([
+            "decompose",
+            "acknowledge",
+            "--store",
+            store,
+            "--house",
+            "origin89",
+            "--task",
+            task,
+            "--holder",
+            "owner-session",
+            "--reason",
+            reason,
+        ])
+        .output()?;
+    Ok(Run {
+        code: output.status.code(),
+        stdout: String::from_utf8(output.stdout)?,
+        stderr: String::from_utf8(output.stderr)?,
+    })
+}
+
+#[test]
+fn acknowledging_a_task_that_holds_nothing_is_refused() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?.join("house");
+    kitchen::state::HouseStore::initialize(
+        &root,
+        kitchen::HouseId::new("origin89")?,
+        kitchen::state::StoreOptions::default(),
+    )?;
+    let store = root.to_str().ok_or("utf-8 path")?;
+
+    let run = acknowledge(
+        store,
+        "decompose-0123456789abcdef0123456789abcdef",
+        "checked",
+    )?;
+    assert_ne!(run.code, Some(0), "{}", run.stdout);
+    assert!(run.stdout.is_empty(), "{}", run.stdout);
+    assert!(!run.stderr.is_empty());
+    Ok(())
+}
+
+#[test]
+fn acknowledging_needs_a_reason() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?.join("house");
+    kitchen::state::HouseStore::initialize(
+        &root,
+        kitchen::HouseId::new("origin89")?,
+        kitchen::state::StoreOptions::default(),
+    )?;
+    let store = root.to_str().ok_or("utf-8 path")?;
+
+    let run = acknowledge(store, "decompose-0123456789abcdef0123456789abcdef", "")?;
+    assert_ne!(run.code, Some(0));
+    assert!(!run.stderr.is_empty());
+    Ok(())
+}

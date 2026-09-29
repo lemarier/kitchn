@@ -33,6 +33,11 @@
 //! are one store transaction ([`HouseStore::reserve_task`]), so two approved
 //! previews cannot both pass. The slot frees when the earlier task settles,
 //! or when its claim lapses with no write that could have reached the forge.
+//! One that settled without success after such a write keeps the repository
+//! until a person runs [`acknowledge`]: it re-reads the forge for that task's
+//! writes, resolving what the forge proves, and records who reviewed the
+//! rest and why. Nothing releases the repository automatically, and only an
+//! interactive claimant may acknowledge.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -48,14 +53,14 @@ use crate::{
     EffectName, Error, ErrorClass, HolderId, Result, TaskId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, CapabilityRequirements, Claimant, Clock,
-        Consent, Effect, ExternalRef, FailureClass, GitHubAction, GitHubMutation, HouseGrants,
-        IssueNumber, LeaseTtl, NotAppliedReason, Provenance, Repository, RetryPolicy, Role,
-        Settlement, TaskAuthority, TaskSpec, Text, Timestamp, Trigger,
+        Consent, Effect, EffectExecutor, ExternalRef, FailureClass, GitHubAction, GitHubMutation,
+        HouseGrants, IssueNumber, LeaseTtl, NotAppliedReason, Provenance, Repository, RetryPolicy,
+        Role, Settlement, TaskAuthority, TaskSpec, Text, Timestamp, Trigger,
     },
     integrations::github::{GitHubExecutor, GitHubMutationTransport},
     state::{
         EffectPlan, EffectRecord, EffectState, HouseStore, Reservation, StateError, TaskRecord,
-        TaskState, reconcile, run_effect,
+        TaskState, WriteAcknowledgement, reconcile, reread_settled, run_effect,
     },
 };
 
@@ -119,6 +124,15 @@ pub enum DecompositionError {
     /// Only a person present can approve and apply a decomposition.
     #[error("a decomposition must be applied by an interactive claimant")]
     ApprovalNeedsPerson,
+    /// Only a person present can acknowledge a settled decomposition's writes.
+    #[error("a decomposition's writes must be acknowledged by an interactive claimant")]
+    AcknowledgementNeedsPerson,
+    /// The task is not a settled, unsuccessful decomposition that holds its
+    /// repository: it is not a decomposition task, has not settled, settled
+    /// successfully, or recorded no write that reached or may have reached
+    /// the forge.
+    #[error("task {0} is not a settled decomposition that holds its repository")]
+    NotHeld(TaskId),
     /// A created issue's receipt does not name an issue in the repository.
     #[error("the forge receipt of a created issue names no issue in the repository")]
     UnreadableReceipt,
@@ -138,7 +152,9 @@ impl DecompositionError {
             | Self::UnknownBlocker { .. }
             | Self::InvalidBlocker(_)
             | Self::Cycle(_) => ErrorClass::InvalidInput,
-            Self::ApprovalNeedsPerson => ErrorClass::Refused,
+            Self::ApprovalNeedsPerson | Self::AcknowledgementNeedsPerson | Self::NotHeld(_) => {
+                ErrorClass::Refused
+            }
             Self::UnreadableReceipt | Self::Encoding => ErrorClass::Execution,
         }
     }
@@ -937,9 +953,11 @@ pub enum ApplyOutcome {
     },
     /// An earlier decomposition of this repository settled without
     /// success after writing, or possibly writing, to the forge. It keeps the
-    /// repository until its owner reconciles the writes and decides how to
-    /// proceed; a different revision could post the same work again. Nothing
-    /// was written.
+    /// repository until a person runs [`acknowledge`] on it (`kitchen
+    /// decompose acknowledge`), which re-reads the forge for its writes and
+    /// records who reviewed them and why they are content to proceed; a
+    /// different revision could post the same work again. Nothing was
+    /// written.
     EarlierSettledWithWrites {
         /// The settled task.
         task: TaskId,
@@ -1276,6 +1294,138 @@ pub fn apply<T: GitHubMutationTransport>(
     Ok(run)
 }
 
+/// What [`acknowledge`] found and recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcknowledgeReport {
+    /// The settled task.
+    pub task: TaskId,
+    /// How it settled.
+    pub settlement: Settlement,
+    /// Whether this call read the forge. Without an executor it could not,
+    /// and every write that was not already resolved stays unproven.
+    pub reread: bool,
+    /// Writes the re-read proved applied.
+    pub applied: Vec<EffectName>,
+    /// Writes the re-read proved absent.
+    pub absent: Vec<EffectName>,
+    /// Writes the forge could not prove either way. The acknowledgement
+    /// accepts that they may or may not exist.
+    pub unresolved: Vec<EffectName>,
+    /// The record that now releases the repository.
+    pub acknowledgement: WriteAcknowledgement,
+    /// Whether an earlier call had already recorded it, so this one changed
+    /// nothing.
+    pub already_acknowledged: bool,
+}
+
+/// Release the repository from a decomposition that settled without success
+/// after writing, or possibly writing, to the forge.
+///
+/// The only way out of [`ApplyOutcome::EarlierSettledWithWrites`]. A person
+/// runs it after looking at what the task left on the forge. With an
+/// `executor` it first re-reads the forge for every write of the task whose
+/// outcome is unknown ([`reread_settled`]), so a write the forge proves
+/// applied or absent stops being unknown. Whatever it still cannot prove is
+/// listed in the recorded [`WriteAcknowledgement`], together with the
+/// claimant, the time, and `reason`; the person accepts that those writes may
+/// or may not exist. Without an `executor` nothing is re-read and every
+/// unknown write is listed the same way. Repeating the call for an
+/// acknowledged task reads nothing and returns the first record.
+///
+/// Nothing is released automatically, and nothing here submits a write.
+///
+/// # Errors
+/// [`DecompositionError::AcknowledgementNeedsPerson`] for a non-interactive
+/// claimant; [`DecompositionError::NotHeld`] unless `task` is a settled,
+/// unsuccessful decomposition with a write that reached or may have reached
+/// the forge; contract errors for an executor of another house; store errors.
+pub fn acknowledge(
+    store: &HouseStore,
+    executor: Option<&dyn EffectExecutor>,
+    task: &TaskId,
+    claimant: &Claimant,
+    reason: &Text,
+    clock: &dyn Clock,
+) -> Result<AcknowledgeReport> {
+    match claimant.trigger {
+        Trigger::Interactive => {}
+        Trigger::Scheduled | Trigger::Event(_) => {
+            return Err(DecompositionError::AcknowledgementNeedsPerson.into());
+        }
+    }
+    let held = |record: &TaskRecord| match record.state() {
+        TaskState::Settled { settlement, .. } => {
+            let decomposition = record.spec().id.as_str().starts_with(TASK_PREFIX);
+            (decomposition
+                && *settlement != Settlement::Succeeded
+                && !forge_writes(record).is_empty())
+            .then_some(*settlement)
+        }
+        TaskState::Open | TaskState::Claimed { .. } => None,
+    };
+    let record = store.task(task)?;
+    let Some(settlement) = held(&record) else {
+        return Err(DecompositionError::NotHeld(task.clone()).into());
+    };
+    if let Some(recorded) = record.write_acknowledgement() {
+        return Ok(AcknowledgeReport {
+            task: task.clone(),
+            settlement,
+            reread: false,
+            applied: Vec::new(),
+            absent: Vec::new(),
+            unresolved: recorded.unresolved.clone(),
+            acknowledgement: recorded.clone(),
+            already_acknowledged: true,
+        });
+    }
+    let mut report = AcknowledgeReport {
+        task: task.clone(),
+        settlement,
+        reread: executor.is_some(),
+        applied: Vec::new(),
+        absent: Vec::new(),
+        unresolved: Vec::new(),
+        acknowledgement: WriteAcknowledgement {
+            by: claimant.holder.clone(),
+            at: clock.now(),
+            reason: reason.clone(),
+            unresolved: Vec::new(),
+        },
+        already_acknowledged: false,
+    };
+    if let Some(executor) = executor {
+        let reread = reread_settled(store, executor, task, clock)?;
+        for effect in &reread.resolved {
+            let names = match effect.state() {
+                EffectState::Applied { .. } => &mut report.applied,
+                _ => &mut report.absent,
+            };
+            if !names.contains(effect.name()) {
+                names.push(effect.name().clone());
+            }
+        }
+    }
+    let record = store.task(task)?;
+    for effect in record
+        .effects()
+        .iter()
+        .filter(|effect| !effect.state().is_resolved())
+    {
+        if !report.unresolved.contains(effect.name()) {
+            report.unresolved.push(effect.name().clone());
+        }
+    }
+    report.acknowledgement.unresolved = report.unresolved.clone();
+    let stored = store.acknowledge_settled_writes(task, report.acknowledgement.clone())?;
+    if let Some(recorded) = stored.write_acknowledgement() {
+        report.already_acknowledged = recorded != &report.acknowledgement;
+        report.acknowledgement = recorded.clone();
+    }
+    Ok(report)
+}
+
 /// Give the claim back after a retryable failure unless the task settled.
 fn release(
     store: &HouseStore,
@@ -1379,8 +1529,8 @@ fn collect_applied(record: &TaskRecord, steps: &[Step], report: &mut ApplyReport
 /// The decomposition of `repository` other than `own` that still holds it,
 /// if any. One holds it while it has not settled and either holds a live
 /// claim or has a write that may have reached the forge, and after it settles
-/// without success if it has such a write: only an owner's reconciliation may
-/// release it, since a different revision could post the same work again. A
+/// without success if it has such a write: only a person's [`acknowledge`]
+/// may release it, since a different revision could post the same work again. A
 /// task that only ever recorded refused or unsent writes and is not being run
 /// wrote nothing and frees the slot, as does one that settled successfully.
 fn earlier_unfinished(
@@ -1397,7 +1547,9 @@ fn earlier_unfinished(
                 && task.spec().repository.as_ref() == Some(repository)
                 && match task.state() {
                     TaskState::Settled { settlement, .. } => {
-                        *settlement != Settlement::Succeeded && !forge_writes(task).is_empty()
+                        *settlement != Settlement::Succeeded
+                            && task.write_acknowledgement().is_none()
+                            && !forge_writes(task).is_empty()
                     }
                     TaskState::Claimed { lease } if lease.is_live(now) => true,
                     TaskState::Open | TaskState::Claimed { .. } => !forge_writes(task).is_empty(),

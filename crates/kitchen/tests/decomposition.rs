@@ -6,17 +6,18 @@ use kitchen::{
     BackendId, CredentialId, EffectName, Error, ErrorClass, HolderId,
     contracts::{
         Clock, EffectFailure, ExternalRef, Grant, HouseGrants, IssueNumber, NotAppliedReason,
-        Permission, PostingBudget, Provenance, Repository, Settlement, Timestamp, UncertainReason,
+        Permission, PostingBudget, Provenance, Repository, Settlement, Text, Timestamp,
+        UncertainReason,
     },
     integrations::github::{
         CredentialRef, GitHubExecutor, GitHubMutationTransport, GitHubReadTransport, HouseScope,
         IntegrationError, MutationRequest, ReadLimits, ReadRequest,
     },
-    state::TaskState,
+    state::{EffectOutcome, EffectRecord, EffectState, RiskAction, RiskDecision, TaskState},
     workflows::decomposition::{
-        ApplyOptions, ApplyOutcome, Approval, Blocker, DecompositionError, IssueKey,
-        OverlapResolution, OwnedPath, Preview, Proposal, ProposedIssue, WriteKind, Writer, apply,
-        preview, task_id,
+        AcknowledgeReport, ApplyOptions, ApplyOutcome, Approval, Blocker, DecompositionError,
+        IssueKey, OverlapResolution, OwnedPath, Preview, Proposal, ProposedIssue, WriteKind,
+        Writer, acknowledge, apply, preview, task_id,
     },
 };
 use serde_json::{Value, json};
@@ -44,6 +45,8 @@ struct Forge {
     submissions: usize,
     /// A fault for the submission with this 1-based number.
     fault: Option<(usize, Fault)>,
+    /// Every read fails, so a lookup cannot prove anything.
+    reads_fail: bool,
 }
 
 impl Forge {
@@ -114,6 +117,9 @@ impl GitHubReadTransport for Transport<'_> {
         _: usize,
     ) -> Result<Vec<u8>, IntegrationError> {
         let forge = self.0.borrow();
+        if forge.reads_fail {
+            return Err(IntegrationError::Unknown);
+        }
         let endpoint = request.endpoint();
         let path = endpoint.split('?').next().unwrap_or(endpoint);
         let issues_root = format!("repos/{REPO}/issues");
@@ -288,6 +294,32 @@ impl House {
             approval,
             &interactive("session")?,
             &options()?,
+        )?)
+    }
+
+    /// Acknowledge `task`'s writes as `claimant`, re-reading `forge` when
+    /// `reread` is set.
+    fn acknowledge(
+        &self,
+        forge: &RefCell<Forge>,
+        task: &kitchen::TaskId,
+        claimant: &kitchen::contracts::Claimant,
+        reread: bool,
+    ) -> TestResult<AcknowledgeReport> {
+        let executor = GitHubExecutor::new(
+            BackendId::new("github")?,
+            self.scope.clone(),
+            Transport(forge),
+            ReadLimits::default(),
+        );
+        self.clock.advance(1);
+        Ok(acknowledge(
+            &self.fixture.store,
+            reread.then_some(&executor as &dyn kitchen::contracts::EffectExecutor),
+            task,
+            claimant,
+            &Text::new("the earlier issues were reviewed by hand")?,
+            &self.clock,
         )?)
     }
 }
@@ -1100,5 +1132,271 @@ fn distinct_blocked_by_edges_never_share_an_effect_name() -> TestResult {
     assert_eq!(blocked_by("x")?, x);
     assert_eq!(blocked_by("a-by-b")?, [number("c")?]);
     assert_eq!(blocked_by("a")?, [number("b-by-c")?]);
+    Ok(())
+}
+
+fn names(list: &[EffectName]) -> Vec<&str> {
+    list.iter().map(EffectName::as_str).collect()
+}
+
+/// A revision of `proposal` that a new approval covers.
+fn revised(proposal: &Proposal) -> TestResult<(Proposal, Approval)> {
+    let mut revised = proposal.clone();
+    if let Some(docs) = revised.issues.first_mut() {
+        docs.title = "Build the docs site".into();
+    }
+    let approval = approval_of(&preview(&revised)?)?;
+    Ok((revised, approval))
+}
+
+#[test]
+fn acknowledging_a_settled_task_releases_the_repository() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge {
+        fault: Some((2, Fault::Reject)),
+        ..Forge::seeded()
+    });
+    let proposal = project()?;
+    let original = preview(&proposal)?;
+    exhausted_after_a_refused_write(&house, &forge, &proposal, &approval_of(&original)?)?;
+    let (next, next_approval) = revised(&proposal)?;
+    let held = house.apply(&forge, &next, &next_approval)?;
+    assert!(matches!(
+        held.outcome,
+        ApplyOutcome::EarlierSettledWithWrites { .. }
+    ));
+
+    let id = task_id(&original.digest)?;
+    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, true)?;
+    assert!(report.reread);
+    assert!(!report.already_acknowledged);
+    assert!(report.unresolved.is_empty());
+    assert_eq!(report.acknowledgement.by.as_str(), "owner-session");
+    assert_eq!(
+        report.acknowledgement.reason.as_str(),
+        "the earlier issues were reviewed by hand"
+    );
+    let recorded = house.fixture.store.task(&id)?;
+    assert_eq!(
+        recorded.write_acknowledgement(),
+        Some(&report.acknowledgement)
+    );
+    assert!(matches!(
+        recorded.state(),
+        TaskState::Settled {
+            settlement: Settlement::Exhausted,
+            ..
+        }
+    ));
+
+    let released = house.apply(&forge, &next, &next_approval)?;
+    assert_eq!(released.outcome, ApplyOutcome::Completed);
+    Ok(())
+}
+
+#[test]
+fn a_scheduled_claimant_cannot_acknowledge() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge {
+        fault: Some((2, Fault::Reject)),
+        ..Forge::seeded()
+    });
+    let proposal = project()?;
+    let original = preview(&proposal)?;
+    exhausted_after_a_refused_write(&house, &forge, &proposal, &approval_of(&original)?)?;
+    let id = task_id(&original.digest)?;
+
+    let refused = house.acknowledge(&forge, &id, &scheduled("tick")?, true);
+    let Err(error) = refused else {
+        return Err("a scheduled claimant acknowledged".into());
+    };
+    assert!(error.to_string().contains("interactive claimant"));
+    assert_eq!(house.fixture.store.task(&id)?.write_acknowledgement(), None);
+    let (next, next_approval) = revised(&proposal)?;
+    let still = house.apply(&forge, &next, &next_approval)?;
+    assert!(matches!(
+        still.outcome,
+        ApplyOutcome::EarlierSettledWithWrites { .. }
+    ));
+    Ok(())
+}
+
+/// A task that settled with `issue-core` unproven: the first submission is
+/// lost, and a person then waives the unknown write to cancel the task.
+fn settled_with_an_unknown_write(
+    house: &House,
+    forge: &RefCell<Forge>,
+    fault: Fault,
+) -> TestResult<(Proposal, kitchen::TaskId)> {
+    forge.borrow_mut().fault = Some((1, fault));
+    let proposal = project()?;
+    let original = preview(&proposal)?;
+    let report = house.apply(forge, &proposal, &approval_of(&original)?)?;
+    assert!(matches!(report.outcome, ApplyOutcome::Uncertain { .. }));
+    let id = task_id(&original.digest)?;
+
+    let store = &house.fixture.store;
+    let operator = interactive("operator")?;
+    let now = house.clock.now();
+    let fence = store.claim(&id, &operator, ttl(600)?, now)?.fence();
+    let lost = store
+        .task(&id)?
+        .effects()
+        .first()
+        .cloned()
+        .ok_or("no write was recorded")?;
+    store.record_effect_outcome(&id, fence, lost.seq(), EffectOutcome::Unresolvable, now)?;
+    let decision = RiskDecision {
+        effect: lost.request().key().clone(),
+        decided_by: operator.holder.clone(),
+        revision: store.task(&id)?.evidence().revision(),
+        action: RiskAction::SettleUnsuccessfully,
+    };
+    store.accept_risk(&id, fence, lost.seq(), decision, now)?;
+    store.request_cancel(&id, &operator.holder, now)?;
+    store.settle_cancelled(&id, fence, now)?;
+    assert!(matches!(
+        store.task(&id)?.state(),
+        TaskState::Settled {
+            settlement: Settlement::Cancelled,
+            ..
+        }
+    ));
+    Ok((proposal, id))
+}
+
+#[test]
+fn a_reread_resolves_an_unknown_write_the_forge_proves_applied() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge::seeded());
+    let (_, id) = settled_with_an_unknown_write(&house, &forge, Fault::LoseAfterApply)?;
+
+    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, true)?;
+    assert_eq!(names(&report.applied), ["issue-core"]);
+    assert!(report.unresolved.is_empty());
+    assert!(report.acknowledgement.unresolved.is_empty());
+    let after = house.fixture.store.task(&id)?;
+    assert!(matches!(
+        after.effects().first().map(EffectRecord::state),
+        Some(EffectState::Applied { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn an_unproven_write_needs_the_acknowledgement_to_release() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge::seeded());
+    let (proposal, id) = settled_with_an_unknown_write(&house, &forge, Fault::LoseAfterApply)?;
+    let (next, next_approval) = revised(&proposal)?;
+    forge.borrow_mut().reads_fail = true;
+    let held = house.apply(&forge, &next, &next_approval)?;
+    assert!(matches!(
+        held.outcome,
+        ApplyOutcome::EarlierSettledWithWrites { .. }
+    ));
+    // Reads still fail: the re-read proves nothing, so the write stays unknown.
+    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, true)?;
+    assert!(report.reread);
+    assert!(report.applied.is_empty() && report.absent.is_empty());
+    assert_eq!(names(&report.unresolved), ["issue-core"]);
+    assert_eq!(names(&report.acknowledgement.unresolved), ["issue-core"]);
+    let after = house.fixture.store.task(&id)?;
+    assert!(matches!(
+        after.effects().first().map(EffectRecord::state),
+        Some(EffectState::Waived { .. })
+    ));
+
+    forge.borrow_mut().reads_fail = false;
+    let released = house.apply(&forge, &next, &next_approval)?;
+    assert_eq!(released.outcome, ApplyOutcome::Completed);
+    Ok(())
+}
+
+#[test]
+fn acknowledging_without_a_backend_reads_nothing() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge::seeded());
+    let (_, id) = settled_with_an_unknown_write(&house, &forge, Fault::LoseBeforeApply)?;
+    let reads_before = forge.borrow().submissions;
+
+    let report = house.acknowledge(&forge, &id, &interactive("owner-session")?, false)?;
+    assert!(!report.reread);
+    assert_eq!(names(&report.unresolved), ["issue-core"]);
+    assert_eq!(forge.borrow().submissions, reads_before);
+    Ok(())
+}
+
+#[test]
+fn a_repeated_acknowledgement_keeps_the_first_record() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge {
+        fault: Some((2, Fault::Reject)),
+        ..Forge::seeded()
+    });
+    let proposal = project()?;
+    let original = preview(&proposal)?;
+    exhausted_after_a_refused_write(&house, &forge, &proposal, &approval_of(&original)?)?;
+    let id = task_id(&original.digest)?;
+
+    let first = house.acknowledge(&forge, &id, &interactive("first-session")?, true)?;
+    let second = house.acknowledge(&forge, &id, &interactive("second-session")?, true)?;
+    assert!(second.already_acknowledged);
+    assert_eq!(second.acknowledgement, first.acknowledgement);
+    assert_eq!(second.acknowledgement.by.as_str(), "first-session");
+    Ok(())
+}
+
+#[test]
+fn only_a_settled_unsuccessful_decomposition_can_be_acknowledged() -> TestResult {
+    let house = House::new(20)?;
+    let forge = RefCell::new(Forge::seeded());
+    let proposal = project()?;
+    let original = preview(&proposal)?;
+    let approval = approval_of(&original)?;
+    let id = task_id(&original.digest)?;
+    let person = interactive("owner-session")?;
+
+    // No such task.
+    assert!(house.acknowledge(&forge, &id, &person, true).is_err());
+
+    // Settled successfully: nothing is held.
+    let done = house.apply(&forge, &proposal, &approval)?;
+    assert_eq!(done.outcome, ApplyOutcome::Completed);
+    let error = house
+        .acknowledge(&forge, &id, &person, true)
+        .err()
+        .ok_or("a successful task was acknowledged")?;
+    assert!(
+        error.to_string().contains("does not hold") || error.to_string().contains("not a settled")
+    );
+    assert_eq!(house.fixture.store.task(&id)?.write_acknowledgement(), None);
+
+    // Unsettled: the unfinished guard is not an acknowledgement's to lift.
+    let pending = RefCell::new(Forge {
+        fault: Some((2, Fault::Reject)),
+        ..Forge::seeded()
+    });
+    let other = House::new(20)?;
+    other.apply(&pending, &proposal, &approval)?;
+    assert!(other.acknowledge(&pending, &id, &person, true).is_err());
+    let unsettled = other
+        .fixture
+        .store
+        .acknowledge_settled_writes(
+            &id,
+            kitchen::state::WriteAcknowledgement {
+                by: person.holder.clone(),
+                at: other.clock.now(),
+                reason: Text::new("too early")?,
+                unresolved: Vec::new(),
+            },
+        )
+        .err()
+        .ok_or("an unsettled task was acknowledged")?;
+    assert!(matches!(
+        unsettled,
+        Error::State(kitchen::state::StateError::TaskNotSettled(_))
+    ));
     Ok(())
 }

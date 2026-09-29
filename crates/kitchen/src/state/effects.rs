@@ -180,3 +180,64 @@ pub fn reconcile(
     }
     Ok(report)
 }
+
+/// Ask the executor what happened to each unproven effect of a settled
+/// `task` and record the answers.
+///
+/// A settled task has no lease and cannot submit anything, so unlike
+/// [`reconcile`] this needs no fence and can only learn: a lookup never
+/// re-executes an effect, and an inconclusive answer leaves the effect as it
+/// was. It exists for the person-driven review of a task that settled without
+/// success. Effects persisted for another backend namespace are reported as
+/// foreign and not looked up.
+///
+/// # Errors
+/// [`ContractError::CrossHouse`] for a foreign backend,
+/// [`StateError::TaskNotSettled`] while the task has not settled, and store
+/// errors.
+pub fn reread_settled(
+    store: &HouseStore,
+    executor: &dyn EffectExecutor,
+    task: &TaskId,
+    clock: &dyn Clock,
+) -> Result<ReconcileReport> {
+    let descriptor = executor.descriptor();
+    if &descriptor.house != store.house() {
+        return Err(ContractError::CrossHouse {
+            expected: store.house().clone(),
+            found: descriptor.house.clone(),
+        }
+        .into());
+    }
+    let record = store.task(task)?;
+    if !matches!(record.state(), TaskState::Settled { .. }) {
+        return Err(StateError::TaskNotSettled(task.clone()).into());
+    }
+    // Every write the forge has not proven, including one a person waived to
+    // settle: a settled task has no work left for a waiver to protect.
+    let pending: Vec<EffectRecord> = record
+        .effects()
+        .iter()
+        .filter(|effect| !effect.state().is_resolved())
+        .cloned()
+        .collect();
+    let mut report = ReconcileReport::default();
+    for effect in pending {
+        if effect.request().backend() != &descriptor.backend {
+            report.foreign.push(effect);
+            continue;
+        }
+        let updated = store.record_settled_outcome(
+            task,
+            effect.seq(),
+            look_up(executor, &effect),
+            clock.now(),
+        )?;
+        if updated.state().is_resolved() {
+            report.resolved.push(updated);
+        } else {
+            report.unresolved.push(updated);
+        }
+    }
+    Ok(report)
+}

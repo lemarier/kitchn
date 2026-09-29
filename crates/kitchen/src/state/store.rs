@@ -36,7 +36,7 @@ use crate::{
     state::{
         CancelStatus, ConsumerRecord, Consumption, Creation, EffectOutcome, EffectPlan,
         EffectRecord, EffectStart, Lease, MarkerAttempt, MarkerFact, MarkerKey, MarkerRecording,
-        RecoveryItem, Reservation, RiskDecision, TaskRecord, WorkflowMarker,
+        RecoveryItem, Reservation, RiskDecision, TaskRecord, WorkflowMarker, WriteAcknowledgement,
         model::StoreState,
         snapshot::{SnapshotStore, StoreLayout, StoreOptions},
     },
@@ -370,6 +370,40 @@ impl HouseStore {
         now: Timestamp,
     ) -> Result<EffectRecord> {
         self.transact(|state| state.accept_risk(id, fence, seq, decision, now))
+    }
+
+    /// Record what a forge re-read proved about one write of a settled task.
+    /// A settled task has no lease, so this takes no fence; it is for the
+    /// person-driven acknowledgement of a task's writes only.
+    ///
+    /// # Errors
+    /// [`StateError::TaskNotSettled`] while the task is unsettled,
+    /// [`StateError::EffectNotFound`] for an unknown write, and
+    /// [`StateError::ConflictingOutcome`] when the answer contradicts a
+    /// recorded one.
+    pub fn record_settled_outcome(
+        &self,
+        id: &TaskId,
+        seq: EffectSeq,
+        outcome: EffectOutcome,
+        now: Timestamp,
+    ) -> Result<EffectRecord> {
+        self.transact(|state| state.record_settled_outcome(id, seq, outcome, now))
+    }
+
+    /// Record a person's review of a settled, unsuccessful task's forge
+    /// writes. The first acknowledgement stays; repeating the call returns the
+    /// record unchanged.
+    ///
+    /// # Errors
+    /// [`StateError::TaskNotSettled`] while the task is unsettled and
+    /// [`StateError::TaskSettled`] for a task that settled successfully.
+    pub fn acknowledge_settled_writes(
+        &self,
+        id: &TaskId,
+        acknowledgement: WriteAcknowledgement,
+    ) -> Result<TaskRecord> {
+        self.transact(|state| state.acknowledge_settled_writes(id, acknowledgement))
     }
 
     /// Record evidence. A new subject (head or base) starts a new evidence revision

@@ -644,6 +644,28 @@ impl HouseStore {
         self.transact(|state| state.record_marker_unless(key, fact, recorded_by, now, guard))
     }
 
+    /// Like [`Self::record_marker_unless`], recorded by the owner of `task`'s
+    /// claim at `fence`. The claim is checked in the same transaction as the
+    /// guard and the write, so an owner that was taken over, or whose task
+    /// settled, since it read the task writes nothing.
+    ///
+    /// # Errors
+    /// Returns [`StateError::TaskNotFound`], [`StateError::TaskSettled`],
+    /// [`StateError::StaleFence`] for another claim or an open task,
+    /// [`StateError::LeaseExpired`], and the errors of
+    /// [`Self::record_marker_unless`].
+    pub fn record_task_marker_unless<R>(
+        &self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        task: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+        guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
+    ) -> Result<MarkerAttempt<R>> {
+        self.transact(|state| state.record_task_marker_unless(key, fact, task, fence, now, guard))
+    }
+
     /// Record `first` and, as the guard decides, `second` in one store
     /// transaction. A refusal or error leaves neither written, so callers
     /// never see one marker without the other they meant to write with it.

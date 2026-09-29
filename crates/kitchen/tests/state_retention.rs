@@ -854,3 +854,58 @@ fn lookup_order_resumes_after_the_cursor_and_wraps() -> TestResult {
     assert!(order(&subjects).is_empty());
     Ok(())
 }
+
+#[test]
+fn held_follow_ups_retire_once_their_task_settled_or_is_gone() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let held = |item: WorkItem, subject: &str| -> TestResult<MarkerKey> {
+        Ok(MarkerKey {
+            workflow: WorkflowId::new("held-follow-up")?,
+            item,
+            subject: MarkerSubject::Observation(ExternalRef::new(subject)?),
+        })
+    };
+    let task = |id: &str| -> TestResult<WorkItem> {
+        Ok(WorkItem::Task {
+            task: common::task_id(id)?,
+        })
+    };
+    let live = common::task_id("follow-up-live")?;
+    store.create_task(common::spec(live.as_str())?, &creator()?, at(0))?;
+    store.claim(&live, &scheduled("worker")?, ttl(3600)?, at(0))?;
+    let settled = common::task_id("follow-up-settled")?;
+    settled_task(&fixture, &settled, None, AttemptOutcome::Succeeded, 5)?;
+
+    let on_live = held(task("follow-up-live")?, "a")?;
+    let on_settled = held(task("follow-up-settled")?, "a")?;
+    let on_missing = held(task("follow-up-retired")?, "a")?;
+    // The rule is about tasks: the same schema on an issue is kept.
+    let on_issue = held(issue(7)?, "a")?;
+    for key in [&on_live, &on_settled, &on_missing, &on_issue] {
+        record(&fixture, key, fact("coordination.held-follow-up/1")?, 1)?;
+    }
+
+    let report = store.retain(
+        &RetentionPolicy::default(),
+        &Inventory::new(),
+        &creator()?,
+        at(6),
+    )?;
+    let mut retired: Vec<(MarkerKey, MarkerRetirement)> = report
+        .markers
+        .into_iter()
+        .map(|retired| (retired.key, retired.reason))
+        .collect();
+    retired.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut expected = vec![
+        (on_settled.clone(), MarkerRetirement::TaskSettled),
+        (on_missing.clone(), MarkerRetirement::TaskSettled),
+    ];
+    expected.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(retired, expected);
+    assert!(store.marker(&on_live)?.is_some());
+    assert!(store.marker(&on_issue)?.is_some());
+    assert_eq!(store.marker(&on_settled)?, None);
+    Ok(())
+}

@@ -2366,6 +2366,28 @@ impl StoreState {
         self.record_marker_guarded(key, fact, recorded_by, now, Some(pending), guard)
     }
 
+    /// Like [`Self::record_marker_unless`], recorded by the owner of `task`'s
+    /// live claim at `fence`. The claim is checked in this transaction, so a
+    /// takeover or settlement since the caller read the task refuses the
+    /// write.
+    pub(crate) fn record_task_marker_unless<R>(
+        &mut self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        task: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+        guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
+    ) -> Result<MarkerAttempt<R>> {
+        let lease = self.task(task)?.owned_lease(fence, now, true)?;
+        let owner = Claimant {
+            holder: lease.holder.clone(),
+            trigger: lease.trigger.clone(),
+            consumer: lease.consumer.clone(),
+        };
+        self.record_marker_guarded(key, fact, &owner, now, None, guard)
+    }
+
     /// Record `first` and, when the guard asks for it, `second` in one
     /// transaction. The guard reads the workflow's markers before either is
     /// written. It blocks both, skips `second`, or records both; an error

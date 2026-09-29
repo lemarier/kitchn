@@ -16,7 +16,10 @@
 //! ([`CoordinationError::FollowUpsFull`],
 //! [`CoordinationError::FollowUpTooLarge`]), never dropped. Markers are
 //! retired once their follow-up was addressed or sent, and when the task
-//! settles.
+//! settles. A follow-up is held only under the task's current live claim,
+//! checked in the same store transaction as the write, so none is held for
+//! a task that settled; store retention also retires the markers of a
+//! settled task.
 
 use std::num::NonZeroU32;
 
@@ -152,8 +155,10 @@ fn markers_of<'a>(
 /// # Errors
 /// Returns [`CoordinationError::FollowUpTooLarge`] for a body over
 /// [`MAX_HELD_FOLLOW_UP_BYTES`], [`CoordinationError::FollowUpsFull`] when
-/// the task already holds [`MAX_HELD_FOLLOW_UPS`], a stale or expired claim,
-/// a different request held under the same id, and store failures.
+/// the task already holds [`MAX_HELD_FOLLOW_UPS`], a claim that is stale,
+/// expired, or taken over, a settled task
+/// ([`crate::state::StateError::TaskSettled`]), a different request held
+/// under the same id, and store failures.
 pub(crate) fn hold(
     store: &HouseStore,
     record: &TaskRecord,
@@ -165,7 +170,6 @@ pub(crate) fn hold(
     if body.as_str().len() > MAX_HELD_FOLLOW_UP_BYTES {
         return Err(CoordinationError::FollowUpTooLarge.into());
     }
-    let claimant = owner(record, fence, now)?;
     let task = &record.spec().id;
     // Follow-ups addressed or sent since the last supervision step do not
     // count against the bound.
@@ -175,8 +179,15 @@ pub(crate) fn hold(
         body: body.clone(),
         delivery: Delivery::Waiting,
     };
-    let attempt =
-        store.record_marker_unless(key(task, id)?, fact(&stored)?, &claimant, now, |markers| {
+    // The claim is checked with the bound and the write: an owner taken over
+    // or settled since `record` was read holds nothing that no one delivers.
+    let attempt = store.record_task_marker_unless(
+        key(task, id)?,
+        fact(&stored)?,
+        task,
+        fence,
+        now,
+        |markers| {
             let held = markers
                 .iter()
                 .filter(|marker| {
@@ -184,7 +195,8 @@ pub(crate) fn hold(
                 })
                 .count();
             Ok((held >= MAX_HELD_FOLLOW_UPS).then_some(CoordinationError::FollowUpsFull))
-        })?;
+        },
+    )?;
     match attempt {
         MarkerAttempt::Recorded(_) | MarkerAttempt::AlreadyRecorded(_) => Ok(()),
         MarkerAttempt::Blocked(refusal) => Err(refusal.into()),

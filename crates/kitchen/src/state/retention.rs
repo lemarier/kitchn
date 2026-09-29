@@ -11,6 +11,8 @@
 //! - A marker whose rule is [`MarkerRule::LatestSubject`] keeps only the
 //!   newest subject per workflow, item, and schema; older subjects retire.
 //!   All of them retire once the item is gone.
+//! - A marker whose rule is [`MarkerRule::UntilTaskSettled`] is retired once
+//!   the task it is about settled or is gone from the store.
 //! - A settled task retires once it has been settled for the policy's window
 //!   and its identity can never be created again: a budget window that has
 //!   passed, or the repair rounds of a pull request that closed.
@@ -245,6 +247,9 @@ pub enum MarkerRule {
     LatestSubject,
     /// Its owner compacts it; retention never removes it directly.
     Compacted,
+    /// Retired once the task it is about settled or was retired. A marker
+    /// about anything other than a task is kept.
+    UntilTaskSettled,
 }
 
 /// The rule for each workflow marker schema. A schema not listed here is
@@ -270,6 +275,9 @@ const MARKER_RULES: &[(&str, MarkerRule)] = &[
     ("deliberation.entry", MarkerRule::Keep),
     ("deliberation.record", MarkerRule::Keep),
     ("deliberation.pin", MarkerRule::Keep),
+    // Delivered only to a worker of an unsettled task, so one held for a
+    // settled task, even one written after its owner pruned, is never read.
+    ("coordination.held-follow-up", MarkerRule::UntilTaskSettled),
 ];
 
 /// The retention rule for a marker's fact.
@@ -299,6 +307,8 @@ pub enum MarkerRetirement {
     ItemGone,
     /// A newer subject of the same item replaced it.
     Superseded,
+    /// The task it is about settled or was retired.
+    TaskSettled,
 }
 
 /// Why a task was retired.
@@ -484,7 +494,7 @@ impl RetentionSubjects {
         for marker in markers {
             match marker_rule(marker.fact()) {
                 MarkerRule::UntilItemGone | MarkerRule::LatestSubject => add(&marker.key().item),
-                MarkerRule::Keep | MarkerRule::Compacted => {}
+                MarkerRule::Keep | MarkerRule::Compacted | MarkerRule::UntilTaskSettled => {}
             }
         }
         for task in tasks.filter(|task| matches!(task.state(), TaskState::Settled { .. })) {
@@ -623,6 +633,9 @@ pub(super) fn plan<'a>(
                 }
                 MarkerRule::LatestSubject => (newest.get(&group(marker)) != Some(&key))
                     .then_some(MarkerRetirement::Superseded),
+                MarkerRule::UntilTaskSettled => {
+                    task_settled(tasks, &key.item).then_some(MarkerRetirement::TaskSettled)
+                }
             }?;
             Some(RetiredMarker {
                 key: key.clone(),
@@ -713,6 +726,19 @@ fn newest_subjects<'a>(markers: &[&'a WorkflowMarker]) -> BTreeMap<Group<'a>, &'
         .into_iter()
         .map(|(group, (_, key))| (group, key))
         .collect()
+}
+
+/// Whether `item` is a task that settled or is no longer in the store.
+fn task_settled(tasks: &BTreeMap<TaskId, TaskRecord>, item: &WorkItem) -> bool {
+    match item {
+        WorkItem::Task { task } => tasks
+            .get(task)
+            .is_none_or(|record| matches!(record.state(), TaskState::Settled { .. })),
+        WorkItem::Issue { .. }
+        | WorkItem::PullRequest { .. }
+        | WorkItem::Resource { .. }
+        | WorkItem::Repository { .. } => false,
+    }
 }
 
 fn settled_long_enough(task: &TaskRecord, policy: &RetentionPolicy, now: Timestamp) -> bool {

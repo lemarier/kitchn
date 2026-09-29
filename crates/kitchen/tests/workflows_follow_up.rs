@@ -7,15 +7,22 @@
 mod common;
 mod workflows_support;
 
+use std::cell::RefCell;
+
 use common::{TestResult, at, ttl};
 use kitchen::{
     Error, TaskId, WorkflowId,
     contracts::{
-        Claimant, Disposition, Effect, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
-        ExternalRef, Fence, Operation, ResourceRef, Settlement, Text, WorkerOutcome, WorkerState,
-        Workspace, fake::ExecuteFault,
+        BackendDescriptor, BackendUnavailable, Claimant, Disposition, Effect, EffectExecutor,
+        EffectFailure, EffectRequest, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
+        ExternalRef, Fence, Lookup, Operation, Receipt, ResourceRef, Settlement, Text, Timestamp,
+        WorkerBackend, WorkerOutcome, WorkerState, Workspace,
+        fake::{ExecuteFault, FakeBackend},
     },
-    state::{EffectState, HouseStore, TaskState},
+    state::{
+        EffectState, HouseStore, Inventory, MarkerRetirement, RetentionPolicy, StateError,
+        TaskState,
+    },
     workflows::{
         coordination::{
             Completion, Context, CoordinationError, FollowUpRoute, LaunchOutcome, Release,
@@ -28,7 +35,7 @@ use kitchen::{
     },
 };
 use workflows_support::{
-    World, branch, brief, issue, signals, supervision, template_with, under_consumer,
+    Approves, World, branch, brief, issue, signals, supervision, template_with, under_consumer,
 };
 
 /// A coordinator whose memory is gone: a fresh store handle on the same
@@ -584,5 +591,205 @@ fn a_held_follow_up_a_completion_addressed_is_never_held_again() -> TestResult {
     let text = latest_brief(store, &task)?;
     assert!(text.contains(&format!("- {open}: ")));
     assert!(!text.contains(addressed.as_str()));
+    Ok(())
+}
+
+type Interleave<'a> = Box<dyn FnOnce() -> kitchen::Result<()> + 'a>;
+
+/// A backend that runs `interleave` once, when the worker is first
+/// observed: after `send_follow_up` read the task and before it holds the
+/// request. Its result is kept in `outcome`.
+struct Interleaved<'a> {
+    inner: &'a FakeBackend,
+    interleave: RefCell<Option<Interleave<'a>>>,
+    outcome: RefCell<Option<kitchen::Result<()>>>,
+}
+
+impl EffectExecutor for Interleaved<'_> {
+    fn descriptor(&self) -> &BackendDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        self.inner.execute(request)
+    }
+
+    fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        self.inner.lookup(request)
+    }
+}
+
+impl WorkerBackend for Interleaved<'_> {
+    fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
+        if let Some(interleave) = self.interleave.borrow_mut().take() {
+            *self.outcome.borrow_mut() = Some(interleave());
+        }
+        self.inner.observe_worker(worker)
+    }
+}
+
+/// How far the task went while the old owner was between its read and its
+/// write.
+#[derive(Clone, Copy)]
+enum Meanwhile {
+    TakenOver,
+    TakenOverAndSettled,
+}
+
+/// Who owned the task before the takeover.
+#[derive(Clone, Copy)]
+enum Coordinator {
+    /// A person's session, with no consumer lease.
+    Interactive,
+    /// A scheduled tick under a consumer lease that stays live.
+    Scheduled,
+}
+
+/// `coordinator` claims the task and launches its worker, and a person
+/// takes the terminal over before supervision noticed. The coordinator reads
+/// the task to send a follow-up; before it holds the request, its claim
+/// expires, another owner takes the task over and, per `meanwhile`, settles
+/// it. The old owner's clock still reads before its own expiry.
+fn hold_after(
+    coordinator: Coordinator,
+    meanwhile: Meanwhile,
+) -> TestResult<(World, TaskId, kitchen::Result<FollowUpRoute>)> {
+    let world = World::new()?;
+    let claimant = match coordinator {
+        Coordinator::Interactive => common::interactive("coordinator")?,
+        Coordinator::Scheduled => under_consumer(&world, "coordinator")?.0,
+    };
+    let ClaimOutcome::Claimed(lease) = claim_issue(
+        &world.fixture.store,
+        &template_with(3, workflows_support::provenance('a')?)?,
+        &issue(1)?,
+        &claimant,
+        ttl(300)?,
+        world.now(),
+    )?
+    else {
+        return Err("claim failed".into());
+    };
+    let task = issue_task_id(&issue(1)?)?;
+    let fence = lease.fence();
+    // An interactive owner launches with its person's consent.
+    let approves = Approves::new("coordinator")?;
+    let launching = match coordinator {
+        Coordinator::Interactive => world.ctx_with(&approves),
+        Coordinator::Scheduled => world.ctx(),
+    };
+    let LaunchOutcome::Accepted { worker, .. } =
+        launch_worker(&launching, &task, fence, Workspace::Isolated, &brief(1)?)?
+    else {
+        return Err("launch not accepted".into());
+    };
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::UserTakeover);
+    let later = Timestamp::from_unix_millis(world.now().as_unix_millis().saturating_add(301_000));
+    let store = &world.fixture.store;
+    let person = common::interactive("david")?;
+    let lease_ttl = ttl(300)?;
+    let takeover: Interleave<'_> = Box::new(|| {
+        let lease = store.take_over(&task, &person, lease_ttl, later)?;
+        match meanwhile {
+            Meanwhile::TakenOver => Ok(()),
+            Meanwhile::TakenOverAndSettled => {
+                store.request_cancel(&task, &person.holder, later)?;
+                store.settle_cancelled(&task, lease.fence(), later)
+            }
+        }
+    });
+    let backend = Interleaved {
+        inner: &world.backend,
+        interleave: RefCell::new(Some(takeover)),
+        outcome: RefCell::new(None),
+    };
+    let sent = send_follow_up(
+        &Context {
+            backend: &backend,
+            ..world.ctx()
+        },
+        &task,
+        fence,
+        &follow_up("review-late", "Rename the driver constant.")?,
+    );
+    match backend.outcome.take() {
+        Some(Ok(())) => {}
+        Some(Err(error)) => return Err(format!("interleaving refused: {error}").into()),
+        None => return Err("the worker was never observed".into()),
+    }
+    drop(backend);
+    Ok((world, task, sent))
+}
+
+#[test]
+fn an_owner_whose_task_settled_since_it_read_the_task_holds_nothing() -> TestResult {
+    for coordinator in [Coordinator::Interactive, Coordinator::Scheduled] {
+        let (world, task, sent) = hold_after(coordinator, Meanwhile::TakenOverAndSettled)?;
+        assert!(
+            matches!(
+                sent,
+                Err(Error::State(StateError::TaskSettled {
+                    settlement: Settlement::Cancelled,
+                    ..
+                }))
+            ),
+            "{sent:?}"
+        );
+        assert!(matches!(
+            world.fixture.store.task(&task)?.state(),
+            TaskState::Settled { .. }
+        ));
+        // No marker is left for a settled task that no worker will read.
+        assert_eq!(held_markers(&world.fixture.store)?, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn an_owner_taken_over_since_it_read_the_task_holds_nothing() -> TestResult {
+    let (world, _, sent) = hold_after(Coordinator::Interactive, Meanwhile::TakenOver)?;
+    assert!(
+        matches!(sent, Err(Error::State(StateError::StaleFence { .. }))),
+        "{sent:?}"
+    );
+    assert_eq!(held_markers(&world.fixture.store)?, 0);
+    Ok(())
+}
+
+#[test]
+fn a_held_follow_up_written_for_a_settled_task_is_retired_by_retention() -> TestResult {
+    let world = World::new()?;
+    let (task, fence, claimant, worker) = person_took_over(&world)?;
+    let store = &world.fixture.store;
+    send_follow_up(
+        &world.ctx(),
+        &task,
+        fence,
+        &follow_up("review-6", "Add a test.")?,
+    )?;
+    // The task settles with no supervision step, so nothing prunes it.
+    store.request_cancel(&task, &common::holder("david")?, world.now())?;
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Cancelled));
+    store.settle_cancelled(&task, fence, world.now())?;
+    assert_eq!(held_markers(store)?, 1);
+    let report = store.retain(
+        &RetentionPolicy::default(),
+        &Inventory::new(),
+        &claimant,
+        world.now(),
+    )?;
+    assert_eq!(
+        report
+            .markers
+            .iter()
+            .map(|retired| retired.reason)
+            .collect::<Vec<_>>(),
+        vec![MarkerRetirement::TaskSettled]
+    );
+    assert_eq!(held_markers(store)?, 0);
     Ok(())
 }

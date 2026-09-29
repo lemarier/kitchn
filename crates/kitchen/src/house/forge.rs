@@ -3,11 +3,19 @@
 //! A [`ForgeBinding`] names the forge, backend namespace, requester identity,
 //! credential name, and per-task posting budget a house writes with. It is
 //! stored at `private/<house>/forge.json` in the house registry, outside every
-//! working tree, and holds no secret. The credential itself is a token file the
+//! working tree, and holds no secret. The credential itself is a file the
 //! person places at [`credential_path`]; Kitchen never writes or copies it and
 //! reads it only when a write runs, after every other check has passed. It is
 //! opened from the registry root one name at a time without following links,
 //! checked on the opened descriptor, and read from that same descriptor.
+//!
+//! The [`CredentialKind`] says what that file holds: a person's token, or the
+//! PEM private key of a GitHub App whose ID and installation the binding
+//! names. An app writes as `<app-slug>[bot]` with installation tokens minted
+//! per effect for its repository and permissions; see
+//! [`AppTokens`](crate::integrations::github::AppTokens). Before an approved
+//! write, [`apply_approved`] refuses an app that is not installed on the
+//! write's repository, naming it.
 //!
 //! [`apply_approved`] is the one entry point for writing an approved preview,
 //! such as an issue draft or a decomposition. It refuses a claimant without a
@@ -27,13 +35,14 @@ use super::{HouseConfig, HouseError};
 use crate::{
     BackendId, CredentialId, ErrorClass, HouseId,
     adoption::{FileMode, HouseRegistry, NewFile, RelativePath, decode, encode},
+    contracts::Repository,
     contracts::{
         BackendDescriptor, BackendUnavailable, Claimant, EffectExecutor, EffectFailure,
         EffectRequest, ExternalRef, Lookup, NotAppliedReason, PostingBudget, Receipt, Trigger,
     },
     integrations::github::{
-        CredentialFile, CredentialRef, GitHubExecutor, GitHubMutationTransport, HouseScope,
-        IntegrationError, ReadLimits,
+        CredentialFile, CredentialRef, GitHubApp, GitHubExecutor, GitHubMutationTransport,
+        HouseScope, Installed, IntegrationError, ReadLimits,
     },
 };
 
@@ -85,6 +94,41 @@ impl fmt::Display for ForgeKind {
     }
 }
 
+/// What the binding's credential file holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum CredentialKind {
+    /// A token for the requester, checked through `/user` before each call.
+    #[default]
+    Token,
+    /// The PEM private key of this GitHub App; the requester is the app's
+    /// `<app-slug>[bot]` login.
+    GitHubApp(GitHubApp),
+}
+
+impl CredentialKind {
+    /// Whether this is the default token kind, which a stored binding omits.
+    #[must_use]
+    pub const fn is_token(&self) -> bool {
+        matches!(self, Self::Token)
+    }
+}
+
+/// The checked credential file handed to `connect` in [`apply_approved`] and
+/// [`forge_reader`], with what it holds.
+#[derive(Debug)]
+pub enum ForgeCredential {
+    /// A token file.
+    Token(CredentialFile),
+    /// A GitHub App's private key file.
+    App {
+        /// The bound app and installation.
+        app: GitHubApp,
+        /// The private key file.
+        key: CredentialFile,
+    },
+}
+
 /// How a house writes to its forge. Contains no credential value or path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -101,20 +145,30 @@ pub struct ForgeBinding {
     pub requester: ExternalRef,
     /// Credential name; house grants for forge effects must name it.
     pub credential: CredentialId,
+    /// What the credential file holds; a token when absent.
+    #[serde(default, skip_serializing_if = "CredentialKind::is_token")]
+    pub credential_kind: CredentialKind,
     /// Most logical writes one task may make.
     pub posting_budget: PostingBudget,
 }
 
 impl ForgeBinding {
-    /// Check the schema, the requester's login syntax, and that the binding
-    /// belongs to `house`.
+    /// Check the schema, the requester's login syntax, that an app's
+    /// requester is a `[bot]` login, and that the binding belongs to `house`.
     ///
     /// # Errors
-    /// [`HouseError::InvalidInput`] for another schema or a requester the
-    /// forge cannot issue, and [`HouseError::HouseSelection`] for another
-    /// house.
+    /// [`HouseError::InvalidInput`] for another schema, a requester the
+    /// forge cannot issue, or an app requester without `[bot]`, and
+    /// [`HouseError::HouseSelection`] for another house.
     pub fn validate(&self, house: &HouseConfig) -> Result<(), HouseError> {
-        if self.schema != FORGE_BINDING_SCHEMA || !self.forge.accepts_requester(&self.requester) {
+        let app_login = match self.credential_kind {
+            CredentialKind::Token => true,
+            CredentialKind::GitHubApp(_) => self.requester.as_str().ends_with("[bot]"),
+        };
+        if self.schema != FORGE_BINDING_SCHEMA
+            || !self.forge.accepts_requester(&self.requester)
+            || !app_login
+        {
             return Err(HouseError::InvalidInput);
         }
         if self.house != house.house {
@@ -248,6 +302,21 @@ pub enum ForgeError {
     /// installed. Nothing was read or written.
     #[error("the GitHub CLI (`gh`) was not found on PATH; install it to write to GitHub")]
     GhNotFound,
+    /// `curl`, which mints GitHub App installation tokens, is not installed.
+    /// Nothing was read or written.
+    #[error("`curl` was not found on PATH; install it to write to GitHub as an app")]
+    CurlNotFound,
+    /// The bound GitHub App is not installed on the write's repository
+    /// through the bound installation. Nothing was written.
+    #[error(
+        "the GitHub App of house {house} is not installed on {repository} through its bound installation; install the app there, or bind the installation that covers it"
+    )]
+    AppNotInstalled {
+        /// The house.
+        house: HouseId,
+        /// The repository the write targets.
+        repository: Repository,
+    },
     /// Registry storage or validation failed.
     #[error(transparent)]
     House(#[from] HouseError),
@@ -277,8 +346,9 @@ impl ForgeError {
             Self::MissingBinding { .. }
             | Self::NoPostingDestinations { .. }
             | Self::NeedsPerson
-            | Self::CredentialUnavailable { .. } => ErrorClass::Refused,
-            Self::GhNotFound => ErrorClass::Execution,
+            | Self::CredentialUnavailable { .. }
+            | Self::AppNotInstalled { .. } => ErrorClass::Refused,
+            Self::GhNotFound | Self::CurlNotFound => ErrorClass::Execution,
             Self::BindingConflict { .. } | Self::StaleApproval { .. } => ErrorClass::Conflict,
             Self::House(error) => error.class(),
             Self::Integration(error) => error.class(),
@@ -498,6 +568,9 @@ pub trait ApprovedWrite {
     /// What the write reports.
     type Report;
 
+    /// The repository the write targets.
+    fn repository(&self) -> &Repository;
+
     /// Recompute the preview and return its digest. Reads nothing remote.
     ///
     /// # Errors
@@ -525,22 +598,25 @@ pub trait ApprovedWrite {
 /// Refuses, before reading any credential: a claimant without a person
 /// present, a house without a forge binding, an approval that does not name
 /// the preview's current digest, a house with no posting destinations, and a
-/// missing, redirected, foreign, or exposed token file. `connect` then builds
-/// the transport, such as [`GhCli::new`] with the GitHub CLI, over the token
-/// file already opened and checked.
+/// missing, redirected, foreign, or exposed credential file. `connect` then
+/// builds the transport, such as [`GhCli::new`] or [`GhCli::app`] with the
+/// GitHub CLI, over the credential file already opened and checked. Before
+/// writing, a GitHub App that is not installed on the write's repository is
+/// refused as [`ForgeError::AppNotInstalled`].
 ///
 /// # Errors
 /// The refusals above as [`ForgeError`]s, `connect` failures, and the
 /// write's own errors.
 ///
 /// [`GhCli::new`]: crate::integrations::github::GhCli::new
+/// [`GhCli::app`]: crate::integrations::github::GhCli::app
 pub fn apply_approved<W, T>(
     registry: &HouseRegistry,
     house: &HouseId,
     write: &W,
     approved: &W::Digest,
     claimant: &Claimant,
-    connect: impl FnOnce(CredentialFile) -> Result<T, ForgeError>,
+    connect: impl FnOnce(ForgeCredential) -> Result<T, ForgeError>,
 ) -> crate::Result<W::Report>
 where
     W: ApprovedWrite,
@@ -559,16 +635,29 @@ where
         }
         .into());
     }
+    let credential = binding.credential_ref();
     let executor = executor(registry, &config, binding, connect)?;
-    write.apply(&executor, approved, claimant)
+    let repository = write.repository();
+    let installed = executor
+        .transport()
+        .installed(&credential, repository, ReadLimits::default().timeout())
+        .map_err(ForgeError::Integration)?;
+    match installed {
+        Installed::Yes => write.apply(&executor, approved, claimant),
+        Installed::No => Err(ForgeError::AppNotInstalled {
+            house: house.clone(),
+            repository: repository.clone(),
+        }
+        .into()),
+    }
 }
 
-/// The house-scoped executor over its checked token file.
+/// The house-scoped executor over its checked credential file.
 fn executor<T: GitHubMutationTransport>(
     registry: &HouseRegistry,
     config: &HouseConfig,
     binding: ForgeBinding,
-    connect: impl FnOnce(CredentialFile) -> Result<T, ForgeError>,
+    connect: impl FnOnce(ForgeCredential) -> Result<T, ForgeError>,
 ) -> Result<GitHubExecutor<T>, ForgeError> {
     let scope = binding.scope(config)?;
     let file = match open_credential(registry, &binding)? {
@@ -581,8 +670,11 @@ fn executor<T: GitHubMutationTransport>(
             });
         }
     };
-    let credential = CredentialFile::opened(binding.credential_ref(), file);
-    let transport = connect(credential)?;
+    let file = CredentialFile::opened(binding.credential_ref(), file);
+    let transport = connect(match binding.credential_kind {
+        CredentialKind::Token => ForgeCredential::Token(file),
+        CredentialKind::GitHubApp(app) => ForgeCredential::App { app, key: file },
+    })?;
     Ok(GitHubExecutor::new(
         binding.backend,
         scope,
@@ -623,7 +715,7 @@ impl<T: GitHubMutationTransport> EffectExecutor for ForgeReader<T> {
 pub fn forge_reader<T: GitHubMutationTransport>(
     registry: &HouseRegistry,
     house: &HouseId,
-    connect: impl FnOnce(CredentialFile) -> Result<T, ForgeError>,
+    connect: impl FnOnce(ForgeCredential) -> Result<T, ForgeError>,
 ) -> Result<ForgeReader<T>, ForgeError> {
     let config = registry.load(house)?;
     let binding = forge_binding(registry, house)?;
@@ -635,7 +727,7 @@ mod tests {
     use super::*;
     use crate::{
         HolderId,
-        contracts::{CommitId, EffectFailure, NotAppliedReason, Repository},
+        contracts::{CommitId, EffectFailure, NotAppliedReason},
         integrations::github::{GitHubReadTransport, MutationRequest, ReadRequest},
     };
     use std::{cell::RefCell, collections::BTreeSet, fs, os::unix::fs::PermissionsExt, path::Path};
@@ -667,10 +759,13 @@ mod tests {
         }
     }
 
-    struct Approved;
+    struct Approved(Repository);
     impl ApprovedWrite for Approved {
         type Digest = &'static str;
         type Report = ();
+        fn repository(&self) -> &Repository {
+            &self.0
+        }
         fn digest(&self) -> crate::Result<&'static str> {
             Ok("sha256:aaaa")
         }
@@ -724,6 +819,7 @@ mod tests {
             backend: BackendId::new("github")?,
             requester: ExternalRef::new("acme-bot")?,
             credential: CredentialId::new("github")?,
+            credential_kind: CredentialKind::Token,
             posting_budget: PostingBudget::new(5)?,
         };
         bind_forge(&registry, &binding)?;
@@ -749,11 +845,14 @@ mod tests {
         apply_approved(
             registry,
             &binding.house,
-            &Approved,
+            &Approved(Repository::new("acme/app").map_err(crate::Error::from)?),
             &"sha256:aaaa",
             &claimant,
-            |file| {
+            |credential| {
                 replace().map_err(|_| ForgeError::Integration(IntegrationError::Unavailable))?;
+                let ForgeCredential::Token(file) = credential else {
+                    return Err(ForgeError::Integration(IntegrationError::ScopeMismatch));
+                };
                 handed.replace(Some(file));
                 Ok(Offline)
             },

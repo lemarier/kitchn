@@ -31,9 +31,9 @@ use crate::{
     },
     contracts::{CommitId, ExternalRef, PostingBudget, Repository, Role},
     house::{
-        BindOutcome, CredentialStatus, FORGE_BINDING_SCHEMA, FollowUpPolicy, ForgeBinding,
-        ForgeKind, HouseConfig, HouseError, MAX_FOLLOW_UP, bind_forge, credential_path,
-        credential_status,
+        BindOutcome, CredentialKind, CredentialStatus, FORGE_BINDING_SCHEMA, FollowUpPolicy,
+        ForgeBinding, ForgeKind, HouseConfig, HouseError, MAX_FOLLOW_UP, bind_forge,
+        credential_path, credential_status,
     },
     scheduling::AgentFamily,
     selection::{AgentPolicy, AgentSelection, RuleMatch, SelectionRule},
@@ -576,6 +576,7 @@ pub fn plan_house_init(
                         .map_err(|_| HouseError::InvalidInput)?,
                     requester,
                     credential,
+                    credential_kind: CredentialKind::Token,
                     posting_budget: PostingBudget::new(DEFAULT_POSTING_BUDGET)
                         .map_err(|_| HouseError::InvalidInput)?,
                 })

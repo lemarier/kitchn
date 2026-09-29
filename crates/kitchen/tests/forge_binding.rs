@@ -8,15 +8,15 @@ use kitchen::{
         Grant, IssueNumber, Permission, PostingBudget, Repository, Text, Trigger,
     },
     house::{
-        AgentInventory, ApprovedWrite, BindOutcome, CredentialStatus, FORGE_BINDING_SCHEMA,
-        ForgeBinding, ForgeError, ForgeKind, HouseConfig, HouseError, HouseInitError, InitAnswers,
-        InitDecision, InitFacts, InitQuestion, NoGitHubAccess, Prompter, apply_approved,
-        bind_forge, credential_path, credential_status, forge_binding, plan_house_init,
-        register_house,
+        AgentInventory, ApprovedWrite, BindOutcome, CredentialKind, CredentialStatus,
+        FORGE_BINDING_SCHEMA, ForgeBinding, ForgeCredential, ForgeError, ForgeKind, HouseConfig,
+        HouseError, HouseInitError, InitAnswers, InitDecision, InitFacts, InitQuestion,
+        NoGitHubAccess, Prompter, apply_approved, bind_forge, credential_path, credential_status,
+        forge_binding, plan_house_init, register_house,
     },
     integrations::github::{
-        CredentialFile, CredentialRef, GitHubExecutor, GitHubMutationTransport,
-        GitHubReadTransport, IntegrationError, MutationRequest, ReadRequest,
+        CredentialRef, GitHubExecutor, GitHubMutationTransport, GitHubReadTransport,
+        IntegrationError, MutationRequest, ReadRequest,
     },
 };
 use std::{
@@ -70,6 +70,7 @@ fn binding(requester: &str) -> TestResult<ForgeBinding> {
         backend: BackendId::new("github")?,
         requester: ExternalRef::new(requester)?,
         credential: CredentialId::new("github")?,
+        credential_kind: CredentialKind::Token,
         posting_budget: PostingBudget::new(5)?,
     })
 }
@@ -304,7 +305,7 @@ fn a_redirected_credentials_directory_is_refused() -> TestResult {
         CredentialStatus::Redirected
     );
     let connected = Cell::new(None);
-    let write = comment();
+    let write = comment()?;
     let error = forge_error(apply(
         &registry,
         &write,
@@ -391,11 +392,15 @@ impl GitHubMutationTransport for Offline {
 /// was handed and counts its calls.
 struct Comment {
     digest: &'static str,
+    repository: Repository,
     applied: Cell<u32>,
 }
 impl ApprovedWrite for Comment {
     type Digest = String;
     type Report = GitHubEffect;
+    fn repository(&self) -> &Repository {
+        &self.repository
+    }
     fn digest(&self) -> kitchen::Result<String> {
         Ok(self.digest.to_owned())
     }
@@ -418,11 +423,12 @@ impl ApprovedWrite for Comment {
     }
 }
 
-fn comment() -> Comment {
-    Comment {
+fn comment() -> TestResult<Comment> {
+    Ok(Comment {
         digest: "sha256:aaaa",
+        repository: Repository::new("acme/app")?,
         applied: Cell::new(0),
-    }
+    })
 }
 
 /// Run the hook, recording whether `connect` was reached and with what.
@@ -439,7 +445,10 @@ fn apply(
         write,
         &approved.to_owned(),
         claimant,
-        |file: CredentialFile| {
+        |credential: ForgeCredential| {
+            let ForgeCredential::Token(file) = credential else {
+                return Err(ForgeError::Integration(IntegrationError::ScopeMismatch));
+            };
             connected.set(Some(file.reference().clone()));
             Ok(Offline)
         },
@@ -464,7 +473,7 @@ fn an_approved_write_uses_the_bound_requester_budget_and_credential() -> TestRes
     bind_forge(&registry, &bound)?;
     place_token(&credential_path(&registry, &bound)?, 0o600)?;
 
-    let write = comment();
+    let write = comment()?;
     let connected = Cell::new(None);
     let effect = apply(&registry, &write, "sha256:aaaa", &person()?, &connected)?;
     assert_eq!(write.applied.get(), 1);
@@ -489,7 +498,7 @@ fn policy_limits_for_another_credential_permit_nothing() -> TestResult {
 
     let result = apply(
         &registry,
-        &comment(),
+        &comment()?,
         "sha256:aaaa",
         &person()?,
         &Cell::new(None),
@@ -507,7 +516,7 @@ fn refusals_come_before_any_credential_is_read() -> TestResult {
     let root = temp.path().canonicalize()?;
     let limits = [grant(Permission::PostComment, "github")?].into();
     let registry = registry(&root, &house_config(limits)?)?;
-    let write = comment();
+    let write = comment()?;
     let connected = Cell::new(None);
 
     // No person present.
@@ -602,7 +611,7 @@ fn a_house_that_posts_nowhere_is_refused() -> TestResult {
     let bound = binding("acme-bot")?;
     bind_forge(&registry, &bound)?;
     place_token(&credential_path(&registry, &bound)?, 0o600)?;
-    let write = comment();
+    let write = comment()?;
     let error = forge_error(apply(
         &registry,
         &write,

@@ -1,7 +1,7 @@
 //! Provider-side mutation and reconciliation. Durable ownership lives in core.
 use super::{
     CloseReason, CredentialRef, GhCli, GitHubAction, GitHubMutation, GitHubReadTransport,
-    HouseScope, IntegrationError, Label, LabelSetup, ReadLimits, ReadRequest,
+    HouseScope, IntegrationError, Label, LabelSetup, ReadLimits, ReadRequest, TokenScope,
 };
 use crate::contracts::{
     EffectFailure, ExternalRef, IdempotencyKey, NotAppliedReason, Receipt, UncertainReason,
@@ -16,6 +16,7 @@ pub struct MutationRequest {
     method: &'static str,
     endpoint: String,
     body: Value,
+    access: TokenScope,
 }
 impl std::fmt::Debug for MutationRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -41,6 +42,11 @@ impl MutationRequest {
     #[must_use]
     pub const fn body(&self) -> &Value {
         &self.body
+    }
+    /// The repository and permissions a GitHub App token for it carries.
+    #[must_use]
+    pub const fn access(&self) -> &TokenScope {
+        &self.access
     }
 }
 /// Mutation transport, injected separately from workflow policy.
@@ -81,7 +87,7 @@ impl GitHubMutationTransport for GhCli {
             .map_err(|_| EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
         let started = Instant::now();
         let token = self
-            .verified_token(credential, timeout)
+            .verified_token(credential, Some(&request.access), timeout)
             .map_err(|_| EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
         let remaining = timeout
             .checked_sub(started.elapsed())
@@ -150,6 +156,8 @@ pub(crate) struct Provider<'a, T> {
     started: Instant,
     remaining: usize,
     limits: ReadLimits,
+    /// Scope of the mutation being inspected or prepared, for App tokens.
+    access: Option<TokenScope>,
 }
 impl<'a, T: GitHubReadTransport> Provider<'a, T> {
     pub fn new(scope: &'a HouseScope, transport: &'a T, limits: ReadLimits) -> Self {
@@ -159,6 +167,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             started: Instant::now(),
             remaining: limits.bytes(),
             limits,
+            access: None,
         }
     }
     pub fn remaining(&self) -> Result<Duration, IntegrationError> {
@@ -177,6 +186,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             &ReadRequest {
                 endpoint,
                 graphql: None,
+                access: self.access.clone(),
             },
             self.remaining()?,
             self.remaining,
@@ -205,6 +215,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                 graphql: Some(
                     json!({"query":query,"variables":{"owner":owner,"name":name,"number":number}}),
                 ),
+                access: self.access.clone(),
             },
             self.remaining()?,
             self.remaining,
@@ -264,6 +275,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
         mutation.validate()?;
         self.scope
             .authorize_read(self.scope.house(), &mutation.repository)?;
+        self.access = Some(TokenScope::for_mutation(mutation));
         let root = format!("repos/{}", mutation.repository);
         let reference = receipt(key)?;
         match &mutation.action {
@@ -567,6 +579,8 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
         mutation: &GitHubMutation,
         key: &IdempotencyKey,
     ) -> Result<MutationRequest, IntegrationError> {
+        let access = TokenScope::for_mutation(mutation);
+        self.access = Some(access.clone());
         let root = format!("repos/{}", mutation.repository);
         let (method, endpoint, body) = match &mutation.action {
             GitHubAction::CloseIssue { number, reason, .. } => {
@@ -684,6 +698,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             method,
             endpoint,
             body,
+            access,
         })
     }
     fn issue_id(&mut self, root: &str, number: u64) -> Result<u64, IntegrationError> {
@@ -1048,6 +1063,13 @@ mod mutation_tests {
             method: "POST",
             endpoint: "repos/sample/project/issues/1/comments".into(),
             body: json!({"body":"fixture"}),
+            access: TokenScope::for_mutation(&GitHubMutation {
+                repository: crate::contracts::Repository::new("sample/project")?,
+                action: GitHubAction::PostComment {
+                    issue: super::super::IssueNumber::new(1)?,
+                    body: crate::contracts::Text::new("fixture")?,
+                },
+            }),
         };
         for (response, expected) in [
             (

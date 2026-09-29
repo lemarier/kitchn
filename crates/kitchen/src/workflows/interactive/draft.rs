@@ -1122,6 +1122,10 @@ impl ApprovedWrite for ApprovedDraft<'_> {
     type Digest = DraftDigest;
     type Report = DraftReport;
 
+    fn repository(&self) -> &Repository {
+        &self.draft.repository
+    }
+
     fn digest(&self) -> Result<DraftDigest> {
         Ok(draft_preview(self.draft)?.digest)
     }

@@ -140,13 +140,21 @@ kitchn adopt <dir> --registry <dir> --template <name> [options]
 
 ## `kitchn forge bind` and `kitchn forge show`
 
-Bind a house to the GitHub account it writes as. kitchn stores no credential:
-the token stays in a file you place in the house's private registry directory.
+Bind a house to the GitHub account or GitHub App it writes as. kitchn stores
+no credential: the token, or the app's private key, stays in a file you place in
+the house's private registry directory.
 
 ```sh
 kitchn forge bind --registry <dir> --house <id> --requester <login> [--credential github] [--posting-budget 20]
+kitchn forge bind --registry <dir> --house <id> --requester <app-slug>[bot] --app-id <id> --installation <id>
 kitchn forge show --registry <dir> --house <id>
 ```
+
+With `--app-id` and `--installation`, the file holds the app's `.pem` private
+key. Each write then runs with an installation token limited to its repository
+and the permissions it needs, minted with `curl` and refreshed before it
+expires. A write to a repository the installation does not cover is refused
+before anything is written, naming the repository.
 
 `--posting-budget` caps the writes one task may make (0 to 100). House policy
 limits for forge writes must name the credential. `show` exits 1 when the token

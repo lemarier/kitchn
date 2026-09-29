@@ -1,11 +1,16 @@
 //! Bounded subprocess boundary with isolated credentials and redacted failures.
 
-use super::{CredentialRef, GitHubReadTransport, IntegrationError, ReadRequest};
+use super::{
+    AppTokens, CredentialRef, GitHubReadTransport, Installed, IntegrationError, ReadRequest,
+    TokenScope,
+};
+use crate::contracts::Repository;
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -103,6 +108,19 @@ impl CredentialFile {
         &self.reference
     }
     pub(crate) fn load(&self, requested: &CredentialRef) -> Result<String, IntegrationError> {
+        let bytes = self.load_bytes(requested)?;
+        let token = String::from_utf8(bytes).map_err(|_| IntegrationError::InvalidInput)?;
+        let token = token.trim();
+        if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(IntegrationError::InvalidInput);
+        }
+        Ok(token.into())
+    }
+    /// The file's bytes, at most [`TOKEN_LIMIT`], such as a PEM private key.
+    pub(crate) fn load_bytes(
+        &self,
+        requested: &CredentialRef,
+    ) -> Result<Vec<u8>, IntegrationError> {
         if requested != &self.reference {
             return Err(IntegrationError::ScopeMismatch);
         }
@@ -128,12 +146,7 @@ impl CredentialFile {
         if bytes.len() > usize::from(TOKEN_LIMIT) {
             return Err(IntegrationError::LimitExceeded);
         }
-        let token = String::from_utf8(bytes).map_err(|_| IntegrationError::InvalidInput)?;
-        let token = token.trim();
-        if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(IntegrationError::InvalidInput);
-        }
-        Ok(token.into())
+        Ok(bytes)
     }
 }
 
@@ -161,44 +174,74 @@ fn read_from_start(file: &File) -> Result<Vec<u8>, IntegrationError> {
 #[derive(Debug, Clone)]
 pub struct GhCli {
     executable: PathBuf,
-    credential: CredentialFile,
+    auth: Auth,
 }
+
+/// What `gh` authenticates with.
+#[derive(Debug, Clone)]
+enum Auth {
+    /// A person's token, verified through `/user` before each call.
+    Token(CredentialFile),
+    /// Installation tokens of a GitHub App, minted per repository scope.
+    App(Arc<AppTokens>),
+}
+
 impl GhCli {
     /// Select the binary and private credential binding without invoking them.
     ///
     /// # Errors
     /// Refuses a relative executable path.
     pub fn new(executable: PathBuf, credential: CredentialFile) -> Result<Self, IntegrationError> {
+        Self::with(executable, Auth::Token(credential))
+    }
+    /// Select the binary and a GitHub App's token source. Each call runs with
+    /// an installation token limited to the request's [`TokenScope`]; a call
+    /// without one, such as an unscoped client read, is refused.
+    ///
+    /// # Errors
+    /// Refuses a relative executable path.
+    pub fn app(executable: PathBuf, tokens: AppTokens) -> Result<Self, IntegrationError> {
+        Self::with(executable, Auth::App(Arc::new(tokens)))
+    }
+    fn with(executable: PathBuf, auth: Auth) -> Result<Self, IntegrationError> {
         if !executable.is_absolute() {
             return Err(IntegrationError::InvalidInput);
         }
-        Ok(Self {
-            executable,
-            credential,
-        })
+        Ok(Self { executable, auth })
     }
     pub(crate) fn call(
         &self,
         reference: &CredentialRef,
+        access: Option<&TokenScope>,
         args: &[String],
         input: &[u8],
         timeout: Duration,
         max_bytes: usize,
     ) -> Result<ProcessOutput, IntegrationError> {
         let started = Instant::now();
-        let token = self.verified_token(reference, timeout)?;
+        let token = self.verified_token(reference, access, timeout)?;
         let remaining = timeout
             .checked_sub(started.elapsed())
             .filter(|d| !d.is_zero())
             .ok_or(IntegrationError::Timeout)?;
         self.run_with_token(&token, args, input, remaining, max_bytes)
     }
+    /// The token for one call: a person's token after `/user` confirms its
+    /// login, or an app's installation token for `access`.
     pub(crate) fn verified_token(
         &self,
         reference: &CredentialRef,
+        access: Option<&TokenScope>,
         timeout: Duration,
     ) -> Result<String, IntegrationError> {
-        let token = self.credential.load(reference)?;
+        let credential = match &self.auth {
+            Auth::Token(credential) => credential,
+            Auth::App(tokens) => {
+                let access = access.ok_or(IntegrationError::ScopeMismatch)?;
+                return tokens.token(reference, access, timeout);
+            }
+        };
+        let token = credential.load(reference)?;
         let env = [
             ("GH_TOKEN", token.as_str()),
             ("GH_HOST", "github.com"),
@@ -272,7 +315,14 @@ impl GitHubReadTransport for GhCli {
         } else {
             Vec::new()
         };
-        let output = self.call(credential, &args, &input, timeout, max_bytes)?;
+        let output = self.call(
+            credential,
+            request.access.as_ref(),
+            &args,
+            &input,
+            timeout,
+            max_bytes,
+        )?;
         if output.code != Some(0) {
             return Err(if reports_not_found(&output.stdout) {
                 IntegrationError::NotFound
@@ -281,6 +331,20 @@ impl GitHubReadTransport for GhCli {
             });
         }
         Ok(output.stdout)
+    }
+    /// A token is verified on each call instead, so it answers yes without
+    /// I/O; an app asks GitHub whether its bound installation covers the
+    /// repository.
+    fn installed(
+        &self,
+        credential: &CredentialRef,
+        repository: &Repository,
+        timeout: Duration,
+    ) -> Result<Installed, IntegrationError> {
+        match &self.auth {
+            Auth::Token(_) => Ok(Installed::Yes),
+            Auth::App(tokens) => tokens.installed(credential, repository, timeout),
+        }
     }
 }
 

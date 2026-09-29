@@ -19,6 +19,8 @@ sha2.workspace = true
 toml.workspace = true
 tempfile.workspace = true
 time.workspace = true
+ring.workspace = true
+base64.workspace = true
 
 [features]
 # Pause points for concurrency tests; enabled for this crate's own tests only.

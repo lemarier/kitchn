@@ -43,7 +43,8 @@ credential name its policy limits refer to, and a posting budget per task. The
 token itself stays in a file you place in the house's private registry
 directory. kitchn never copies it into its configuration, the repository or a
 command line. `kitchn house init` offers the logged-in `gh` account as the
-default.
+default. A house can instead write as a GitHub App: bind its app ID and
+installation, and place the app's private key where the token would go.
 
 ## The repository binding
 

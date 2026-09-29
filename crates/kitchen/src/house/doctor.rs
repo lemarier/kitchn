@@ -123,7 +123,7 @@ impl DoctorFinding {
                 "Legacy repository binding {} is still in the working tree; Kitchen no longer reads it.",
                 path.display()
             ),
-            next_step: "Import it with kitchen house import if the registry lacks this binding, then delete the file yourself; Kitchen does not delete repository files.".into(),
+            next_step: "Import it with kitchn house import if the registry lacks this binding, then delete the file yourself; Kitchen does not delete repository files.".into(),
         }
     }
 }
@@ -252,7 +252,7 @@ pub fn doctor(
     let instructions = match resolve_instructions(registry.root(), &house, None) {
         Ok(instructions) => Some(instructions),
         Err(error) => {
-            findings.push(DoctorFinding { code: DoctorCode::Instructions, message: error.to_string(), next_step: format!("Obtain the verified bundle for Kitchen {} and house guidance {}, then run kitchen house sync --registry '{}' --house {} --bundle <verified-bundle.json>.", house.kitchen, house.guidance, registry.root().display(), house.house) });
+            findings.push(DoctorFinding { code: DoctorCode::Instructions, message: error.to_string(), next_step: format!("Obtain the verified bundle for Kitchen {} and house guidance {}, then run kitchn house sync --registry '{}' --house {} --bundle <verified-bundle.json>.", house.kitchen, house.guidance, registry.root().display(), house.house) });
             None
         }
     };
@@ -376,7 +376,7 @@ pub fn doctor(
         }
     }
     for report in evidence.map_or(&[][..], |evidence| &evidence.undelivered_budget_reports) {
-        findings.push(DoctorFinding { code: DoctorCode::BudgetReport, message: format!("Schedule {} was paused for exhausting its {} ({} of {}) in the window ending at {} (Unix ms), but its owner was not told: the budget schedule has no report destination.", report.consumer, report.exhausted.limit, report.exhausted.used, report.exhausted.allowed, report.window.end.as_unix_millis()), next_step: "Reinstall the budget schedule with kitchen budget install --report-issue owner/repo#N naming a house posting destination, or tell the schedule's owner yourself; it stays paused until the owner activates it.".into() });
+        findings.push(DoctorFinding { code: DoctorCode::BudgetReport, message: format!("Schedule {} was paused for exhausting its {} ({} of {}) in the window ending at {} (Unix ms), but its owner was not told: the budget schedule has no report destination.", report.consumer, report.exhausted.limit, report.exhausted.used, report.exhausted.allowed, report.window.end.as_unix_millis()), next_step: "Reinstall the budget schedule with kitchn budget install --report-issue owner/repo#N naming a house posting destination, or tell the schedule's owner yourself; it stays paused until the owner activates it.".into() });
     }
     let access = evidence.map_or(AccessStatus::Unobserved, |evidence| evidence.access);
     if access != AccessStatus::Available {

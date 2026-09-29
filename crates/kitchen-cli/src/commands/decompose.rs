@@ -1,11 +1,11 @@
-//! `kitchen decompose preview`: validate a proposed project decomposition
+//! `kitchn decompose preview`: validate a proposed project decomposition
 //! and show the exact issues, owned paths, acceptance criteria, blocked-by
 //! edges, and ownership overlaps a person approves, with the digest that
 //! binds the approval. Reads only the proposal file; writes nothing and
 //! contacts no forge. Writing happens through the library's
 //! `workflows::decomposition::apply` with a person's approval of that digest.
 //!
-//! `kitchen decompose acknowledge` releases a repository that an earlier
+//! `kitchn decompose acknowledge` releases a repository that an earlier
 //! decomposition still holds after settling without success. It opens the
 //! house store and records the acknowledgement; the CLI holds no forge
 //! credential, so it cannot re-read the forge and says so.

@@ -9,5 +9,5 @@ empty. Repository instructions (such as `AGENTS.md`) stay in each repository
 and are read at the task's pinned revision.
 
 To add house conventions, export a reviewed guidance bundle and install it with
-`kitchen house update`. Tasks already running keep the guidance they started
+`kitchn house update`. Tasks already running keep the guidance they started
 with.

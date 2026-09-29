@@ -90,12 +90,12 @@ impl PrecheckWindow {
 }
 
 /// Everything the scheduled precheck needs, rendered as its argument vector
-/// for `kitchen gardener precheck`. Paths are absolute because the backend
+/// for `kitchn gardener precheck`. Paths are absolute because the backend
 /// runs the precheck outside any checkout. The credential file path is
 /// recorded in the schedule; the token itself never is.
 #[derive(Debug, Clone)]
 pub struct PrecheckArgs {
-    /// The installed `kitchen` executable.
+    /// The installed `kitchn` executable.
     pub kitchen: PathBuf,
     /// The house.
     pub house: HouseId,

@@ -1,5 +1,5 @@
 [package]
-name = "kitchen-cli"
+name = "kitchn"
 description = "Command-line interface for Kitchen"
 version.workspace = true
 edition.workspace = true
@@ -10,7 +10,7 @@ repository.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "kitchen"
+name = "kitchn"
 path = "src/main.rs"
 doc = false
 

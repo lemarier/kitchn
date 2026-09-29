@@ -956,7 +956,7 @@ pub enum ApplyOutcome {
     },
     /// An earlier decomposition of this repository settled without
     /// success after writing, or possibly writing, to the forge. It keeps the
-    /// repository until a person runs [`acknowledge`] on it (`kitchen
+    /// repository until a person runs [`acknowledge`] on it (`kitchn
     /// decompose acknowledge`), which re-reads the forge for its writes and
     /// records who reviewed them and why they are content to proceed; a
     /// different revision could post the same work again. Nothing was

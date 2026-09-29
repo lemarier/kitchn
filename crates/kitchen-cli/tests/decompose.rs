@@ -1,4 +1,4 @@
-//! `kitchen decompose preview` through the real binary. Reads only a
+//! `kitchn decompose preview` through the real binary. Reads only a
 //! proposal file in a disposable directory; no forge is contacted.
 
 use std::{fs, path::PathBuf, process::Command};
@@ -22,7 +22,7 @@ fn preview(proposal: &Value, json_output: bool) -> TestResult<Run> {
     if json_output {
         args.push("--json");
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .args(&args)
         .output()?;
     Ok(Run {
@@ -102,7 +102,7 @@ fn a_cycle_or_malformed_proposal_exits_two() -> TestResult {
 }
 
 fn acknowledge(store: &str, task: &str, reason: &str) -> TestResult<Run> {
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .args([
             "decompose",
             "acknowledge",

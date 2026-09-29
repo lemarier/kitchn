@@ -185,7 +185,7 @@ pub enum HouseResolution {
     Ready(Box<ResolvedHouse>),
     /// Exactly one house claims the repository, which is not set up yet.
     /// Entrypoints refuse to run until the person binds it
-    /// (`kitchen house setup`).
+    /// (`kitchn house setup`).
     NeedsSetup {
         /// The repository as the house allowlist names it.
         repository: Repository,

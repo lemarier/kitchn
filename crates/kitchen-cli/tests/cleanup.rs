@@ -1,4 +1,4 @@
-//! `kitchen cleanup preview` and `approve` through the real binary. Simulated evidence: the
+//! `kitchn cleanup preview` and `approve` through the real binary. Simulated evidence: the
 //! store and worktrees are disposable, and ownership comes from the fake
 //! backend; nothing here reads a live orchestrator.
 
@@ -24,7 +24,7 @@ use kitchen::{
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn kitchen(args: &[&str]) -> TestResult<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .args(args)
         .output()?)
 }

@@ -14,12 +14,12 @@ fn spawn_guard() -> MutexGuard<'static, ()> {
 fn help_and_default_invocation_explain_the_available_surface() -> Result<(), Box<dyn Error>> {
     let _spawn_guard = spawn_guard();
     for args in [vec![], vec!["--help"], vec!["-h"]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
             .args(args)
             .output()?;
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout)?;
-        assert!(stdout.contains("Usage: kitchen"));
+        assert!(stdout.contains("Usage: kitchn"));
         assert!(stdout.contains("https://getkitchn.com/docs/"));
         assert!(output.stderr.is_empty());
     }
@@ -29,13 +29,13 @@ fn help_and_default_invocation_explain_the_available_surface() -> Result<(), Box
 #[test]
 fn version_is_machine_readable() -> Result<(), Box<dyn Error>> {
     let _spawn_guard = spawn_guard();
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .arg("--version")
         .output()?;
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout)?,
-        format!("kitchen {}\n", env!("CARGO_PKG_VERSION"))
+        format!("kitchn {}\n", env!("CARGO_PKG_VERSION"))
     );
     assert!(output.stderr.is_empty());
     Ok(())
@@ -44,7 +44,7 @@ fn version_is_machine_readable() -> Result<(), Box<dyn Error>> {
 #[test]
 fn unknown_commands_fail_without_claiming_execution() -> Result<(), Box<dyn Error>> {
     let _spawn_guard = spawn_guard();
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .arg("launch-everything")
         .output()?;
     assert_eq!(output.status.code(), Some(2));
@@ -56,7 +56,7 @@ fn unknown_commands_fail_without_claiming_execution() -> Result<(), Box<dyn Erro
 #[test]
 fn unknown_flags_are_rejected() -> Result<(), Box<dyn Error>> {
     let _spawn_guard = spawn_guard();
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .arg("--unknown")
         .output()?;
     assert_eq!(output.status.code(), Some(2));
@@ -78,7 +78,7 @@ fn identifiers_are_validated_by_the_library() -> Result<(), Box<dyn Error>> {
             "a_".to_owned(),
             "a--b".to_owned(),
         ] {
-            let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+            let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
                 .args([command, &id])
                 .output()?;
             assert_eq!(output.status.code(), Some(0));
@@ -90,7 +90,7 @@ fn identifiers_are_validated_by_the_library() -> Result<(), Box<dyn Error>> {
             ("a".repeat(65), "1 to 64 bytes"),
             ("private/secret".to_owned(), "ASCII"),
         ] {
-            let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+            let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
                 .args([command, &id])
                 .output()?;
             assert_eq!(output.status.code(), Some(2));
@@ -99,7 +99,7 @@ fn identifiers_are_validated_by_the_library() -> Result<(), Box<dyn Error>> {
             assert!(stderr.contains(diagnostic));
             assert!(!stderr.contains("private/secret"));
         }
-        let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
             .arg(command)
             .output()?;
         assert_eq!(output.status.code(), Some(2));
@@ -129,7 +129,7 @@ fn closed_output_is_a_failure() -> Result<(), Box<dyn Error>> {
         let (writer, reader) = UnixStream::pair()?;
         drop(reader);
         let fd: OwnedFd = writer.into();
-        let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
             .args(args)
             .stdout(Stdio::from(fd))
             .output()?;

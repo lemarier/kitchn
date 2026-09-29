@@ -101,7 +101,7 @@ impl Setup {
 
     /// Run `kitchen <args>` in the checkout with the session flags.
     fn run(&self, args: &[&str], claim: Option<&str>) -> TestResult<Output> {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kitchen"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kitchn"));
         command
             .current_dir(&self.consumer)
             .args(args)
@@ -151,14 +151,14 @@ fn work_claims_the_issue_and_a_second_session_is_skipped() -> TestResult {
     assert_eq!(json(&second)?["plan"]["refusal"]["trigger"], "interactive");
 
     // Only the holder hands back; the other session then adopts it.
-    let mut hand_back = Command::new(env!("CARGO_BIN_EXE_kitchen"));
+    let mut hand_back = Command::new(env!("CARGO_BIN_EXE_kitchn"));
     hand_back
         .current_dir(&setup.consumer)
         .args(["hand-back", &task, "--registry"])
         .arg(setup.registry.root())
         .arg("--store")
         .arg(&setup.store);
-    let refused = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    let refused = Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .current_dir(&setup.consumer)
         .args(["hand-back", &task, "--holder", "other", "--registry"])
         .arg(setup.registry.root())
@@ -260,7 +260,7 @@ fn an_unbound_repository_asks_for_setup_and_claims_nothing() -> TestResult {
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("claimed by house crabnebula but not set up"));
-    assert!(stdout.contains("kitchen house setup --registry"));
+    assert!(stdout.contains("kitchn house setup --registry"));
     let store = HouseStore::open(&setup.store, "crabnebula".parse()?, StoreOptions::default())?;
     assert!(store.tasks()?.is_empty());
     Ok(())
@@ -420,7 +420,7 @@ fn the_skill_uses_only_flags_the_cli_accepts() -> TestResult {
         vec!["house", "setup", "--help"],
         vec!["house", "doctor", "--help"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
             .args(&args)
             .output()?;
         assert_eq!(output.status.code(), Some(0), "{args:?}");
@@ -599,7 +599,7 @@ fn issue_acknowledge_releases_a_settled_draft_for_the_person_only() -> TestResul
     ));
 
     let acknowledge = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_kitchen"))
+        Command::new(env!("CARGO_BIN_EXE_kitchn"))
             .current_dir(&setup.consumer)
             .args(["issue", "acknowledge", task.as_str(), "--registry"])
             .arg(setup.registry.root())
@@ -652,7 +652,7 @@ fn issue_acknowledge_releases_a_settled_draft_for_the_person_only() -> TestResul
         .as_str()
         .ok_or("task")?
         .to_owned();
-    let refused = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    let refused = Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .current_dir(&setup.consumer)
         .args(["issue", "acknowledge", &pickup, "--registry"])
         .arg(setup.registry.root())

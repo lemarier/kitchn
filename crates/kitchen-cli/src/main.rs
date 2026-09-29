@@ -12,7 +12,7 @@ use kitchen::{ErrorClass, HouseId, TaskId};
 
 #[derive(Parser)]
 #[command(
-    name = "kitchen",
+    name = "kitchn",
     version,
     about = "Portable agent workflows",
     after_help = "Docs: https://getkitchn.com/docs/"

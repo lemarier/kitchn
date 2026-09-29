@@ -133,7 +133,7 @@ pub enum ScaffoldError {
     },
     /// `init` was pointed at a directory that already has content.
     #[error(
-        "target {} is not empty; use `kitchen adopt` to add template files to an existing directory",
+        "target {} is not empty; use `kitchn adopt` to add template files to an existing directory",
         path.display()
     )]
     TargetNotEmpty {

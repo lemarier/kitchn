@@ -1,4 +1,4 @@
-//! `kitchen cleanup`: preview dishwasher decisions from a captured inventory
+//! `kitchn cleanup`: preview dishwasher decisions from a captured inventory
 //! and record a person's approval of what the preview showed.
 //!
 //! Both subcommands read the house store, an inventory snapshot exported from

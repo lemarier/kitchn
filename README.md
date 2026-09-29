@@ -48,10 +48,9 @@ earned, never assumed.
 > [!NOTE]
 > kitchn is early. You can register a house, bind repositories and draft issues
 > from your session today. Working issues and pull requests needs a house state
-> store that no command creates yet. Unattended runs are still being validated ([#1](https://github.com/lemarier/kitchen/issues/1)). The binary is
-> still named `kitchen` until
-> [#18](https://github.com/lemarier/kitchen/issues/18) ships the rename and the
-> install script.
+> store that no command creates yet. Unattended runs are still being validated ([#1](https://github.com/lemarier/kitchen/issues/1)). The install
+> script and the crates.io release arrive with
+> [#18](https://github.com/lemarier/kitchen/issues/18).
 
 ## The brigade
 
@@ -96,7 +95,7 @@ just install
 asks for a name, infers the rest, and shows you everything before saving it.
 
 ```sh
-kitchen house init
+kitchn house init
 ```
 
 **3. Give your agent the skill.** Copy or link `skills/kitchn` into your
@@ -128,11 +127,11 @@ action, in that session. A yes never carries over to the next action.
 
 ## The CLI
 
-`kitchen` is the engine behind the skill. Your agent runs it and reads its
+`kitchn` is the engine behind the skill. Your agent runs it and reads its
 JSON; you rarely type anything beyond `house init`. The commands are precise
 and verbose on purpose, because agents and schedules call them, not people.
 
-If you want to look under the hood, `kitchen --help` lists every command and
+If you want to look under the hood, `kitchn --help` lists every command and
 the [CLI reference](https://getkitchn.com/docs/reference/cli/) documents
 their flags and exit codes. One current gap: commands that track claims need a
 house state store, and no command creates one yet.
@@ -142,7 +141,7 @@ house state store, and no command creates one yet.
 | Path | Contents |
 | --- | --- |
 | `crates/kitchen` | Domain contracts, workflow policy, house registry, state store, and the Orca and GitHub adapters. |
-| `crates/kitchen-cli` | The `kitchen` executable, a thin layer over the library. |
+| `crates/kitchen-cli` | The `kitchn` package and executable, a thin layer over the library. |
 | `roles/` | The eight role cards, embedded in the binary and pinned by digest. |
 | `skills/kitchn/` | The `/kitchn` agent skill. |
 | `templates/` | The example house template and the template guide. |

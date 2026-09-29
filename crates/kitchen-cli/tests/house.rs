@@ -83,7 +83,7 @@ fn tree_status(path: &Path) -> TestResult<String> {
     )
 }
 fn kitchen(current_dir: &Path, registry: &HouseRegistry, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kitchen"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kitchn"));
     command
         .current_dir(current_dir)
         .args(args.iter().take(2))
@@ -198,7 +198,7 @@ fn invalid_secret_input_and_missing_house_fail_without_echo_or_writes() -> TestR
     let root = temp.path().canonicalize()?;
     let source = root.join("invalid.json");
     fs::write(&source, br#"{"token":"SECRET-MUST-NOT-APPEAR"}"#)?;
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .args(["house", "init", "--registry"])
         .arg(root.join("registry"))
         .arg("--config")
@@ -237,7 +237,7 @@ fn relative_registry_and_repository_path_are_resolved() -> TestResult {
         &root.join("consumer"),
         "https://github.com/crabnebula/tauri-fixture.git",
     )?;
-    let output = Command::new(env!("CARGO_BIN_EXE_kitchen"))
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
         .current_dir(&root)
         .args([
             "house",
@@ -423,7 +423,7 @@ fn doctor_reports_unbound_repositories_and_legacy_files() -> TestResult {
     fs::write(&path, &bytes)?;
     let before = tree_status(&consumer)?;
     let output = kitchen(&consumer, &registry, &["house", "doctor"]).output()?;
-    assert!(String::from_utf8(output.stdout)?.contains("Next: kitchen house import"));
+    assert!(String::from_utf8(output.stdout)?.contains("Next: kitchn house import"));
     // Preview by default: nothing is stored, and everything to be stored shows.
     let output = kitchen(&consumer, &registry, &["house", "import"]).output()?;
     assert_eq!(output.status.code(), Some(0), "{output:?}");

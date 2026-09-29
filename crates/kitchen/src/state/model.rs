@@ -17,9 +17,10 @@ use crate::{
         AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Capability,
         Claimant, Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext,
         EffectRequest, EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef,
-        FailureClass, Fence, HouseGrants, IdempotencyKey, LeaseTtl, NotAppliedReason, Operation,
-        Receipt, ResourceKind, ResourceRef, RetryPolicy, ScheduleEffect, ScheduleRequirements,
-        Settlement, SubmittedEffects, TaskSpec, Text, Timestamp, Trigger, UncertainReason,
+        FailureClass, Fence, HouseGrants, IdempotencyKey, IssueNumber, LeaseTtl, NotAppliedReason,
+        Operation, Receipt, ResourceKind, ResourceRef, RetryPolicy, ScheduleEffect,
+        ScheduleRequirements, Settlement, SubmittedEffects, TaskSpec, Text, Timestamp, Trigger,
+        UncertainReason,
     },
     state::{
         ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerAttempt, MarkerFact,
@@ -28,6 +29,10 @@ use crate::{
         marker::{MarkerRefusal, MarkerWrite, Markers, PairPlan},
         retention::{
             self, Inventory, RetentionPolicy, RetentionReport, RetentionSubjects, StoreCapacity,
+        },
+        usage::{
+            AttemptUsage, AttemptUsageEntry, HumanReply, MAX_HUMAN_REPLIES_PER_ATTEMPT, UsageError,
+            UsageReport,
         },
     },
     workflows::intake,
@@ -172,6 +177,12 @@ pub struct AttemptRecord {
     fence: Fence,
     started_at: Timestamp,
     state: AttemptState,
+    // Omitted while not reported, so a store stays readable by a Kitchen
+    // from before usage records until one is reported.
+    #[serde(default, skip_serializing_if = "not_reported")]
+    usage: AttemptUsage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    replies: Vec<HumanReply>,
 }
 
 impl AttemptRecord {
@@ -198,6 +209,22 @@ impl AttemptRecord {
     pub const fn state(&self) -> AttemptState {
         self.state
     }
+
+    /// What its worker backend reported, or an explicit not-reported.
+    #[must_use]
+    pub const fn usage(&self) -> &AttemptUsage {
+        &self.usage
+    }
+
+    /// A person's replies to its worker's questions, oldest first.
+    #[must_use]
+    pub fn replies(&self) -> &[HumanReply] {
+        &self.replies
+    }
+}
+
+const fn not_reported(usage: &AttemptUsage) -> bool {
+    matches!(usage, AttemptUsage::NotReported)
 }
 
 /// What is known about an external effect.
@@ -585,9 +612,23 @@ pub struct TaskRecord {
     cancel: Option<CancelRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     acknowledgement: Option<WriteAcknowledgement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pull_request: Option<IssueNumber>,
 }
 
 impl TaskRecord {
+    /// The pull request in the task's repository linked to the task
+    /// ([`crate::state::HouseStore::link_pull_request`]).
+    #[must_use]
+    pub const fn pull_request(&self) -> Option<IssueNumber> {
+        self.pull_request
+    }
+
+    /// Each attempt's usage and derived human time, oldest first.
+    pub fn attempt_usage(&self) -> impl Iterator<Item = AttemptUsageEntry> + '_ {
+        AttemptUsageEntry::of_task(self)
+    }
+
     /// The person's review of this settled task's forge writes, if recorded.
     #[must_use]
     pub const fn write_acknowledgement(&self) -> Option<&WriteAcknowledgement> {
@@ -717,6 +758,30 @@ impl TaskRecord {
                 })
             }
             TaskState::Claimed { lease } => Ok(lease),
+        }
+    }
+
+    /// Accept a recorded fact from the current owner, or from the owner that
+    /// settled the task: usage often arrives after the attempt that settled it.
+    fn check_recorder(&self, fence: Fence) -> Result<()> {
+        let recorder = match &self.state {
+            TaskState::Claimed { lease } => Some(lease.fence),
+            TaskState::Settled { .. } => match self.ownership.last() {
+                Some(OwnershipEvent::Released { fence, .. }) => Some(*fence),
+                Some(
+                    OwnershipEvent::Claimed { .. }
+                    | OwnershipEvent::Adopted { .. }
+                    | OwnershipEvent::Relinquished { .. }
+                    | OwnershipEvent::TakenOver { .. },
+                )
+                | None => None,
+            },
+            TaskState::Open => None,
+        };
+        if recorder == Some(fence) {
+            Ok(())
+        } else {
+            fail(StateError::StaleFence { presented: fence })
         }
     }
 
@@ -1269,6 +1334,7 @@ impl StoreState {
             consumed: BTreeSet::new(),
             cancel: None,
             acknowledgement: None,
+            pull_request: None,
         };
         self.tasks.insert(spec.id, record);
         Ok(Creation::Created)
@@ -1479,6 +1545,8 @@ impl StoreState {
             fence,
             started_at: now,
             state: AttemptState::Running,
+            usage: AttemptUsage::NotReported,
+            replies: Vec::new(),
         });
         Ok(AttemptStart::Started(number))
     }
@@ -2161,6 +2229,123 @@ impl StoreState {
         Ok(Consumption::New)
     }
 
+    pub(crate) fn record_attempt_usage(
+        &mut self,
+        id: &TaskId,
+        fence: Fence,
+        number: AttemptNumber,
+        backend: &BackendDescriptor,
+        report: UsageReport,
+        now: Timestamp,
+    ) -> Result<()> {
+        if backend.house != self.house {
+            return Err(ContractError::CrossHouse {
+                expected: self.house.clone(),
+                found: backend.house.clone(),
+            }
+            .into());
+        }
+        if backend
+            .capabilities
+            .support(Capability::UsageAttribution)
+            .is_none()
+        {
+            return Err(ContractError::UnsupportedCapabilities {
+                missing: vec![Capability::UsageAttribution],
+                partial: Vec::new(),
+            }
+            .into());
+        }
+        if report.is_empty() {
+            return Err(UsageError::EmptyReport.into());
+        }
+        let task = self.task_mut(id)?;
+        task.check_recorder(fence)?;
+        let index = usize::try_from(number.get().saturating_sub(1)).unwrap_or(usize::MAX);
+        let Some(attempt) = task.attempts.get_mut(index) else {
+            return fail(StateError::AttemptNotFound(number));
+        };
+        match &attempt.usage {
+            AttemptUsage::NotReported => {
+                attempt.usage = AttemptUsage::Reported {
+                    backend: backend.backend.clone(),
+                    report,
+                    at: now,
+                };
+                Ok(())
+            }
+            AttemptUsage::Reported {
+                backend: recorded_backend,
+                report: recorded,
+                ..
+            } if recorded_backend == &backend.backend && recorded == &report => Ok(()),
+            AttemptUsage::Reported { .. } => Err(UsageError::AlreadyReported(number).into()),
+        }
+    }
+
+    pub(crate) fn record_human_reply(
+        &mut self,
+        id: &TaskId,
+        fence: Fence,
+        question: &ExternalRef,
+        asked_at: Timestamp,
+        now: Timestamp,
+    ) -> Result<()> {
+        if asked_at > now {
+            return Err(UsageError::ReplyBeforeQuestion.into());
+        }
+        let task = self.task_mut(id)?;
+        task.owned_lease(fence, now, false)?;
+        if task
+            .attempts
+            .iter()
+            .flat_map(|attempt| &attempt.replies)
+            .any(|reply| &reply.question == question)
+        {
+            return Ok(());
+        }
+        let Some(attempt) = task.running_attempt_mut(fence) else {
+            return fail(StateError::NoRunningAttempt);
+        };
+        if attempt.replies.len() >= MAX_HUMAN_REPLIES_PER_ATTEMPT {
+            return Err(UsageError::TooManyReplies.into());
+        }
+        attempt.replies.push(HumanReply {
+            question: question.clone(),
+            asked_at,
+            answered_at: now,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn link_pull_request(
+        &mut self,
+        id: &TaskId,
+        fence: Fence,
+        number: IssueNumber,
+    ) -> Result<()> {
+        let task = self.task_mut(id)?;
+        task.check_recorder(fence)?;
+        if task.spec.repository.is_none() {
+            return Err(UsageError::NoRepository.into());
+        }
+        match task.pull_request {
+            None => {
+                task.pull_request = Some(number);
+                Ok(())
+            }
+            Some(linked) if linked == number => Ok(()),
+            Some(linked) => Err(UsageError::PullRequestConflict(linked).into()),
+        }
+    }
+
+    pub(crate) fn attempt_usage(&self) -> Vec<AttemptUsageEntry> {
+        self.tasks
+            .values()
+            .flat_map(TaskRecord::attempt_usage)
+            .collect()
+    }
+
     pub(crate) fn acquire_consumer(
         &mut self,
         consumer: &ConsumerId,
@@ -2777,6 +2962,9 @@ impl StoreState {
             }
             if attempt.fence.get() >= self.next_fence {
                 return Err(Corruption::FenceAhead);
+            }
+            if attempt.replies.len() > MAX_HUMAN_REPLIES_PER_ATTEMPT {
+                return Err(Corruption::LimitExceeded);
             }
             let is_last = index.saturating_add(1) == task.attempts.len();
             if attempt.state == AttemptState::Running

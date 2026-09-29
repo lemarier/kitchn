@@ -40,6 +40,9 @@
 //!   scoped [`RiskDecision`] allows one specific action.
 //! - One retention policy ([`RetentionPolicy`]) removes markers and settled
 //!   tasks no workflow still needs, only on positive outside evidence.
+//! - Each attempt carries its backend-reported usage or an explicit
+//!   [`AttemptUsage::NotReported`]; human time is derived from recorded
+//!   replies and interactive claims, never reported ([`AttemptUsageEntry`]).
 
 mod consumer;
 mod effects;
@@ -49,6 +52,7 @@ mod model;
 mod retention;
 pub(crate) mod snapshot;
 mod store;
+mod usage;
 mod verification;
 
 pub use consumer::{ConsumerEvent, ConsumerRecord, ConsumerState, MAX_CONSUMER_HISTORY};
@@ -76,4 +80,8 @@ pub use retention::{
 };
 pub use snapshot::StoreOptions;
 pub use store::HouseStore;
+pub use usage::{
+    AttemptUsage, AttemptUsageEntry, Cost, CostBasis, HumanReply, HumanTime,
+    MAX_HUMAN_REPLIES_PER_ATTEMPT, TokenCounts, UsageError, UsageReport, UsdMicros,
+};
 pub use verification::{VerificationPlan, run_verification};

@@ -93,6 +93,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #110 trust ledger archival | `trust/archive.rs` | The `archivals` summaries in `trust/store.rs` and the archive append in `state/snapshot.rs`; `kitchn trust` in `crates/kitchen-cli/src/commands/trust.rs`; tests in `crates/kitchen/tests/trust_archive.rs` and `crates/kitchen-cli/tests/trust.rs` |
 | #88 durable follow-ups for a person-held terminal | `workflows/follow_up.rs` | Held follow-up routing in `workflows/coordination.rs` (with #8); tests in `crates/kitchen/tests/workflows_follow_up.rs` |
 | #174 user-facing repository links | — | `repository` in root `Cargo.toml`, README, and website links and clone commands; test fixtures keep `lemarier/kitchen` as sample data |
+| #194 attempt usage records | `state/usage.rs` | The usage and pull-request fields on `AttemptRecord` and `TaskRecord` and their `HouseStore` methods in `state/model.rs` and `state/store.rs` (with #4); the usage count on retired tasks in `state/retention.rs` (with #85); tests in `crates/kitchen/tests/attempt_usage.rs` |
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.

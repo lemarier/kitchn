@@ -73,6 +73,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #46 report intake | `workflows/intake.rs` | Intake source, grouping, and redaction tests |
 | #149 fake-executable test helper | `crates/kitchen/tests/common/executable.rs` | Test support only; `tests/fake_executable.rs` covers it |
 | #47 project decomposition | `workflows/decomposition.rs` | Decomposition tests; `kitchen decompose` CLI command |
+| #98 guided house init | `house/wizard/` | `kitchen house init` without `--config` in `crates/kitchen-cli/src/commands/house_init.rs`; `tests/house_init.rs` in both crates |
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.
@@ -127,11 +128,13 @@ just check
 cargo test -p kitchen --locked --offline
 cargo test -p kitchen-cli --locked --offline
 just msrv-check
-cargo install --path crates/kitchen-cli --locked --offline
+just install
 ```
 
-`just check` includes doctests through `just test`. The install command uses the
-committed lockfile; repeat it from the same revision to reinstall that version.
+`just check` includes doctests through `just test`. `just install` uses the
+committed lockfile and records the commit only from a clean tree on a
+remote-tracking branch (see the README); repeat it from the same revision to
+reinstall that version.
 `just security` is a separate networked audit and requires its documented tools.
 
 Local workers load the verified snapshot printed by `just skills-sync`, retain

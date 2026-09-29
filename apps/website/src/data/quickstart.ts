@@ -1,10 +1,13 @@
 // The two-minute setup at /docs/start/quickstart/, one entry per step.
 //
 // Blocks without `planned` are output captured from the kitchn CLI built from
-// PR #96 (#93), against a scratch registry and a checkout whose origin remote
-// is github.com/acme/app. Paths are shortened to ~/.kitchn, the 40-character
-// pins to 7, and long reports are trimmed; the wording is otherwise the CLI's
-// own, except that commands and hints say `kitchn`: the binary is still named
+// PR #96 (#93), and for `house init` from the #98 branch built with
+// KITCHEN_COMMIT set to its base commit, against a scratch registry and a
+// checkout whose origin remote is github.com/acme/app. Typed answers are shown
+// on their prompt lines and the printed configuration is abridged. Paths are
+// shortened to ~/.kitchn, the 40-character pins to 7, and long reports are
+// trimmed; the wording is otherwise the CLI's own, except that commands, hints
+// and prompts say `kitchn`: the binary is still named
 // `kitchen` until #18 renames it.
 //
 // Blocks marked `planned: true` show the intended behavior of features that
@@ -87,7 +90,8 @@ export const steps: Step[] = [
         label: "From source, today",
         lines: [
           cmd("git clone https://github.com/lemarier/kitchen && cd kitchen"),
-          cmd("cargo install --path crates/kitchen-cli --locked"),
+          cmd("just install"),
+          ok("recording commit <sha>"),
           cmd("kitchen --version"),
           ok("kitchen 0.1.0"),
         ],
@@ -124,36 +128,37 @@ export const steps: Step[] = [
   },
   {
     id: "orchestrator",
-    title: "Check your orchestrator",
-    lede: "kitchn runs its brigade on Orca. Enable the agents you want in Orca, then run `kitchn house init`: it asks a few questions and registers your house.",
+    title: "Register your house",
+    lede: "Install the agents you want to cook with, then run `kitchn house init` from a checkout. It asks only what it can't infer, shows the result, and registers your house.",
     blocks: [
       {
         kind: "term",
         label: "Register the house",
-        planned: true,
         lines: [
           cmd("kitchn house init"),
-          out("House name: acme"),
-          out("Repositories kitchn may work in [acme/app, from this checkout]: acme/app"),
-          out("Orca has Claude Code, Codex and Gemini. Who works each station?"),
-          out("  Sous-chef     plans and splits work     [Claude Code]"),
-          out("  Station cook  writes the code           [Codex]"),
-          out("  Expediter     reviews at the pass       [Claude Code]"),
-          out("Required checks on acme/app main: test, lint"),
-          ok("Registered house acme in ~/.kitchn and pinned kitchn guidance at 4f2a9c1."),
+          out("Registry directory [~/.kitchn]:"),
+          you("House name: acme"),
+          out("Repositories kitchn may work in [acme/app, from this checkout]:"),
+          out("Where kitchn may post [acme/app, the repositories]:"),
+          out("Found Claude Code and Codex on PATH. Who works each station?"),
+          out("  Sous-chef     plans and splits work  [Claude Code]:"),
+          out("  Station cook  writes the code        [Codex]:"),
+          out("  Expediter     reviews at the pass    [Claude Code]:"),
+          warn("No house-scoped GitHub access to read required checks (see --github-requester)."),
+          you("Required checks: test, lint"),
+          out("Required reviewers [expediter]:"),
+          dim('{ "house": "acme", "repositories": ["acme/app"], "grants": [], … }'),
+          you("Register house acme in ~/.kitchn? [y/N]: y"),
+          ok("Registered house acme in ~/.kitchn and pinned the default guidance at ed7da17."),
           ok("No authority or workflows activated."),
           dim("Saved your answers as ~/.kitchn/houses/acme.json. Review it any time."),
         ],
       },
     ],
     worked: [
-      "Orca lists the agents you picked as installed.",
+      "Press Enter to take a default in brackets; only the house name and the required checks needed typing.",
       "`house init` says the house is registered and nothing was activated.",
-      "Prefer a file you review first? `kitchn house init --config house.json` still works.",
-    ],
-    tracking: [
-      { issue: 98, what: "the guided `house init`" },
-      { issue: 42, what: "choosing the agent per station (PR #82)" },
+      "Scripting it? Every question has a flag, such as `--house acme --required-checks test,lint --yes`. Prefer a file you review first? `kitchn house init --registry ~/.kitchn --config house.json` still works.",
     ],
   },
   {

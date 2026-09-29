@@ -11,7 +11,8 @@ They never share credentials, private context, answers or history.
 
 ## House policy
 
-The policy is a reviewed JSON document registered with `kitchn house init`.
+The policy is a JSON document registered with `kitchn house init`, which can
+write it for you from a few answers or register one you wrote and reviewed.
 
 | Field | Meaning |
 | --- | --- |

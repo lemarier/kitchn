@@ -25,13 +25,15 @@ cargo install kitchn --locked
 ## From source
 
 This works today. kitchn needs the Rust toolchain pinned in the repository's
-`rust-toolchain.toml`; rustup installs it automatically.
+`rust-toolchain.toml`; rustup installs it automatically. The install step also needs [just](https://just.systems).
 
 ```sh
 git clone https://github.com/lemarier/kitchen
 cd kitchen
-cargo install --path crates/kitchen-cli --locked
+just install
 ```
+
+`just install` runs `cargo install` and records the commit you built, which guided `house init` needs to pin its built-in guidance. It records it only from a clean checkout whose commit is on a remote branch; otherwise it prints why and installs without it. That binary still works, but `house init` then needs `--bundle <path>`.
 
 :::note
 The rename from `kitchen` to `kitchn` is in progress

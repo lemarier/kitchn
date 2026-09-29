@@ -17,6 +17,13 @@ kitchen house sync --registry /absolute/external/kitchen --house example --bundl
 kitchen house setup --registry /absolute/external/kitchen
 ```
 
+Without `--config`, `kitchen house init` asks for the house name and offers a
+default for everything else: the checkout's repository, Claude Code at the pass
+and Codex at the stations, and the expediter as required reviewer. It prints
+the configuration, registers it after confirmation, and pins Kitchen's default
+guidance in the same run. Every question has a flag; with piped input, missing
+answers fail with exit 2 and the flags to pass.
+
 Setup asks for the house and workflows. Choose `none` for interactive-only work.
 It writes nothing into the repository: the binding is stored in the registry,
 keyed by the repository, and setup finishes with a doctor report and next steps.

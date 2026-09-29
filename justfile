@@ -54,3 +54,21 @@ website-deploy:
 security:
     cargo deny check
     zizmor --min-severity medium .github/
+
+# Installs kitchen-cli. The build records KITCHEN_COMMIT (which lets guided
+# `house init` pin the built-in guidance) only from a clean tree whose commit is
+# on a remote-tracking branch; otherwise it installs without it and says why.
+install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    commit=$(git rev-parse HEAD)
+    if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+        echo "not recording the commit: the working tree has uncommitted changes" >&2
+        commit=
+    elif [ -z "$(git branch -r --contains "$commit")" ]; then
+        echo "not recording the commit: $commit is not on a remote-tracking branch (fetch, or push it)" >&2
+        commit=
+    else
+        echo "recording commit $commit"
+    fi
+    KITCHEN_COMMIT="$commit" cargo install --path crates/kitchen-cli --locked --force

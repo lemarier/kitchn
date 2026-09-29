@@ -24,12 +24,17 @@ pub struct HouseArgs {
 }
 #[derive(Subcommand)]
 enum HouseCommand {
-    /// Register a reviewed external house policy without granting new authority.
+    /// Register a house without granting new authority. Without --config,
+    /// asks only for what cannot be inferred and pins the default guidance.
     Init {
+        /// External registry directory (default: ~/.kitchn).
         #[arg(long)]
-        registry: PathBuf,
-        #[arg(long)]
-        config: PathBuf,
+        registry: Option<PathBuf>,
+        /// A reviewed house policy file; registers it without prompts.
+        #[arg(long, requires = "registry", conflicts_with_all = super::house_init::GUIDED)]
+        config: Option<PathBuf>,
+        #[command(flatten)]
+        guided: Box<super::house_init::InitArgs>,
     },
     /// Bind a repository in the registry; prompt only for house and workflows.
     /// Nothing is written to the repository's working tree.
@@ -107,7 +112,18 @@ enum HouseCommand {
 
 pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
     match args.command {
-        HouseCommand::Init { registry, config } => {
+        HouseCommand::Init {
+            registry,
+            config: None,
+            guided,
+        } => super::house_init::run(registry, guided),
+        HouseCommand::Init {
+            registry,
+            config: Some(config),
+            guided: _,
+        } => {
+            // Clap requires --registry with --config.
+            let registry = registry.ok_or(HouseError::InvalidInput)?;
             let registry = HouseRegistry::new(canonical_root(registry)?)?;
             let config: HouseConfig = decode(&config)?;
             registry.initialize(&config)?;
@@ -392,7 +408,7 @@ fn parse_workflows(value: &str) -> Result<BTreeSet<Workflow>, HouseError> {
     }
     value.split(',').map(|name| name.trim().parse()).collect()
 }
-fn prompt(message: &str) -> Result<String, HouseError> {
+pub(super) fn prompt(message: &str) -> Result<String, HouseError> {
     let mut output = io::stderr().lock();
     write!(output, "{message}")?;
     output.flush()?;
@@ -414,7 +430,7 @@ fn prompt(message: &str) -> Result<String, HouseError> {
     }
     Err(HouseError::InvalidInput)
 }
-fn canonical_root(path: PathBuf) -> Result<PathBuf, HouseError> {
+pub(super) fn canonical_root(path: PathBuf) -> Result<PathBuf, HouseError> {
     // Preserve path redirects for the library to reject; canonicalization would
     // erase the evidence. Make only the normal current-directory prefix absolute.
     if path.is_absolute() {

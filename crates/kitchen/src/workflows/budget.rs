@@ -24,14 +24,15 @@
 //!
 //! A house may change `windowHours` in the middle of a window. Windows are
 //! aligned to the Unix epoch, so the new window can start at the same instant
-//! as the old one, or inside it. A window's task keeps the retry budget it was
-//! created with, so a longer window whose start is shared with a shorter
-//! window's task gets its own task (see `window_task`). Before a task acts,
-//! the tick looks up every effect left unresolved by another task whose
-//! window overlaps its own, whatever that window's start, and refuses while
-//! one stays unknown. A report another overlapping task already posted, or
-//! one recorded for a window still open, is not posted again; a pause is
-//! repeated only on a later observation, which finds the schedule paused.
+//! as the old one, or inside it. A window's task is named for its start and
+//! its length, so each length gets its own task (see `window_task`). Before a
+//! task acts, the tick looks up every effect left unresolved by another task
+//! whose window may overlap its own, whatever that window's start, and refuses
+//! while one stays unknown. An earlier release's task whose window length is
+//! unknown counts as the longest window a policy admits. A report another
+//! overlapping task already posted, or one recorded for a window still open,
+//! is not posted again; a pause is repeated only on a later observation, which
+//! finds the schedule paused.
 //!
 //! The owner report is recorded only after delivery, with
 //! [`confirm_reported`]. A pass interrupted after a pause and before that
@@ -675,33 +676,34 @@ fn claim(tick: &Tick<'_>, task: &TaskId) -> Result<Fence> {
     Ok(fence)
 }
 
-/// The id of the task that acts for `window`.
+/// The id of the task that acts for `window`: `budget-<start>-<hours>h`.
 ///
-/// A window's task is named for its start and keeps the retry budget it was
-/// created with, sized for the window length then. Windows are aligned to the
-/// Unix epoch, so a house that changes `windowHours` mid-window can get a new
-/// window with the same start. `budget-<start>` is used again when its task is
-/// open and stays retryable for this whole window; otherwise, such as a 24 hour
-/// task under a new 744 hour window, or a settled one, the task is
-/// `budget-<start>-<hours>h`. Both tasks share the window's start, so the
-/// report and marker names, which derive from the start, stay the same.
+/// Windows are aligned to the Unix epoch, so a house that changes
+/// `windowHours` mid-window can get a new window with the same start; the
+/// hours in the id give each length its own task, and a task's window can be
+/// read from its id alone. Report and marker names derive from the start, so
+/// they stay the same for both lengths.
+///
+/// Releases before this one named a task `budget-<start>`. Such a task is
+/// continued while it is open and its retry budget covers this whole window,
+/// so a window in progress at the upgrade keeps its task.
 ///
 /// # Errors
 /// Store read failures.
 fn window_task(store: &HouseStore, window: UsageWindow) -> Result<TaskId> {
     let start = window.start.as_unix_millis();
-    let base = TaskId::new(&format!("{WORKFLOW}-{start}"))?;
     let length = window_length(window);
-    let reusable = match store.task(&base) {
+    let bare = TaskId::new(&format!("{WORKFLOW}-{start}"))?;
+    let continued = match store.task(&bare) {
         Ok(record) => {
             !matches!(record.state(), TaskState::Settled { .. })
                 && record.spec().retry.max_elapsed() >= length
         }
-        Err(Error::State(StateError::TaskNotFound(_))) => true,
+        Err(Error::State(StateError::TaskNotFound(_))) => false,
         Err(error) => return Err(error),
     };
-    if reusable {
-        return Ok(base);
+    if continued {
+        return Ok(bare);
     }
     let hours = length.as_secs() / 3600;
     Ok(TaskId::new(&format!("{WORKFLOW}-{start}-{hours}h"))?)
@@ -716,14 +718,19 @@ fn window_length(window: UsageWindow) -> Duration {
     )
 }
 
+/// The longest window a policy admits.
+fn longest_window() -> Duration {
+    Duration::from_secs(u64::from(scheduling::MAX_WINDOW_HOURS) * 3600)
+}
+
 /// What a budget task id names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WindowTaskId {
     /// The window's start, in Unix milliseconds.
     start: u64,
-    /// Whether the id names the window's length too: `budget-<start>-<hours>h`
-    /// rather than `budget-<start>`.
-    sized: bool,
+    /// The window's length in hours, for `budget-<start>-<hours>h`; `None`
+    /// for an earlier release's `budget-<start>`.
+    hours: Option<u16>,
 }
 
 impl WindowTaskId {
@@ -731,16 +738,15 @@ impl WindowTaskId {
         let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
         let rest = id.as_str().strip_prefix(WORKFLOW)?.strip_prefix('-')?;
         let (start, hours) = match rest.split_once('-') {
-            Some((start, hours)) => (start, Some(hours)),
+            Some((start, hours)) => (start, Some(hours.strip_suffix('h')?)),
             None => (rest, None),
         };
-        let hours_ok = hours.is_none_or(|hours| hours.strip_suffix('h').is_some_and(digits));
-        if !(digits(start) && hours_ok) {
+        if !(digits(start) && hours.is_none_or(digits)) {
             return None;
         }
         Some(Self {
             start: start.parse().ok()?,
-            sized: hours.is_some(),
+            hours: hours.map(str::parse).transpose().ok()?,
         })
     }
 }
@@ -748,54 +754,80 @@ impl WindowTaskId {
 /// The elapsed budget every window task had before #182.
 const LEGACY_TICK_ELAPSED: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// A budget task's window start, and the first instant after its window.
-///
-/// A task's retry budget is its window's length, except for a task from
-/// before #182: `budget-<start>` with that release's 30 day budget, whatever
-/// its window. Its window is taken to be `length` long, the current one's;
-/// 30 days would let one such task hold back, or hide the reports of, the
-/// windows that follow it. A 720 hour window's own task looks the same, so
-/// after a length change its window may be taken as the new length.
-fn task_window(record: &TaskRecord, length: Duration) -> Option<(u64, u128)> {
-    let id = WindowTaskId::parse(&record.spec().id)?;
-    let budget = record.spec().retry.max_elapsed();
-    let length = if !id.sized && budget == LEGACY_TICK_ELAPSED {
-        length
-    } else {
-        budget
-    };
-    Some((id.start, u128::from(id.start) + length.as_millis()))
+/// A budget task's window, as far as its id and retry budget show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskWindow {
+    /// The window's start, and the first instant after it.
+    Known { start: u64, end: u128 },
+    /// A `budget-<start>` task with a 30 day retry budget. Before #182 every
+    /// task had that budget, whatever its window; after it, a 720 hour
+    /// window's task had it too. Its window is between 1 and
+    /// [`MAX_WINDOW_HOURS`](scheduling::MAX_WINDOW_HOURS) hours long.
+    Ambiguous { start: u64 },
 }
 
-/// Every other budget task whose window overlaps `window`, with its start
-/// and the first instant after its window.
+impl TaskWindow {
+    /// The window of a budget task, or `None` for another task.
+    fn of(record: &TaskRecord) -> Option<Self> {
+        let id = WindowTaskId::parse(&record.spec().id)?;
+        let length = match id.hours {
+            Some(hours) => Duration::from_secs(u64::from(hours) * 3600),
+            None => match record.spec().retry.max_elapsed() {
+                LEGACY_TICK_ELAPSED => return Some(Self::Ambiguous { start: id.start }),
+                // A task from #182 until ids carried the hours: its retry
+                // budget is its window's length.
+                budget => budget,
+            },
+        };
+        Some(Self::Known {
+            start: id.start,
+            end: u128::from(id.start) + length.as_millis(),
+        })
+    }
+
+    const fn start(self) -> u64 {
+        match self {
+            Self::Known { start, .. } | Self::Ambiguous { start } => start,
+        }
+    }
+
+    /// The first instant after the window, taking an ambiguous one to be as
+    /// long as the longest window a policy admits.
+    fn latest_end(self) -> u128 {
+        match self {
+            Self::Known { end, .. } => end,
+            Self::Ambiguous { start } => u128::from(start) + longest_window().as_millis(),
+        }
+    }
+}
+
+/// Every other budget task whose window may overlap `window`, taking an
+/// ambiguous task's window to be the longest a policy admits.
 fn overlapping_tasks(
     store: &HouseStore,
     task: &TaskId,
     window: UsageWindow,
-) -> Result<Vec<(u64, u128, TaskRecord)>> {
+) -> Result<Vec<(TaskWindow, TaskRecord)>> {
     let (start, end) = (window.start.as_unix_millis(), window.end.as_unix_millis());
-    let length = window_length(window);
     Ok(store
         .tasks()?
         .into_iter()
         .filter(|record| record.spec().id != *task)
         .filter_map(|record| {
-            let (other_start, other_end) = task_window(&record, length)?;
-            (other_start < end && other_end > u128::from(start)).then_some((
-                other_start,
-                other_end,
-                record,
-            ))
+            let other = TaskWindow::of(&record)?;
+            (other.start() < end && other.latest_end() > u128::from(start))
+                .then_some((other, record))
         })
         .collect())
 }
 
-/// Look up the unresolved effects of every other task whose window overlaps
-/// `window`, so this one never pauses or reports what one of them may already
-/// have done. An effect still unresolved after the lookup refuses the tick.
+/// Look up the unresolved effects of every other task whose window may
+/// overlap `window`, so this one never pauses or reports what one of them may
+/// already have done. An effect still unresolved after the lookup refuses the
+/// tick. An ambiguous task counts for the longest window from its start, so
+/// until its effects are known it holds back up to that window's ticks.
 fn reconcile_overlapping(tick: &Tick<'_>, task: &TaskId, window: UsageWindow) -> Result<()> {
-    for (_, _, record) in overlapping_tasks(tick.store, task, window)? {
+    for (_, record) in overlapping_tasks(tick.store, task, window)? {
         if matches!(record.state(), TaskState::Settled { .. })
             || record.unresolved_effects().next().is_none()
         {
@@ -957,6 +989,11 @@ fn deliver(
 /// task of the window this window's length change replaced. Its post is
 /// named for its own window's start. A report whose window has closed does
 /// not count, as its marker would not.
+///
+/// An ambiguous task's post that was recorded as reported has the window its
+/// marker names; the report's own marker covers that window. One found
+/// applied only by a lookup has no marker, so its window is taken to be the
+/// longest a policy admits and it is not posted again within it.
 fn posted_elsewhere(
     store: &HouseStore,
     task: &TaskId,
@@ -964,19 +1001,54 @@ fn posted_elsewhere(
     observed_at: Timestamp,
 ) -> Result<bool> {
     let now = u128::from(observed_at.as_unix_millis());
-    for (start, end, record) in overlapping_tasks(store, task, exhaustion.window)? {
-        if end <= now {
-            continue;
-        }
-        let name = report_name_at(&exhaustion.schedule, start)?;
+    for (other, record) in overlapping_tasks(store, task, exhaustion.window)? {
+        let name = report_name_at(&exhaustion.schedule, other.start())?;
         let applied = record.effects().iter().any(|effect| {
             effect.name() == &name && matches!(effect.state(), EffectState::Applied { .. })
         });
-        if applied {
+        if !applied {
+            continue;
+        }
+        let end = match other {
+            TaskWindow::Known { end, .. } => end,
+            TaskWindow::Ambiguous { start } => {
+                match reported_window_end(store, &exhaustion.schedule, start)? {
+                    Some(end) => end,
+                    None => other.latest_end(),
+                }
+            }
+        };
+        if end > now {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// The end of the window whose report for `schedule` was recorded for the
+/// window starting at `start`, if one was.
+fn reported_window_end(
+    store: &HouseStore,
+    schedule: &ResourceRef,
+    start: u64,
+) -> Result<Option<u128>> {
+    let reported = scheduling::exhausted_schema()?;
+    let workflow = WorkflowId::new(scheduling::BUDGET_WORKFLOW)?;
+    for marker in store.markers(&workflow)? {
+        let WorkItem::Resource { resource } = &marker.key().item else {
+            continue;
+        };
+        if resource != schedule
+            || !matches!(marker.fact(), MarkerFact::Workflow { schema, .. } if *schema == reported)
+        {
+            continue;
+        }
+        let window = marker.fact().decode::<ExhaustionReport>(&reported)?.window;
+        if window.start.as_unix_millis() == start {
+            return Ok(Some(u128::from(window.end.as_unix_millis())));
+        }
+    }
+    Ok(None)
 }
 
 /// Settle the budget tasks of windows that ended before `observed_at` and
@@ -985,12 +1057,12 @@ fn posted_elsewhere(
 /// unresolved. A task that is still unresolved, or whose claim or lookup fails
 /// now, is left for a later tick.
 ///
-/// A `budget-<start>` task whose start is before the current task's also
-/// settles once nothing on it is unresolved, even while its retry budget
-/// runs: a release before #182 gave every such task 30 days, whatever its
-/// window. If the house later restores a window with that start, the window
-/// gets a `budget-<start>-<hours>h` task. A sized task waits for its window
-/// to end, because nothing would replace it if its window came back.
+/// An earlier release's `budget-<start>` task whose start is before the
+/// current task's also settles once nothing on it is unresolved, even while
+/// its retry budget runs: a release before #182 gave every such task 30 days,
+/// whatever its window. If the house later restores a window with that start,
+/// the window gets a `budget-<start>-<hours>h` task. Any other task waits for
+/// its window to end, because it is used again if its window comes back.
 ///
 /// # Errors
 /// Only a store read of the task list, and a claim that cannot be given back.
@@ -1013,7 +1085,8 @@ fn settle_earlier(
             // house restores its length, so its task stays.
             let end = u128::from(id.start) + record.spec().retry.max_elapsed().as_millis();
             let ended = end <= u128::from(observed_at.as_unix_millis());
-            let superseded = !id.sized && current_start.is_some_and(|current| id.start < current);
+            let superseded =
+                id.hours.is_none() && current_start.is_some_and(|current| id.start < current);
             record.spec().id != *current
                 && (ended || superseded)
                 && !matches!(record.state(), TaskState::Settled { .. })

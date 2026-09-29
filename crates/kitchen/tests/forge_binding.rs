@@ -173,6 +173,10 @@ fn a_binding_for_another_house_or_schema_is_refused_before_writing() -> TestResu
         "-lead",
         "trail-",
         "two--hyphens",
+        "_lead",
+        "trail_",
+        "two__under",
+        "mixed-_run",
         "$(id)",
         &"a".repeat(40),
     ] {
@@ -185,7 +189,13 @@ fn a_binding_for_another_house_or_schema_is_refused_before_writing() -> TestResu
         );
     }
     assert!(!root.join("registry/private").exists());
-    for login in ["a", "octo-cat", "kitchen-app[bot]", &"a".repeat(39)] {
+    for login in [
+        "a",
+        "octo-cat",
+        "user_acme",
+        "kitchen-app[bot]",
+        &"a".repeat(39),
+    ] {
         assert!(
             ForgeKind::GitHub.accepts_requester(&ExternalRef::new(login)?),
             "{login}"

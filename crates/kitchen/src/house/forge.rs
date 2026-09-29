@@ -48,8 +48,9 @@ pub enum ForgeKind {
 
 impl ForgeKind {
     /// Whether `requester` is a login this forge can issue: for GitHub, 1 to
-    /// 39 letters, digits, and inner single hyphens, optionally ending in
-    /// `[bot]` for an app.
+    /// 39 letters, digits, and inner single hyphens or underscores (an
+    /// Enterprise Managed User login is `handle_shortcode`), optionally
+    /// ending in `[bot]` for an app.
     #[must_use]
     pub fn accepts_requester(self, requester: &ExternalRef) -> bool {
         match self {
@@ -59,10 +60,12 @@ impl ForgeKind {
                 (1..=39).contains(&name.len())
                     && name
                         .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-                    && !name.starts_with('-')
-                    && !name.ends_with('-')
-                    && !name.contains("--")
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                    && !name.starts_with(['-', '_'])
+                    && !name.ends_with(['-', '_'])
+                    && !["--", "__", "-_", "_-"]
+                        .iter()
+                        .any(|pair| name.contains(pair))
             }
         }
     }

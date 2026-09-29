@@ -204,7 +204,9 @@ pub fn gh_login(path: Option<std::ffi::OsString>) -> Option<ExternalRef> {
         .take(GH_OUTPUT_BYTES)
         .read_to_string(&mut output)
         .ok()?;
-    ExternalRef::new(output.trim()).ok()
+    ExternalRef::new(output.trim())
+        .ok()
+        .filter(|login| ForgeKind::GitHub.accepts_requester(login))
 }
 
 #[cfg(test)]
@@ -248,6 +250,15 @@ mod tests {
         // Logged out, unparseable, and hung all leave the login unknown.
         fake_gh(&directory, "#!/bin/sh\nexit 1\n")?;
         assert_eq!(gh_login(Some(path.clone())), None);
+        // A login the forge could not issue is not offered as a default.
+        fake_gh(&directory, "#!/bin/sh\necho two--hyphens\n")?;
+        assert_eq!(gh_login(Some(path.clone())), None);
+        // Enterprise Managed User logins carry an underscore.
+        fake_gh(&directory, "#!/bin/sh\necho user_acme\n")?;
+        assert_eq!(
+            gh_login(Some(path.clone())),
+            Some(ExternalRef::new("user_acme")?)
+        );
         fake_gh(&directory, "#!/bin/sh\necho 'not a login'\n")?;
         assert_eq!(gh_login(Some(path.clone())), None);
         fake_gh(&directory, "#!/bin/sh\nexec /bin/sleep 30\n")?;

@@ -1017,6 +1017,7 @@ fn registry_with(
         agent_models: None,
         stack_tool: None,
         schedules: None,
+        readiness: None,
     };
     Ok((temp, registry, repository, evidence))
 }

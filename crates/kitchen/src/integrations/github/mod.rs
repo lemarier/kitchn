@@ -22,7 +22,11 @@
 //! effects, rather than promising a wall-clock posting rate limit.
 //! Provider 4xx refusals are definitely not applied; rate-limit responses carry
 //! a typed retry delay when one is supplied. Transport and 5xx outcomes require
-//! reconciliation. A merge must name the task's current evidence subject: core
+//! reconciliation. The executor admits and executes a merge only at a subject
+//! a readiness-checked [`MergeGrant`](crate::workflows::gate::MergeGrant) given
+//! to [`GitHubExecutor::with_merge_grant`] covers, so a house below its merge
+//! readiness policy cannot merge through it. A merge must also name the task's
+//! current evidence subject: core
 //! refuses it at admission unless `expected_head` and `expected_base_commit`
 //! equal the recorded head and base, so callers record evidence before
 //! merging. The provider then requires the approved head and base branch; a

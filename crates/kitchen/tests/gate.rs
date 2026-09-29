@@ -89,11 +89,57 @@ fn fix_grants(house: &HouseId) -> TestResult<HouseGrants> {
         ],
     ))
 }
-/// Merge and fix grants in `house`, with no reviewer invocation.
+/// A house that serves `lemarier/kitchen` with a standing merge grant on
+/// the forge and the given readiness policy.
+fn merge_house(
+    house: &HouseId,
+    policy: &[(&str, kitchen::house::ReadinessLevel)],
+) -> TestResult<kitchen::house::HouseConfig> {
+    let mut config: kitchen::house::HouseConfig =
+        serde_json::from_str(include_str!("fixtures/house/origin89.json"))?;
+    let repository = Repository::new("lemarier/kitchen")?;
+    let merge = Grant::repository(
+        Permission::Merge,
+        repository.clone(),
+        BackendId::new("github")?,
+        CredentialId::new("gate-credential")?,
+    );
+    config.house = house.clone();
+    config.repositories = [repository.clone()].into();
+    config.posting_destinations = [repository].into();
+    config.grants = [merge.clone()].into();
+    config.policy_limits = [merge].into();
+    for (work_type, level) in policy {
+        config.merge_readiness.insert(Text::new(work_type)?, *level);
+    }
+    Ok(config)
+}
+/// The subject of [`ready`] in `house`.
+fn ready_subject() -> TestResult<kitchen::house::MergeSubject> {
+    let e = ready()?;
+    Ok(kitchen::house::MergeSubject {
+        repository: e.repository,
+        number: e.number,
+        head: e.head,
+        base: e.base,
+    })
+}
+/// The readiness-checked merge grant for `subject` in a house without a
+/// readiness policy.
+fn merge_grant(house: &HouseId, subject: &kitchen::house::MergeSubject) -> TestResult<MergeGrant> {
+    let issued = merge_house(house, &[])?.issue_authority(&[], &[])?;
+    Ok(MergeGrant::resolve(
+        &issued,
+        subject,
+        &BackendId::new("github")?,
+    )?)
+}
+/// Merge and fix grants in `house`, with no reviewer invocation. The merge
+/// grant covers the subject of [`ready`].
 fn grants_in(house: &HouseId) -> TestResult<GateGrants> {
     let workers = FakeBackend::fully_capable(common::backend_id()?, house.clone());
     Ok(GateGrants {
-        merge: true,
+        merge: merge_grant(house, &ready_subject()?)?,
         fix_request: FixGrant::resolve(
             &fix_grants(house)?,
             &Repository::new("lemarier/kitchen")?,
@@ -115,6 +161,19 @@ fn key(n: u8) -> TestResult<kitchen::contracts::IdempotencyKey> {
     Ok(kitchen::contracts::IdempotencyKey::from_ref(
         ExternalRef::new(&format!("fake:effect/{n}"))?,
     ))
+}
+/// The readiness-checked merge grant for a decision's exact subject.
+fn granted(recorded: &RecordedDecision) -> TestResult<MergeGrant> {
+    let d = &recorded.decision;
+    merge_grant(
+        &d.house,
+        &kitchen::house::MergeSubject {
+            repository: d.repository.clone(),
+            number: d.number,
+            head: d.head.clone(),
+            base: d.base.clone(),
+        },
+    )
 }
 /// A decision admitted for exactly one submission, as the store would admit it.
 fn admitted(decision: GateDecision) -> TestResult<RecordedDecision> {
@@ -264,18 +323,18 @@ fn merge_request_rechecks_refs_and_run_limit() -> TestResult {
     let e = ready()?;
     let d = admitted(gate::evaluate(&e, grants()?, GateHistory::default()))?;
     assert_eq!(
-        gate::merge_request(&d, &e.head, &e.base, 0)?.match_head,
+        gate::merge_request(&d, &granted(&d)?, &e.head, &e.base, 0)?.match_head,
         e.head
     );
     assert_eq!(
-        gate::merge_request(&d, &e.head, &commit('c')?, 0),
+        gate::merge_request(&d, &granted(&d)?, &e.head, &commit('c')?, 0),
         Err(RequestRefusal::MovedRevision)
     );
     assert_eq!(
-        gate::merge_request(&d, &e.head, &e.base, 3),
+        gate::merge_request(&d, &granted(&d)?, &e.head, &e.base, 3),
         Err(RequestRefusal::MergeLimit)
     );
-    let mutation = gate::merge_request(&d, &e.head, &e.base, 0)?.mutation();
+    let mutation = gate::merge_request(&d, &granted(&d)?, &e.head, &e.base, 0)?.mutation();
     assert_eq!(mutation.repository, e.repository);
     assert_eq!(
         mutation.action,
@@ -521,7 +580,7 @@ fn report_only_records_once_per_exact_subject_without_effect() -> TestResult {
     assert_eq!(first.decision.verdict, Verdict::Merge);
     assert_eq!(first.mode, GateMode::ReportOnly);
     assert_eq!(
-        gate::merge_request(&first, &e.head, &e.base, 0),
+        gate::merge_request(&first, &granted(&first)?, &e.head, &e.base, 0),
         Err(RequestRefusal::EffectsDisabled)
     );
     let second =
@@ -978,13 +1037,13 @@ fn forge_reread_blocks_a_moved_head_before_merge_effect() -> TestResult {
     let recorded = admitted(gate::evaluate(&e, grants()?, GateHistory::default()))?;
     let current = forge_client(e.head.as_str(), false)?;
     assert_eq!(
-        gate::merge_request_from_forge(&recorded, &current, 0)?.match_head,
+        gate::merge_request_from_forge(&recorded, &granted(&recorded)?, &current, 0)?.match_head,
         e.head
     );
     let moved_head = commit('c')?;
     let moved = forge_client(moved_head.as_str(), false)?;
     assert_eq!(
-        gate::merge_request_from_forge(&recorded, &moved, 0),
+        gate::merge_request_from_forge(&recorded, &granted(&recorded)?, &moved, 0),
         Err(kitchen::integrations::github::IntegrationError::StaleDecision)
     );
     // A PR retargeted away from the judged base branch is stale as well.
@@ -996,7 +1055,12 @@ fn forge_reread_blocks_a_moved_head_before_merge_effect() -> TestResult {
         GateHistory::default(),
     ))?;
     assert_eq!(
-        gate::merge_request_from_forge(&retargeted, &forge_client(e.head.as_str(), false)?, 0),
+        gate::merge_request_from_forge(
+            &retargeted,
+            &granted(&retargeted)?,
+            &forge_client(e.head.as_str(), false)?,
+            0
+        ),
         Err(kitchen::integrations::github::IntegrationError::StaleDecision)
     );
     Ok(())
@@ -1085,7 +1149,7 @@ fn run_caps_evaluations_and_confirmed_merges() -> TestResult {
             .is_none()
     );
     let recorded = admitted(gate::evaluate(&e, grants()?, GateHistory::default()))?;
-    let request = gate::merge_request(&recorded, &e.head, &e.base, 0)?;
+    let request = gate::merge_request(&recorded, &granted(&recorded)?, &e.head, &e.base, 0)?;
     for number in 9..=11 {
         let mut distinct = request.clone();
         distinct.number = IssueNumber::new(number)?;
@@ -1155,7 +1219,7 @@ fn quota_failure_on_an_older_head_is_stale_not_current() -> TestResult {
 fn merge_readback_requires_closed_merged_and_commit() -> TestResult {
     let e = ready()?;
     let recorded = admitted(gate::evaluate(&e, grants()?, GateHistory::default()))?;
-    let request = gate::merge_request(&recorded, &e.head, &e.base, 0)?;
+    let request = gate::merge_request(&recorded, &granted(&recorded)?, &e.head, &e.base, 0)?;
     let mut run = GateRun::new();
     let open = forge_client(e.head.as_str(), false)?;
     assert_eq!(
@@ -1481,7 +1545,7 @@ fn crash_after_intent_reconciles_instead_of_resubmitting() -> TestResult {
     let intent = store.effects[0].1.clone();
     assert_eq!(restarted.admission, Admission::Reconcile(intent.clone()));
     assert_eq!(
-        gate::merge_request(&restarted, &e.head, &e.base, 0),
+        gate::merge_request(&restarted, &granted(&restarted)?, &e.head, &e.base, 0),
         Err(RequestRefusal::EffectsDisabled)
     );
     assert_eq!(store.current[0].effect.as_ref(), Some(&intent));
@@ -1499,7 +1563,7 @@ fn refused_submission_is_reevaluated_and_superseded_within_a_bound() -> TestResu
     let first = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100))?;
     let refused = submitted(&first)?;
     assert_eq!(
-        gate::merge_request(&first, &e.head, &e.base, 0)?.key,
+        gate::merge_request(&first, &granted(&first)?, &e.head, &e.base, 0)?.key,
         refused
     );
     store.settle(&refused, GateEffectState::NotApplied);
@@ -1613,7 +1677,7 @@ fn marker_race_admits_no_effect() -> TestResult {
     assert_eq!(lost.admission, Admission::None);
     assert_eq!(lost.decision.verdict, Verdict::Skip);
     assert_eq!(
-        gate::merge_request(&lost, &e.head, &e.base, 0),
+        gate::merge_request(&lost, &granted(&lost)?, &e.head, &e.base, 0),
         Err(RequestRefusal::EffectsDisabled)
     );
     assert_eq!(store.current[0].mode, GateMode::ReportOnly);
@@ -1626,6 +1690,7 @@ fn marker_race_admits_no_effect() -> TestResult {
 struct Durable {
     fixture: common::Fixture,
     grants: HouseGrants,
+    merge: MergeGrant,
     delegated: Vec<Grant>,
     backend: BackendDescriptor,
     workers: FakeBackend,
@@ -1669,6 +1734,7 @@ fn durable_selecting(delegate_push: bool, agent: Option<ResolvedSelection>) -> T
     Ok(Durable {
         fixture,
         grants,
+        merge: merge_grant(&common::house()?, &ready_subject()?)?,
         delegated,
         backend: BackendDescriptor {
             backend,
@@ -1845,6 +1911,7 @@ impl Durable {
             fence: self.fence,
             claimant: common::scheduled("gate-9")?,
             grants: &self.grants,
+            merge: &self.merge,
             backend: &self.backend,
             requester: ExternalRef::new("kitchen-gate")?,
             posting_budget: PostingBudget::new(10)?,
@@ -1946,7 +2013,8 @@ fn durable_merge_intent_precedes_its_marker_and_survives_restart() -> TestResult
         effects[0].request().effect(),
         &Effect::GitHub(GitHubEffect {
             requester: ExternalRef::new("kitchen-gate")?,
-            mutation: gate::merge_request(&first, &e.head, &e.base, 0)?.mutation(),
+            mutation: gate::merge_request(&first, &granted(&first)?, &e.head, &e.base, 0)?
+                .mutation(),
             posting_budget: PostingBudget::new(10)?,
         })
     );
@@ -1970,7 +2038,7 @@ fn durable_merge_intent_precedes_its_marker_and_survives_restart() -> TestResult
     )?;
     assert_eq!(again.admission, Admission::Reconcile(key.clone()));
     assert_eq!(
-        gate::merge_request(&again, &e.head, &e.base, 0),
+        gate::merge_request(&again, &granted(&again)?, &e.head, &e.base, 0),
         Err(RequestRefusal::EffectsDisabled)
     );
     assert_eq!(d.effects()?.len(), 1);
@@ -2897,7 +2965,7 @@ fn base_tip_comes_from_the_branch_ref_not_the_pr_object() -> TestResult {
     reread.transport().responses.borrow_mut()[1] =
         json!({"name":"main","commit":{"sha":moved_base.as_str()}});
     assert_eq!(
-        gate::merge_request_from_forge(&recorded, &reread, 0),
+        gate::merge_request_from_forge(&recorded, &granted(&recorded)?, &reread, 0),
         Err(kitchen::integrations::github::IntegrationError::StaleDecision)
     );
     // A ref read for another branch, or an unreadable ref, is not a base.
@@ -2905,13 +2973,13 @@ fn base_tip_comes_from_the_branch_ref_not_the_pr_object() -> TestResult {
     renamed.transport().responses.borrow_mut()[1] =
         json!({"name":"release","commit":{"sha":e.base.as_str()}});
     assert_eq!(
-        gate::merge_request_from_forge(&recorded, &renamed, 0),
+        gate::merge_request_from_forge(&recorded, &granted(&recorded)?, &renamed, 0),
         Err(kitchen::integrations::github::IntegrationError::Unknown)
     );
     let unreadable = forge_client(e.head.as_str(), false)?;
     unreadable.transport().responses.borrow_mut().truncate(1);
     assert_eq!(
-        gate::merge_request_from_forge(&recorded, &unreadable, 0),
+        gate::merge_request_from_forge(&recorded, &granted(&recorded)?, &unreadable, 0),
         Err(kitchen::integrations::github::IntegrationError::Unavailable)
     );
     Ok(())
@@ -3179,5 +3247,214 @@ fn durable_fix_launch_is_refused_when_the_executor_cannot_honor_the_selection() 
     assert!(error.contains("agent.select"), "{error}");
     assert!(d.effects()?.is_empty(), "nothing is reserved on refusal");
     assert_eq!(d.workers.effects_performed(), 0);
+    Ok(())
+}
+
+/// A synthetic assessment of `lemarier/kitchen` whose firmware work type
+/// reaches `covered`. It is not live forge evidence.
+fn covered_readiness(house: &HouseId) -> TestResult<kitchen::house::RepositoryReadiness> {
+    use kitchen::house::{Assessed, ReadinessLevel, RepositoryReadiness};
+    let checks: std::collections::BTreeSet<String> = ["build".into(), "bench".into()].into();
+    Ok(RepositoryReadiness {
+        house: house.clone(),
+        repository: Repository::new("lemarier/kitchen")?,
+        required_checks: Assessed::Known(checks),
+        check_history: std::collections::BTreeMap::new(),
+        instruction_files: Assessed::Known(["AGENTS.md".into()].into()),
+        acceptance_checks: [(
+            Text::new("firmware")?,
+            Assessed::Known(["bench".into()].into()),
+        )]
+        .into(),
+        level: ReadinessLevel::Reliable,
+        gaps: Vec::new(),
+    })
+}
+#[test]
+fn readiness_policy_gates_the_merge_verdict() -> TestResult {
+    use kitchen::house::{HouseError, ReadinessLevel};
+    let e = ready()?;
+    let subject = ready_subject()?;
+    let github = BackendId::new("github")?;
+    let house = merge_house(&e.house, &[("firmware", ReadinessLevel::Covered)])?;
+    // Below policy: no assessment counts as unready, and no grant resolves.
+    let below = house.issue_authority(&[], &[])?;
+    assert!(matches!(
+        MergeGrant::resolve(&below, &subject, &github),
+        Err(HouseError::BelowReadiness {
+            required: ReadinessLevel::Covered,
+            assessed: ReadinessLevel::Unready,
+        })
+    ));
+    let refused = GateGrants {
+        merge: MergeGrant::none(),
+        ..grants()?
+    };
+    assert_eq!(
+        gate::evaluate(&e, refused, GateHistory::default()).verdict,
+        Verdict::HandOver {
+            gaps: vec![Gap::MergeGrant]
+        }
+    );
+    // At the required level the same house merges exactly this subject.
+    let at_level = house.issue_authority(&[covered_readiness(&e.house)?], &[])?;
+    let granted = GateGrants {
+        merge: MergeGrant::resolve(&at_level, &subject, &github)?,
+        ..grants()?
+    };
+    assert_eq!(
+        gate::evaluate(&e, granted.clone(), GateHistory::default()).verdict,
+        Verdict::Merge
+    );
+    let mut moved = e.clone();
+    moved.head = commit('c')?;
+    moved.semantic_head = Some(moved.head.clone());
+    moved.supporting_subject = Some((moved.head.clone(), moved.base.clone()));
+    moved.reviewers[0].reviewed_head = Some(moved.head.clone());
+    assert_eq!(
+        gate::evaluate(&moved, granted, GateHistory::default()).verdict,
+        Verdict::HandOver {
+            gaps: vec![Gap::MergeGrant]
+        }
+    );
+    // Without a standing merge grant, readiness alone grants nothing.
+    let mut ungranted = house.clone();
+    ungranted.grants.clear();
+    let plain = ungranted.issue_authority(&[covered_readiness(&e.house)?], &[])?;
+    assert_eq!(
+        MergeGrant::resolve(&plain, &subject, &github)?,
+        MergeGrant::none()
+    );
+    Ok(())
+}
+#[test]
+fn owner_approval_persisted_in_the_house_store_lets_a_below_level_merge_through() -> TestResult {
+    use kitchen::house::{BelowReadinessRequest, ReadinessLevel};
+    let house = common::house()?;
+    let subject = ready_subject()?;
+    let config = merge_house(&house, &[("firmware", ReadinessLevel::Covered)])?;
+    let mut checked = covered_readiness(&house)?;
+    checked.level = ReadinessLevel::Checked;
+    let request = BelowReadinessRequest {
+        work_type: Text::new("firmware")?,
+        subject: subject.clone(),
+        reason: Text::new("Bench runs weekly by hand")?,
+    };
+    let fixture = common::Fixture::new()?;
+    let (task, fence, revision, grants) = common::asking_task(
+        &fixture,
+        "gate-ask",
+        &subject.repository,
+        &subject.head,
+        &subject.base,
+    )?;
+    let ask = kitchen::house::below_readiness_ask(&config, &checked, &request, &task, revision)?;
+    common::persist_ask(&fixture, &task, fence, &grants, ask.clone())?;
+    let (roger, _) =
+        common::roger_client(&subject.repository, Ok(common::roger_answer(&ask, true)?))?;
+    let decision = kitchen::house::accept_below_readiness(
+        &config,
+        &checked,
+        &request,
+        &fixture.store,
+        &task,
+        &roger,
+    )?;
+    let issued = config.issue_authority(
+        std::slice::from_ref(&checked),
+        std::slice::from_ref(&decision),
+    )?;
+    let merge = MergeGrant::resolve(&issued, &subject, &BackendId::new("github")?)?;
+    assert_eq!(
+        gate::evaluate(
+            &durable_evidence()?,
+            GateGrants {
+                merge,
+                ..dgrants()?
+            },
+            GateHistory::default()
+        )
+        .verdict,
+        Verdict::Merge
+    );
+    assert_eq!(
+        issued.merge_clearance(&subject)?[0].reason().as_str(),
+        "Bench runs weekly by hand"
+    );
+    Ok(())
+}
+#[test]
+fn durable_store_refuses_a_merge_effect_without_the_readiness_checked_grant() -> TestResult {
+    let mut d = durable()?;
+    let e = durable_evidence()?;
+    // The verdict was reached with a grant, but the store holds none for
+    // this subject: nothing is persisted.
+    d.merge = MergeGrant::none();
+    let refused = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &e,
+        dgrants()?,
+        GateMode::Active,
+        secs(100),
+    );
+    assert!(matches!(refused, Err(GateStoreError::MergeNotGranted)));
+    assert!(d.effects()?.is_empty());
+    assert!(d.marker('a')?.is_none());
+    // A grant for another head does not cover this one either.
+    let mut other = ready_subject()?;
+    other.head = commit('c')?;
+    d.merge = merge_grant(&common::house()?, &other)?;
+    assert!(matches!(
+        gate::evaluate_and_record(
+            &mut d.gate(&d.fixture.store)?,
+            &e,
+            dgrants()?,
+            GateMode::Active,
+            secs(100),
+        ),
+        Err(GateStoreError::MergeNotGranted)
+    ));
+    assert!(d.effects()?.is_empty());
+    // With the grant for this subject the merge intent is persisted.
+    d.merge = merge_grant(&common::house()?, &ready_subject()?)?;
+    let admitted = gate::evaluate_and_record(
+        &mut d.gate(&d.fixture.store)?,
+        &e,
+        dgrants()?,
+        GateMode::Active,
+        secs(100),
+    )?;
+    assert!(matches!(admitted.admission, Admission::Submit(_)));
+    assert_eq!(d.effects()?.len(), 1);
+    Ok(())
+}
+#[test]
+fn merge_request_needs_the_grant_for_its_exact_subject() -> TestResult {
+    let e = ready()?;
+    let recorded = admitted(gate::evaluate(&e, grants()?, GateHistory::default()))?;
+    assert_eq!(recorded.decision.verdict, Verdict::Merge);
+    let mut other = ready_subject()?;
+    other.number = IssueNumber::new(10)?;
+    for merge in [MergeGrant::none(), merge_grant(&e.house, &other)?] {
+        assert_eq!(
+            gate::merge_request(&recorded, &merge, &e.head, &e.base, 0),
+            Err(RequestRefusal::NoMergeGrant)
+        );
+        // Refused before the forge is read.
+        assert_eq!(
+            gate::merge_request_from_forge(
+                &recorded,
+                &merge,
+                &forge_client(e.head.as_str(), false)?,
+                0
+            )
+            .err(),
+            Some(kitchen::integrations::github::IntegrationError::ScopeMismatch)
+        );
+    }
+    assert_eq!(
+        gate::merge_request(&recorded, &granted(&recorded)?, &e.head, &e.base, 0)?.match_head,
+        e.head
+    );
     Ok(())
 }

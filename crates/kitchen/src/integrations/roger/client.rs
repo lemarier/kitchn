@@ -39,6 +39,11 @@ impl<T: RogerReadTransport> RogerClient<T> {
             limits,
         }
     }
+    /// The house boundary every read is checked against.
+    #[must_use]
+    pub const fn scope(&self) -> &HouseScope {
+        &self.scope
+    }
     /// Poll after restart using the persisted receipt and original binding.
     ///
     /// # Errors

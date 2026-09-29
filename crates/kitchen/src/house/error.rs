@@ -63,6 +63,33 @@ pub enum HouseError {
     /// A bounded Git read failed; nothing was decided from it.
     #[error("git could not be read: {0}")]
     Git(crate::git::GitReadError),
+    /// A merge grant was attempted below the house's required readiness.
+    #[error(
+        "repository readiness {} is below the required {}; an owner must approve this merge with a reason to proceed",
+        assessed.as_str(),
+        required.as_str()
+    )]
+    BelowReadiness {
+        /// Level house policy requires.
+        required: super::ReadinessLevel,
+        /// Assessed level.
+        assessed: super::ReadinessLevel,
+    },
+    /// A below-readiness request does not match house policy and the
+    /// assessment: the work type is not below its required level, the
+    /// reason is blank, or the Ask would be invalid.
+    #[error("readiness request is not below this house's policy, or has no reason")]
+    ReadinessDecision,
+    /// No owner approval of this below-readiness merge was persisted, or
+    /// the Roger answer does not approve it.
+    #[error("no persisted owner approval covers this below-readiness merge")]
+    ReadinessNotApproved,
+    /// The task holding a readiness decision could not be read.
+    #[error("the persisted readiness decision could not be read")]
+    DecisionRecord,
+    /// A configured merge grant cannot become authority without a readiness check.
+    #[error("merge grants are issued through the readiness check, not plain authority")]
+    MergeNeedsReadiness,
     /// Bounded filesystem I/O failed.
     #[error("house storage operation failed ({0:?})")]
     Io(std::io::ErrorKind),
@@ -81,13 +108,18 @@ impl HouseError {
             | Self::PinMismatch
             | Self::RepositoryUnidentified
             | Self::AmbiguousHouse { .. }
-            | Self::RemotesDisagree { .. } => ErrorClass::Refused,
+            | Self::RemotesDisagree { .. }
+            | Self::BelowReadiness { .. }
+            | Self::ReadinessDecision
+            | Self::ReadinessNotApproved
+            | Self::MergeNeedsReadiness => ErrorClass::Refused,
             Self::Conflict | Self::Conflicts(_) | Self::LegacyChanged | Self::Busy => {
                 ErrorClass::Conflict
             }
             Self::UnverifiedSnapshot
             | Self::PartialInstallation { .. }
             | Self::Git(_)
+            | Self::DecisionRecord
             | Self::Io(_) => ErrorClass::Execution,
         }
     }

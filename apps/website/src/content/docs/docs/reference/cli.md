@@ -68,13 +68,18 @@ kitchn house import --registry <dir> [--repository-path <dir>] --yes --digest <s
 
 ## `kitchn house doctor`
 
-Diagnose pins, scoped access, labels and backend capabilities.
+Diagnose pins, scoped access, labels and backend capabilities, and report
+merge readiness: required checks, their recent pass, fail and flaky history,
+repository instructions, and work types without an acceptance check. Facts
+missing from the evidence are reported as unknown, never as passing. When branch protection binds a check to a GitHub App
+(`requiredCheckApps`), only that app's runs count toward the check's history.
 
 ```sh
 kitchn house doctor --registry <dir> [--repository-path <dir>] [--evidence <file>] [--json]
 ```
 
-Exits 0 when configuration is complete and 1 when findings remain.
+Exits 0 when configuration is complete and 1 when findings remain. Readiness
+gaps become findings only for work types whose `mergeReadiness` level is not met.
 
 ## `kitchn init` and `kitchn adopt`
 

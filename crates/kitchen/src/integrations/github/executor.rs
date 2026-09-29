@@ -1,6 +1,6 @@
 //! Forge executor for the core persisted-intent path.
 use super::{
-    GitHubMutation, HouseScope, IntegrationError, ReadLimits,
+    GitHubAction, GitHubMutation, HouseScope, IntegrationError, ReadLimits,
     provider::{GitHubMutationTransport, Inspection, Provider},
 };
 use crate::{
@@ -10,16 +10,20 @@ use crate::{
         EffectFailure, EffectRequest, GitHubEffect, Lookup, NotAppliedReason, Receipt,
         UncertainReason,
     },
+    workflows::gate::MergeGrant,
 };
 
 /// GitHub effects execute only after core has persisted their intent.
 /// GitHub has no native idempotency key: this executor deliberately does not
 /// declare idempotent submissions. Uncertain outcomes are reconciled, never retried.
+/// A merge is admitted and executed only at a subject one of its
+/// readiness-checked [`MergeGrant`]s covers; see [`Self::with_merge_grant`].
 pub struct GitHubExecutor<T> {
     descriptor: BackendDescriptor,
     scope: HouseScope,
     transport: T,
     limits: ReadLimits,
+    merges: Vec<MergeGrant>,
 }
 impl<T: GitHubMutationTransport> GitHubExecutor<T> {
     /// Bind a namespace, house policy, and credential-aware provider boundary.
@@ -37,12 +41,22 @@ impl<T: GitHubMutationTransport> GitHubExecutor<T> {
             scope,
             transport,
             limits,
+            merges: Vec::new(),
         }
+    }
+    /// Admit merges of exactly the pull request, head, and base `grant`
+    /// covers. Without a covering grant, every merge is refused before any
+    /// provider call, whatever the house scope permits.
+    #[must_use]
+    pub fn with_merge_grant(mut self, grant: MergeGrant) -> Self {
+        self.merges.push(grant);
+        self
     }
     /// Build the exact effect to put in a core `EffectPlan`.
     ///
     /// # Errors
-    /// Refuses invalid input, destinations, missing permissions and disabled budgets.
+    /// Refuses invalid input, destinations, missing permissions, a merge no
+    /// readiness-checked grant covers, and disabled budgets.
     pub fn effect(&self, mutation: GitHubMutation) -> Result<GitHubEffect, IntegrationError> {
         let effect = GitHubEffect {
             requester: self.scope.requester().clone(),
@@ -69,7 +83,32 @@ impl<T: GitHubMutationTransport> GitHubExecutor<T> {
             &effect.mutation.repository,
             effect.required_permission(),
             0,
-        )
+        )?;
+        if let GitHubAction::MergePullRequest {
+            number,
+            expected_head,
+            expected_base_commit,
+            ..
+        } = &effect.mutation.action
+        {
+            // A merge grant always names a base commit, so a baseless merge
+            // is never covered.
+            let granted = expected_base_commit.as_ref().is_some_and(|base| {
+                self.merges.iter().any(|grant| {
+                    grant.covers(
+                        self.scope.house(),
+                        &effect.mutation.repository,
+                        *number,
+                        expected_head,
+                        base,
+                    )
+                })
+            });
+            if !granted {
+                return Err(IntegrationError::PermissionDenied);
+            }
+        }
+        Ok(())
     }
     fn payload<'a>(
         &self,
@@ -155,7 +194,7 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
             Ok(Inspection::Conflict)
                 if matches!(
                     effect.mutation.action,
-                    super::GitHubAction::MergePullRequest { .. }
+                    GitHubAction::MergePullRequest { .. }
                 ) =>
             {
                 Ok(Lookup::Absent)

@@ -24,6 +24,7 @@ The policy is a reviewed JSON document registered with `kitchn house init`.
 | `requiredChecks` | Checks every change needs. |
 | `grants` | Standing, repository-scoped grants with explicit backend and credential identifiers. |
 | `policyLimits` | Limits kept separate from grants. |
+| `mergeReadiness` | Optional. The readiness level (`checked`, `reliable` or `covered`) each work type must reach before the merge gate may merge in a repository with a merge grant. Readiness never grants merge authority. Below the level, a merge needs an owner's Roger approval for that exact pull request, head and base; Kitchen persists the Ask, with the work type, levels and reason, before it is sent. Unobserved readiness counts as `unready`. |
 
 Permission given during an interactive session is never promoted into a
 standing grant.

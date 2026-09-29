@@ -62,6 +62,7 @@ fn house_config() -> TestResult<HouseConfig> {
         agents: None,
         stack_tool: None,
         schedules: None,
+        merge_readiness: std::collections::BTreeMap::new(),
     })
 }
 

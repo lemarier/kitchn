@@ -65,6 +65,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #13 end-to-end validation and operations | — | End-to-end harness in `crates/kitchen/tests/e2e_*`; operational docs in `docs/` |
 | #16 house repository templates and scaffold/adopt flow | `scaffold/` | Template assets in root `templates/`; template rendering and repository scaffolding through #5's installer |
 | #42 agent selection | `selection/` | House `agents` policy, the selection recorded on a task, and its launch check; backends map it to their own flags |
+| #48 repository readiness | `house/readiness.rs`; readiness findings in `house/doctor.rs` | Readiness tests in `crates/kitchen/tests/house_readiness.rs`; check history comes from #7 and #9, grants from #12 |
 | #41 event-started workflows | `events/`; the event trigger in `contracts/trigger.rs` | Event intake tests; webhook delivery stays with #6 and #7 |
 | #43 verification environments | `contracts/verification.rs` | Verification target, policy, evidence, and access tests in `crates/kitchen/tests/verification.rs` |
 | #40 schedule intervals and usage budgets | `scheduling/budget.rs` | The house `schedules` policy field and schedule doctor findings in `house/`; install refusal in the Orca schedule adapter; `tests/schedule_budgets.rs` |

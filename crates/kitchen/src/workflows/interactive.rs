@@ -1105,6 +1105,9 @@ pub fn pull_request(request: &PrRequest<'_>) -> Result<(PrPlan, Option<Lease>)> 
     }
     let task = repair_task_id(request.repository, facts.view.number, round)?;
     let template = request.template;
+    // Repair and follow-up rounds share the scheduled repair's task ids, so
+    // they record the same work type.
+    let work_type = crate::selection::WorkType::fix();
     let spec = TaskSpec {
         id: task.clone(),
         role: crate::contracts::Role::StationCook,
@@ -1117,9 +1120,10 @@ pub fn pull_request(request: &PrRequest<'_>) -> Result<(PrPlan, Option<Lease>)> 
         agent: crate::workflows::pickup::resolve_agent(
             template.agents.as_ref(),
             crate::contracts::Role::StationCook,
+            &work_type,
             request.repository,
         ),
-        work_type: None,
+        work_type: Some(work_type),
     };
     let lease = match claim_task(
         request.store,

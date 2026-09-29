@@ -52,9 +52,13 @@ pub enum EvidenceMode {
     Live,
 }
 
-/// Scope of a station's evidence and autonomy. A task's scope is derived
-/// from its stored specification with [`StationScope::of_task`]; callers do
-/// not declare it.
+/// Scope of a station's evidence and autonomy.
+///
+/// A task binding's scope is always derived from the stored task with
+/// [`StationScope::of_task`]; [`crate::trust::Ledger::bind_task`] takes no
+/// scope. An [`AutonomyProposal`] names the scope the caller wants standing
+/// for; the ledger accepts it only when every piece of presented evidence
+/// was recorded under that same scope and matches its task binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StationScope {
@@ -353,7 +357,8 @@ pub struct AutonomyProposal {
     pub id: ExternalRef,
     /// Owning house.
     pub house: HouseId,
-    /// Station, project, and work category.
+    /// Station, project, and work category, chosen by the proposer. Every
+    /// presented evidence item must have been recorded under this scope.
     pub scope: StationScope,
     /// Proposed exact core grant.
     pub claim: Grant,

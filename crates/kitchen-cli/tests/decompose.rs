@@ -226,6 +226,7 @@ fn held_store(root: &std::path::Path, applied: bool) -> TestResult<String> {
         resources: std::collections::BTreeSet::new(),
         requires: kitchen::contracts::CapabilityRequirements::new(),
         agent: None,
+        work_type: None,
     };
     let at = |seconds: u64| Timestamp::from_unix_millis(seconds * 1000);
     let person = HolderId::new("operator")?;

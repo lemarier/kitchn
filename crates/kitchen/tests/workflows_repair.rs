@@ -14,7 +14,9 @@ use kitchen::{
         ExternalRef, IssueNumber, ResourceKind, ResourceRef, RetryPolicy, Settlement, Workspace,
     },
     integrations::github::PullRequest,
+    selection::{AgentModel, WorkType},
     state::StateError,
+    trust::{StationScope, TrustError},
     workflows::{
         coordination::{LaunchOutcome, launch_worker},
         repair::{
@@ -538,6 +540,7 @@ fn a_repair_task_carries_the_selection_the_house_policy_resolves() -> TestResult
     assert_eq!(
         spec.agent,
         Some(policy.resolve(&kitchen::selection::SelectionRequest {
+            work_type: Some(WorkType::new("fix")?),
             repository: Some(repo()?),
             ..kitchen::selection::SelectionRequest::new(kitchen::contracts::Role::StationCook)
         }))
@@ -589,5 +592,55 @@ fn repair_takes_its_round_budget_from_the_house() -> TestResult {
         assess(&none, &fresh),
         RepairDecision::HandOver(HandOver::BudgetExhausted)
     );
+    Ok(())
+}
+
+#[test]
+fn a_repair_task_records_the_fix_work_type_and_binds_for_trust() -> TestResult {
+    let world = World::new()?;
+    let worktree = ResourceRef {
+        kind: ResourceKind::Worktree,
+        backend: common::backend_id()?,
+        handle: ExternalRef::new("worktree-issue-5")?,
+    };
+    let id = repair_task_id(&repo()?, number(5)?, 1)?;
+    let spec = repair_spec(
+        id.clone(),
+        repo()?,
+        worktree,
+        template()?.authority,
+        RetryPolicy::new(1, Duration::from_secs(3600))?,
+        provenance('a')?,
+        Some(&workflows_support::work_type_policy()?),
+    );
+    world
+        .fixture
+        .store
+        .create_task(spec, &scheduled("repair-tick")?, world.now())?;
+    let stored = world.fixture.store.task(&id)?;
+    let spec = stored.spec();
+    let fix = WorkType::new("fix")?;
+    assert_eq!(spec.work_type.as_ref(), Some(&fix));
+    // Only the fix rule names this model, so the selection was resolved for
+    // the same work type the task records.
+    assert_eq!(
+        spec.agent
+            .as_ref()
+            .and_then(|resolved| resolved.selection.model.as_ref()),
+        Some(&AgentModel::new("sonnet")?)
+    );
+    assert!(matches!(
+        workflows_support::bind_for_trust(&world.fixture, spec)?,
+        Ok(true)
+    ));
+    assert_eq!(StationScope::of_task(spec)?.work_type, fix);
+    // A spec stored before work types were recorded stays refused.
+    let mut legacy = spec.clone();
+    legacy.work_type = None;
+    let other = World::new()?;
+    assert!(matches!(
+        workflows_support::bind_for_trust(&other.fixture, &legacy)?,
+        Err(TrustError::Refused)
+    ));
     Ok(())
 }

@@ -17,7 +17,7 @@ use crate::{
         Provenance, Repository, RetryPolicy, Role, Settlement, TaskAuthority, TaskSpec, Text,
         Timestamp, Trigger,
     },
-    selection::{AgentPolicy, ResolvedSelection, SelectionRequest},
+    selection::{AgentPolicy, ResolvedSelection, SelectionRequest, WorkType},
     state::{HouseStore, Lease, OwnershipEvent, StateError, TaskRecord, TaskState},
     workflows::{coordination::CoordinationError, recovery::QueuedFollowUp},
 };
@@ -520,18 +520,22 @@ pub struct TaskTemplate {
     pub agents: Option<AgentPolicy>,
 }
 
-/// The selection `agents` resolves for `role` in `repository`, or `None` for
-/// a house without an agent policy. Every path that creates a task spec
-/// resolves through this, so a pickup, a scheduled repair and an interactive
-/// repair round pick the same agent for the same house.
+/// The selection `agents` resolves for `role` and `work_type` in
+/// `repository`, or `None` for a house without an agent policy. Every path
+/// that creates a task spec resolves through this, so a pickup, a scheduled
+/// repair and an interactive repair round pick the same agent for the same
+/// house. The caller records the same `work_type` on the task, which is what
+/// trust derives the task's scope from.
 #[must_use]
 pub fn resolve_agent(
     agents: Option<&AgentPolicy>,
     role: Role,
+    work_type: &WorkType,
     repository: &Repository,
 ) -> Option<ResolvedSelection> {
     agents.map(|policy| {
         policy.resolve(&SelectionRequest {
+            work_type: Some(work_type.clone()),
             repository: Some(repository.clone()),
             ..SelectionRequest::new(role)
         })
@@ -539,14 +543,16 @@ pub fn resolve_agent(
 }
 
 impl TaskTemplate {
-    /// The task spec for `issue`, carrying the selection the house policy
-    /// resolves for the task's role and repository.
+    /// The task spec for `issue`, recording the
+    /// [`WorkType::implementation`] work type and the selection the house
+    /// policy resolves for it, the task's role, and its repository.
     ///
     /// # Errors
     /// Propagates task-id derivation failures.
     pub fn spec_for(&self, issue: &IssueRef) -> Result<TaskSpec> {
         let role = Role::StationCook;
-        let agent = resolve_agent(self.agents.as_ref(), role, &issue.repository);
+        let work_type = WorkType::implementation();
+        let agent = resolve_agent(self.agents.as_ref(), role, &work_type, &issue.repository);
         Ok(TaskSpec {
             id: issue_task_id(issue)?,
             role,
@@ -557,7 +563,7 @@ impl TaskTemplate {
             resources: std::collections::BTreeSet::new(),
             requires: self.requires.clone(),
             agent,
-            work_type: None,
+            work_type: Some(work_type),
         })
     }
 }

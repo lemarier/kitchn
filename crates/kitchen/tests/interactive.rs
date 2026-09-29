@@ -24,6 +24,7 @@ use kitchen::{
         Trigger, UncertainReason,
     },
     house::{HouseConfig, HouseError, RepositoryConfig, Workflow},
+    selection::{AgentModel, WorkType},
     state::{EffectOutcome, RiskAction, RiskDecision, TaskState},
     workflows::{
         interactive::{
@@ -873,6 +874,7 @@ fn pr_repair_round_carries_the_house_policy_agent() -> TestResult {
         return Err(format!("expected a repair round, got {plan:?}").into());
     };
     let expected = policy.resolve(&kitchen::selection::SelectionRequest {
+        work_type: Some(WorkType::new("fix")?),
         repository: Some(repo()?),
         ..kitchen::selection::SelectionRequest::new(kitchen::contracts::Role::StationCook)
     });
@@ -888,6 +890,56 @@ fn pr_repair_round_carries_the_house_policy_agent() -> TestResult {
         return Err("expected a repair round".into());
     };
     assert_eq!(bare.fixture.store.task(&bare_task)?.spec().agent, None);
+    Ok(())
+}
+
+#[test]
+fn pr_repair_and_follow_up_rounds_record_the_fix_work_type_for_trust() -> TestResult {
+    let facts = pr_facts(
+        PullRequestState::Open,
+        Mergeability::Conflicting,
+        ReviewState::Reviewed,
+    )?;
+    let mut with_policy = template()?;
+    with_policy.agents = Some(workflows_support::work_type_policy()?);
+    for intent in [PrIntent::Repair, PrIntent::FollowUp] {
+        let world = World::new()?;
+        let (plan, _) = pull_request(&PrRequest {
+            store: &world.fixture.store,
+            template: &with_policy,
+            repository: &repo()?,
+            facts: &facts,
+            intent: Some(intent),
+            follow_up: house_budget()?,
+            fix_rounds: None,
+            claimant: &interactive("person")?,
+            ttl: ttl(600)?,
+            now: world.now(),
+            take_over: false,
+        })?;
+        let task = match plan {
+            PrPlan::Repair { task, .. } | PrPlan::FollowUp { task, .. } => task,
+            other => return Err(format!("expected a writer round, got {other:?}").into()),
+        };
+        let stored = world.fixture.store.task(&task)?;
+        let spec = stored.spec();
+        let fix = WorkType::new("fix")?;
+        assert_eq!(spec.work_type.as_ref(), Some(&fix), "{intent:?}");
+        // Only the fix rule names this model: the selection was resolved for
+        // the work type the task records.
+        assert_eq!(
+            spec.agent
+                .as_ref()
+                .and_then(|resolved| resolved.selection.model.as_ref()),
+            Some(&AgentModel::new("sonnet")?),
+            "{intent:?}"
+        );
+        assert!(matches!(
+            workflows_support::bind_for_trust(&world.fixture, spec)?,
+            Ok(true)
+        ));
+        assert_eq!(kitchen::trust::StationScope::of_task(spec)?.work_type, fix);
+    }
     Ok(())
 }
 

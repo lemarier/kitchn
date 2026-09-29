@@ -197,9 +197,10 @@ pub struct TaskSpec {
     pub agent: Option<ResolvedSelection>,
     /// The house work type the task was created for, the same one its agent
     /// selection was resolved with. The trust ledger scopes the task's
-    /// evidence to it. `None` when the workflow assigns no work type, and for
-    /// tasks stored before the field existed; the trust ledger refuses to bind
-    /// such a task.
+    /// evidence to it. Pickup records `implementation`; scheduled repair and
+    /// interactive pull-request rounds record `fix`. `None` for workflows
+    /// that launch no selected agent, and for tasks stored before the field
+    /// existed; the trust ledger refuses to bind such a task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_type: Option<WorkType>,
 }

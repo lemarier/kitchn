@@ -20,7 +20,7 @@ use crate::{
     integrations::github::{
         GitHubClient, GitHubReadTransport, IssueState, MergeState, Observation, PullRequest,
     },
-    selection::AgentPolicy,
+    selection::{AgentPolicy, WorkType},
     workflows::pickup::{FollowUpBudget, derived_task_id, resolve_agent},
 };
 
@@ -425,8 +425,9 @@ pub fn repair_task_id(
 
 /// The task spec for a repair writer. The existing worktree is handed to the
 /// task, so the writer works in place and cannot target other resources. The
-/// task carries the selection `agents` resolves for the writer's role and
-/// repository; `None` only for a house without an agent policy.
+/// task records the [`WorkType::fix`] work type and carries the selection
+/// `agents` resolves for it, the writer's role, and the repository; the
+/// selection is `None` only for a house without an agent policy.
 #[must_use]
 pub fn repair_spec(
     id: TaskId,
@@ -438,7 +439,8 @@ pub fn repair_spec(
     agents: Option<&AgentPolicy>,
 ) -> TaskSpec {
     let role = Role::StationCook;
-    let agent = resolve_agent(agents, role, &repository);
+    let work_type = WorkType::fix();
+    let agent = resolve_agent(agents, role, &work_type, &repository);
     TaskSpec {
         id,
         role,
@@ -449,5 +451,6 @@ pub fn repair_spec(
         resources: BTreeSet::from([worktree]),
         requires: CapabilityRequirements::new(),
         agent,
+        work_type: Some(work_type),
     }
 }

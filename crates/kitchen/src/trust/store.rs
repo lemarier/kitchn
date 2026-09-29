@@ -2,7 +2,7 @@
 //! Private records never belong in Git.
 use crate::{
     HouseId,
-    contracts::{ExternalRef, Grant, GrantScope, HouseGrants, Permission, Role, TaskSpec},
+    contracts::{ExternalRef, Grant, GrantScope, HouseGrants, Permission, TaskSpec},
     state::{
         HouseStore, StateError, StoreOptions, TaskState,
         snapshot::{Snapshot, SnapshotStore, StoreLayout},
@@ -58,8 +58,10 @@ const LAYOUT: StoreLayout = StoreLayout {
 };
 // Older stores are refused as unsupported before decoding; there is no
 // migration. Version 2 added the inspector task and fence to inspections;
-// version 3 requires every binding's model to come from its agent selection.
-const SCHEMA: u64 = 3;
+// version 3 requires every binding's model to come from its agent selection;
+// version 4 derives every scope's station from the task role and its work type
+// from the task's recorded work type.
+const SCHEMA: u64 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -111,8 +113,7 @@ impl Document {
         let mut bindings = HashMap::with_capacity(self.bindings.len());
         for binding in &self.bindings {
             if binding.spec.authority.house() != house
-                || binding.spec.repository.as_ref() != Some(&binding.scope.project)
-                || !role_matches_station(binding.spec.role, &binding.scope)
+                || StationScope::of_task(&binding.spec).ok().as_ref() != Some(&binding.scope)
                 || selected_model(&binding.spec).as_ref() != Some(&binding.model)
                 || bindings.insert(&binding.spec.id, binding).is_some()
             {
@@ -290,30 +291,27 @@ impl Ledger {
         self.engine.house()
     }
 
-    /// Bind a prospective task to one station and work type. The model trust
-    /// compares against observations is derived from the task's resolved
-    /// agent selection ([`AgentSelection::attribution_model`]); the station
-    /// and work type are still declared by the caller. Bind before delegating
-    /// earned standing grants, then create the task. Repeating the same
-    /// binding is idempotent; it cannot be edited.
+    /// Bind a prospective task to its station scope and model, both derived
+    /// from the task: the scope with [`StationScope::of_task`] and the model
+    /// from its resolved agent selection
+    /// ([`AgentSelection::attribution_model`]). Bind before delegating earned
+    /// standing grants, then create the task. Repeating the same binding is
+    /// idempotent; it cannot be edited.
     ///
     /// [`AgentSelection::attribution_model`]: crate::selection::AgentSelection::attribution_model
     ///
     /// # Errors
-    /// Rejects cross-house, project, role, or identity mismatches, and a task
-    /// without a resolved agent selection.
+    /// Rejects a cross-house task, an identity conflict, house-level work, and
+    /// a task without a recorded work type or resolved agent selection.
     pub fn bind_task(
         &self,
         spec: &TaskSpec,
-        scope: StationScope,
         source: crate::contracts::ExternalRef,
     ) -> Result<bool, TrustError> {
-        if spec.authority.house() != self.house()
-            || spec.repository.as_ref() != Some(&scope.project)
-            || !role_matches_station(spec.role, &scope)
-        {
+        if spec.authority.house() != self.house() {
             return Err(TrustError::Refused);
         }
+        let scope = StationScope::of_task(spec)?;
         let model = selected_model(spec).ok_or(TrustError::Refused)?;
         let binding = TaskBinding {
             spec: spec.clone(),
@@ -338,9 +336,10 @@ impl Ledger {
     /// revisions are retained, but the projection stays incomplete until gaps close.
     ///
     /// The task must be settled and the observation must equal its stored
-    /// facts. When core holds evidence for the task, PR evidence must describe
-    /// that exact head and base; where core holds none, the adapter's PR
-    /// evidence is the only source. A core item that is not a pass keeps the
+    /// facts, including the station scope derived from it. When core holds
+    /// evidence for the task, PR evidence must describe that exact head and
+    /// base; where core holds none, the adapter's PR evidence is the only
+    /// source. A core item that is not a pass keeps the
     /// record out of trust (see [`Observation::trust_eligible`]).
     ///
     /// # Errors
@@ -354,7 +353,8 @@ impl Ledger {
         }
         let task = store.task(&observation.task).map_err(store_error)?;
         if !matches!(task.state(), TaskState::Settled { .. })
-            || task.spec().repository.as_ref() != Some(&observation.attribution.scope.project)
+            || StationScope::of_task(task.spec()).ok().as_ref()
+                != Some(&observation.attribution.scope)
             || task.spec().provenance != observation.instructions
             || task.spec().role != observation.role
             || task.state() != &observation.state
@@ -727,15 +727,6 @@ fn selected_model(spec: &TaskSpec) -> Option<crate::contracts::Text> {
     spec.agent
         .as_ref()
         .and_then(|agent| agent.selection.attribution_model().ok())
-}
-/// A station named after a role binds only tasks of that role. Any other
-/// station name is a house-defined domain that accepts every role; earned
-/// standing still requires the acting task's role to equal the evidence task's.
-fn role_matches_station(role: Role, scope: &StationScope) -> bool {
-    !Role::ALL
-        .iter()
-        .any(|candidate| candidate.as_str() == scope.station.as_str())
-        || role.as_str() == scope.station.as_str()
 }
 fn validate_grant(grant: &AutonomyGrant) -> Result<(), TrustError> {
     validate_claim(&grant.claim, &grant.scope, &grant.evidence)?;

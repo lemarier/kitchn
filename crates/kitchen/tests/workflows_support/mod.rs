@@ -385,3 +385,45 @@ pub fn agent_policy() -> TestResult<kitchen::selection::AgentPolicy> {
         }],
     })
 }
+
+/// A house policy that picks the agent by work type alone, so a task's
+/// recorded selection shows which work type it was resolved for.
+pub fn work_type_policy() -> TestResult<kitchen::selection::AgentPolicy> {
+    use kitchen::{
+        scheduling::AgentFamily,
+        selection::{AgentModel, AgentPolicy, AgentSelection, RuleMatch, SelectionRule, WorkType},
+    };
+    let rule = |work_type: &str, agent: AgentFamily, model: &str| -> TestResult<SelectionRule> {
+        Ok(SelectionRule {
+            when: RuleMatch {
+                work_type: Some(WorkType::new(work_type)?),
+                ..RuleMatch::default()
+            },
+            selection: AgentSelection {
+                agent,
+                model: Some(AgentModel::new(model)?),
+                effort: None,
+            },
+        })
+    };
+    Ok(AgentPolicy {
+        default: AgentSelection::agent_default(AgentFamily::Claude),
+        rules: vec![
+            rule("implementation", AgentFamily::Codex, "gpt-6-sol")?,
+            rule("fix", AgentFamily::Claude, "sonnet")?,
+        ],
+    })
+}
+
+/// Bind `spec` in a fresh trust ledger for its house, as the trust adapter
+/// does for a created task.
+pub fn bind_for_trust(
+    fixture: &Fixture,
+    spec: &kitchen::contracts::TaskSpec,
+) -> TestResult<Result<bool, kitchen::trust::TrustError>> {
+    let ledger = kitchen::trust::Ledger::initialize(
+        fixture.dir.path().join("trust"),
+        spec.authority.house().clone(),
+    )?;
+    Ok(ledger.bind_task(spec, ExternalRef::new("fixture:task-binding")?))
+}

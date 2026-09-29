@@ -61,6 +61,7 @@ fn task_spec(id: &str, grants: &HouseGrants) -> TestResult<TaskSpec> {
         resources: BTreeSet::new(),
         requires: requirements(),
         agent: None,
+        work_type: None,
     })
 }
 

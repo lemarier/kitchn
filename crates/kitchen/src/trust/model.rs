@@ -6,6 +6,7 @@ use crate::{
         AttemptNumber, Evidence, EvidenceSubject, EvidenceVerdict, ExternalRef, Grant, Provenance,
         Repository, Role, TaskSpec, Text, Timestamp,
     },
+    selection::WorkType,
     state::{AttemptState, EffectRecord, HouseStore, TaskState},
     trust::TrustError,
 };
@@ -51,16 +52,42 @@ pub enum EvidenceMode {
     Live,
 }
 
-/// Scope of a station's evidence and autonomy. Names are bounded validated text.
+/// Scope of a station's evidence and autonomy.
+///
+/// A task binding's scope is always derived from the stored task with
+/// [`StationScope::of_task`]; [`crate::trust::Ledger::bind_task`] takes no
+/// scope. An [`AutonomyProposal`] names the scope the caller wants standing
+/// for; the ledger accepts it only when every piece of presented evidence
+/// was recorded under that same scope and matches its task binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StationScope {
-    /// House-defined station/domain name.
-    pub station: Text,
+    /// The station is the task's role. Domain specialties such as firmware
+    /// are work types.
+    pub station: Role,
     /// Exact project; house-wide autonomy is deliberately unsupported.
     pub project: Repository,
     /// House-defined work category.
-    pub work_type: Text,
+    pub work_type: WorkType,
+}
+
+impl StationScope {
+    /// The scope of `spec`: its role, repository, and work type.
+    ///
+    /// # Errors
+    /// Returns [`TrustError::Refused`] for house-level work or a task without
+    /// a recorded work type, including tasks stored before work types were
+    /// recorded.
+    pub fn of_task(spec: &TaskSpec) -> Result<Self, TrustError> {
+        match (&spec.repository, &spec.work_type) {
+            (Some(project), Some(work_type)) => Ok(Self {
+                station: spec.role,
+                project: project.clone(),
+                work_type: work_type.clone(),
+            }),
+            (None, _) | (_, None) => Err(TrustError::Refused),
+        }
+    }
 }
 
 /// Attribution supplied by the adapter, including explicit unknowns.
@@ -173,7 +200,8 @@ impl Observation {
     /// Additional measurements start missing and must be supplied explicitly.
     ///
     /// # Errors
-    /// Rejects a project mismatch or unavailable task/store.
+    /// Rejects attribution scoped other than the stored task, a task without a
+    /// derivable scope, or an unavailable task/store.
     pub fn collect(
         store: &HouseStore,
         task: &TaskId,
@@ -183,7 +211,7 @@ impl Observation {
         observed_at: Timestamp,
     ) -> crate::Result<Self> {
         let record = store.task(task)?;
-        if record.spec().repository.as_ref() != Some(&attribution.scope.project) {
+        if StationScope::of_task(record.spec())? != attribution.scope {
             return Err(TrustError::Refused.into());
         }
         Ok(Self {
@@ -329,7 +357,8 @@ pub struct AutonomyProposal {
     pub id: ExternalRef,
     /// Owning house.
     pub house: HouseId,
-    /// Station, project, and work category.
+    /// Station, project, and work category, chosen by the proposer. Every
+    /// presented evidence item must have been recorded under this scope.
     pub scope: StationScope,
     /// Proposed exact core grant.
     pub claim: Grant,
@@ -348,8 +377,8 @@ pub struct AutonomyProposal {
 pub struct TaskBinding {
     /// Prospective task specification before earned authority is delegated.
     pub spec: TaskSpec,
-    /// Station and work category declared by the house adapter; the task
-    /// contract does not record them.
+    /// Station, project, and work type derived from `spec` with
+    /// [`StationScope::of_task`] and checked against it on load.
     pub scope: StationScope,
     /// The model identity derived from the task's resolved agent selection,
     /// compared verbatim with the observed model.
@@ -368,6 +397,7 @@ impl TaskBinding {
             && self.spec.resources == spec.resources
             && self.spec.requires == spec.requires
             && self.spec.agent == spec.agent
+            && self.spec.work_type == spec.work_type
     }
 }
 

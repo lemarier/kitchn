@@ -115,6 +115,7 @@ pub fn spec_with(id: &str, retry: RetryPolicy, permissions: &[Permission]) -> Te
         resources: std::collections::BTreeSet::new(),
         requires: kitchen::contracts::CapabilityRequirements::new(),
         agent: None,
+        work_type: None,
     })
 }
 

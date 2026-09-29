@@ -1596,6 +1596,7 @@ fn schedule_task(fixture: &Fixture) -> TestResult<(kitchen::TaskId, kitchen::con
         requires: CapabilityRequirements::new(),
         resources: BTreeSet::new(),
         agent: None,
+        work_type: None,
     };
     fixture.store.create_task(spec, &creator()?, at(0))?;
     let fence = fixture

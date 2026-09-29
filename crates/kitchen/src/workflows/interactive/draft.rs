@@ -815,6 +815,7 @@ fn spec(
         resources: std::collections::BTreeSet::new(),
         requires: CapabilityRequirements::new(),
         agent: None,
+        work_type: None,
     })
 }
 

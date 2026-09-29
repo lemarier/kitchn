@@ -157,6 +157,7 @@ fn settled_intake(kitchen: &Kitchen) -> TestResult {
             resources: BTreeSet::new(),
             requires: CapabilityRequirements::new(),
             agent: None,
+            work_type: None,
         },
         &tick,
         now,

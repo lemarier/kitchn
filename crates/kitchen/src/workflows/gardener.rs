@@ -680,6 +680,7 @@ pub fn report_stale<R: GitHubReadTransport, M: GitHubMutationTransport>(
                     requires: CapabilityRequirements::new(),
                     resources: BTreeSet::new(),
                     agent: None,
+                    work_type: None,
                 },
                 pass.claimant,
                 pass.clock.now(),

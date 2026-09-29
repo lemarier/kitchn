@@ -599,6 +599,7 @@ pub fn tick(
         requires: CapabilityRequirements::new(),
         resources: BTreeSet::new(),
         agent: None,
+        work_type: None,
     };
     match tick
         .store

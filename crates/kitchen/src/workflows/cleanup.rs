@@ -1613,6 +1613,7 @@ impl Run<'_> {
                 ],
             ),
             agent: None,
+            work_type: None,
         })
     }
 }

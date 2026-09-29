@@ -384,6 +384,7 @@ mod tests {
             resources: BTreeSet::new(),
             requires: CapabilityRequirements::new(),
             agent: None,
+            work_type: None,
         };
         let creator = Claimant::scheduled(HolderId::new("pickup")?);
         store.create_task(spec, &creator, at(0))?;

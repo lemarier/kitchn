@@ -111,6 +111,21 @@ selection_value!(
     validate_name,
     "A house-defined work category, such as `fix` or `firmware`.\n\nThe same name is the trust ledger's station work type."
 );
+impl WorkType {
+    /// The work type Kitchen records for implementing a picked-up issue.
+    #[must_use]
+    pub fn implementation() -> Self {
+        Self(String::from("implementation"))
+    }
+
+    /// The work type Kitchen records for a repair or follow-up round on an
+    /// open pull request, so a house `fix` rule selects its agent.
+    #[must_use]
+    pub fn fix() -> Self {
+        Self(String::from("fix"))
+    }
+}
+
 selection_value!(
     TaskGroup,
     SelectionValue::TaskGroup,
@@ -239,6 +254,9 @@ mod tests {
     #[test]
     fn names_are_lowercase_tokens() {
         assert!(WorkType::new("fix").is_ok());
+        for assigned in [WorkType::implementation(), WorkType::fix()] {
+            assert_eq!(WorkType::new(assigned.as_str()).ok(), Some(assigned));
+        }
         assert!(EffortLevel::new("xhigh").is_ok());
         assert!(TaskGroup::new("issue-1.v2_a").is_ok());
         for invalid in ["", "Fix", "-x", "_x", "a b", "a/b"] {

@@ -8,8 +8,11 @@ mod workflows_support;
 use common::{TestResult, at, interactive, scheduled, ttl};
 use kitchen::{
     ErrorClass,
-    contracts::{IssueNumber, Repository, Settlement, Text, Trigger},
+    contracts::{IssueNumber, Repository, Role, Settlement, Text, Trigger},
+    scheduling::AgentFamily,
+    selection::{AgentModel, AgentSelection, WorkType},
     state::{OwnershipEvent, StateError},
+    trust::{StationScope, TrustError},
     workflows::{
         coordination::CoordinationError,
         pickup::{
@@ -20,7 +23,8 @@ use kitchen::{
     },
 };
 use workflows_support::{
-    World, brief, issue, policy, provenance, ready, repo, template, template_with, under_consumer,
+    World, bind_for_trust, brief, issue, policy, provenance, ready, repo, template, template_with,
+    under_consumer, work_type_policy,
 };
 
 #[test]
@@ -765,5 +769,55 @@ fn operational_brief_arguments_must_be_plain_single_line_values() -> TestResult 
             kitchen::Error::Coordination(CoordinationError::InvalidBriefArgument)
         ));
     }
+    Ok(())
+}
+
+#[test]
+fn a_picked_up_task_records_its_work_type_and_binds_for_trust() -> TestResult {
+    let world = World::new()?;
+    let mut with_policy = template()?;
+    with_policy.agents = Some(work_type_policy()?);
+    let outcome = claim_issue(
+        &world.fixture.store,
+        &with_policy,
+        &issue(7)?,
+        &scheduled("pickup")?,
+        ttl(600)?,
+        world.now(),
+    )?;
+    assert!(matches!(outcome, ClaimOutcome::Claimed(_)));
+    let stored = world.fixture.store.task(&issue_task_id(&issue(7)?)?)?;
+    let spec = stored.spec();
+    let implementation = WorkType::new("implementation")?;
+    assert_eq!(spec.work_type.as_ref(), Some(&implementation));
+    // The selection was resolved with the same work type: only the
+    // implementation rule names Codex.
+    assert_eq!(
+        spec.agent.as_ref().map(|resolved| &resolved.selection),
+        Some(&AgentSelection {
+            agent: AgentFamily::Codex,
+            model: Some(AgentModel::new("gpt-6-sol")?),
+            effort: None,
+        })
+    );
+    assert!(matches!(bind_for_trust(&world.fixture, spec)?, Ok(true)));
+    assert_eq!(
+        StationScope::of_task(spec)?,
+        StationScope {
+            station: Role::StationCook,
+            project: repo()?,
+            work_type: implementation.clone(),
+        }
+    );
+    // Without a house policy the work type is still recorded, but no model
+    // is selected, so trust refuses to bind the task.
+    let bare = template()?.spec_for(&issue(8)?)?;
+    assert_eq!(bare.work_type, Some(implementation));
+    assert_eq!(bare.agent, None);
+    let other = World::new()?;
+    assert!(matches!(
+        bind_for_trust(&other.fixture, &bare)?,
+        Err(TrustError::Refused)
+    ));
     Ok(())
 }

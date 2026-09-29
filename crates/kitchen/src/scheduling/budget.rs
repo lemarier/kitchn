@@ -1113,6 +1113,15 @@ pub struct UndeliveredReport {
     pub exhausted: Exhausted,
 }
 
+/// The schema of the fact recorded under [`BudgetExhaustion::marker_key`].
+///
+/// # Errors
+/// [`BudgetError::InvalidPolicy`] if the schema cannot be built.
+pub fn exhausted_schema() -> Result<MarkerSchema, BudgetError> {
+    MarkerSchema::new("schedule-budget-exhausted", NonZeroU32::MIN)
+        .map_err(|_| BudgetError::InvalidPolicy)
+}
+
 /// The schema of the fact recorded under
 /// [`BudgetExhaustion::undeliverable_key`].
 ///
@@ -1176,17 +1185,14 @@ impl BudgetExhaustion {
     /// # Errors
     /// [`BudgetError::InvalidPolicy`] if the fact cannot be encoded.
     pub fn marker_fact(&self) -> Result<MarkerFact, BudgetError> {
-        let invalid = |_| BudgetError::InvalidPolicy;
-        let schema =
-            MarkerSchema::new("schedule-budget-exhausted", NonZeroU32::MIN).map_err(invalid)?;
         MarkerFact::workflow(
-            schema,
+            exhausted_schema()?,
             &ExhaustionReport {
                 window: self.window,
                 exhausted: self.exhausted,
             },
         )
-        .map_err(invalid)
+        .map_err(|_| BudgetError::InvalidPolicy)
     }
 
     /// The fact to record under [`Self::undeliverable_key`].

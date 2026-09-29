@@ -34,8 +34,8 @@ pub use budget::{
     ExhaustionReport, IdlePolicy, IdleSchedule, IntervalMinutes, MAX_EVIDENCE_SCHEDULES,
     MAX_INTERVAL_MINUTES, MAX_SCHEDULE_LIMITS, MAX_WINDOW_HOURS, Percent, ScheduleAssessment,
     ScheduleEvidence, ScheduleLimit, ScheduleLimits, SchedulePolicy, ScheduleUsage, TokenUsage,
-    UndeliveredReport, UsageWindow, WindowHours, WindowUsage, shortest_interval_minutes,
-    undeliverable_schema,
+    UndeliveredReport, UsageWindow, WindowHours, WindowUsage, exhausted_schema,
+    shortest_interval_minutes, undeliverable_schema,
 };
 pub use reconcile::{
     InstallPlan, InstalledSchedule, JudgedRun, MAX_SCHEDULE_RUNS, ObservedScheduleState, Readiness,

@@ -22,6 +22,15 @@
 //! [`MAX_EVIDENCE_SCHEDULES`](crate::scheduling::MAX_EVIDENCE_SCHEDULES)
 //! schedules, and by the executor's own call deadlines.
 //!
+//! A house may change `windowHours` in the middle of a window. Windows are
+//! aligned to the Unix epoch, so the new window can start at the same instant
+//! as the old one, or inside it. A window's task keeps the retry budget it was
+//! created with, so a longer window whose start is shared with a shorter
+//! window's task gets its own task (see `window_task`), after the tick looks
+//! up any effect the other task left unresolved. A report the other task
+//! already posted, or one recorded for a window still open, is not posted
+//! again; a pause is repeated only for a schedule the owner re-activated.
+//!
 //! The owner report is recorded only after delivery, with
 //! [`confirm_reported`]. A pass interrupted after a pause and before that
 //! finds the schedule paused and unreported next time, and returns the
@@ -55,16 +64,20 @@ use crate::{
     BackendId, ConsumerId, CredentialId, Error, HouseId, TaskId, WorkflowId,
     contracts::{
         AttemptOutcome, Capability, CapabilityRequirements, Claimant, Clock, Effect,
-        EffectExecutor, Fence, Grant, HouseGrants, LeaseTtl, Provenance, Repository, RetryPolicy,
-        Role, ScheduleEffect, TaskAuthority, TaskSpec, Text, Timestamp,
+        EffectExecutor, Fence, Grant, HouseGrants, LeaseTtl, Provenance, Repository, ResourceRef,
+        RetryPolicy, Role, ScheduleEffect, TaskAuthority, TaskSpec, Text, Timestamp,
     },
     id::EffectName,
     scheduling::{
-        self, BudgetExhaustion, PrecheckTimeout, Recurrence, ScheduleEvidence, SchedulePolicy,
-        ScheduleSpec, ScheduleState, Timezone, UndeliveredReport, UsageWindow, WorkflowName,
+        self, BudgetExhaustion, ExhaustionReport, PrecheckTimeout, Recurrence, ScheduleEvidence,
+        SchedulePolicy, ScheduleSpec, ScheduleState, Timezone, UndeliveredReport, UsageWindow,
+        WorkflowName,
     },
     selection::ResolvedSelection,
-    state::{EffectPlan, EffectRecord, EffectState, HouseStore, MarkerFact, StateError, TaskState},
+    state::{
+        EffectPlan, EffectRecord, EffectState, HouseStore, MarkerFact, StateError, TaskRecord,
+        TaskState, WorkItem,
+    },
 };
 
 use super::{Precheck, WorkflowError};
@@ -317,14 +330,7 @@ const TICK_ATTEMPTS: u32 = 16;
 /// window, so an elapsed budget of the window's length keeps it retryable
 /// until the window ends, whatever the policy's window length.
 fn tick_retry(window: UsageWindow) -> Result<RetryPolicy> {
-    let length = window
-        .end
-        .as_unix_millis()
-        .saturating_sub(window.start.as_unix_millis());
-    Ok(RetryPolicy::new(
-        TICK_ATTEMPTS,
-        Duration::from_millis(length),
-    )?)
+    Ok(RetryPolicy::new(TICK_ATTEMPTS, window_length(window))?)
 }
 
 /// Which budget command a schedule step runs.
@@ -567,7 +573,7 @@ pub struct TickReport {
 }
 
 /// Run one budget tick over `evidence`: claim this window's task
-/// (`budget-<window start>`), reconcile its unresolved effects with both
+/// (`window_task`), reconcile its unresolved effects with both
 /// backends, run the pass, post each due report, and record it only once its
 /// post applied. The claim is given back at the end, even after an error, so
 /// the window's next tick continues the same task. Then settle earlier
@@ -591,7 +597,7 @@ pub fn tick(
             settled: Vec::new(),
         });
     };
-    let task = TaskId::new(&format!("{WORKFLOW}-{}", window.start.as_unix_millis()))?;
+    let task = window_task(tick.store, window)?;
     let spec = TaskSpec {
         id: task.clone(),
         role: Role::Expediter,
@@ -624,13 +630,16 @@ pub fn tick(
         }
         Err(error) => return Err(error),
     }
+    // A task of this window under another id may hold an effect whose
+    // outcome is unknown; look it up before this one acts on the same window.
+    reconcile_same_window(tick, &task, window)?;
     let fence = claim(tick, &task)?;
     let result = act(tick, &task, fence, policy, evidence);
     let released = tick.store.relinquish(&task, fence, tick.clock.now());
     let (pass, deliveries) = result?;
     released?;
     // Cleanup runs after the pass, so it can never hold back a pause.
-    let settled = settle_earlier(tick, &task)?;
+    let settled = settle_earlier(tick, &task, evidence.observed_at)?;
     Ok(TickReport {
         pass,
         deliveries,
@@ -661,6 +670,104 @@ fn claim(tick: &Tick<'_>, task: &TaskId) -> Result<Fence> {
         return Err(error);
     }
     Ok(fence)
+}
+
+/// The id of the task that acts for `window`.
+///
+/// A window's task is named for its start and keeps the retry budget it was
+/// created with, sized for the window length then. Windows are aligned to the
+/// Unix epoch, so a house that changes `windowHours` mid-window can get a new
+/// window with the same start. `budget-<start>` is used again when its task is
+/// open and stays retryable for this whole window; otherwise, such as a 24 hour
+/// task under a new 744 hour window, or a settled one, the task is
+/// `budget-<start>-<hours>h`. Both tasks share the window's start, so the
+/// report and marker names, which derive from the start, stay the same.
+///
+/// # Errors
+/// Store read failures.
+fn window_task(store: &HouseStore, window: UsageWindow) -> Result<TaskId> {
+    let start = window.start.as_unix_millis();
+    let base = TaskId::new(&format!("{WORKFLOW}-{start}"))?;
+    let length = window_length(window);
+    let reusable = match store.task(&base) {
+        Ok(record) => {
+            !matches!(record.state(), TaskState::Settled { .. })
+                && record.spec().retry.max_elapsed() >= length
+        }
+        Err(Error::State(StateError::TaskNotFound(_))) => true,
+        Err(error) => return Err(error),
+    };
+    if reusable {
+        return Ok(base);
+    }
+    let hours = length.as_secs() / 3600;
+    Ok(TaskId::new(&format!("{WORKFLOW}-{start}-{hours}h"))?)
+}
+
+fn window_length(window: UsageWindow) -> Duration {
+    Duration::from_millis(
+        window
+            .end
+            .as_unix_millis()
+            .saturating_sub(window.start.as_unix_millis()),
+    )
+}
+
+/// The window start a budget task id names: `budget-<start>` or
+/// `budget-<start>-<hours>h`.
+fn window_task_start(id: &TaskId) -> Option<u64> {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    let rest = id.as_str().strip_prefix(WORKFLOW)?.strip_prefix('-')?;
+    let (start, hours) = match rest.split_once('-') {
+        Some((start, hours)) => (start, Some(hours)),
+        None => (rest, None),
+    };
+    let hours_ok = hours.is_none_or(|hours| hours.strip_suffix('h').is_some_and(digits));
+    if digits(start) && hours_ok {
+        start.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Every other budget task of the window that starts at `start`.
+fn same_window_tasks(
+    store: &HouseStore,
+    task: &TaskId,
+    start: Timestamp,
+) -> Result<Vec<TaskRecord>> {
+    Ok(store
+        .tasks()?
+        .into_iter()
+        .filter(|record| {
+            record.spec().id != *task
+                && window_task_start(&record.spec().id) == Some(start.as_unix_millis())
+        })
+        .collect())
+}
+
+/// Look up the unresolved effects of the other tasks of `window`, so this
+/// one never pauses or reports what one of them may already have done. An
+/// effect still unresolved after the lookup refuses the tick.
+fn reconcile_same_window(tick: &Tick<'_>, task: &TaskId, window: UsageWindow) -> Result<()> {
+    for record in same_window_tasks(tick.store, task, window.start)? {
+        if matches!(record.state(), TaskState::Settled { .. })
+            || record.unresolved_effects().next().is_none()
+        {
+            continue;
+        }
+        let other = &record.spec().id;
+        let fence = claim(tick, other)?;
+        let looked_up = reconcile(tick, other, fence);
+        let released = tick.store.relinquish(other, fence, tick.clock.now());
+        looked_up?;
+        released?;
+        let count = tick.store.task(other)?.unresolved_effects().count();
+        if count > 0 {
+            return Err(Error::State(StateError::UnresolvedEffects { count }));
+        }
+    }
+    Ok(())
 }
 
 fn act(
@@ -747,6 +854,18 @@ fn deliver(
         return Ok(Delivery::Undeliverable(exhaustion));
     };
     let name = report_name(&exhaustion)?;
+    // Another task of this window already posted this report, such as the
+    // one this window's length change replaced: record it, post nothing.
+    let posted = same_window_tasks(tick.store, task, exhaustion.window.start)?
+        .iter()
+        .flat_map(TaskRecord::effects)
+        .any(|record| {
+            record.name() == &name && matches!(record.state(), EffectState::Applied { .. })
+        });
+    if posted {
+        confirm_reported(tick.store, tick.claimant, &exhaustion, tick.clock.now())?;
+        return Ok(Delivery::Delivered(exhaustion));
+    }
     let task_record = tick.store.task(task)?;
     // An earlier post of this window's report is resubmitted as recorded, so
     // a changed limit or allowance cannot post a second, different report.
@@ -789,28 +908,33 @@ fn deliver(
     }
 }
 
-/// Settle the budget tasks of earlier windows that no live tick holds,
-/// including one a crashed tick left claimed: reconcile their unresolved
-/// effects and finish them once nothing is unresolved. A task that is still
-/// unresolved, or whose claim or lookup fails now, is left for a later tick.
+/// Settle the budget tasks of windows that ended before `observed_at` and
+/// that no live tick holds, including one a crashed tick left claimed:
+/// reconcile their unresolved effects and finish them once nothing is
+/// unresolved. A task that is still unresolved, or whose claim or lookup fails
+/// now, is left for a later tick.
 ///
 /// # Errors
 /// Only a store read of the task list, and a claim that cannot be given back.
-fn settle_earlier(tick: &Tick<'_>, current: &TaskId) -> Result<Vec<TaskId>> {
+fn settle_earlier(
+    tick: &Tick<'_>,
+    current: &TaskId,
+    observed_at: Timestamp,
+) -> Result<Vec<TaskId>> {
     let earlier: Vec<TaskId> = tick
         .store
         .tasks()?
         .into_iter()
         .filter(|record| {
-            let id = record.spec().id.as_str();
-            let window = id
-                .strip_prefix(WORKFLOW)
-                .and_then(|rest| rest.strip_prefix('-'))
-                .is_some_and(|start| {
-                    !start.is_empty() && start.bytes().all(|b| b.is_ascii_digit())
-                });
+            let ended = window_task_start(&record.spec().id).is_some_and(|start| {
+                // The task's retry budget is its window's length, so this is
+                // the end of its window. A window still open may come back
+                // if the house restores its length, so its task stays.
+                let end = u128::from(start) + record.spec().retry.max_elapsed().as_millis();
+                end <= u128::from(observed_at.as_unix_millis())
+            });
             record.spec().id != *current
-                && window
+                && ended
                 && !matches!(record.state(), TaskState::Settled { .. })
         })
         .map(|record| record.spec().id.clone())
@@ -910,8 +1034,51 @@ fn plan(
             true
         }
     })?;
-    match failure.into_inner() {
-        Some(error) => Err(error),
-        None => Ok(plan),
+    if let Some(error) = failure.into_inner() {
+        return Err(error);
     }
+    let open = open_reports(store, evidence.observed_at)?;
+    Ok(plan
+        .into_iter()
+        .map(|mut item| {
+            // A house that shortens or lengthens its window mid-window starts
+            // a new window inside one it already reported for. The schedule is
+            // the same exhausted one, so its owner is not told twice.
+            if item.report_due && open.contains(&item.schedule) {
+                item.report_due = false;
+            }
+            item
+        })
+        .filter(|item| item.pause || item.report_due)
+        .collect())
+}
+
+/// The schedules whose exhaustion was reported, or found undeliverable, for a
+/// window that is still open at `now`.
+fn open_reports(store: &HouseStore, now: Timestamp) -> Result<BTreeSet<ResourceRef>> {
+    let reported = scheduling::exhausted_schema()?;
+    let undeliverable = scheduling::undeliverable_schema()?;
+    let workflow = WorkflowId::new(scheduling::BUDGET_WORKFLOW)?;
+    let mut open = BTreeSet::new();
+    for marker in store.markers(&workflow)? {
+        let WorkItem::Resource { resource } = &marker.key().item else {
+            continue;
+        };
+        let window = match marker.fact() {
+            MarkerFact::Workflow { schema, .. } if *schema == reported => {
+                marker.fact().decode::<ExhaustionReport>(&reported)?.window
+            }
+            MarkerFact::Workflow { schema, .. } if *schema == undeliverable => {
+                marker
+                    .fact()
+                    .decode::<UndeliveredReport>(&undeliverable)?
+                    .window
+            }
+            _ => continue,
+        };
+        if window.contains(now) {
+            open.insert(resource.clone());
+        }
+    }
+    Ok(open)
 }

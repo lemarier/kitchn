@@ -206,6 +206,7 @@ fn pause_all(
                 decided_at,
                 effect,
                 consent: None,
+                basis: None,
             },
             clock,
         )?;
@@ -735,6 +736,7 @@ fn deliver(
             decided_at: task_record.evidence().revision(),
             effect,
             consent: None,
+            basis: None,
         },
         tick.clock,
     )?;

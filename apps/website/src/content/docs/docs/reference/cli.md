@@ -326,8 +326,10 @@ also moves inspections whose deadline has passed and whose samples all have a
 result. Grants, the evidence they cite, and bindings of tasks with no recorded
 observation stay, so revoking a grant never needs the archive. The records go
 to `archive.jsonl` in the ledger directory, owner-only like the ledger, and the
-ledger keeps the batch's SHA-256 digest and counts as one entry. An archived
-stream no longer supports new grant proposals.
+ledger keeps the batch's SHA-256 digest, counts, and length as one entry.
+Bytes past the committed length, left by an archival that failed partway, are
+cut off before the next batch. A symlinked, hard-linked, or shortened archive
+file is refused. An archived stream no longer supports new grant proposals.
 
 ## `kitchn pickup`
 

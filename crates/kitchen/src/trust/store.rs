@@ -170,9 +170,12 @@ impl Document {
         }
         let mut digests = HashSet::with_capacity(self.archivals.len());
         for archival in &self.archivals {
-            if archival.records() == 0 || !digests.insert(&archival.digest) {
+            if archival.records() == 0 || archival.bytes == 0 || !digests.insert(&archival.digest) {
                 return Err(TrustError::Corrupt);
             }
+        }
+        if Archival::committed_bytes(&self.archivals).is_none() {
+            return Err(TrustError::Corrupt);
         }
         Ok(())
     }

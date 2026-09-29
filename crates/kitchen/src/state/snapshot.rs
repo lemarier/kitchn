@@ -11,6 +11,7 @@
 //! their own [`StoreLayout`] and payload type.
 
 use std::{
+    cmp::Ordering,
     fs::{self, File, OpenOptions, TryLockError},
     hash::{BuildHasher, RandomState},
     io::{Read, Write},
@@ -447,23 +448,59 @@ impl<S: Snapshot> SnapshotStore<S> {
         self.write_file(self.layout.snapshot, bytes)
     }
 
-    /// Append `bytes` to the file `name` beside the snapshot and sync it,
-    /// creating it owner-only. Call inside [`Self::transact`], so appends
-    /// are serialized by the store lock. A redirected file, or a nonprivate
-    /// one in a private store, is refused before anything is written.
-    pub(crate) fn append_private(&self, name: &str, bytes: &[u8]) -> Result<(), StateError> {
+    /// Append `bytes` to the append-only file `name` beside the snapshot and
+    /// sync it, creating it owner-only. `committed` is the length the
+    /// snapshot records for the file: bytes past it are the remains of an
+    /// append whose snapshot commit never happened, and are cut off first.
+    /// Call inside [`Self::transact`], so appends are serialized by the store
+    /// lock and `committed` cannot change underneath.
+    ///
+    /// Type, link count, and mode are checked on the opened descriptor, which
+    /// is the one written to, so the path cannot be swapped after the check.
+    ///
+    /// # Errors
+    /// A symlink, non-regular, or hard-linked file is
+    /// [`StateError::RedirectedPath`]; a nonprivate one in a private store is
+    /// [`StateError::PublicPath`]; a file shorter than `committed` is
+    /// [`Corruption::TruncatedAppend`]. Nothing is cut off or appended in
+    /// those cases, though a missing file is created empty.
+    pub(crate) fn append_private(
+        &self,
+        name: &str,
+        committed: u64,
+        bytes: &[u8],
+    ) -> Result<(), StateError> {
+        self.append_with(name, committed, bytes, |file, bytes| file.write_all(bytes))
+    }
+
+    /// [`Self::append_private`] with the write step injected, so tests can
+    /// fail it partway or act between the checks and the write.
+    fn append_with(
+        &self,
+        name: &str,
+        committed: u64,
+        bytes: &[u8],
+        write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
+    ) -> Result<(), StateError> {
         let io = |error| StateError::io(StorageOperation::Write, error);
-        let path = self.dir.join(name);
-        refuse_redirected(&path)?;
-        if self.layout.require_private && exists(&path)? {
-            require_private(&path)?;
+        let mut file = open_append_file(&self.dir.join(name))?;
+        let metadata = file.metadata().map_err(io)?;
+        if !metadata.is_file() || links(&metadata) != 1 {
+            return Err(StateError::RedirectedPath);
         }
-        let created = !exists(&path)?;
-        let mut file = open_append_file(&path).map_err(io)?;
-        file.write_all(bytes).map_err(io)?;
+        if self.layout.require_private && is_public(&metadata) {
+            return Err(StateError::PublicPath);
+        }
+        match metadata.len().cmp(&committed) {
+            Ordering::Less => return Err(StateError::CorruptState(Corruption::TruncatedAppend)),
+            Ordering::Greater => file.set_len(committed).map_err(io)?,
+            Ordering::Equal => {}
+        }
+        write(&mut file, bytes).map_err(io)?;
         file.sync_all().map_err(io)?;
         drop(file);
-        if created {
+        if committed == 0 {
+            // The file may be new; make its directory entry durable too.
             sync_dir(&self.dir).map_err(io)?;
         }
         Ok(())
@@ -545,19 +582,62 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
+/// Open `path` for appending without following a final symlink, creating
+/// it owner-only. Non-blocking, so a FIFO placed there cannot stall the open.
 #[cfg(unix)]
-fn open_append_file(path: &Path) -> std::io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(path)
+fn open_append_file(path: &Path) -> Result<File, StateError> {
+    use rustix::{
+        fs::{Mode, OFlags, open},
+        io::Errno,
+    };
+    let flags = OFlags::WRONLY
+        | OFlags::APPEND
+        | OFlags::CREATE
+        | OFlags::NOFOLLOW
+        | OFlags::NONBLOCK
+        | OFlags::NOCTTY
+        | OFlags::CLOEXEC;
+    match open(path, flags, Mode::RUSR | Mode::WUSR) {
+        Ok(descriptor) => Ok(File::from(descriptor)),
+        // A final symlink, or a FIFO with no reader.
+        Err(Errno::LOOP | Errno::NXIO) => Err(StateError::RedirectedPath),
+        Err(error) => Err(StateError::io(
+            StorageOperation::Write,
+            std::io::Error::from(error),
+        )),
+    }
 }
 
 #[cfg(not(unix))]
-fn open_append_file(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new().append(true).create(true).open(path)
+fn open_append_file(path: &Path) -> Result<File, StateError> {
+    refuse_redirected(path)?;
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|error| StateError::io(StorageOperation::Write, error))
+}
+
+#[cfg(unix)]
+fn links(metadata: &fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::nlink(metadata)
+}
+
+/// Link counts are not available on this platform; treat the file as unshared.
+#[cfg(not(unix))]
+fn links(_metadata: &fs::Metadata) -> u64 {
+    1
+}
+
+#[cfg(unix)]
+fn is_public(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o077 != 0
+}
+
+#[cfg(not(unix))]
+fn is_public(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 /// Create the store directory (and missing parents) readable only by the owner.
@@ -635,10 +715,9 @@ fn refuse_redirected(path: &Path) -> Result<(), StateError> {
 /// Refuse a path that other users can read or write.
 #[cfg(unix)]
 fn require_private(path: &Path) -> Result<(), StateError> {
-    use std::os::unix::fs::PermissionsExt;
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| StateError::io(StorageOperation::Prepare, error))?;
-    if metadata.permissions().mode() & 0o077 != 0 {
+    if is_public(&metadata) {
         return Err(StateError::PublicPath);
     }
     Ok(())
@@ -890,6 +969,90 @@ mod tests {
         assert!(matches!(
             store.read(|toy| toy.items.len()),
             Err(crate::Error::State(StateError::PublicPath))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_partial_append_is_cut_off_before_the_retry() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        store.append_private("log", 0, b"one\n")?;
+        // The write stops partway, as a full disk or a crash would leave it.
+        let failed = store.append_with("log", 4, b"two\n", |file, bytes| {
+            file.write_all(bytes.get(..2).unwrap_or_default())?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+        assert!(matches!(
+            failed,
+            Err(StateError::Io {
+                operation: StorageOperation::Write,
+                ..
+            })
+        ));
+        assert_eq!(fs::read(path.join("log"))?, b"one\ntw");
+        store.append_private("log", 4, b"two\n")?;
+        assert_eq!(fs::read(path.join("log"))?, b"one\ntwo\n");
+        // A whole line the snapshot never committed is cut off the same way.
+        store.append_private("log", 4, b"three\n")?;
+        assert_eq!(fs::read(path.join("log"))?, b"one\nthree\n");
+        Ok(())
+    }
+
+    #[test]
+    fn an_append_file_shorter_than_committed_is_refused_unchanged() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        store.append_private("log", 0, b"one\n")?;
+        assert!(matches!(
+            store.append_private("log", 5, b"two\n"),
+            Err(StateError::CorruptState(Corruption::TruncatedAppend))
+        ));
+        assert_eq!(fs::read(path.join("log"))?, b"one\n");
+        Ok(())
+    }
+
+    /// The checks read the opened descriptor, and the write goes to that
+    /// descriptor, so a file swapped in after the checks never receives it.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_swapped_in_after_the_checks_is_not_written() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        let other = dir.path().join("other");
+        fs::write(&other, b"other\n")?;
+        let log = path.join("log");
+        store.append_with("log", 0, b"one\n", |file, bytes| {
+            fs::remove_file(&log)?;
+            fs::hard_link(&other, &log)?;
+            file.write_all(bytes)
+        })?;
+        assert_eq!(fs::read(&other)?, b"other\n");
+        // The swapped-in file now has two links, so the next append refuses it.
+        assert!(matches!(
+            store.append_private("log", 0, b"two\n"),
+            Err(StateError::RedirectedPath)
+        ));
+        assert_eq!(fs::read(&other)?, b"other\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_append_file_is_refused_without_blocking() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store");
+        let store = bounded(&path, &[])?;
+        let made = std::process::Command::new("mkfifo")
+            .arg(path.join("log"))
+            .status()?;
+        assert!(made.success());
+        assert!(matches!(
+            store.append_private("log", 0, b"one\n"),
+            Err(StateError::RedirectedPath)
         ));
         Ok(())
     }

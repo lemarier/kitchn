@@ -25,9 +25,12 @@
 //! needs the archive.
 //!
 //! The batch is appended and synced before the ledger commits, under the
-//! ledger's exclusive lock. If the ledger write then fails, the batch stays in
-//! the file but its digest is not in [`Ledger::archivals`]: it was never
-//! applied, and its records are still live. Recording an archived stream
+//! ledger's exclusive lock. Each summary records its line's length, so the
+//! ledger knows how long the committed file is. Bytes past that length were
+//! written by an archival whose append or ledger write failed: it was never
+//! applied, and its records are still live. The next archival cuts them off
+//! before appending, so every line in the file is one committed batch. A file
+//! shorter than its committed length is refused as corrupt. Recording an archived stream
 //! again adds it back to the live ledger; a correction to an archived stream
 //! leaves a revision gap, so it reads as incomplete and supports no grant.
 use crate::{
@@ -110,6 +113,8 @@ pub struct Archival {
     pub bindings: usize,
     /// Inspections moved.
     pub inspections: usize,
+    /// Length of the batch line in [`ARCHIVE_FILE`], newline included.
+    pub bytes: u64,
 }
 
 impl Archival {
@@ -117,6 +122,14 @@ impl Archival {
     #[must_use]
     pub const fn records(&self) -> usize {
         self.observations + self.bindings + self.inspections
+    }
+
+    /// Committed length of [`ARCHIVE_FILE`]: the sum of every batch line;
+    /// `None` on overflow.
+    pub(super) fn committed_bytes(archivals: &[Self]) -> Option<u64> {
+        archivals
+            .iter()
+            .try_fold(0_u64, |total, archival| total.checked_add(archival.bytes))
     }
 }
 
@@ -214,8 +227,9 @@ impl Ledger {
     /// the snapshot by more than a summary.
     ///
     /// # Errors
-    /// A redirected or nonprivate archive file, and I/O failures, are
-    /// `Storage`; the live ledger is then unchanged.
+    /// A redirected, hard-linked, or nonprivate archive file, an archive
+    /// shorter than its committed batches, and I/O failures are `Storage`;
+    /// the live ledger is then unchanged.
     pub fn archive(&self, now: Timestamp) -> Result<ArchiveReport, TrustError> {
         let house = self.house();
         self.transact(|doc| {
@@ -254,19 +268,22 @@ impl Ledger {
             let mut line = serde_json::to_vec(&batch).map_err(|error| {
                 crate::state::StateError::io(crate::state::StorageOperation::Write, error.into())
             })?;
+            let digest = ArchiveDigest::of(&line);
+            line.push(b'\n');
+            let committed = Archival::committed_bytes(&doc.archivals).ok_or(TrustError::Corrupt)?;
             let archival = Archival {
-                digest: ArchiveDigest::of(&line),
+                digest,
                 at: now,
                 observations: batch.observations.len(),
                 bindings: batch.bindings.len(),
                 inspections: batch.inspections.len(),
+                bytes: u64::try_from(line.len()).map_err(|_| TrustError::Corrupt)?,
             };
             doc.archivals.push(archival.clone());
             // Check before the append, so a batch is written only for a
             // ledger that will commit.
             doc.validate(house)?;
-            line.push(b'\n');
-            self.engine.append_private(ARCHIVE_FILE, &line)?;
+            self.engine.append_private(ARCHIVE_FILE, committed, &line)?;
             report.archival = Some(archival);
             Ok(report)
         })

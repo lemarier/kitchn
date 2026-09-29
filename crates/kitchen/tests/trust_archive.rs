@@ -12,7 +12,7 @@ use kitchen::{
     },
     scheduling::AgentFamily,
     selection::{AgentModel, AgentSelection, ResolvedSelection, WorkType},
-    state::{StateError, TaskState},
+    state::{Corruption, StateError, TaskState},
     trust::{
         ARCHIVE_FILE, ArchiveBatch, Attribution, AutonomyProposal, BenchResult, EvidenceMode,
         GrantAudit, Ledger, Measurement, Observation, PullRequestEvidence, StationScope,
@@ -571,6 +571,7 @@ fn a_stored_summary_that_is_empty_or_malformed_is_corrupt() -> TestResult {
     for (field, value) in [
         ("observations", serde_json::json!(0)),
         ("digest", serde_json::json!("not-hex")),
+        ("bytes", serde_json::json!(0)),
     ] {
         let mut document = original.clone();
         if field == "observations" {
@@ -586,6 +587,20 @@ fn a_stored_summary_that_is_empty_or_malformed_is_corrupt() -> TestResult {
             "{field} must be refused"
         );
     }
+    // Two summaries whose lengths overflow a file length.
+    let mut overflowing = original.clone();
+    let summaries = overflowing["archivals"].as_array_mut().ok_or("archivals")?;
+    let mut second = summaries.first().cloned().ok_or("summary")?;
+    second["digest"] = serde_json::json!("0".repeat(64));
+    summaries.push(second);
+    for summary in summaries.iter_mut() {
+        summary["bytes"] = serde_json::json!(u64::MAX);
+    }
+    fs::write(&path, serde_json::to_vec(&overflowing)?)?;
+    assert!(matches!(
+        Ledger::open(f.dir.path().join("trust"), house()?),
+        Err(TrustError::Corrupt)
+    ));
     let mut duplicated = original;
     let summaries = duplicated["archivals"].as_array_mut().ok_or("archivals")?;
     let first = summaries.first().cloned().ok_or("summary")?;
@@ -595,5 +610,112 @@ fn a_stored_summary_that_is_empty_or_malformed_is_corrupt() -> TestResult {
         Ledger::open(f.dir.path().join("trust"), house()?),
         Err(TrustError::Corrupt)
     ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hard_linked_archive_file_is_refused_without_writing_either_file() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    delivered(&f, &l, "settled")?;
+    let before = fs::read(ledger_path(&f))?;
+
+    // Another house's private archive, linked in under this house's name.
+    let elsewhere = f.dir.path().join("other-house-archive.jsonl");
+    fs::write(&elsewhere, b"{\"other\":true}\n")?;
+    fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o600))?;
+    fs::hard_link(&elsewhere, archive_path(&f))?;
+    assert!(matches!(
+        l.archive(at(100)),
+        Err(TrustError::Storage(StateError::RedirectedPath))
+    ));
+    assert_eq!(fs::read(&elsewhere)?, b"{\"other\":true}\n");
+    assert_eq!(fs::read(ledger_path(&f))?, before);
+
+    // Once the link is gone, the house gets its own file.
+    fs::remove_file(archive_path(&f))?;
+    l.archive(at(100))?;
+    assert_eq!(archived(&f)?.len(), 1);
+    assert_eq!(fs::read(&elsewhere)?, b"{\"other\":true}\n");
+    Ok(())
+}
+
+/// A failed append leaves either part of a batch (the write stopped) or a
+/// whole batch whose ledger commit failed. Neither was committed, so the next
+/// archival drops it and every line stays one committed batch.
+#[test]
+fn an_uncommitted_tail_is_dropped_before_the_next_batch() -> TestResult {
+    let tails: [&[u8]; 3] = [
+        b"{\"schema\":1,\"house\":\"exa",
+        b"{\"schema\":1,\"house\":\"example\",\"at\":1,\"observations\":[],\"bindings\":[],\"inspections\":[]}\n",
+        b"\n",
+    ];
+    for (index, tail) in tails.into_iter().enumerate() {
+        let f = Fixture::new()?;
+        let l = ledger(&f)?;
+        // A tail on a file with nothing committed yet.
+        fs::write(archive_path(&f), tail)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(archive_path(&f), fs::Permissions::from_mode(0o600))?;
+        }
+        delivered(&f, &l, "first")?;
+        l.archive(at(100))?;
+        // A tail after a committed batch.
+        let mut bytes = fs::read(archive_path(&f))?;
+        bytes.extend_from_slice(tail);
+        fs::write(archive_path(&f), &bytes)?;
+        delivered(&f, &l, "second")?;
+        l.archive(at(200))?;
+
+        let batches = archived(&f)?;
+        let digests: Vec<&str> = batches.iter().map(|(d, _)| d.as_str()).collect();
+        let committed: Vec<String> = reopen(&f)?
+            .archivals()?
+            .iter()
+            .map(|a| a.digest.as_str().to_owned())
+            .collect();
+        assert_eq!(digests, committed, "tail {index}");
+        let tasks: Vec<_> = batches
+            .iter()
+            .flat_map(|(_, b)| b.observations.iter().map(|o| o.task.clone()))
+            .collect();
+        assert_eq!(tasks, vec![task_id("first")?, task_id("second")?]);
+    }
+    Ok(())
+}
+
+#[test]
+fn an_archive_shorter_than_its_summaries_is_refused() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    delivered(&f, &l, "first")?;
+    l.archive(at(100))?;
+    let committed = fs::read(archive_path(&f))?;
+    delivered(&f, &l, "second")?;
+    let before = fs::read(ledger_path(&f))?;
+
+    let truncated = committed.get(..committed.len() - 1).ok_or("line")?;
+    fs::write(archive_path(&f), truncated)?;
+    assert!(matches!(
+        l.archive(at(200)),
+        Err(TrustError::Storage(StateError::CorruptState(
+            Corruption::TruncatedAppend
+        )))
+    ));
+    assert_eq!(fs::read(archive_path(&f))?, truncated);
+    assert_eq!(fs::read(ledger_path(&f))?, before);
+
+    fs::remove_file(archive_path(&f))?;
+    assert!(matches!(
+        l.archive(at(200)),
+        Err(TrustError::Storage(StateError::CorruptState(
+            Corruption::TruncatedAppend
+        )))
+    ));
+    assert_eq!(fs::read(ledger_path(&f))?, before);
     Ok(())
 }

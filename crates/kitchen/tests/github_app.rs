@@ -533,6 +533,25 @@ fn a_token_is_reused_until_it_nears_expiry_and_then_replaced() -> TestResult {
 }
 
 #[test]
+fn a_warm_token_is_never_handed_to_another_credential_reference() -> TestResult {
+    let fixture = Fixture::new(true)?;
+    let tokens = fixture.tokens()?;
+    let scope = TokenScope::for_mutation(&comment_on("acme/app")?);
+    assert_eq!(
+        tokens.token(&credential_ref(LOGIN)?, &scope, TIMEOUT)?,
+        "ghs_fake_1"
+    );
+    // The cache now holds a token for this scope; another reference still
+    // gets nothing from it.
+    assert_eq!(
+        tokens.token(&credential_ref("other-app[bot]")?, &scope, TIMEOUT),
+        Err(IntegrationError::ScopeMismatch)
+    );
+    assert_eq!(fixture.remote()?.mints().len(), 1);
+    Ok(())
+}
+
+#[test]
 fn an_app_missing_from_the_repository_is_refused_before_any_token_is_minted() -> TestResult {
     let fixture = Fixture::new(true)?;
     let tokens = fixture.tokens()?;

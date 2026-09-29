@@ -492,6 +492,11 @@ impl AppTokens {
         scope: &TokenScope,
         timeout: Duration,
     ) -> Result<String, IntegrationError> {
+        // Checked before the cache: a warm token is never handed to a
+        // credential reference other than the one this source is bound to.
+        if credential != self.key.reference() {
+            return Err(IntegrationError::ScopeMismatch);
+        }
         let deadline = Deadline::new(timeout);
         let fresh_until = self.clock.now().saturating_add(REFRESH_MARGIN);
         if let Some(cached) = self

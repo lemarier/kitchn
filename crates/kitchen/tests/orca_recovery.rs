@@ -169,10 +169,54 @@ fn a_truncated_transcript_without_an_agent_message_proves_nothing() -> TestResul
         Some(TranscriptProgress {
             complete: false,
             agent_spoke: false,
-            last_activity: Some(Timestamp::from_unix_millis(9_000)),
+            // The prompt sender's message is not the agent's progress.
+            last_activity: None,
         })
     );
     assert!(!signals.proves_never_started());
+    assert_eq!(signals.idle_since(), None);
+    Ok(())
+}
+
+#[test]
+fn only_the_agents_own_messages_count_as_its_activity() -> TestResult {
+    // The prompt sender wrote last; the agent's newest message is older. Its
+    // idle clock starts at its own message, not at the later nudge.
+    let nudged = SimWorker {
+        activity: "idle",
+        output: transcript(vec![
+            message("user", "do the task", 1_000),
+            message("assistant", "on it", 2_000),
+            message("user", "status?", 9_000),
+        ]),
+        ..live()
+    };
+    let signals = recovered(nudged, 300_000)?;
+    assert_eq!(
+        signals.idle_since(),
+        Some(Timestamp::from_unix_millis(2_000))
+    );
+    // A tool result is the agent's work too.
+    let tooling = SimWorker {
+        activity: "idle",
+        output: transcript(vec![
+            message("user", "do the task", 1_000),
+            message("tool", "cargo test", 4_000),
+        ]),
+        ..live()
+    };
+    assert_eq!(
+        recovered(tooling, 300_000)?.idle_since(),
+        Some(Timestamp::from_unix_millis(4_000))
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unanswered_prompt_has_no_idle_clock() -> TestResult {
+    let signals = recovered(unanswered("live"), 1_000)?;
+    assert_eq!(signals.prompt, PromptState::Idle);
+    assert_eq!(signals.idle_since(), None);
     Ok(())
 }
 

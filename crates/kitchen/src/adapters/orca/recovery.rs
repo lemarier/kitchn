@@ -65,7 +65,9 @@ impl WorkerSignals {
             transcript: self.transcript.map(|progress| TranscriptProgress {
                 complete: progress.complete,
                 agent_spoke: progress.agent_spoke,
-                last_activity: progress.last_activity,
+                // The idle clock counts the agent's own messages only: a prompt the
+                // agent has not answered is not progress to time out.
+                last_activity: progress.last_agent_activity,
             }),
             terminal: match (self.terminal, self.liveness) {
                 (TerminalOwner::Person, _) => TerminalHolder::Person,

@@ -48,9 +48,9 @@ earned, never assumed.
 > [!NOTE]
 > kitchn is early. You can register a house, bind repositories and draft issues
 > from your session today. Working issues and pull requests needs a house state
-> store that no command creates yet. Unattended runs are still being validated ([#1](https://github.com/lemarier/kitchen/issues/1)). The install
+> store that no command creates yet. Unattended runs are still being validated ([#1](https://github.com/lemarier/kitchn/issues/1)). The install
 > script and the crates.io release arrive with
-> [#18](https://github.com/lemarier/kitchen/issues/18).
+> [#18](https://github.com/lemarier/kitchn/issues/18).
 
 ## The brigade
 
@@ -88,7 +88,7 @@ can't cross.
 pinned toolchain) and [just](https://just.systems).
 
 ```sh
-git clone https://github.com/lemarier/kitchen && cd kitchen
+git clone https://github.com/lemarier/kitchn && cd kitchn
 just install
 ```
 

@@ -1,7 +1,7 @@
 ---
 import { type Block, steps } from "../data/quickstart";
 
-const repository = "https://github.com/lemarier/kitchen";
+const repository = "https://github.com/lemarier/kitchn";
 
 /** Splits `code` spans out of a sentence so they render as <code>. */
 const spans = (text: string) => text.split("`").map((part, i) => ({ code: i % 2 === 1, part }));

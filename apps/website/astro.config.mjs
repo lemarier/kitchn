@@ -1,7 +1,7 @@
 import starlight from "@astrojs/starlight";
 import { defineConfig } from "astro/config";
 
-const repository = "https://github.com/lemarier/kitchen";
+const repository = "https://github.com/lemarier/kitchn";
 
 export default defineConfig({
   site: "https://getkitchn.com",

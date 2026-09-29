@@ -8,6 +8,8 @@ use kitchen::{
     },
 };
 use serde_json::{Value, json};
+mod common;
+
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn fixture() -> Result<(HouseScope, DecisionBinding, Value)> {
     let house = HouseId::new("sample")?;
@@ -232,19 +234,20 @@ fn offline_recovery_does_not_create_a_new_ask() -> Result {
 #[cfg(unix)]
 #[test]
 fn optional_roger_capability_detection_needs_no_credentials() -> Result {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir()?;
     let binary = dir.path().join("roger");
     assert_eq!(RogerCli::detect(&binary)?, RogerAvailability::NotInstalled);
-    std::fs::write(&binary, "#!/bin/sh\nprintf '%s' 'unsupported old cli'\n")?;
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))?;
+    common::executable::write_executable(
+        &binary,
+        "#!/bin/sh\nprintf '%s' 'unsupported old cli'\n",
+    )?;
     assert_eq!(RogerCli::detect(&binary)?, RogerAvailability::Unsupported);
-    std::fs::write(
+    common::executable::write_executable(
         &binary,
         "#!/bin/sh\n[ -z \"$ROGER_TOKEN\" ] || exit 2\nprintf '%s' '--idem --decision-key --action-rev --action-target --action-limits --resume-task --resume-rev --body-file'\n",
     )?;
     assert_eq!(RogerCli::detect(&binary)?, RogerAvailability::Available);
-    std::fs::write(&binary, "#!/bin/sh\nexit 1\n")?;
+    common::executable::write_executable(&binary, "#!/bin/sh\nexit 1\n")?;
     assert_eq!(
         RogerCli::detect(&binary),
         Err(IntegrationError::Unavailable)
@@ -257,7 +260,7 @@ fn optional_roger_capability_detection_needs_no_credentials() -> Result {
 fn roger_cli_uses_selected_house_url_and_isolated_token_for_get_find_submit() -> Result {
     use kitchen::contracts::IdempotencyKey;
     use kitchen::integrations::github::CredentialFile;
-    use std::{os::unix::fs::PermissionsExt, time::Duration};
+    use std::time::Duration;
     let (scope, binding, mut receipt) = fixture()?;
     receipt["title"] = json!("-review");
     receipt["body"] = json!("fixture body");
@@ -284,8 +287,7 @@ esac
         log.display(),
         receipt
     );
-    std::fs::write(&executable, script)?;
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+    common::executable::write_executable(&executable, script)?;
     let credential = CredentialFile::new(scope.credential().clone(), token_path)?;
     let probe = ExternalRef::new("01ARZ3NDEKTSV4RRFFQ69G5FAV")?;
     assert!(matches!(
@@ -352,11 +354,10 @@ esac
     assert!(calls.contains("--idem fixture-key"));
     assert!(calls.contains("--supersedes 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
     let wrong_binary = directory.path().join("wrong-roger");
-    std::fs::write(
+    common::executable::write_executable(
         &wrong_binary,
         "#!/bin/sh\nif [ \"$2\" = --help ]; then printf '%s' '--idem --decision-key --action-rev --action-target --action-limits --resume-task --resume-rev --body-file'; else printf '%s' '{\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"requester\":\"foreign\"}'; fi\n",
     )?;
-    std::fs::set_permissions(&wrong_binary, std::fs::Permissions::from_mode(0o700))?;
     let wrong_credential =
         CredentialFile::new(scope.credential().clone(), directory.path().join("token"))?;
     let wrong = RogerCli::new(
@@ -390,7 +391,6 @@ fn roger_listing(
     answered: &[Value],
 ) -> Result<(tempfile::TempDir, RogerCli)> {
     use kitchen::integrations::github::CredentialFile;
-    use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir()?;
     let executable = directory.path().join("roger");
     let token_path = directory.path().join("token");
@@ -409,8 +409,7 @@ esac
         json!({"asks": open}),
         json!({"asks": answered})
     );
-    std::fs::write(&executable, script)?;
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+    common::executable::write_executable(&executable, script)?;
     let cli = RogerCli::new(
         executable,
         CredentialFile::new(scope.credential().clone(), token_path)?,

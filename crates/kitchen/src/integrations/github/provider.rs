@@ -612,10 +612,13 @@ fn inspect_markers(
 }
 
 #[cfg(all(test, unix))]
+#[path = "../../../tests/common/executable.rs"]
+mod executable;
+
+#[cfg(all(test, unix))]
 mod mutation_tests {
     use super::*;
     use crate::{CredentialId, HouseId, contracts::ExternalRef};
-    use std::os::unix::fs::PermissionsExt;
     use std::{cell::RefCell, collections::VecDeque};
 
     struct ReadFixture(RefCell<VecDeque<Value>>);
@@ -811,8 +814,7 @@ mod mutation_tests {
     ) -> Result<(tempfile::TempDir, GhCli, CredentialRef), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let executable = directory.path().join("gh");
-        std::fs::write(&executable, format!("#!/bin/sh\n{script}\n"))?;
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        super::executable::write_executable(&executable, format!("#!/bin/sh\n{script}\n"))?;
         let token_path = directory.path().join("token");
         std::fs::write(&token_path, "fixture-secret")?;
         let credential = CredentialRef::new(

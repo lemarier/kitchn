@@ -557,7 +557,6 @@ fn set_label_requires_existing_repository_definition() -> TestResult {
 #[cfg(unix)]
 #[test]
 fn gh_cli_provider_refusal_can_be_corrected_and_rerun() -> TestResult {
-    use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new()?;
     let (scope, grants, task, fence) = setup(&fixture, 2, &[Permission::EditLabels], "github")?;
     let directory = tempfile::tempdir()?;
@@ -565,7 +564,7 @@ fn gh_cli_provider_refusal_can_be_corrected_and_rerun() -> TestResult {
     let mode = directory.path().join("mode");
     let applied = directory.path().join("applied");
     std::fs::write(&mode, "deny")?;
-    std::fs::write(
+    common::executable::write_executable(
         &executable,
         format!(
             r##"#!/bin/sh
@@ -586,7 +585,6 @@ esac
             applied.display()
         ),
     )?;
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
     let token = directory.path().join("token");
     std::fs::write(&token, "fixture-secret")?;
     let cli = GhCli::new(

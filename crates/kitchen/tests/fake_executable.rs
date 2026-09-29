@@ -103,16 +103,37 @@ fn classify(spawned: std::io::Result<ExitStatus>) -> Round {
     }
 }
 
-fn round(path: &std::path::Path) -> Round {
+/// Attempts per round. A resource failure is retried with a fresh script
+/// after a short backoff, and each attempt writes and runs again, so every
+/// retry exercises the race too.
+const ATTEMPTS: u32 = 5;
+
+fn attempt(path: &std::path::Path) -> Round {
     if let Err(e) = write_executable(path, "#!/bin/sh\nexit 0\n") {
         return Round::Other(format!("write {:?}: {e}", e.kind()));
     }
     classify(Command::new(path).stdin(Stdio::null()).status())
 }
 
+/// One round: retried while it fails for a reason other than the race.
+fn round(dir: &std::path::Path, name: &str) -> Round {
+    let mut last = Round::Other("no attempt".into());
+    for n in 0..ATTEMPTS {
+        last = attempt(&dir.join(format!("{name}-{n}")));
+        match last {
+            Round::Succeeded | Round::Busy => return last,
+            Round::Unsuccessful(_) | Round::Other(_) => {
+                thread::sleep(std::time::Duration::from_millis(u64::from(n + 1) * 20));
+            }
+        }
+    }
+    last
+}
+
 /// Judge every writer's rounds. `None` is a writer thread that panicked.
 /// Passes only when each writer finished all `rounds_per_writer` rounds, none
-/// hit `ETXTBSY`, and at least one script ran to a successful exit.
+/// hit `ETXTBSY`, and at least half of all rounds ran a script to a
+/// successful exit, so the race was really exercised.
 fn judge(writers: &[Option<Vec<Round>>], rounds_per_writer: usize) -> Result<(), String> {
     let mut succeeded = 0;
     for (writer, rounds) in writers.iter().enumerate() {
@@ -135,8 +156,13 @@ fn judge(writers: &[Option<Vec<Round>>], rounds_per_writer: usize) -> Result<(),
             }
         }
     }
-    if succeeded == 0 {
-        return Err("no script exited successfully; the host cannot run this test".into());
+    let total = writers.len().saturating_mul(rounds_per_writer);
+    let required = total.div_ceil(2);
+    if succeeded < required {
+        return Err(format!(
+            "only {succeeded} of {total} rounds ran a script successfully (need {required}); \
+             the host is too loaded for this test to exercise the race"
+        ));
     }
     Ok(())
 }
@@ -145,9 +171,10 @@ fn judge(writers: &[Option<Vec<Round>>], rounds_per_writer: usize) -> Result<(),
 /// script fail with `ETXTBSY` right after it is written. The pre-fix pattern
 /// (`fs::write` then run) fails this on Linux. Only `ExecutableFileBusy`
 /// counts as the regression; other write or spawn errors and unsuccessful
-/// exits come from resource exhaustion on a loaded host, so they are printed
-/// and tolerated as long as every writer finished all its rounds and some
-/// script exited successfully. A writer panic fails the test.
+/// exits come from resource exhaustion on a loaded host, so a round retries
+/// them a few times and they are printed. The test still needs every writer
+/// to finish all its rounds and at least half of all rounds to run a script
+/// successfully. A writer panic fails the test.
 #[test]
 fn scripts_start_while_other_threads_fork_children() -> TestResult {
     const WRITERS: usize = 4;
@@ -169,7 +196,7 @@ fn scripts_start_while_other_threads_fork_children() -> TestResult {
                 let dir = dir.path();
                 scope.spawn(move || {
                     (0..ROUNDS)
-                        .map(|n| round(&dir.join(format!("script-{writer}-{n}"))))
+                        .map(|n| round(dir, &format!("script-{writer}-{n}")))
                         .collect::<Vec<_>>()
                 })
             })
@@ -229,7 +256,7 @@ fn a_run_without_a_successful_exit_fails() {
         full(|| Round::Other("write Other".into()), 2),
     ];
     let error = judge(&writers, 2).err().unwrap_or_default();
-    assert!(error.contains("no script exited successfully"), "{error}");
+    assert!(error.contains("only 0 of 4 rounds"), "{error}");
 }
 
 #[test]
@@ -241,11 +268,14 @@ fn a_busy_round_fails_even_among_successes() {
 }
 
 #[test]
-fn tolerated_failures_pass_with_at_least_one_success() {
-    let rounds = vec![
-        Round::Succeeded,
-        Round::Unsuccessful("exit 1".into()),
-        Round::Other("spawn WouldBlock".into()),
-    ];
-    assert_eq!(judge(&[Some(rounds)], 3), Ok(()));
+fn tolerated_failures_pass_only_while_half_the_rounds_succeed() {
+    let at = |succeeded: usize| {
+        let mut rounds: Vec<_> = (0..succeeded).map(|_| Round::Succeeded).collect();
+        rounds.extend((succeeded..4).map(|_| Round::Other("spawn WouldBlock".into())));
+        judge(&[Some(rounds)], 4)
+    };
+    assert_eq!(at(2), Ok(()));
+    assert_eq!(at(4), Ok(()));
+    let error = at(1).err().unwrap_or_default();
+    assert!(error.contains("only 1 of 4 rounds"), "{error}");
 }

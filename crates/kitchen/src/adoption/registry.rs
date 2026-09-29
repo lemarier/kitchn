@@ -27,6 +27,38 @@ const BINDINGS: &str = "repositories";
 /// Longest wait for the registry lock before reporting it busy.
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Held for the duration of one registry mutation.
+///
+/// The lock is an `flock`-style lock on the open file description, the same
+/// kind older Kitchen versions take, so mixed versions still exclude each
+/// other. A child forked by another thread shares that description until it
+/// execs, so closing the descriptor alone would leave the lock held; dropping
+/// this releases it explicitly first.
+struct RegistryLock(File);
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        // `drop` cannot report a failed unlock. The close that follows
+        // still releases the lock once no child shares the description.
+        let _unlock_result = self.0.unlock();
+    }
+}
+
+/// Outcome of one non-blocking attempt on the lock file.
+enum Attempt {
+    Locked,
+    Contended,
+}
+
+/// Take the file lock without blocking.
+fn try_lock_file(file: &File) -> Result<Attempt, HouseError> {
+    match file.try_lock() {
+        Ok(()) => Ok(Attempt::Locked),
+        Err(fs::TryLockError::WouldBlock) => Ok(Attempt::Contended),
+        Err(fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
 /// External registry containing house policy, immutable snapshots, and one
 /// binding per repository. It is the only place Kitchen records a repository's
 /// house; nothing is kept in working trees. All paths are explicit; opening it
@@ -385,7 +417,7 @@ impl HouseRegistry {
     fn config_path(&self, house: &HouseId) -> PathBuf {
         self.root.join("houses").join(format!("{house}.json"))
     }
-    fn lock(&self) -> Result<File, HouseError> {
+    fn lock(&self) -> Result<RegistryLock, HouseError> {
         ensure_external(&self.root)?;
         if !self.root.is_dir() {
             return Err(HouseError::HouseSelection);
@@ -400,23 +432,88 @@ impl HouseRegistry {
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        // Wait briefly: a process forked by another thread can hold a copy of
-        // a just-released lock until it execs. A longer hold is a real writer.
+        // Wait briefly for a writer that is about to release; a longer hold
+        // is a real writer.
         let started = std::time::Instant::now();
         let mut backoff = std::time::Duration::from_millis(1);
         loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(file),
-                Err(fs::TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+            match try_lock_file(&file)? {
+                Attempt::Locked => return Ok(RegistryLock(file)),
+                Attempt::Contended if started.elapsed() < LOCK_WAIT => {
                     std::thread::sleep(backoff);
                     backoff = backoff
                         .saturating_mul(2)
                         .min(std::time::Duration::from_millis(20));
                 }
-                Err(fs::TryLockError::WouldBlock) => return Err(HouseError::Busy),
-                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+                Attempt::Contended => return Err(HouseError::Busy),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn registry() -> Result<(tempfile::TempDir, HouseRegistry), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let registry = HouseRegistry::new(directory.path().canonicalize()?)?;
+        Ok((directory, registry))
+    }
+
+    #[test]
+    fn a_shared_description_does_not_extend_the_lock() -> TestResult {
+        let (_directory, registry) = registry()?;
+        let held = registry.lock()?;
+        // What a child forked before its exec holds: the same description.
+        let inherited = held.0.try_clone()?;
+        drop(held);
+        let reacquired = registry.lock();
+        drop(inherited);
+        assert!(reacquired.is_ok(), "a shared description kept the lock");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_sharing_the_description_does_not_extend_the_lock() -> TestResult {
+        let (_directory, registry) = registry()?;
+        let held = registry.lock()?;
+        // The child keeps the description past exec, standing in for one
+        // forked by another thread that has not exec'd yet.
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .stdin(std::process::Stdio::from(held.0.try_clone()?))
+            .spawn()?;
+        drop(held);
+        let reacquired = registry.lock();
+        let alive = child.try_wait()?.is_none();
+        child.kill()?;
+        child.wait()?;
+        assert!(alive, "child must still share the description");
+        assert!(reacquired.is_ok(), "child retained the registry lock");
+        Ok(())
+    }
+
+    #[test]
+    fn a_lock_held_on_another_description_is_contended() -> TestResult {
+        let (_directory, registry) = registry()?;
+        let held = registry.lock()?;
+        let other = File::open(registry.root().join("installation.lock"))?;
+        assert!(matches!(try_lock_file(&other)?, Attempt::Contended));
+        drop(held);
+        assert!(matches!(try_lock_file(&other)?, Attempt::Locked));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unopenable_lock_file_is_an_error_not_busy() -> TestResult {
+        let (_directory, registry) = registry()?;
+        fs::create_dir(registry.root().join("installation.lock"))?;
+        assert!(matches!(registry.lock(), Err(HouseError::Io(_))));
+        Ok(())
     }
 }
 

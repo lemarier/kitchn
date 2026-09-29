@@ -5,7 +5,7 @@ use kitchen::{
         HouseRegistry, InstructionAsset, InstructionBundle, RelativePath, role_cards_digest,
     },
     contracts::CommitId,
-    house::{HouseConfig, HouseError},
+    house::HouseConfig,
 };
 use std::{
     cell::Cell,
@@ -93,21 +93,11 @@ impl Fixture {
         };
         self.install(&bundle)
     }
-    /// Select `bundle` as the house's guidance. Other tests spawn the CLI
-    /// concurrently, and a child forked while this process holds the registry
-    /// lock keeps it until exec, so `Busy` is retried within a bound.
+    /// Select `bundle` as the house's guidance.
     fn install(&self, bundle: &InstructionBundle) -> Result {
-        for _ in 0..100 {
-            let current = self.registry.load(&bundle.house)?;
-            match self.registry.update(&current, bundle) {
-                Err(HouseError::Busy) => std::thread::sleep(std::time::Duration::from_millis(20)),
-                result => {
-                    result?;
-                    return Ok(());
-                }
-            }
-        }
-        Err("registry stayed busy".into())
+        let current = self.registry.load(&bundle.house)?;
+        self.registry.update(&current, bundle)?;
+        Ok(())
     }
     fn command(&self, verb: &str, target: &Path) -> Command {
         self.command_for(verb, target, "test")

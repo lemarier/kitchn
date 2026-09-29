@@ -515,6 +515,66 @@ impl<'a> StaleMarkers<'a> {
     }
 }
 
+/// A stale-issue report the gardener posted, to be confirmed on the forge.
+#[derive(Debug, Clone, Copy)]
+pub struct StaleReport<'a> {
+    /// Repository of the stale issue.
+    pub repository: &'a Repository,
+    /// The stale issue the report is about.
+    pub issue: IssueNumber,
+    /// Provider id of the report comment.
+    pub comment: u64,
+    /// The house identity that posted the report.
+    pub reporter: &'a ExternalRef,
+}
+
+/// Record stale `issue` as handled once its report is confirmed on the forge.
+///
+/// The worker's word is not evidence. The report comment must be read back
+/// on the issue and authored by `reporter`, the house
+/// identity that posted it; only then is the issue read again and its
+/// `updated_at` recorded, which covers the report's own update. A missing
+/// or foreign comment, a closed issue, or an incomplete read records
+/// nothing, so the issue keeps waking the schedule. Running it again after
+/// a restart records the same revision again (no change) or a newer one.
+///
+/// # Errors
+/// [`WorkflowError::IncompleteEvidence`] when the comment is absent or the
+/// issue read is incomplete, [`WorkflowError::DecisionMismatch`] when the
+/// comment has another author or the issue is not open,
+/// [`WorkflowError::PrecheckFailed`] when a read fails, plus every error of
+/// [`StaleMarkers::record`].
+pub fn record_reported<T: GitHubReadTransport>(
+    client: &GitHubClient<T>,
+    markers: &StaleMarkers<'_>,
+    house: &HouseId,
+    report: &StaleReport<'_>,
+    recorded_by: &Claimant,
+    now: Timestamp,
+) -> crate::Result<MarkerRecording> {
+    let StaleReport {
+        repository,
+        issue,
+        comment: report_comment,
+        reporter,
+    } = *report;
+    let comments = known(client.comments(house, repository, issue))?;
+    let comment = comments
+        .iter()
+        .find(|comment| comment.id == report_comment)
+        .ok_or(WorkflowError::IncompleteEvidence)?;
+    if comment.user.login != reporter.as_str() {
+        return Err(WorkflowError::DecisionMismatch.into());
+    }
+    let current = known(client.issue(house, repository, issue))?;
+    match current.state {
+        IssueState::Open => {}
+        IssueState::Closed => return Err(WorkflowError::DecisionMismatch.into()),
+        IssueState::Unknown => return Err(WorkflowError::IncompleteEvidence.into()),
+    }
+    markers.record(repository, issue, current.updated_at, recorded_by, now)
+}
+
 /// Evidence that the house holds a standing [`Permission::CloseIssue`] grant
 /// for one repository. No other permission implies it, and consent-only
 /// policy limits do not count for unattended runs.

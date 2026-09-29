@@ -318,3 +318,170 @@ fn precheck_failures_never_exit_as_idle() -> TestResult {
     assert!(missing.stdout.is_empty());
     Ok(())
 }
+
+fn comment(id: u64, login: &str) -> String {
+    serde_json::json!({"id":id,"user":{"login":login},"body":"stale report","created_at":"2999-01-01T00:00:00Z","updated_at":"2999-01-01T00:00:00Z"}).to_string()
+}
+
+/// A fake `gh` answering issue 3's comments and its own read, for
+/// `gardener record-handled`; `$6` is the API endpoint.
+fn fake_report_gh(root: &Path, comments: &str, issue_3: &str) -> TestResult<PathBuf> {
+    let script = format!(
+        "#!/bin/sh\nif [ \"$4\" = user ]; then printf '%s' '{{\"login\":\"sample-bot\"}}'; exit 0; fi\ncase \"$6\" in\n  *issues/3/comments*) printf '%s' '{comments}' ;;\n  *issues/3*) printf '%s' '{issue_3}' ;;\n  *) exit 1 ;;\nesac\n"
+    );
+    let path = root.join("gh-report");
+    executable::write_executable(&path, script)?;
+    Ok(path)
+}
+
+fn record_argv(root: &Path, gh: &Path, comment_id: u64) -> TestResult<Vec<String>> {
+    let token = root.join("token");
+    std::fs::write(&token, "sanitized-fixture-token")?;
+    house_store(root)?;
+    let path = |path: &Path| path.to_str().map(str::to_owned).ok_or("non-UTF-8 path");
+    Ok(vec![
+        env!("CARGO_BIN_EXE_kitchen").into(),
+        "gardener".into(),
+        "record-handled".into(),
+        "--house".into(),
+        "sample".into(),
+        "--repository".into(),
+        "sample/project".into(),
+        "--requester".into(),
+        "sample-bot".into(),
+        "--credential".into(),
+        "read".into(),
+        "--credential-file".into(),
+        path(&token)?,
+        "--gh".into(),
+        path(gh)?,
+        "--store".into(),
+        path(&root.join("house"))?,
+        "--issue".into(),
+        "3".into(),
+        "--report-comment".into(),
+        comment_id.to_string(),
+    ])
+}
+
+/// The precheck's answer for stale issue 3 as `updated` after the report.
+fn precheck_after(root: &Path, updated: &str) -> TestResult<PrecheckOutcome> {
+    let current = issue(3, "open", updated, &[]);
+    let gh = fake_gh(root, &format!("[{current}]"), &format!("[{current}]"))?;
+    Ok(outcome(&run(&scheduled_argv(root, gh)?)?))
+}
+
+#[test]
+fn record_handled_after_a_confirmed_report_keeps_the_next_run_idle() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let stale = issue(3, "open", "2000-01-01T00:00:00Z", &[]);
+    let gh = fake_gh(root.path(), "[]", &format!("[{stale}]"))?;
+    assert_eq!(
+        outcome(&run(&scheduled_argv(root.path(), gh)?)?),
+        PrecheckOutcome::Actionable
+    );
+
+    // The report moved the issue's last update; the comment is on the forge.
+    let reported = issue(3, "open", "2999-01-01T00:00:00Z", &[]);
+    let gh = fake_report_gh(
+        root.path(),
+        &format!("[{}]", comment(77, "sample-bot")),
+        &reported,
+    )?;
+    let recorded = run(&record_argv(root.path(), &gh, 77)?)?;
+    assert_eq!(
+        recorded.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    assert_eq!(String::from_utf8(recorded.stdout)?, "recorded\n");
+    assert_eq!(
+        precheck_after(root.path(), "2999-01-01T00:00:00Z")?,
+        PrecheckOutcome::Idle
+    );
+
+    // Restart: the worker runs the step again after a crash. The same
+    // revision changes nothing and the run stays idle.
+    let again = run(&record_argv(root.path(), &gh, 77)?)?;
+    assert_eq!(again.status.code(), Some(0));
+    assert_eq!(
+        precheck_after(root.path(), "2999-01-01T00:00:00Z")?,
+        PrecheckOutcome::Idle
+    );
+
+    // Someone else answers afterwards: that wakes the schedule again.
+    assert_eq!(
+        precheck_after(root.path(), "2999-01-02T00:00:00Z")?,
+        PrecheckOutcome::Actionable
+    );
+    Ok(())
+}
+
+#[test]
+fn record_handled_records_nothing_when_the_report_is_not_confirmed() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let reported = issue(3, "open", "2999-01-01T00:00:00Z", &[]);
+
+    // The report failed: no comment with that id exists on the issue.
+    let gh = fake_report_gh(root.path(), "[]", &reported)?;
+    let missing = run(&record_argv(root.path(), &gh, 77)?)?;
+    assert_eq!(missing.status.code(), Some(3));
+    assert!(missing.stdout.is_empty());
+
+    // A comment by someone else is not the gardener's report.
+    let gh = fake_report_gh(
+        root.path(),
+        &format!("[{}]", comment(77, "someone-else")),
+        &reported,
+    )?;
+    let foreign = run(&record_argv(root.path(), &gh, 77)?)?;
+    assert_eq!(foreign.status.code(), Some(3));
+
+    // A closed issue needs no stale handling.
+    let closed = issue(3, "closed", "2999-01-01T00:00:00Z", &[]);
+    let gh = fake_report_gh(
+        root.path(),
+        &format!("[{}]", comment(77, "sample-bot")),
+        &closed,
+    )?;
+    assert_eq!(
+        run(&record_argv(root.path(), &gh, 77)?)?.status.code(),
+        Some(3)
+    );
+
+    // The forge read fails.
+    let gh = fake_report_gh(root.path(), "not json", &reported)?;
+    let failed = run(&record_argv(root.path(), &gh, 77)?)?;
+    assert_eq!(failed.status.code(), Some(3));
+    assert!(!String::from_utf8(failed.stderr)?.contains("sanitized-fixture-token"));
+
+    // Nothing was recorded, so the issue still wakes the schedule.
+    assert_eq!(
+        precheck_after(root.path(), "2000-01-01T00:00:00Z")?,
+        PrecheckOutcome::Actionable
+    );
+    Ok(())
+}
+
+#[test]
+fn record_handled_rejects_invalid_arguments_before_reading() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let gh = root.path().join("gh");
+    let mut argv = record_argv(root.path(), &gh, 77)?;
+    let store = argv
+        .iter()
+        .position(|arg| arg == "--store")
+        .ok_or("missing store")?;
+    *argv.get_mut(store + 1).ok_or("missing value")? = "house".into();
+    assert_eq!(run(&argv)?.status.code(), Some(2));
+
+    let mut argv = record_argv(root.path(), &gh, 77)?;
+    let issue = argv
+        .iter()
+        .position(|arg| arg == "--issue")
+        .ok_or("missing issue")?;
+    *argv.get_mut(issue + 1).ok_or("missing value")? = "0".into();
+    assert_eq!(run(&argv)?.status.code(), Some(2));
+    Ok(())
+}

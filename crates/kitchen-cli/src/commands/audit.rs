@@ -157,7 +157,7 @@ pub fn run(args: AuditArgs) -> Result<(String, bool), kitchen::Error> {
             open: open.as_ref(),
             publication: Publication {
                 forge,
-                repositories: &config.repositories,
+                destinations: &config.posting_destinations,
             },
         },
     )?;

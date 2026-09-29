@@ -48,7 +48,8 @@
 //! The report copies no free text from its inputs: finding consequences,
 //! task specifications, and transcripts stay in the house. Evidence sources
 //! are listed only when they are public-safe [`EvidenceLink`]s: an `https`
-//! link on the house's forge into one of its own repositories, or a Kitchen
+//! link on the house's forge to an issue, pull request, or commit in a repository
+//! the drafts are posted to, or a Kitchen
 //! identifier. Every other source is private: it is counted, never listed.
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -289,8 +290,9 @@ pub struct Publication<'a> {
     /// The forge the house's binding names, if any. Without one no source
     /// is a public forge link.
     pub forge: Option<ForgeKind>,
-    /// The house's own repositories.
-    pub repositories: &'a BTreeSet<Repository>,
+    /// The repositories drafts are posted to (the house's posting
+    /// destinations); only links into these are published.
+    pub destinations: &'a BTreeSet<Repository>,
 }
 
 impl Publication<'_> {
@@ -300,7 +302,7 @@ impl Publication<'_> {
             evidence.total = evidence.total.saturating_add(1);
             match self
                 .forge
-                .and_then(|forge| EvidenceLink::forge(forge, self.repositories, source))
+                .and_then(|forge| EvidenceLink::forge(forge, self.destinations, source))
             {
                 Some(link) if evidence.links.len() < MAX_LISTED => evidence.links.push(link),
                 Some(_) => evidence.unlisted = evidence.unlisted.saturating_add(1),
@@ -336,23 +338,26 @@ pub struct AuditInputs<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "kebab-case")]
 pub enum EvidenceLink {
-    /// An `https` link on the house's forge into one of its repositories.
+    /// An `https` link on the house's forge to an issue, pull request, or
+    /// commit in a repository the drafts are posted to.
     Forge(ExternalRef),
     /// A Kitchen schedule consumer of the house.
     Consumer(ConsumerId),
 }
 
 impl EvidenceLink {
-    /// `source` as a forge link when it is public-safe: for GitHub,
-    /// `https://github.com/<owner>/<repo>` with `<owner>/<repo>` one of
-    /// `repositories`, then only path segments of ASCII letters, digits, `-`,
-    /// `_`, and `.` (never `.` or `..` alone), and an optional `#` fragment
-    /// of letters, digits, `-`, and `_`. A query, port, credential, or any
-    /// other host is private.
+    /// `source` as a forge link when it is safe to publish with a draft: for
+    /// GitHub, `https://github.com/<owner>/<repo>` with `<owner>/<repo>` one
+    /// of `destinations` (the repositories drafts are posted to, so a link
+    /// never reaches a reader who cannot already see its repository),
+    /// optionally followed by exactly `issues/<number>`, `pull/<number>`, or
+    /// `commit/<7-40 hex>`, and an optional `#` fragment of letters, digits,
+    /// `-`, and `_`. Any other path (a transcript or file locator, for
+    /// example), a query, port, credential, or other host is private.
     #[must_use]
     pub fn forge(
         forge: ForgeKind,
-        repositories: &BTreeSet<Repository>,
+        destinations: &BTreeSet<Repository>,
         source: &ExternalRef,
     ) -> Option<Self> {
         match forge {
@@ -376,15 +381,23 @@ impl EvidenceLink {
                 };
                 let mut segments = path.split('/');
                 let (owner, name) = (segments.next()?, segments.next()?);
-                let own = repositories.iter().any(|repository| {
+                let own = destinations.iter().any(|repository| {
                     repository.owner().eq_ignore_ascii_case(owner)
                         && repository.name().eq_ignore_ascii_case(name)
                 });
-                (own && fragment_safe
-                    && segment_safe(owner)
-                    && segment_safe(name)
-                    && segments.all(segment_safe))
-                .then(|| Self::Forge(source.clone()))
+                let resource = match (segments.next(), segments.next(), segments.next()) {
+                    (None, None, None) => true,
+                    (Some("issues" | "pull"), Some(number), None) => {
+                        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                    }
+                    (Some("commit"), Some(sha), None) => {
+                        (7..=40).contains(&sha.len())
+                            && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    }
+                    _ => false,
+                };
+                (own && resource && fragment_safe && segment_safe(owner) && segment_safe(name))
+                    .then(|| Self::Forge(source.clone()))
             }
         }
     }

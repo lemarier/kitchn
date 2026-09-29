@@ -80,13 +80,27 @@ fn finding(name: &str) -> TestResult<Finding> {
     })
 }
 
+/// A stable pull-request number for a fixture name, since only numbered
+/// pull requests are publishable links.
+fn number(name: &str) -> u32 {
+    name.bytes().fold(7_u32, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(u32::from(byte))
+    }) % 100_000
+}
+
 fn pr(name: &str) -> TestResult<ExternalRef> {
-    source(&format!("https://github.com/example/project/pull/{name}"))
+    source(&format!(
+        "https://github.com/example/project/pull/{}",
+        number(name)
+    ))
 }
 
 /// A public review comment on `name`'s pull request.
 fn review(name: &str) -> String {
-    format!("https://github.com/example/project/pull/{name}#discussion_r1")
+    format!(
+        "https://github.com/example/project/pull/{}#discussion_r1",
+        number(name)
+    )
 }
 
 fn forge(value: &str) -> TestResult<EvidenceLink> {
@@ -337,7 +351,7 @@ fn audit_with(
             open,
             publication: Publication {
                 forge: Some(ForgeKind::GitHub),
-                repositories: &repositories,
+                destinations: &repositories,
             },
         },
     ))
@@ -873,7 +887,7 @@ fn the_audit_refuses_to_read_another_house() -> TestResult {
     let (schedules, repositories) = (schedules()?, repositories()?);
     let publication = Publication {
         forge: Some(ForgeKind::GitHub),
-        repositories: &repositories,
+        destinations: &repositories,
     };
     let cases = [
         (&foreign_ledger, &f.store, &ours),
@@ -1032,7 +1046,7 @@ fn an_unknown_house_budget_reports_without_proposing() -> TestResult {
 }
 
 #[test]
-fn only_links_into_the_house_repositories_are_public() -> TestResult {
+fn only_resource_links_into_the_posting_destinations_are_public() -> TestResult {
     let repositories = repositories()?;
     let public = |value: &str| -> TestResult<bool> {
         Ok(EvidenceLink::forge(ForgeKind::GitHub, &repositories, &source(value)?).is_some())
@@ -1040,7 +1054,7 @@ fn only_links_into_the_house_repositories_are_public() -> TestResult {
     for listed in [
         "https://github.com/example/project/pull/7",
         "https://github.com/example/project/pull/7#discussion_r12",
-        "https://github.com/Example/Project/commit/abc123",
+        "https://github.com/Example/Project/commit/abc1234",
         "https://github.com/example/project",
     ] {
         assert!(public(listed)?, "{listed} should be public");
@@ -1054,6 +1068,11 @@ fn only_links_into_the_house_repositories_are_public() -> TestResult {
         "https://github.com/example/project/../other/pull/7",
         "https://github.com/example/project/pull/7/",
         "https://github.com/example/project/pull/7?token=secret",
+        "https://github.com/example/project/transcripts/run-42",
+        "https://github.com/example/project/blob/main/private.md",
+        "https://github.com/example/project/issues/abc",
+        "https://github.com/example/project/commit/zzz1234",
+        "https://github.com/example/project/pull/7/files",
         "https://github.com/example/project/pull/7#",
         "https://github.com/example/project/pull/7#a=b",
         "https://github.com:8443/example/project/pull/7",
@@ -1075,7 +1094,8 @@ fn evidence_beyond_the_listing_limit_is_counted() -> TestResult {
         findings: (0..many)
             .map(|n| {
                 finding(&format!(
-                    "https://github.com/example/project/pull/many#r{n}"
+                    "https://github.com/example/project/pull/{}#r{n}",
+                    number("many")
                 ))
             })
             .collect::<TestResult<_>>()?,
@@ -1113,7 +1133,7 @@ fn evidence_beyond_the_listing_limit_is_counted() -> TestResult {
             open: Some(&BTreeSet::new()),
             publication: Publication {
                 forge: None,
-                repositories: &repositories,
+                destinations: &repositories,
             },
         },
     )?;

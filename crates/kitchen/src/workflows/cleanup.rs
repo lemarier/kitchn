@@ -1175,7 +1175,9 @@ pub fn retire(
             .into_iter()
             .filter_map(|key| match key.item {
                 WorkItem::Resource { resource } => Some(resource),
-                WorkItem::Issue { .. } | WorkItem::PullRequest { .. } => None,
+                WorkItem::Issue { .. }
+                | WorkItem::PullRequest { .. }
+                | WorkItem::Repository { .. } => None,
             })
             .collect(),
         tasks,

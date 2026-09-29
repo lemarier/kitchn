@@ -1,28 +1,38 @@
 //! Merge trains: overlapping ready pull requests are planned into one
-//! stack, judged layer by layer at their exact stacked heads, and merged
-//! together under per-layer merge grants. Commands run against a recording
-//! stack runner and a stand-in `gh`; no forge or `gh stack` is contacted.
+//! stack, judged layer by layer at their exact stacked heads, and landed
+//! bottom first through the gate's head-matched merge. Assembly runs
+//! against a recording stack runner and the forge re-read against a
+//! scripted transport; no forge or `gh stack` is contacted.
 
 mod common;
-mod workflows_support;
 
-use std::{cell::RefCell, collections::BTreeSet, path::PathBuf, time::Duration};
+use std::{
+    cell::RefCell, collections::BTreeSet, collections::VecDeque, path::PathBuf, time::Duration,
+};
 
 use common::{TestResult, commit, house};
 use kitchen::{
     BackendId, CredentialId, HouseId,
     contracts::{
-        BranchName, EvidenceSubject, EvidenceVerdict, ExternalRef, Grant, IssueNumber, Permission,
-        Repository,
+        BranchName, EvidenceSubject, EvidenceVerdict, ExternalRef, GitHubAction, Grant,
+        IssueNumber, MergeMethod, Permission, Repository,
     },
     house::{HouseConfig, MergeSubject},
+    integrations::github::{
+        CredentialRef, GitHubClient, GitHubReadTransport, HouseScope, IntegrationError,
+        MergeStatusValue, PostingBudget, ReadLimits, ReadRequest,
+    },
     workflows::{
-        gate::MergeGrant,
+        gate::{
+            self, Admission, BaseTipRead, Checks, ExpectedReviewer, FixGrant, Gap, GateEvidence,
+            GateGrants, GateHistory, GateMode, GateRun, MergeGrant, RecordedDecision,
+            ReviewTriggers, ReviewerOutcome, SemanticReview, Verdict,
+        },
         ready::{HeadEvidence, MergeReadiness, NotReady},
-        stack::{GhStack, MAX_STACK_LAYERS, StackCommand, StackLink, StackResult, StackRunner},
+        stack::{MAX_STACK_LAYERS, StackCommand, StackLink, StackResult, StackRunner},
         train::{
             Deferral, LayerState, Touch, TrainCandidate, TrainDecision, TrainError, TrainLayer,
-            TrainRefusal, evaluate_train, merge_train, plan_train, reorder_commands,
+            TrainRefusal, evaluate_train, merge_train, plan_train,
         },
     },
 };
@@ -41,6 +51,10 @@ fn trunk() -> TestResult<BranchName> {
 
 fn number(value: u64) -> TestResult<IssueNumber> {
     Ok(IssueNumber::new(value)?)
+}
+
+fn numbers(values: &[u64]) -> TestResult<Vec<IssueNumber>> {
+    values.iter().map(|value| number(*value)).collect()
 }
 
 fn layer_branch(number: u64) -> TestResult<BranchName> {
@@ -132,6 +146,20 @@ fn green(number_: u64, head: char, base: char) -> TestResult<TrainLayer> {
     layer(number_, head, base, EvidenceVerdict::Pass)
 }
 
+/// A layer at `head` on `base` whose evidence is about an older subject.
+fn stale(number_: u64, head: char, base: char, old: (char, char)) -> TestResult<TrainLayer> {
+    Ok(TrainLayer {
+        readiness: readiness(
+            number_,
+            (head, base),
+            old,
+            EvidenceVerdict::Pass,
+            EvidenceVerdict::Pass,
+        )?,
+        branch: layer_branch(number_)?,
+    })
+}
+
 fn merge_subject(number_: u64, head: char, base: char) -> TestResult<MergeSubject> {
     Ok(MergeSubject {
         repository: repo()?,
@@ -160,22 +188,160 @@ fn merge_house(id: &HouseId) -> TestResult<HouseConfig> {
     Ok(config)
 }
 
-/// The readiness-checked merge grant for each `(number, head, base)`.
-fn grants(subjects: &[(u64, char, char)]) -> TestResult<Vec<MergeGrant>> {
+/// The readiness-checked merge grant for pull request `number_` at `head`
+/// on `base`.
+fn grant(number_: u64, head: char, base: char) -> TestResult<MergeGrant> {
     let issued = merge_house(&house()?)?.issue_authority(&[], &[])?;
-    subjects
-        .iter()
-        .map(|(number_, head, base)| {
-            Ok(MergeGrant::resolve(
-                &issued,
-                &merge_subject(*number_, *head, *base)?,
-                &BackendId::new("github")?,
-            )?)
-        })
-        .collect()
+    Ok(MergeGrant::resolve(
+        &issued,
+        &merge_subject(number_, head, base)?,
+        &BackendId::new("github")?,
+    )?)
 }
 
-/// A stack runner that records every command and link and answers `Done`.
+/// Gate evidence for pull request `number_` at `head` on the trunk at
+/// `base`, with every rule met.
+fn gate_evidence(number_: u64, head: char, base: char) -> TestResult<GateEvidence> {
+    let (head, base) = (commit(head)?, commit(base)?);
+    Ok(GateEvidence {
+        house: house()?,
+        repository: repo()?,
+        number: number(number_)?,
+        head: head.clone(),
+        head_branch: Some(format!("lemarier/pr-{number_}")),
+        base: base.clone(),
+        base_branch: Some(trunk()?),
+        base_tip: BaseTipRead::Read,
+        head_age: Some(Duration::from_secs(3600)),
+        open: Some(true),
+        draft: Some(false),
+        same_repository: Some(true),
+        targets_default: Some(true),
+        author_allowed: Some(true),
+        merge_state: Some(MergeStatusValue::Clean),
+        contains_base: Some(true),
+        checks: Checks::Passed,
+        reviewers: vec![ExpectedReviewer {
+            name: "reviewer".into(),
+            reviewed_head: Some(head.clone()),
+            outcome: ReviewerOutcome::Clean,
+        }],
+        threads_resolved: Some(true),
+        no_change_request: Some(true),
+        semantic_review: SemanticReview::Clean,
+        semantic_source: Some(ExternalRef::new(
+            "https://github.com/lemarier/kitchen/pull/1#review",
+        )?),
+        verified_findings: Vec::new(),
+        disproved_findings: Vec::new(),
+        semantic_head: Some(head.clone()),
+        semantic_base: Some(base.clone()),
+        semantic_read_only: true,
+        semantic_independent: true,
+        acceptance_met: Some(true),
+        hardware_complete: Some(true),
+        risk_classes: Some(Vec::new()),
+        risk_approval: None,
+        writer_working: false,
+        supporting_subject: Some((head, base)),
+        reopen_event: None,
+        follow_up: common::house_with_fix_rounds(None)?.follow_up_budget(),
+    })
+}
+
+/// The gate's decision on `e` under a merge grant for its exact subject,
+/// admitted for one submission as the durable store would admit it.
+fn recorded(e: &GateEvidence) -> TestResult<RecordedDecision> {
+    let head = e.head.as_str().chars().next().ok_or("empty head")?;
+    let base = e.base.as_str().chars().next().ok_or("empty base")?;
+    let grants = GateGrants {
+        merge: grant(e.number.get(), head, base)?,
+        fix_request: FixGrant::none(),
+        review_triggers: ReviewTriggers::none(),
+    };
+    Ok(RecordedDecision {
+        decision: gate::evaluate(e, grants, GateHistory::default()),
+        mode: GateMode::Active,
+        admission: Admission::Submit(kitchen::contracts::IdempotencyKey::from_ref(
+            ExternalRef::new("fake:effect/train")?,
+        )),
+    })
+}
+
+/// The gate's recorded merge of pull request `number_` at `head` on the
+/// trunk at `base`.
+fn gate_merge(number_: u64, head: char, base: char) -> TestResult<RecordedDecision> {
+    let decision = recorded(&gate_evidence(number_, head, base)?)?;
+    assert_eq!(decision.decision.verdict, Verdict::Merge);
+    Ok(decision)
+}
+
+/// A forge transport that answers reads from a script, in order.
+struct Forge {
+    responses: RefCell<VecDeque<serde_json::Value>>,
+    reads: RefCell<usize>,
+}
+
+impl GitHubReadTransport for Forge {
+    fn read(
+        &self,
+        _: &CredentialRef,
+        _: &ReadRequest,
+        _: Duration,
+        _: usize,
+    ) -> Result<Vec<u8>, IntegrationError> {
+        *self.reads.borrow_mut() += 1;
+        let next = self
+            .responses
+            .borrow_mut()
+            .pop_front()
+            .ok_or(IntegrationError::Unavailable)?;
+        serde_json::to_vec(&next).map_err(|_| IntegrationError::Unknown)
+    }
+}
+
+fn client(responses: Vec<serde_json::Value>) -> TestResult<GitHubClient<Forge>> {
+    let requester = ExternalRef::new("train-reader")?;
+    let scope = HouseScope::new(
+        house()?,
+        [repo()?],
+        requester.clone(),
+        CredentialRef::new(house()?, CredentialId::new("read")?, requester),
+        PostingBudget::new(0)?,
+        [],
+    )?;
+    Ok(GitHubClient::new(
+        scope,
+        Forge {
+            responses: RefCell::new(responses.into()),
+            reads: RefCell::new(0),
+        },
+        ReadLimits::default(),
+    ))
+}
+
+/// The forge as it reads just before a merge: pull request `number_` open
+/// at `head` against `base_ref`, and the trunk's tip at `tip`.
+fn forge(number_: u64, head: char, base_ref: &str, tip: char) -> TestResult<GitHubClient<Forge>> {
+    let (head, tip) = (commit(head)?, commit(tip)?);
+    client(vec![
+        serde_json::json!({
+            "number": number_, "state": "open", "draft": false, "merged": false,
+            "head": {"sha": head.as_str(), "ref": format!("lemarier/pr-{number_}"),
+                     "repo": {"full_name": "lemarier/kitchen"}},
+            "base": {"sha": tip.as_str(), "ref": base_ref},
+            "mergeable": true, "user": {"login": "allowed"}
+        }),
+        serde_json::json!({"name": "main", "commit": {"sha": tip.as_str()}}),
+    ])
+}
+
+/// A forge that must not be read: every read fails and is counted.
+fn unread() -> TestResult<GitHubClient<Forge>> {
+    client(Vec::new())
+}
+
+/// A stack runner that records every command and answers `Done`.
 #[derive(Default)]
 struct Recording {
     commands: RefCell<Vec<StackCommand>>,
@@ -192,30 +358,19 @@ impl StackRunner for Recording {
     }
 }
 
-fn run_all(runner: &Recording, commands: &[StackCommand]) -> Vec<StackResult> {
-    commands.iter().map(|command| runner.run(command)).collect()
-}
-
-fn assembly(trunk: &BranchName, numbers: &[u64]) -> TestResult<Vec<StackCommand>> {
-    Ok(vec![
-        StackCommand::Adopt {
-            trunk: trunk.clone(),
-            branches: numbers
-                .iter()
-                .map(|number_| layer_branch(*number_))
-                .collect::<TestResult<_>>()?,
-        },
-        StackCommand::RebaseUpstack,
-        StackCommand::Submit { ready: true },
-    ])
-}
-
 fn decision(layers: &[TrainLayer]) -> TestResult<TrainDecision> {
     Ok(evaluate_train(layers, &commit('0')?)?.0)
 }
 
+fn merging(ready: &[u64], deferred: &[u64]) -> TestResult<TrainDecision> {
+    Ok(TrainDecision::Merge {
+        ready: numbers(ready)?,
+        deferred: numbers(deferred)?,
+    })
+}
+
 #[test]
-fn three_overlapping_ready_pull_requests_become_one_train_and_merge_together() -> TestResult {
+fn overlapping_ready_pull_requests_become_one_train_and_land_bottom_first() -> TestResult {
     let candidates = [
         ready_candidate(12, files(&["src/error.rs"]))?,
         ready_candidate(13, files(&["src/a.rs", "src/b.rs"]))?,
@@ -249,8 +404,21 @@ fn three_overlapping_ready_pull_requests_become_one_train_and_merge_together() -
     // The stack tool assembles the train in that order.
     let runner = Recording::default();
     let commands = plan.assembly();
-    assert_eq!(commands, assembly(&trunk()?, &[11, 12, 13])?);
-    assert_eq!(run_all(&runner, &commands), vec![StackResult::Done; 3]);
+    assert_eq!(
+        commands,
+        vec![
+            StackCommand::Adopt {
+                trunk: trunk()?,
+                branches: vec![layer_branch(11)?, layer_branch(12)?, layer_branch(13)?],
+            },
+            StackCommand::RebaseUpstack,
+            StackCommand::Submit { ready: true },
+        ]
+    );
+    for command in &commands {
+        assert_eq!(runner.run(command), StackResult::Done);
+    }
+    assert_eq!(*runner.commands.borrow(), commands);
 
     // CI and review ran at every stacked head: #11 on trunk tip 0, #12 on
     // #11's head a, #13 on #12's head b.
@@ -259,244 +427,150 @@ fn three_overlapping_ready_pull_requests_become_one_train_and_merge_together() -
         green(12, 'b', 'a')?,
         green(13, 'c', 'b')?,
     ];
-    let (decision, states) = evaluate_train(&train, &commit('0')?)?;
-    assert_eq!(decision, TrainDecision::Merge { top: number(13)? });
+    let (outcome, states) = evaluate_train(&train, &commit('0')?)?;
+    assert_eq!(outcome, merging(&[11, 12, 13], &[])?);
     assert_eq!(states, vec![LayerState::Ready; 3]);
 
-    let merge = merge_train(
+    // The bottom layer lands through the gate's head-matched squash merge.
+    let request = merge_train(
         &house()?,
         &train,
-        &commit('0')?,
-        &grants(&[(11, 'a', '0'), (12, 'b', 'a'), (13, 'c', 'b')])?,
+        &trunk()?,
+        &gate_merge(11, 'a', '0')?,
+        &grant(11, 'a', '0')?,
+        &GateRun::new(),
+        &forge(11, 'a', "main", '0')?,
     )?;
-    assert_eq!(merge.top(), number(13)?);
+    assert_eq!(request.number, number(11)?);
+    assert_eq!(request.match_head, commit('a')?);
+    assert_eq!(request.checked_base, commit('0')?);
+    assert_eq!(request.base_branch, trunk()?);
     assert_eq!(
-        merge.layers(),
-        [
-            merge_subject(11, 'a', '0')?,
-            merge_subject(12, 'b', 'a')?,
-            merge_subject(13, 'c', 'b')?,
-        ]
+        request.mutation().action,
+        GitHubAction::MergePullRequest {
+            number: number(11)?,
+            expected_head: commit('a')?,
+            expected_base: trunk()?,
+            expected_base_commit: Some(commit('0')?),
+            method: MergeMethod::Squash,
+        }
     );
-    // One stack-tool merge lands the whole train.
-    assert_eq!(runner.run(&merge.command()), StackResult::Done);
+
+    // #11 squashed onto trunk as f. Rebased onto it, #12 and #13 have new
+    // heads d and e; once their CI ran there, #12 is the next bottom.
+    let next = [green(12, 'd', 'f')?, green(13, 'e', 'd')?];
     assert_eq!(
-        runner.commands.borrow().last(),
-        Some(&StackCommand::Merge(merge.clone()))
+        evaluate_train(&next, &commit('f')?)?.0,
+        merging(&[12, 13], &[])?
     );
-    assert_eq!(merge.command().permissions(), [Permission::Merge]);
+    let request = merge_train(
+        &house()?,
+        &next,
+        &trunk()?,
+        &gate_merge(12, 'd', 'f')?,
+        &grant(12, 'd', 'f')?,
+        &GateRun::new(),
+        &forge(12, 'd', "main", 'f')?,
+    )?;
+    assert_eq!(
+        (request.number, request.match_head),
+        (number(12)?, commit('d')?)
+    );
     Ok(())
 }
 
 #[test]
-fn a_failing_middle_layer_is_moved_up_and_the_rest_merge() -> TestResult {
-    let train = [
+fn a_pending_middle_layer_never_blocks_the_ready_layers_below() -> TestResult {
+    let unreadable = [
+        green(11, 'a', '0')?,
+        layer(12, 'b', 'a', EvidenceVerdict::Unavailable)?,
+        green(13, 'c', 'b')?,
+    ];
+    let (outcome, states) = evaluate_train(&unreadable, &commit('0')?)?;
+    // #12 and everything above it wait for the next train; #11 merges.
+    assert_eq!(outcome, merging(&[11], &[12, 13])?);
+    assert_eq!(
+        states,
+        vec![
+            LayerState::Ready,
+            LayerState::Pending(vec![NotReady::ChecksNotGreen]),
+            LayerState::Ready,
+        ]
+    );
+    let request = merge_train(
+        &house()?,
+        &unreadable,
+        &trunk()?,
+        &gate_merge(11, 'a', '0')?,
+        &grant(11, 'a', '0')?,
+        &GateRun::new(),
+        &forge(11, 'a', "main", '0')?,
+    )?;
+    assert_eq!(request.number, number(11)?);
+
+    // A failure reported about another head is stale, not a failure here.
+    let (outcome, states) = evaluate_train(
+        &[
+            green(11, 'a', '0')?,
+            TrainLayer {
+                readiness: readiness(
+                    12,
+                    ('b', 'a'),
+                    ('8', 'a'),
+                    EvidenceVerdict::Pass,
+                    EvidenceVerdict::Fail,
+                )?,
+                branch: layer_branch(12)?,
+            },
+            green(13, 'c', 'b')?,
+        ],
+        &commit('0')?,
+    )?;
+    assert_eq!(outcome, merging(&[11], &[12, 13])?);
+    assert!(matches!(states.get(1), Some(LayerState::Pending(_))));
+
+    // A pending bottom layer holds everything: nothing below it can merge.
+    let pending_bottom = [
+        layer(11, 'a', '0', EvidenceVerdict::Unavailable)?,
+        green(12, 'b', 'a')?,
+    ];
+    assert_eq!(decision(&pending_bottom)?, TrainDecision::Hold);
+    assert_eq!(
+        merge_train(
+            &house()?,
+            &pending_bottom,
+            &trunk()?,
+            &gate_merge(11, 'a', '0')?,
+            &grant(11, 'a', '0')?,
+            &GateRun::new(),
+            &unread()?,
+        ),
+        Err(TrainRefusal::NotReady)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_failed_layer_is_deferred_and_a_failed_bottom_is_removed_by_its_owner() -> TestResult {
+    let failed_middle = [
         green(11, 'a', '0')?,
         layer(12, 'b', 'a', EvidenceVerdict::Fail)?,
         green(13, 'c', 'b')?,
     ];
-    let (first, states) = evaluate_train(&train, &commit('0')?)?;
-    assert_eq!(
-        first,
-        TrainDecision::Reorder {
-            order: vec![layer_branch(11)?, layer_branch(13)?, layer_branch(12)?],
-        }
-    );
+    let (outcome, states) = evaluate_train(&failed_middle, &commit('0')?)?;
+    assert_eq!(outcome, merging(&[11], &[12, 13])?);
     assert_eq!(
         states.get(1),
         Some(&LayerState::Failed(vec![NotReady::ChecksNotGreen]))
     );
-    // Nothing merges while the failing layer sits below another.
-    let all = grants(&[(11, 'a', '0'), (12, 'b', 'a'), (13, 'c', 'b')])?;
     assert_eq!(
-        merge_train(&house()?, &train, &commit('0')?, &all),
-        Err(TrainRefusal::NotReady)
+        decision(&[
+            green(11, 'a', '0')?,
+            green(12, 'b', 'a')?,
+            layer(13, 'c', 'b', EvidenceVerdict::Fail)?,
+        ])?,
+        merging(&[11, 12], &[13])?
     );
-    let TrainDecision::Reorder { order } = first else {
-        return Err("expected a reorder".into());
-    };
-    let runner = Recording::default();
-    let commands = reorder_commands(&trunk()?, &order);
-    let mut expected = vec![StackCommand::Unstack];
-    expected.extend(assembly(&trunk()?, &[11, 13, 12])?);
-    assert_eq!(commands, expected);
-    assert_eq!(run_all(&runner, &commands), vec![StackResult::Done; 4]);
-
-    // After the rebase #13 sits on #11 at a new head d, and #12 on top at e.
-    // While #12's CI runs again the train holds.
-    let pending_top = TrainLayer {
-        readiness: readiness(
-            12,
-            ('e', 'd'),
-            ('b', 'a'),
-            EvidenceVerdict::Pass,
-            EvidenceVerdict::Fail,
-        )?,
-        branch: layer_branch(12)?,
-    };
-    let reordered = [green(11, 'a', '0')?, green(13, 'd', 'a')?, pending_top];
-    assert_eq!(decision(&reordered)?, TrainDecision::Hold);
-
-    // #12 fails again at its new head: the layers below it merge.
-    let reordered = [
-        green(11, 'a', '0')?,
-        green(13, 'd', 'a')?,
-        layer(12, 'e', 'd', EvidenceVerdict::Fail)?,
-    ];
-    assert_eq!(
-        decision(&reordered)?,
-        TrainDecision::Merge { top: number(13)? }
-    );
-    let merge = merge_train(
-        &house()?,
-        &reordered,
-        &commit('0')?,
-        &grants(&[(11, 'a', '0'), (13, 'd', 'a')])?,
-    )?;
-    assert_eq!(merge.top(), number(13)?);
-    assert_eq!(
-        merge.layers(),
-        [merge_subject(11, 'a', '0')?, merge_subject(13, 'd', 'a')?]
-    );
-    // #13's grant must name its new base; one for its old place is not enough.
-    assert_eq!(
-        merge_train(
-            &house()?,
-            &reordered,
-            &commit('0')?,
-            &grants(&[(11, 'a', '0'), (13, 'c', 'b')])?,
-        ),
-        Err(TrainRefusal::NoMergeGrant(number(13)?))
-    );
-    Ok(())
-}
-
-#[test]
-fn a_lower_layer_change_invalidates_upper_layer_readiness() -> TestResult {
-    let before = [
-        green(11, 'a', '0')?,
-        green(12, 'b', 'a')?,
-        green(13, 'c', 'b')?,
-    ];
-    assert_eq!(
-        decision(&before)?,
-        TrainDecision::Merge { top: number(13)? }
-    );
-
-    // A new commit 1 lands on #11; #12 and #13 still sit on its old head.
-    let moved_bottom = TrainLayer {
-        readiness: readiness(
-            11,
-            ('1', '0'),
-            ('a', '0'),
-            EvidenceVerdict::Pass,
-            EvidenceVerdict::Pass,
-        )?,
-        branch: layer_branch(11)?,
-    };
-    let changed = [
-        moved_bottom.clone(),
-        green(12, 'b', 'a')?,
-        green(13, 'c', 'b')?,
-    ];
-    let (outcome, states) = evaluate_train(&changed, &commit('0')?)?;
-    assert_eq!(outcome, TrainDecision::Hold);
-    assert_eq!(
-        states,
-        vec![
-            LayerState::Pending(vec![NotReady::ReviewStale, NotReady::ChecksStale]),
-            LayerState::LowerLayerChanged,
-            LayerState::LowerLayerChanged,
-        ]
-    );
-    let old_grants = grants(&[(11, 'a', '0'), (12, 'b', 'a'), (13, 'c', 'b')])?;
-    assert_eq!(
-        merge_train(&house()?, &changed, &commit('0')?, &old_grants),
-        Err(TrainRefusal::NotReady)
-    );
-
-    // Rebased onto 1, #12 and #13 have new heads; their old evidence is
-    // stale until CI runs again.
-    let stale = |number_: u64, head: char, base: char, old: (char, char)| {
-        Ok::<_, Box<dyn std::error::Error>>(TrainLayer {
-            readiness: readiness(
-                number_,
-                (head, base),
-                old,
-                EvidenceVerdict::Pass,
-                EvidenceVerdict::Pass,
-            )?,
-            branch: layer_branch(number_)?,
-        })
-    };
-    let rebased = [
-        green(11, '1', '0')?,
-        stale(12, '2', '1', ('b', 'a'))?,
-        stale(13, '3', '2', ('c', 'b'))?,
-    ];
-    let (outcome, states) = evaluate_train(&rebased, &commit('0')?)?;
-    assert_eq!(outcome, TrainDecision::Hold);
-    assert_eq!(
-        states.get(1..),
-        Some(
-            &[
-                LayerState::Pending(vec![NotReady::ReviewStale, NotReady::ChecksStale]),
-                LayerState::Pending(vec![NotReady::ReviewStale, NotReady::ChecksStale]),
-            ][..]
-        )
-    );
-
-    // Once CI ran at every new head, the train merges, but only under grants
-    // for the new heads.
-    let rerun = [
-        green(11, '1', '0')?,
-        green(12, '2', '1')?,
-        green(13, '3', '2')?,
-    ];
-    assert_eq!(decision(&rerun)?, TrainDecision::Merge { top: number(13)? });
-    assert_eq!(
-        merge_train(&house()?, &rerun, &commit('0')?, &old_grants),
-        Err(TrainRefusal::NoMergeGrant(number(11)?))
-    );
-    let merge = merge_train(
-        &house()?,
-        &rerun,
-        &commit('0')?,
-        &grants(&[(11, '1', '0'), (12, '2', '1'), (13, '3', '2')])?,
-    )?;
-    assert_eq!(merge.layers().len(), 3);
-    Ok(())
-}
-
-#[test]
-fn a_moved_trunk_invalidates_the_whole_train() -> TestResult {
-    let train = [green(11, 'a', '0')?, green(12, 'b', 'a')?];
-    let (outcome, states) = evaluate_train(&train, &commit('9')?)?;
-    assert_eq!(outcome, TrainDecision::Hold);
-    assert_eq!(states, vec![LayerState::LowerLayerChanged; 2]);
-    Ok(())
-}
-
-#[test]
-fn failed_layers_on_top_never_block_the_layers_below() -> TestResult {
-    let failed_top = [
-        green(11, 'a', '0')?,
-        green(12, 'b', 'a')?,
-        layer(13, 'c', 'b', EvidenceVerdict::Fail)?,
-    ];
-    assert_eq!(
-        decision(&failed_top)?,
-        TrainDecision::Merge { top: number(12)? }
-    );
-    let merge = merge_train(
-        &house()?,
-        &failed_top,
-        &commit('0')?,
-        &grants(&[(11, 'a', '0'), (12, 'b', 'a')])?,
-    )?;
-    assert_eq!(merge.top(), number(12)?);
-    assert_eq!(merge.layers().len(), 2);
-
     // A failed review counts like failed checks.
     let review_failed = TrainLayer {
         readiness: readiness(
@@ -510,93 +584,233 @@ fn failed_layers_on_top_never_block_the_layers_below() -> TestResult {
     };
     assert_eq!(
         decision(&[green(11, 'a', '0')?, review_failed])?,
-        TrainDecision::Merge { top: number(11)? }
+        merging(&[11], &[12])?
     );
 
-    // Every layer failed: nothing to merge.
-    let all_failed = [
-        layer(11, 'a', '0', EvidenceVerdict::Fail)?,
-        layer(12, 'b', 'a', EvidenceVerdict::Fail)?,
-    ];
-    assert_eq!(decision(&all_failed)?, TrainDecision::Hold);
-    assert_eq!(
-        merge_train(&house()?, &all_failed, &commit('0')?, &[]),
-        Err(TrainRefusal::NotReady)
-    );
+    // A failed bottom layer is not reordered: its owner removes it.
+    for failed_bottom in [
+        vec![
+            layer(11, 'a', '0', EvidenceVerdict::Fail)?,
+            green(12, 'b', 'a')?,
+        ],
+        vec![
+            layer(11, 'a', '0', EvidenceVerdict::Fail)?,
+            layer(12, 'b', 'a', EvidenceVerdict::Fail)?,
+        ],
+    ] {
+        assert_eq!(
+            decision(&failed_bottom)?,
+            TrainDecision::RemoveBottom {
+                failed: number(11)?
+            }
+        );
+        assert_eq!(
+            merge_train(
+                &house()?,
+                &failed_bottom,
+                &trunk()?,
+                &gate_merge(11, 'a', '0')?,
+                &grant(11, 'a', '0')?,
+                &GateRun::new(),
+                &unread()?,
+            ),
+            Err(TrainRefusal::NotReady)
+        );
+    }
     Ok(())
 }
 
 #[test]
-fn unreadable_evidence_holds_the_train_and_is_never_a_failure() -> TestResult {
-    let train = [
-        green(11, 'a', '0')?,
-        layer(12, 'b', 'a', EvidenceVerdict::Unavailable)?,
+fn a_lower_layer_change_invalidates_upper_layer_readiness() -> TestResult {
+    // A new commit 1 lands on #11; #12 and #13 still sit on its old head.
+    let changed = [
+        stale(11, '1', '0', ('a', '0'))?,
+        green(12, 'b', 'a')?,
         green(13, 'c', 'b')?,
     ];
-    let (outcome, states) = evaluate_train(&train, &commit('0')?)?;
+    let (outcome, states) = evaluate_train(&changed, &commit('0')?)?;
     assert_eq!(outcome, TrainDecision::Hold);
     assert_eq!(
-        states.get(1),
-        Some(&LayerState::Pending(vec![NotReady::ChecksNotGreen]))
+        states,
+        vec![
+            LayerState::Pending(vec![NotReady::ReviewStale, NotReady::ChecksStale]),
+            LayerState::LowerLayerChanged,
+            LayerState::LowerLayerChanged,
+        ]
     );
-    // A failure reported about another head is stale, not a failure here.
-    let old_failure = TrainLayer {
-        readiness: readiness(
-            12,
-            ('b', 'a'),
-            ('8', 'a'),
-            EvidenceVerdict::Pass,
-            EvidenceVerdict::Fail,
-        )?,
-        branch: layer_branch(12)?,
-    };
-    let (outcome, states) = evaluate_train(
-        &[green(11, 'a', '0')?, old_failure, green(13, 'c', 'b')?],
-        &commit('0')?,
-    )?;
+
+    // Rebased onto 1, #12 and #13 have new heads; their old evidence is
+    // stale until CI runs again, so only #11 may merge, and only under a
+    // gate merge recorded for its new head.
+    let rebased = [
+        green(11, '1', '0')?,
+        stale(12, '2', '1', ('b', 'a'))?,
+        stale(13, '3', '2', ('c', 'b'))?,
+    ];
+    let (outcome, states) = evaluate_train(&rebased, &commit('0')?)?;
+    assert_eq!(outcome, merging(&[11], &[12, 13])?);
+    assert_eq!(
+        states.get(1..),
+        Some(
+            &[
+                LayerState::Pending(vec![NotReady::ReviewStale, NotReady::ChecksStale]),
+                LayerState::Pending(vec![NotReady::ReviewStale, NotReady::ChecksStale]),
+            ][..]
+        )
+    );
+    assert_eq!(
+        merge_train(
+            &house()?,
+            &rebased,
+            &trunk()?,
+            &gate_merge(11, 'a', '0')?,
+            &grant(11, 'a', '0')?,
+            &GateRun::new(),
+            &unread()?,
+        ),
+        Err(TrainRefusal::NoGateMerge(number(11)?))
+    );
+
+    // A moved trunk invalidates the whole train.
+    let train = [green(11, 'a', '0')?, green(12, 'b', 'a')?];
+    let (outcome, states) = evaluate_train(&train, &commit('9')?)?;
     assert_eq!(outcome, TrainDecision::Hold);
-    assert!(matches!(states.get(1), Some(LayerState::Pending(_))));
+    assert_eq!(states, vec![LayerState::LowerLayerChanged; 2]);
     Ok(())
 }
 
 #[test]
-fn a_merge_needs_a_grant_for_every_layer_in_this_house() -> TestResult {
+fn a_grant_and_passing_evidence_do_not_merge_a_layer_with_a_gate_gap() -> TestResult {
     let train = [green(11, 'a', '0')?, green(12, 'b', 'a')?];
-    assert_eq!(
-        merge_train(
-            &house()?,
+    let attempt = |recorded: &RecordedDecision, grant: &MergeGrant, house: &HouseId| {
+        let forge = unread()?;
+        let result = merge_train(
+            house,
             &train,
-            &commit('0')?,
-            &grants(&[(11, 'a', '0')])?
-        ),
-        Err(TrainRefusal::NoMergeGrant(number(12)?))
+            &trunk()?,
+            recorded,
+            grant,
+            &GateRun::new(),
+            &forge,
+        );
+        // Every refusal here comes before any forge read.
+        assert_eq!(*forge.transport().reads.borrow(), 0);
+        Ok::<_, Box<dyn std::error::Error>>(result)
+    };
+    let granted = grant(11, 'a', '0')?;
+    let refused = Err(TrainRefusal::NoGateMerge(number(11)?));
+
+    // Review and checks pass and the grant covers the exact subject, but a
+    // review thread is unresolved: the gate records no merge.
+    let mut threads = gate_evidence(11, 'a', '0')?;
+    threads.threads_resolved = Some(false);
+    let gap = recorded(&threads)?;
+    assert!(
+        matches!(&gap.decision.verdict, Verdict::HandOver { gaps } if gaps.contains(&Gap::Threads))
     );
+    assert_eq!(attempt(&gap, &granted, &house()?)?, refused);
+    // The same for a missing independent semantic review or acceptance.
+    let mut unreviewed = gate_evidence(11, 'a', '0')?;
+    unreviewed.semantic_independent = false;
     assert_eq!(
-        merge_train(&house()?, &train, &commit('0')?, &[]),
-        Err(TrainRefusal::NoMergeGrant(number(11)?))
+        attempt(&recorded(&unreviewed)?, &granted, &house()?)?,
+        refused
     );
-    // A grant resolved without a standing merge permission covers nothing.
+    let mut unaccepted = gate_evidence(11, 'a', '0')?;
+    unaccepted.acceptance_met = Some(false);
     assert_eq!(
-        merge_train(
-            &house()?,
-            &train,
-            &commit('0')?,
-            &[MergeGrant::none(), MergeGrant::none()],
-        ),
-        Err(TrainRefusal::NoMergeGrant(number(11)?))
+        attempt(&recorded(&unaccepted)?, &granted, &house()?)?,
+        refused
     );
-    // Grants from this house do not merge a train in another.
-    let both = grants(&[(11, 'a', '0'), (12, 'b', 'a')])?;
+
+    // A gate merge recorded for another subject does not count: another
+    // head, base branch, pull request, repository, or house.
+    let mut other_base_branch = gate_merge(11, 'a', '0')?;
+    other_base_branch.decision.base_branch = Some(branch("release")?);
+    let mut other_repository = gate_merge(11, 'a', '0')?;
+    other_repository.decision.repository = Repository::new("lemarier/other")?;
+    let mut other_house = gate_merge(11, 'a', '0')?;
+    other_house.decision.house = common::other_house()?;
+    for elsewhere in [
+        gate_merge(11, 'f', '0')?,
+        gate_merge(12, 'b', '0')?,
+        other_base_branch,
+        other_repository,
+        other_house,
+    ] {
+        assert_eq!(attempt(&elsewhere, &granted, &house()?)?, refused);
+    }
+    // A gate merge on another trunk tip judges the train against that tip,
+    // where the bottom layer's base is stale.
     assert_eq!(
-        merge_train(
-            &HouseId::new(common::OTHER_HOUSE)?,
-            &train,
-            &commit('0')?,
-            &both
-        ),
-        Err(TrainRefusal::NoMergeGrant(number(11)?))
+        attempt(&gate_merge(11, 'a', '9')?, &granted, &house()?)?,
+        Err(TrainRefusal::NotReady)
     );
-    assert!(merge_train(&house()?, &train, &commit('0')?, &both).is_ok());
+
+    // With the gate merge recorded, the grant must still cover the subject.
+    let merge = gate_merge(11, 'a', '0')?;
+    let no_grant = Err(TrainRefusal::NoMergeGrant(number(11)?));
+    assert_eq!(attempt(&merge, &MergeGrant::none(), &house()?)?, no_grant);
+    assert_eq!(attempt(&merge, &grant(11, 'f', '0')?, &house()?)?, no_grant);
+    let mut elsewhere = gate_merge(11, 'a', '0')?;
+    elsewhere.decision.house = common::other_house()?;
+    assert_eq!(
+        attempt(&elsewhere, &granted, &common::other_house()?)?,
+        no_grant
+    );
+    Ok(())
+}
+
+#[test]
+fn the_forge_is_read_again_just_before_the_merge() -> TestResult {
+    let train = [green(11, 'a', '0')?, green(12, 'b', 'a')?];
+    let attempt = |forge: &GitHubClient<Forge>, recorded: &RecordedDecision| {
+        Ok::<_, Box<dyn std::error::Error>>(
+            merge_train(
+                &house()?,
+                &train,
+                &trunk()?,
+                recorded,
+                &grant(11, 'a', '0')?,
+                &GateRun::new(),
+                forge,
+            )
+            .map(|request| request.match_head),
+        )
+    };
+    let merge = gate_merge(11, 'a', '0')?;
+    let stale = TrainRefusal::Forge(IntegrationError::StaleDecision);
+    // A push after the train was read, a moved trunk, or a retargeted pull
+    // request is refused.
+    for (forge, expected) in [
+        (forge(11, 'f', "main", '0')?, stale),
+        (forge(11, 'a', "main", '9')?, stale),
+        (forge(11, 'a', "release", '0')?, stale),
+        (
+            unread()?,
+            TrainRefusal::Forge(IntegrationError::Unavailable),
+        ),
+    ] {
+        assert_eq!(attempt(&forge, &merge)?, Err(expected));
+    }
+    // A recorded merge whose effect is already in flight, or a report-only
+    // record, never submits again.
+    let mut reconcile = gate_merge(11, 'a', '0')?;
+    reconcile.admission = Admission::Reconcile(kitchen::contracts::IdempotencyKey::from_ref(
+        ExternalRef::new("fake:effect/train")?,
+    ));
+    let mut report_only = gate_merge(11, 'a', '0')?;
+    report_only.mode = GateMode::ReportOnly;
+    for recorded in [reconcile, report_only] {
+        assert_eq!(
+            attempt(&forge(11, 'a', "main", '0')?, &recorded)?,
+            Err(stale)
+        );
+    }
+    assert_eq!(
+        attempt(&forge(11, 'a', "main", '0')?, &merge)?,
+        Ok(commit('a')?)
+    );
     Ok(())
 }
 
@@ -637,7 +851,15 @@ fn invalid_train_input_is_refused() -> TestResult {
             Err(TrainError::InvalidLayers)
         );
         assert_eq!(
-            merge_train(&house()?, &bad, &commit('0')?, &[]),
+            merge_train(
+                &house()?,
+                &bad,
+                &trunk()?,
+                &gate_merge(11, 'a', '0')?,
+                &grant(11, 'a', '0')?,
+                &GateRun::new(),
+                &unread()?,
+            ),
             Err(TrainRefusal::Invalid(TrainError::InvalidLayers))
         );
     }
@@ -682,73 +904,6 @@ fn a_train_is_bounded_and_needs_two_overlapping_ready_pull_requests() -> TestRes
         let plan = plan_train(&repo()?, &trunk()?, &alone)?;
         assert!(plan.layers.is_empty());
         assert!(plan.assembly().is_empty());
-    }
-    Ok(())
-}
-
-#[test]
-fn gh_stack_merges_the_train_by_its_top_pull_request_without_prompting() -> TestResult {
-    let temp = tempfile::tempdir()?;
-    let gh = GhStack::new(
-        "/usr/bin/gh".into(),
-        "/tmp/checkout".into(),
-        "upstream",
-        workflows_support::isolated_config(temp.path(), &[])?,
-        Duration::from_secs(5),
-    )?;
-    let train = [green(11, 'a', '0')?, green(12, 'b', 'a')?];
-    let merge = merge_train(
-        &house()?,
-        &train,
-        &commit('0')?,
-        &grants(&[(11, 'a', '0'), (12, 'b', 'a')])?,
-    )?;
-    assert_eq!(
-        gh.args(&merge.command()).join(" "),
-        "stack merge 12 --yes --squash"
-    );
-    assert_eq!(
-        gh.args(&StackCommand::Unstack).join(" "),
-        "stack unstack --local"
-    );
-    assert_eq!(
-        StackCommand::Unstack.permissions(),
-        [Permission::PushBranch]
-    );
-    assert!(!merge.command().touches_upstack());
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn a_failed_merge_call_is_uncertain_and_a_refusal_is_not() -> TestResult {
-    let train = [green(11, 'a', '0')?, green(12, 'b', 'a')?];
-    let merge = merge_train(
-        &house()?,
-        &train,
-        &commit('0')?,
-        &grants(&[(11, 'a', '0'), (12, 'b', 'a')])?,
-    )?;
-    for (code, expected) in [
-        (0, StackResult::Done),
-        // A generic or API failure may follow a merge that landed.
-        (1, StackResult::Uncertain),
-        (5, StackResult::Rejected),
-        (8, StackResult::Locked),
-    ] {
-        let temp = tempfile::tempdir()?;
-        let dir = temp.path().canonicalize()?;
-        let gh_path = dir.join("gh");
-        common::executable::write_executable(&gh_path, format!("#!/bin/sh\nexit {code}\n"))?;
-        let kitchen = tempfile::tempdir()?;
-        let gh = GhStack::new(
-            gh_path,
-            dir.clone(),
-            "origin",
-            workflows_support::isolated_config(kitchen.path(), &[])?,
-            Duration::from_secs(5),
-        )?;
-        assert_eq!(gh.run(&merge.command()), expected, "exit {code}");
     }
     Ok(())
 }

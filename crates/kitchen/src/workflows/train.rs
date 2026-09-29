@@ -1,5 +1,5 @@
-//! Merge trains: ready pull requests that overlap land together as one
-//! stack instead of one at a time.
+//! Merge trains: ready pull requests that overlap are assembled into one
+//! stack, so each conflict between them is resolved once.
 //!
 //! Merging overlapping pull requests one by one forces a rebase and a CI
 //! round on every other open one after each merge, and some of those
@@ -8,23 +8,26 @@
 //! files or contracts and orders them into one train; the house stack tool
 //! ([`crate::workflows::stack`]) assembles it, so each conflict is resolved
 //! once inside the stack. [`evaluate_train`] then judges every layer at its
-//! exact stacked head and base: a failing layer moves to the top, a pending
-//! one holds the train, and a lower layer that changed makes every layer
-//! above it stale until its CI runs again. [`merge_train`] prepares the
-//! stack tool's merge only when every merged layer is ready and a merge
-//! grant covers its exact head and base.
+//! exact stacked head and base: the ready layers from the bottom may merge,
+//! the first layer that is not ready and everything above it wait for the
+//! next train, and a lower layer that changed makes every layer above it
+//! stale until its CI runs again. [`merge_train`] prepares the gate's
+//! head-matched merge of the bottom layer, and only when the gate recorded
+//! a merge for its exact head and base.
 //!
-//! This module performs no I/O. Its commands run through the stack tool
-//! ([`crate::workflows::stack::StackBoundary`]) like any other.
+//! This module performs no I/O besides the forge re-read in
+//! [`merge_train`]. Its assembly commands run through the stack tool
+//! ([`crate::workflows::stack::StackBoundary`]) like any other; it never
+//! reorders or merges a stack through the stack tool.
 
 use std::{collections::BTreeSet, path::PathBuf};
 
 use crate::{
     HouseId,
     contracts::{BranchName, CommitId, EvidenceVerdict, IssueNumber, Repository},
-    house::MergeSubject,
+    integrations::github::{GitHubClient, GitHubReadTransport, IntegrationError},
     workflows::{
-        gate::MergeGrant,
+        gate::{GateRun, MergeGrant, MergeRequest, RecordedDecision, Verdict},
         ready::{MergeReadiness, NotReady},
         stack::{MAX_STACK_LAYERS, StackCommand},
     },
@@ -218,8 +221,9 @@ pub enum LayerState {
     /// Its final review is clean and its required checks are green at its
     /// exact head and base.
     Ready,
-    /// Its review or checks failed at its exact head and base: it moves to
-    /// the top of the train.
+    /// Its review or checks failed at its exact head and base: it waits
+    /// for a later train, or is removed from the stack when it is the
+    /// bottom layer.
     Failed(Vec<NotReady>),
     /// Its evidence is about another head or base, or could not be read:
     /// its CI and review must run again at this head.
@@ -233,22 +237,28 @@ pub enum LayerState {
 /// What to do with an assembled train.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrainDecision {
-    /// Merge every layer up to and including `top`, bottom to top, with
-    /// [`merge_train`]. Failed layers above `top` stay for a later train.
+    /// The layers in `ready`, bottom to top, are ready at their exact heads
+    /// and bases. [`merge_train`] merges the bottom one; after it lands, the
+    /// rest are rebased onto the trunk and evaluated again. The layers in
+    /// `deferred` sit above the first layer that is not ready and wait for
+    /// the next train, so they never block the layers below them.
     Merge {
-        /// The highest layer to merge.
-        top: IssueNumber,
+        /// The ready layers from the bottom, lowest first; never empty.
+        ready: Vec<IssueNumber>,
+        /// The first layer that is not ready and every layer above it.
+        deferred: Vec<IssueNumber>,
     },
-    /// Failed layers sit below others: adopt the branches again in `order`,
-    /// with every failed layer moved to the top, then rebase and submit
-    /// ([`reorder_commands`]). The moved layers' CI runs again.
-    Reorder {
-        /// The new order, bottom to top.
-        order: Vec<BranchName>,
-    },
-    /// Nothing merges yet: a layer below the failed ones is pending or
-    /// changed, or every layer failed.
+    /// The bottom layer is pending or must be rebased: nothing merges until
+    /// its CI and review run again at a new head, or the stack's owner
+    /// rebases it onto the moved trunk.
     Hold,
+    /// The bottom layer failed at its exact head and base. Kitchen does not
+    /// reorder a stack: the stack's owner removes this pull request from
+    /// the stack, and the rest is planned again as a new train.
+    RemoveBottom {
+        /// The failed bottom layer.
+        failed: IssueNumber,
+    },
 }
 
 /// Evaluate an assembled train, bottom to top, against `trunk_tip`, the
@@ -258,12 +268,9 @@ pub enum TrainDecision {
 /// is [`LayerState::LowerLayerChanged`] or has stale evidence until it is
 /// rebased and its CI runs again.
 ///
-/// A failed layer below any other layer is moved to the top. Otherwise,
-/// the layers below the failed ones merge together once every one of them
-/// is ready. A pending or changed layer among them holds the whole train
-/// while its CI runs again, rather than merging the layers below it alone
-/// and forcing another rebase and CI round on the rest; the caller bounds
-/// how long it holds, as the gate does with [`crate::workflows::gate::STALL_TIME`].
+/// The ready layers from the bottom up to the first layer that is not
+/// ready may merge; that layer and every one above it are deferred to the
+/// next train, whether it failed or is still pending.
 ///
 /// # Errors
 /// Returns [`TrainError::InvalidLayers`] for no layers, more than
@@ -287,38 +294,20 @@ pub fn evaluate_train(
         states.push(state);
         below = &layer.readiness.subject.head;
     }
-    let first_failed = states
+    let ready_count = states
         .iter()
-        .position(|state| matches!(state, LayerState::Failed(_)));
-    let moved_up = first_failed.is_some_and(|first| {
-        states
-            .iter()
-            .skip(first)
-            .any(|state| !matches!(state, LayerState::Failed(_)))
-    });
-    let decision = if moved_up {
-        let (failed, kept): (Vec<_>, Vec<_>) = layers
-            .iter()
-            .zip(&states)
-            .partition(|(_, state)| matches!(state, LayerState::Failed(_)));
-        TrainDecision::Reorder {
-            order: kept
-                .into_iter()
-                .chain(failed)
-                .map(|(layer, _)| layer.branch.clone())
-                .collect(),
-        }
-    } else {
-        let mergeable = first_failed.unwrap_or(states.len());
-        let prefix = states.get(..mergeable).unwrap_or_default();
-        match layers.get(..mergeable).and_then(<[TrainLayer]>::last) {
-            Some(top) if prefix.iter().all(|state| state == &LayerState::Ready) => {
-                TrainDecision::Merge {
-                    top: top.readiness.pull_request,
-                }
-            }
-            Some(_) | None => TrainDecision::Hold,
-        }
+        .take_while(|state| **state == LayerState::Ready)
+        .count();
+    let numbers = layers.iter().map(|layer| layer.readiness.pull_request);
+    let decision = match (ready_count, layers.first(), states.first()) {
+        (0, Some(bottom), Some(LayerState::Failed(_))) => TrainDecision::RemoveBottom {
+            failed: bottom.readiness.pull_request,
+        },
+        (0, _, _) => TrainDecision::Hold,
+        (count, _, _) => TrainDecision::Merge {
+            ready: numbers.clone().take(count).collect(),
+            deferred: numbers.skip(count).collect(),
+        },
     };
     Ok((decision, states))
 }
@@ -365,51 +354,6 @@ fn layer_state(layer: &TrainLayer, below: &CommitId) -> LayerState {
     }
 }
 
-/// The stack-tool commands that move a train into `order`: stop tracking
-/// the current stack locally, adopt the branches again in the new order,
-/// rebase them onto each other, and push and relink their pull requests.
-#[must_use]
-pub fn reorder_commands(trunk: &BranchName, order: &[BranchName]) -> Vec<StackCommand> {
-    vec![
-        StackCommand::Unstack,
-        StackCommand::Adopt {
-            trunk: trunk.clone(),
-            branches: order.to_vec(),
-        },
-        StackCommand::RebaseUpstack,
-        StackCommand::Submit { ready: true },
-    ]
-}
-
-/// A prepared train merge. Only [`merge_train`] builds one, so the stack
-/// tool's merge ([`StackCommand::Merge`]) always carries layers that were
-/// ready and granted at their exact heads and bases.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrainMerge {
-    top: IssueNumber,
-    layers: Vec<MergeSubject>,
-}
-
-impl TrainMerge {
-    /// The highest layer merged.
-    #[must_use]
-    pub const fn top(&self) -> IssueNumber {
-        self.top
-    }
-
-    /// Every merged layer's exact subject, bottom to top.
-    #[must_use]
-    pub fn layers(&self) -> &[MergeSubject] {
-        &self.layers
-    }
-
-    /// The stack-tool command that merges the train.
-    #[must_use]
-    pub fn command(&self) -> StackCommand {
-        StackCommand::Merge(self.clone())
-    }
-}
-
 /// Why a train merge was not prepared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TrainRefusal {
@@ -419,9 +363,17 @@ pub enum TrainRefusal {
     /// [`evaluate_train`] does not decide to merge the train as read.
     #[error("the train is not ready to merge")]
     NotReady,
+    /// The gate has not recorded a merge of this layer at its exact pull
+    /// request, head, and base, targeting the trunk, in this house.
+    #[error("no recorded gate merge for pull request {} at its exact head and base", .0.get())]
+    NoGateMerge(IssueNumber),
     /// No merge grant covers this layer at its exact head and base.
     #[error("no merge grant covers pull request {} at its exact head and base", .0.get())]
     NoMergeGrant(IssueNumber),
+    /// The forge re-read before the merge failed, or found the pull request
+    /// or trunk moved, closed, or retargeted.
+    #[error(transparent)]
+    Forge(#[from] IntegrationError),
 }
 
 impl TrainRefusal {
@@ -430,73 +382,80 @@ impl TrainRefusal {
     pub const fn class(self) -> crate::ErrorClass {
         match self {
             Self::Invalid(error) => error.class(),
-            Self::NotReady | Self::NoMergeGrant(_) => crate::ErrorClass::Refused,
+            Self::NotReady | Self::NoGateMerge(_) | Self::NoMergeGrant(_) => {
+                crate::ErrorClass::Refused
+            }
+            Self::Forge(error) => error.class(),
         }
     }
 }
 
-/// Prepare the stack tool's merge of `layers` in `house`, read again right
-/// before the merge. The train is evaluated again with `trunk_tip`, and
-/// every layer up to the top it decides to merge must be covered by one of
-/// `grants`, each resolved with [`MergeGrant::resolve`] for that layer's
-/// exact pull request, head, and base (the head of the layer below, or the
-/// trunk tip).
+/// Prepare the merge of the train's bottom layer in `house` onto `trunk`.
 ///
-/// `gh stack merge` checks only that each pull request is open and not a
-/// draft, not that its head is still the one read here. Read the layers
-/// immediately before the merge, and after an uncertain result read the
-/// pull requests again before planning another train: a merged layer can
-/// never merge twice. `gh stack merge` also reads a bare number as a stack
-/// number before a pull-request number; where a stack shares the top pull
-/// request's number, the command names that stack, which this module
-/// cannot detect.
+/// A train lands one layer at a time, bottom to top, through the gate's
+/// head-matched squash merge ([`crate::workflows::gate::MergeRequest`]),
+/// never through the stack tool's merge, which cannot pin each layer's
+/// head. The train must decide to merge ([`evaluate_train`]), and `recorded`
+/// must be the gate's recorded [`Verdict::Merge`] for exactly the bottom
+/// layer: this house, repository, pull request, and head, with `trunk` as
+/// its base branch and the bottom layer's base as its base. The train is
+/// judged against that base as the trunk tip, and `grant` must cover the
+/// same subject. Every mismatch is refused before any forge call. The
+/// forge is then read again through `run`: a pull request that moved,
+/// closed, or was retargeted, or a trunk whose tip is no longer that base,
+/// is refused, and the forge itself enforces the expected head when it
+/// receives the merge.
+///
+/// After the bottom layer lands, the stack's owner rebases the rest onto
+/// the trunk; their CI runs again at the new heads and the gate records a
+/// new decision for the next bottom layer. A layer above the bottom
+/// targets another layer's branch, so the gate never records a merge for
+/// it until it becomes the bottom.
 ///
 /// # Errors
 /// Returns [`TrainRefusal::Invalid`] for invalid layers,
-/// [`TrainRefusal::NotReady`] unless the train decides to merge, and
-/// [`TrainRefusal::NoMergeGrant`] for the lowest layer no grant covers.
-pub fn merge_train(
+/// [`TrainRefusal::NotReady`] unless the train decides to merge,
+/// [`TrainRefusal::NoGateMerge`] without a matching recorded gate merge,
+/// [`TrainRefusal::NoMergeGrant`] without a matching grant, and
+/// [`TrainRefusal::Forge`] when the re-read fails or finds a change.
+pub fn merge_train<T: GitHubReadTransport>(
     house: &HouseId,
     layers: &[TrainLayer],
-    trunk_tip: &CommitId,
-    grants: &[MergeGrant],
-) -> Result<TrainMerge, TrainRefusal> {
+    trunk: &BranchName,
+    recorded: &RecordedDecision,
+    grant: &MergeGrant,
+    run: &GateRun,
+    client: &GitHubClient<T>,
+) -> Result<MergeRequest, TrainRefusal> {
+    let gate = &recorded.decision;
+    let trunk_tip = &gate.base;
     let (decision, _) = evaluate_train(layers, trunk_tip)?;
-    let top = match decision {
-        TrainDecision::Merge { top } => top,
-        TrainDecision::Reorder { .. } | TrainDecision::Hold => {
+    let bottom = match (decision, layers.first()) {
+        (TrainDecision::Merge { .. }, Some(bottom)) => &bottom.readiness,
+        (
+            TrainDecision::Merge { .. } | TrainDecision::Hold | TrainDecision::RemoveBottom { .. },
+            _,
+        ) => {
             return Err(TrainRefusal::NotReady);
         }
     };
-    let mut merged = Vec::with_capacity(layers.len());
-    let mut below = trunk_tip;
-    for layer in layers {
-        let readiness = &layer.readiness;
-        let covered = grants.iter().any(|grant| {
-            grant.covers(
-                house,
-                &readiness.repository,
-                readiness.pull_request,
-                &readiness.subject.head,
-                below,
-            )
-        });
-        if !covered {
-            return Err(TrainRefusal::NoMergeGrant(readiness.pull_request));
-        }
-        merged.push(MergeSubject {
-            repository: readiness.repository.clone(),
-            number: readiness.pull_request,
-            head: readiness.subject.head.clone(),
-            base: below.clone(),
-        });
-        below = &readiness.subject.head;
-        if readiness.pull_request == top {
-            break;
-        }
+    let recorded_here = gate.verdict == Verdict::Merge
+        && &gate.house == house
+        && gate.repository == bottom.repository
+        && gate.number == bottom.pull_request
+        && gate.head == bottom.subject.head
+        && gate.base_branch.as_ref() == Some(trunk);
+    if !recorded_here {
+        return Err(TrainRefusal::NoGateMerge(bottom.pull_request));
     }
-    Ok(TrainMerge {
-        top,
-        layers: merged,
-    })
+    if !grant.covers(
+        house,
+        &bottom.repository,
+        bottom.pull_request,
+        &bottom.subject.head,
+        trunk_tip,
+    ) {
+        return Err(TrainRefusal::NoMergeGrant(bottom.pull_request));
+    }
+    Ok(run.next_merge(recorded, grant, client)?)
 }

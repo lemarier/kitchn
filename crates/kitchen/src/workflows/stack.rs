@@ -58,7 +58,6 @@ use crate::{
             decide, git_environment, observe, record_landed, run_bounded,
         },
         repair::{Observed, PullRequestState},
-        train::TrainMerge,
     },
 };
 
@@ -280,14 +279,6 @@ pub enum StackCommand {
     },
     /// Read the stack.
     View,
-    /// Stop tracking the checkout's stack locally, so its branches can be
-    /// adopted again in another order. Pull requests stay linked on the
-    /// forge until the next submission relinks them.
-    Unstack,
-    /// Merge a train's layers up to and including its top pull request in
-    /// one all-or-nothing forge operation, squashing each. Only
-    /// [`crate::workflows::train::merge_train`] builds one.
-    Merge(TrainMerge),
 }
 
 impl StackCommand {
@@ -296,15 +287,13 @@ impl StackCommand {
     pub const fn touches_upstack(&self) -> bool {
         match self {
             Self::RebaseUpstack | Self::Push | Self::Submit { .. } => true,
-            Self::Adopt { .. } | Self::Add { .. } | Self::View | Self::Unstack | Self::Merge(_) => {
-                false
-            }
+            Self::Adopt { .. } | Self::Add { .. } | Self::View => false,
         }
     }
 
-    /// The permissions the command exercises: every command but a merge
-    /// acts on the task's branch, and a submission also opens pull requests
-    /// and, when `ready`, asks for their review.
+    /// The permissions the command exercises: every command acts on the
+    /// task's branch, and a submission also opens pull requests and, when
+    /// `ready`, asks for their review.
     #[must_use]
     pub const fn permissions(&self) -> &'static [Permission] {
         match self {
@@ -314,13 +303,11 @@ impl StackCommand {
                 Permission::OpenPullRequest,
                 Permission::RequestReview,
             ],
-            Self::Merge(_) => &[Permission::Merge],
             Self::Adopt { .. }
             | Self::Add { .. }
             | Self::RebaseUpstack
             | Self::Push
-            | Self::View
-            | Self::Unstack => &[Permission::PushBranch],
+            | Self::View => &[Permission::PushBranch],
         }
     }
 }
@@ -677,17 +664,6 @@ impl GhStack {
             StackCommand::View => {
                 args.extend(["view".to_owned(), "--json".to_owned()]);
             }
-            StackCommand::Unstack => {
-                args.extend(["unstack".to_owned(), "--local".to_owned()]);
-            }
-            StackCommand::Merge(merge) => {
-                args.extend([
-                    "merge".to_owned(),
-                    merge.top().get().to_string(),
-                    "--yes".to_owned(),
-                    "--squash".to_owned(),
-                ]);
-            }
         }
         args
     }
@@ -795,15 +771,9 @@ impl StackRunner for GhStack {
                 | StackCommand::Add { .. }
                 | StackCommand::RebaseUpstack
                 | StackCommand::Push
-                | StackCommand::Submit { .. }
-                | StackCommand::Unstack
-                | StackCommand::Merge(_) => StackResult::Done,
+                | StackCommand::Submit { .. } => StackResult::Done,
             },
-            // A failed merge call may still have merged the train.
-            code => exit_result(
-                code,
-                command.touches_upstack() || matches!(command, StackCommand::Merge(_)),
-            ),
+            code => exit_result(code, command.touches_upstack()),
         }
     }
 
@@ -1600,9 +1570,7 @@ const fn publish(command: &StackCommand) -> Option<Publish> {
         StackCommand::Adopt { .. }
         | StackCommand::Add { .. }
         | StackCommand::RebaseUpstack
-        | StackCommand::View
-        | StackCommand::Unstack
-        | StackCommand::Merge(_) => None,
+        | StackCommand::View => None,
     }
 }
 
@@ -1639,9 +1607,7 @@ fn check_layers(
         | StackCommand::RebaseUpstack
         | StackCommand::Push
         | StackCommand::Submit { .. }
-        | StackCommand::View
-        | StackCommand::Unstack
-        | StackCommand::Merge(_) => Ok(()),
+        | StackCommand::View => Ok(()),
     }
 }
 

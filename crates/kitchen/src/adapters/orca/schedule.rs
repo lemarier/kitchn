@@ -34,8 +34,8 @@ use crate::{
     ConsumerId, HouseId,
     adapters::orca::{OrcaBackend, OrcaError, OrcaRunner, backend, wire},
     contracts::{
-        EffectFailure, ExternalRef, Lookup, NotAppliedReason, Receipt, ResourceKind, ResourceRef,
-        ScheduleEffect, Timestamp, UncertainReason,
+        EffectExecutor, EffectFailure, ExternalRef, Lookup, NotAppliedReason, Receipt,
+        ResourceKind, ResourceRef, ScheduleEffect, Timestamp, UncertainReason,
     },
     scheduling::{
         InstallPlan, InstalledSchedule, MAX_SCHEDULE_RUNS, ObservedScheduleState, PrecheckOutcome,
@@ -454,12 +454,17 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// A selection naming a model or effort is refused before anything is
     /// read or reserved: Orca automations take only a provider
     /// ([`SCHEDULE_SELECTION`](super::SCHEDULE_SELECTION)).
+    /// A schedule requiring a capability Orca does not fully support
+    /// ([`ScheduleSpec::requires`]) is refused the same way.
     ///
     /// Concurrent installers for one house and consumer take turns: the
     /// listing, the create, and the read-back happen under a reservation, so
     /// a second installer finds the schedule the first created.
     ///
     /// # Errors
+    /// [`OrcaError::Contract`] with
+    /// [`ContractError::UnsupportedCapabilities`](crate::contracts::ContractError::UnsupportedCapabilities)
+    /// naming every required capability Orca lacks or supports only in part.
     /// [`OrcaError::Selection`] naming every part of the selection Orca
     /// cannot launch. [`OrcaError::ScheduleActive`] when the consumer's
     /// schedule is firing and [`OrcaError::ScheduleDiffers`] when it is not
@@ -477,6 +482,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// [`OrcaBackend::install_schedule`], and whether this call created the
     /// schedule or reused one already installed.
     fn install(&self, spec: &ScheduleSpec) -> Result<(ResourceRef, Install), OrcaError> {
+        EffectExecutor::descriptor(self)
+            .capabilities
+            .require(spec.requires().iter().copied())?;
         backend::SCHEDULE_SELECTION.check(&spec.agent().selection)?;
         let consumer = spec.consumer();
         let mut reservation = self.reserve(format!(

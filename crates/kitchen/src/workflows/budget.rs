@@ -452,7 +452,8 @@ fn absolute(path: &Path) -> Result<&str> {
 /// The house's budget schedule under the consumer [`WORKFLOW`], for the
 /// backend's schedule installer, such as
 /// [`OrcaBackend::install_schedule`](crate::adapters::orca::OrcaBackend::install_schedule),
-/// which installs it paused and counts its allocation against the house
+/// which installs it paused, refuses it unless the backend supports
+/// [`REQUIRED_CAPABILITIES`], and counts its allocation against the house
 /// budget. It is budgeted like any other schedule, so an exhausted house
 /// budget pauses it too. Nothing in Kitchen activates it: turning it on, and
 /// again after a pause, is the owner's separate schedule effect under its own
@@ -496,7 +497,8 @@ pub fn install(
         prompt,
         agent,
     )
-    .with_precheck(check))
+    .with_precheck(check)
+    .requiring(REQUIRED_CAPABILITIES))
 }
 
 /// How a tick posts one owner report.

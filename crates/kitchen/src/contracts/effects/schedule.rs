@@ -5,6 +5,8 @@
 //! [`Permission::ManageSchedule`], and turning a schedule on needs the
 //! separate [`Permission::ActivateSchedule`].
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -61,6 +63,16 @@ impl ScheduleEffect {
             | Self::SetState { .. }
             | Self::Remove { .. }
             | Self::Trial { .. } => Capability::ScheduleManage,
+        }
+    }
+
+    /// The capabilities the scheduled workflow requires of the executor,
+    /// beyond [`Self::required_capability`]; only an install carries them.
+    #[must_use]
+    pub fn workflow_requirements(&self) -> Option<&BTreeSet<Capability>> {
+        match self {
+            Self::InstallDisabled { schedule } => Some(schedule.requires()),
+            Self::SetState { .. } | Self::Remove { .. } | Self::Trial { .. } => None,
         }
     }
 

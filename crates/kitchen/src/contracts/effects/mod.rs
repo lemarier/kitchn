@@ -224,6 +224,17 @@ impl Effect {
         }
     }
 
+    /// The capabilities the effect's workflow declares for the executor
+    /// beyond [`Self::required_capability`], such as a schedule install's
+    /// [`ScheduleSpec::requires`](crate::scheduling::ScheduleSpec::requires).
+    pub fn workflow_requirements(&self) -> impl Iterator<Item = Capability> + '_ {
+        let declared = match self {
+            Self::Schedule(effect) => effect.workflow_requirements(),
+            Self::Worker(_) | Self::GitHub(_) | Self::Roger(_) => None,
+        };
+        declared.into_iter().flatten().copied()
+    }
+
     /// The task permission this effect needs.
     #[must_use]
     pub const fn required_permission(&self) -> Permission {

@@ -104,9 +104,12 @@
 //!   create, and every change is read back. An existing schedule is reused
 //!   only when it is paused and matches the requested definition, and its
 //!   receipt then lists it as touched, not created; an active
-//!   or different one is refused and never changed. Orca cannot tell an idle precheck
-//!   from a failed one, and cannot prevent overlapping runs of one schedule;
-//!   Kitchen's consumer lease must.
+//!   or different one is refused and never changed. Orca skips a run on any
+//!   non-zero precheck exit; only its run history tells an idle precheck from
+//!   a failed one. It cannot prevent overlapping runs of one schedule or
+//!   enforce a run timeout, so a schedule whose workflow requires either is
+//!   refused; for other schedules, Kitchen's consumer lease must prevent
+//!   overlap.
 
 mod accounts;
 mod backend;

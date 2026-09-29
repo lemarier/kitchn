@@ -177,9 +177,10 @@ fn absolute(path: &Path) -> Result<&str, WorkflowError> {
 }
 
 /// The effect that installs the gardener's daily schedule for `consumer`,
-/// paused. There is no gardener path that activates it: turning it on is a
-/// separate schedule effect under its own permission. `agent` is the house
-/// policy's resolution for
+/// paused, requiring [`REQUIRED_CAPABILITIES`] of the backend. There is no
+/// gardener path that activates it: turning it on is a separate schedule
+/// effect under its own permission. `agent` is the house policy's resolution
+/// for
 /// [`Workflow::Gardener`](crate::house::Workflow::Gardener)'s
 /// [`schedule_request`](crate::house::Workflow::schedule_request).
 ///
@@ -211,7 +212,8 @@ pub fn install(
         prompt,
         agent,
     )
-    .with_precheck(check);
+    .with_precheck(check)
+    .requiring(REQUIRED_CAPABILITIES);
     Ok(Effect::Schedule(ScheduleEffect::InstallDisabled {
         schedule: schedule.into(),
     }))

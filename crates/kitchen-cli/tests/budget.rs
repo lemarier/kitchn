@@ -301,6 +301,37 @@ fn installing_the_tick_needs_the_schedule_grant() -> TestResult {
 }
 
 #[test]
+fn installing_the_tick_on_orca_is_refused_naming_the_missing_capabilities() -> TestResult {
+    // Every grant is in place; Orca lacks what the tick requires.
+    let kitchen = Kitchen::new(0, |_| Ok(()))?;
+    let output = kitchen.budget(
+        "install",
+        &[
+            "--kitchen",
+            env!("CARGO_BIN_EXE_kitchn"),
+            "--cron",
+            "15 * * * *",
+            "--timezone",
+            "America/Toronto",
+            "--agent",
+            "claude",
+        ],
+    )?;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for capability in [
+        "schedule.single_consumer",
+        "schedule.run_timeout",
+        "schedule.precheck",
+    ] {
+        assert!(stderr.contains(capability), "{capability}: {stderr}");
+    }
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(kitchen.calls("automations")?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn installing_the_tick_with_a_report_issue_needs_the_comment_grant() -> TestResult {
     // The schedule grant is there; the house grants no comments.
     let kitchen = Kitchen::new(0, |_| Ok(()))?;

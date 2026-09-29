@@ -1640,7 +1640,8 @@ impl StoreState {
             task.spec
                 .requires
                 .for_executor(plan.effect.executor())
-                .chain([plan.effect.required_capability()]),
+                .chain([plan.effect.required_capability()])
+                .chain(plan.effect.workflow_requirements()),
         )?;
         let trigger = task.owned_lease(plan.fence, now, true)?.trigger.clone();
         // Every launch uses the selection fixed when the task was created.

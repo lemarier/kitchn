@@ -74,8 +74,8 @@ A preview shows every issue, comment, label and dependency it would write, with
 a digest. A preview with open questions is not ready. `issue new` and
 `issue refine` post nothing, and this release has no command that posts an
 approved draft ([#140](https://github.com/lemarier/kitchen/issues/140)). The
-session tells you the approved text is ready and posts nothing unless you
-approve that exact post.
+session returns the approved draft for you to post yourself; this release never
+posts it.
 
 If an earlier draft on the same subject settled after writing, or possibly
 writing, to the forge, new drafts are refused until you release the subject.

@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.98.1"
 authors = ["lemarier"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/lemarier/kitchen"
+repository = "https://github.com/lemarier/kitchn"
 publish = false
 
 [workspace.dependencies]

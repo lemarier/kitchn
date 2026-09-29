@@ -14,7 +14,7 @@ The skill lives in the kitchn repository at `skills/kitchn/`. Copy or link that
 directory into your agent's skills directory, for example
 `~/.claude/skills/kitchn` for Claude Code. A `kitchn skill install` command is
 planned with the first release
-([#18](https://github.com/lemarier/kitchen/issues/18)).
+([#18](https://github.com/lemarier/kitchn/issues/18)).
 
 The skill asks for your registry path the first time it needs it.
 
@@ -73,7 +73,7 @@ budget applies. You can ask for fewer rounds in a session, never more.
 A preview shows every issue, comment, label and dependency it would write, with
 a digest. A preview with open questions is not ready. `issue new` and
 `issue refine` post nothing, and this release has no command that posts an
-approved draft ([#140](https://github.com/lemarier/kitchen/issues/140)). The
+approved draft ([#140](https://github.com/lemarier/kitchn/issues/140)). The
 session returns the approved draft for you to post yourself; this release never
 posts it.
 

@@ -87,7 +87,7 @@ export const steps: Step[] = [
         kind: "term",
         label: "From source, today",
         lines: [
-          cmd("git clone https://github.com/lemarier/kitchen && cd kitchen"),
+          cmd("git clone https://github.com/lemarier/kitchn && cd kitchn"),
           cmd("just install"),
           ok("recording commit <sha>"),
           cmd("kitchn --version"),

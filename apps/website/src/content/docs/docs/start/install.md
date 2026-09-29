@@ -5,7 +5,7 @@ description: Install the kitchn CLI.
 
 ## Install script (macOS and Linux)
 
-Available with the first release ([#18](https://github.com/lemarier/kitchen/issues/18)).
+Available with the first release ([#18](https://github.com/lemarier/kitchn/issues/18)).
 
 ```sh
 curl -fsSL https://getkitchn.com/install.sh | sh
@@ -28,8 +28,8 @@ This works today. kitchn needs the Rust toolchain pinned in the repository's
 `rust-toolchain.toml`; rustup installs it automatically. The install step also needs [just](https://just.systems).
 
 ```sh
-git clone https://github.com/lemarier/kitchen
-cd kitchen
+git clone https://github.com/lemarier/kitchn
+cd kitchn
 just install
 ```
 
@@ -37,7 +37,7 @@ just install
 
 :::note
 The install script and the `kitchn` crate are not published yet
-([#18](https://github.com/lemarier/kitchen/issues/18)). A source build
+([#18](https://github.com/lemarier/kitchn/issues/18)). A source build
 installs the `kitchn` binary today.
 :::
 

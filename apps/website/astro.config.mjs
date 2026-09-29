@@ -44,7 +44,7 @@ export default defineConfig({
         },
         {
           label: "Guides",
-          items: ["docs/guides/templates", "docs/guides/pins-and-recovery"],
+          items: ["docs/guides/sessions", "docs/guides/templates", "docs/guides/pins-and-recovery"],
         },
         { label: "Reference", items: ["docs/reference/cli"] },
         { label: "Project", items: ["docs/project/status"] },

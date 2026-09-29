@@ -36,6 +36,15 @@ The registry holds house policies and pinned guidance snapshots. Keep it in a
 private directory you control, outside any checkout. Private registry files are
 created with mode 0600 and directories with 0700.
 
+## The forge binding
+
+`kitchn forge bind` records the GitHub account a house writes as, the
+credential name its policy limits refer to, and a posting budget per task. The
+token itself stays in a file you place in the house's private registry
+directory. kitchn never copies it into its configuration, the repository or a
+command line. `kitchn house init` offers the logged-in `gh` account as the
+default.
+
 ## The repository binding
 
 kitchn never writes a file into your repository to remember its house. The

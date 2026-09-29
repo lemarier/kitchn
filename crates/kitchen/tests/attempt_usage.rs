@@ -712,6 +712,84 @@ fn a_store_written_before_usage_records_reads_as_not_reported() -> TestResult {
 }
 
 #[test]
+fn a_delivered_reply_is_recorded_on_its_own_ended_attempt_once() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let (id, fence) = claimed(&fixture, "usage-ended-reply", 0)?;
+    store.start_attempt(&id, fence, at(0))?;
+    store.finish_attempt(
+        &id,
+        fence,
+        AttemptNumber::FIRST,
+        AttemptOutcome::Failed(FailureClass::Retryable),
+        at(500),
+    )?;
+    store.start_attempt(&id, fence, at(800))?;
+    // A reply delivered to attempt 1's worker at 400 is found only now,
+    // while attempt 2 runs; it lands on attempt 1.
+    let question = ExternalRef::new("question-1")?;
+    store.record_attempt_reply(
+        &id,
+        fence,
+        AttemptNumber::FIRST,
+        &question,
+        at(100),
+        at(400),
+    )?;
+    // Recording it again, even on another attempt, changes nothing.
+    let second = AttemptNumber::new(2).ok_or("attempt")?;
+    store.record_attempt_reply(&id, fence, second, &question, at(100), at(900))?;
+    let replies: Vec<usize> = fixture
+        .reopen()?
+        .task(&id)?
+        .attempts()
+        .iter()
+        .map(|attempt| attempt.replies().len())
+        .collect();
+    assert_eq!(replies, [1, 0]);
+    let first = store.task(&id)?;
+    let [reply] = first.attempts().first().ok_or("attempt")?.replies() else {
+        return Err("expected one reply on attempt 1".into());
+    };
+    assert_eq!((reply.asked_at, reply.answered_at), (at(100), at(400)));
+
+    let other = ExternalRef::new("question-2")?;
+    let refused = store.record_attempt_reply(&id, fence, second, &other, at(20), at(10));
+    assert!(matches!(
+        refused,
+        Err(Error::Usage(UsageError::ReplyBeforeQuestion))
+    ));
+    let third = AttemptNumber::new(3).ok_or("attempt")?;
+    let refused = store.record_attempt_reply(&id, fence, third, &other, at(1), at(2));
+    assert!(matches!(
+        refused,
+        Err(Error::State(StateError::AttemptNotFound(number))) if number == third
+    ));
+
+    // After the claim changes hands, only the new owner records.
+    store.relinquish(&id, fence, at(1000))?;
+    let current = store
+        .claim(&id, &scheduled("next")?, ttl(3600)?, at(1001))?
+        .fence();
+    let refused = store.record_attempt_reply(&id, fence, second, &other, at(1), at(2));
+    assert!(matches!(
+        refused,
+        Err(Error::State(StateError::StaleFence { .. }))
+    ));
+    store.record_attempt_reply(&id, current, second, &other, at(850), at(950))?;
+    assert_eq!(
+        store
+            .task(&id)?
+            .attempts()
+            .iter()
+            .map(|attempt| attempt.replies().len())
+            .collect::<Vec<_>>(),
+        [1, 1]
+    );
+    Ok(())
+}
+
+#[test]
 fn a_session_taken_over_leaves_only_the_attempts_it_could_overlap_incomplete() -> TestResult {
     let fixture = Fixture::new()?;
     let mut spec = common::spec("usage-takeover")?;

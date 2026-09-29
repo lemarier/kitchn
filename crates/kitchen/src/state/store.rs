@@ -574,6 +574,31 @@ impl HouseStore {
         self.transact(|state| state.record_human_reply(id, fence, question, asked_at, now))
     }
 
+    /// Record that a person's reply to worker question `question`, asked at
+    /// `asked_at`, was delivered at `answered_at` to the worker of attempt
+    /// `attempt`, whether or not that attempt has ended: a delivered reply
+    /// found after a restart belongs to the attempt it reached. The current
+    /// owner records it, or the owner that settled the task. Recording the
+    /// same question again changes nothing.
+    ///
+    /// # Errors
+    /// [`UsageError::ReplyBeforeQuestion`] when `asked_at` is after
+    /// `answered_at`, [`UsageError::TooManyReplies`],
+    /// [`StateError::AttemptNotFound`], and [`StateError::StaleFence`].
+    pub fn record_attempt_reply(
+        &self,
+        id: &TaskId,
+        fence: Fence,
+        attempt: AttemptNumber,
+        question: &ExternalRef,
+        asked_at: Timestamp,
+        answered_at: Timestamp,
+    ) -> Result<()> {
+        self.transact(|state| {
+            state.record_attempt_reply(id, fence, attempt, question, asked_at, answered_at)
+        })
+    }
+
     /// Link the task to pull request `number` in its repository. The owner
     /// that recorded usage may link it; linking the same one again changes
     /// nothing.

@@ -1747,6 +1747,124 @@ fn a_restart_records_a_persons_reply_from_its_recorded_source() -> TestResult {
     Ok(())
 }
 
+/// A person's reply that applied, but whose recording was lost: the reply's
+/// outcome was lost, then reconciliation found it applied, and the
+/// coordinator stopped before the question was handled again. The worker
+/// then fails, ending attempt 1.
+fn reply_applied_then_attempt_failed(
+    world: &World,
+    attempts: u32,
+) -> TestResult<(TaskId, Fence, Supervision)> {
+    let (task, fence) = claim(world, "coordinator", 1, attempts)?;
+    let worker = launched(world, &task, fence, 1)?;
+    world.clock.advance(20);
+    world.backend.inject(ExecuteFault::ApplyThenLoseResponse);
+    assert_eq!(
+        handle_question(
+            &world.ctx(),
+            &task,
+            fence,
+            &supervision()?,
+            &question("msg-lost", 1_000)?,
+            &person("Use the existing SPI helper.")?,
+            None
+        )?,
+        QuestionRoute::Uncertain
+    );
+    world.backend.set_worker_state(&worker, WorkerState::Ready);
+    assert_eq!(
+        step(world, &task, fence)?,
+        Supervision::Running(WorkerState::Ready)
+    );
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Failed));
+    let ended = step(world, &task, fence)?;
+    assert!(replies(world, &task)?.is_empty());
+    Ok((task, fence, ended))
+}
+
+/// The replies on each of the task's attempts, oldest attempt first.
+fn replies_by_attempt(
+    world: &World,
+    task: &TaskId,
+) -> TestResult<Vec<Vec<kitchen::state::HumanReply>>> {
+    Ok(world
+        .fixture
+        .store
+        .task(task)?
+        .attempts()
+        .iter()
+        .map(|attempt| attempt.replies().to_vec())
+        .collect())
+}
+
+#[test]
+fn a_replayed_reply_is_recorded_on_its_ended_attempt_once() -> TestResult {
+    let world = World::new()?;
+    let (task, fence, ended) = reply_applied_then_attempt_failed(&world, 2)?;
+    assert_eq!(ended, Supervision::Retry { remaining: 1 });
+    launched(&world, &task, fence, 1)?;
+    world.clock.advance(60);
+    // The replay knows neither who answered nor, exactly, when the question
+    // was asked; both come from the delivered reply.
+    let replayed = question("msg-lost", 1_010)?;
+    let policy = supervision()?;
+    for _ in 0..2 {
+        assert_eq!(
+            handle_question(
+                &world.ctx(),
+                &task,
+                fence,
+                &policy,
+                &replayed,
+                &Response::Pending,
+                None
+            )?,
+            QuestionRoute::Duplicate
+        );
+    }
+    let recorded = replies_by_attempt(&world, &task)?;
+    let [first, second] = recorded.as_slice() else {
+        return Err(format!("expected two attempts, got {recorded:?}").into());
+    };
+    let [reply] = first.as_slice() else {
+        return Err(format!("expected one reply on attempt 1, got {first:?}").into());
+    };
+    assert_eq!(reply.question.as_str(), "msg-lost");
+    assert_eq!(reply.asked_at, common::at(1_000));
+    assert_eq!(reply.answered_at, common::at(1_020));
+    assert!(second.is_empty());
+    assert_eq!(world.backend.effects_performed(), 3);
+    Ok(())
+}
+
+#[test]
+fn a_replayed_reply_is_recorded_after_its_attempt_settled_the_task() -> TestResult {
+    let world = World::new()?;
+    let (task, fence, ended) = reply_applied_then_attempt_failed(&world, 1)?;
+    assert_eq!(ended, Supervision::Settled(Settlement::Exhausted));
+    let policy = supervision()?;
+    let replayed = question("msg-lost", 1_000)?;
+    for _ in 0..2 {
+        assert_eq!(
+            handle_question(
+                &world.ctx(),
+                &task,
+                fence,
+                &policy,
+                &replayed,
+                &Response::Pending,
+                None
+            )?,
+            QuestionRoute::Duplicate
+        );
+    }
+    let recorded = replies_by_attempt(&world, &task)?;
+    assert_eq!(recorded.iter().map(Vec::len).collect::<Vec<_>>(), [1]);
+    Ok(())
+}
+
 #[test]
 fn an_adopted_task_does_not_record_a_persons_reply_twice() -> TestResult {
     let policy = supervision()?;
@@ -1938,7 +2056,7 @@ fn a_late_report_lands_on_its_own_attempt_after_a_retry() -> TestResult {
 }
 
 #[test]
-fn a_report_for_another_worker_or_source_is_not_recorded() -> TestResult {
+fn a_report_for_an_unknown_worker_or_another_backend_is_not_recorded() -> TestResult {
     use kitchen::state::AttemptUsage;
     use kitchen::workflows::coordination::{UsageRoute, record_worker_usage};
     let mut world = World::new()?;
@@ -1951,13 +2069,8 @@ fn a_report_for_another_worker_or_source_is_not_recorded() -> TestResult {
         step(&world, &task, fence)?,
         Supervision::Retry { remaining: 1 }
     );
-    let second = launched(&world, &task, fence, 1)?;
+    launched(&world, &task, fence, 1)?;
 
-    // Attempt 2's report named as attempt 1's worker is refused.
-    assert_eq!(
-        record_worker_usage(&world.ctx(), &task, fence, &first, usage_report(&second))?,
-        UsageRoute::SourceMismatch
-    );
     // A worker this task never launched is unknown.
     let stranger = ResourceRef {
         handle: ExternalRef::new("worker-not-launched")?,
@@ -1990,11 +2103,50 @@ fn a_report_for_another_worker_or_source_is_not_recorded() -> TestResult {
     );
     assert_eq!(
         record_worker_usage(&world.ctx(), &task, fence, &first, usage_report(&first))?,
-        UsageRoute::SourceMismatch
+        UsageRoute::BackendMismatch
     );
     assert_eq!(
         attempt_usage(&world, &task)?,
         vec![AttemptUsage::NotReported, AttemptUsage::NotReported]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_report_keeps_its_run_id_source_on_the_named_workers_attempt() -> TestResult {
+    use kitchen::contracts::AttemptNumber;
+    use kitchen::state::AttemptUsage;
+    use kitchen::workflows::coordination::{UsageRoute, record_worker_usage};
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 2)?;
+    let first = launched(&world, &task, fence, 1)?;
+    world
+        .backend
+        .set_worker_state(&first, WorkerState::Settled(WorkerOutcome::Failed));
+    assert_eq!(
+        step(&world, &task, fence)?,
+        Supervision::Retry { remaining: 1 }
+    );
+    launched(&world, &task, fence, 1)?;
+    // The backend reports under its own run ID, not the worker's handle;
+    // the caller names the worker it launched.
+    let mut report = usage_report(&first);
+    report.source = ExternalRef::new("orca-run:42")?;
+    assert_ne!(report.source, first.handle);
+    assert_eq!(
+        record_worker_usage(&world.ctx(), &task, fence, &first, report.clone())?,
+        UsageRoute::Recorded(AttemptNumber::FIRST)
+    );
+    assert_eq!(
+        attempt_usage(&world, &task)?,
+        vec![
+            AttemptUsage::Reported {
+                backend: common::backend_id()?,
+                report,
+                at: world.now(),
+            },
+            AttemptUsage::NotReported,
+        ]
     );
     Ok(())
 }

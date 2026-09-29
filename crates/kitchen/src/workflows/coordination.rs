@@ -1647,27 +1647,54 @@ pub enum AnswerSource {
     Person,
 }
 
-impl AnswerSource {
+/// Who answered, as recorded with the reply effect that delivered the
+/// answer. A person's answer also keeps when the question was asked, so a
+/// restart records it without trusting the repeated question's time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedAnswer {
+    Coordinator,
+    Person { asked_at: Timestamp },
+}
+
+impl RecordedAnswer {
     const COORDINATOR_BASIS: &'static str = "answer-source:coordinator";
-    const PERSON_BASIS: &'static str = "answer-source:person";
+    const PERSON_BASIS_PREFIX: &'static str = "answer-source:person:asked-at:";
+
+    const fn new(source: AnswerSource, question: &WorkerQuestion) -> Self {
+        match source {
+            AnswerSource::Coordinator => Self::Coordinator,
+            AnswerSource::Person => Self::Person {
+                asked_at: question.asked_at,
+            },
+        }
+    }
 
     /// The basis recorded with the reply effect that delivers the answer.
     fn basis(self) -> Result<ExternalRef> {
-        Ok(ExternalRef::new(match self {
-            Self::Coordinator => Self::COORDINATOR_BASIS,
-            Self::Person => Self::PERSON_BASIS,
-        })?)
+        Ok(match self {
+            Self::Coordinator => ExternalRef::new(Self::COORDINATOR_BASIS)?,
+            Self::Person { asked_at } => ExternalRef::new(&format!(
+                "{}{}",
+                Self::PERSON_BASIS_PREFIX,
+                asked_at.as_unix_millis()
+            ))?,
+        })
     }
 
-    /// The source recorded with a delivered reply, or `None` when the
-    /// reply carries none, such as one delivered before sources were
-    /// recorded.
-    fn recorded(reply: &EffectRecord) -> Option<Self> {
-        match reply.basis().map(ExternalRef::as_str) {
-            Some(Self::COORDINATOR_BASIS) => Some(Self::Coordinator),
-            Some(Self::PERSON_BASIS) => Some(Self::Person),
-            Some(_) | None => None,
+    /// The answer recorded with a delivered reply, or `None` when the reply
+    /// carries no readable source.
+    fn of(reply: &EffectRecord) -> Option<Self> {
+        let basis = reply.basis()?.as_str();
+        if basis == Self::COORDINATOR_BASIS {
+            return Some(Self::Coordinator);
         }
+        let millis = basis
+            .strip_prefix(Self::PERSON_BASIS_PREFIX)?
+            .parse::<u64>()
+            .ok()?;
+        Some(Self::Person {
+            asked_at: Timestamp::from_unix_millis(millis),
+        })
     }
 }
 
@@ -1741,10 +1768,11 @@ fn named_effect<'r>(record: &'r TaskRecord, name: &str) -> Option<&'r EffectReco
         .find(|effect| effect.name().as_str() == name)
 }
 
-/// Record a person's reply once its delivery applied, dated when it
-/// applied. The source is the one recorded with the reply effect, never a
-/// later caller's claim; a coordinator's answer, or a reply without a
-/// recorded source, records nothing.
+/// Record a person's reply once its delivery applied, on the attempt it
+/// reached, dated when it applied. The source and question time are the
+/// ones recorded with the reply effect, never a later caller's claim; a
+/// coordinator's answer, or a reply without a recorded source, records
+/// nothing.
 fn record_reply(
     ctx: &Context<'_>,
     task: &TaskId,
@@ -1752,13 +1780,20 @@ fn record_reply(
     question: &WorkerQuestion,
     reply: &EffectRecord,
 ) -> Result<()> {
-    match (AnswerSource::recorded(reply), reply.state()) {
-        (Some(AnswerSource::Person), EffectState::Applied { at, .. }) => ctx
-            .store
-            .record_human_reply(task, fence, &question.id, question.asked_at, *at),
-        (Some(AnswerSource::Coordinator) | None, _)
+    match (RecordedAnswer::of(reply), reply.state()) {
+        (Some(RecordedAnswer::Person { asked_at }), EffectState::Applied { at, .. }) => {
+            ctx.store.record_attempt_reply(
+                task,
+                fence,
+                reply.request().attempt(),
+                &question.id,
+                asked_at,
+                *at,
+            )
+        }
+        (Some(RecordedAnswer::Coordinator) | None, _)
         | (
-            Some(AnswerSource::Person),
+            Some(RecordedAnswer::Person { .. }),
             EffectState::Intended
             | EffectState::Uncertain { .. }
             | EffectState::NotApplied { .. }
@@ -1772,8 +1807,9 @@ fn record_reply(
 /// across retries, restarts, and adoption; a human decision goes through
 /// Roger only when installed, at most once per question. A person's answer
 /// ([`AnswerSource::Person`]) is recorded with
-/// [`HouseStore::record_human_reply`] once its delivery applied, also when
-/// a restart repeats the question after delivery.
+/// [`HouseStore::record_attempt_reply`] on the attempt it reached once its
+/// delivery applied, also when a restart repeats the question after
+/// delivery and that attempt has since ended.
 ///
 /// # Errors
 /// Returns store and authority failures, and the reply's recording errors
@@ -1795,17 +1831,17 @@ pub fn handle_question(
     if let Some(existing) = named_effect(&record, &reply_name) {
         return Ok(match existing.state() {
             EffectState::Applied { .. } => {
-                ctx.store.consume_message(task, fence, &question.id, now)?;
                 // A restart between delivery and recording lost the
-                // person's reply; record it now from the source recorded
-                // with the delivery. The repeat's own response is not
-                // trusted: it cannot relabel a coordinator's answer.
-                if AnswerSource::recorded(existing) == Some(AnswerSource::Person)
-                    && open_worker(&record)
-                        .is_some_and(|view| view.attempt == existing.request().attempt())
-                {
-                    running_attempt(ctx, task, fence)?;
-                    record_reply(ctx, task, fence, question, existing)?;
+                // person's reply; record it now on the attempt it reached,
+                // even if that attempt or the task has since ended, from
+                // what was recorded with the delivery. The repeat's own
+                // response is not trusted: it cannot relabel an answer.
+                record_reply(ctx, task, fence, question, existing)?;
+                match record.state() {
+                    TaskState::Settled { .. } => {}
+                    TaskState::Open | TaskState::Claimed { .. } => {
+                        ctx.store.consume_message(task, fence, &question.id, now)?;
+                    }
                 }
                 QuestionRoute::Duplicate
             }
@@ -1854,7 +1890,7 @@ pub fn handle_question(
                 &reply_name,
                 effect,
                 revision,
-                Some(source.basis()?),
+                Some(RecordedAnswer::new(*source, question).basis()?),
             )?;
             Ok(match reply.state() {
                 EffectState::Applied { .. } => {
@@ -1948,19 +1984,20 @@ pub enum UsageRoute {
     AttemptOpen,
     /// No applied launch of this task created the named worker.
     UnknownWorker,
-    /// The report's source is not the named worker's handle, or the worker
-    /// belongs to another backend than the one reporting; nothing is
-    /// recorded.
-    SourceMismatch,
+    /// The named worker belongs to another backend than the one reporting;
+    /// nothing is recorded.
+    BackendMismatch,
 }
 
 /// Record the usage report the worker backend returned for `worker`, on
 /// the attempt whose applied launch created it, once that attempt has
 /// ended: finished, cancelled, or settling the task. A late report for an
-/// earlier attempt lands on that attempt, not on a retry's. The report's
-/// source must be the worker's handle. The owner that settled the task may
-/// still record it. Repeating the same report changes nothing. Without a
-/// report the attempt stays [`crate::state::AttemptUsage::NotReported`].
+/// earlier attempt lands on that attempt, not on a retry's. The caller
+/// names the worker it launched and asked about; the report keeps its own
+/// source, such as the backend's run ID, which need not be the worker's
+/// handle. The owner that settled the task may still record it. Repeating
+/// the same report changes nothing. Without a report the attempt stays
+/// [`crate::state::AttemptUsage::NotReported`].
 ///
 /// # Errors
 /// Returns [`HouseStore::record_attempt_usage`] failures, including
@@ -1978,8 +2015,8 @@ pub fn record_worker_usage(
         return Ok(UsageRoute::UnknownWorker);
     };
     let descriptor = ctx.backend.descriptor();
-    if report.source != view.worker.handle || view.worker.backend != descriptor.backend {
-        return Ok(UsageRoute::SourceMismatch);
+    if view.worker.backend != descriptor.backend {
+        return Ok(UsageRoute::BackendMismatch);
     }
     // A missing attempt falls through to the store, which refuses it.
     if let Some(attempt) = record

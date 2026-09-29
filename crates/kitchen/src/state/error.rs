@@ -168,6 +168,9 @@ pub enum StateError {
     /// A task id was reused with a different specification.
     #[error("task {0} already exists with a different specification")]
     TaskConflict(TaskId),
+    /// A task-fenced marker write named a marker of another work item.
+    #[error("marker is not for task {0}")]
+    MarkerNotForTask(TaskId),
     /// The task is settled; no further changes are accepted.
     #[error("task {task} is already settled as {settlement}")]
     TaskSettled {
@@ -398,7 +401,9 @@ impl StateError {
             | Self::ScheduleRequirementsUnknown
             | Self::ScheduleRequirementsMismatch
             | Self::AcknowledgementNeedsPerson => ErrorClass::Refused,
-            Self::MarkerSchemaInvalid | Self::MarkerPayloadInvalid => ErrorClass::InvalidInput,
+            Self::MarkerSchemaInvalid | Self::MarkerPayloadInvalid | Self::MarkerNotForTask(_) => {
+                ErrorClass::InvalidInput
+            }
             Self::TaskNotFound(_)
             | Self::TaskConflict(_)
             | Self::TaskSettled { .. }

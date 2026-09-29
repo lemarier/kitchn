@@ -2366,6 +2366,43 @@ impl StoreState {
         self.record_marker_guarded(key, fact, recorded_by, now, Some(pending), guard)
     }
 
+    /// Like [`Self::record_marker_unless`], recorded by the owner of `task`'s
+    /// live claim at `fence`. The claim is checked in this transaction, so a
+    /// takeover or settlement since the caller read the task refuses the
+    /// write.
+    pub(crate) fn record_task_marker_unless<R>(
+        &mut self,
+        key: MarkerKey,
+        fact: MarkerFact,
+        task: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+        guard: impl FnOnce(&[&WorkflowMarker]) -> Result<Option<R>>,
+    ) -> Result<MarkerAttempt<R>> {
+        let owner = self.task_owner(&key, task, fence, now)?;
+        self.record_marker_guarded(key, fact, &owner, now, None, guard)
+    }
+
+    /// The claimant owning `task`'s live claim at `fence`, for a marker of
+    /// that task only: a claim on one task never writes another's marker.
+    fn task_owner(
+        &self,
+        key: &MarkerKey,
+        task: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<Claimant> {
+        if !matches!(&key.item, WorkItem::Task { task: item } if item == task) {
+            return fail(StateError::MarkerNotForTask(task.clone()));
+        }
+        let lease = self.task(task)?.owned_lease(fence, now, true)?;
+        Ok(Claimant {
+            holder: lease.holder.clone(),
+            trigger: lease.trigger.clone(),
+            consumer: lease.consumer.clone(),
+        })
+    }
+
     /// Record `first` and, when the guard asks for it, `second` in one
     /// transaction. The guard reads the workflow's markers before either is
     /// written. It blocks both, skips `second`, or records both; an error
@@ -2449,6 +2486,21 @@ impl StoreState {
         self.markers
             .supersede(key, expected, fact, recorded_by, now)
             .or_else(marker_refusal)
+    }
+
+    /// Like [`Self::supersede_marker`], by the owner of `task`'s live claim
+    /// at `fence`, checked in this transaction.
+    pub(crate) fn supersede_task_marker(
+        &mut self,
+        key: &MarkerKey,
+        expected: &MarkerFact,
+        fact: MarkerFact,
+        task: &TaskId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<MarkerRecording> {
+        let owner = self.task_owner(key, task, fence, now)?;
+        self.supersede_marker(key, expected, fact, &owner, now)
     }
 
     pub(crate) fn retire_markers(

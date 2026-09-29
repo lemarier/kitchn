@@ -1091,3 +1091,225 @@ fn an_asked_question_is_never_retired() -> TestResult {
     assert!(fixture.store.marker(&spent)?.is_some());
     Ok(())
 }
+
+fn task_key(task: &kitchen::TaskId, subject: &str) -> TestResult<MarkerKey> {
+    Ok(MarkerKey {
+        workflow: WorkflowId::new("held-follow-up")?,
+        item: WorkItem::Task { task: task.clone() },
+        subject: MarkerSubject::Observation(ExternalRef::new(subject)?),
+    })
+}
+
+#[test]
+fn a_task_marker_is_recorded_only_under_the_tasks_current_live_claim() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let task = task_id("held-task")?;
+    store.create_task(spec(task.as_str())?, &common::creator()?, at(0))?;
+    let first = store.claim(&task, &scheduled("first")?, ttl(60)?, at(0))?;
+    let fact = || verdict(EvidenceVerdict::Pass);
+    let unblocked = |_: &[&kitchen::state::WorkflowMarker]| Ok(None::<()>);
+
+    // The claim's owner records it, and the guard can still block a write.
+    let attempt = store.record_task_marker_unless(
+        task_key(&task, "a")?,
+        fact(),
+        &task,
+        first.fence(),
+        at(1),
+        unblocked,
+    )?;
+    let MarkerAttempt::Recorded(marker) = attempt else {
+        return Err(format!("not recorded: {attempt:?}").into());
+    };
+    assert_eq!(marker.recorded_by().holder.as_str(), "first");
+    let blocked = store.record_task_marker_unless(
+        task_key(&task, "b")?,
+        fact(),
+        &task,
+        first.fence(),
+        at(2),
+        |_| Ok(Some("full")),
+    )?;
+    assert_eq!(blocked, MarkerAttempt::Blocked("full"));
+    assert_eq!(store.marker(&task_key(&task, "b")?)?, None);
+
+    // An expired claim records nothing, even before anyone took it over.
+    let expired = store.record_task_marker_unless(
+        task_key(&task, "b")?,
+        fact(),
+        &task,
+        first.fence(),
+        at(61),
+        unblocked,
+    );
+    assert!(
+        matches!(expired, Err(Error::State(StateError::LeaseExpired { .. }))),
+        "{expired:?}"
+    );
+
+    // Taken over: the old fence is stale, even for a key already recorded.
+    let second = store.take_over(&task, &scheduled("second")?, ttl(60)?, at(62))?;
+    for subject in ["a", "b"] {
+        let stale = store.record_task_marker_unless(
+            task_key(&task, subject)?,
+            fact(),
+            &task,
+            first.fence(),
+            at(63),
+            unblocked,
+        );
+        assert!(
+            matches!(stale, Err(Error::State(StateError::StaleFence { .. }))),
+            "{stale:?}"
+        );
+    }
+
+    // Settled: even the current owner records nothing more.
+    store.request_cancel(&task, &common::holder("second")?, at(64))?;
+    store.settle_cancelled(&task, second.fence(), at(64))?;
+    let settled = store.record_task_marker_unless(
+        task_key(&task, "b")?,
+        fact(),
+        &task,
+        second.fence(),
+        at(65),
+        unblocked,
+    );
+    assert!(
+        matches!(settled, Err(Error::State(StateError::TaskSettled { .. }))),
+        "{settled:?}"
+    );
+    let missing = task_id("no-such-task")?;
+    let unknown = store.record_task_marker_unless(
+        task_key(&missing, "a")?,
+        fact(),
+        &missing,
+        second.fence(),
+        at(65),
+        unblocked,
+    );
+    assert!(
+        matches!(unknown, Err(Error::State(StateError::TaskNotFound(_)))),
+        "{unknown:?}"
+    );
+    assert_eq!(store.markers(&WorkflowId::new("held-follow-up")?)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_task_marker_is_superseded_only_under_the_tasks_current_live_claim() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let task = task_id("briefed-task")?;
+    store.create_task(spec(task.as_str())?, &common::creator()?, at(0))?;
+    let first = store.claim(&task, &scheduled("first")?, ttl(60)?, at(0))?;
+    let key = task_key(&task, "a")?;
+    let waiting = verdict(EvidenceVerdict::Pass);
+    let briefed = verdict(EvidenceVerdict::Fail);
+    store.record_marker(key.clone(), waiting.clone(), &scheduled("first")?, at(1))?;
+
+    // Taken over: the old owner changes nothing.
+    let second = store.take_over(&task, &scheduled("second")?, ttl(60)?, at(61))?;
+    let stale = store.supersede_task_marker(
+        &key,
+        &waiting,
+        briefed.clone(),
+        &task,
+        first.fence(),
+        at(62),
+    );
+    assert!(
+        matches!(stale, Err(Error::State(StateError::StaleFence { .. }))),
+        "{stale:?}"
+    );
+    assert_eq!(
+        store.marker(&key)?.map(|marker| marker.fact().clone()),
+        Some(waiting.clone())
+    );
+
+    // The current owner supersedes it, recorded as itself.
+    let recorded = store.supersede_task_marker(
+        &key,
+        &waiting,
+        briefed.clone(),
+        &task,
+        second.fence(),
+        at(63),
+    )?;
+    let MarkerRecording::Superseded(marker) = recorded else {
+        return Err(format!("not superseded: {recorded:?}").into());
+    };
+    assert_eq!(marker.fact(), &briefed);
+    assert_eq!(marker.recorded_by().holder.as_str(), "second");
+
+    // Settled: nothing more, even from the owner that settled it.
+    store.request_cancel(&task, &common::holder("second")?, at(64))?;
+    store.settle_cancelled(&task, second.fence(), at(64))?;
+    let settled =
+        store.supersede_task_marker(&key, &briefed, waiting, &task, second.fence(), at(65));
+    assert!(
+        matches!(settled, Err(Error::State(StateError::TaskSettled { .. }))),
+        "{settled:?}"
+    );
+    assert_eq!(
+        store.marker(&key)?.map(|marker| marker.fact().clone()),
+        Some(briefed)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_claim_on_one_task_never_writes_another_tasks_marker() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = &fixture.store;
+    let owned = task_id("owned-task")?;
+    let other = task_id("other-task")?;
+    for task in [&owned, &other] {
+        store.create_task(spec(task.as_str())?, &common::creator()?, at(0))?;
+    }
+    let claim = store.claim(&owned, &scheduled("owner")?, ttl(60)?, at(0))?;
+    let waiting = verdict(EvidenceVerdict::Pass);
+    let briefed = verdict(EvidenceVerdict::Fail);
+    let foreign = task_key(&other, "a")?;
+    store.record_marker(
+        foreign.clone(),
+        waiting.clone(),
+        &scheduled("other")?,
+        at(1),
+    )?;
+
+    let recorded = store.record_task_marker_unless(
+        task_key(&other, "b")?,
+        waiting.clone(),
+        &owned,
+        claim.fence(),
+        at(2),
+        |_| Ok(None::<()>),
+    );
+    assert!(
+        matches!(recorded, Err(Error::State(StateError::MarkerNotForTask(_)))),
+        "{recorded:?}"
+    );
+    // The same key can never succeed, so it is invalid input, not a conflict.
+    assert_eq!(
+        recorded.err().map(|error| error.class()),
+        Some(kitchen::ErrorClass::InvalidInput)
+    );
+    assert_eq!(store.marker(&task_key(&other, "b")?)?, None);
+
+    let superseded =
+        store.supersede_task_marker(&foreign, &waiting, briefed, &owned, claim.fence(), at(3));
+    assert!(
+        matches!(
+            superseded,
+            Err(Error::State(StateError::MarkerNotForTask(_)))
+        ),
+        "{superseded:?}"
+    );
+    assert_eq!(
+        store.marker(&foreign)?.map(|marker| marker.fact().clone()),
+        Some(waiting)
+    );
+    Ok(())
+}

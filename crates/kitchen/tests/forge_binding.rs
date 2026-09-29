@@ -8,9 +8,9 @@ use kitchen::{
         Grant, IssueNumber, Permission, PostingBudget, Repository, Text, Trigger,
     },
     house::{
-        ApprovedWrite, BindOutcome, CredentialStatus, FORGE_BINDING_SCHEMA, ForgeBinding,
-        ForgeError, ForgeKind, HouseConfig, HouseError, HouseInitError, InitAnswers, InitDecision,
-        InitFacts, InitQuestion, InstalledAgents, NoGitHubAccess, Prompter, apply_approved,
+        AgentInventory, ApprovedWrite, BindOutcome, CredentialStatus, FORGE_BINDING_SCHEMA,
+        ForgeBinding, ForgeError, ForgeKind, HouseConfig, HouseError, HouseInitError, InitAnswers,
+        InitDecision, InitFacts, InitQuestion, NoGitHubAccess, Prompter, apply_approved,
         bind_forge, credential_path, credential_status, forge_binding, plan_house_init,
         register_house,
     },
@@ -18,7 +18,6 @@ use kitchen::{
         CredentialFile, CredentialRef, GitHubExecutor, GitHubMutationTransport,
         GitHubReadTransport, IntegrationError, MutationRequest, ReadRequest,
     },
-    scheduling::AgentFamily,
 };
 use std::{
     cell::Cell,
@@ -640,10 +639,7 @@ fn facts(home: &Path, login: Option<&str>) -> TestResult<InitFacts> {
         home: Some(home.to_path_buf()),
         checkout: Ok("acme/app".parse()?),
         kitchen: Some(CommitId::new(KITCHEN)?),
-        agents: InstalledAgents::Observed {
-            source: "PATH",
-            found: vec![AgentFamily::Claude, AgentFamily::Codex],
-        },
+        agents: AgentInventory::UNKNOWN,
         forge_login: login.map(ExternalRef::new).transpose()?,
     })
 }

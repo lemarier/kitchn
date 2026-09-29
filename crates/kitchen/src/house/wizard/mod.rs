@@ -229,18 +229,80 @@ impl InitAnswers {
     }
 }
 
-/// Which coding agents were observed installed, for the station question.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InstalledAgents {
-    /// These agents were observed; others were looked for and not found.
-    Observed {
-        /// Where they were observed, such as `PATH`.
-        source: &'static str,
-        /// The agents found.
-        found: Vec<AgentFamily>,
-    },
-    /// Nothing could be observed; no agent is claimed available.
+/// What one probe could establish about an agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// The probe found it.
+    Found,
+    /// The probe ran and did not find it.
+    NotFound,
+    /// The probe could not run or its answer was unusable.
     Unknown,
+}
+
+/// The evidence gathered for one agent family. Neither probe runs the agent
+/// or shows that Orca can launch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentEvidence {
+    /// An executable file of that name on `PATH`.
+    pub path: Probe,
+    /// A managed account for the family in `orca account list`.
+    pub orca_account: Probe,
+}
+
+impl AgentEvidence {
+    /// Nothing could be checked.
+    pub const UNKNOWN: Self = Self {
+        path: Probe::Unknown,
+        orca_account: Probe::Unknown,
+    };
+
+    fn found(self) -> bool {
+        self.path == Probe::Found || self.orca_account == Probe::Found
+    }
+
+    fn verified_absent(self) -> bool {
+        self.path == Probe::NotFound && self.orca_account == Probe::NotFound
+    }
+}
+
+/// Which coding agents could be observed, for the station question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentInventory {
+    /// Claude Code.
+    pub claude: AgentEvidence,
+    /// Codex.
+    pub codex: AgentEvidence,
+}
+
+impl AgentInventory {
+    /// Nothing could be observed; no agent is claimed available.
+    pub const UNKNOWN: Self = Self {
+        claude: AgentEvidence::UNKNOWN,
+        codex: AgentEvidence::UNKNOWN,
+    };
+
+    const fn evidence(&self, agent: AgentFamily) -> AgentEvidence {
+        match agent {
+            AgentFamily::Claude => self.claude,
+            AgentFamily::Codex => self.codex,
+        }
+    }
+
+    fn describe(&self, agent: AgentFamily) -> String {
+        let evidence = self.evidence(agent);
+        let path = match evidence.path {
+            Probe::Found => "found on PATH",
+            Probe::NotFound => "not on PATH",
+            Probe::Unknown => "PATH not checked",
+        };
+        let orca = match evidence.orca_account {
+            Probe::Found => "Orca has a managed account",
+            Probe::NotFound => "Orca has no managed account",
+            Probe::Unknown => "Orca's account list could not be read",
+        };
+        format!("{}: {path}; {orca}.", agent_name(agent))
+    }
 }
 
 /// What Kitchen inferred from the environment before asking anything.
@@ -252,8 +314,8 @@ pub struct InitFacts {
     pub checkout: Result<Repository, HouseError>,
     /// The Kitchen revision this binary was built from, when recorded.
     pub kitchen: Option<CommitId>,
-    /// The agents observed installed.
-    pub agents: InstalledAgents,
+    /// The agents observed.
+    pub agents: AgentInventory,
     /// The GitHub login the `gh` CLI is logged in as, read without its token.
     pub forge_login: Option<ExternalRef>,
 }
@@ -729,25 +791,13 @@ impl Session<'_> {
     fn agents(
         &mut self,
         answers: &InitAnswers,
-        installed: &InstalledAgents,
+        installed: &AgentInventory,
     ) -> Result<Option<AgentPolicy>, HouseInitError> {
-        match installed {
-            InstalledAgents::Observed { source, found } if found.is_empty() => {
-                self.show(&format!(
-                    "Found neither Claude Code nor Codex on {source}. Who works each station?"
-                ))?
-            }
-            InstalledAgents::Observed { source, found } => self.show(&format!(
-                "Found {} on {source}. Who works each station?",
-                found
-                    .iter()
-                    .map(|agent| agent_name(*agent))
-                    .collect::<Vec<_>>()
-                    .join(" and ")
-            ))?,
-            InstalledAgents::Unknown => self
-                .show("Kitchen cannot tell which agents are installed. Who works each station?")?,
-        }
+        self.show(&format!(
+            "{}\n{}\nThese checks never run an agent and do not show what Orca can launch. Who works each station?",
+            installed.describe(AgentFamily::Claude),
+            installed.describe(AgentFamily::Codex),
+        ))?;
         let mut chosen = Vec::with_capacity(Station::ALL.len());
         for station in Station::ALL {
             let agent = self.answer(
@@ -757,13 +807,19 @@ impl Session<'_> {
                 Some(Offer::plain(agent_name(station.default_agent()).to_owned())),
                 parse_agent,
             )?;
-            if let (Some(agent), InstalledAgents::Observed { source, found }) = (agent, installed)
-                && !found.contains(&agent)
-            {
-                self.show(&format!(
-                    "  {} was not found on {source}; install it before this station starts work.",
-                    agent_name(agent)
-                ))?;
+            if let Some(agent) = agent {
+                let evidence = installed.evidence(agent);
+                if evidence.verified_absent() {
+                    self.show(&format!(
+                        "  {} was not found; install it before this station starts work.",
+                        agent_name(agent)
+                    ))?;
+                } else if !evidence.found() {
+                    self.show(&format!(
+                        "  {} could not be verified; check it before this station starts work.",
+                        agent_name(agent)
+                    ))?;
+                }
             }
             chosen.push((station, agent));
         }

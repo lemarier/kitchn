@@ -1456,6 +1456,83 @@ fn a_pickup_launch_is_refused_when_the_executor_lacks_the_selection() -> TestRes
 }
 
 #[test]
+fn an_unsupported_selection_never_spends_an_attempt_over_many_ticks() -> TestResult {
+    // More ticks than the budget of three: none may open an attempt.
+    let world = World::new()?;
+    let (task, fence) = claim_with_policy(&world, 1)?;
+    for _ in 0..5 {
+        let error = launch(&world, &task, fence, 1)
+            .err()
+            .ok_or("a launch ran on an executor that cannot honor the selection")?;
+        assert!(matches!(
+            error.downcast_ref::<kitchen::Error>(),
+            Some(kitchen::Error::Contract(
+                ContractError::UnsupportedCapabilities { missing, .. }
+            )) if missing.contains(&Capability::AgentSelectFamily)
+        ));
+    }
+    let record = world.fixture.store.task(&task)?;
+    assert!(record.attempts().is_empty());
+    assert!(matches!(record.state(), TaskState::Claimed { .. }));
+    assert_eq!(world.backend.execute_calls(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_partly_supported_selection_is_refused_before_an_attempt() -> TestResult {
+    // The family is launchable but its model is not.
+    let mut world = World::new()?;
+    world.backend = FakeBackend::new(
+        common::backend_id()?,
+        common::house()?,
+        CapabilitySet::supporting(Capability::ALL),
+    )
+    .with_worker_selection(SelectionSupport {
+        families: &[AgentFamily::Claude, AgentFamily::Codex],
+        model: false,
+        effort: EffortSupport::Unsupported,
+    });
+    let (task, fence) = claim_with_policy(&world, 1)?;
+    let error = launch(&world, &task, fence, 1)
+        .err()
+        .ok_or("a launch ran without the selection's model")?;
+    assert!(matches!(
+        error.downcast_ref::<kitchen::Error>(),
+        Some(kitchen::Error::Contract(
+            ContractError::UnsupportedCapabilities { missing, .. }
+        )) if missing == &[Capability::AgentSelectModel]
+    ));
+    assert_eq!(attempt_count(&world, &task)?, 0);
+    assert_eq!(world.backend.execute_calls(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_refused_selection_launches_on_its_first_attempt_once_supported() -> TestResult {
+    let mut world = World::new()?;
+    let (task, fence) = claim_with_policy(&world, 1)?;
+    for _ in 0..3 {
+        assert!(launch(&world, &task, fence, 1).is_err());
+    }
+    world.backend = FakeBackend::new(
+        common::backend_id()?,
+        common::house()?,
+        CapabilitySet::supporting(Capability::ALL),
+    )
+    .with_worker_selection(SelectionSupport {
+        families: &[AgentFamily::Codex],
+        model: true,
+        effort: EffortSupport::WithModel,
+    });
+    match launch(&world, &task, fence, 1)? {
+        LaunchOutcome::Accepted { attempt, .. } => assert_eq!(attempt.get(), 1),
+        other => return Err(format!("launch not accepted: {other:?}").into()),
+    }
+    assert_eq!(world.backend.launched_agents(), vec![Some(codex_model()?)]);
+    Ok(())
+}
+
+#[test]
 fn a_pickup_without_a_policy_launches_the_backend_default() -> TestResult {
     let world = World::new()?;
     let (task, fence) = claim(&world, "coordinator", 1, 3)?;

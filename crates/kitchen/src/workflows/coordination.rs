@@ -474,7 +474,8 @@ fn unstopped_worker(ctx: &Context<'_>, record: &TaskRecord, fence: Fence) -> Opt
 ///
 /// # Errors
 /// Returns brief, store, and authority failures, such as a brief that does
-/// not match the task or a superseded consumer.
+/// not match the task or a superseded consumer. A task's agent selection that
+/// the backend cannot launch is refused before any attempt starts.
 pub fn launch_worker(
     ctx: &Context<'_>,
     task: &TaskId,
@@ -493,6 +494,13 @@ pub fn launch_worker(
     }
     if let Some(worker) = unstopped_worker(ctx, &record, fence) {
         return Ok(LaunchOutcome::SuperviseFirst { worker });
+    }
+    // A selection the executor cannot launch is a configuration problem no
+    // retry fixes: refuse it before an attempt is spent on it.
+    if let Some(resolved) = &record.spec().agent {
+        ctx.backend
+            .descriptor()
+            .check_worker_selection(&resolved.selection)?;
     }
     let attempt = match ctx.store.start_attempt(task, fence, ctx.clock.now()) {
         Ok(AttemptStart::Started(attempt) | AttemptStart::AlreadyRunning(attempt)) => attempt,

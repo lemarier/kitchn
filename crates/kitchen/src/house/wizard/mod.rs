@@ -257,8 +257,10 @@ impl AgentEvidence {
         orca_account: Probe::Unknown,
     };
 
+    /// Only the executable counts: a managed account alone does not show
+    /// that Orca can launch the agent.
     fn found(self) -> bool {
-        self.path == Probe::Found || self.orca_account == Probe::Found
+        self.path == Probe::Found
     }
 
     fn verified_absent(self) -> bool {

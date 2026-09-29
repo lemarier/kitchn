@@ -317,8 +317,8 @@ fn unknown_agents_are_asked_without_claiming_any_available() -> TestResult {
     assert!(!script.said("Claude Code was not found"));
     assert!(plan.config.agents.is_some());
 
-    // Evidence from either probe counts, and a partial failure is unverified
-    // rather than absent.
+    // A partial failure is unverified rather than absent, and a managed
+    // account without the executable does not show Orca can launch it.
     let mixed = InitFacts {
         agents: AgentInventory {
             claude: evidence(Probe::NotFound, Probe::Unknown),
@@ -335,8 +335,9 @@ fn unknown_agents_are_asked_without_claiming_any_available() -> TestResult {
     )?)?;
     assert!(script.said("Claude Code: not on PATH; Orca's account list could not be read."));
     assert!(script.said("Claude Code could not be verified"));
+    assert!(script.said("Codex: not on PATH; Orca has a managed account."));
     assert!(!script.said("Codex was not found"));
-    assert!(!script.said("Codex could not be verified"));
+    assert!(script.said("Codex could not be verified"));
     Ok(())
 }
 

@@ -17,6 +17,11 @@
 //!   and its identity can never be created again: a budget window that has
 //!   passed, or the repair rounds of a pull request that closed.
 //!
+//! - Attempt usage records ([`crate::state::AttemptUsage`]) and the events
+//!   human time is derived from live on their task. They never keep a task
+//!   and retire with it; a report counts them, so a preview shows what usage
+//!   evidence a pass would remove.
+//!
 //! Everything else is kept, including every marker dedupe still needs
 //! (asked questions, deliberation threads, reports owed to an owner) and
 //! every task of an unknown family. Intake markers follow their owner's
@@ -46,8 +51,8 @@ use crate::{
     contracts::{IssueNumber, ResourceRef, Settlement, Timestamp},
     integrations::github::{GitHubClient, GitHubReadTransport, IssueState, Observation},
     state::{
-        EffectState, MAX_CONSUMERS, MAX_MARKERS, MAX_TASKS, MarkerFact, MarkerKey, MarkerSchema,
-        StateError, TaskRecord, TaskState, WorkItem, WorkflowMarker,
+        AttemptUsage, EffectState, MAX_CONSUMERS, MAX_MARKERS, MAX_TASKS, MarkerFact, MarkerKey,
+        MarkerSchema, StateError, TaskRecord, TaskState, WorkItem, WorkflowMarker,
     },
     workflows::{budget, intake::LedgerCompaction, pickup, repair},
 };
@@ -348,6 +353,8 @@ pub struct RetiredTask {
     pub task: TaskId,
     /// Why.
     pub reason: TaskRetirement,
+    /// Attempts whose reported usage retires with the task.
+    pub reported_usage: usize,
 }
 
 /// What a retention pass removed, or would remove in a preview.
@@ -665,7 +672,7 @@ pub(super) fn plan<'a>(
             | WorkItem::Repository { .. } => None,
         })
         .collect();
-    let mut groups: BTreeMap<WorkItem, Vec<(&TaskId, bool)>> = BTreeMap::new();
+    let mut groups: BTreeMap<WorkItem, Vec<(&TaskRecord, bool)>> = BTreeMap::new();
     let mut retired_tasks = Vec::new();
     for task in tasks.values() {
         let family = TaskFamily::of(task);
@@ -678,11 +685,9 @@ pub(super) fn plan<'a>(
             TaskFamily::BudgetWindow if eligible => retired_tasks.push(RetiredTask {
                 task: task.spec().id.clone(),
                 reason: TaskRetirement::WindowEnded,
+                reported_usage: reported_usage(task),
             }),
-            TaskFamily::Repair(item) => groups
-                .entry(item)
-                .or_default()
-                .push((&task.spec().id, eligible)),
+            TaskFamily::Repair(item) => groups.entry(item).or_default().push((task, eligible)),
             TaskFamily::BudgetWindow | TaskFamily::Issue(_) | TaskFamily::Other => {}
         }
     }
@@ -691,8 +696,9 @@ pub(super) fn plan<'a>(
     for (item, members) in groups {
         if inventory.gone(&item) && members.iter().all(|(_, eligible)| *eligible) {
             retired_tasks.extend(members.into_iter().map(|(task, _)| RetiredTask {
-                task: task.clone(),
+                task: task.spec().id.clone(),
                 reason: TaskRetirement::ItemGone,
+                reported_usage: reported_usage(task),
             }));
         }
     }
@@ -747,6 +753,16 @@ fn task_settled(tasks: &BTreeMap<TaskId, TaskRecord>, item: &WorkItem) -> bool {
         | WorkItem::Resource { .. }
         | WorkItem::Repository { .. } => false,
     }
+}
+
+fn reported_usage(task: &TaskRecord) -> usize {
+    task.attempts()
+        .iter()
+        .filter(|attempt| match attempt.usage() {
+            AttemptUsage::Reported { .. } => true,
+            AttemptUsage::NotReported => false,
+        })
+        .count()
 }
 
 fn settled_long_enough(task: &TaskRecord, policy: &RetentionPolicy, now: Timestamp) -> bool {

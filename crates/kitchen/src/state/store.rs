@@ -29,9 +29,10 @@ use std::path::Path;
 use crate::{
     ConsumerId, Error, HolderId, HouseId, TaskId, WorkflowId,
     contracts::{
-        AttemptNumber, AttemptOutcome, AttemptStart, Claimant, Disposition, EffectExecutor,
-        EffectSeq, Evidence, EvidenceKind, EvidenceRevision, ExternalRef, Fence, HouseGrants,
-        LeaseTtl, RecordedEvidence, TaskSpec, Text, Timestamp, VerificationError,
+        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Claimant, Disposition,
+        EffectExecutor, EffectSeq, Evidence, EvidenceKind, EvidenceRevision, ExternalRef, Fence,
+        HouseGrants, IssueNumber, LeaseTtl, RecordedEvidence, TaskSpec, Text, Timestamp,
+        VerificationError,
     },
     state::{
         CancelStatus, ConsumerRecord, Consumption, Creation, EffectOutcome, EffectPlan,
@@ -44,11 +45,15 @@ use crate::{
             Inventory, RetentionPolicy, RetentionReport, RetentionSubjects, StoreCapacity,
         },
         snapshot::{SnapshotStore, StoreLayout, StoreOptions},
+        usage::{AttemptUsageEntry, UsageReport},
     },
 };
 
 #[cfg(doc)]
-use crate::{contracts::ContractError, state::StateError};
+use crate::{
+    contracts::ContractError,
+    state::{AttemptUsage, StateError, UsageError},
+};
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -521,6 +526,72 @@ impl HouseStore {
         now: Timestamp,
     ) -> Result<Consumption> {
         self.transact(|state| state.consume_message(id, fence, message, now))
+    }
+
+    /// Record what `backend` reported for attempt `attempt`. The current
+    /// owner records it, or the owner that settled the task, since a report
+    /// often arrives after the attempt ended. Repeating the same report
+    /// changes nothing. An attempt without a report stays
+    /// [`AttemptUsage::NotReported`].
+    ///
+    /// # Errors
+    /// [`ContractError::CrossHouse`] for another house's backend,
+    /// [`ContractError::UnsupportedCapabilities`] when `backend` does not
+    /// declare [`Capability::UsageAttribution`], [`UsageError::EmptyReport`],
+    /// [`UsageError::AlreadyReported`] for a different report,
+    /// [`StateError::AttemptNotFound`], and [`StateError::StaleFence`].
+    ///
+    /// [`Capability::UsageAttribution`]: crate::contracts::Capability::UsageAttribution
+    pub fn record_attempt_usage(
+        &self,
+        id: &TaskId,
+        fence: Fence,
+        attempt: AttemptNumber,
+        backend: &BackendDescriptor,
+        report: UsageReport,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.transact(|state| state.record_attempt_usage(id, fence, attempt, backend, report, now))
+    }
+
+    /// Record that a person's reply to worker question `question`, asked at
+    /// `asked_at`, was delivered now, in the running attempt. Record only
+    /// replies a person gave, not a coordinator's own answers. Recording the
+    /// same question again changes nothing.
+    ///
+    /// # Errors
+    /// [`UsageError::ReplyBeforeQuestion`] when `asked_at` is after `now`,
+    /// [`UsageError::TooManyReplies`], [`StateError::NoRunningAttempt`], and
+    /// ownership errors.
+    pub fn record_human_reply(
+        &self,
+        id: &TaskId,
+        fence: Fence,
+        question: &ExternalRef,
+        asked_at: Timestamp,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.transact(|state| state.record_human_reply(id, fence, question, asked_at, now))
+    }
+
+    /// Link the task to pull request `number` in its repository. The owner
+    /// that recorded usage may link it; linking the same one again changes
+    /// nothing.
+    ///
+    /// # Errors
+    /// [`UsageError::NoRepository`], [`UsageError::PullRequestConflict`]
+    /// when another pull request is linked, and [`StateError::StaleFence`].
+    pub fn link_pull_request(&self, id: &TaskId, fence: Fence, number: IssueNumber) -> Result<()> {
+        self.transact(|state| state.link_pull_request(id, fence, number))
+    }
+
+    /// Every attempt's usage in this house, with its task, station, work
+    /// type, pull request, and derived human time.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub fn attempt_usage(&self) -> Result<Vec<AttemptUsageEntry>> {
+        self.read(StoreState::attempt_usage)
     }
 
     /// Acquire the single-consumer lease for a workflow scope. Acquiring a

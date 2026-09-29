@@ -95,6 +95,9 @@ pub enum Error {
     /// An inspection sampling decision was refused or not reproducible.
     #[error(transparent)]
     Sampling(#[from] crate::workflows::sampling::SamplingError),
+    /// An attempt usage record was refused.
+    #[error(transparent)]
+    Usage(#[from] crate::state::UsageError),
 }
 
 impl Error {
@@ -125,6 +128,7 @@ impl Error {
             Self::Interactive(error) => error.class(),
             Self::Backend(error) => error.class(),
             Self::Sampling(error) => error.class(),
+            Self::Usage(error) => error.class(),
         }
     }
 }

@@ -93,21 +93,22 @@ pub enum OrcaError {
         /// Which parts differ, or could not be read back to compare.
         fields: Vec<ScheduleField>,
     },
-    /// The automation's name records no workflow requirements this Kitchen
-    /// can read, as for one installed before they were recorded, so it is
-    /// neither activated nor tried; or the spec being installed was stored
-    /// before they were recorded, so it is not installed. Nothing was
-    /// changed; install again from the current workflow.
+    /// The automation's name records no workflow, as for one installed
+    /// before it was recorded, or one Kitchen defines no schedule for, so
+    /// its requirements are unknown and it is neither activated nor tried;
+    /// or the spec being installed was stored before requirements were
+    /// recorded, so it is not installed. Nothing was changed; install again
+    /// from the current workflow.
     #[error(
-        "the schedule records no readable workflow requirements; remove and reinstall it before activating or trying it"
+        "the schedule's workflow requirements are unknown to Kitchen; remove and reinstall it before activating or trying it"
     )]
     ScheduleRequirementsUnknown,
-    /// The automation's name records other workflow requirements than the
-    /// ones Kitchen recorded for the schedule, as after the automation was
-    /// renamed in Orca, so it is neither activated nor tried. Nothing was
-    /// changed.
+    /// The workflow the automation's name records, or the spec being
+    /// installed runs, cannot serve its consumer, as after an automation was
+    /// renamed onto another workflow's consumer, so it is neither installed,
+    /// activated, nor tried. Nothing was changed.
     #[error(
-        "the schedule's name records other workflow requirements than Kitchen's; remove and reinstall it before activating or trying it"
+        "the schedule's workflow cannot serve its consumer; remove and reinstall it before activating or trying it"
     )]
     ScheduleRequirementsMismatch,
     /// A trial run needs a paused schedule.

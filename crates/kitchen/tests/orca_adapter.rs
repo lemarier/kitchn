@@ -1229,7 +1229,7 @@ fn install_creates_paused_once_and_reuses_it() -> TestResult {
     assert!(!create.iter().any(|arg| arg == "--enabled"));
     assert_eq!(
         flag(create, "name"),
-        Some("kitchen:origin89:pickup:requires=")
+        Some("kitchen:origin89:pickup:workflow=pickup")
     );
     assert_eq!(
         flag(create, "precheck"),
@@ -1499,7 +1499,7 @@ fn schedule_changes_are_owned_and_read_back() -> TestResult {
             },
             ScheduleEffect::Trial {
                 schedule: schedule(foreign)?,
-                requires: Some(BTreeSet::new()),
+                requires: None,
             },
         ] {
             assert_eq!(
@@ -1513,31 +1513,44 @@ fn schedule_changes_are_owned_and_read_back() -> TestResult {
     assert!(sim.calls_to(&["automations", "remove"]).is_empty());
     assert!(sim.calls_to(&["automations", "run"]).is_empty());
 
+    // Kitchen defines no scheduled `pickup` workflow, so Orca cannot
+    // establish its requirements and neither tries nor activates it.
     let ours = backend.install_schedule(&schedule_spec("pickup")?)?;
-    backend.execute(&request(
-        ScheduleEffect::Trial {
-            schedule: ours.clone(),
-            requires: Some(BTreeSet::new()),
-        },
-        "trial",
-    )?)?;
-    assert_eq!(
-        sim.calls_to(&["automations", "run"]).len(),
-        1,
-        "a trial runs while paused"
-    );
     let activate = request(
         ScheduleEffect::SetState {
             schedule: ours.clone(),
             state: ScheduleState::Active,
-            requires: Some(BTreeSet::new()),
+            requires: None,
         },
         "activate",
     )?;
-    let active = backend.execute(&activate)?;
-    assert_eq!(backend.resolve(&activate)?, Lookup::Applied(active));
+    for effect in [
+        request(
+            ScheduleEffect::Trial {
+                schedule: ours.clone(),
+                requires: None,
+            },
+            "trial",
+        )?,
+        activate.clone(),
+    ] {
+        assert_eq!(
+            backend.execute(&effect),
+            Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+        );
+    }
+    assert!(sim.calls_to(&["automations", "run"]).is_empty());
+    assert!(sim.calls_to(&["automations", "edit"]).is_empty());
+    // Enabled in Orca by someone else: the lookup reports what Orca shows,
+    // and a trial needs it paused.
+    sim.state()
+        .automations
+        .iter_mut()
+        .filter(|automation| automation.id == ours.handle.as_str())
+        .for_each(|automation| automation.enabled = true);
+    assert!(matches!(backend.resolve(&activate)?, Lookup::Applied(_)));
     assert_eq!(
-        backend.trial_schedule(&ours, Some(&BTreeSet::new())),
+        backend.trial_schedule(&ours),
         Err(OrcaError::TrialRequiresPaused)
     );
     sim.state().ignore_edits = true;
@@ -1554,7 +1567,7 @@ fn schedule_changes_are_owned_and_read_back() -> TestResult {
         "an edit that did not take effect is not reported as done"
     );
     sim.state().ignore_edits = false;
-    backend.set_schedule_state(&ours, ScheduleState::Paused, None)?;
+    backend.set_schedule_state(&ours, ScheduleState::Paused)?;
 
     // Orca records every non-zero precheck exit as a skip; the recorded
     // result keeps idle apart from errors.
@@ -1928,7 +1941,7 @@ fn installing_disabled_never_settles_for_an_active_schedule() -> TestResult {
         Some(ObservedScheduleState::Active)
     );
     // Paused again, the same definition installs (reuses) as before.
-    backend.set_schedule_state(&installed, ScheduleState::Paused, None)?;
+    backend.set_schedule_state(&installed, ScheduleState::Paused)?;
     assert_eq!(
         backend.install_schedule(&schedule_spec("pickup")?)?,
         installed
@@ -1987,10 +2000,10 @@ fn installing_disabled_refuses_a_schedule_that_differs_from_the_request() -> Tes
             ScheduleField::Precheck,
             ScheduleField::Workspace,
             ScheduleField::MissedRunGrace,
-            ScheduleField::Requirements,
+            ScheduleField::Workflow,
         ]),
         "Orca always reports session reuse, so only that field matches; the \
-         name records no requirements"
+         name records no workflow"
     );
     assert_eq!(
         backend.execute(&request(install("gardener")?, "install-bare")?),

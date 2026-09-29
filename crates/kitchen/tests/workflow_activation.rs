@@ -1,9 +1,12 @@
 //! A workflow's declared capability requirements are enforced when its
 //! schedule is installed, activated, or tried (#81): through the state store
 //! before any intent is persisted, and by the Orca adapter before any Orca
-//! change. Activation and trial carry Kitchen's recorded requirements; a
-//! schedule whose requirements were never recorded, or whose Orca name
-//! records others, is not started. Pausing it still works.
+//! change. Through the store, activation and trial carry Kitchen's recorded
+//! requirements. The Orca adapter takes none from its caller: it derives
+//! them from Kitchen's definition of the workflow the automation's name
+//! records, so a schedule naming no defined workflow, or renamed onto a
+//! consumer its workflow cannot serve, is not started. Pausing and removing
+//! it still work.
 //!
 //! Executors are the in-memory fake and the simulated Orca runtime
 //! (`orca_sim`); none of this is live runtime evidence.
@@ -243,6 +246,26 @@ fn orca_refuses_an_install_whose_workflow_needs_what_orca_lacks() -> TestResult 
     assert_eq!(
         backend.execute(&request),
         Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+    );
+    assert!(sim.calls_to(&["automations"]).is_empty(), "no Orca call");
+
+    // A gardener spec declaring nothing still needs what the gardener
+    // definition requires, and one on the budget's consumer is refused
+    // outright.
+    let gardener = |consumer: &str| -> TestResult<ScheduleSpec> {
+        Ok(ScheduleSpec::new(
+            WorkflowName::new("gardener")?,
+            ConsumerId::new(consumer)?,
+            Recurrence::Hourly,
+            Timezone::new("UTC")?,
+            Text::new("Run the gardener.")?,
+            agent(),
+        ))
+    };
+    assert_eq!(backend.install_schedule(&gardener("nightly")?), refused);
+    assert_eq!(
+        backend.install_schedule(&gardener("budget")?),
+        Err(OrcaError::ScheduleRequirementsMismatch)
     );
     assert!(sim.calls_to(&["automations"]).is_empty(), "no Orca call");
 
@@ -559,178 +582,205 @@ fn orca_request(key: &str, effect: ScheduleEffect) -> TestResult<EffectRequest> 
     ))
 }
 
-#[test]
-fn orca_does_not_start_a_schedule_whose_requirements_it_cannot_establish() -> TestResult {
-    let sim = SimOrca::default();
-    let legacy = |id: &str, name: &str, enabled: bool| SimAutomation {
+fn sim_automation(id: &str, name: &str) -> SimAutomation {
+    SimAutomation {
         id: id.to_owned(),
         name: name.to_owned(),
-        enabled,
+        enabled: false,
         ..SimAutomation::default()
-    };
-    {
-        let mut state = sim.state();
-        // Installed before requirements were recorded in the name.
-        state
-            .automations
-            .push(legacy("legacy", "kitchen:origin89:gardener", false));
-        // Recorded with a requirement Orca lacks, as if Orca's support shrank.
-        state.automations.push(legacy(
-            "shrunk",
-            "kitchen:origin89:budget:requires=schedule.manage,schedule.run_timeout",
-            false,
-        ));
-        // Recorded with a capability this Kitchen does not know.
-        state.automations.push(legacy(
-            "unknown",
-            "kitchen:origin89:triage:requires=schedule.teleport",
-            false,
-        ));
     }
-    let backend = OrcaBackend::connect(orca_config(&sim)?, &sim)?;
-    let kitchen = requiring(budget::REQUIRED_CAPABILITIES);
-    for id in ["legacy", "unknown"] {
-        let schedule = orca_ref(id)?;
-        assert_eq!(
-            backend.set_schedule_state(&schedule, ScheduleState::Active, kitchen.as_ref()),
-            Err(OrcaError::ScheduleRequirementsUnknown),
-            "{id}"
-        );
-        assert_eq!(
-            backend.trial_schedule(&schedule, kitchen.as_ref()),
-            Err(OrcaError::ScheduleRequirementsUnknown),
-            "{id}"
-        );
-    }
-    let shrunk = orca_ref("shrunk")?;
-    let recorded = requiring([Capability::ScheduleManage, Capability::ScheduleRunTimeout]);
-    // Without Kitchen's requirements the name alone starts nothing.
-    assert_eq!(
-        backend.set_schedule_state(&shrunk, ScheduleState::Active, None),
-        Err(OrcaError::ScheduleRequirementsUnknown)
-    );
-    assert_eq!(
-        backend.trial_schedule(&shrunk, None),
-        Err(OrcaError::ScheduleRequirementsUnknown)
-    );
-    let lacking = Err(OrcaError::Contract(
+}
+
+/// What Orca's support leaves of the budget and gardener definitions.
+fn orca_lacks_the_tick() -> Result<(), OrcaError> {
+    Err(OrcaError::Contract(
         ContractError::UnsupportedCapabilities {
-            missing: vec![Capability::ScheduleRunTimeout],
-            partial: Vec::new(),
+            missing: vec![
+                Capability::ScheduleSingleConsumer,
+                Capability::ScheduleRunTimeout,
+            ],
+            partial: vec![Capability::SchedulePrecheck],
         },
-    ));
+    ))
+}
+
+/// Activate and try `schedule` directly and as effects that carry the
+/// lowered requirement set a caller could supply; each must fail as
+/// `expected`, the effects as a definite rejection.
+fn assert_not_started(
+    backend: &OrcaBackend<&SimOrca>,
+    schedule: &ResourceRef,
+    expected: &Result<(), OrcaError>,
+    label: &str,
+) -> TestResult {
     assert_eq!(
-        backend.set_schedule_state(&shrunk, ScheduleState::Active, recorded.as_ref()),
-        lacking
+        &backend.set_schedule_state(schedule, ScheduleState::Active),
+        expected,
+        "{label}: activate"
     );
-    assert_eq!(backend.trial_schedule(&shrunk, recorded.as_ref()), lacking);
-    // Executed as effects, the refusals are definite.
+    assert_eq!(
+        &backend.trial_schedule(schedule),
+        expected,
+        "{label}: trial"
+    );
     for (key, effect) in [
-        (
-            "activate-legacy",
-            activate(&orca_ref("legacy")?, kitchen.clone()),
-        ),
-        ("trial-legacy", trial(&orca_ref("legacy")?, kitchen)),
-        ("activate-shrunk", activate(&shrunk, recorded)),
-        ("trial-unstated", trial(&shrunk, None)),
+        ("activate", activate(schedule, requiring([]))),
+        ("trial", trial(schedule, requiring([]))),
+        ("activate-unstated", activate(schedule, None)),
     ] {
         assert_eq!(
             backend.execute(&orca_request(key, effect)?),
             Err(EffectFailure::NotApplied(NotAppliedReason::Rejected)),
-            "{key}"
+            "{label}: {key}"
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn orca_does_not_start_a_schedule_whose_requirements_it_cannot_establish() -> TestResult {
+    let sim = SimOrca::default();
+    {
+        let mut state = sim.state();
+        // Installed before the workflow was recorded in the name.
+        state
+            .automations
+            .push(sim_automation("legacy", "kitchen:origin89:gardener"));
+        // A workflow Kitchen defines no schedule for.
+        state.automations.push(sim_automation(
+            "undefined",
+            "kitchen:origin89:pickup:workflow=pickup",
+        ));
+        // No valid workflow name at all.
+        state.automations.push(sim_automation(
+            "blank",
+            "kitchen:origin89:nightly:workflow=",
+        ));
+    }
+    let backend = OrcaBackend::connect(orca_config(&sim)?, &sim)?;
+    for id in ["legacy", "undefined", "blank"] {
+        assert_not_started(
+            &backend,
+            &orca_ref(id)?,
+            &Err(OrcaError::ScheduleRequirementsUnknown),
+            id,
+        )?;
     }
     assert!(sim.calls_to(&["automations", "edit"]).is_empty());
     assert!(sim.calls_to(&["automations", "run"]).is_empty());
 
-    // A legacy schedule can still be paused: that starts nothing.
-    backend.set_schedule_state(&orca_ref("legacy")?, ScheduleState::Paused, None)?;
+    // A legacy schedule can still be paused and removed: neither starts
+    // anything.
+    backend.set_schedule_state(&orca_ref("legacy")?, ScheduleState::Paused)?;
     assert_eq!(sim.calls_to(&["automations", "edit"]).len(), 1);
-
-    // A schedule this adapter installs records its requirements and can
-    // be tried and activated with Kitchen's matching set.
-    let manage = requiring([Capability::ScheduleManage]);
-    let installed =
-        backend.install_schedule(&plain_schedule()?.requiring([Capability::ScheduleManage]))?;
-    let creates = sim.calls_to(&["automations", "create"]);
-    let create = creates.first().ok_or("one create")?;
+    backend.execute(&orca_request(
+        "remove-legacy",
+        ScheduleEffect::Remove {
+            schedule: orca_ref("legacy")?,
+        },
+    )?)?;
+    assert_eq!(sim.calls_to(&["automations", "remove"]).len(), 1);
     assert!(
-        create
+        !sim.state()
+            .automations
             .iter()
-            .any(|arg| arg == "--name=kitchen:origin89:pickup:requires=schedule.manage"),
-        "{create:?}"
+            .any(|automation| automation.id == "legacy")
     );
-    backend.trial_schedule(&installed, manage.as_ref())?;
-    backend.set_schedule_state(&installed, ScheduleState::Active, manage.as_ref())?;
     Ok(())
 }
 
 #[test]
 fn orca_does_not_start_a_renamed_schedule() -> TestResult {
     let sim = SimOrca::default();
+    let original = [
+        ("tick", "kitchen:origin89:budget:workflow=budget"),
+        ("nightly", "kitchen:origin89:nightly:workflow=gardener"),
+    ];
+    for (id, name) in original {
+        sim.state().automations.push(sim_automation(id, name));
+    }
     let backend = OrcaBackend::connect(orca_config(&sim)?, &sim)?;
-    let kitchen = requiring([Capability::ScheduleManage]);
-    let installed =
-        backend.install_schedule(&plain_schedule()?.requiring([Capability::ScheduleManage]))?;
-    // Renamed in Orca to record no, fewer, or other requirements than
-    // Kitchen recorded at install. Orca supports every name below, so only
-    // the comparison with Kitchen's set can refuse them.
-    for renamed in [
-        "kitchen:origin89:pickup:requires=",
-        "kitchen:origin89:pickup:requires=effect.lookup",
-        "kitchen:origin89:pickup:requires=schedule.manage,effect.lookup",
+    // The original names: Orca derives the definitions' requirements, not
+    // an empty set, and lacks them.
+    for (id, name) in original {
+        assert_not_started(&backend, &orca_ref(id)?, &orca_lacks_the_tick(), name)?;
+    }
+    // Renamed in Orca to lower the requirements: to a workflow Kitchen
+    // defines no schedule for, to no workflow, or onto a consumer the
+    // workflow cannot serve. Every direct call and effect is refused.
+    for (id, renamed, expected) in [
+        (
+            "nightly",
+            "kitchen:origin89:nightly:workflow=pickup",
+            OrcaError::ScheduleRequirementsUnknown,
+        ),
+        (
+            "nightly",
+            "kitchen:origin89:nightly",
+            OrcaError::ScheduleRequirementsUnknown,
+        ),
+        (
+            "tick",
+            "kitchen:origin89:budget:workflow=gardener",
+            OrcaError::ScheduleRequirementsMismatch,
+        ),
+        (
+            "nightly",
+            "kitchen:origin89:nightly:workflow=budget",
+            OrcaError::ScheduleRequirementsMismatch,
+        ),
     ] {
-        sim.state().automations.first_mut().ok_or("installed")?.name = renamed.to_owned();
-        assert_eq!(
-            backend.set_schedule_state(&installed, ScheduleState::Active, kitchen.as_ref()),
-            Err(OrcaError::ScheduleRequirementsMismatch),
-            "{renamed}"
-        );
-        assert_eq!(
-            backend.trial_schedule(&installed, kitchen.as_ref()),
-            Err(OrcaError::ScheduleRequirementsMismatch),
-            "{renamed}"
-        );
-        for (key, effect) in [
-            ("activate", activate(&installed, kitchen.clone())),
-            ("trial", trial(&installed, kitchen.clone())),
-        ] {
-            assert_eq!(
-                backend.execute(&orca_request(key, effect)?),
-                Err(EffectFailure::NotApplied(NotAppliedReason::Rejected)),
-                "{renamed}: {key}"
-            );
-        }
+        sim.state()
+            .automations
+            .iter_mut()
+            .filter(|automation| automation.id == id)
+            .for_each(|automation| renamed.clone_into(&mut automation.name));
+        assert_not_started(&backend, &orca_ref(id)?, &Err(expected), renamed)?;
     }
     assert!(sim.calls_to(&["automations", "edit"]).is_empty());
     assert!(sim.calls_to(&["automations", "run"]).is_empty());
 
-    // With the recorded name restored, the same calls go through.
-    sim.state().automations.first_mut().ok_or("installed")?.name =
-        "kitchen:origin89:pickup:requires=schedule.manage".to_owned();
-    backend.trial_schedule(&installed, kitchen.as_ref())?;
-    backend.set_schedule_state(&installed, ScheduleState::Active, kitchen.as_ref())?;
+    // Pausing and removing a renamed schedule still work.
+    backend.set_schedule_state(&orca_ref("nightly")?, ScheduleState::Paused)?;
+    assert_eq!(sim.calls_to(&["automations", "edit"]).len(), 1);
+    backend.execute(&orca_request(
+        "remove-tick",
+        ScheduleEffect::Remove {
+            schedule: orca_ref("tick")?,
+        },
+    )?)?;
+    assert_eq!(sim.calls_to(&["automations", "remove"]).len(), 1);
     Ok(())
 }
 
 #[test]
-fn orca_does_not_reuse_a_matching_schedule_without_recorded_requirements() -> TestResult {
+fn orca_does_not_reuse_a_matching_schedule_under_another_workflow() -> TestResult {
     let sim = SimOrca::default();
     let backend = OrcaBackend::connect(orca_config(&sim)?, &sim)?;
     backend.install_schedule(&plain_schedule()?)?;
-    // Rename it to the pre-requirements form, as an older install left it.
-    {
-        let mut state = sim.state();
-        let automation = state.automations.first_mut().ok_or("installed")?;
-        assert_eq!(automation.name, "kitchen:origin89:pickup:requires=");
-        automation.name = "kitchen:origin89:pickup".to_owned();
-    }
-    assert_eq!(
-        backend.install_schedule(&plain_schedule()?),
-        Err(OrcaError::ScheduleDiffers {
-            fields: vec![ScheduleField::Requirements]
-        })
+    let creates = sim.calls_to(&["automations", "create"]);
+    let create = creates.first().ok_or("one create")?;
+    assert!(
+        create
+            .iter()
+            .any(|arg| arg == "--name=kitchen:origin89:pickup:workflow=pickup"),
+        "{create:?}"
     );
+    // Renamed to the pre-workflow form, as an older install left it, or to
+    // another workflow.
+    for renamed in [
+        "kitchen:origin89:pickup",
+        "kitchen:origin89:pickup:workflow=gardener",
+    ] {
+        renamed.clone_into(&mut sim.state().automations.first_mut().ok_or("installed")?.name);
+        assert_eq!(
+            backend.install_schedule(&plain_schedule()?),
+            Err(OrcaError::ScheduleDiffers {
+                fields: vec![ScheduleField::Workflow]
+            }),
+            "{renamed}"
+        );
+    }
     assert_eq!(sim.calls_to(&["automations", "create"]).len(), 1);
     Ok(())
 }

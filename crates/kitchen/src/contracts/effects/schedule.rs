@@ -61,9 +61,10 @@ pub enum ScheduleEffect {
         /// The requested state.
         state: ScheduleState,
         /// The capabilities Kitchen recorded for the schedule's workflow when
-        /// it was installed. Activation is refused without them, or when
-        /// they differ from the store's record or from what the executor
-        /// recorded with the schedule; pausing ignores them.
+        /// it was installed. The store refuses activation without them, or
+        /// when they differ from its record; pausing ignores them. An
+        /// executor that can establish the workflow's requirements itself,
+        /// such as Orca, relies on its own instead.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requires: Option<BTreeSet<Capability>>,
     },

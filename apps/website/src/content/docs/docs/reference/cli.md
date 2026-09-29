@@ -278,10 +278,12 @@ required capabilities (no overlapping runs, an enforced run timeout, and typed
 idle and error precheck results); otherwise `install` exits 1 naming the missing
 and partial ones, and nothing is created. Orca does not provide the first two
 and reports precheck errors only in its run history, so the install is refused
-there. Activating or trying an installed schedule checks the requirements
-Kitchen recorded at install again; a schedule installed before Kitchen recorded
-them, or renamed in Orca to record others, is refused until it is removed and
-installed again. Pausing and removing such a schedule still work.
+there. Activating or trying an installed schedule checks its workflow's
+requirements again. On Orca they come from Kitchen's definition of the workflow
+the automation's name records; a schedule installed before Kitchen recorded the
+workflow, or renamed in Orca to another workflow or consumer, is refused until
+it is removed and installed again. Pausing and removing such a schedule still
+work.
 
 ## `kitchn store`
 

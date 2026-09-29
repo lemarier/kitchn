@@ -1467,8 +1467,7 @@ fn orca_refuses_activating_an_exhausted_schedule_before_editing_it() -> TestResu
     };
     sim.state().runs = full(4);
 
-    let refused =
-        backend.set_schedule_state(&installed, ScheduleState::Active, Some(&BTreeSet::new()));
+    let refused = backend.set_schedule_state(&installed, ScheduleState::Active);
     assert_eq!(
         refused,
         Err(OrcaError::ScheduleLimit(BudgetError::Exhausted {
@@ -1513,7 +1512,7 @@ fn orca_refuses_activating_an_exhausted_schedule_before_editing_it() -> TestResu
         })
         .collect();
     assert!(matches!(
-        backend.set_schedule_state(&installed, ScheduleState::Active, Some(&BTreeSet::new())),
+        backend.set_schedule_state(&installed, ScheduleState::Active),
         Err(OrcaError::ScheduleLimit(BudgetError::IncompleteEvidence {
             observed: 0,
             ..
@@ -1521,18 +1520,25 @@ fn orca_refuses_activating_an_exhausted_schedule_before_editing_it() -> TestResu
     ));
     assert!(sim.calls_to(&["automations", "edit"]).is_empty());
 
-    // Headroom, or the next window, activates it.
+    // With headroom, or in the next window, the budget allows it; Kitchen
+    // defines no scheduled `pickup` workflow, so its requirements are unknown
+    // and it is still not activated.
     sim.state().runs = full(3);
-    backend.set_schedule_state(&installed, ScheduleState::Active, Some(&BTreeSet::new()))?;
-    assert!(enabled(&sim, installed.handle.as_str()));
-    backend.set_schedule_state(&installed, ScheduleState::Paused, None)?;
+    assert_eq!(
+        backend.set_schedule_state(&installed, ScheduleState::Active),
+        Err(OrcaError::ScheduleRequirementsUnknown)
+    );
     sim.state().runs = full(4);
     let next = connect(&sim)?.with_clock(noon_on_day_twenty_one);
-    next.set_schedule_state(&installed, ScheduleState::Active, Some(&BTreeSet::new()))?;
-    assert!(enabled(&sim, installed.handle.as_str()));
+    assert_eq!(
+        next.set_schedule_state(&installed, ScheduleState::Active),
+        Err(OrcaError::ScheduleRequirementsUnknown)
+    );
+    assert!(sim.calls_to(&["automations", "edit"]).is_empty());
+    assert!(!enabled(&sim, installed.handle.as_str()));
 
     // Pausing is never refused.
-    backend.set_schedule_state(&installed, ScheduleState::Paused, None)?;
+    backend.set_schedule_state(&installed, ScheduleState::Paused)?;
     Ok(())
 }
 

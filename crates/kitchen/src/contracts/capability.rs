@@ -36,6 +36,10 @@ closed_names! {
         WorkerStatusAndOutcome = "worker.status_and_outcome",
         /// Relinquish and adopt a supervised run.
         RunTransfer = "run.transfer",
+        /// Deliver worker questions, reports, and escalations to the
+        /// coordinator at least once, replaying each batch until it is
+        /// acknowledged ([`crate::contracts::CoordinatorMailbox`]).
+        WorkerDeliveries = "worker.deliveries",
         /// Cancel a worker.
         WorkerCancel = "worker.cancel",
         /// Inventory resources with ownership details.

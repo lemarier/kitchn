@@ -8,7 +8,8 @@ use serde_json::Value;
 use crate::{
     adapters::orca::{OrcaBackend, OrcaError, OrcaRunner, backend, wire},
     contracts::{
-        ExternalRef, Liveness, MAX_TEXT_BYTES, ResourceKind, ResourceRef, Text, WorkerOutcome,
+        CoordinatorMailbox, Delivery, ExternalRef, Liveness, MAX_MAILBOX_WAIT, MAX_TEXT_BYTES,
+        MailMessage, MailboxError, MessageKind, ResourceKind, ResourceRef, Text, WorkerOutcome,
         WorkerState,
     },
 };
@@ -117,85 +118,26 @@ struct ListRow {
     projection: backend::Projection,
 }
 
-/// What an Orca mailbox message is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MessageKind {
-    /// A worker question that expects a reply.
-    Question,
-    /// A worker's terminal report.
-    WorkerDone,
-    /// A worker needs the coordinator to act.
-    Escalation,
-    /// A liveness signal; never completion evidence.
-    Heartbeat,
-    /// Status or any other informational type.
-    Status,
-    /// A type Kitchen does not recognize.
-    Other,
-}
-
-impl MessageKind {
-    fn from_wire(value: &str) -> Self {
-        match value {
-            "question" => Self::Question,
-            "worker_done" => Self::WorkerDone,
-            "escalation" => Self::Escalation,
-            "heartbeat" => Self::Heartbeat,
-            "status" | "dispatch" | "handoff" | "merge_ready" | "decision_gate" => Self::Status,
-            _ => Self::Other,
-        }
+/// The contract's type for an Orca message type.
+fn message_kind(value: &str) -> MessageKind {
+    match value {
+        "question" => MessageKind::Question,
+        "worker_done" => MessageKind::WorkerDone,
+        "escalation" => MessageKind::Escalation,
+        "heartbeat" => MessageKind::Heartbeat,
+        "status" | "dispatch" | "handoff" | "merge_ready" | "decision_gate" => MessageKind::Status,
+        _ => MessageKind::Other,
     }
 }
 
-/// One mailbox message, bounded and typed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MailMessage {
-    /// Orca's message id, used to reply.
-    pub id: ExternalRef,
-    /// The message type.
-    pub kind: MessageKind,
-    /// The sending worker, when the payload names its Dispatch.
-    pub worker: Option<ResourceRef>,
-    /// The worker's reported outcome, only on [`MessageKind::WorkerDone`].
-    pub outcome: Option<WorkerOutcome>,
-    /// The subject, truncated to Kitchen's text bound.
-    pub subject: Option<Text>,
-    /// The body, truncated to Kitchen's text bound.
-    pub body: Option<Text>,
-}
-
-/// One unacknowledged mailbox batch. Orca replays it until acknowledged.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Delivery {
-    /// The id that acknowledges the batch.
-    pub id: ExternalRef,
-    /// Messages in arrival order. Rows Kitchen cannot identify are dropped,
-    /// counted in `unreadable`.
-    pub messages: Vec<MailMessage>,
-    /// Rows without a valid id; the batch must not be acknowledged blindly.
-    pub unreadable: usize,
-}
-
-impl Delivery {
-    /// Messages that need the coordinator: questions, reports, escalations,
-    /// and unrecognized types. Heartbeats and status notes are liveness and
-    /// information only; a batch holding nothing else is acknowledged and
-    /// the wait continues.
-    pub fn actionable(&self) -> impl Iterator<Item = &MailMessage> {
-        self.messages.iter().filter(|message| {
-            matches!(
-                message.kind,
-                MessageKind::Question
-                    | MessageKind::WorkerDone
-                    | MessageKind::Escalation
-                    | MessageKind::Other
-            )
-        })
+/// A mailbox call failure on the contract: Orca refuses a terminal that
+/// lost the Run to an adopting coordinator with `consumer_fenced`.
+fn mailbox_failure(error: &OrcaError) -> MailboxError {
+    match error {
+        OrcaError::Refused { code, .. } if code == "consumer_fenced" => MailboxError::Fenced,
+        other => MailboxError::Unavailable(backend::read_failure(other)),
     }
 }
-
-/// Longest single mailbox wait.
-pub const MAX_MAILBOX_WAIT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -342,77 +284,6 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         })
     }
 
-    /// Bind this instance's coordinator terminal to its Run, so the Run's
-    /// mailbox and worker mail reach it.
-    ///
-    /// Call this only after Kitchen recorded the adoption (a relinquish
-    /// followed by an adopt in the state store). Orca records no relinquish,
-    /// and binding neither stops nor moves workers; the previous coordinator
-    /// terminal loses the mailbox.
-    ///
-    /// # Errors
-    /// Call and parse failures.
-    pub fn adopt_run(&self) -> Result<(), OrcaError> {
-        let args = wire::Args::command(&["orchestration", "run-use"])
-            .value("id", self.config().run.as_str())
-            .value("from", self.config().coordinator.as_str())
-            .json();
-        self.call(args, self.config().call_timeout).map(|_| ())
-    }
-
-    /// Read the oldest unacknowledged mailbox batch without consuming it.
-    ///
-    /// Orca replays the same batch until [`Self::acknowledge`] names it, so a
-    /// crash between reading and handling loses nothing.
-    ///
-    /// # Errors
-    /// Call and parse failures.
-    pub fn next_delivery(&self) -> Result<Option<Delivery>, OrcaError> {
-        let args = wire::Args::command(&["orchestration", "check"])
-            .value("terminal", self.config().coordinator.as_str())
-            .value("run", self.config().run.as_str())
-            .json();
-        self.delivery(args)
-    }
-
-    /// Acknowledge a batch after every message in it was handled, and read
-    /// the next one.
-    ///
-    /// # Errors
-    /// Call and parse failures.
-    pub fn acknowledge(&self, delivery: &ExternalRef) -> Result<Option<Delivery>, OrcaError> {
-        let args = wire::Args::command(&["orchestration", "check"])
-            .value("terminal", self.config().coordinator.as_str())
-            .value("run", self.config().run.as_str())
-            .value("ack", delivery.as_str())
-            .json();
-        self.delivery(args)
-    }
-
-    /// Wait up to `wait` (at most [`MAX_MAILBOX_WAIT`]) for a question,
-    /// report, or escalation, and return the oldest unacknowledged batch.
-    ///
-    /// Orca returns the whole batch even when it woke for one type, so the
-    /// batch can hold heartbeats; use [`Delivery::actionable`] and keep
-    /// waiting when it is empty. `None` means the wait ended with nothing
-    /// new, which is a checkpoint, never evidence that a worker stopped.
-    ///
-    /// # Errors
-    /// Call and parse failures.
-    pub fn await_delivery(&self, wait: Duration) -> Result<Option<Delivery>, OrcaError> {
-        let wait = wait.min(MAX_MAILBOX_WAIT);
-        let millis = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
-        let args = wire::Args::command(&["orchestration", "check"])
-            .value("terminal", self.config().coordinator.as_str())
-            .value("run", self.config().run.as_str())
-            .switch("wait")
-            .value("types", "worker_done,escalation,question")
-            .value("timeout-ms", &millis.to_string())
-            .json();
-        let deadline = wait.saturating_add(self.config().call_timeout);
-        self.delivery_within(args, deadline)
-    }
-
     fn delivery(&self, args: Vec<String>) -> Result<Option<Delivery>, OrcaError> {
         self.delivery_within(args, self.config().call_timeout)
     }
@@ -448,7 +319,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
 
     fn mail_message(&self, message: CheckMessage) -> Option<MailMessage> {
         let id = ExternalRef::new(&message.id).ok()?;
-        let kind = MessageKind::from_wire(&message.kind);
+        let kind = message_kind(&message.kind);
         let report = message
             .payload
             .and_then(|payload| serde_json::from_value::<ReportPayload>(payload).ok());
@@ -472,6 +343,71 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     }
 }
 
+/// The Run mailbox, read by this instance's coordinator terminal.
+impl<R: OrcaRunner> CoordinatorMailbox for OrcaBackend<R> {
+    /// Bind this instance's coordinator terminal to its Run, so the Run's
+    /// mailbox and worker mail reach it.
+    ///
+    /// Call this only after Kitchen recorded the adoption (a relinquish
+    /// followed by an adopt in the state store). Orca records no relinquish,
+    /// and binding neither stops nor moves workers; the previous coordinator
+    /// terminal loses the mailbox.
+    fn adopt_run(&self) -> Result<(), MailboxError> {
+        let args = wire::Args::command(&["orchestration", "run-use"])
+            .value("id", self.config().run.as_str())
+            .value("from", self.config().coordinator.as_str())
+            .json();
+        self.call(args, self.config().call_timeout)
+            .map(|_| ())
+            .map_err(|error| mailbox_failure(&error))
+    }
+
+    /// Read the oldest unacknowledged mailbox batch without consuming it.
+    ///
+    /// Orca replays the same batch until [`CoordinatorMailbox::acknowledge`]
+    /// names it, so a crash between reading and handling loses nothing.
+    fn next_delivery(&self) -> Result<Option<Delivery>, MailboxError> {
+        let args = wire::Args::command(&["orchestration", "check"])
+            .value("terminal", self.config().coordinator.as_str())
+            .value("run", self.config().run.as_str())
+            .json();
+        self.delivery(args).map_err(|error| mailbox_failure(&error))
+    }
+
+    /// Acknowledge a batch after every message in it was handled, and read
+    /// the next one.
+    fn acknowledge(&self, delivery: &ExternalRef) -> Result<Option<Delivery>, MailboxError> {
+        let args = wire::Args::command(&["orchestration", "check"])
+            .value("terminal", self.config().coordinator.as_str())
+            .value("run", self.config().run.as_str())
+            .value("ack", delivery.as_str())
+            .json();
+        self.delivery(args).map_err(|error| mailbox_failure(&error))
+    }
+
+    /// Wait up to `wait` (at most [`MAX_MAILBOX_WAIT`]) for a question,
+    /// report, or escalation, and return the oldest unacknowledged batch.
+    ///
+    /// Orca returns the whole batch even when it woke for one type, so the
+    /// batch can hold heartbeats; use [`Delivery::actionable`] and keep
+    /// waiting when it is empty. `None` means the wait ended with nothing
+    /// new, which is a checkpoint, never evidence that a worker stopped.
+    fn await_delivery(&self, wait: Duration) -> Result<Option<Delivery>, MailboxError> {
+        let wait = wait.min(MAX_MAILBOX_WAIT);
+        let millis = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        let args = wire::Args::command(&["orchestration", "check"])
+            .value("terminal", self.config().coordinator.as_str())
+            .value("run", self.config().run.as_str())
+            .switch("wait")
+            .value("types", "worker_done,escalation,question")
+            .value("timeout-ms", &millis.to_string())
+            .json();
+        let deadline = wait.saturating_add(self.config().call_timeout);
+        self.delivery_within(args, deadline)
+            .map_err(|error| mailbox_failure(&error))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +427,6 @@ mod tests {
         assert_eq!(liveness("stale"), Liveness::Unverifiable);
         assert_eq!(terminal(Some("new_state")), TerminalAccounting::Unknown);
         assert_eq!(terminal(None), TerminalAccounting::Unknown);
-        assert_eq!(MessageKind::from_wire("mystery"), MessageKind::Other);
+        assert_eq!(message_kind("mystery"), MessageKind::Other);
     }
 }

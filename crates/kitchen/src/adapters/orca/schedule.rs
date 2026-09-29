@@ -44,7 +44,7 @@ use crate::{
     adapters::orca::{OrcaBackend, OrcaError, OrcaRunner, backend, wire},
     contracts::{
         Capability, EffectExecutor, EffectFailure, ExternalRef, Lookup, NotAppliedReason, Receipt,
-        ResourceKind, ResourceRef, ScheduleEffect, Timestamp, UncertainReason,
+        ResourceKind, ResourceRef, ScheduleBackend, ScheduleEffect, Timestamp, UncertainReason,
     },
     scheduling::{
         InstallPlan, InstalledSchedule, MAX_SCHEDULE_RUNS, ObservedScheduleState, PrecheckOutcome,
@@ -506,44 +506,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         Ok(args.json())
     }
 
-    /// Install `spec` paused, or return the paused schedule already installed
-    /// for its consumer with the same definition.
-    ///
-    /// A selection naming a model or effort is refused before anything is
-    /// read or reserved: Orca automations take only a provider
-    /// ([`SCHEDULE_SELECTION`](super::SCHEDULE_SELECTION)).
-    /// A schedule requiring a capability Orca does not fully support is
-    /// refused the same way: the spec's own [`ScheduleSpec::requires`] and,
-    /// for a workflow Kitchen defines a schedule for, that definition's
-    /// ([`ScheduledWorkflow`]). So is a spec stored before requirements were
-    /// recorded, and a defined workflow on a consumer it cannot serve.
-    ///
-    /// Concurrent installers for one house and consumer take turns: the
-    /// listing, the create, and the read-back happen under a reservation, so
-    /// a second installer finds the schedule the first created.
-    ///
-    /// # Errors
-    /// [`OrcaError::Contract`] with
-    /// [`ContractError::UnsupportedCapabilities`](crate::contracts::ContractError::UnsupportedCapabilities)
-    /// naming every required capability Orca lacks or supports only in part,
-    /// [`OrcaError::ScheduleRequirementsUnknown`] for a spec without them,
-    /// and [`OrcaError::ScheduleRequirementsMismatch`] for a workflow on a
-    /// consumer it cannot serve.
-    /// [`OrcaError::Selection`] naming every part of the selection Orca
-    /// cannot launch. [`OrcaError::ScheduleActive`] when the consumer's
-    /// schedule is firing and [`OrcaError::ScheduleDiffers`] when it is not
-    /// the requested one;
-    /// neither changes anything. [`OrcaError::DuplicateSchedules`] when
-    /// several share the name, [`OrcaError::InstallUncertain`] when a create
-    /// may have happened but no listing shows it,
-    /// [`OrcaError::StateMismatch`] when a new schedule does not read back
-    /// paused, [`OrcaError::ReservationBusy`] when another installer held the
-    /// reservation for the whole wait, and call or parse failures.
-    pub fn install_schedule(&self, spec: &ScheduleSpec) -> Result<ResourceRef, OrcaError> {
-        self.install(spec).map(|(schedule, _)| schedule)
-    }
-
-    /// [`OrcaBackend::install_schedule`], and whether this call created the
+    /// [`ScheduleBackend::install_schedule`], and whether this call created the
     /// schedule or reused one already installed.
     fn install(&self, spec: &ScheduleSpec) -> Result<(ResourceRef, Install), OrcaError> {
         let declared = spec
@@ -616,65 +579,6 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }
     }
 
-    /// Observe a schedule's state and up to [`MAX_SCHEDULE_RUNS`] recent
-    /// runs, each judged against `readiness`.
-    ///
-    /// Orca's `completed` only means the launch step finished. A run whose
-    /// agent showed no [`crate::scheduling::ReadinessSignal`] within the
-    /// deadline is [`crate::scheduling::RunVerdict::LaunchFailed`], so a
-    /// launch swallowed by an interactive prompt is reported as one instead
-    /// of as a completed run.
-    ///
-    /// # Errors
-    /// Call and parse failures. A schedule absent from a complete listing is
-    /// reported as [`ObservedScheduleState::Missing`], not an error.
-    pub fn inspect_schedule(
-        &self,
-        schedule: &ResourceRef,
-        readiness: &Readiness<'_>,
-    ) -> Result<ScheduleObservation, OrcaError> {
-        let automation = match self.owned(schedule) {
-            Ok(automation) => automation,
-            Err(OrcaError::ScheduleNotFound) => {
-                return Ok(ScheduleObservation {
-                    state: ObservedScheduleState::Missing,
-                    recent_runs: Vec::new(),
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        let args = wire::Args::command(&["automations", "runs"])
-            .value("id", &automation.id)
-            .json();
-        let mut runs: RunList = wire::typed(
-            self.call(args, self.config().call_timeout)?,
-            "automation runs",
-        )?;
-        // Newest first. A run with no due time is a trial or still
-        // dispatching, so it ranks newest and survives the cut below; the
-        // sort is stable, so undated runs keep Orca's listing order.
-        runs.runs
-            .sort_by_key(|run| std::cmp::Reverse((run.scheduled_for.is_none(), run.scheduled_for)));
-        let recent: Vec<ScheduleRun> = runs
-            .runs
-            .iter()
-            .take(MAX_SCHEDULE_RUNS)
-            .map(|run| ScheduleRun {
-                outcome: run_outcome(run),
-                scheduled_for: run.scheduled_for.map(Timestamp::from_unix_millis),
-                created_at: run.created_at.map(Timestamp::from_unix_millis),
-                usage: run_usage(run),
-                // Orca's run records carry no provider, and the automation's
-                // current one may have been edited since the run.
-                agent: None,
-            })
-            .collect();
-        Ok(ScheduleObservation {
-            state: state_of(automation.enabled),
-            recent_runs: readiness.judge(&recent),
-        })
-    }
-
     /// Pause or activate a Kitchen schedule and read the state back.
     ///
     /// Activation starts a live consumer; the caller must hold that authority.
@@ -722,37 +626,6 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             Err(error) => Err(error),
             Ok(_) => Err(OrcaError::StateMismatch),
         }
-    }
-
-    /// Observe every Kitchen schedule of this house and its recent runs now,
-    /// for judging budgets: an activation check or a budget pass
-    /// ([`crate::workflows::budget`]). Reads only.
-    ///
-    /// Runs are judged with no readiness signals, so budgets count every
-    /// launched run as a possible agent start. Every schedule is judged the
-    /// same way, the budget schedule included.
-    ///
-    /// # Errors
-    /// Call and parse failures, and [`OrcaError::ListingTooLong`].
-    pub fn schedule_evidence(&self) -> Result<ScheduleEvidence, OrcaError> {
-        let now = self.now();
-        let readiness = Readiness::new(&[], now, std::time::Duration::ZERO);
-        let schedules = self
-            .installed_schedules()?
-            .into_iter()
-            .map(|installed| {
-                Ok(ScheduleUsage {
-                    observation: self.inspect_schedule(&installed.resource, &readiness)?,
-                    consumer: installed.consumer,
-                    schedule: installed.resource,
-                })
-            })
-            .collect::<Result<Vec<_>, OrcaError>>()?;
-        Ok(ScheduleEvidence {
-            house: self.config().house.clone(),
-            observed_at: now,
-            schedules,
-        })
     }
 
     /// Judge the house's usage in the window containing now, from a fresh
@@ -809,7 +682,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// Its requirements are derived and checked as for activation.
     ///
     /// Orca's `automations run` takes no request key: a lost response must be
-    /// resolved with [`Self::inspect_schedule`] before another trial.
+    /// resolved with [`ScheduleBackend::inspect_schedule`] before another trial.
     ///
     /// # Errors
     /// [`OrcaError::TrialRequiresPaused`] for an active schedule, the
@@ -826,6 +699,137 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .json();
         let _: Value = self.call(args, self.config().call_timeout)?;
         Ok(())
+    }
+}
+
+impl<R: OrcaRunner> ScheduleBackend for OrcaBackend<R> {
+    type Error = OrcaError;
+
+    /// Install `spec` paused, or return the paused schedule already installed
+    /// for its consumer with the same definition.
+    ///
+    /// A selection naming a model or effort is refused before anything is
+    /// read or reserved: Orca automations take only a provider
+    /// ([`SCHEDULE_SELECTION`](super::SCHEDULE_SELECTION)).
+    /// A schedule requiring a capability Orca does not fully support is
+    /// refused the same way: the spec's own [`ScheduleSpec::requires`] and,
+    /// for a workflow Kitchen defines a schedule for, that definition's
+    /// ([`ScheduledWorkflow`]). So is a spec stored before requirements were
+    /// recorded, and a defined workflow on a consumer it cannot serve.
+    ///
+    /// Concurrent installers for one house and consumer take turns: the
+    /// listing, the create, and the read-back happen under a reservation, so
+    /// a second installer finds the schedule the first created.
+    ///
+    /// # Errors
+    /// [`OrcaError::Contract`] with
+    /// [`ContractError::UnsupportedCapabilities`](crate::contracts::ContractError::UnsupportedCapabilities)
+    /// naming every required capability Orca lacks or supports only in part,
+    /// [`OrcaError::ScheduleRequirementsUnknown`] for a spec without them,
+    /// and [`OrcaError::ScheduleRequirementsMismatch`] for a workflow on a
+    /// consumer it cannot serve.
+    /// [`OrcaError::Selection`] naming every part of the selection Orca
+    /// cannot launch. [`OrcaError::ScheduleActive`] when the consumer's
+    /// schedule is firing and [`OrcaError::ScheduleDiffers`] when it is not
+    /// the requested one;
+    /// neither changes anything. [`OrcaError::DuplicateSchedules`] when
+    /// several share the name, [`OrcaError::InstallUncertain`] when a create
+    /// may have happened but no listing shows it,
+    /// [`OrcaError::StateMismatch`] when a new schedule does not read back
+    /// paused, [`OrcaError::ReservationBusy`] when another installer held the
+    /// reservation for the whole wait, and call or parse failures.
+    fn install_schedule(&self, spec: &ScheduleSpec) -> Result<ResourceRef, Self::Error> {
+        self.install(spec).map(|(schedule, _)| schedule)
+    }
+
+    /// Observe a schedule's state and up to [`MAX_SCHEDULE_RUNS`] recent
+    /// runs, each judged against `readiness`.
+    ///
+    /// Orca's `completed` only means the launch step finished. A run whose
+    /// agent showed no [`crate::scheduling::ReadinessSignal`] within the
+    /// deadline is [`crate::scheduling::RunVerdict::LaunchFailed`], so a
+    /// launch swallowed by an interactive prompt is reported as one instead
+    /// of as a completed run.
+    ///
+    /// # Errors
+    /// Call and parse failures. A schedule absent from a complete listing is
+    /// reported as [`ObservedScheduleState::Missing`], not an error.
+    fn inspect_schedule(
+        &self,
+        schedule: &ResourceRef,
+        readiness: &Readiness<'_>,
+    ) -> Result<ScheduleObservation, Self::Error> {
+        let automation = match self.owned(schedule) {
+            Ok(automation) => automation,
+            Err(OrcaError::ScheduleNotFound) => {
+                return Ok(ScheduleObservation {
+                    state: ObservedScheduleState::Missing,
+                    recent_runs: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let args = wire::Args::command(&["automations", "runs"])
+            .value("id", &automation.id)
+            .json();
+        let mut runs: RunList = wire::typed(
+            self.call(args, self.config().call_timeout)?,
+            "automation runs",
+        )?;
+        // Newest first. A run with no due time is a trial or still
+        // dispatching, so it ranks newest and survives the cut below; the
+        // sort is stable, so undated runs keep Orca's listing order.
+        runs.runs
+            .sort_by_key(|run| std::cmp::Reverse((run.scheduled_for.is_none(), run.scheduled_for)));
+        let recent: Vec<ScheduleRun> = runs
+            .runs
+            .iter()
+            .take(MAX_SCHEDULE_RUNS)
+            .map(|run| ScheduleRun {
+                outcome: run_outcome(run),
+                scheduled_for: run.scheduled_for.map(Timestamp::from_unix_millis),
+                created_at: run.created_at.map(Timestamp::from_unix_millis),
+                usage: run_usage(run),
+                // Orca's run records carry no provider, and the automation's
+                // current one may have been edited since the run.
+                agent: None,
+            })
+            .collect();
+        Ok(ScheduleObservation {
+            state: state_of(automation.enabled),
+            recent_runs: readiness.judge(&recent),
+        })
+    }
+
+    /// Observe every Kitchen schedule of this house and its recent runs now,
+    /// for judging budgets: an activation check or a budget pass
+    /// ([`crate::workflows::budget`]). Reads only.
+    ///
+    /// Runs are judged with no readiness signals, so budgets count every
+    /// launched run as a possible agent start. Every schedule is judged the
+    /// same way, the budget schedule included.
+    ///
+    /// # Errors
+    /// Call and parse failures, and [`OrcaError::ListingTooLong`].
+    fn schedule_evidence(&self) -> Result<ScheduleEvidence, Self::Error> {
+        let now = self.now();
+        let readiness = Readiness::new(&[], now, std::time::Duration::ZERO);
+        let schedules = self
+            .installed_schedules()?
+            .into_iter()
+            .map(|installed| {
+                Ok(ScheduleUsage {
+                    observation: self.inspect_schedule(&installed.resource, &readiness)?,
+                    consumer: installed.consumer,
+                    schedule: installed.resource,
+                })
+            })
+            .collect::<Result<Vec<_>, OrcaError>>()?;
+        Ok(ScheduleEvidence {
+            house: self.config().house.clone(),
+            observed_at: now,
+            schedules,
+        })
     }
 }
 

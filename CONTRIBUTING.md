@@ -76,6 +76,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #101 verification access binding and target-scoped grants | `contracts/verification.rs` with #43; `state/verification.rs` (`run_verification`) and the evidence-kind check in `HouseStore::record_evidence`; grant targets in `contracts/authority.rs` and `EvidenceKind::AuthorizedVerification` in `contracts/evidence.rs`, coordinated with #4 | Run, binding, forgery, target-scope, and legacy-grant tests in `crates/kitchen/tests/verification.rs` |
 | #40 schedule intervals and usage budgets | `scheduling/budget.rs` | The house `schedules` policy field and schedule doctor findings in `house/`; install refusal in the Orca schedule adapter; `tests/schedule_budgets.rs` |
 | #46 report intake | `workflows/intake.rs` | Intake source, grouping, and redaction tests |
+| #192 backend deliveries and schedule inspection | `contracts/mailbox.rs`, `contracts/schedules.rs` | `run_mailbox` in `contracts/conformance.rs` and the fake's mailbox; `crates/kitchen/tests/backend_deliveries.rs` |
 | #149 fake-executable test helper | `crates/kitchen/tests/common/executable.rs` | Test support only; `tests/fake_executable.rs` covers it |
 | #189 fake-executable fork-pressure test | `crates/kitchen/tests/fake_executable.rs` | Test-only; separates the Linux `ETXTBSY` regression from resource failures on loaded hosts |
 | #47 project decomposition | `workflows/decomposition.rs` | Decomposition tests; `kitchn decompose` CLI command |

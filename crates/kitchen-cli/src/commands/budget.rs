@@ -21,8 +21,7 @@ use kitchen::{
     adapters::{
         BackendError, OrcaSession, backend_binding,
         orca::{
-            DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, OrcaBackend,
-            SystemRunner,
+            DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, SystemRunner,
         },
         resolve_backend,
     },
@@ -30,7 +29,7 @@ use kitchen::{
     contracts::{
         Capability, Claimant, Effect, EffectExecutor, ExternalRef, GitHubAction, GitHubMutation,
         Grant, IssueNumber, LeaseTtl, Permission, PostingBudget, Provenance, Repository,
-        SystemClock, Text,
+        ScheduleBackend, SystemClock, Text,
     },
     house::{BackendBinding, HouseConfig, HouseError},
     integrations::github::{
@@ -200,7 +199,8 @@ fn precheck(source: &Source) -> ExitCode {
     let result = Opened::open(source).and_then(|opened| {
         let evidence = opened
             .backend(source, &TICK_CAPABILITIES)?
-            .schedule_evidence()?;
+            .schedule_evidence()
+            .map_err(Into::into)?;
         budget::precheck(
             &opened.store,
             &opened.config.house,
@@ -287,12 +287,13 @@ impl Opened {
         })
     }
 
-    /// Build the house's bound backend, which must fully support `required`.
+    /// Build the house's bound backend, which must fully support `required`
+    /// and enforces the house's schedule limits.
     fn backend(
         &self,
         source: &Source,
         required: &[Capability],
-    ) -> Result<OrcaBackend<SystemRunner>, kitchen::Error> {
+    ) -> Result<impl ScheduleBackend, kitchen::Error> {
         Ok(resolve_backend(
             &self.config,
             OrcaSession {
@@ -310,8 +311,7 @@ impl Opened {
             },
             SystemRunner::new(&source.orca),
             required,
-        )?
-        .with_schedule_policy(self.policy.clone()))
+        )?)
     }
 
     /// The standing grant the tick pauses schedules under: the bound
@@ -426,7 +426,7 @@ fn tick(source: Source, flags: &ReportFlags) -> Result<(String, bool), kitchen::
         ttl: LeaseTtl::new(TICK_LEASE)?,
         clock: &SystemClock,
     };
-    let evidence = backend.schedule_evidence()?;
+    let evidence = backend.schedule_evidence().map_err(Into::into)?;
     let outcome = budget::tick(&tick, &opened.policy, &evidence)?;
     Ok(render(&outcome))
 }
@@ -553,7 +553,8 @@ fn install(
     // before Orca is contacted.
     let installed = opened
         .backend(&source, &budget::REQUIRED_CAPABILITIES)?
-        .install_schedule(&tick)?;
+        .install_schedule(&tick)
+        .map_err(Into::into)?;
     Ok((
         format!(
             "installed paused {} ({})",

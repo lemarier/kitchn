@@ -159,17 +159,20 @@ impl ConsentSource for Standing {
 }
 
 /// Worker backend capabilities supervision needs: isolated launch, positive
-/// readiness, messaging, status, and cancellation of a stalled launch. They
+/// readiness, messaging, status, cancellation of a stalled launch, and worker
+/// deliveries, without which the coordinator never receives a question or a
+/// report ([`crate::contracts::CoordinatorMailbox`]). They
 /// are checked when a coordinator starts, and a task records them as its
 /// [`crate::contracts::ExecutorKind::Worker`] requirements
 /// ([`crate::contracts::CapabilityRequirements`]), which the store applies to
 /// worker backends only, never to forge or Roger executors.
-pub const REQUIRED_WORKER_CAPABILITIES: [Capability; 5] = [
+pub const REQUIRED_WORKER_CAPABILITIES: [Capability; 6] = [
     Capability::WorkerLaunchIsolated,
     Capability::WorkerLaunchReadiness,
     Capability::WorkerMessaging,
     Capability::WorkerStatusAndOutcome,
     Capability::WorkerCancel,
+    Capability::WorkerDeliveries,
 ];
 
 /// What coordination acts through.

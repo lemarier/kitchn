@@ -26,8 +26,8 @@ use kitchen::{
     contracts::{
         AttemptNumber, BranchName, Capability, CapabilitySet, ContractError, Effect,
         EffectExecutor, EffectFailure, EffectRequest, ExternalRef, Fence, HouseGrants,
-        IdempotencyKey, NotAppliedReason, Permission, ResourceKind, ResourceRef, ScheduleEffect,
-        Support, TaskAuthority, Text, fake::FakeBackend,
+        IdempotencyKey, NotAppliedReason, Permission, ResourceKind, ResourceRef, ScheduleBackend,
+        ScheduleEffect, Support, TaskAuthority, Text, fake::FakeBackend,
     },
     scheduling::{
         AgentFamily, CronExpr, Recurrence, ScheduleField, ScheduleSpec, ScheduleState, Timezone,

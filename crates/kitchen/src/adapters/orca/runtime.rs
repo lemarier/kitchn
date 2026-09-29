@@ -148,6 +148,8 @@ pub fn capabilities() -> CapabilitySet {
         C::WorkerLaunchReadiness,
         // `send --to dispatch:`, `reply`, and the Run mailbox.
         C::WorkerMessaging,
+        // `check` replays the oldest batch until `--ack` names it.
+        C::WorkerDeliveries,
         // `worker-show` projection; settled only on an accepted report or stop.
         C::WorkerStatusAndOutcome,
         // `worker-stop` fences the Dispatch and stops only its agent terminal.
@@ -257,5 +259,10 @@ mod tests {
             assert!(declared.supports(declared_kind), "{declared_kind}");
         }
         assert!(declared.supports(Capability::ResourceInventory));
+        assert!(declared.supports(Capability::WorkerDeliveries));
+        assert_eq!(
+            declared.support(Capability::RunTransfer),
+            Some(Support::Partial)
+        );
     }
 }

@@ -124,7 +124,8 @@ pub fn backend_binding(
 
 /// Build the worker backend `house` is bound to, then refuse it unless it
 /// fully supports every capability in `required`. Every command that needs a
-/// backend builds it here.
+/// backend builds it here. The backend enforces the house's schedule limits,
+/// when it sets any, on schedule installs and activations.
 ///
 /// # Errors
 /// [`BackendError::Unbound`] and [`BackendError::Unknown`] before anything
@@ -156,6 +157,10 @@ pub fn resolve_backend<R: OrcaRunner>(
             },
             runner,
         )?,
+    };
+    let backend = match &house.schedules {
+        Some(policy) => backend.with_schedule_policy(policy.clone()),
+        None => backend,
     };
     EffectExecutor::descriptor(&backend)
         .capabilities

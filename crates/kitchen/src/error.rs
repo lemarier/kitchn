@@ -71,6 +71,9 @@ pub enum Error {
     /// A schedule interval or usage budget check refused the request.
     #[error(transparent)]
     Budget(#[from] crate::scheduling::BudgetError),
+    /// An intake source or report was refused or malformed.
+    #[error(transparent)]
+    Intake(#[from] crate::workflows::intake::IntakeError),
 }
 
 impl Error {
@@ -93,6 +96,7 @@ impl Error {
             Self::Verification(error) => error.class(),
             Self::Coordination(error) => error.class(),
             Self::Budget(error) => error.class(),
+            Self::Intake(error) => error.class(),
         }
     }
 }

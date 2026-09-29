@@ -202,7 +202,9 @@ fn check_item(item: &WorkItem, subject: &MarkerSubject) -> Result<(Repository, b
     let (repository, pull_request) = match item {
         WorkItem::Issue { repository, .. } => (repository, false),
         WorkItem::PullRequest { repository, .. } => (repository, true),
-        WorkItem::Resource { .. } => return Err(EventError::UnsupportedItem),
+        WorkItem::Resource { .. } | WorkItem::Repository { .. } => {
+            return Err(EventError::UnsupportedItem);
+        }
     };
     match (subject, pull_request) {
         (MarkerSubject::Git(_), true) | (MarkerSubject::Issue(_), false) => {

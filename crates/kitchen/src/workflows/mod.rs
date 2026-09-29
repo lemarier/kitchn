@@ -10,6 +10,7 @@ pub mod coordination;
 pub mod gardener;
 pub mod gate;
 pub mod inspector;
+pub mod intake;
 pub mod pickup;
 pub mod push;
 pub mod ready;

@@ -10,9 +10,10 @@ use common::{
 use kitchen::{
     BackendId, CredentialId, Error, ErrorClass, HouseId, IdentifierError,
     contracts::{
-        Capability, CapabilitySet, CommitId, ContractError, ExternalRef, Grant, GrantScope,
-        HouseGrants, LeaseTtl, MAX_EXTERNAL_REF_BYTES, MAX_TEXT_BYTES, Permission, Repository,
-        RetryPolicy, Role, Support, TaskAuthority, TaskSpec, Text, ValueKind,
+        BranchName, Capability, CapabilitySet, CommitId, ContractError, ExternalRef, Grant,
+        GrantScope, HouseGrants, LeaseTtl, MAX_EXTERNAL_REF_BYTES, MAX_TEXT_BYTES, Permission,
+        Receipt, Repository, Retarget, RetryPolicy, Role, Support, TaskAuthority, TaskSpec, Text,
+        ValueKind,
     },
 };
 
@@ -627,4 +628,31 @@ fn branch_names_follow_git_ref_rules() -> TestResult {
 
 fn invalid_kind(kind: ValueKind) -> ContractError {
     ContractError::InvalidValue { kind }
+}
+
+#[test]
+fn receipt_retarget_round_trips_and_stays_optional() -> TestResult {
+    let plain = Receipt::new(ExternalRef::new("abc")?, vec![], vec![])?;
+    assert!(plain.retarget().is_none());
+    let json = serde_json::to_value(&plain)?;
+    assert!(
+        json.get("retarget").is_none(),
+        "absent retarget is not written"
+    );
+    assert_eq!(serde_json::from_value::<Receipt>(json)?, plain);
+
+    let moved = plain.with_retarget(Retarget {
+        expected: BranchName::new("main")?,
+        actual: BranchName::new("release")?,
+    });
+    let back: Receipt = serde_json::from_value(serde_json::to_value(&moved)?)?;
+    assert_eq!(back, moved);
+    assert_eq!(back.retarget().map(|r| r.actual.as_str()), Some("release"));
+    Ok(())
+}
+
+#[test]
+fn receipt_rejects_an_unknown_field() {
+    let value = serde_json::json!({"reference":"abc","created":[],"touched":[],"extra":1});
+    assert!(serde_json::from_value::<Receipt>(value).is_err());
 }

@@ -323,7 +323,22 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                         .ok_or(IntegrationError::Unknown)?;
                     let merge = crate::contracts::CommitId::new(sha)
                         .map_err(|_| IntegrationError::Unknown)?;
-                    let receipt = Receipt::new(ExternalRef::new(merge.as_str())?, vec![], vec![])?;
+                    let mut receipt =
+                        Receipt::new(ExternalRef::new(merge.as_str())?, vec![], vec![])?;
+                    // The merge of the approved head stays applied, but a
+                    // different actual base is carried so it is never taken
+                    // for the approved merge into the intended base.
+                    let actual = pr
+                        .pointer("/base/ref")
+                        .and_then(Value::as_str)
+                        .ok_or(IntegrationError::Unknown)?;
+                    if actual != expected_base.as_str() {
+                        receipt = receipt.with_retarget(crate::contracts::Retarget {
+                            expected: expected_base.clone(),
+                            actual: crate::contracts::BranchName::new(actual)
+                                .map_err(|_| IntegrationError::Unknown)?,
+                        });
+                    }
                     return Ok(Inspection::Applied(receipt));
                 }
                 if pr.pointer("/base/ref").and_then(Value::as_str) != Some(expected_base.as_str()) {

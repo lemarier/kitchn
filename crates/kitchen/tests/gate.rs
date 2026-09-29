@@ -1616,6 +1616,19 @@ fn uncertain_submission_reconciles_then_applied_is_satisfied() -> TestResult {
     Ok(())
 }
 #[test]
+fn merge_applied_into_another_base_is_never_satisfied() -> TestResult {
+    let mut store = FakeMarkers::default();
+    let e = ready()?;
+    let first = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(100))?;
+    let key = submitted(&first)?;
+    store.settle(&key, GateEffectState::AppliedElsewhere);
+    let held = gate::evaluate_and_record(&mut store, &e, grants()?, GateMode::Active, secs(200))?;
+    // The owner must resolve it: no second merge and no silent satisfaction.
+    assert_eq!(held.admission, Admission::Reconcile(key.clone()));
+    assert_eq!(store.effects.len(), 1);
+    Ok(())
+}
+#[test]
 fn uncertain_submission_proven_absent_is_superseded() -> TestResult {
     let mut store = FakeMarkers::default();
     let mut e = ready()?;

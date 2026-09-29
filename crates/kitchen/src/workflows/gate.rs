@@ -1406,6 +1406,9 @@ pub enum GateEffectState {
     HandedOver,
     /// Applied, with a receipt.
     Applied,
+    /// Applied, but the merge landed in a base other than the approved one.
+    /// It is not the approved merge, so the owner must resolve it.
+    AppliedElsewhere,
     /// Definitely not applied, for example a refused submission.
     NotApplied,
 }
@@ -1646,7 +1649,8 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
         match store.effect_state(key)? {
             GateEffectState::Intended
             | GateEffectState::Uncertain
-            | GateEffectState::HandedOver => {
+            | GateEffectState::HandedOver
+            | GateEffectState::AppliedElsewhere => {
                 let mut decision = evaluate(evidence, grants, GateHistory::default());
                 decision.verdict = record.verdict.clone();
                 return Ok(RecordedDecision {
@@ -1750,7 +1754,8 @@ pub fn evaluate_and_record<S: GateMarkerStore>(
                     GateEffectState::NotApplied => Admission::None,
                     GateEffectState::Intended
                     | GateEffectState::Uncertain
-                    | GateEffectState::HandedOver => Admission::Reconcile(key),
+                    | GateEffectState::HandedOver
+                    | GateEffectState::AppliedElsewhere => Admission::Reconcile(key),
                 }
             }
         },

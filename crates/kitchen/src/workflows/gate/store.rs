@@ -420,6 +420,9 @@ const fn gate_state(state: &EffectState) -> GateEffectState {
     match state {
         EffectState::Intended => GateEffectState::Intended,
         EffectState::Uncertain { .. } => GateEffectState::Uncertain,
+        EffectState::Applied { receipt, .. } if receipt.retarget().is_some() => {
+            GateEffectState::AppliedElsewhere
+        }
         EffectState::Applied { .. } => GateEffectState::Applied,
         EffectState::NotApplied { .. } => GateEffectState::NotApplied,
         EffectState::Unresolvable { .. } | EffectState::Waived { .. } => {

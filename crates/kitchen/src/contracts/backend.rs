@@ -252,6 +252,21 @@ pub struct Receipt {
     reference: ExternalRef,
     created: Vec<ResourceRef>,
     touched: Vec<ResourceRef>,
+    retarget: Option<Retarget>,
+}
+
+/// A merge that landed in a different base than the approved one.
+///
+/// The effect happened, so its outcome stays applied, but it is not the
+/// approved merge into the intended base: automation must not treat it as
+/// such and the owner must see the mismatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Retarget {
+    /// The base the approval named.
+    pub expected: BranchName,
+    /// The base the merge actually landed in.
+    pub actual: BranchName,
 }
 
 impl Receipt {
@@ -275,7 +290,21 @@ impl Receipt {
             reference,
             created,
             touched,
+            retarget: None,
         })
+    }
+
+    /// Record that the effect landed in a base other than the approved one.
+    #[must_use]
+    pub fn with_retarget(mut self, retarget: Retarget) -> Self {
+        self.retarget = Some(retarget);
+        self
+    }
+
+    /// The base mismatch, when the effect landed away from the approved base.
+    #[must_use]
+    pub const fn retarget(&self) -> Option<&Retarget> {
+        self.retarget.as_ref()
     }
 
     /// The backend's reference for the applied request.
@@ -303,13 +332,19 @@ struct RawReceipt {
     reference: ExternalRef,
     created: Vec<ResourceRef>,
     touched: Vec<ResourceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retarget: Option<Retarget>,
 }
 
 impl TryFrom<RawReceipt> for Receipt {
     type Error = ContractError;
 
     fn try_from(raw: RawReceipt) -> Result<Self, Self::Error> {
-        Self::new(raw.reference, raw.created, raw.touched)
+        let receipt = Self::new(raw.reference, raw.created, raw.touched)?;
+        Ok(match raw.retarget {
+            Some(retarget) => receipt.with_retarget(retarget),
+            None => receipt,
+        })
     }
 }
 
@@ -319,6 +354,7 @@ impl From<Receipt> for RawReceipt {
             reference: receipt.reference,
             created: receipt.created,
             touched: receipt.touched,
+            retarget: receipt.retarget,
         }
     }
 }

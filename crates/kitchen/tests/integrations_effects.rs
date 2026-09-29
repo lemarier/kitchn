@@ -1794,12 +1794,40 @@ fn merge_into_a_retargeted_base_at_the_expected_head_is_applied() -> TestResult 
     let (report, calls) = reconcile_lost_merge(merged_pull_request(HEAD, "release"))?;
     assert!(report.unresolved.is_empty());
     assert_eq!(report.resolved.len(), 1);
+    // Applied, but the landing base is carried so it is not mistaken for the
+    // approved merge into the intended base.
     assert!(matches!(
         report.resolved[0].state(),
         EffectState::Applied { receipt, .. }
             if receipt.reference().as_str() == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                && receipt.retarget().is_some_and(|r| {
+                    r.expected.as_str() == "main" && r.actual.as_str() == "release"
+                })
     ));
     assert_eq!(calls, 1, "reconciliation never writes");
+    Ok(())
+}
+
+#[test]
+fn merge_into_the_expected_base_carries_no_retarget() -> TestResult {
+    let (report, _) = reconcile_lost_merge(merged_pull_request(HEAD, "main"))?;
+    assert!(matches!(
+        report.resolved.as_slice(),
+        [record] if matches!(
+            record.state(),
+            EffectState::Applied { receipt, .. } if receipt.retarget().is_none()
+        )
+    ));
+    Ok(())
+}
+
+#[test]
+fn merge_with_an_unreadable_actual_base_stays_unresolved() -> TestResult {
+    let mut landed = merged_pull_request(HEAD, "main");
+    landed["base"] = json!({});
+    let (report, _) = reconcile_lost_merge(landed)?;
+    assert!(report.resolved.is_empty());
+    assert_eq!(report.unresolved.len(), 1);
     Ok(())
 }
 

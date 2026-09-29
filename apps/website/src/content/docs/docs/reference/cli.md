@@ -144,12 +144,14 @@ kitchn forge show --registry <dir> --house <id>
 
 `--posting-budget` caps the writes one task may make (0 to 100). House policy
 limits for forge writes must name the credential. `show` exits 1 when the token
-file is not in place.
+file is not ready: missing, not a regular file, reached through a link, owned
+by another user, or accessible to group or others.
 
 ## `kitchn work`, `kitchn pr` and `kitchn hand-back`
 
 The entrypoints behind the [`/kitchn` skill](/docs/guides/sessions/). Each
-prints a plan and takes a durable claim shared with scheduled runs.
+prints a plan. `work` and the `pr` writer rounds (`follow-up`, `repair`) take a
+durable claim shared with scheduled runs; `review` and `gate` only read.
 
 ```sh
 kitchn work <issue> --facts <issue.json> --revision <sha> --registry <dir> --store <dir> --holder <you> [--json]

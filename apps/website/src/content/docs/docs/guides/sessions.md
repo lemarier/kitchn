@@ -47,8 +47,8 @@ fan-out is unavailable.
 
 ## Claims
 
-`work` and `pr` take a durable claim on the issue or pull request, the same
-claim scheduled runs use, so a session and a scheduled run never work the same
+`work` and the `pr` writer rounds (`follow-up` and `repair`) take a durable
+claim on the issue or pull request, the same claim scheduled runs use, so a session and a scheduled run never work the same
 item at once. If someone else holds it, the session tells you who and stops.
 A claim lasts 120 minutes unless you pass `--lease-minutes`. `--take-over` takes
 a claim only after its lease expired without a hand-back.

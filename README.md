@@ -129,7 +129,7 @@ It drives these CLI entrypoints:
 | Command | What it does |
 | --- | --- |
 | `kitchen work <issue>` | Plan one issue: coordinate sub-issues, propose a split, or implement it. Takes a durable claim. |
-| `kitchen pr <number>` | Plan a review, follow-up, repair, or merge-gate pass at one exact head. |
+| `kitchen pr <number>` | Plan a review, follow-up, repair, or merge-gate pass at one exact head. Follow-up and repair take a durable claim. |
 | `kitchen issue new` / `refine` | Preview an issue draft for approval. Posts nothing. |
 | `kitchen hand-back <task>` | Release your claim so a scheduled run or another session can adopt it. |
 

@@ -596,7 +596,7 @@ pub fn register_house(plan: &HouseInitPlan) -> Result<HouseInitReport, HouseInit
             Ok(BoundForge {
                 binding: binding.clone(),
                 outcome,
-                credential: credential_status(&path)?,
+                credential: credential_status(&registry, binding)?,
                 credential_path: path,
             })
         })

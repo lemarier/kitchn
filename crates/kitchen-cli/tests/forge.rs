@@ -235,6 +235,23 @@ fn bind_then_show_reports_the_token_file_without_reading_it() -> TestResult {
         assert_eq!(output.status.code(), Some(1));
         assert!(text(&output.stdout).contains("readable by other users"));
         fs::set_permissions(&token, fs::Permissions::from_mode(0o600))?;
+
+        // A credentials directory linked elsewhere is refused, with no
+        // command that would write through the link.
+        let credentials = token.parent().ok_or("no parent")?.to_path_buf();
+        let moved = fixture.root.join("moved-credentials");
+        fs::rename(&credentials, &moved)?;
+        std::os::unix::fs::symlink(&moved, &credentials)?;
+        let output = show()?;
+        assert_eq!(output.status.code(), Some(1));
+        let stdout = text(&output.stdout);
+        assert!(
+            stdout.contains("is behind a link or non-directory on its path"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("gh auth token"), "{stdout}");
+        fs::remove_file(&credentials)?;
+        fs::rename(&moved, &credentials)?;
     }
     let output = show()?;
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));

@@ -224,22 +224,126 @@ fn a_missing_binding_is_refused_by_name() -> TestResult {
 fn the_token_file_is_inspected_without_reading_or_following_it() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
-    let token = root.join("credentials/github");
-    assert_eq!(credential_status(&token)?, CredentialStatus::Missing);
+    let registry = registry(&root, &house_config(BTreeSet::new())?)?;
+    let bound = binding("acme-bot")?;
+    let token = credential_path(&registry, &bound)?;
+    assert_eq!(
+        credential_status(&registry, &bound)?,
+        CredentialStatus::Missing
+    );
     place_token(&token, 0o600)?;
-    assert_eq!(credential_status(&token)?, CredentialStatus::Ready);
+    assert_eq!(
+        credential_status(&registry, &bound)?,
+        CredentialStatus::Ready
+    );
     #[cfg(unix)]
     {
         place_token(&token, 0o640)?;
-        assert_eq!(credential_status(&token)?, CredentialStatus::Exposed);
-        let link = root.join("credentials/link");
-        std::os::unix::fs::symlink(&token, &link)?;
-        assert_eq!(credential_status(&link)?, CredentialStatus::NotRegularFile);
+        assert_eq!(
+            credential_status(&registry, &bound)?,
+            CredentialStatus::Exposed
+        );
+        let elsewhere = root.join("elsewhere");
+        place_token(&elsewhere, 0o600)?;
+        fs::remove_file(&token)?;
+        std::os::unix::fs::symlink(&elsewhere, &token)?;
+        assert_eq!(
+            credential_status(&registry, &bound)?,
+            CredentialStatus::NotRegularFile
+        );
+        fs::remove_file(&token)?;
     }
-    fs::create_dir_all(root.join("credentials/directory"))?;
+    fs::create_dir_all(&token)?;
     assert_eq!(
-        credential_status(&root.join("credentials/directory"))?,
+        credential_status(&registry, &bound)?,
         CredentialStatus::NotRegularFile
+    );
+    Ok(())
+}
+
+/// Replace `link` with a symbolic link to `target`.
+#[cfg(unix)]
+fn redirect(link: &Path, target: &Path) -> TestResult {
+    if link.is_dir() {
+        fs::remove_dir_all(link)?;
+    }
+    fs::create_dir_all(link.parent().ok_or("no parent")?)?;
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_redirected_credentials_directory_is_refused() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let limits = [grant(Permission::PostComment, "github")?].into();
+    let registry = registry(&root, &house_config(limits)?)?;
+    let bound = binding("acme-bot")?;
+    bind_forge(&registry, &bound)?;
+    // Another house's private token, ready in every other respect.
+    let other = root.join("registry/private/other/credentials");
+    place_token(&other.join("github"), 0o600)?;
+    let credentials = root.join("registry/private/acme/credentials");
+    redirect(&credentials, &other)?;
+
+    assert_eq!(
+        credential_status(&registry, &bound)?,
+        CredentialStatus::Redirected
+    );
+    let connected = Cell::new(None);
+    let write = comment();
+    let error = forge_error(apply(
+        &registry,
+        &write,
+        "sha256:aaaa",
+        &person()?,
+        &connected,
+    ))?;
+    assert!(matches!(
+        error,
+        ForgeError::CredentialUnavailable {
+            status: CredentialStatus::Redirected,
+            ..
+        }
+    ));
+    assert!(!error.to_string().contains(TOKEN));
+    assert_eq!(connected.take(), None);
+    assert_eq!(write.applied.get(), 0);
+
+    // An external directory is refused the same way.
+    let external = root.join("external");
+    place_token(&external.join("github"), 0o600)?;
+    fs::remove_file(&credentials)?;
+    redirect(&credentials, &external)?;
+    assert_eq!(
+        credential_status(&registry, &bound)?,
+        CredentialStatus::Redirected
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_redirected_house_directory_is_refused() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let registry = registry(&root, &house_config(BTreeSet::new())?)?;
+    let bound = binding("acme-bot")?;
+    // The house's private directory points at a copy holding a ready token.
+    let copy = root.join("copy");
+    place_token(&copy.join("credentials/github"), 0o600)?;
+    redirect(&root.join("registry/private/acme"), &copy)?;
+    assert!(matches!(
+        credential_status(&registry, &bound),
+        Err(ForgeError::House(HouseError::RedirectedPath))
+    ));
+    // Without the redirect, the same layout is ready.
+    fs::remove_file(root.join("registry/private/acme"))?;
+    place_token(&credential_path(&registry, &bound)?, 0o600)?;
+    assert_eq!(
+        credential_status(&registry, &bound)?,
+        CredentialStatus::Ready
     );
     Ok(())
 }

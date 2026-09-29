@@ -5,7 +5,9 @@
 //! stored at `private/<house>/forge.json` in the house registry, outside every
 //! working tree, and holds no secret. The credential itself is a token file the
 //! person places at [`credential_path`]; Kitchen never writes or copies it and
-//! reads it only when a write runs, after every other check has passed.
+//! reads it only when a write runs, after every other check has passed. It is
+//! opened from the registry root one name at a time without following links,
+//! checked on the opened descriptor, and read from that same descriptor.
 //!
 //! [`apply_approved`] is the one entry point for writing an approved preview,
 //! such as an issue draft or a decomposition. It refuses a claimant without a
@@ -14,7 +16,7 @@
 //! Posting once, resuming after an interruption, and never duplicating a write
 //! are the [`ApprovedWrite`] implementation's duty, through the core task store.
 
-use std::{fmt, path::PathBuf};
+use std::{fmt, fs::File, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -167,12 +169,17 @@ pub enum BindOutcome {
 /// Whether the credential file is ready to use. Checked without reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialStatus {
-    /// A regular file only its owner can access.
+    /// A regular file the current user owns and only they can access.
     Ready,
     /// No file is there yet.
     Missing,
     /// Something other than a regular file, such as a link or directory.
     NotRegularFile,
+    /// A directory on its path, such as `credentials` or the house's private
+    /// directory, is a link or not a directory.
+    Redirected,
+    /// Another user owns it.
+    NotOwned,
     /// Group or others can access it.
     Exposed,
 }
@@ -242,6 +249,8 @@ impl fmt::Display for CredentialStatus {
             Self::Ready => "ready",
             Self::Missing => "missing",
             Self::NotRegularFile => "not a regular file",
+            Self::Redirected => "behind a link or non-directory on its path",
+            Self::NotOwned => "owned by another user",
             Self::Exposed => "readable by other users (chmod 600 it)",
         })
     }
@@ -347,29 +356,84 @@ pub fn credential_path(
         .join(binding.credential.as_str()))
 }
 
-/// Inspect the token file at `path` without reading it or following a link.
+/// Inspect the binding's token file without reading it, following a link,
+/// or leaving the house's private directory.
 ///
 /// # Errors
-/// Filesystem failures other than absence.
-pub fn credential_status(path: &std::path::Path) -> Result<CredentialStatus, HouseError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CredentialStatus::Missing);
-        }
-        Err(error) => return Err(error.into()),
+/// House loading failures, a private directory inside a repository, and
+/// filesystem failures other than absence or redirection.
+pub fn credential_status(
+    registry: &HouseRegistry,
+    binding: &ForgeBinding,
+) -> Result<CredentialStatus, ForgeError> {
+    Ok(match open_credential(registry, binding)? {
+        Ok(_) => CredentialStatus::Ready,
+        Err(status) => status,
+    })
+}
+
+/// Open the token file at [`credential_path`] from the registry root, one
+/// name at a time, refusing a link at every step. Ownership, type, and mode
+/// are checked on the opened descriptor, which the caller reads the token
+/// from, so replacing the file after the check cannot change what is read.
+#[cfg(unix)]
+fn open_credential(
+    registry: &HouseRegistry,
+    binding: &ForgeBinding,
+) -> Result<Result<File, CredentialStatus>, ForgeError> {
+    use rustix::{
+        fs::{Mode, OFlags, open, openat},
+        io::Errno,
     };
+    use std::os::unix::fs::MetadataExt;
+
+    fn failed(error: Errno) -> ForgeError {
+        HouseError::from(std::io::Error::from(error)).into()
+    }
+
+    // Loads the house and refuses a private directory inside a repository.
+    registry.private_path(&binding.house)?;
+    let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // The registry root is the caller's choice and may itself be a link.
+    let mut parent = open(registry.root(), directory, Mode::empty()).map_err(failed)?;
+    for name in ["private", binding.house.as_str(), CREDENTIALS] {
+        parent = match openat(&parent, name, directory | OFlags::NOFOLLOW, Mode::empty()) {
+            Ok(child) => child,
+            Err(Errno::NOENT) => return Ok(Err(CredentialStatus::Missing)),
+            Err(Errno::LOOP | Errno::NOTDIR) => return Ok(Err(CredentialStatus::Redirected)),
+            Err(error) => return Err(failed(error)),
+        };
+    }
+    // Non-blocking, so a FIFO placed there cannot stall the open.
+    let token =
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let file = match openat(&parent, binding.credential.as_str(), token, Mode::empty()) {
+        Ok(descriptor) => File::from(descriptor),
+        Err(Errno::NOENT) => return Ok(Err(CredentialStatus::Missing)),
+        Err(Errno::LOOP) => return Ok(Err(CredentialStatus::NotRegularFile)),
+        Err(error) => return Err(failed(error)),
+    };
+    let metadata = file.metadata().map_err(HouseError::from)?;
     if !metadata.is_file() {
-        return Ok(CredentialStatus::NotRegularFile);
+        return Ok(Err(CredentialStatus::NotRegularFile));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Ok(CredentialStatus::Exposed);
-        }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Ok(Err(CredentialStatus::NotOwned));
     }
-    Ok(CredentialStatus::Ready)
+    if metadata.mode() & 0o077 != 0 {
+        return Ok(Err(CredentialStatus::Exposed));
+    }
+    Ok(Ok(file))
+}
+
+/// Without no-follow opens and owner checks, no token file is trusted.
+#[cfg(not(unix))]
+fn open_credential(
+    registry: &HouseRegistry,
+    binding: &ForgeBinding,
+) -> Result<Result<File, CredentialStatus>, ForgeError> {
+    registry.private_path(&binding.house)?;
+    Err(HouseError::Io(std::io::ErrorKind::Unsupported).into())
 }
 
 /// A previewed forge write that a person approves by its digest, such as an
@@ -407,8 +471,9 @@ pub trait ApprovedWrite {
 /// Refuses, before reading any credential: a claimant without a person
 /// present, a house without a forge binding, an approval that does not name
 /// the preview's current digest, a house with no posting destinations, and a
-/// missing or exposed token file. `connect` then builds the transport over
-/// the house's credential file, such as [`GhCli::new`] with the GitHub CLI.
+/// missing, redirected, foreign, or exposed token file. `connect` then builds
+/// the transport, such as [`GhCli::new`] with the GitHub CLI, over the token
+/// file already opened and checked.
 ///
 /// # Errors
 /// The refusals above as [`ForgeError`]s, `connect` failures, and the
@@ -441,12 +506,9 @@ where
         .into());
     }
     let scope = binding.scope(&config)?;
-    let path = credential_path(registry, &binding)?;
-    match credential_status(&path)? {
-        CredentialStatus::Ready => {}
-        status @ (CredentialStatus::Missing
-        | CredentialStatus::NotRegularFile
-        | CredentialStatus::Exposed) => {
+    let file = match open_credential(registry, &binding)? {
+        Ok(file) => file,
+        Err(status) => {
             return Err(ForgeError::CredentialUnavailable {
                 house: house.clone(),
                 credential: binding.credential,
@@ -454,10 +516,202 @@ where
             }
             .into());
         }
-    }
-    let file =
-        CredentialFile::new(binding.credential_ref(), path).map_err(ForgeError::Integration)?;
-    let transport = connect(file).map_err(ForgeError::Integration)?;
+    };
+    let credential = CredentialFile::opened(binding.credential_ref(), file);
+    let transport = connect(credential).map_err(ForgeError::Integration)?;
     let executor = GitHubExecutor::new(binding.backend, scope, transport, ReadLimits::default());
     write.apply(&executor, approved, claimant)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::{
+        HolderId,
+        contracts::{CommitId, EffectFailure, NotAppliedReason, Repository},
+        integrations::github::{GitHubReadTransport, MutationRequest, ReadRequest},
+    };
+    use std::{cell::RefCell, collections::BTreeSet, fs, os::unix::fs::PermissionsExt, path::Path};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    const CHECKED: &str = "checked-fixture-token";
+
+    struct Offline;
+    impl GitHubReadTransport for Offline {
+        fn read(
+            &self,
+            _: &CredentialRef,
+            _: &ReadRequest,
+            _: std::time::Duration,
+            _: usize,
+        ) -> Result<Vec<u8>, IntegrationError> {
+            Err(IntegrationError::Unavailable)
+        }
+    }
+    impl GitHubMutationTransport for Offline {
+        fn submit(
+            &self,
+            _: &CredentialRef,
+            _: &MutationRequest,
+            _: std::time::Duration,
+            _: usize,
+        ) -> Result<Vec<u8>, EffectFailure> {
+            Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+        }
+    }
+
+    struct Approved;
+    impl ApprovedWrite for Approved {
+        type Digest = &'static str;
+        type Report = ();
+        fn digest(&self) -> crate::Result<&'static str> {
+            Ok("sha256:aaaa")
+        }
+        fn apply<T: GitHubMutationTransport>(
+            &self,
+            _: &GitHubExecutor<T>,
+            _: &&'static str,
+            _: &Claimant,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn write_token(path: &Path, token: &str, mode: u32) -> TestResult {
+        fs::write(path, token)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        Ok(())
+    }
+
+    /// A registry with house `acme` bound to credential `github` and a
+    /// ready token file.
+    fn bound(
+        root: &Path,
+    ) -> Result<(HouseRegistry, ForgeBinding, PathBuf), Box<dyn std::error::Error>> {
+        let app = Repository::new("acme/app")?;
+        let kitchen = CommitId::new("4f2a9c1e0b7d3a5f6c8e9d0a1b2c3d4e5f6a7b8c")?;
+        let config = HouseConfig {
+            schema: 1,
+            house: HouseId::new("acme")?,
+            kitchen: kitchen.clone(),
+            guidance: kitchen,
+            repositories: [app.clone()].into(),
+            posting_destinations: [app].into(),
+            required_reviewers: BTreeSet::new(),
+            required_checks: BTreeSet::new(),
+            policy_limits: BTreeSet::new(),
+            grants: BTreeSet::new(),
+            agents: None,
+            stack_tool: None,
+            schedules: None,
+        };
+        let registry = HouseRegistry::new(root.join("registry"))?;
+        registry.initialize(&config)?;
+        let binding = ForgeBinding {
+            schema: FORGE_BINDING_SCHEMA,
+            house: config.house,
+            forge: ForgeKind::GitHub,
+            backend: BackendId::new("github")?,
+            requester: ExternalRef::new("acme-bot")?,
+            credential: CredentialId::new("github")?,
+            posting_budget: PostingBudget::new(5)?,
+        };
+        bind_forge(&registry, &binding)?;
+        let path = credential_path(&registry, &binding)?;
+        fs::create_dir_all(path.parent().ok_or("no parent")?)?;
+        write_token(&path, CHECKED, 0o600)?;
+        Ok((registry, binding, path))
+    }
+
+    /// Run the hook; `replace` runs in `connect`, after the checks and
+    /// before any token is read. Returns the token the transport would load.
+    fn apply_then_load(
+        registry: &HouseRegistry,
+        binding: &ForgeBinding,
+        replace: impl FnOnce() -> TestResult,
+    ) -> Result<Result<String, IntegrationError>, Box<dyn std::error::Error>> {
+        let handed = RefCell::new(None);
+        let claimant = Claimant {
+            holder: HolderId::new("session-1")?,
+            trigger: Trigger::Interactive,
+            consumer: None,
+        };
+        apply_approved(
+            registry,
+            &binding.house,
+            &Approved,
+            &"sha256:aaaa",
+            &claimant,
+            |file| {
+                replace().map_err(|_| IntegrationError::Unavailable)?;
+                handed.replace(Some(file));
+                Ok(Offline)
+            },
+        )?;
+        let file = handed.take().ok_or("connect was not reached")?;
+        Ok(file.load(&binding.credential_ref()))
+    }
+
+    #[test]
+    fn a_token_replaced_after_the_check_is_never_read() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (registry, binding, path) = bound(&root)?;
+
+        // An exposed file renamed over the checked one.
+        let loaded = apply_then_load(&registry, &binding, || {
+            let exposed = root.join("exposed");
+            write_token(&exposed, "exposed-fixture-token", 0o644)?;
+            fs::rename(&exposed, &path)?;
+            Ok(())
+        })?;
+        assert_eq!(loaded, Ok(CHECKED.to_owned()));
+        assert_eq!(
+            credential_status(&registry, &binding)?,
+            CredentialStatus::Exposed
+        );
+
+        // A link to another house's token put in its place.
+        write_token(&path, CHECKED, 0o600)?;
+        let loaded = apply_then_load(&registry, &binding, || {
+            let other = root.join("registry/private/other/credentials/github");
+            fs::create_dir_all(other.parent().ok_or("no parent")?)?;
+            write_token(&other, "other-house-fixture-token", 0o600)?;
+            fs::remove_file(&path)?;
+            std::os::unix::fs::symlink(&other, &path)?;
+            Ok(())
+        })?;
+        assert_eq!(loaded, Ok(CHECKED.to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_checked_token_emptied_in_place_is_refused() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (registry, binding, path) = bound(&root)?;
+        // Truncating the same file leaves nothing to read, so loading fails
+        // rather than falling back to another path.
+        let loaded = apply_then_load(&registry, &binding, || {
+            fs::write(&path, "")?;
+            Ok(())
+        })?;
+        assert_eq!(loaded, Err(IntegrationError::InvalidInput));
+        Ok(())
+    }
+
+    #[test]
+    fn an_oversized_checked_token_is_refused_without_its_contents() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (registry, binding, path) = bound(&root)?;
+        write_token(&path, &"t".repeat(16 * 1024 + 1), 0o600)?;
+        let loaded = apply_then_load(&registry, &binding, || Ok(()))?;
+        assert_eq!(loaded, Err(IntegrationError::LimitExceeded));
+        // The largest accepted token still loads.
+        write_token(&path, &"t".repeat(16 * 1024), 0o600)?;
+        let loaded = apply_then_load(&registry, &binding, || Ok(()))?;
+        assert_eq!(loaded.map(|token| token.len()), Ok(16 * 1024));
+        Ok(())
+    }
 }

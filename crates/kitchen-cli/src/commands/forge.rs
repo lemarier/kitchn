@@ -120,7 +120,7 @@ fn token(
     binding: &ForgeBinding,
 ) -> Result<(PathBuf, CredentialStatus), kitchen::Error> {
     let path = credential_path(registry, binding)?;
-    let status = credential_status(&path)?;
+    let status = credential_status(registry, binding)?;
     Ok((path, status))
 }
 
@@ -132,9 +132,15 @@ pub fn token_text(binding: &ForgeBinding, path: &Path, status: CredentialStatus)
         CredentialStatus::Ready => format!(
             "Token file {file} is ready. Kitchen reads it only when it writes and never copies it."
         ),
-        CredentialStatus::Missing
-        | CredentialStatus::NotRegularFile
-        | CredentialStatus::Exposed => {
+        // Writing through the path would follow what is there, so only
+        // removal is suggested.
+        CredentialStatus::NotRegularFile
+        | CredentialStatus::Redirected
+        | CredentialStatus::NotOwned => format!(
+            "Token file {file} is {status}, so kitchen will not use it. Remove what is there, keep every directory on that path a real directory you own, then place a token for {login} readable only by you.",
+            login = binding.requester.as_str(),
+        ),
+        CredentialStatus::Missing | CredentialStatus::Exposed => {
             let directory = quote(&path.parent().unwrap_or(path).display().to_string());
             format!(
                 "Token file {file} is {status}. Place a token for {login} there, readable only by you, for example:\n  mkdir -p {directory} && (umask 077; gh auth token --user {user} > {target})\nKitchen reads it only when it writes and never copies it.",

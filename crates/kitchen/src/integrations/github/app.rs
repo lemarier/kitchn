@@ -551,7 +551,7 @@ impl AppTokens {
         let installation: Installation = match response.status {
             200 => parse(&response.body)?,
             404 => return Ok(Installed::No),
-            status => return Err(refusal(status)),
+            _ => return Err(refusal(&response)),
         };
         let login = format!("{}[bot]", installation.app_slug);
         if installation.app_id != self.app.app_id.get()
@@ -589,7 +589,7 @@ impl AppTokens {
             deadline.remaining()?,
         )?;
         if response.status != 201 {
-            return Err(refusal(response.status));
+            return Err(refusal(&response));
         }
         let created: Created = parse(&response.body)?;
         if created.token.is_empty() || !created.token.bytes().all(|b| b.is_ascii_graphic()) {
@@ -636,7 +636,7 @@ impl AppTokens {
             deadline.remaining()?,
         )?;
         if response.status != 200 {
-            return Err(refusal(response.status));
+            return Err(refusal(&response));
         }
         let listed: Listed = parse(&response.body)?;
         if listed.total_count != 1 || !only(&listed.repositories, &scope.repository) {
@@ -722,12 +722,23 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, IntegrationEr
     serde_json::from_slice(body).map_err(|_| IntegrationError::Unknown)
 }
 
-/// A refused App API call: client errors are refusals, anything else an outage.
-const fn refusal(status: u16) -> IntegrationError {
-    match status {
+/// A refused App API call. A rate limit (429, or a 403 whose message says
+/// so, as GitHub answers a secondary limit) is an outage to retry later;
+/// other client errors are refusals, and anything else an outage.
+fn refusal(response: &AppResponse) -> IntegrationError {
+    match response.status {
+        429 => IntegrationError::Unavailable,
+        403 if mentions_rate_limit(&response.body) => IntegrationError::Unavailable,
         400..=499 => IntegrationError::ScopeMismatch,
         _ => IntegrationError::Unavailable,
     }
+}
+
+/// Whether a response body names a rate limit, in any case.
+fn mentions_rate_limit(body: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"rate limit";
+    body.windows(NEEDLE.len())
+        .any(|window| window.eq_ignore_ascii_case(NEEDLE))
 }
 
 /// One deadline shared by the calls a token needs.
@@ -801,5 +812,41 @@ mod tests {
         assert!(!scope.granted_exactly(&granted(&[("metadata", "write")])));
         assert!(!scope.granted_exactly(&granted(&[])));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::{AppResponse, IntegrationError, refusal};
+
+    fn response(status: u16, body: &str) -> AppResponse {
+        AppResponse {
+            status,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn rate_limits_are_outages_and_other_client_errors_refusals() {
+        assert_eq!(refusal(&response(429, "")), IntegrationError::Unavailable);
+        assert_eq!(
+            refusal(&response(
+                403,
+                r#"{"message":"You have exceeded a secondary Rate Limit."}"#
+            )),
+            IntegrationError::Unavailable
+        );
+        assert_eq!(
+            refusal(&response(
+                403,
+                r#"{"message":"Resource not accessible by integration"}"#
+            )),
+            IntegrationError::ScopeMismatch
+        );
+        assert_eq!(
+            refusal(&response(422, r#"{"message":"rate"}"#)),
+            IntegrationError::ScopeMismatch
+        );
+        assert_eq!(refusal(&response(502, "")), IntegrationError::Unavailable);
     }
 }

@@ -3515,6 +3515,25 @@ fn a_refused_open_stops_the_submission_after_the_push_without_linking() -> TestR
     );
     assert_eq!(layers.updated.borrow().len(), 1);
     assert!(runner.linked().is_empty());
+    // A refused open created nothing, so running the submission again tries
+    // the open again instead of hitting the refused record.
+    let (outcome, runner) = run_opening(
+        &setup,
+        &new_top_layer()?,
+        &layers,
+        &forge,
+        &Titles(Vec::new()),
+        &StackCommand::Submit { ready: true },
+    )?;
+    assert_eq!(outcome, StackOutcome::Ran(StackResult::Done));
+    assert_eq!(runner.linked(), vec![link_of(&[3, 4, 8], true)?]);
+    assert_eq!(
+        forge.actions(),
+        vec![
+            open_action("lemarier/issue-5", "lemarier/issue-4", 'd', false)?,
+            open_action("lemarier/issue-5", "lemarier/issue-4", 'd', false)?,
+        ]
+    );
     Ok(())
 }
 

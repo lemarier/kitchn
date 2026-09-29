@@ -333,19 +333,30 @@ fi
 #[cfg(unix)]
 #[test]
 fn gh_cli_timeout_output_bound_and_failure_are_explicit() -> Result {
-    for (script, expected) in [
-        ("while :; do :; done", IntegrationError::Timeout),
+    // Only the busy loop needs its deadline to fire. The other cases end on
+    // their own, so a generous deadline keeps them independent of machine load.
+    for (script, expected, deadline) in [
+        (
+            "while :; do :; done",
+            IntegrationError::Timeout,
+            Duration::from_secs(1),
+        ),
         (
             "exec /usr/bin/yes sanitized-output",
             IntegrationError::LimitExceeded,
+            Duration::from_secs(60),
         ),
-        ("exit 1", IntegrationError::Unavailable),
+        (
+            "exit 1",
+            IntegrationError::Unavailable,
+            Duration::from_secs(60),
+        ),
     ] {
         let (_root, executable, credential) = fake_cli(script)?;
         let client = GitHubClient::new(
             scope()?,
             GhCli::new(executable, credential)?,
-            ReadLimits::new(Duration::from_secs(1), 1, 65536)?,
+            ReadLimits::new(deadline, 1, 65536)?,
         );
         assert_eq!(
             client.issues(

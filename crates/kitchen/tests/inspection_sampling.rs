@@ -26,7 +26,7 @@ use kitchen::{
     },
     workflows::inspector::{FollowUpRoute, InspectionPlan, SampleResult},
     workflows::sampling::{
-        GrantEpoch, Outcome, OwnerReport, Rate, RateRaise, RateSchedule, RecordedFinding,
+        GrantEpoch, MAX_DAYS, Outcome, OwnerReport, Rate, RateRaise, RateSchedule, RecordedFinding,
         SamplingDecision, SamplingError, SamplingPolicy, ScopeRecord, SelectionKey, compact,
         select,
     },
@@ -61,6 +61,7 @@ fn policy() -> TestResult<SamplingPolicy> {
         revision: NonZeroU32::MIN,
         default: schedule()?,
         work_types: BTreeMap::new(),
+        audit_horizon_days: NonZeroU16::new(90).ok_or("zero")?,
     })
 }
 
@@ -1060,7 +1061,7 @@ fn an_author_cannot_precompute_draws_for_candidate_heads() -> TestResult {
 }
 
 #[test]
-fn compaction_frees_a_full_store_and_keeps_replay_evidence() -> TestResult {
+fn compaction_frees_a_full_store_and_keeps_decisions_for_the_audit_horizon() -> TestResult {
     let s = sampler()?;
     let recorder = scheduled("sampling")?;
     let always = flat(1000)?;
@@ -1072,13 +1073,13 @@ fn compaction_frees_a_full_store_and_keeps_replay_evidence() -> TestResult {
     old.record(&s.f.store, &recorder, day(1))?;
     let recent = decide(2, day(50))?;
     recent.record(&s.f.store, &recorder, day(50))?;
-    // The only decision of another scope stays however old it is.
+    // Another scope's decision gets the same horizon.
     let docs_epoch = GrantEpoch::establish(&s.f.store, &scope_of("docs")?, &recorder, at(0))?;
     let docs_record = ScopeRecord {
         scope: scope_of("docs")?,
         ..record([])?
     };
-    let docs = select(
+    select(
         &always,
         &s.key,
         &merge(3)?,
@@ -1086,13 +1087,13 @@ fn compaction_frees_a_full_store_and_keeps_replay_evidence() -> TestResult {
         &docs_epoch,
         &open_budget(),
         day(1),
-    )?;
-    docs.record(&s.f.store, &recorder, day(1))?;
+    )?
+    .record(&s.f.store, &recorder, day(1))?;
     // Raises for a finding long past its window and a recent one.
     let mut found = record(1..=5)?;
     for (name, when) in [
         ("fixture:old-finding", day(2)),
-        ("fixture:new-finding", day(55)),
+        ("fixture:new-finding", day(80)),
     ] {
         found.findings.push(RecordedFinding {
             source: source(name)?,
@@ -1104,10 +1105,10 @@ fn compaction_frees_a_full_store_and_keeps_replay_evidence() -> TestResult {
         &recorder,
         day(3),
     )?;
-    RateRaise::of(&policy()?, &found, &source("fixture:new-finding")?, day(56))?.record(
+    RateRaise::of(&policy()?, &found, &source("fixture:new-finding")?, day(81))?.record(
         &s.f.store,
         &recorder,
-        day(56),
+        day(81),
     )?;
 
     // Fill the store with copies of the old decision, one pull request each.
@@ -1130,9 +1131,9 @@ fn compaction_frees_a_full_store_and_keeps_replay_evidence() -> TestResult {
     fs::write(&path, serde_json::to_vec(&state)?)?;
     let store = s.f.reopen()?;
     assert_eq!(store.capacity()?.markers.used, MAX_MARKERS);
-    let next = decide(4, day(60))?;
+    let next = decide(4, day(91))?;
     assert!(matches!(
-        next.record(&store, &recorder, day(60)),
+        next.record(&store, &recorder, day(91)),
         Err(kitchen::Error::State(StateError::CapacityExceeded { .. }))
     ));
 
@@ -1148,38 +1149,46 @@ fn compaction_frees_a_full_store_and_keeps_replay_evidence() -> TestResult {
             Presence::Gone,
         );
     }
-    let preview = store.preview_retention(&RetentionPolicy::default(), &inventory, day(60))?;
+    let preview = store.preview_retention(&RetentionPolicy::default(), &inventory, day(91))?;
     assert!(preview.markers.is_empty(), "{:?}", preview.markers);
 
-    let compaction = compact(&store, &policy()?, &recorder, day(60))?;
-    assert_eq!(compaction.decisions, copies + 1);
-    assert_eq!(compaction.raises, 1);
-    // Recent decisions, the newest decision per scope, the recent raise,
-    // the key, and both epochs remain.
-    assert_eq!(store.capacity()?.markers.used, 6);
-    for (kept, number) in [(&recent, 2), (&docs, 3)] {
-        let loaded = SamplingDecision::load(&store, &merge(number)?)?.ok_or("retired")?;
-        assert_eq!(&loaded, kept);
-    }
-    SamplingDecision::load(&store, &merge(2)?)?
-        .ok_or("retired")?
+    // On day 90 the day-1 decisions are 89 days old, inside the 90-day
+    // horizon: all stay. Only the raise past its finding window goes.
+    let compaction = compact(&store, &policy()?, &recorder, day(90))?;
+    assert_eq!((compaction.decisions, compaction.raises), (0, 1));
+    SamplingDecision::load(&store, &merge(1)?)?
+        .ok_or("retired inside the horizon")?
         .replay(&always, &s.key)?;
+
+    // On day 91 they reach the horizon and are retired.
+    let compaction = compact(&store, &policy()?, &recorder, day(91))?;
+    assert_eq!((compaction.decisions, compaction.raises), (copies + 2, 0));
+    // The day-50 decision, the recent raise, the key, and both epochs remain.
+    assert_eq!(store.capacity()?.markers.used, 5);
+    // 41 days old, past the finding window but inside the horizon: it still
+    // replays.
+    let kept = SamplingDecision::load(&store, &merge(2)?)?.ok_or("retired")?;
+    assert_eq!(kept, recent);
+    kept.replay(&always, &s.key)?;
+    // Past the horizon a decision has expired: it can no longer be loaded,
+    // so why merges 1 and 3 were picked cannot be shown any more.
     assert_eq!(SamplingDecision::load(&store, &merge(1)?)?, None);
+    assert_eq!(SamplingDecision::load(&store, &merge(3)?)?, None);
     assert_eq!(
         SelectionKey::load(&store, &project()?)?.as_ref(),
         Some(&s.key)
     );
     assert_eq!(
-        GrantEpoch::establish(&store, &scope()?, &recorder, day(60))?,
+        GrantEpoch::establish(&store, &scope()?, &recorder, day(91))?,
         s.epoch
     );
     assert!(matches!(
-        next.record(&store, &recorder, day(60))?,
+        next.record(&store, &recorder, day(91))?,
         MarkerRecording::Recorded(_)
     ));
     // A second pass has nothing left to retire.
     assert_eq!(
-        compact(&store, &policy()?, &recorder, day(60))?,
+        compact(&store, &policy()?, &recorder, day(91))?,
         kitchen::workflows::sampling::Compaction::default()
     );
     // An invalid policy retires nothing.
@@ -1189,6 +1198,42 @@ fn compaction_frees_a_full_store_and_keeps_replay_evidence() -> TestResult {
         compact(&store, &inverted, &recorder, day(400)),
         Err(kitchen::Error::Sampling(SamplingError::InvalidPolicy))
     ));
-    assert_eq!(store.capacity()?.markers.used, 7);
+    assert_eq!(store.capacity()?.markers.used, 6);
+    Ok(())
+}
+
+#[test]
+fn the_audit_horizon_defaults_to_ninety_days_and_covers_every_finding_window() -> TestResult {
+    let mut parsed: serde_json::Value = serde_json::to_value(policy()?)?;
+    let removed = parsed
+        .as_object_mut()
+        .ok_or("not an object")?
+        .remove("auditHorizonDays");
+    assert_eq!(removed, Some(90.into()));
+    let defaulted: SamplingPolicy = serde_json::from_value(parsed)?;
+    assert_eq!(defaulted.audit_horizon_days.get(), 90);
+    defaulted.validate()?;
+
+    // A horizon equal to the finding window is the shortest accepted.
+    let mut shortest = policy()?;
+    shortest.audit_horizon_days = NonZeroU16::new(30).ok_or("zero")?;
+    shortest.validate()?;
+
+    let mut short = policy()?;
+    short.audit_horizon_days = NonZeroU16::new(29).ok_or("zero")?;
+    let mut long_window = schedule()?;
+    long_window.finding_window_days = NonZeroU16::new(120).ok_or("zero")?;
+    let mut per_type = policy()?;
+    per_type
+        .work_types
+        .insert(WorkType::new("docs")?, long_window);
+    let mut too_long = policy()?;
+    too_long.audit_horizon_days = NonZeroU16::new(MAX_DAYS + 1).ok_or("zero")?;
+    for invalid in [short, per_type, too_long] {
+        assert!(matches!(
+            invalid.validate(),
+            Err(SamplingError::InvalidPolicy)
+        ));
+    }
     Ok(())
 }

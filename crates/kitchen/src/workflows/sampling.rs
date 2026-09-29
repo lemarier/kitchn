@@ -33,7 +33,11 @@
 //!
 //! Decisions and rate raises are markers in the shared store, so [`compact`]
 //! retires the ones replay and deduplication no longer need; the store's
-//! retention pass leaves them to it.
+//! retention pass leaves them to it. Every decision is kept for the policy's
+//! audit horizon, 90 days unless the policy sets another and never shorter
+//! than a finding window. That horizon is the limit of explainability: once
+//! a decision is compacted, [`SamplingDecision::load`] no longer finds it and
+//! the house can no longer show why that merge was or was not inspected.
 //!
 //! This module launches no inspection and posts nothing:
 //! [`crate::workflows::inspector`] runs samples, and callers deliver
@@ -41,9 +45,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    hash::{BuildHasher as _, RandomState},
     num::{NonZeroU16, NonZeroU32, NonZeroU64},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -67,8 +70,10 @@ use crate::{
 pub const WORKFLOW: &str = "inspection-sampling";
 /// Work types with their own rates in one policy.
 pub const MAX_WORK_TYPE_RATES: usize = 64;
-/// Longest accepted maturity or finding window, in days.
+/// Longest accepted maturity window, finding window, or audit horizon, in days.
 pub const MAX_DAYS: u16 = 3650;
+/// Days every decision is kept when a policy sets no audit horizon.
+pub const DEFAULT_AUDIT_HORIZON_DAYS: u16 = 90;
 
 const DECISION_SCHEMA: &str = "inspection-sampling.decision";
 const RAISE_SCHEMA: &str = "inspection-sampling.rate-raise";
@@ -107,6 +112,10 @@ pub enum SamplingError {
     /// A recorded selection key or grant epoch does not decode.
     #[error("a recorded sampling key or grant epoch is malformed")]
     MalformedRecord,
+    /// The operating system's cryptographic random source failed, so no
+    /// selection key was generated.
+    #[error("operating-system randomness is unavailable")]
+    EntropyUnavailable(#[source] getrandom::Error),
     /// The house budget assessment is for another window than the decision.
     #[error("the house budget assessment does not cover the decision time")]
     StaleBudget,
@@ -139,7 +148,7 @@ impl SamplingError {
             | Self::HouseMismatch
             | Self::UnboundRecord => ErrorClass::Refused,
             Self::NotReproducible => ErrorClass::Conflict,
-            Self::MalformedRecord => ErrorClass::Execution,
+            Self::MalformedRecord | Self::EntropyUnavailable(_) => ErrorClass::Execution,
             Self::Trust(error) => error.class(),
         }
     }
@@ -249,8 +258,16 @@ impl RateSchedule {
     }
 
     fn finding_window(&self) -> Duration {
-        Duration::from_secs(u64::from(self.finding_window_days.get()) * 86_400)
+        days(self.finding_window_days)
     }
+}
+
+fn days(count: NonZeroU16) -> Duration {
+    Duration::from_secs(u64::from(count.get()) * 86_400)
+}
+
+const fn default_audit_horizon() -> NonZeroU16 {
+    NonZeroU16::MIN.saturating_add(DEFAULT_AUDIT_HORIZON_DAYS - 1)
 }
 
 /// A house's inspection sampling rates.
@@ -265,6 +282,10 @@ pub struct SamplingPolicy {
     /// Rates for individual work types.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub work_types: BTreeMap<WorkType, RateSchedule>,
+    /// Days every decision is kept for replay before [`compact`] may retire
+    /// it; the limit of explainability. At least every finding window.
+    #[serde(default = "default_audit_horizon")]
+    pub audit_horizon_days: NonZeroU16,
 }
 
 impl SamplingPolicy {
@@ -273,15 +294,21 @@ impl SamplingPolicy {
     /// # Errors
     /// [`SamplingError::InvalidPolicy`] for more than [`MAX_WORK_TYPE_RATES`]
     /// work types, a floor above the initial rate, an initial rate above the
-    /// rate after a finding, or a window longer than [`MAX_DAYS`].
+    /// rate after a finding, a window or audit horizon longer than
+    /// [`MAX_DAYS`], or an audit horizon shorter than a finding window.
     pub fn validate(&self) -> Result<(), SamplingError> {
-        if self.work_types.len() > MAX_WORK_TYPE_RATES {
+        if self.work_types.len() > MAX_WORK_TYPE_RATES || self.audit_horizon_days.get() > MAX_DAYS {
             return Err(SamplingError::InvalidPolicy);
         }
-        self.default.validate()?;
-        self.work_types
-            .values()
-            .try_for_each(RateSchedule::validate)
+        std::iter::once(&self.default)
+            .chain(self.work_types.values())
+            .try_for_each(|schedule| {
+                schedule.validate()?;
+                if schedule.finding_window_days > self.audit_horizon_days {
+                    return Err(SamplingError::InvalidPolicy);
+                }
+                Ok(())
+            })
     }
 
     /// The schedule for `work_type`.
@@ -689,8 +716,9 @@ impl SelectionKey {
     /// read the recorded key.
     ///
     /// # Errors
-    /// [`SamplingError::MalformedRecord`] for an undecodable key, and store
-    /// failures.
+    /// [`SamplingError::MalformedRecord`] for an undecodable key,
+    /// [`SamplingError::EntropyUnavailable`] when the operating system cannot
+    /// supply random bytes for a new key, and store failures.
     pub fn establish(
         store: &HouseStore,
         repository: &Repository,
@@ -700,7 +728,7 @@ impl SelectionKey {
         if let Some(key) = Self::load(store, repository)? {
             return Ok(key);
         }
-        let fresh = fresh_key();
+        let fresh = fresh_key(getrandom::fill)?;
         let fact = MarkerFact::workflow(key_schema()?, &KeyRecord { key: hex(&fresh) })?;
         match store.record_marker(key_key(repository)?, fact, recorded_by, now) {
             Ok(_) => Ok(Self {
@@ -764,20 +792,14 @@ fn key_key(repository: &Repository) -> crate::Result<MarkerKey> {
     })
 }
 
-/// A 256-bit key digested from the standard library's hasher keys, which
-/// hold 128 bits of operating-system randomness per thread, mixed with the
-/// process and time. The workspace has no other randomness source.
-fn fresh_key() -> [u8; KEY_BYTES] {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let mut hasher = Sha256::new();
-    for round in 0u8..8 {
-        // Each `RandomState` has distinct keys.
-        let word = RandomState::new().hash_one((round, std::process::id(), now));
-        hasher.update(word.to_be_bytes());
-    }
-    hasher.finalize().into()
+/// A 256-bit key filled by `fill`, which is the operating system's
+/// cryptographic random source outside tests. A failure yields no key.
+fn fresh_key(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> Result<[u8; KEY_BYTES], SamplingError> {
+    let mut key = [0u8; KEY_BYTES];
+    fill(&mut key).map_err(SamplingError::EntropyUnavailable)?;
+    Ok(key)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -966,7 +988,9 @@ impl SamplingDecision {
         store.record_marker(decision_key(&self.merge)?, fact, recorded_by, now)
     }
 
-    /// The decision recorded for `merge`, if any.
+    /// The decision recorded for `merge`, if any. `None` also covers a
+    /// decision [`compact`] retired after the audit horizon: it has expired
+    /// and can no longer be replayed.
     ///
     /// # Errors
     /// Store failures, and a marker that does not decode.
@@ -1110,14 +1134,15 @@ pub struct Compaction {
 /// Retire the sampling markers replay and deduplication no longer need,
 /// in one store transaction:
 ///
-/// - a decision judged at least its scope's finding window before `now`,
-///   unless it is the newest decision for its station scope;
+/// - a decision judged at least the policy's audit horizon before `now`.
+///   Every younger decision stays replayable; an older one can no longer be
+///   explained;
 /// - a rate raise whose finding is at least the finding window old, which
 ///   [`RateRaise::of`] no longer produces, so it cannot be reported twice.
 ///
 /// Selection keys and grant epochs stay. A marker that does not decode also
-/// stays. Windows come from `policy`; run this with the policy current
-/// sampling uses, such as after each recorded decision.
+/// stays. The horizon and windows come from `policy`; run this with the
+/// policy current sampling uses, such as after each recorded decision.
 ///
 /// # Errors
 /// [`SamplingError::InvalidPolicy`], a marker changed since it was read
@@ -1131,30 +1156,14 @@ pub fn compact(
     policy.validate()?;
     let (decision, raise) = (decision_schema()?, raise_schema()?);
     let markers = store.markers(&WorkflowId::new(WORKFLOW)?)?;
-    let expired = |scope: &StationScope, at: Timestamp| {
-        now.saturating_since(at) >= policy.schedule(&scope.work_type).finding_window()
-    };
-    let decisions: Vec<(&WorkflowMarker, DecisionRecord)> = markers
-        .iter()
-        .filter_map(|marker| Some((marker, marker.fact().decode(&decision).ok()?)))
-        .collect();
-    // The newest decision per scope, by judged time and then key. Scopes
-    // are few, so a list is enough.
-    let mut newest: Vec<(&StationScope, (Timestamp, &MarkerKey))> = Vec::new();
-    for (marker, record) in &decisions {
-        let candidate = (record.inputs.at, marker.key());
-        match newest.iter_mut().find(|(scope, _)| *scope == &record.scope) {
-            Some((_, current)) => *current = (*current).max(candidate),
-            None => newest.push((&record.scope, candidate)),
-        }
-    }
+    let horizon = days(policy.audit_horizon_days);
     let mut retire = Vec::new();
     let mut compaction = Compaction::default();
-    for (marker, record) in &decisions {
-        let latest = newest
-            .iter()
-            .any(|(scope, (_, key))| *scope == &record.scope && *key == marker.key());
-        if !latest && expired(&record.scope, record.inputs.at) {
+    for marker in &markers {
+        let Ok(record) = marker.fact().decode::<DecisionRecord>(&decision) else {
+            continue;
+        };
+        if now.saturating_since(record.inputs.at) >= horizon {
             retire.push((marker.key().clone(), marker.fact().clone()));
             compaction.decisions += 1;
         }
@@ -1163,7 +1172,8 @@ pub fn compact(
         let Ok(raised) = marker.fact().decode::<RateRaise>(&raise) else {
             continue;
         };
-        if expired(&raised.scope, raised.finding_at) {
+        let window = policy.schedule(&raised.scope.work_type).finding_window();
+        if now.saturating_since(raised.finding_at) >= window {
             retire.push((marker.key().clone(), marker.fact().clone()));
             compaction.raises += 1;
         }
@@ -1191,4 +1201,37 @@ pub enum OwnerReport {
         /// The exhausted house limit.
         exhausted: Exhausted,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_comes_from_the_random_source() -> Result<(), SamplingError> {
+        let key = fresh_key(|bytes| {
+            bytes.fill(0xa5);
+            Ok(())
+        })?;
+        assert_eq!(key, [0xa5; KEY_BYTES]);
+        // The operating system source gives distinct keys.
+        assert_ne!(fresh_key(getrandom::fill)?, fresh_key(getrandom::fill)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_random_source_yields_no_key() {
+        let failed = fresh_key(|bytes| {
+            bytes.fill(0xa5);
+            Err(getrandom::Error::UNSUPPORTED)
+        });
+        assert!(matches!(
+            failed,
+            Err(SamplingError::EntropyUnavailable(error)) if error == getrandom::Error::UNSUPPORTED
+        ));
+        assert_eq!(
+            SamplingError::EntropyUnavailable(getrandom::Error::UNEXPECTED).class(),
+            ErrorClass::Execution
+        );
+    }
 }

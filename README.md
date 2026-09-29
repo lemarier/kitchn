@@ -93,8 +93,9 @@ just install
 ```
 
 **2. Set up your house.** Change into the repository you want to register, then
-run this once. It asks for a name, infers the rest from that checkout, and shows
-you everything before saving it.
+run this once. It takes the repository from that checkout, asks for a name,
+fills the rest from your machine and defaults, and shows you everything before
+saving it.
 
 ```sh
 cd /path/to/your/repository

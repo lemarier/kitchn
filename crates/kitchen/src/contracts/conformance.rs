@@ -80,10 +80,11 @@ pub enum Check {
     DeliveriesDeclared,
     /// An unacknowledged batch is delivered again on every read.
     DeliveryReplayed,
-    /// After a restart, the adopting coordinator receives the unacknowledged
-    /// batch; the previous one is fenced from reading, acknowledging, and
-    /// waiting, and the batch stays with the adopter. Undeclared adoption is
-    /// refused.
+    /// After a restart, the adopting coordinator receives every
+    /// unacknowledged message, possibly in a batch with a new id; the
+    /// previous one is fenced from reading, acknowledging, and waiting, and
+    /// the batch stays with the adopter, even when the adopter names the batch
+    /// id from before the adoption. Undeclared adoption is refused.
     AdoptionReplays,
     /// Repeating an acknowledgement succeeds and consumes no later batch.
     DuplicateAcknowledgement,
@@ -309,19 +310,24 @@ pub fn run_mailbox(
         .results
         .push((Check::DeliveryReplayed, CheckResult::Passed));
 
-    let consumer = if declared(Capability::RunTransfer) {
+    let (consumer, current) = if declared(Capability::RunTransfer) {
         if restarted.adopt_run().is_err() {
             return fail(
                 Check::AdoptionReplays,
                 "the restarted coordinator could not adopt the run",
             );
         }
-        if restarted.next_delivery() != Ok(Some(first.clone())) {
-            return fail(
-                Check::AdoptionReplays,
-                "the adopting coordinator did not receive the unacknowledged batch",
-            );
-        }
+        // The backend may redeliver under a new batch id: what must survive
+        // adoption is every unacknowledged message, oldest first.
+        let adopted = match restarted.next_delivery() {
+            Ok(Some(adopted)) if message_ids(&adopted).starts_with(&message_ids(&first)) => adopted,
+            Ok(_) | Err(_) => {
+                return fail(
+                    Check::AdoptionReplays,
+                    "the adopting coordinator did not receive the unacknowledged messages",
+                );
+            }
+        };
         if coordinator.next_delivery() != Err(MailboxError::Fenced) {
             return fail(
                 Check::AdoptionReplays,
@@ -334,10 +340,18 @@ pub fn run_mailbox(
                 "the previous coordinator's acknowledgement was not fenced",
             );
         }
-        if restarted.next_delivery() != Ok(Some(first.clone())) {
+        if restarted.next_delivery() != Ok(Some(adopted.clone())) {
             return fail(
                 Check::AdoptionReplays,
                 "the unacknowledged batch left the adopting coordinator",
+            );
+        }
+        // A batch id from before the adoption is no longer current: naming
+        // it consumes nothing.
+        if adopted.id != first.id && restarted.acknowledge(&first.id) != Ok(Some(adopted.clone())) {
+            return fail(
+                Check::AdoptionReplays,
+                "acknowledging a batch id from before the adoption did not keep the current batch",
             );
         }
         if coordinator.await_delivery(FENCED_WAIT) != Err(MailboxError::Fenced) {
@@ -349,7 +363,7 @@ pub fn run_mailbox(
         report
             .results
             .push((Check::AdoptionReplays, CheckResult::Passed));
-        restarted
+        (restarted, adopted)
     } else {
         let unsupported = Err(MailboxError::Unavailable(BackendUnavailable::Unsupported(
             Capability::RunTransfer,
@@ -366,10 +380,10 @@ pub fn run_mailbox(
                 requires: Capability::RunTransfer,
             },
         ));
-        coordinator
+        (coordinator, first)
     };
 
-    let received = drain(consumer, first, sent.len())?;
+    let received = drain(consumer, current, sent.len())?;
     report
         .results
         .push((Check::DuplicateAcknowledgement, CheckResult::Passed));
@@ -383,6 +397,14 @@ pub fn run_mailbox(
         .results
         .push((Check::DeliveryOrder, CheckResult::Passed));
     Ok(report)
+}
+
+fn message_ids(delivery: &Delivery) -> Vec<&ExternalRef> {
+    delivery
+        .messages
+        .iter()
+        .map(|message| &message.id)
+        .collect()
 }
 
 /// How long a fenced coordinator's wait may take in [`run_mailbox`]. A fenced

@@ -25,8 +25,9 @@
 //! so the worker's process exits without a stop: its launch must still be
 //! found, and resubmitting it must start nothing. A second coordinator
 //! terminal then adopts the Run: the test sends a status note to the Run
-//! mailbox, checks that the adopter receives the unacknowledged batch and the
-//! first terminal is fenced, and acknowledges the batch twice. Finally it
+//! mailbox, checks that the adopter receives the unacknowledged message
+//! (Orca redelivers it under a new batch id) and the first terminal is
+//! fenced, and acknowledges the batch twice. Finally it
 //! stops and releases the workers, removes the worktrees it created, and
 //! closes the terminals. Orca has no command to delete a Run, so each
 //! invocation leaves one empty Run whose objective marks it as a throwaway
@@ -47,10 +48,10 @@ use kitchen::{
         SystemRunner, TerminalOwner, launch_marker, redact, verify_branch,
     },
     contracts::{
-        AttemptNumber, BranchName, Clock, CoordinatorMailbox, EffectExecutor, EffectFailure,
-        EffectRequest, ExternalRef, IdempotencyKey, Lookup, MailboxError, NotAppliedReason,
-        Operation, Repository, ResourceKind, Role, SystemClock, Text, WorkerBackend, WorkerOutcome,
-        WorkerState, Workspace,
+        AttemptNumber, BranchName, Clock, CoordinatorMailbox, Delivery, EffectExecutor,
+        EffectFailure, EffectRequest, ExternalRef, IdempotencyKey, Lookup, MailboxError,
+        NotAppliedReason, Operation, Repository, ResourceKind, Role, SystemClock, Text,
+        WorkerBackend, WorkerOutcome, WorkerState, Workspace,
         conformance::{self, ConformanceFixture},
     },
     scheduling::AgentFamily,
@@ -512,15 +513,40 @@ fn adapter_checks(
         worker.handle,
         backend.observe_worker(&worker)?
     );
-    // Recovery signals, read-only, of a worker this test launched.
+    // Recovery signals, read-only, of a worker this test launched. Right
+    // after launch Orca can report a pending Dispatch whose worker state is
+    // `start_unknown`, which the adapter reads as Unknown, so poll within a
+    // bound, logging the raw fields each time.
     let window = || StartWindow::new(launched_at, SystemClock.now(), Duration::from_secs(60));
-    let running = backend
-        .observe_signals(&worker, &window())?
-        .ok_or("Orca has no record of the second worker")?;
-    println!("LIVE second worker signals while running: {running:?}");
+    let mut attempts = 0;
+    let running = loop {
+        let running = backend
+            .observe_signals(&worker, &window())?
+            .ok_or("Orca has no record of the second worker")?;
+        println!("LIVE second worker signals while running: {running:?}");
+        println!(
+            "LIVE second worker raw: {}",
+            raw_dispatch(runner, worker.handle.as_str())
+        );
+        attempts += 1;
+        let active = running.dispatch == DispatchActivity::Active
+            && running.terminal == TerminalOwner::Supervised;
+        if active || attempts >= ACTIVE_POLLS {
+            break running;
+        }
+        std::thread::sleep(ACTIVE_POLL_INTERVAL);
+    };
     if running.dispatch != DispatchActivity::Active || running.terminal != TerminalOwner::Supervised
     {
-        return Err(format!("a fresh worker reads as {running:?}").into());
+        // Diagnostics only: whether Orca ever settles the launch on its own.
+        for _ in 0..ACTIVE_POLLS {
+            std::thread::sleep(ACTIVE_POLL_INTERVAL.saturating_mul(2));
+            println!(
+                "LIVE second worker raw after the bound: {}",
+                raw_dispatch(runner, worker.handle.as_str())
+            );
+        }
+        return Err(format!("a fresh worker reads as {running:?} after {attempts} reads").into());
     }
     let message = backend.execute(&smoke_request(
         fixture,
@@ -754,11 +780,53 @@ fn exit_checks(
     Ok(())
 }
 
+/// How many times, and how often, the fresh worker's signals are read before
+/// a reading other than Active fails the test: 30 seconds in all.
+const ACTIVE_POLLS: u32 = 15;
+const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The raw Orca fields behind the adapter's dispatch reading, for diagnosing
+/// a mismatch with its mapping.
+fn raw_dispatch(runner: &SystemRunner, dispatch: &str) -> String {
+    let shown = match orca(
+        runner,
+        &[
+            "orchestration",
+            "worker-show",
+            &format!("--dispatch={dispatch}"),
+            "--json",
+        ],
+    ) {
+        Ok(shown) => shown,
+        Err(error) => return format!("worker-show failed: {error}"),
+    };
+    let field = |pointer| shown.pointer(pointer).unwrap_or(&Value::Null).to_string();
+    format!(
+        "dispatch.status={} dispatch.runId={} dispatch.capabilityRevokedAt={} \
+         dispatch.lastFailure={} worker.state={} worker.stage={} worker.lastError={} \
+         projection.outcome={} projection.stage.activity={}",
+        field("/dispatch/status"),
+        field("/dispatch/runId"),
+        field("/dispatch/capabilityRevokedAt"),
+        field("/dispatch/lastFailure"),
+        field("/worker/state"),
+        field("/worker/stage"),
+        field("/worker/lastError")
+            .chars()
+            .take(200)
+            .collect::<String>(),
+        field("/projection/outcome"),
+        field("/projection/stage/activity"),
+    )
+}
+
 /// A second coordinator terminal adopts the Run. The test first sends a
 /// status note to the Run mailbox so a batch is waiting. The adopter must
-/// receive the batch the first terminal read, and the first terminal's read,
-/// acknowledgement, and wait must all fail with [`MailboxError::Fenced`]
-/// while the batch stays with the adopter. The adopter then acknowledges the
+/// receive the messages of the batch the first terminal read, in a batch
+/// Orca may give a new id, and the first terminal's read, acknowledgement,
+/// and wait must all fail with [`MailboxError::Fenced`] while the batch stays
+/// with the adopter. The adopter then acknowledges the batch id from before
+/// the adoption, which must not take the batch it now holds, and its own
 /// batch twice: the repeat must return the same next batch and consume
 /// nothing more.
 fn adoption(
@@ -768,12 +836,16 @@ fn adoption(
     terminals: &mut Vec<String>,
 ) -> TestResult {
     let run = format!("--to=run:{}", backend.config().run.as_str());
+    // Name the sender: Kitchen's runner does not pass the host terminal's
+    // environment on, and the note comes from this test's own coordinator.
+    let from = format!("--from={}", backend.config().coordinator.as_str());
     let note = orca(
         runner,
         &[
             "orchestration",
             "send",
             &run,
+            &from,
             "--type=status",
             "--subject=Kitchen smoke test mailbox note (throwaway)",
             "--json",
@@ -800,13 +872,17 @@ fn adoption(
         runner,
     )?;
     adopting.adopt_run()?;
-    let replayed = adopting.next_delivery()?;
+    let replayed = adopting
+        .next_delivery()?
+        .ok_or("the adopter received no batch")?;
     println!(
-        "LIVE adopter reads batch {:?}",
-        replayed.as_ref().map(|delivery| delivery.id.as_str())
+        "LIVE adopter reads batch {} with messages {:?} (first held {:?})",
+        replayed.id,
+        message_ids(&replayed),
+        message_ids(&first)
     );
-    if replayed.as_ref() != Some(&first) {
-        return Err("the adopter did not receive the unacknowledged batch".into());
+    if !message_ids(&replayed).starts_with(&message_ids(&first)) {
+        return Err("the adopter did not receive the unacknowledged messages".into());
     }
     let read = backend.next_delivery();
     let acknowledged = backend.acknowledge(&first.id);
@@ -826,9 +902,23 @@ fn adoption(
             return Err(format!("the previous coordinator's {call} was not fenced").into());
         }
     }
-    if adopting.next_delivery()?.as_ref() != Some(&first) {
+    if adopting.next_delivery()?.as_ref() != Some(&replayed) {
         return Err("the unacknowledged batch left the adopter".into());
     }
+    if replayed.id != first.id {
+        let stale = adopting.acknowledge(&first.id);
+        println!(
+            "LIVE adopter acknowledging the old batch {}: {:?}",
+            first.id,
+            stale
+                .as_ref()
+                .map(|next| next.as_ref().map(|d| d.id.as_str()))
+        );
+        if stale != Ok(Some(replayed.clone())) {
+            return Err("acknowledging the old batch id did not keep the adopter's batch".into());
+        }
+    }
+    let first = replayed;
     let next = adopting.acknowledge(&first.id)?;
     let repeated = adopting.acknowledge(&first.id)?;
     let current = adopting.next_delivery()?;
@@ -851,6 +941,14 @@ fn adoption(
         waited.map_or(0, |delivery| delivery.actionable().count())
     );
     Ok(())
+}
+
+fn message_ids(delivery: &Delivery) -> Vec<&str> {
+    delivery
+        .messages
+        .iter()
+        .map(|message| message.id.as_str())
+        .collect()
 }
 
 /// Stop, release, and remove only what this test created, then close its terminals.

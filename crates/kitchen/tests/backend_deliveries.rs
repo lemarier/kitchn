@@ -6,7 +6,12 @@
 
 mod common;
 
-use std::{fs, path::Path, time::Duration};
+use std::{
+    fs,
+    path::Path,
+    sync::{Mutex, PoisonError},
+    time::Duration,
+};
 
 use common::{TestResult, backend_id, house};
 use kitchen::contracts::{
@@ -84,15 +89,30 @@ fn a_crash_before_acknowledging_loses_nothing() -> TestResult {
     // The coordinator stops here, before handling or acknowledging.
     let adopter = fake.restarted();
     adopter.adopt_run()?;
-    assert_eq!(adopter.next_delivery()?, Some(read.clone()));
+    // The same messages come back under a new batch id.
+    let adopted = adopter.next_delivery()?.ok_or("the adopter got nothing")?;
+    assert_ne!(adopted.id, read.id);
+    assert_eq!(adopted.messages, read.messages);
     assert_eq!(
         adopter.await_delivery(Duration::from_secs(1))?,
-        Some(read.clone())
+        Some(adopted.clone())
     );
     assert_eq!(fake.next_delivery(), Err(MailboxError::Fenced));
     assert_eq!(fake.acknowledge(&read.id), Err(MailboxError::Fenced));
-    // The fenced coordinator's acknowledgement consumed nothing.
-    assert_eq!(adopter.next_delivery()?, Some(read));
+    // The fenced coordinator's acknowledgement consumed nothing, and neither
+    // does the adopter naming the batch id from before the adoption.
+    assert_eq!(adopter.next_delivery()?, Some(adopted.clone()));
+    assert_eq!(adopter.acknowledge(&read.id)?, Some(adopted.clone()));
+    // Adopting again keeps the ids the adopter already holds.
+    adopter.adopt_run()?;
+    assert_eq!(adopter.next_delivery()?, Some(adopted.clone()));
+    let next = adopter
+        .acknowledge(&adopted.id)?
+        .ok_or("the second batch")?;
+    assert_eq!(
+        next.messages.first().map(|m| m.id.as_str()),
+        Some("msg-done")
+    );
     Ok(())
 }
 
@@ -201,6 +221,8 @@ enum Fault {
     ConsumeOnRead,
     /// Any acknowledgement consumes the oldest batch, whatever it names.
     AckConsumesOldest,
+    /// Repeating the latest acknowledgement consumes the oldest batch.
+    RepeatAckConsumes,
     /// Adoption succeeds without fencing the previous coordinator.
     NoFence,
     /// A fenced coordinator's acknowledgement takes the run back and consumes
@@ -211,6 +233,8 @@ enum Fault {
     FencedAckConsumes,
     /// A fenced coordinator still receives the batch while waiting.
     FencedWaitReads,
+    /// Adoption consumes the oldest unacknowledged batch.
+    AdoptionDrops,
     /// Messages within a batch come out reversed.
     Reorder,
 }
@@ -219,6 +243,8 @@ enum Fault {
 struct Broken {
     inner: FakeBackend,
     fault: Fault,
+    /// The batch this instance acknowledged last.
+    acknowledged: Mutex<Option<ExternalRef>>,
 }
 
 impl EffectExecutor for Broken {
@@ -257,7 +283,13 @@ impl CoordinatorMailbox for Broken {
         if self.fault == Fault::NoFence {
             return Ok(());
         }
-        self.inner.adopt_run()
+        self.inner.adopt_run()?;
+        if self.fault == Fault::AdoptionDrops
+            && let Some(oldest) = self.inner.next_delivery()?
+        {
+            self.inner.acknowledge(&oldest.id)?;
+        }
+        Ok(())
     }
 
     fn next_delivery(&self) -> Result<Option<Delivery>, MailboxError> {
@@ -271,16 +303,27 @@ impl CoordinatorMailbox for Broken {
     }
 
     fn acknowledge(&self, delivery: &ExternalRef) -> Result<Option<Delivery>, MailboxError> {
+        let repeated = self
+            .acknowledged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(delivery.clone())
+            .is_some_and(|last| &last == delivery);
         let target = match (self.fault, self.inner.next_delivery()) {
             (Fault::AckConsumesOldest, Ok(Some(oldest))) => oldest.id,
+            (Fault::RepeatAckConsumes, Ok(Some(oldest))) if repeated => oldest.id,
             (Fault::FencedAckAccepted, Err(MailboxError::Fenced)) => {
                 self.inner.adopt_run()?;
                 let next = self.inner.acknowledge(delivery)?;
                 return Ok(self.shape(next));
             }
             (Fault::FencedAckConsumes, Err(MailboxError::Fenced)) => {
+                // Taking the run back renames the batch, so consume it by
+                // its current id.
                 self.inner.adopt_run()?;
-                self.inner.acknowledge(delivery)?;
+                if let Some(oldest) = self.inner.next_delivery()? {
+                    self.inner.acknowledge(&oldest.id)?;
+                }
                 return Err(MailboxError::Fenced);
             }
             (_, Err(error)) => return Err(error),
@@ -308,10 +351,12 @@ fn broken_run(fault: Fault) -> TestResult<ConformanceFailure> {
     let coordinator = Broken {
         inner: fake.restarted(),
         fault,
+        acknowledged: Mutex::new(None),
     };
     let restarted = Broken {
         inner: fake.restarted(),
         fault,
+        acknowledged: Mutex::new(None),
     };
     conformance::run_mailbox(&coordinator, &restarted, &sent)
         .err()
@@ -347,7 +392,17 @@ fn each_broken_rule_fails_its_check() -> TestResult {
             "the previous coordinator still waits on the mailbox",
         ),
         (
+            Fault::AdoptionDrops,
+            Check::AdoptionReplays,
+            "the adopting coordinator did not receive the unacknowledged messages",
+        ),
+        (
             Fault::AckConsumesOldest,
+            Check::AdoptionReplays,
+            "acknowledging a batch id from before the adoption did not keep the current batch",
+        ),
+        (
+            Fault::RepeatAckConsumes,
             Check::DuplicateAcknowledgement,
             "a repeated acknowledgement failed or consumed a later batch",
         ),

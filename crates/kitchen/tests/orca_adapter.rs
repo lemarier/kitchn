@@ -1141,6 +1141,12 @@ fn adoption_moves_the_mailbox_to_the_new_coordinator() -> TestResult {
     let old = connect(&sim)?;
     old.adopt_run()?;
     assert_eq!(old.next_delivery()?, None);
+    sim.state().mail = VecDeque::from([json!({"deliveryId": "delivery_1", "messages": [
+        {"id": "msg_q", "type": "question", "payload": {"dispatchId": "ctx_1"}},
+    ]})]);
+    let held = old
+        .next_delivery()?
+        .ok_or("the first coordinator got nothing")?;
     let adopting = OrcaBackend::connect(
         OrcaConfig {
             coordinator: ExternalRef::new("term_adopter")?,
@@ -1158,11 +1164,19 @@ fn adoption_moves_the_mailbox_to_the_new_coordinator() -> TestResult {
         calls.last().and_then(|call| flag(call, "id")),
         Some("run_sim")
     );
-    assert_eq!(adopting.next_delivery()?, None);
+    // Orca redelivers the unacknowledged message under a new batch id.
+    let adopted = adopting.next_delivery()?.ok_or("the adopter got nothing")?;
+    assert_ne!(adopted.id, held.id);
+    assert_eq!(adopted.messages, held.messages);
     assert!(
         old.next_delivery() == Err(MailboxError::Fenced),
         "the previous coordinator no longer reads the mailbox"
     );
+    // Orca refuses the old id as fenced; the adopter still holds the Run, so
+    // the acknowledgement consumed nothing and is not a fence.
+    assert_eq!(adopting.acknowledge(&held.id)?, Some(adopted.clone()));
+    assert_eq!(adopting.acknowledge(&adopted.id)?, None);
+    assert!(sim.state().mail.is_empty());
     Ok(())
 }
 
@@ -1233,6 +1247,44 @@ fn mailbox_failures_keep_their_meaning() -> TestResult {
     assert_eq!(
         backend.await_delivery(Duration::from_secs(1)),
         Err(MailboxError::Fenced)
+    );
+    Ok(())
+}
+
+/// A fenced acknowledgement is checked with a plain read: only a read that
+/// is fenced too means the Run was lost, and a read that fails keeps its
+/// failure rather than passing for either.
+#[test]
+fn a_fenced_acknowledgement_is_confirmed_by_a_read() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    let gone = ExternalRef::new("delivery_old")?;
+    sim.fault_on(
+        &["orchestration", "check"],
+        Fault::Refuse("consumer_fenced"),
+    );
+    assert_eq!(backend.acknowledge(&gone), Ok(None), "the read succeeded");
+    for _ in 0..2 {
+        sim.fault_on(
+            &["orchestration", "check"],
+            Fault::Refuse("consumer_fenced"),
+        );
+    }
+    assert_eq!(backend.acknowledge(&gone), Err(MailboxError::Fenced));
+    sim.fault_on(
+        &["orchestration", "check"],
+        Fault::Refuse("consumer_fenced"),
+    );
+    sim.fault_on(&["orchestration", "check"], Fault::TimeoutBeforeEffect);
+    assert_eq!(
+        backend.acknowledge(&gone),
+        Err(MailboxError::Unavailable(BackendUnavailable::Timeout))
+    );
+    let checks = sim.calls_to(&["orchestration", "check"]);
+    assert_eq!(
+        checks.len(),
+        6,
+        "one read after each fenced acknowledgement"
     );
     Ok(())
 }

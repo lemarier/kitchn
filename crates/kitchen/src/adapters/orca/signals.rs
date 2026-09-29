@@ -1223,6 +1223,14 @@ mod tests {
                 "ready",
                 DispatchActivity::Unknown,
             ),
+            // Live Orca 1.4.216 left a fresh launch here for over 30 seconds
+            // with no transcript: the brief was never handed over, so the
+            // Dispatch is not yet the live attempt.
+            (
+                json!({"runId": "run_sim", "status": "pending", "capabilityRevokedAt": null}),
+                "start_unknown",
+                DispatchActivity::Unknown,
+            ),
             (
                 json!({"runId": "run_sim", "status": "paused"}),
                 "ready",

@@ -148,11 +148,7 @@ impl FakeBackend {
     /// [`ContractError::InvalidValue`] when the id cannot be formed.
     pub fn post(&self, messages: Vec<MailMessage>) -> Result<ExternalRef, ContractError> {
         let mut state = self.lock();
-        state.next_id = state.next_id.saturating_add(1);
-        let id = ExternalRef::new(&format!(
-            "delivery-{}-{}",
-            self.descriptor.backend, state.next_id
-        ))?;
+        let id = self.delivery_id(&mut state)?;
         state.mailbox.push_back(Delivery {
             id: id.clone(),
             messages,
@@ -161,9 +157,18 @@ impl FakeBackend {
         Ok(id)
     }
 
+    fn delivery_id(&self, state: &mut FakeState) -> Result<ExternalRef, ContractError> {
+        state.next_id = state.next_id.saturating_add(1);
+        ExternalRef::new(&format!(
+            "delivery-{}-{}",
+            self.descriptor.backend, state.next_id
+        ))
+    }
+
     /// Another coordinator instance of this backend, as after a restart: it
     /// shares every worker and the mailbox, and reads the mailbox once it
-    /// adopts the run.
+    /// adopts the run. Adoption redelivers each unacknowledged batch under a
+    /// new id, as Orca does.
     #[must_use]
     pub fn restarted(&self) -> Self {
         let coordinator = {
@@ -443,7 +448,21 @@ impl WorkerBackend for FakeBackend {
 impl CoordinatorMailbox for FakeBackend {
     fn adopt_run(&self) -> Result<(), MailboxError> {
         self.declared(Capability::RunTransfer)?;
-        self.lock().adopted_by = Some(self.coordinator);
+        let mut state = self.lock();
+        if state.adopted_by == Some(self.coordinator) {
+            return Ok(());
+        }
+        // An id only fails to form for a backend id that cannot be part of
+        // a reference, which `post` would already have refused.
+        let pending = state.mailbox.len();
+        let ids = (0..pending)
+            .map(|_| self.delivery_id(&mut state))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| BackendUnavailable::Transport)?;
+        for (batch, id) in state.mailbox.iter_mut().zip(ids) {
+            batch.id = id;
+        }
+        state.adopted_by = Some(self.coordinator);
         Ok(())
     }
 

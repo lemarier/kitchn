@@ -292,7 +292,8 @@ pub struct SimState {
     pub runs: Vec<Value>,
     pub worker_pages: Vec<Value>,
     /// Unacknowledged mailbox batches, oldest first. `check` returns the
-    /// oldest; `--ack` consumes it only when it names that batch.
+    /// oldest; `--ack` consumes it only when it names that batch. A
+    /// `run-use` from a terminal not yet bound gives each batch a new id.
     pub mail: VecDeque<Value>,
     pub faults: VecDeque<(Option<Vec<String>>, Fault)>,
     pub calls: Vec<Vec<String>>,
@@ -312,6 +313,8 @@ pub struct SimState {
     pub ignore_edits: bool,
     /// The coordinator terminal bound to the Run, once one was bound.
     pub bound: Option<String>,
+    /// Delivery ids replaced when another terminal adopted the Run.
+    pub retired: Vec<String>,
     /// How the next `worker-start` ends: `ready` or `failed`.
     pub start_state: &'static str,
     /// The prefix Orca puts before the name of a worktree it creates.
@@ -371,6 +374,7 @@ impl Default for SimOrca {
                 release_action: "released",
                 ignore_edits: false,
                 bound: None,
+                retired: Vec::new(),
                 start_state: "ready",
                 branch_prefix: "lemarier/",
                 existing_branch: None,
@@ -881,7 +885,21 @@ impl SimState {
                     .unwrap_or_else(|| json!({"workers": [], "page": {"hasMore": false}})))
             }
             ["orchestration", "run-use"] => {
-                self.bound = Some(Self::flag(flags, "from"));
+                let from = Self::flag(flags, "from");
+                // A new coordinator gets every unacknowledged message again,
+                // under a new delivery id, as live Orca 1.4.216 does.
+                if self.bound.as_ref() != Some(&from) {
+                    for index in 0..self.mail.len() {
+                        let id = self.next_id("delivery_redelivered_");
+                        if let Some(batch) = self.mail.get_mut(index) {
+                            if let Some(old) = batch["deliveryId"].as_str() {
+                                self.retired.push(old.to_owned());
+                            }
+                            batch["deliveryId"] = json!(id);
+                        }
+                    }
+                }
+                self.bound = Some(from);
                 self.mutation(json!({"runId": Self::flag(flags, "id")}))
             }
             ["orchestration", "check"] => {
@@ -890,6 +908,11 @@ impl SimState {
                     return refuse("consumer_fenced");
                 }
                 let ack = flags.get("ack").map(String::as_str);
+                // As 1.4.216 answers an acknowledgement of a batch id issued
+                // before the caller adopted the Run.
+                if ack.is_some_and(|ack| self.retired.iter().any(|old| old == ack)) {
+                    return refuse("consumer_fenced");
+                }
                 if ack.is_some()
                     && self
                         .mail

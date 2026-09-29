@@ -94,7 +94,10 @@
 //!   [`CoordinatorMailbox::adopt_run`](crate::contracts::CoordinatorMailbox::adopt_run);
 //!   the previous terminal is then fenced from the mailbox (`consumer_fenced`,
 //!   reported as [`crate::contracts::MailboxError::Fenced`]). Workers keep
-//!   running.
+//!   running. Orca 1.4.216 redelivers the unacknowledged messages to the
+//!   adopter under a new delivery id and refuses an acknowledgement of the
+//!   old id with `consumer_fenced`; the adapter confirms such a refusal with
+//!   a plain read before reporting a fence.
 //! - Released terminals. `worker-release` is idempotent and archives output;
 //!   a released worker stays observable and keeps its settled state. Orca
 //!   reads an archive from its oldest message forward, so signals follow its

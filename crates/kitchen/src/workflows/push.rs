@@ -673,7 +673,8 @@ const GIT_POLL: Duration = Duration::from_millis(10);
 /// It never prompts. Every call has a deadline; an expired call reports
 /// unknown or uncertain, never success.
 ///
-/// Every call runs Git under one environment: no system configuration,
+/// Every call runs Git under one environment: no `GIT_*` variable Kitchen
+/// inherited, no system configuration,
 /// Kitchen's own [`IsolatedGitConfig`] in place of the user's global one,
 /// hooks disabled, and the SSH command, the remote's pack programs, and a
 /// push's tags, submodules, and mirroring pinned. What remains is the
@@ -685,14 +686,15 @@ const GIT_POLL: Duration = Duration::from_millis(10);
 /// of the remote (`git remote get-url --all`) must also be the granted
 /// repository under one of the accepted URL bases (GitHub's HTTPS and SSH
 /// forms by default). Credential helpers configured in the checkout still
-/// run; a Kitchen-owned clone removes that limit.
+/// run for reads; a Kitchen-owned clone removes that limit.
 ///
 /// An update does not push by remote name: it pushes to the verified URL,
-/// which no configuration Git reads may rewrite. The checks and the push
-/// are separate Git processes, so a worker still writing to its checkout's
-/// configuration while Kitchen pushes can add a rewrite after the last
-/// check; the two reads narrow that to the instants between the final check
-/// and Git's own read.
+/// and it pushes from a Kitchen-owned, empty bare repository beside
+/// Kitchen's configuration that borrows the checkout's objects, so the push
+/// never reads the checkout's configuration. A rewrite or remote URL a
+/// worker writes to its checkout after the last check cannot redirect it,
+/// and the checkout's credential helpers do not run for it: give Kitchen's
+/// own [`PushSetting::CredentialHelper`] instead.
 #[derive(Debug, Clone)]
 pub struct GitRemote {
     git: PathBuf,
@@ -788,12 +790,45 @@ impl GitRemote {
     }
 
     pub(crate) fn run(&self, args: &[&str]) -> Option<(Option<i32>, Vec<u8>)> {
+        self.run_in(&self.worktree, args)
+    }
+
+    fn run_in(&self, dir: &std::path::Path, args: &[&str]) -> Option<(Option<i32>, Vec<u8>)> {
         let env = git_environment(&self.config, &self.remote);
         let env: Vec<(&str, &str)> = env
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
-        run_bounded(&self.git, &self.worktree, args, &env, self.deadline)
+        run_bounded(&self.git, dir, args, &env, self.deadline)
+    }
+
+    /// An empty bare repository in Kitchen's configuration directory whose
+    /// object store borrows the checkout's, so a push from it reads only
+    /// configuration Kitchen wrote. Removed when dropped. `None` when it
+    /// could not be made.
+    fn push_snapshot(&self) -> Option<tempfile::TempDir> {
+        let (Some(0), stdout) = self.run(&["rev-parse", "--git-common-dir"])? else {
+            return None;
+        };
+        let common = String::from_utf8(stdout).ok()?;
+        // Git prints the common directory relative to the checkout when it
+        // is inside it.
+        let objects = self.worktree.join(common.trim_end()).join("objects");
+        let objects = objects.canonicalize().ok()?;
+        let objects = objects.to_str().filter(|path| !path.contains('\n'))?;
+        let snapshot = tempfile::Builder::new()
+            .prefix("kitchen-push-")
+            .tempdir_in(self.config.path.parent()?)
+            .ok()?;
+        let dir = snapshot.path();
+        let (Some(0), _) = self.run_in(dir, &["init", "--bare", "--quiet", "--template=", "."])?
+        else {
+            return None;
+        };
+        let info = dir.join("objects").join("info");
+        std::fs::create_dir_all(&info).ok()?;
+        std::fs::write(info.join("alternates"), format!("{objects}\n")).ok()?;
+        Some(snapshot)
     }
 
     /// Whether `url` names `repository` under an accepted base.
@@ -1106,8 +1141,8 @@ pub(crate) fn git_environment(config: &IsolatedGitConfig, remote: &str) -> Vec<(
 /// captured to a file (never a terminal), and return its exit code and
 /// bounded stdout. `None` means the process did not complete: it could not
 /// start, ran past `deadline`, or produced too much output. Meant for Git
-/// and Git-driven tools: it sets `LC_ALL=C` and drops `GIT_DIR` and
-/// `GIT_WORK_TREE`.
+/// and Git-driven tools: it sets `LC_ALL=C` and drops every inherited `GIT_*`
+/// variable before `env` applies.
 pub(crate) fn run_bounded(
     program: &std::path::Path,
     dir: &std::path::Path,
@@ -1117,10 +1152,13 @@ pub(crate) fn run_bounded(
 ) -> Option<(Option<i32>, Vec<u8>)> {
     let mut output = tempfile::tempfile().ok()?;
     let mut command = Command::new(program);
-    // A caller inside a Git hook must not redirect Git to its own
-    // repository, and configuration Kitchen inherited must not reach Git.
-    for inherited in INHERITED_GIT_ENV {
-        command.env_remove(inherited);
+    // Kitchen's own environment must not choose Git's repository, object
+    // store, index, namespace, or configuration: a caller inside a Git hook
+    // sets several of them, and any could send a read or push elsewhere.
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(key);
+        }
     }
     let mut child = command
         .args(args)
@@ -1147,19 +1185,6 @@ pub(crate) fn run_bounded(
     };
     Some((status.code(), read_bounded(&mut output)?))
 }
-
-/// Git variables removed from every process [`run_bounded`] starts before
-/// its own `env` applies.
-const INHERITED_GIT_ENV: [&str; 8] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_CONFIG",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_NOSYSTEM",
-];
 
 /// Read `file` from the start, refusing more than [`MAX_GIT_OUTPUT`] bytes.
 fn read_bounded(file: &mut File) -> Option<Vec<u8>> {
@@ -1250,6 +1275,10 @@ impl GitRemote {
         let Some(destination) = urls.first() else {
             return Err(UpdateFailure::Uncertain);
         };
+        // From here on the checkout's configuration is not read.
+        let Some(snapshot) = self.push_snapshot() else {
+            return Err(UpdateFailure::Uncertain);
+        };
         let mut args: Vec<String> = [
             "push",
             "--porcelain",
@@ -1278,7 +1307,7 @@ impl GitRemote {
                 .map(|update| format!("{}:refs/heads/{}", update.commit, update.branch)),
         );
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        match self.run(&args) {
+        match self.run_in(snapshot.path(), &args) {
             Some((Some(0), _)) => Ok(()),
             // Git reports a refused ref, such as a failed lease, as a line
             // starting with `!` under `--porcelain`: nothing changed, since

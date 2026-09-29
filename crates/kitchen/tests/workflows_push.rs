@@ -1789,6 +1789,217 @@ mod git_remote {
         Ok(())
     }
 
+    /// A `git` that writes `key = value` into the worker's configuration
+    /// just before it runs a push: the change lands after every check the
+    /// update makes, the window issue #92 describes.
+    fn git_rewriting_before_push(repos: &Repos, key: &str, value: &str) -> TestResult<PathBuf> {
+        let path = repos.dir.path().join("git-racing");
+        let config = repos.worker.join(".git").join("config");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 for arg in \"$@\"; do\n  \
+                 if [ \"$arg\" = push ]; then {GIT} config --file '{config}' '{key}' '{value}'; fi\n\
+                 done\n\
+                 exec {GIT} \"$@\"\n",
+                config = text(&config)?,
+            ),
+        )?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    /// A rewrite written after the update's last check does not reach the
+    /// push: it pushes the verified URL under configuration the checkout
+    /// cannot change.
+    #[test]
+    fn git_pushes_the_verified_url_despite_a_rewrite_written_as_the_push_starts() -> TestResult {
+        for variable in ["insteadOf", "pushInsteadOf"] {
+            let repos = fresh_repos()?;
+            let setup = pushing()?;
+            let elsewhere = elsewhere(&repos, "elsewhere")?;
+            let mine = commit_in(&repos.worker, "mine")?;
+            let granted = text(&repos.remote)?.to_owned();
+            let key = format!("url.{}.{variable}", text(&elsewhere)?);
+            let remote = GitRemote::new(
+                git_rewriting_before_push(&repos, &key, &granted)?,
+                repos.worker.clone(),
+                "origin",
+                workflows_support::isolated_config(repos.dir.path(), &[])?,
+                Duration::from_secs(30),
+            )?
+            .with_url_bases(&[&url_base(&repos)?])?;
+            let outcome = push_with(
+                &setup,
+                Observed::Unknown,
+                &remote,
+                &remote,
+                &first_intent()?,
+                &mine,
+            )?;
+            // The rewrite did land in the checkout, after the checks.
+            assert_eq!(git(&repos.worker, &["config", "--get", &key])?, granted);
+            assert_eq!(
+                outcome,
+                PushOutcome::Pushed { replaced: None },
+                "{variable}"
+            );
+            assert_eq!(
+                remote_head(&repos, BRANCH)?.as_deref(),
+                Some(mine.as_str()),
+                "{variable}"
+            );
+            assert!(
+                git(&elsewhere, &["for-each-ref"])?.is_empty(),
+                "{variable}: the push followed the late rewrite"
+            );
+        }
+        Ok(())
+    }
+
+    /// Without its own push repository Kitchen sends nothing, and says the
+    /// outcome is unknown rather than stale or pushed.
+    #[test]
+    fn git_sends_nothing_when_its_push_repository_cannot_be_made() -> TestResult {
+        let repos = fresh_repos()?;
+        let setup = pushing()?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        let kitchen = tempfile::tempdir()?;
+        let remote = GitRemote::new(
+            PathBuf::from(GIT),
+            repos.worker.clone(),
+            "origin",
+            workflows_support::isolated_config(kitchen.path(), &[])?,
+            Duration::from_secs(30),
+        )?
+        .with_url_bases(&[&url_base(&repos)?])?;
+        // Kitchen's configuration directory is gone.
+        let gone = kitchen.path().to_path_buf();
+        drop(kitchen);
+        assert!(!gone.exists());
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert_eq!(outcome, PushOutcome::Uncertain);
+        assert_eq!(remote_head(&repos, BRANCH)?, None);
+        Ok(())
+    }
+
+    /// Set in the copy of this test binary that
+    /// [`git_ignores_inherited_repository_variables`] starts: the directory
+    /// of its repositories.
+    const INHERITED_ROOT: &str = "KITCHEN_TEST_INHERITED_GIT_ROOT";
+
+    /// Kitchen inherits variables that select another repository, object
+    /// store, index, namespace, or configuration. Its reads and its push must
+    /// still use the worker's checkout, Kitchen's own push repository, and the
+    /// granted URL. The variables can only be inherited by a process, so the
+    /// test runs its push in a copy of this test binary started with them.
+    #[test]
+    fn git_ignores_inherited_repository_variables() -> TestResult {
+        if let Some(root) = std::env::var_os(INHERITED_ROOT) {
+            return push_under_inherited_variables(Path::new(&root));
+        }
+        let repos = fresh_repos()?;
+        let elsewhere = elsewhere(&repos, "elsewhere")?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        let granted = text(&repos.remote)?;
+        let other = text(&elsewhere)?;
+        let objects = format!("{other}/objects");
+        let rewrite = format!("url.{other}.insteadOf");
+        let system = repos.dir.path().join("system-config");
+        fs::write(
+            &system,
+            format!("[url \"{other}\"]\n\tpushInsteadOf = {granted}\n"),
+        )?;
+        let inherited = [
+            ("GIT_DIR", other),
+            ("GIT_WORK_TREE", text(&repos.other)?),
+            ("GIT_COMMON_DIR", other),
+            ("GIT_OBJECT_DIRECTORY", &objects),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", &objects),
+            ("GIT_INDEX_FILE", "/dev/null"),
+            ("GIT_NAMESPACE", "hostile"),
+            ("GIT_CEILING_DIRECTORIES", text(repos.dir.path())?),
+            ("GIT_CONFIG_SYSTEM", text(&system)?),
+            ("GIT_CONFIG_PARAMETERS", &format!("'{rewrite}'='{granted}'")),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", &rewrite),
+            ("GIT_CONFIG_VALUE_0", granted),
+        ];
+        let child = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "git_remote::git_ignores_inherited_repository_variables",
+                "--test-threads=1",
+            ])
+            .env(INHERITED_ROOT, repos.dir.path())
+            .envs(inherited)
+            .output()?;
+        assert!(
+            child.status.success(),
+            "the push under inherited variables failed: {}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&child.stdout)
+                .lines()
+                .filter(|line| line.starts_with("test result: ok. 1 passed"))
+                .count(),
+            1,
+            "the copy did not run the push"
+        );
+        assert_eq!(remote_head(&repos, BRANCH)?.as_deref(), Some(mine.as_str()));
+        assert_eq!(
+            git(&repos.remote, &["for-each-ref", "refs/namespaces"])?,
+            "",
+            "the push went into a namespace"
+        );
+        assert!(
+            git(&elsewhere, &["for-each-ref"])?.is_empty(),
+            "the push reached another repository"
+        );
+        Ok(())
+    }
+
+    /// The copy's half of [`git_ignores_inherited_repository_variables`]:
+    /// check and push the worker's new commit as a first push.
+    fn push_under_inherited_variables(root: &Path) -> TestResult {
+        let setup = pushing()?;
+        let kitchen = tempfile::tempdir()?;
+        let remote = GitRemote::new(
+            PathBuf::from(GIT),
+            root.join("worker"),
+            "origin",
+            workflows_support::isolated_config(kitchen.path(), &[])?,
+            Duration::from_secs(30),
+        )?
+        .with_url_bases(&[&format!("{}/", text(root)?)])?;
+        let head = fs::read_to_string(
+            root.join("worker")
+                .join(".git")
+                .join("refs/heads")
+                .join(BRANCH),
+        )?;
+        let mine = CommitId::new(head.trim())?;
+        let outcome = push_with(
+            &setup,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert_eq!(outcome, PushOutcome::Pushed { replaced: None });
+        Ok(())
+    }
+
     /// A clean checkout pushes to a local bare remote with Kitchen's own
     /// configuration carrying a credential helper, and the push's Git reads
     /// no system configuration and no user configuration but Kitchen's file.

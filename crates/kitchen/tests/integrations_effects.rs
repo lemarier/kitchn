@@ -36,6 +36,10 @@ struct Remote {
     reads: std::cell::Cell<usize>,
     asks: BTreeMap<String, Value>,
     hide_lookup: bool,
+    /// Pull requests, as the pulls list returns them.
+    pulls: Vec<Value>,
+    /// Remote branch heads by name.
+    branches: BTreeMap<String, String>,
 }
 /// One query-string value of a relative endpoint.
 fn query<'a>(endpoint: &'a str, name: &str) -> Option<&'a str> {
@@ -74,7 +78,29 @@ impl GitHubReadTransport for Provider {
             return Err(IntegrationError::Unavailable);
         }
         let path = request.endpoint();
-        let value = if path.contains("/comments?") {
+        let value = if path.contains("/pulls?") {
+            let head = query(path, "head")
+                .ok_or(IntegrationError::Unknown)?
+                .replace("%3A", ":")
+                .replace("%2F", "/");
+            json!(
+                remote
+                    .pulls
+                    .iter()
+                    .filter(|pull| Some(head.as_str())
+                        == pull["head"]["ref"]
+                            .as_str()
+                            .map(|name| format!("sample:{name}"))
+                            .as_deref())
+                    .collect::<Vec<_>>()
+            )
+        } else if let Some((_, name)) = path.split_once("/git/ref/heads/") {
+            let sha = remote
+                .branches
+                .get(name)
+                .ok_or(IntegrationError::NotFound)?;
+            json!({"ref": format!("refs/heads/{name}"), "object": {"sha": sha}})
+        } else if path.contains("/comments?") {
             json!(remote.comments)
         } else if path.ends_with("/pulls/1") {
             remote
@@ -156,7 +182,20 @@ impl GitHubMutationTransport for Provider {
         }
         let path = request.endpoint();
         let body = request.body();
-        if path.ends_with("/comments") {
+        if path.ends_with("/pulls") {
+            let number = remote.pulls.len() + 7;
+            let head = body["head"].as_str().unwrap_or_default().to_owned();
+            let sha = remote.branches.get(&head).cloned();
+            remote.pulls.push(json!({
+                "number": number,
+                "state": "open",
+                "head": {"ref": head, "sha": sha},
+                "base": {"ref": body["base"]},
+                "body": body["body"],
+                "user": {"login": "sample-bot"},
+                "html_url": format!("https://github.com/sample/project/pull/{number}"),
+            }));
+        } else if path.ends_with("/comments") {
             remote.comments.push(json!({"id":1,"body":body["body"],"user":{"login":"sample-bot"},"html_url":"https://github.com/sample/project/issues/1#issuecomment-1"}));
         } else if path.ends_with("/pulls/1/merge") {
             let pr = remote
@@ -2023,6 +2062,346 @@ fn roger_submit_errors_map_to_definite_refusal_or_uncertainty() -> TestResult {
                 assert_eq!(remote.borrow().calls.len(), 1);
             }
         }
+    }
+    Ok(())
+}
+
+fn open_action(title: &str) -> TestResult<GitHubAction> {
+    Ok(GitHubAction::OpenPullRequest {
+        head: BranchName::new("feature/x")?,
+        expected_head: CommitId::new(&"b".repeat(40))?,
+        base: BranchName::new("main")?,
+        title: Text::new(title)?,
+        body: Text::new("Adds x.")?,
+        draft: false,
+    })
+}
+fn open_remote(fault: Option<Fault>) -> Rc<RefCell<Remote>> {
+    Rc::new(RefCell::new(Remote {
+        branches: BTreeMap::from([("feature/x".to_owned(), "b".repeat(40))]),
+        fault,
+        ..Remote::default()
+    }))
+}
+#[test]
+fn open_pull_request_requires_its_grant_and_reconciles_a_lost_response() -> TestResult {
+    // Creating issues does not imply opening pull requests.
+    let fixture = Fixture::new()?;
+    let (scope, _, task, _) = setup(&fixture, 3, &[Permission::CreateIssue], "github")?;
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, open_remote(None))?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        backend.effect(mutation(open_action("Add x")?)?),
+        Err(IntegrationError::PermissionDenied)
+    );
+    // A house that permits it cannot open one for a task without the grant.
+    let permitted = Fixture::new()?;
+    let (scope, ..) = setup(&permitted, 3, &[Permission::OpenPullRequest], "github")?;
+    let remote = open_remote(None);
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let fixture = Fixture::new()?;
+    let (_, grants, task, fence) = setup(&fixture, 3, &[Permission::CreateIssue], "github")?;
+    let effect = backend.effect(mutation(open_action("Add x")?)?)?;
+    assert!(matches!(
+        run_effect(
+            &fixture.store,
+            &backend,
+            &grants,
+            plan(&task, fence, "open", effect)?,
+            &ManualClock::starting_at(1),
+        ),
+        Err(Error::Contract(ContractError::PermissionDenied {
+            permission: Permission::OpenPullRequest
+        }))
+    ));
+    assert!(remote.borrow().calls.is_empty());
+
+    // With the grant, a lost response is reconciled to the pull request it
+    // opened, and no retry opens another.
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) =
+        setup(&fixture, 3, &[Permission::OpenPullRequest], "github")?;
+    let remote = open_remote(Some(Fault::LoseAfterApply));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope.clone(),
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let effect = backend.effect(mutation(open_action("Add x")?)?)?;
+    assert_eq!(effect.required_permission(), Permission::OpenPullRequest);
+    let first = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "open", effect.clone())?,
+        &ManualClock::starting_at(1),
+    )?;
+    assert!(matches!(first.state(), EffectState::Uncertain { .. }));
+    assert!(matches!(
+        run_effect(
+            &fixture.reopen()?,
+            &backend,
+            &grants,
+            plan(&task, fence, "open", effect.clone())?,
+            &ManualClock::starting_at(2),
+        ),
+        Err(Error::State(StateError::UnsafeRetry(_)))
+    ));
+    let restarted = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let reconciled = kitchen::state::reconcile(
+        &fixture.reopen()?,
+        &restarted,
+        &task,
+        fence,
+        &ManualClock::starting_at(3),
+    )?;
+    assert_eq!(reconciled.resolved.len(), 1);
+    let second = run_effect(
+        &fixture.reopen()?,
+        &restarted,
+        &grants,
+        plan(&task, fence, "open", effect)?,
+        &ManualClock::starting_at(4),
+    )?;
+    let EffectState::Applied { receipt, .. } = second.state() else {
+        return Err("expected the opened pull request".into());
+    };
+    assert_eq!(
+        receipt.reference().as_str(),
+        "https://github.com/sample/project/pull/7"
+    );
+    let remote = remote.borrow();
+    assert_eq!(remote.pulls.len(), 1);
+    assert_eq!(remote.calls.len(), 1);
+    let (endpoint, body) = &remote.calls[0];
+    assert_eq!(endpoint, "repos/sample/project/pulls");
+    assert_eq!(body["head"], "feature/x");
+    assert_eq!(body["base"], "main");
+    assert_eq!(body["title"], "Add x");
+    assert_eq!(body["draft"], false);
+    let marked = body["body"].as_str().ok_or("no body")?;
+    assert!(marked.starts_with("Adds x.\n\n<!-- kitchen:"), "{marked}");
+    Ok(())
+}
+#[test]
+fn open_pull_request_never_pushes_and_refuses_a_moved_missing_or_taken_head() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) =
+        setup(&fixture, 5, &[Permission::OpenPullRequest], "github")?;
+    let other = |state: &str| {
+        json!({
+            "number": 3, "state": state, "head": {"ref": "feature/x"},
+            "base": {"ref": "release"}, "body": null,
+            "user": {"login": "someone"},
+            "html_url": "https://github.com/sample/project/pull/3",
+        })
+    };
+    let cases = [
+        // The branch is not on the remote: opening would need a push.
+        ("missing", BTreeMap::new(), Vec::new()),
+        // The remote branch holds another head.
+        (
+            "moved",
+            BTreeMap::from([("feature/x".to_owned(), "c".repeat(40))]),
+            Vec::new(),
+        ),
+        // Someone already has an open pull request from the branch.
+        (
+            "taken",
+            BTreeMap::from([("feature/x".to_owned(), "b".repeat(40))]),
+            vec![other("open")],
+        ),
+    ];
+    for (name, branches, pulls) in cases {
+        let remote = Rc::new(RefCell::new(Remote {
+            branches,
+            pulls,
+            ..Remote::default()
+        }));
+        let backend = GitHubExecutor::new(
+            BackendId::new("github")?,
+            scope.clone(),
+            provider(&fixture, &task, remote.clone())?,
+            ReadLimits::default(),
+        );
+        let effect = backend.effect(mutation(open_action("Add x")?)?)?;
+        let record = run_effect(
+            &fixture.store,
+            &backend,
+            &grants,
+            plan(&task, fence, name, effect)?,
+            &ManualClock::starting_at(1),
+        )?;
+        assert!(
+            matches!(
+                record.state(),
+                EffectState::NotApplied {
+                    reason: NotAppliedReason::Rejected,
+                    ..
+                }
+            ),
+            "{name}"
+        );
+        assert!(remote.borrow().calls.is_empty(), "{name} submitted");
+    }
+    // A closed pull request from the branch does not take it.
+    let remote = open_remote(None);
+    remote.borrow_mut().pulls.push(other("closed"));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let effect = backend.effect(mutation(open_action("Add x")?)?)?;
+    let record = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "reopened", effect)?,
+        &ManualClock::starting_at(2),
+    )?;
+    assert!(matches!(record.state(), EffectState::Applied { .. }));
+    assert_eq!(remote.borrow().calls.len(), 1);
+    Ok(())
+}
+#[test]
+fn an_open_lost_before_it_applied_stays_unresolved_rather_than_absent() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (scope, grants, task, fence) =
+        setup(&fixture, 3, &[Permission::OpenPullRequest], "github")?;
+    let remote = open_remote(Some(Fault::LoseBeforeApply));
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, remote.clone())?,
+        ReadLimits::default(),
+    );
+    let effect = backend.effect(mutation(open_action("Add x")?)?)?;
+    let record = run_effect(
+        &fixture.store,
+        &backend,
+        &grants,
+        plan(&task, fence, "open", effect)?,
+        &ManualClock::starting_at(1),
+    )?;
+    assert!(matches!(record.state(), EffectState::Uncertain { .. }));
+    // No marked pull request is not proof: an earlier request may land.
+    let report = kitchen::state::reconcile(
+        &fixture.reopen()?,
+        &backend,
+        &task,
+        fence,
+        &ManualClock::starting_at(2),
+    )?;
+    assert!(report.resolved.is_empty());
+    assert_eq!(report.unresolved.len(), 1);
+    assert_eq!(remote.borrow().calls.len(), 1);
+    assert!(remote.borrow().pulls.is_empty());
+    Ok(())
+}
+#[test]
+fn open_pull_request_refuses_a_self_based_branch_and_a_multiline_title() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (scope, _, task, _) = setup(&fixture, 3, &[Permission::OpenPullRequest], "github")?;
+    let backend = GitHubExecutor::new(
+        BackendId::new("github")?,
+        scope,
+        provider(&fixture, &task, open_remote(None))?,
+        ReadLimits::default(),
+    );
+    let mut onto_itself = open_action("Add x")?;
+    if let GitHubAction::OpenPullRequest { base, .. } = &mut onto_itself {
+        *base = BranchName::new("feature/x")?;
+    }
+    for action in [
+        onto_itself,
+        open_action("Add x\nand y")?,
+        open_action(" Add x")?,
+        open_action(&"t".repeat(257))?,
+    ] {
+        assert_eq!(
+            backend.effect(mutation(action)?),
+            Err(IntegrationError::InvalidInput)
+        );
+    }
+    assert!(
+        backend
+            .effect(mutation(open_action(&"t".repeat(256))?)?)
+            .is_ok()
+    );
+    Ok(())
+}
+/// A named change to the remote after a lost create.
+type RemoteChange = (&'static str, fn(&mut Remote));
+#[test]
+fn a_marked_pull_request_at_another_head_or_base_is_not_the_one_requested() -> TestResult {
+    let cases: [RemoteChange; 3] = [
+        // The head advanced after the lost create.
+        ("head moved", |remote| {
+            remote.pulls[0]["head"]["sha"] = json!("c".repeat(40));
+        }),
+        // The pull request was retargeted after the lost create.
+        ("base retargeted", |remote| {
+            remote.pulls[0]["base"]["ref"] = json!("release");
+        }),
+        // Two pull requests carry the marker: neither is evidence.
+        ("marked twice", |remote| {
+            let mut copy = remote.pulls[0].clone();
+            copy["number"] = json!(8);
+            copy["html_url"] = json!("https://github.com/sample/project/pull/8");
+            remote.pulls.push(copy);
+        }),
+    ];
+    for (name, change) in cases {
+        let fixture = Fixture::new()?;
+        let (scope, grants, task, fence) =
+            setup(&fixture, 3, &[Permission::OpenPullRequest], "github")?;
+        let remote = open_remote(Some(Fault::LoseAfterApply));
+        let backend = GitHubExecutor::new(
+            BackendId::new("github")?,
+            scope,
+            provider(&fixture, &task, remote.clone())?,
+            ReadLimits::default(),
+        );
+        let effect = backend.effect(mutation(open_action("Add x")?)?)?;
+        let record = run_effect(
+            &fixture.store,
+            &backend,
+            &grants,
+            plan(&task, fence, "open", effect)?,
+            &ManualClock::starting_at(1),
+        )?;
+        assert!(
+            matches!(record.state(), EffectState::Uncertain { .. }),
+            "{name}"
+        );
+        change(&mut remote.borrow_mut());
+        let report = kitchen::state::reconcile(
+            &fixture.reopen()?,
+            &backend,
+            &task,
+            fence,
+            &ManualClock::starting_at(2),
+        )?;
+        assert!(report.resolved.is_empty(), "{name} resolved");
+        assert_eq!(report.unresolved.len(), 1, "{name}");
+        assert_eq!(remote.borrow().calls.len(), 1, "{name} opened another");
     }
     Ok(())
 }

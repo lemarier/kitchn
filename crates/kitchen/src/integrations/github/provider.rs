@@ -136,6 +136,11 @@ pub(crate) enum Inspection {
     /// one since: the approved merge may have completed before the branch
     /// advanced, so this is neither a new merge's target nor absence evidence.
     MergedAtOtherHead,
+    /// Pull requests carry this request's marker, but not exactly one of
+    /// them at the expected head and base: the create may have landed and
+    /// then moved, so this is neither the requested pull request nor a
+    /// reason to open another.
+    MarkedElsewhere,
 }
 
 /// Per-operation read budget; an exhausted page budget is never absence evidence.
@@ -421,6 +426,19 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                     LabelSetup::Conflict => Inspection::Conflict,
                 })
             }
+            GitHubAction::OpenPullRequest {
+                head,
+                expected_head,
+                base,
+                body,
+                ..
+            } => self.pull_request(
+                &mutation.repository,
+                head,
+                expected_head,
+                base,
+                &marked(body.as_str(), key),
+            ),
             GitHubAction::LinkSubIssue { parent, child } => self.relationship(
                 &format!("{root}/issues/{}/sub_issues", parent.get()),
                 child.get(),
@@ -434,6 +452,89 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                 reference,
             ),
         }
+    }
+    /// Find the pull request `expected` marks among `head`'s pull requests.
+    /// Only the requester's marker counts, and it is applied only while it is
+    /// the one marked pull request and still holds `expected_head` on `base`;
+    /// otherwise it is [`Inspection::MarkedElsewhere`]. Without a marker,
+    /// another open pull request from `head`, a missing remote branch, or a
+    /// remote head other than `expected_head` is a conflict: a branch gets one
+    /// open pull request, and opening never pushes.
+    fn pull_request(
+        &mut self,
+        repository: &crate::contracts::Repository,
+        head: &crate::contracts::BranchName,
+        expected_head: &crate::contracts::CommitId,
+        base: &crate::contracts::BranchName,
+        expected: &str,
+    ) -> Result<Inspection, IntegrationError> {
+        let root = format!("repos/{repository}");
+        let entries = self.pages(&format!(
+            "{root}/pulls?state=all&head={}",
+            encode_segment(&format!("{}:{head}", repository.owner()))
+        ))?;
+        let requester = self.scope.requester().as_str();
+        let mut found = None;
+        let mut marks = 0_usize;
+        let mut occupied = false;
+        for entry in &entries {
+            let field = |pointer: &str| {
+                entry
+                    .pointer(pointer)
+                    .and_then(Value::as_str)
+                    .ok_or(IntegrationError::Unknown)
+            };
+            // The filter names the head; anything else is not an answer to it.
+            if field("/head/ref")? != head.as_str() {
+                return Err(IntegrationError::Unknown);
+            }
+            let marked = entry.get("body").and_then(Value::as_str) == Some(expected);
+            if marked && field("/user/login")?.eq_ignore_ascii_case(requester) {
+                marks = marks.saturating_add(1);
+                let url = field("/html_url")?;
+                if !url.starts_with(&format!("https://github.com/{repository}/pull/")) {
+                    return Err(IntegrationError::Unknown);
+                }
+                if field("/head/sha")? == expected_head.as_str()
+                    && field("/base/ref")? == base.as_str()
+                {
+                    found = Some(Receipt::new(ExternalRef::new(url)?, vec![], vec![])?);
+                }
+            } else if field("/state")? == "open" {
+                occupied = true;
+            }
+        }
+        match (marks, found) {
+            (0, _) => {}
+            (1, Some(receipt)) => return Ok(Inspection::Applied(receipt)),
+            _ => return Ok(Inspection::MarkedElsewhere),
+        }
+        if occupied {
+            return Ok(Inspection::Conflict);
+        }
+        let reference = head
+            .as_str()
+            .split('/')
+            .map(encode_segment)
+            .collect::<Vec<_>>()
+            .join("/");
+        let branch = match self.read(format!("{root}/git/ref/heads/{reference}")) {
+            Ok(branch) => branch,
+            Err(IntegrationError::NotFound) => return Ok(Inspection::Conflict),
+            Err(error) => return Err(error),
+        };
+        if branch.get("ref").and_then(Value::as_str) != Some(&format!("refs/heads/{head}")) {
+            return Err(IntegrationError::Unknown);
+        }
+        let sha = branch
+            .pointer("/object/sha")
+            .and_then(Value::as_str)
+            .ok_or(IntegrationError::Unknown)?;
+        Ok(if sha == expected_head.as_str() {
+            Inspection::Missing
+        } else {
+            Inspection::Conflict
+        })
     }
     fn relationship(
         &mut self,
@@ -543,6 +644,24 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                 "POST",
                 format!("{root}/labels"),
                 json!({"name":label.name,"color":label.color,"description":label.description}),
+            ),
+            GitHubAction::OpenPullRequest {
+                head,
+                base,
+                title,
+                body,
+                draft,
+                ..
+            } => (
+                "POST",
+                format!("{root}/pulls"),
+                json!({
+                    "title": title.as_str(),
+                    "head": head.as_str(),
+                    "base": base.as_str(),
+                    "body": marked(body.as_str(), key),
+                    "draft": draft,
+                }),
             ),
             GitHubAction::LinkSubIssue { parent, child } => {
                 let id = self.issue_id(&root, child.get())?;

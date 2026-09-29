@@ -366,6 +366,7 @@ fn boundary<'a>(
         remote,
         updater: remote,
         local: remote,
+        opener: None,
     }
 }
 
@@ -1039,6 +1040,7 @@ fn run_layers_with(
         remote: layers,
         updater: layers,
         local: layers,
+        opener: None,
     }
     .run(&setup.task, setup.fence, command, &intent()?)?;
     Ok((outcome, runner))
@@ -1175,6 +1177,7 @@ fn a_layer_moved_after_the_check_fails_the_whole_push_and_links_nothing() -> Tes
         remote: &layers,
         updater: &layers,
         local: &layers,
+        opener: None,
     }
     .run(&setup.task, setup.fence, &StackCommand::Push, &first)?;
     assert_eq!(outcome, StackOutcome::Ran(StackResult::Done));
@@ -2116,6 +2119,7 @@ mod gh_process {
                     remote: &remote,
                     updater: &remote,
                     local: &remote,
+                    opener: None,
                 }
                 .run(&setup.task, setup.fence, &command, &intent()?)?;
                 assert_eq!(
@@ -2174,6 +2178,7 @@ mod gh_process {
                 remote: &remote,
                 updater: &remote,
                 local: &remote,
+                opener: None,
             }
             .run(&setup.task, setup.fence, &command, &intent()?)?;
             assert_eq!(
@@ -2301,6 +2306,7 @@ exec {GIT} \"$@\"
             remote: &remote,
             updater: &remote,
             local: &remote,
+            opener: None,
         }
         .run(&setup.task, setup.fence, command, &intent)?)
     }
@@ -2401,6 +2407,7 @@ exec {GIT} \"$@\"
             remote: &remote,
             updater: &remote,
             local: &remote,
+            opener: None,
         }
         .run(
             &setup.task,
@@ -2416,6 +2423,81 @@ exec {GIT} \"$@\"
         );
         assert_eq!(remote_heads(&bare)?, before, "a layer was pushed");
         assert_eq!(gh_calls(&root)?, vec!["stack view --json"]);
+        Ok(())
+    }
+
+    /// Real Git: with an opener, the same submission pushes the layers
+    /// first, then opens the task layer's pull request at the pushed head
+    /// with the head commit's message as its text, and `gh stack` receives
+    /// only pull-request numbers.
+    #[test]
+    fn a_layer_without_a_pull_request_is_opened_after_the_push_and_linked_by_number() -> TestResult
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (bare, worker, heads) = pushed_stack(&root)?;
+        let [base, lower, top, next] = heads.as_slice() else {
+            return Err("four heads".into());
+        };
+        let pull_requests = stack_pull_requests(lower, top)?;
+        let setup = stacking()?;
+        let view = r#"{"trunk":"main","branches":[{"name":"lemarier/issue-4","pr":{"number":4}},{"name":"lemarier/issue-5"}]}"#;
+        let (gh, _kitchen) = adapter(fake_gh(&root, view, 0)?, &worker)?;
+        let remote = gh
+            .git_remote(Path::new(GIT).to_path_buf(), Duration::from_secs(30))?
+            .with_url_bases(&[&format!("{}/", text(&root)?)])?;
+        let forge = Forge::new(&pull_requests.updated)?;
+        let outcome = StackBoundary {
+            store: &setup.world.fixture.store,
+            grants: &setup.world.grants,
+            destination: &setup.github,
+            clock: &setup.world.clock,
+            runner: &gh,
+            pull_requests: &pull_requests,
+            remote: &remote,
+            updater: &remote,
+            local: &remote,
+            opener: Some(LayerOpener {
+                forge: &forge,
+                consent: &Standing,
+                text: &remote,
+            }),
+        }
+        .run(
+            &setup.task,
+            setup.fence,
+            &StackCommand::Submit { ready: false },
+            &PushIntent {
+                pull_request: None,
+                expected_remote: Some(top.clone()),
+            },
+        )?;
+        assert_eq!(outcome, StackOutcome::Ran(StackResult::Done));
+        assert_eq!(
+            remote_heads(&bare)?,
+            format!(
+                "refs/heads/lemarier/issue-4 {lower}\nrefs/heads/lemarier/issue-5 {next}\n\
+                 refs/heads/main {base}"
+            )
+        );
+        assert_eq!(
+            forge.actions(),
+            vec![GitHubAction::OpenPullRequest {
+                head: branch("lemarier/issue-5")?,
+                expected_head: next.clone(),
+                base: branch("lemarier/issue-4")?,
+                title: Text::new("next")?,
+                body: Text::new("next")?,
+                draft: true,
+            }]
+        );
+        assert_eq!(
+            gh_calls(&root)?,
+            vec![
+                "stack view --json",
+                "stack link --base main --remote origin 4 7"
+            ]
+        );
         Ok(())
     }
 
@@ -2687,6 +2769,7 @@ exec {GIT} \"$@\"
             remote: &remote,
             updater: &remote,
             local: &remote,
+            opener: None,
         }
         .run(&setup.task, setup.fence, &StackCommand::Push, &intent()?)?;
         assert_eq!(
@@ -3027,4 +3110,678 @@ fn a_hostile_branch_name_from_pull_request_data_never_becomes_shell_text() -> Te
         ])
     );
     Ok(())
+}
+
+// Opening a layer's missing pull request.
+
+use kitchen::{
+    contracts::{
+        BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, Effect, EffectExecutor,
+        EffectFailure, EffectRequest, ExternalRef, GitHubAction, GitHubEffect, GitHubMutation,
+        Lookup, NotAppliedReason, PostingBudget, Receipt, Text, UncertainReason,
+    },
+    state::{EffectState, reconcile},
+    workflows::{
+        coordination::Standing,
+        interactive::ForgeWriter,
+        stack::{LayerOpener, LayerText, MAX_TITLE_BYTES, PullRequestText},
+    },
+};
+
+/// A forge that numbers each pull request it opens from 7 upward, records
+/// every open with how many layer pushes preceded it, and fails an open
+/// with the next scripted failure first.
+struct Forge<'a> {
+    descriptor: BackendDescriptor,
+    pushes: &'a RefCell<Vec<LayerCall>>,
+    failures: RefCell<Vec<EffectFailure>>,
+    opened: RefCell<Vec<(GitHubAction, usize)>>,
+    /// What a lookup answers.
+    found: RefCell<Lookup>,
+}
+
+impl<'a> Forge<'a> {
+    fn new(pushes: &'a RefCell<Vec<LayerCall>>) -> TestResult<Self> {
+        Ok(Self {
+            descriptor: BackendDescriptor {
+                backend: BackendId::new("github")?,
+                house: common::house()?,
+                worker_selection: None,
+                capabilities: CapabilitySet::supporting([
+                    Capability::ForgeMutation,
+                    Capability::EffectLookup,
+                ]),
+            },
+            pushes,
+            failures: RefCell::new(Vec::new()),
+            opened: RefCell::new(Vec::new()),
+            found: RefCell::new(Lookup::Unknown),
+        })
+    }
+
+    fn failing(self, failure: EffectFailure) -> Self {
+        self.failures.borrow_mut().push(failure);
+        self
+    }
+
+    fn actions(&self) -> Vec<GitHubAction> {
+        self.opened
+            .borrow()
+            .iter()
+            .map(|(action, _)| action.clone())
+            .collect()
+    }
+}
+
+fn pull_url(number: usize) -> TestResult<ExternalRef> {
+    Ok(ExternalRef::new(&format!(
+        "https://github.com/origin89hq/firmware/pull/{number}"
+    ))?)
+}
+
+impl EffectExecutor for Forge<'_> {
+    fn descriptor(&self) -> &BackendDescriptor {
+        &self.descriptor
+    }
+
+    fn execute(&self, request: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        let Effect::GitHub(effect) = request.effect() else {
+            return Err(EffectFailure::NotApplied(NotAppliedReason::Rejected));
+        };
+        let mut opened = self.opened.borrow_mut();
+        opened.push((effect.mutation.action.clone(), self.pushes.borrow().len()));
+        if let Some(failure) = self.failures.borrow_mut().pop() {
+            return Err(failure);
+        }
+        pull_url(opened.len().saturating_add(6))
+            .and_then(|url| Ok(Receipt::new(url, vec![], vec![])?))
+            .map_err(|_| EffectFailure::Uncertain(UncertainReason::ResponseLost))
+    }
+
+    fn lookup(&self, _: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        Ok(self.found.borrow().clone())
+    }
+}
+
+impl ForgeWriter for Forge<'_> {
+    fn github_effect(&self, mutation: GitHubMutation) -> Result<GitHubEffect, kitchen::Error> {
+        Ok(GitHubEffect {
+            requester: ExternalRef::new("sample-bot")?,
+            mutation,
+            posting_budget: PostingBudget::new(10)?,
+        })
+    }
+}
+
+/// Text from each layer's name; `Unknown` for the layers in `unreadable`.
+struct Titles(Vec<&'static str>);
+
+impl LayerText for Titles {
+    fn pull_request_text(&self, branch: &BranchName) -> Observed<PullRequestText> {
+        if self.0.contains(&branch.as_str()) {
+            return Observed::Unknown;
+        }
+        match (
+            Text::new(&format!("Work on {branch}")),
+            Text::new(&format!("Body of {branch}")),
+        ) {
+            (Ok(title), Ok(body)) => Observed::Known(PullRequestText { title, body }),
+            _ => Observed::Unknown,
+        }
+    }
+}
+
+/// Run `command` for the task on `issue-5`, whose branch has no pull
+/// request yet, with `forge` opening missing ones.
+fn run_opening(
+    setup: &Stacking,
+    view: &StackView,
+    layers: &Layers,
+    forge: &Forge<'_>,
+    text: &dyn LayerText,
+    command: &StackCommand,
+) -> TestResult<(StackOutcome, Recording)> {
+    run_opening_with(setup, view, layers, forge, text, command, None)
+}
+
+/// [`run_opening`] with the task's push naming `pull_request`.
+fn run_opening_with(
+    setup: &Stacking,
+    view: &StackView,
+    layers: &Layers,
+    forge: &Forge<'_>,
+    text: &dyn LayerText,
+    command: &StackCommand,
+    pull_request: Option<u64>,
+) -> TestResult<(StackOutcome, Recording)> {
+    let runner =
+        Recording::answering(StackResult::Done)?.with_view(StackResult::Viewed(view.clone()));
+    let outcome = StackBoundary {
+        opener: Some(LayerOpener {
+            forge,
+            consent: &Standing,
+            text,
+        }),
+        ..boundary_over(setup, &runner, layers)
+    }
+    .run(
+        &setup.task,
+        setup.fence,
+        command,
+        &PushIntent {
+            pull_request: pull_request.map(number).transpose()?,
+            expected_remote: Some(commit('d')?),
+        },
+    )?;
+    Ok((outcome, runner))
+}
+
+fn boundary_over<'a>(
+    setup: &'a Stacking,
+    runner: &'a Recording,
+    layers: &'a Layers,
+) -> StackBoundary<'a> {
+    StackBoundary {
+        store: &setup.world.fixture.store,
+        grants: &setup.world.grants,
+        destination: &setup.github,
+        clock: &setup.world.clock,
+        runner,
+        pull_requests: layers,
+        remote: layers,
+        updater: layers,
+        local: layers,
+        opener: None,
+    }
+}
+
+/// `issue-3` and `issue-4` with pull requests, and the task's `issue-5`
+/// without one.
+fn new_top_layer() -> TestResult<StackView> {
+    stack_with_prs(&[
+        ("lemarier/issue-3", false, Some(3)),
+        ("lemarier/issue-4", false, Some(4)),
+        ("lemarier/issue-5", false, None),
+    ])
+}
+
+fn open_action(name: &str, base: &str, head: char, draft: bool) -> TestResult<GitHubAction> {
+    Ok(GitHubAction::OpenPullRequest {
+        head: branch(name)?,
+        expected_head: commit(head)?,
+        base: branch(base)?,
+        title: Text::new(&format!("Work on {name}"))?,
+        body: Text::new(&format!("Body of {name}"))?,
+        draft,
+    })
+}
+
+fn link_of(numbers: &[u64], ready: bool) -> TestResult<StackLink> {
+    Ok(StackLink {
+        trunk: branch("main")?,
+        pull_requests: numbers
+            .iter()
+            .map(|value| number(*value))
+            .collect::<TestResult<_>>()?,
+        ready,
+    })
+}
+
+#[test]
+fn a_new_layer_gets_its_pull_request_opened_after_the_push_and_linked_by_number() -> TestResult {
+    let setup = stacking()?;
+    let mut layers = Layers::consistent()?;
+    let forge = Forge::new(&layers.updated)?;
+    let titles = Titles(Vec::new());
+    let (outcome, runner) = run_opening(
+        &setup,
+        &new_top_layer()?,
+        &layers,
+        &forge,
+        &titles,
+        &StackCommand::Submit { ready: false },
+    )?;
+    assert_eq!(outcome, StackOutcome::Ran(StackResult::Done));
+    // The tool pushes nothing and links every layer by number.
+    assert!(runner.ran().is_empty());
+    assert_eq!(runner.linked(), vec![link_of(&[3, 4, 7], false)?]);
+    // Opened after the push, based on the layer below, at the pushed head.
+    assert_eq!(
+        *forge.opened.borrow(),
+        vec![(
+            open_action("lemarier/issue-5", "lemarier/issue-4", 'd', true)?,
+            1
+        )]
+    );
+    // The branch now has a pull request, so a push must name it.
+    let (outcome, _) = run_opening(
+        &setup,
+        &new_top_layer()?,
+        &layers,
+        &forge,
+        &titles,
+        &StackCommand::Push,
+    )?;
+    assert_eq!(
+        outcome,
+        StackOutcome::Refused(StackRefusal::Push(PushRefusal::PullRequestRequired))
+    );
+    // A later submission naming it reuses the opened pull request even
+    // while the tool's view lacks it.
+    layers.pull_requests.insert(
+        7,
+        Observed::Known(Some(layer_pr(
+            7,
+            "lemarier/issue-5",
+            "lemarier/issue-4",
+            'd',
+        )?)),
+    );
+    let (outcome, runner) = run_opening_with(
+        &setup,
+        &new_top_layer()?,
+        &layers,
+        &forge,
+        &titles,
+        &StackCommand::Submit { ready: true },
+        Some(7),
+    )?;
+    assert_eq!(outcome, StackOutcome::Ran(StackResult::Done));
+    assert_eq!(runner.linked(), vec![link_of(&[3, 4, 7], true)?]);
+    assert_eq!(
+        forge.opened.borrow().len(),
+        1,
+        "opened a second pull request"
+    );
+    assert_eq!(layers.updated.borrow().len(), 2);
+    let record = setup.world.fixture.store.task(&setup.task)?;
+    let opened: Vec<_> = record
+        .effects()
+        .iter()
+        .filter(|effect| matches!(effect.request().effect(), Effect::GitHub(_)))
+        .map(|effect| matches!(effect.state(), EffectState::Applied { .. }))
+        .collect();
+    assert_eq!(opened, vec![true]);
+    Ok(())
+}
+
+#[test]
+fn every_missing_layer_is_opened_bottom_to_top_on_the_layer_below() -> TestResult {
+    let setup = stacking()?;
+    settled_layer(&setup, 7, "lemarier/issue-7")?;
+    let mut layers = Layers::consistent()?;
+    layers
+        .local
+        .insert("lemarier/issue-7", Observed::Known(Some(commit('e')?)));
+    let forge = Forge::new(&layers.updated)?;
+    let view = stack_with_prs(&[
+        ("lemarier/issue-3", true, Some(3)),
+        ("lemarier/issue-4", false, Some(4)),
+        ("lemarier/issue-5", false, None),
+        ("lemarier/issue-7", false, None),
+    ])?;
+    let (outcome, runner) = run_opening(
+        &setup,
+        &view,
+        &layers,
+        &forge,
+        &Titles(Vec::new()),
+        &StackCommand::Submit { ready: false },
+    )?;
+    assert_eq!(outcome, StackOutcome::Ran(StackResult::Done));
+    assert_eq!(
+        forge.actions(),
+        vec![
+            open_action("lemarier/issue-5", "lemarier/issue-4", 'd', true)?,
+            open_action("lemarier/issue-7", "lemarier/issue-5", 'e', true)?,
+        ]
+    );
+    assert_eq!(runner.linked(), vec![link_of(&[4, 7, 8], false)?]);
+    Ok(())
+}
+
+#[test]
+fn an_uncertain_open_is_reconciled_to_the_existing_pull_request_not_a_second_one() -> TestResult {
+    let setup = stacking()?;
+    let mut layers = Layers::consistent()?;
+    let forge = Forge::new(&layers.updated)?
+        .failing(EffectFailure::Uncertain(UncertainReason::ResponseLost));
+    let titles = Titles(Vec::new());
+    let submit = StackCommand::Submit { ready: false };
+    let (outcome, runner) =
+        run_opening(&setup, &new_top_layer()?, &layers, &forge, &titles, &submit)?;
+    assert_eq!(
+        outcome,
+        StackOutcome::Ran(StackResult::OpenUncertain {
+            branch: branch("lemarier/issue-5")?
+        })
+    );
+    assert!(runner.linked().is_empty());
+    // Retrying before reconciling never submits the open again.
+    assert!(run_opening(&setup, &new_top_layer()?, &layers, &forge, &titles, &submit).is_err());
+    assert_eq!(forge.opened.borrow().len(), 1);
+    // The lookup finds the pull request the lost response opened.
+    *forge.found.borrow_mut() = Lookup::Applied(Receipt::new(pull_url(7)?, vec![], vec![])?);
+    let report = reconcile(
+        &setup.world.fixture.store,
+        &forge,
+        &setup.task,
+        setup.fence,
+        &setup.world.clock,
+    )?;
+    assert_eq!(report.resolved.len(), 1);
+    // Linked again only because the forge shows it open where it belongs.
+    layers.pull_requests.insert(
+        7,
+        Observed::Known(Some(layer_pr(
+            7,
+            "lemarier/issue-5",
+            "lemarier/issue-4",
+            'd',
+        )?)),
+    );
+    let (outcome, runner) =
+        run_opening(&setup, &new_top_layer()?, &layers, &forge, &titles, &submit)?;
+    assert_eq!(outcome, StackOutcome::Ran(StackResult::Done));
+    assert_eq!(runner.linked(), vec![link_of(&[3, 4, 7], false)?]);
+    assert_eq!(
+        forge.opened.borrow().len(),
+        1,
+        "opened a second pull request"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_refused_open_stops_the_submission_after_the_push_without_linking() -> TestResult {
+    let setup = stacking()?;
+    let layers = Layers::consistent()?;
+    let forge =
+        Forge::new(&layers.updated)?.failing(EffectFailure::NotApplied(NotAppliedReason::Rejected));
+    let (outcome, runner) = run_opening(
+        &setup,
+        &new_top_layer()?,
+        &layers,
+        &forge,
+        &Titles(Vec::new()),
+        &StackCommand::Submit { ready: true },
+    )?;
+    assert_eq!(
+        outcome,
+        StackOutcome::Ran(StackResult::NotOpened {
+            branch: branch("lemarier/issue-5")?,
+            reason: NotAppliedReason::Rejected,
+        })
+    );
+    assert_eq!(layers.updated.borrow().len(), 1);
+    assert!(runner.linked().is_empty());
+    // A refused open created nothing, so running the submission again tries
+    // the open again instead of hitting the refused record.
+    let (outcome, runner) = run_opening(
+        &setup,
+        &new_top_layer()?,
+        &layers,
+        &forge,
+        &Titles(Vec::new()),
+        &StackCommand::Submit { ready: true },
+    )?;
+    assert_eq!(outcome, StackOutcome::Ran(StackResult::Done));
+    assert_eq!(runner.linked(), vec![link_of(&[3, 4, 8], true)?]);
+    assert_eq!(
+        forge.actions(),
+        vec![
+            open_action("lemarier/issue-5", "lemarier/issue-4", 'd', false)?,
+            open_action("lemarier/issue-5", "lemarier/issue-4", 'd', false)?,
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_submission_that_cannot_open_is_refused_before_any_push() -> TestResult {
+    // No text for the new pull request.
+    let setup = stacking()?;
+    let layers = Layers::consistent()?;
+    let forge = Forge::new(&layers.updated)?;
+    let (outcome, runner) = run_opening(
+        &setup,
+        &new_top_layer()?,
+        &layers,
+        &forge,
+        &Titles(vec!["lemarier/issue-5"]),
+        &StackCommand::Submit { ready: false },
+    )?;
+    assert_eq!(
+        outcome,
+        StackOutcome::Refused(StackRefusal::PullRequestText {
+            branch: branch("lemarier/issue-5")?
+        })
+    );
+    // Without the open-pull-request grant, even with an opener.
+    let setup = stacking_granted(&[Permission::PushBranch])?;
+    let refused = run_opening(
+        &setup,
+        &new_top_layer()?,
+        &layers,
+        &forge,
+        &Titles(Vec::new()),
+        &StackCommand::Submit { ready: false },
+    );
+    assert!(matches!(
+        refused,
+        Err(error) if matches!(
+            error.downcast_ref::<kitchen::Error>(),
+            Some(kitchen::Error::Contract(ContractError::PermissionDenied {
+                permission: Permission::OpenPullRequest
+            }))
+        )
+    ));
+    assert!(layers.updated.borrow().is_empty(), "pushed");
+    assert!(forge.opened.borrow().is_empty(), "opened");
+    assert!(runner.linked().is_empty());
+    Ok(())
+}
+
+#[test]
+fn pull_request_text_comes_from_the_head_commit_message() -> TestResult {
+    let text =
+        PullRequestText::from_commit_message("feat: add x\0Why it matters.\n").ok_or("no text")?;
+    assert_eq!(text.title.as_str(), "feat: add x");
+    assert_eq!(text.body.as_str(), "Why it matters.");
+    // An empty body falls back to the subject.
+    let text = PullRequestText::from_commit_message("fix: y\0\n").ok_or("no text")?;
+    assert_eq!(text.body.as_str(), "fix: y");
+    // A long subject is cut on a character boundary.
+    let long = format!("{}é tail", "a".repeat(MAX_TITLE_BYTES - 1));
+    let text = PullRequestText::from_commit_message(&long).ok_or("no text")?;
+    assert_eq!(text.title.as_str(), "a".repeat(MAX_TITLE_BYTES - 1));
+    // No subject, no pull request.
+    assert_eq!(PullRequestText::from_commit_message("  \0body"), None);
+    Ok(())
+}
+
+#[test]
+fn a_pull_request_opened_earlier_is_linked_again_only_while_it_still_matches() -> TestResult {
+    use kitchen::workflows::stack::OpenedFault;
+    // Each case changes #8, which an earlier submission opened for the layer
+    // above the task's branch, before a submission whose view lacks it.
+    let cases: [ReadsChange; 6] = [
+        ("still open", |_| {}, None),
+        (
+            "closed",
+            |layers| {
+                edit_pr(layers, 8, |pr| pr.state = PullRequestState::Closed);
+            },
+            Some(OpenedFault::NotOpen(PullRequestState::Closed)),
+        ),
+        (
+            "retargeted",
+            |layers| edit_pr(layers, 8, |pr| pr.base_branch = "main".to_owned()),
+            Some(OpenedFault::BaseChanged),
+        ),
+        (
+            "replaced",
+            |layers| {
+                edit_pr(layers, 8, |pr| pr.state = PullRequestState::Closed);
+                if let Ok(replacement) = layer_pr(9, "lemarier/issue-7", "lemarier/issue-5", 'e') {
+                    layers.insert(9, Observed::Known(Some(replacement)));
+                }
+            },
+            Some(OpenedFault::NotOpen(PullRequestState::Closed)),
+        ),
+        (
+            "gone",
+            |layers| {
+                layers.insert(8, Observed::Known(None));
+            },
+            Some(OpenedFault::Missing),
+        ),
+        (
+            "unreadable",
+            |layers| {
+                layers.insert(8, Observed::Unknown);
+            },
+            Some(OpenedFault::Unreadable),
+        ),
+    ];
+    for (name, change, fault) in cases {
+        let setup = stacking()?;
+        settled_layer(&setup, 7, "lemarier/issue-7")?;
+        let mut layers = Layers::consistent()?;
+        layers
+            .local
+            .insert("lemarier/issue-7", Observed::Known(Some(commit('e')?)));
+        let forge = Forge::new(&layers.updated)?;
+        let titles = Titles(Vec::new());
+        let submit = StackCommand::Submit { ready: false };
+        let view = stack_with_prs(&[
+            ("lemarier/issue-3", false, Some(3)),
+            ("lemarier/issue-4", false, Some(4)),
+            ("lemarier/issue-5", false, None),
+            ("lemarier/issue-7", false, None),
+        ])?;
+        let (outcome, _) = run_opening(&setup, &view, &layers, &forge, &titles, &submit)?;
+        assert_eq!(outcome, StackOutcome::Ran(StackResult::Done), "{name}");
+        // Both are open where the first submission put them.
+        for (number_, pr) in [
+            (7, layer_pr(7, "lemarier/issue-5", "lemarier/issue-4", 'd')?),
+            (8, layer_pr(8, "lemarier/issue-7", "lemarier/issue-5", 'e')?),
+        ] {
+            layers
+                .pull_requests
+                .insert(number_, Observed::Known(Some(pr)));
+        }
+        layers
+            .remote
+            .insert("lemarier/issue-7", Observed::Known(Some(commit('e')?)));
+        change(&mut layers.pull_requests);
+        let view = stack_with_prs(&[
+            ("lemarier/issue-3", false, Some(3)),
+            ("lemarier/issue-4", false, Some(4)),
+            ("lemarier/issue-5", false, Some(7)),
+            ("lemarier/issue-7", false, None),
+        ])?;
+        let (outcome, runner) =
+            run_opening_with(&setup, &view, &layers, &forge, &titles, &submit, Some(7))?;
+        match fault {
+            None => {
+                assert_eq!(outcome, StackOutcome::Ran(StackResult::Done), "{name}");
+                assert_eq!(runner.linked(), vec![link_of(&[3, 4, 7, 8], false)?]);
+                assert_eq!(layers.updated.borrow().len(), 2, "{name}");
+            }
+            Some(fault) => {
+                assert_eq!(
+                    outcome,
+                    StackOutcome::Refused(StackRefusal::OpenedPullRequest {
+                        branch: branch("lemarier/issue-7")?,
+                        number: number(8)?,
+                        fault,
+                    }),
+                    "{name}"
+                );
+                assert!(runner.linked().is_empty(), "{name} linked");
+                assert_eq!(layers.updated.borrow().len(), 1, "{name} pushed");
+            }
+        }
+        assert_eq!(forge.opened.borrow().len(), 2, "{name} opened another");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_reused_pull_request_not_at_the_pushed_head_is_not_linked() -> TestResult {
+    use kitchen::workflows::stack::OpenedFault;
+    let setup = stacking()?;
+    settled_layer(&setup, 7, "lemarier/issue-7")?;
+    let mut layers = Layers::consistent()?;
+    layers
+        .local
+        .insert("lemarier/issue-7", Observed::Known(Some(commit('e')?)));
+    let forge = Forge::new(&layers.updated)?;
+    let titles = Titles(Vec::new());
+    let submit = StackCommand::Submit { ready: false };
+    let view = stack_with_prs(&[
+        ("lemarier/issue-3", false, Some(3)),
+        ("lemarier/issue-4", false, Some(4)),
+        ("lemarier/issue-5", false, None),
+        ("lemarier/issue-7", false, None),
+    ])?;
+    run_opening(&setup, &view, &layers, &forge, &titles, &submit)?;
+    layers.pull_requests.insert(
+        7,
+        Observed::Known(Some(layer_pr(
+            7,
+            "lemarier/issue-5",
+            "lemarier/issue-4",
+            'd',
+        )?)),
+    );
+    // Someone else's commit reached the layer's pull request after the push.
+    layers.pull_requests.insert(
+        8,
+        Observed::Known(Some(layer_pr(
+            8,
+            "lemarier/issue-7",
+            "lemarier/issue-5",
+            'f',
+        )?)),
+    );
+    layers
+        .remote
+        .insert("lemarier/issue-7", Observed::Known(Some(commit('e')?)));
+    let view = stack_with_prs(&[
+        ("lemarier/issue-3", false, Some(3)),
+        ("lemarier/issue-4", false, Some(4)),
+        ("lemarier/issue-5", false, Some(7)),
+        ("lemarier/issue-7", false, None),
+    ])?;
+    let (outcome, runner) =
+        run_opening_with(&setup, &view, &layers, &forge, &titles, &submit, Some(7))?;
+    assert_eq!(
+        outcome,
+        StackOutcome::Ran(StackResult::OpenedPullRequest {
+            branch: branch("lemarier/issue-7")?,
+            number: number(8)?,
+            fault: OpenedFault::HeadMoved,
+        })
+    );
+    assert_eq!(layers.updated.borrow().len(), 2);
+    assert!(runner.linked().is_empty());
+    assert_eq!(forge.opened.borrow().len(), 2);
+    Ok(())
+}
+
+type PullRequestReads = BTreeMap<u64, Observed<Option<PullRequestView>>>;
+
+/// A named change to pull-request reads and the fault it must cause, if any.
+type ReadsChange = (
+    &'static str,
+    fn(&mut PullRequestReads),
+    Option<kitchen::workflows::stack::OpenedFault>,
+);
+
+fn edit_pr(reads: &mut PullRequestReads, number_: u64, change: impl FnOnce(&mut PullRequestView)) {
+    if let Some(Observed::Known(Some(view))) = reads.get_mut(&number_) {
+        change(view);
+    }
 }

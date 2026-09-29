@@ -157,6 +157,10 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
             Inspection::Conflict | Inspection::Retargeted | Inspection::MergedAtOtherHead => {
                 return Err(EffectFailure::NotApplied(NotAppliedReason::Rejected));
             }
+            // A marked pull request may be this request's, moved since.
+            Inspection::MarkedElsewhere => {
+                return Err(EffectFailure::Uncertain(UncertainReason::ResponseLost));
+            }
             Inspection::Missing => {}
         }
         let mutation = provider
@@ -181,7 +185,8 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
             Inspection::Missing
             | Inspection::Conflict
             | Inspection::Retargeted
-            | Inspection::MergedAtOtherHead => {
+            | Inspection::MergedAtOtherHead
+            | Inspection::MarkedElsewhere => {
                 Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
             }
         }
@@ -207,7 +212,8 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
                 Inspection::Missing
                 | Inspection::Conflict
                 | Inspection::Retargeted
-                | Inspection::MergedAtOtherHead,
+                | Inspection::MergedAtOtherHead
+                | Inspection::MarkedElsewhere,
             ) => Ok(Lookup::Unknown),
             Err(IntegrationError::Timeout) => Err(BackendUnavailable::Timeout),
             Err(IntegrationError::LimitExceeded) => Err(BackendUnavailable::LimitExceeded),

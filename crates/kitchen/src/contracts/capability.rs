@@ -121,6 +121,10 @@ closed_names! {
         LookupCloseIssue = "effect.lookup.close_issue",
         /// Resubmitting a `close_issue` effect's key never repeats it.
         IdempotentCloseIssue = "effect.idempotent.close_issue",
+        /// Look up an `open_pull_request` effect's outcome by its persisted request.
+        LookupOpenPullRequest = "effect.lookup.open_pull_request",
+        /// Resubmitting an `open_pull_request` effect's key never repeats it.
+        IdempotentOpenPullRequest = "effect.idempotent.open_pull_request",
         /// Look up a `ask` effect's outcome by its persisted request.
         LookupAsk = "effect.lookup.ask",
         /// Resubmitting a `ask` effect's key never repeats it.

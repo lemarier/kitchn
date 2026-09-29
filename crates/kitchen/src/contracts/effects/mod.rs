@@ -84,6 +84,8 @@ closed_names! {
         MergePullRequest = "merge_pull_request",
         /// The `close_issue` effect.
         CloseIssue = "close_issue",
+        /// The `open_pull_request` effect.
+        OpenPullRequest = "open_pull_request",
         /// The `ask` effect.
         Ask = "ask",
         /// The `install_disabled_schedule` effect.
@@ -115,6 +117,7 @@ impl EffectKind {
             Self::LinkDependency => Capability::LookupLinkDependency,
             Self::MergePullRequest => Capability::LookupMergePullRequest,
             Self::CloseIssue => Capability::LookupCloseIssue,
+            Self::OpenPullRequest => Capability::LookupOpenPullRequest,
             Self::Ask => Capability::LookupAsk,
             Self::InstallDisabledSchedule => Capability::LookupInstallDisabledSchedule,
             Self::SetScheduleState => Capability::LookupSetScheduleState,
@@ -140,6 +143,7 @@ impl EffectKind {
             Self::LinkDependency => Capability::IdempotentLinkDependency,
             Self::MergePullRequest => Capability::IdempotentMergePullRequest,
             Self::CloseIssue => Capability::IdempotentCloseIssue,
+            Self::OpenPullRequest => Capability::IdempotentOpenPullRequest,
             Self::Ask => Capability::IdempotentAsk,
             Self::InstallDisabledSchedule => Capability::IdempotentInstallDisabledSchedule,
             Self::SetScheduleState => Capability::IdempotentSetScheduleState,
@@ -197,6 +201,7 @@ impl Effect {
                 GitHubAction::LinkDependency { .. } => EffectKind::LinkDependency,
                 GitHubAction::MergePullRequest { .. } => EffectKind::MergePullRequest,
                 GitHubAction::CloseIssue { .. } => EffectKind::CloseIssue,
+                GitHubAction::OpenPullRequest { .. } => EffectKind::OpenPullRequest,
             },
             Self::Roger(_) => EffectKind::Ask,
             Self::Schedule(effect) => match effect {

@@ -186,6 +186,23 @@ pub enum GitHubAction {
         /// Desired label.
         label: LabelDefinition,
     },
+    /// Open a pull request for a branch already on the remote, identified by
+    /// its persisted idempotency marker. Opening never pushes: the provider
+    /// refuses unless the remote branch is at `expected_head`.
+    OpenPullRequest {
+        /// Head branch in this repository.
+        head: BranchName,
+        /// Commit the remote head branch must hold when the request is made.
+        expected_head: CommitId,
+        /// Base branch the pull request targets.
+        base: BranchName,
+        /// Pull request title.
+        title: Text,
+        /// Pull request body.
+        body: Text,
+        /// Open it as a draft rather than ready for review.
+        draft: bool,
+    },
 }
 /// GitHub's issue closure reasons. Duplicate retains the referenced issue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,7 +226,8 @@ impl GitHubMutation {
     /// Validate bounded content and relationships.
     ///
     /// # Errors
-    /// Rejects self-links, malformed labels, and oversized titles/bodies.
+    /// Rejects self-links, malformed labels, oversized titles/bodies, and a
+    /// pull request whose head is its base.
     pub fn validate(&self) -> Result<(), ContractError> {
         match &self.action {
             GitHubAction::CloseIssue { repository, .. } if repository != &self.repository => {
@@ -226,23 +244,25 @@ impl GitHubMutation {
             }
             GitHubAction::MergePullRequest { .. } | GitHubAction::PostComment { .. } => Ok(()),
             GitHubAction::SetLabel { label, .. } => validate_label_name(label),
-            GitHubAction::CreateIssue { title, body } => {
-                if title.as_str().len() > 256
-                    || title.as_str().trim() != title.as_str()
-                    || title.as_str().chars().any(char::is_control)
-                    || body.as_str().len() > 60 * 1024
-                {
-                    Err(invalid())
-                } else {
-                    Ok(())
-                }
-            }
+            GitHubAction::CreateIssue { title, body } => validate_title_body(title, body),
+            GitHubAction::OpenPullRequest { head, base, .. } if head == base => Err(invalid()),
+            GitHubAction::OpenPullRequest { title, body, .. } => validate_title_body(title, body),
             GitHubAction::LinkSubIssue { parent, child } if parent == child => Err(invalid()),
             GitHubAction::LinkDependency { issue, blocker } if issue == blocker => Err(invalid()),
             GitHubAction::LinkSubIssue { .. } | GitHubAction::LinkDependency { .. } => Ok(()),
             GitHubAction::CreateLabel { label } => label.validate(),
         }
     }
+}
+fn validate_title_body(title: &Text, body: &Text) -> Result<(), ContractError> {
+    if title.as_str().len() > 256
+        || title.as_str().trim() != title.as_str()
+        || title.as_str().chars().any(char::is_control)
+        || body.as_str().len() > 60 * 1024
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 fn validate_label_name(name: &str) -> Result<(), ContractError> {
     if name.is_empty() || name.len() > 50 || name.chars().any(char::is_control) {
@@ -279,6 +299,7 @@ impl GitHubEffect {
                 Permission::EditLabels
             }
             GitHubAction::CreateIssue { .. } => Permission::CreateIssue,
+            GitHubAction::OpenPullRequest { .. } => Permission::OpenPullRequest,
             GitHubAction::LinkSubIssue { .. } | GitHubAction::LinkDependency { .. } => {
                 Permission::EditIssueRelationships
             }

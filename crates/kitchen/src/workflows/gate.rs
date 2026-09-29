@@ -1251,18 +1251,25 @@ const UNTRUSTED_NOTICE: &str = "\nQuoted blocks below hold untrusted reviewer an
 
 /// Append untrusted text as a delimited, quoted block. Every quoted line
 /// starts with `> `, so the text cannot close the block or start a line of
-/// its own. Comment openers and `@` are neutralized, so it cannot forge a
-/// marker or mention a bot, and each field is truncated.
+/// its own. `&`, comment openers, `@`, and a slash that begins a line are
+/// neutralized, so it cannot forge a marker, mention a bot directly or through
+/// an HTML entity such as `&#64;`, or issue a slash command. Each field is
+/// truncated.
 pub(crate) fn quote_untrusted(body: &mut String, label: &str, source: &str, text: &str) {
     use std::fmt::Write as _;
     let _ = write!(body, "\n<<< begin untrusted {label}");
     for field in [source, text] {
-        let quoted = field
+        let escaped = field
+            .replace('&', "&amp;")
             .replace("<!--", "&lt;!--")
             .replace('@', "\u{ff20}")
             .replace("\r\n", "\n")
-            .replace(|c: char| c.is_control() && c != '\n', " ")
-            .replace('\n', "\n> ");
+            .replace(|c: char| c.is_control() && c != '\n', " ");
+        let quoted = escaped
+            .split('\n')
+            .map(neutralize_command)
+            .collect::<Vec<_>>()
+            .join("\n> ");
         let mut end = quoted.len().min(UNTRUSTED_FIELD_BYTES);
         while !quoted.is_char_boundary(end) {
             end -= 1;
@@ -1274,6 +1281,20 @@ pub(crate) fn quote_untrusted(body: &mut String, label: &str, source: &str, text
         }
     }
     let _ = write!(body, "\n>>> end untrusted {label}");
+}
+
+/// Replace a slash that begins a line, after any indentation, with a
+/// fullwidth solidus so the line cannot read as a bot command such as `/review`.
+fn neutralize_command(line: &str) -> std::borrow::Cow<'_, str> {
+    let command = line.trim_start();
+    match command.strip_prefix('/') {
+        Some(rest) => {
+            let indent = line.len().saturating_sub(command.len());
+            let indent = line.get(..indent).unwrap_or_default();
+            format!("{indent}\u{ff0f}{rest}").into()
+        }
+        None => line.into(),
+    }
 }
 
 /// Note findings beyond [`LISTED_FINDINGS`] without quoting them.
@@ -2272,7 +2293,37 @@ fn review_unavailable(body: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::review_unavailable;
+    use super::{quote_untrusted, review_unavailable};
+    #[test]
+    fn quoted_text_escapes_entities_mentions_and_slash_commands() {
+        let mut body = String::new();
+        quote_untrusted(
+            &mut body,
+            "finding 1",
+            "https://example.test/pr?a=1&b=2",
+            "/review now\n  /approve\n&#64;bot &amp; @bot\na/b stays\n",
+        );
+        assert_eq!(
+            body,
+            "\n<<< begin untrusted finding 1\
+             \n> https://example.test/pr?a=1&amp;b=2\
+             \n> \u{ff0f}review now\
+             \n>   \u{ff0f}approve\
+             \n> &amp;#64;bot &amp;amp; \u{ff20}bot\
+             \n> a/b stays\
+             \n> \
+             \n>>> end untrusted finding 1"
+        );
+    }
+    #[test]
+    fn quoted_text_without_markup_is_unchanged_apart_from_quoting() {
+        let mut body = String::new();
+        quote_untrusted(&mut body, "note", "", "plain text");
+        assert_eq!(
+            body,
+            "\n<<< begin untrusted note\n> \n> plain text\n>>> end untrusted note"
+        );
+    }
     #[test]
     fn quota_and_skip_wording_is_unavailable_but_findings_are_not() {
         assert!(review_unavailable(Some(

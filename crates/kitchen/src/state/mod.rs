@@ -48,6 +48,7 @@ mod store;
 pub use consumer::{ConsumerEvent, ConsumerRecord, ConsumerState, MAX_CONSUMER_HISTORY};
 pub use effects::{ReconcileReport, reconcile, reread_settled, run_effect};
 pub use error::{Corruption, Limit, StateError, StorageOperation};
+pub(crate) use marker::PairPlan;
 pub use marker::{
     IssueRevision, MAX_MARKER_HISTORY, MAX_MARKER_PAYLOAD_BYTES, MAX_MARKERS, MarkerAttempt,
     MarkerFact, MarkerKey, MarkerPayload, MarkerRecording, MarkerSchema, MarkerSubject,

@@ -83,6 +83,9 @@ pub enum Error {
     /// A forge binding was missing or refused an approved write.
     #[error(transparent)]
     Forge(#[from] crate::house::ForgeError),
+    /// A deliberation thread, record, or pin was refused.
+    #[error(transparent)]
+    Deliberation(#[from] crate::workflows::deliberation::DeliberationError),
 }
 
 impl Error {
@@ -109,6 +112,7 @@ impl Error {
             Self::Intake(error) => error.class(),
             Self::HouseInit(error) => error.class(),
             Self::Forge(error) => error.class(),
+            Self::Deliberation(error) => error.class(),
         }
     }
 }

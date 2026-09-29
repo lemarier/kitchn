@@ -54,6 +54,7 @@ use crate::{
         reconcile, run_effect,
     },
     workflows::{
+        deliberation,
         pickup::{Base, WorkerBrief, quote, stable_hash},
         recovery::{
             EnvironmentFault, FollowUp, ProviderCheck, ProviderInterruption, QueuedFollowUp,
@@ -496,6 +497,10 @@ pub fn launch_worker(
     if let Some(worker) = unstopped_worker(ctx, &record, fence) {
         return Ok(LaunchOutcome::SuperviseFirst { worker });
     }
+    // Context records pinned to the task travel with its brief, bounded. The
+    // outcomes above use no brief, so an oversized context cannot hide them;
+    // it is still refused before an attempt starts.
+    let text = deliberation::context_brief(&deliberation::task_context(ctx.store, task)?, &text)?;
     // A selection the executor cannot launch is a configuration problem no
     // retry fixes: refuse it before an attempt is spent on it.
     if let Some(resolved) = &record.spec().agent {

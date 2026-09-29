@@ -881,7 +881,11 @@ fn adoption(
         message_ids(&replayed),
         message_ids(&first)
     );
-    if !message_ids(&replayed).starts_with(&message_ids(&first)) {
+    // Redelivery may regroup batches, so the two only need to agree on
+    // their shared, nonempty prefix.
+    let (got, held) = (message_ids(&replayed), message_ids(&first));
+    let shared = got.len().min(held.len());
+    if shared == 0 || got.get(..shared) != held.get(..shared) {
         return Err("the adopter did not receive the unacknowledged messages".into());
     }
     let read = backend.next_delivery();

@@ -320,7 +320,9 @@ pub fn run_mailbox(
         // The backend may redeliver under a new batch id: what must survive
         // adoption is every unacknowledged message, oldest first.
         let adopted = match restarted.next_delivery() {
-            Ok(Some(adopted)) if message_ids(&adopted).starts_with(&message_ids(&first)) => adopted,
+            Ok(Some(adopted)) if same_start(&message_ids(&adopted), &message_ids(&first)) => {
+                adopted
+            }
             Ok(_) | Err(_) => {
                 return fail(
                     Check::AdoptionReplays,
@@ -397,6 +399,14 @@ pub fn run_mailbox(
         .results
         .push((Check::DeliveryOrder, CheckResult::Passed));
     Ok(report)
+}
+
+/// Whether two nonempty id sequences agree on their shared prefix. A
+/// redelivered batch may regroup the same messages, splitting or joining
+/// batches; the later drain checks that every message arrives.
+fn same_start<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+    let shared = a.len().min(b.len());
+    shared > 0 && a.get(..shared) == b.get(..shared)
 }
 
 fn message_ids(delivery: &Delivery) -> Vec<&ExternalRef> {
@@ -1192,5 +1202,22 @@ impl<'a> Runner<'a> {
                 "declared inventory was unavailable",
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod same_start_tests {
+    use super::same_start;
+
+    #[test]
+    fn regrouped_batches_agree_on_their_shared_prefix() {
+        // Same batch, a split one, and a joined one all start alike.
+        assert!(same_start(&[1, 2], &[1, 2]));
+        assert!(same_start(&[1], &[1, 2]));
+        assert!(same_start(&[1, 2, 3], &[1, 2]));
+        // A reorder, a different first message, or nothing at all does not.
+        assert!(!same_start(&[2, 1], &[1, 2]));
+        assert!(!same_start(&[3], &[1, 2]));
+        assert!(!same_start::<u8>(&[], &[1]));
     }
 }

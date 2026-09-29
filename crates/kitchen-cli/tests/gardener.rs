@@ -12,11 +12,9 @@ use std::{
 mod executable;
 
 use kitchen::{
-    BackendId, CredentialId, HolderId, HouseId,
+    BackendId, CredentialId, HouseId,
     adoption::HouseRegistry,
-    contracts::{
-        Claimant, ExternalRef, Grant, IssueNumber, Permission, Repository, Text, Timestamp,
-    },
+    contracts::{ExternalRef, Grant, Permission, Repository, Text},
     house::HouseConfig,
     scheduling::PrecheckOutcome,
     state::{HouseStore, StoreOptions},
@@ -120,22 +118,25 @@ fn a_handled_stale_issue_keeps_later_daily_runs_idle() -> TestResult {
     let root = tempfile::tempdir()?;
     let stale = issue(3, "open", "2000-01-01T00:00:00Z", &[]);
     let gh = fake_gh(root.path(), "[]", &format!("[{stale}]"))?;
-    let argv = scheduled_argv(root.path(), gh)?;
-    assert_eq!(outcome(&run(&argv)?), PrecheckOutcome::Actionable);
+    assert_eq!(
+        outcome(&run(&scheduled_argv(root.path(), gh)?)?),
+        PrecheckOutcome::Actionable
+    );
 
-    // The pass reports the stale issue and records it as handled at its
-    // current revision; the following days have nothing to do.
-    let store = house_store(root.path())?;
-    let markers = gardener::StaleMarkers::new(&store)?;
-    let project = Repository::new("sample/project")?;
-    let updated = Timestamp::from_unix_millis(946_684_800_000); // 2000-01-01
-    markers.record(
-        &project,
-        IssueNumber::new(3)?,
-        updated,
-        &Claimant::scheduled(HolderId::new("gardener-tick")?),
-        Timestamp::from_unix_millis(946_684_900_000),
-    )?;
+    // The pass reports the stale issue; the report is its last update and
+    // leaves it stale. The following days have nothing to do.
+    fake_forge(root.path())?;
+    forge_set(root.path(), "posted_at", "2000-01-02T00:00:00Z")?;
+    let reported = report(root.path())?;
+    assert_eq!(
+        reported.status.code(),
+        Some(0),
+        "{}",
+        text(&reported.stderr)
+    );
+    let handled = issue(3, "open", "2000-01-02T00:00:00Z", &[]);
+    let gh = fake_gh(root.path(), "[]", &format!("[{handled}]"))?;
+    let argv = scheduled_argv(root.path(), gh)?;
     for day in 0..3 {
         let output = run(&argv)?;
         assert_eq!(outcome(&output), PrecheckOutcome::Idle, "day {day}");
@@ -144,7 +145,7 @@ fn a_handled_stale_issue_keeps_later_daily_runs_idle() -> TestResult {
 
     // Another stale issue that was never handled wakes the schedule.
     let other = issue(5, "open", "2000-01-01T00:00:00Z", &[]);
-    let gh = fake_gh(root.path(), "[]", &format!("[{stale},{other}]"))?;
+    let gh = fake_gh(root.path(), "[]", &format!("[{handled},{other}]"))?;
     assert_eq!(
         outcome(&run(&scheduled_argv(root.path(), gh)?)?),
         PrecheckOutcome::Actionable
@@ -224,50 +225,6 @@ fn a_schedule_installed_without_a_store_keeps_its_behavior() -> TestResult {
 }
 
 #[test]
-fn the_gardener_report_does_not_wake_the_next_run() -> TestResult {
-    let root = tempfile::tempdir()?;
-    let stale = issue(3, "open", "2000-01-01T00:00:00Z", &[]);
-    let gh = fake_gh(root.path(), "[]", &format!("[{stale}]"))?;
-    assert_eq!(
-        outcome(&run(&scheduled_argv(root.path(), gh)?)?),
-        PrecheckOutcome::Actionable
-    );
-
-    // The pass comments on the issue, which moves its last update into the
-    // next run's change window, then records the revision it read back.
-    let reported = issue(3, "open", "2999-01-01T00:00:00Z", &[]);
-    let store = house_store(root.path())?;
-    gardener::StaleMarkers::new(&store)?.record(
-        &Repository::new("sample/project")?,
-        IssueNumber::new(3)?,
-        Timestamp::from_unix_millis(32_472_144_000_000), // 2999-01-01
-        &Claimant::scheduled(HolderId::new("gardener-tick")?),
-        Timestamp::from_unix_millis(946_684_900_000),
-    )?;
-    let gh = fake_gh(
-        root.path(),
-        &format!("[{reported}]"),
-        &format!("[{reported}]"),
-    )?;
-    let next = run(&scheduled_argv(root.path(), gh)?)?;
-    assert_eq!(outcome(&next), PrecheckOutcome::Idle);
-    assert_eq!(String::from_utf8(next.stdout)?, "idle\n");
-
-    // Someone else comments afterwards: that is a change to look at.
-    let answered = issue(3, "open", "2999-01-02T00:00:00Z", &[]);
-    let gh = fake_gh(
-        root.path(),
-        &format!("[{answered}]"),
-        &format!("[{answered}]"),
-    )?;
-    assert_eq!(
-        outcome(&run(&scheduled_argv(root.path(), gh)?)?),
-        PrecheckOutcome::Actionable
-    );
-    Ok(())
-}
-
-#[test]
 fn precheck_failures_never_exit_as_idle() -> TestResult {
     let root = tempfile::tempdir()?;
     // The forge read fails: an execution error, not a quiet day.
@@ -327,9 +284,11 @@ fn precheck_failures_never_exit_as_idle() -> TestResult {
 /// under `root`: `updated` is issue 3's last update and `state` its state,
 /// `posted` holds the report comment once a POST applied, and `mode` makes a
 /// POST `deny` (403, nothing applied) or `lose` its response (applied, but
-/// `gh` fails). `reread` set to `fail` fails issue reads once a report is
-/// posted. `posts` counts POSTs, and `comments` holds other comments on the
-/// issue. Nothing here is a live forge.
+/// `gh` fails). A POST creates the comment at `posted_at` and moves the
+/// issue's last update there, or to `after` when set, as when someone else
+/// updates the issue right after the post. `reread` set to `fail` fails
+/// issue reads once a report is posted. `posts` counts POSTs, and `comments`
+/// holds other comments on the issue. Nothing here is a live forge.
 fn fake_forge(root: &Path) -> TestResult<PathBuf> {
     let dir = root.join("forge");
     std::fs::create_dir_all(&dir)?;
@@ -340,6 +299,8 @@ fn fake_forge(root: &Path) -> TestResult<PathBuf> {
         ("reread", "ok"),
         ("posts", ""),
         ("comments", ""),
+        ("posted_at", "2999-01-01T00:00:00Z"),
+        ("after", ""),
     ] {
         std::fs::write(dir.join(name), value)?;
     }
@@ -353,7 +314,8 @@ if [ "$6" = POST ]; then
   mode=$(/bin/cat '{d}/mode')
   if [ "$mode" = deny ]; then printf 'HTTP/2 403 Forbidden\r\n\r\n{{}}'; exit 1; fi
   /bin/cat | /usr/bin/sed 's/^{{//; s/}}$//' > '{d}/posted'
-  echo 2999-01-01T00:00:00Z > '{d}/updated'
+  /bin/cat '{d}/posted_at' > '{d}/posted_time'
+  if [ -s '{d}/after' ]; then /bin/cat '{d}/after' > '{d}/updated'; else /bin/cat '{d}/posted_at' > '{d}/updated'; fi
   if [ "$mode" = lose ]; then exit 1; fi
   printf 'HTTP/2 201 Created\r\n\r\n{{}}'; exit 0
 fi
@@ -363,7 +325,8 @@ case "$6" in
     sep=''
     if [ -s '{d}/comments' ]; then /bin/cat '{d}/comments'; sep=','; fi
     if [ -s '{d}/posted' ]; then
-      printf '%s{{"id":77,"user":{{"login":"sample-bot"}},"html_url":"https://github.com/sample/project/issues/3#issuecomment-77",%s}}' "$sep" "$(/bin/cat '{d}/posted')"
+      at=$(/bin/cat '{d}/posted_time')
+      printf '%s{{"id":77,"user":{{"login":"sample-bot"}},"html_url":"https://github.com/sample/project/issues/3#issuecomment-77","created_at":"%s","updated_at":"%s",%s}}' "$sep" "$at" "$at" "$(/bin/cat '{d}/posted')"
     fi
     printf ']' ;;
   *issues/3*)
@@ -531,7 +494,7 @@ fn a_failed_report_records_nothing_even_beside_a_requester_comment() -> TestResu
     forge_set(
         root.path(),
         "comments",
-        r#"{"id":88,"user":{"login":"sample-bot"},"html_url":"https://github.com/sample/project/issues/3#issuecomment-88","body":"unrelated"}"#,
+        r#"{"id":88,"user":{"login":"sample-bot"},"html_url":"https://github.com/sample/project/issues/3#issuecomment-88","created_at":"2000-01-01T00:00:00Z","updated_at":"2000-01-01T00:00:00Z","body":"unrelated"}"#,
     )?;
     forge_set(root.path(), "mode", "deny")?;
     let refused = report(root.path())?;
@@ -628,6 +591,81 @@ fn a_run_interrupted_after_the_post_records_it_on_restart() -> TestResult {
     assert_eq!(
         precheck_after(root.path(), "2999-01-01T00:00:00Z")?,
         PrecheckOutcome::Idle
+    );
+    Ok(())
+}
+
+#[test]
+fn an_update_between_the_post_and_the_reread_stays_unhandled() -> TestResult {
+    let root = tempfile::tempdir()?;
+    fake_forge(root.path())?;
+    // Someone labels the issue right after the report lands, before the
+    // command reads it again.
+    forge_set(root.path(), "after", "2999-01-01T00:05:00Z")?;
+    let reported = report(root.path())?;
+    assert_eq!(
+        reported.status.code(),
+        Some(0),
+        "{}",
+        text(&reported.stderr)
+    );
+    assert_eq!(
+        text(&reported.stdout),
+        "recorded https://github.com/sample/project/issues/3#issuecomment-77; later activity stays unhandled\n"
+    );
+    assert_eq!(posts(root.path())?, 1);
+    // Only the revision the report was decided on is handled, so the label
+    // change wakes the next precheck.
+    assert_eq!(
+        precheck_after(root.path(), "2999-01-01T00:05:00Z")?,
+        PrecheckOutcome::Actionable
+    );
+
+    // The next pass reports on that activity and is handled once the report
+    // is the latest update.
+    forge_set(root.path(), "after", "")?;
+    forge_set(root.path(), "posted_at", "2999-01-02T00:00:00Z")?;
+    let next = report(root.path())?;
+    assert_eq!(next.status.code(), Some(0), "{}", text(&next.stderr));
+    assert_eq!(
+        text(&next.stdout),
+        "recorded https://github.com/sample/project/issues/3#issuecomment-77\n"
+    );
+    assert_eq!(posts(root.path())?, 2);
+    assert_eq!(
+        precheck_after(root.path(), "2999-01-02T00:00:00Z")?,
+        PrecheckOutcome::Idle
+    );
+    Ok(())
+}
+
+#[test]
+fn an_update_while_interrupted_after_the_post_stays_unhandled_on_restart() -> TestResult {
+    let root = tempfile::tempdir()?;
+    fake_forge(root.path())?;
+    // The post applies, then the run stops before recording.
+    forge_set(root.path(), "reread", "fail")?;
+    assert_eq!(report(root.path())?.status.code(), Some(3));
+    assert_eq!(posts(root.path())?, 1);
+
+    // Someone updates the issue before the restart.
+    forge_set(root.path(), "reread", "ok")?;
+    forge_set(root.path(), "updated", "2999-01-01T00:05:00Z")?;
+    let recovered = report(root.path())?;
+    assert_eq!(
+        recovered.status.code(),
+        Some(0),
+        "{}",
+        text(&recovered.stderr)
+    );
+    assert_eq!(
+        text(&recovered.stdout),
+        "recorded https://github.com/sample/project/issues/3#issuecomment-77; later activity stays unhandled\n"
+    );
+    assert_eq!(posts(root.path())?, 1);
+    assert_eq!(
+        precheck_after(root.path(), "2999-01-01T00:05:00Z")?,
+        PrecheckOutcome::Actionable
     );
     Ok(())
 }

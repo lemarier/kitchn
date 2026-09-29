@@ -283,9 +283,22 @@ fn report_stale(args: ReportStaleArgs) -> Result<gardener::StaleReportOutcome, F
 
 fn report_stale_outcome(result: Result<gardener::StaleReportOutcome, Failure>) -> ExitCode {
     let (written, code) = match result {
-        Ok(gardener::StaleReportOutcome::Recorded { receipt, .. }) => {
-            (writeln!(io::stdout().lock(), "recorded {receipt}"), 0)
-        }
+        Ok(gardener::StaleReportOutcome::Recorded {
+            receipt,
+            later_activity: false,
+            ..
+        }) => (writeln!(io::stdout().lock(), "recorded {receipt}"), 0),
+        Ok(gardener::StaleReportOutcome::Recorded {
+            receipt,
+            later_activity: true,
+            ..
+        }) => (
+            writeln!(
+                io::stdout().lock(),
+                "recorded {receipt}; later activity stays unhandled"
+            ),
+            0,
+        ),
         Ok(gardener::StaleReportOutcome::AlreadyHandled) => {
             (writeln!(io::stdout().lock(), "already handled"), 0)
         }

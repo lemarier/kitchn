@@ -244,7 +244,9 @@ issue is marked handled only after GitHub shows the posted comment. Exits `0`
 when recorded or already handled, `1` when the post did not apply (nothing is
 recorded; run it again later), `2` for invalid input and `3` when GitHub, the
 house or its store refuse or cannot be read. Running it again after a crash
-looks the earlier post up instead of posting twice.
+looks the earlier post up instead of posting twice. If someone else updated the
+issue after the report was decided, the command prints `recorded <url>; later
+activity stays unhandled` and the next precheck wakes for that activity.
 
 ## `kitchn budget`
 

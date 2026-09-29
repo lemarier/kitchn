@@ -85,8 +85,9 @@ pub struct RetryPolicy {
 impl RetryPolicy {
     /// Largest accepted attempt count.
     pub const MAX_ATTEMPTS: u32 = 16;
-    /// Longest accepted elapsed budget (30 days).
-    pub const MAX_ELAPSED: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+    /// Longest accepted elapsed budget (31 days), enough for a task to stay
+    /// retryable across the longest usage window.
+    pub const MAX_ELAPSED: Duration = Duration::from_secs(31 * 24 * 60 * 60);
 
     /// Validate a retry budget.
     ///

@@ -12,6 +12,7 @@ use crate::{
     workflows::{
         cleanup::DiskPressurePolicy,
         pickup::{DEFAULT_FIX_ROUNDS, DEFAULT_REVIEW_REQUESTS, FollowUpBudget},
+        tick::TickPolicy,
     },
 };
 
@@ -141,6 +142,10 @@ pub struct HouseConfig {
     /// unattended runs. Meeting them never grants anything by itself.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub graduation: BTreeMap<WorkType, GraduationPolicy>,
+    /// The workflow passes `kitchn tick` runs and how often. Absent means the
+    /// tick runs nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick: Option<TickPolicy>,
 }
 
 impl HouseConfig {
@@ -228,6 +233,13 @@ impl HouseConfig {
             .grants
             .iter()
             .any(|grant| !self.policy_limits.iter().any(|limit| limit.covers(grant)))
+        {
+            return Err(HouseError::PolicyRelaxation);
+        }
+        if self
+            .tick
+            .as_ref()
+            .is_some_and(|tick| !tick.keeps(self.schedules.as_ref()))
         {
             return Err(HouseError::PolicyRelaxation);
         }

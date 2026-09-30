@@ -847,6 +847,7 @@ fn house_config() -> TestResult<HouseConfig> {
         follow_up: None,
         backend: None,
         graduation: Default::default(),
+        tick: None,
     })
 }
 

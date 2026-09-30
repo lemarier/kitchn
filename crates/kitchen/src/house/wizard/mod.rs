@@ -591,6 +591,7 @@ pub fn plan_house_init(
         }),
         backend: Some(default_binding(worker_backend)?),
         graduation: BTreeMap::new(),
+        tick: None,
     };
     config.validate()?;
     bundle.validate(&config)?;

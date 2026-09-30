@@ -12,4 +12,5 @@ pub mod mailbox;
 pub mod pickup;
 pub mod scaffold;
 pub mod store;
+pub mod tick;
 pub mod trust;

@@ -104,6 +104,9 @@ pub enum Error {
     /// A house mailbox call was refused.
     #[error(transparent)]
     Mail(#[from] crate::state::MailError),
+    /// A house tick or run ledger call was refused.
+    #[error(transparent)]
+    Tick(#[from] crate::workflows::tick::TickError),
 }
 
 impl Error {
@@ -137,6 +140,7 @@ impl Error {
             Self::Usage(error) => error.class(),
             Self::Audit(error) => error.class(),
             Self::Mail(error) => error.class(),
+            Self::Tick(error) => error.class(),
         }
     }
 }

@@ -441,6 +441,50 @@ a full mailbox refuses the post instead of dropping it. Bodies and answers are
 at most 8 KiB. `kitchn store retain` removes handled messages once their
 attempt ended or their task settled.
 
+## `kitchn tick`
+
+The one command a trigger runs for a house. launchd, cron, GitHub Actions or a
+backend schedule only start it; the house configuration's `tick` passes and
+the run ledger in the house store decide what runs.
+
+```sh
+kitchn tick --registry <dir> --house <id> [--store <dir>]
+kitchn tick runs --registry <dir> --house <id> [--store <dir>]
+kitchn tick settle --registry <dir> --house <id> [--store <dir>] --pass <pass> --run <n> --reason <text> --holder <you>
+kitchn tick trigger launchd|cron --kitchn <abs path> --registry <abs dir> --house <id> [--every-minutes 1-59]
+```
+
+Each configured pass runs when it never ran or its last run started at least
+`everyMinutes` ago. A pass runs under its own lease in the house store, so a
+second trigger that fires while it runs prints `busy` and changes nothing. A
+pass that runs longer than its one-hour lease renews it, but the lease never
+extends past six hours from the run's start. Once the lease lapses or the six
+hours pass, the run can no longer record tasks, renew, or record its end.
+
+A run whose lease expired before it recorded an end is recorded as uncertain by
+the next tick. Its pass stays blocked: every tick prints `blocked` with the
+number of unresolved effects on the tasks the run recorded, and exits 1. A run
+may have acted without recording a task, so zero does not mean it did nothing
+and no tick clears the block. Check what the run did, then settle it with
+`kitchn tick settle`. The ledger records who settled it (`--holder`), when, and
+why (`--reason`, at most 4096 bytes). A scheduled trigger cannot settle a run.
+Settling a settled run changes nothing.
+
+Each run records its start, end, outcome, usage where the pass reports it, and
+up to 8 backend run references as evidence. The ledger keeps the newest 64
+settled runs per pass for at most 30 days; it never drops a running or
+uncertain run. The tick exits 1 when a pass failed, is blocked, or outlasted its
+lease, or when the house configures no passes.
+
+The scheduled pickup, coordination, repair and gate passes are not wired in
+yet; until they are, every pass that runs is recorded as failed with "pass not
+available in this build".
+
+`runs` lists the ledger and reads only. `trigger` prints a launchd plist or a
+crontab line that runs the tick every `--every-minutes` (default 5; for cron it
+must divide 60, since cron restarts its minute step each hour); it installs
+nothing and changes no live schedule.
+
 ## `kitchn pickup`
 
 Offline pickup diagnostics.

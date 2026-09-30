@@ -489,8 +489,9 @@ nothing and changes no live schedule.
 ## `kitchn run`
 
 One bounded scheduled pass, for a trigger such as an Orca schedule, launchd, or
-cron. `kitchn tick` does not run these passes yet. Each pass needs only the
-house; everything else defaults from it.
+cron. `kitchn tick` does not run these passes yet. `gate` needs only the house;
+`pickup`, `coordinate`, and `repair` also need the worker backend options below.
+Everything else defaults from the house.
 
 ```sh
 kitchn run pickup     <house> <backend> [--ready-label ready] [--needs-spec-label needs-spec]

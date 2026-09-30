@@ -376,6 +376,9 @@ pub fn doctor(
                 let grant = if matches!(
                     permission,
                     Permission::LaunchWorker
+                        | Permission::MessageWorker
+                        | Permission::CancelWorker
+                        | Permission::ReleaseResource
                         | Permission::PushBranch
                         | Permission::OpenPullRequest
                         | Permission::Merge

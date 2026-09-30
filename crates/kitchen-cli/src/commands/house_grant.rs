@@ -3,7 +3,7 @@ use clap::Args;
 use kitchen::{
     HouseId,
     adoption::{HouseRegistry, RepositoryMatch},
-    contracts::{Grant, Permission, Repository},
+    contracts::{Grant, GrantScope, Permission, Repository},
     house::{HouseConfig, HouseError, Workflow, forge_binding, workflow_grant_permissions},
 };
 use std::{
@@ -33,6 +33,9 @@ pub struct GrantArgs {
     /// Repository to scope the grant to; inferred only when the house has one.
     #[arg(long)]
     repository: Option<Repository>,
+    /// Revoke matching authority across the whole house, including other repositories.
+    #[arg(long)]
+    house_wide: bool,
     /// Show the exact change without writing or prompting.
     #[arg(long, conflicts_with = "yes")]
     preview: bool,
@@ -42,6 +45,9 @@ pub struct GrantArgs {
 }
 
 pub fn run(args: GrantArgs, revoke: bool) -> Result<(String, bool), kitchen::Error> {
+    if args.house_wide && !revoke {
+        return Err(HouseError::InvalidInput.into());
+    }
     let root = match args.registry {
         Some(path) => super::house::canonical_root(path)?,
         None => std::env::var_os("HOME")
@@ -90,17 +96,15 @@ pub fn run(args: GrantArgs, revoke: bool) -> Result<(String, bool), kitchen::Err
             repository
         }
     };
+    let permissions = selected_permissions(args.workflow, args.permission)?;
     let requested = if revoke {
-        let permissions = selected_permissions(args.workflow, args.permission)?;
         current
             .grants
             .union(&current.policy_limits)
             .filter(|grant| {
                 permissions.contains(&grant.permission)
-                    && match &grant.scope {
-                        kitchen::contracts::GrantScope::House => true,
-                        kitchen::contracts::GrantScope::Repository(scope) => scope == &repository,
-                    }
+                    && (args.house_wide
+                        || matches!(&grant.scope, GrantScope::Repository(scope) if scope == &repository))
             })
             .cloned()
             .collect()
@@ -171,6 +175,22 @@ pub fn run(args: GrantArgs, revoke: bool) -> Result<(String, bool), kitchen::Err
                 ""
             },
         ));
+    }
+    if revoke && !args.house_wide {
+        let retained: BTreeSet<_> = current
+            .grants
+            .union(&current.policy_limits)
+            .filter(|grant| {
+                matches!(grant.scope, GrantScope::House) && permissions.contains(&grant.permission)
+            })
+            .map(|grant| grant.permission.to_string())
+            .collect();
+        if !retained.is_empty() {
+            preview.push_str(&format!(
+                "  Retained house-scoped authority for {}. Use --house-wide to revoke matching authority across all repositories.\n",
+                retained.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
     }
     preview.push_str("No workers, schedules, or external effects are started.\n");
     if args.preview || changed.is_empty() {

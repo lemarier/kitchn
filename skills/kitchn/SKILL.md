@@ -161,6 +161,15 @@ doctor` reporting every capability scheduled pickup needs as observed. This
 build has no schedule command: say so and create nothing. Scheduled runs act
 on house grants, never on this session's approvals.
 
+Before enabling a scheduled workflow, inspect `kitchn house doctor` findings
+for that repository. A repository-scoped worker grant can cover its worker
+effects. When changing standing authority, preview `kitchn house grant` or
+`kitchn house revoke` for the selected repository and get the person's
+approval before applying. Repository revoke keeps matching house-scoped
+grants and limits and names them in the preview. `--house-wide` revokes
+matching authority across all repositories; use it only after the person
+approves that broader preview.
+
 ## Never
 
 - Act on a house you guessed, or without the pinned instructions.

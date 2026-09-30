@@ -1517,6 +1517,46 @@ fn a_parked_adopted_worker_resumes_when_the_provider_works() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn provider_recovery_does_not_resume_an_adopted_worker_still_starting() -> TestResult {
+    use kitchen::state::AttemptState;
+    use kitchen::workflows::recovery::{ProviderCheck, ProviderInterruption, RecoverySignals};
+    let world = World::new()?;
+    let (task, fence, worker) = adopted_with_budget(&world, 1)?;
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Starting);
+    let refused = RecoverySignals {
+        provider: Some(ProviderInterruption::Quota),
+        ..workflows_support::signals(&worker, Some(common::at(1)))
+    };
+    let effects = world.backend.effects_performed();
+    let outcome = supervise(
+        &world.ctx(),
+        &task,
+        fence,
+        &supervision()?,
+        &SupervisionInput {
+            signals: Some(&refused),
+            provider: ProviderCheck::Working,
+            ..SupervisionInput::default()
+        },
+    )?;
+    assert_eq!(outcome, Supervision::Running(WorkerState::Starting));
+    assert_eq!(world.backend.effects_performed(), effects);
+    assert!(matches!(
+        world
+            .fixture
+            .store
+            .task(&task)?
+            .attempts()
+            .last()
+            .map(|attempt| attempt.state()),
+        Some(AttemptState::Interrupted { .. })
+    ));
+    Ok(())
+}
+
 fn claim_with_policy(world: &World, number: u64) -> TestResult<(TaskId, Fence)> {
     let (claimant, _) = under_consumer(world, "coordinator")?;
     let mut template = template()?;

@@ -359,6 +359,8 @@ impl GitHubReadTransport for GhCli {
         if output.code != Some(0) {
             return Err(match reported_status(&output.stdout) {
                 Some(404) => IntegrationError::NotFound,
+                Some(429) => IntegrationError::Unavailable,
+                Some(403) if reports_rate_limit(&output.stdout) => IntegrationError::Unavailable,
                 Some(status) => IntegrationError::HttpStatus(status),
                 None => IntegrationError::Unavailable,
             });
@@ -392,6 +394,29 @@ fn reported_status(stdout: &[u8]) -> Option<u16> {
         .ok()
         .and_then(|body| body.status?.parse::<u16>().ok())
         .filter(|status| (400..=599).contains(status))
+}
+
+/// A 403 can mean GitHub throttled a read instead of refusing its scope.
+fn reports_rate_limit(stdout: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct ErrorBody {
+        #[serde(default)]
+        message: String,
+        #[serde(rename = "x-ratelimit-remaining")]
+        remaining: Option<String>,
+        #[serde(default)]
+        headers: std::collections::BTreeMap<String, String>,
+    }
+    let Ok(body) = serde_json::from_slice::<ErrorBody>(stdout) else {
+        return false;
+    };
+    body.message.to_ascii_lowercase().contains("rate limit")
+        || body.message.to_ascii_lowercase().contains("rate-limit")
+        || body.remaining.as_deref() == Some("0")
+        || body
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-ratelimit-remaining") && value == "0")
 }
 
 pub(crate) struct ProcessOutput {

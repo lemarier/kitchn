@@ -1286,7 +1286,7 @@ fn supervise_step(
     let stalled = signals
         .and_then(RecoverySignals::idle_since)
         .is_some_and(|since| now.saturating_since(since) > policy.idle_deadline);
-    if live
+    if matches!(state, WorkerState::Ready | WorkerState::AwaitingReply)
         && !person
         && let Some(signals) = signals
         && let Some(interruption) = signals.provider

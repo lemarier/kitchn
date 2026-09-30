@@ -300,7 +300,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             return Ok(None);
         };
         let id = ExternalRef::new(&id).map_err(|_| OrcaError::Malformed { what: "mailbox" })?;
-        let senders = self.sender_dispatches()?;
+        // Assignment lookup enriches sender-only messages. Payload dispatches
+        // remain usable when the Task listing is unavailable or over its bound.
+        let senders = self.sender_dispatches().unwrap_or_default();
         let mut unreadable = 0_usize;
         let messages = check
             .messages

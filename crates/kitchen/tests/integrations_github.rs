@@ -382,6 +382,22 @@ fn gh_cli_reports_a_missing_resource_apart_from_other_failures() -> Result {
             r#"{"message":"Server Error","status":"502"}"#,
             IntegrationError::HttpStatus(502),
         ),
+        (
+            r#"{"message":"API rate limit exceeded","status":"429"}"#,
+            IntegrationError::Unavailable,
+        ),
+        (
+            r#"{"message":"You have exceeded a secondary rate limit","status":"403"}"#,
+            IntegrationError::Unavailable,
+        ),
+        (
+            r#"{"message":"Forbidden","status":"403","x-ratelimit-remaining":"0"}"#,
+            IntegrationError::Unavailable,
+        ),
+        (
+            r#"{"message":"Resource not accessible by integration","status":"403"}"#,
+            IntegrationError::HttpStatus(403),
+        ),
         ("gh: connection refused", IntegrationError::Unavailable),
         ("", IntegrationError::Unavailable),
     ] {

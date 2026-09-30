@@ -1192,6 +1192,28 @@ fn mailbox_routes_a_question_by_its_assigned_terminal() -> TestResult {
 }
 
 #[test]
+fn mailbox_keeps_payload_dispatches_when_assignment_listing_fails() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    sim.state().mail = VecDeque::from([json!({
+        "deliveryId": "delivery_listing_failure",
+        "messages": [
+            {"id": "msg_done", "type": "worker_done", "from_handle": "term_ctx_1",
+             "payload": {"dispatchId": "ctx_1", "outcome": "succeeded"}},
+            {"id": "msg_question", "type": "question", "from_handle": "term_ctx_1"}
+        ]
+    })]);
+    sim.fault_on(&["orchestration", "task-list"], Fault::TimeoutBeforeEffect);
+    let delivery = backend.next_delivery()?.ok_or("delivery")?;
+    assert_eq!(delivery.unreadable, 0);
+    assert_eq!(delivery.messages.len(), 2);
+    assert_eq!(delivery.messages[0].worker, Some(worker("ctx_1")?));
+    assert_eq!(delivery.messages[0].outcome, Some(WorkerOutcome::Succeeded));
+    assert_eq!(delivery.messages[1].worker, None);
+    Ok(())
+}
+
+#[test]
 fn adoption_moves_the_mailbox_to_the_new_coordinator() -> TestResult {
     let sim = SimOrca::default();
     let old = connect(&sim)?;

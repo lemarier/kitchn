@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "house": "delivery",
+  "forge": "github",
+  "backend": "github",
+  "requester": "widget-bot[bot]",
+  "credential": "github",
+  "credentialKind": {
+    "gitHubApp": {
+      "appId": 1001,
+      "installation": 2002
+    }
+  },
+  "postingBudget": 20
+}

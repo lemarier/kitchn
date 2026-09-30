@@ -1,0 +1,160 @@
+{
+  "schema": 1,
+  "house": "delivery",
+  "kitchen": "2179f96f85cc40df74e433fb86de0f37745b4ffe",
+  "guidance": "2179f96f85cc40df74e433fb86de0f37745b4ffe",
+  "repositories": [
+    "acme/widget"
+  ],
+  "postingDestinations": [
+    "acme/widget"
+  ],
+  "requiredReviewers": [
+    "expediter"
+  ],
+  "requiredChecks": [
+    "cargo-deny (advisories)",
+    "cargo-deny (bans licenses sources)",
+    "check",
+    "dependency-review",
+    "zizmor"
+  ],
+  "policyLimits": [
+    {
+      "permission": "launch-worker",
+      "scope": {
+        "type": "repository",
+        "repository": "acme/widget"
+      },
+      "destination": "orca",
+      "credential": "orca"
+    },
+    {
+      "permission": "message-worker",
+      "scope": {
+        "type": "house"
+      },
+      "destination": "orca",
+      "credential": "orca"
+    },
+    {
+      "permission": "cancel-worker",
+      "scope": {
+        "type": "house"
+      },
+      "destination": "orca",
+      "credential": "orca"
+    },
+    {
+      "permission": "release-resource",
+      "scope": {
+        "type": "house"
+      },
+      "destination": "orca",
+      "credential": "orca"
+    },
+    {
+      "permission": "push-branch",
+      "scope": {
+        "type": "repository",
+        "repository": "acme/widget"
+      },
+      "destination": "github",
+      "credential": "github"
+    },
+    {
+      "permission": "open-pull-request",
+      "scope": {
+        "type": "repository",
+        "repository": "acme/widget"
+      },
+      "destination": "github",
+      "credential": "github"
+    }
+  ],
+  "grants": [
+    {
+      "permission": "launch-worker",
+      "scope": {
+        "type": "repository",
+        "repository": "acme/widget"
+      },
+      "destination": "orca",
+      "credential": "orca"
+    },
+    {
+      "permission": "message-worker",
+      "scope": {
+        "type": "house"
+      },
+      "destination": "orca",
+      "credential": "orca"
+    },
+    {
+      "permission": "cancel-worker",
+      "scope": {
+        "type": "house"
+      },
+      "destination": "orca",
+      "credential": "orca"
+    },
+    {
+      "permission": "release-resource",
+      "scope": {
+        "type": "house"
+      },
+      "destination": "orca",
+      "credential": "orca"
+    },
+    {
+      "permission": "push-branch",
+      "scope": {
+        "type": "repository",
+        "repository": "acme/widget"
+      },
+      "destination": "github",
+      "credential": "github"
+    },
+    {
+      "permission": "open-pull-request",
+      "scope": {
+        "type": "repository",
+        "repository": "acme/widget"
+      },
+      "destination": "github",
+      "credential": "github"
+    }
+  ],
+  "agents": {
+    "default": {
+      "agent": "claude"
+    },
+    "rules": [
+      {
+        "when": {
+          "role": "sous-chef"
+        },
+        "use": {
+          "agent": "claude"
+        }
+      },
+      {
+        "when": {
+          "role": "expediter"
+        },
+        "use": {
+          "agent": "codex"
+        }
+      }
+    ]
+  },
+  "followUp": {
+    "fixRounds": 2,
+    "reviewRequests": 1
+  },
+  "backend": {
+    "kind": "orca",
+    "backend": "orca",
+    "credential": "orca"
+  }
+}

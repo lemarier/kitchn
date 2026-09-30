@@ -433,18 +433,18 @@ impl Fixture {
     }
 }
 
-/// Run with KITCHEN_LIVE_POLICY_FIXTURE and KITCHEN_LIVE_FORGE_FIXTURE set to
-/// the read-only evidence paths. The private house files are never committed.
+/// The fixtures copy the structure of a live dogfood house policy and GitHub
+/// App forge binding (#266), with identifiers renamed.
 #[test]
-#[ignore = "requires the supplied read-only live house and forge evidence"]
-fn live_house_policy_allows_delivery_and_fake_github_distinguishes_a_refused_mint() -> TestResult {
-    let policy = std::env::var("KITCHEN_LIVE_POLICY_FIXTURE")?;
-    let binding = std::env::var("KITCHEN_LIVE_FORGE_FIXTURE")?;
-    let house: HouseConfig = serde_json::from_slice(&fs::read(policy)?)?;
-    let binding: ForgeBinding = serde_json::from_slice(&fs::read(binding)?)?;
+fn live_shaped_house_policy_allows_delivery_and_fake_github_distinguishes_a_refused_mint()
+-> TestResult {
+    let house: HouseConfig =
+        serde_json::from_str(include_str!("fixtures/house/app-delivery.json"))?;
+    let binding: ForgeBinding =
+        serde_json::from_str(include_str!("fixtures/house/app-delivery-forge.json"))?;
     house.validate()?;
     let scope = binding.scope(&house)?;
-    let repository = Repository::new("lemarier/kitchn")?;
+    let repository = Repository::new("acme/widget")?;
     for permission in [Permission::PushBranch, Permission::OpenPullRequest] {
         scope.authorize_effect(&house.house, &repository, permission, 0)?;
     }
@@ -461,7 +461,7 @@ fn live_house_policy_allows_delivery_and_fake_github_distinguishes_a_refused_min
             (
                 app.installation.get(),
                 app.app_id.get(),
-                "kitchn-expediter".into(),
+                "widget-bot".into(),
             ),
         );
         remote.mint_status = Some(403);
@@ -489,7 +489,7 @@ fn live_house_policy_allows_delivery_and_fake_github_distinguishes_a_refused_min
     let mutation = GitHubMutation {
         repository: repository.clone(),
         action: GitHubAction::OpenPullRequest {
-            head: BranchName::new("lemarier/issue-237-attempt-2")?,
+            head: BranchName::new("acme/issue-237-attempt-2")?,
             expected_head: CommitId::new(&"a".repeat(40))?,
             base: BranchName::new("main")?,
             title: Text::new("Add gate guidance")?,

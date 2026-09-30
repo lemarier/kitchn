@@ -673,6 +673,13 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
                     | IntegrationError::InvalidInput
                     | IntegrationError::LimitExceeded
                     | IntegrationError::PermissionDenied
+                    | IntegrationError::MissingPermission(_)
+                    | IntegrationError::CredentialMismatch(_)
+                    | IntegrationError::HttpStatus(_)
+                    | IntegrationError::AttemptNotRunning
+                    | IntegrationError::WorkerNotLive
+                    | IntegrationError::WorkerUnobservable
+                    | IntegrationError::PushPreflight(_)
                     | IntegrationError::AppRequiredForPush
                     | IntegrationError::BudgetExhausted => NotMerged::Unread,
                 };

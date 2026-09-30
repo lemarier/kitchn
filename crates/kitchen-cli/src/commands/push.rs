@@ -9,23 +9,31 @@ use std::{
 use clap::Args;
 use kitchen::{
     HouseId, TaskId,
-    adapters::orca::{Invocation, OrcaRunner, SystemRunner},
+    adapters::{
+        OrcaSession,
+        orca::{
+            DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, Invocation,
+            OrcaRunner, SystemRunner,
+        },
+        resolve_backend,
+    },
     adoption::HouseRegistry,
     contracts::{
-        Clock, ExternalRef, GrantScope, HouseGrants, Permission, Repository, SystemClock,
-        TaskAuthority, Text,
+        Capability, Clock, ExternalRef, GrantScope, HouseGrants, Permission, Repository,
+        SystemClock, TaskAuthority, Text,
     },
     house::{CredentialKind, checked_forge_credential, forge_binding, runtime_config},
     integrations::github::{
-        GitHubClient, GitHubExecutor, HouseScope, IntegrationError, ReadLimits,
+        GitHubClient, GitHubExecutor, HouseScope, IntegrationError, PushPreflight, ReadLimits,
     },
+    scheduling::AgentFamily,
     state::{AttemptState, HouseStore, StoreOptions, TaskState},
     workflows::{
         coordination::{Standing, current_worker, task_branch},
         pickup::{IssueRef, issue_task_id},
         push::{
             GitHubPullRequests, GitHubRemoteBranches, GitRemote, IsolatedGitConfig, OpenOutcome,
-            OpenRequest, PullRequests, PushBoundary, PushIntent, PushOutcome,
+            OpenRequest, PullRequests, PushBoundary, PushIntent, PushOutcome, delivery_worker_live,
             open_task_pull_request, owns_worktree,
         },
         repair::Observed,
@@ -89,24 +97,19 @@ impl PushArgs {
         let store = HouseStore::open(&store_path, self.house.clone(), StoreOptions::default())?;
         let record = store.task(&self.task)?;
         let TaskState::Claimed { lease } = record.state() else {
-            return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+            return Err(IntegrationError::PushPreflight(PushPreflight::Claim).into());
         };
         if !lease.is_live(SystemClock.now()) || record.cancel_request().is_some() {
-            return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+            return Err(IntegrationError::PushPreflight(PushPreflight::Claim).into());
         }
         let worker = current_worker(&record)
-            .ok_or(kitchen::integrations::github::IntegrationError::PermissionDenied)?;
+            .ok_or(IntegrationError::PushPreflight(PushPreflight::Worker))?;
         let attempt = record
             .attempts()
             .last()
-            .ok_or(kitchen::integrations::github::IntegrationError::PermissionDenied)?;
-        if attempt.number() != worker.attempt
-            || !matches!(
-                attempt.state(),
-                AttemptState::Running | AttemptState::Interrupted { .. }
-            )
-        {
-            return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+            .ok_or(IntegrationError::AttemptNotRunning)?;
+        if attempt.number() != worker.attempt || attempt.state() != AttemptState::Running {
+            return Err(IntegrationError::AttemptNotRunning.into());
         }
         let repository = record
             .spec()
@@ -153,7 +156,7 @@ fn authorize_delivery(
             backend,
         )?;
         if &selected != credential {
-            return Err(IntegrationError::PermissionDenied.into());
+            return Err(IntegrationError::CredentialMismatch(permission).into());
         }
         // Check the executor's policy before the branch update: it may be
         // narrower than the task's grant after a forge binding change.
@@ -175,6 +178,24 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
     let runtime = runtime_config(&selected.registry, &args.house)?
         .and_then(|runtime| runtime.orca)
         .ok_or(kitchen::house::HouseError::HouseSelection)?;
+    let backend = resolve_backend(
+        &selected.house,
+        OrcaSession {
+            run: runtime.run.clone(),
+            coordinator: runtime.coordinator.clone(),
+            repo: runtime.repo.clone(),
+            base_branch: None,
+            branch_prefix: None,
+            agent: AgentFamily::Claude,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+            launch_timeout: DEFAULT_LAUNCH_TIMEOUT,
+            runtime_dir: runtime.runtime_dir.clone(),
+            reservation_timeout: DEFAULT_RESERVATION_TIMEOUT,
+        },
+        SystemRunner::new(runtime.executable.clone()),
+        &[Capability::WorkerStatusAndOutcome],
+    )?;
+    delivery_worker_live(&selected.record, &backend)?;
     let current = SystemRunner::new(runtime.executable).run(&Invocation::new(
         vec!["worktree".into(), "current".into(), "--json".into()],
         DEADLINE,
@@ -185,7 +206,7 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
     let current: serde_json::Value = serde_json::from_slice(&current.stdout)
         .map_err(|_| kitchen::integrations::github::IntegrationError::Unknown)?;
     if current["ok"] != true {
-        return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+        return Err(IntegrationError::PushPreflight(PushPreflight::WorktreeContext).into());
     }
     let worktree = &current["result"]["worktree"];
     let worktree_id = worktree["id"]
@@ -203,19 +224,20 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
                 .map_err(|_| kitchen::house::HouseError::HouseSelection)?,
         )
     {
-        return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+        return Err(IntegrationError::PushPreflight(PushPreflight::WorktreePath).into());
     }
     let worktree_id = ExternalRef::new(worktree_id)?;
-    if !owns_worktree(&selected.record, &worktree_id)
-        || worktree["projectId"].as_str() != Some(&format!("github:{}", selected.repository))
-    {
-        return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+    if !owns_worktree(&selected.record, &worktree_id) {
+        return Err(IntegrationError::PushPreflight(PushPreflight::WorktreeOwnership).into());
+    }
+    if worktree["projectId"].as_str() != Some(&format!("github:{}", selected.repository)) {
+        return Err(IntegrationError::PushPreflight(PushPreflight::WorktreeRepository).into());
     }
     if args.acceptance_done {
         acceptance_reported(&selected, Path::new(worktree_path))?;
     }
     let branch = task_branch(&selected.record)
-        .ok_or(kitchen::integrations::github::IntegrationError::PermissionDenied)?;
+        .ok_or(IntegrationError::PushPreflight(PushPreflight::Branch))?;
     let git = executable("git").ok_or(kitchen::house::HouseError::InvalidInput)?;
     let config = IsolatedGitConfig::create(
         &git,
@@ -241,7 +263,7 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
         || worktree["branch"].as_str() != Some(&format!("refs/heads/{branch}"))
         || worktree["head"].as_str() != Some(head.as_str())
     {
-        return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+        return Err(IntegrationError::PushPreflight(PushPreflight::Checkout).into());
     }
     let binding = forge_binding(&selected.registry, &args.house)?;
     let gh = connect_gh(checked_forge_credential(&selected.registry, &binding)?)?;
@@ -427,7 +449,7 @@ fn acceptance_reported(selected: &Selected, worktree: &Path) -> Result<(), kitch
         .canonicalize()
         .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
     if !canonical_file.starts_with(canonical_worktree) {
-        return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+        return Err(IntegrationError::PushPreflight(PushPreflight::AcceptanceReport).into());
     }
     let file = std::fs::File::open(canonical_file)
         .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
@@ -504,7 +526,7 @@ mod tests {
                 &credential
             ),
             Err(kitchen::Error::Integration(
-                IntegrationError::PermissionDenied
+                IntegrationError::MissingPermission(Permission::OpenPullRequest)
             ))
         ));
         assert!(matches!(
@@ -517,7 +539,7 @@ mod tests {
                 &CredentialId::new("other")?
             ),
             Err(kitchen::Error::Integration(
-                IntegrationError::PermissionDenied
+                IntegrationError::CredentialMismatch(Permission::PushBranch)
             ))
         ));
         Ok(())

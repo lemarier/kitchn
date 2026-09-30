@@ -357,10 +357,10 @@ impl GitHubReadTransport for GhCli {
             max_bytes,
         )?;
         if output.code != Some(0) {
-            return Err(if reports_not_found(&output.stdout) {
-                IntegrationError::NotFound
-            } else {
-                IntegrationError::Unavailable
+            return Err(match reported_status(&output.stdout) {
+                Some(404) => IntegrationError::NotFound,
+                Some(status) => IntegrationError::HttpStatus(status),
+                None => IntegrationError::Unavailable,
             });
         }
         Ok(output.stdout)
@@ -381,15 +381,17 @@ impl GitHubReadTransport for GhCli {
     }
 }
 
-/// Whether a failed `gh api` call printed GitHub's 404 error body. Any other
-/// failure, including an unparsable body, stays a possibly transient outage.
-fn reports_not_found(stdout: &[u8]) -> bool {
+/// The HTTP status in a failed `gh api` response, without its private body.
+/// An unparsable response remains a possibly transient outage.
+fn reported_status(stdout: &[u8]) -> Option<u16> {
     #[derive(serde::Deserialize)]
     struct ErrorBody {
         status: Option<String>,
     }
     serde_json::from_slice::<ErrorBody>(stdout)
-        .is_ok_and(|body| body.status.as_deref() == Some("404"))
+        .ok()
+        .and_then(|body| body.status?.parse::<u16>().ok())
+        .filter(|status| (400..=599).contains(status))
 }
 
 pub(crate) struct ProcessOutput {
@@ -489,4 +491,21 @@ pub(crate) fn run(
         code,
         stdout: bytes,
     })
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::reported_status;
+
+    #[test]
+    fn gh_api_error_status_is_read_without_exposing_its_body() {
+        assert_eq!(
+            reported_status(
+                br#"{"message":"Resource not accessible by integration","status":"403"}"#
+            ),
+            Some(403)
+        );
+        assert_eq!(reported_status(br#"{"status":"404"}"#), Some(404));
+        assert_eq!(reported_status(br#"{"status":"nonsense"}"#), None);
+    }
 }

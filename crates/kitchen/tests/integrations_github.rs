@@ -79,7 +79,7 @@ fn scope_rejects_foreign_house_repository_requester_and_budget() -> Result {
     );
     assert_eq!(
         selected.authorize_effect(&house, &repo, Permission::EditLabels, 0),
-        Err(IntegrationError::PermissionDenied)
+        Err(IntegrationError::MissingPermission(Permission::EditLabels))
     );
     selected.authorize_effect(&house, &repo, Permission::PostComment, 1)?;
     let mismatch = HouseScope::new(
@@ -380,7 +380,7 @@ fn gh_cli_reports_a_missing_resource_apart_from_other_failures() -> Result {
         ),
         (
             r#"{"message":"Server Error","status":"502"}"#,
-            IntegrationError::Unavailable,
+            IntegrationError::HttpStatus(502),
         ),
         ("gh: connection refused", IntegrationError::Unavailable),
         ("", IntegrationError::Unavailable),

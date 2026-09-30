@@ -1050,6 +1050,7 @@ impl StackBoundary<'_> {
             Err(UpdateFailure::Redirected(key)) => {
                 return Ok(refused(PushRefusal::CheckoutRedirect(key)));
             }
+            Err(UpdateFailure::Credential(error)) => return Err(error.into()),
             Err(UpdateFailure::Uncertain) => return Ok(StackOutcome::Ran(StackResult::Uncertain)),
         }
         record_landed(

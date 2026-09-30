@@ -508,7 +508,9 @@ fn policy_limits_for_another_credential_permit_nothing() -> TestResult {
     );
     assert!(matches!(
         result,
-        Err(Error::Integration(IntegrationError::PermissionDenied))
+        Err(Error::Integration(IntegrationError::MissingPermission(
+            Permission::PostComment
+        )))
     ));
     Ok(())
 }

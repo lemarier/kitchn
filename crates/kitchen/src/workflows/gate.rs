@@ -2099,15 +2099,24 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
             | Observation::Unknown => (pr.base.sha.clone(), BaseTipRead::Unreadable),
             // A timeout or outage may clear; the recorded pass retries a
             // bounded number of times.
-            Observation::Unavailable(IntegrationError::Timeout | IntegrationError::Unavailable) => {
-                (pr.base.sha.clone(), BaseTipRead::Retry)
-            }
+            Observation::Unavailable(
+                IntegrationError::Timeout
+                | IntegrationError::Unavailable
+                | IntegrationError::HttpStatus(500..=599),
+            ) => (pr.base.sha.clone(), BaseTipRead::Retry),
             // Scope, permission, budget, and decision errors are not expected
             // from a read the PR read already authorized; the pass ends
             // without a verdict rather than posting under them.
             Observation::Unavailable(
                 error @ (IntegrationError::ScopeMismatch
                 | IntegrationError::PermissionDenied
+                | IntegrationError::MissingPermission(_)
+                | IntegrationError::CredentialMismatch(_)
+                | IntegrationError::HttpStatus(_)
+                | IntegrationError::AttemptNotRunning
+                | IntegrationError::WorkerNotLive
+                | IntegrationError::WorkerUnobservable
+                | IntegrationError::PushPreflight(_)
                 | IntegrationError::AppRequiredForPush
                 | IntegrationError::BudgetExhausted
                 | IntegrationError::StaleDecision),

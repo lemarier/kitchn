@@ -803,7 +803,7 @@ fn refusal(response: &AppResponse) -> IntegrationError {
     match response.status {
         429 => IntegrationError::Unavailable,
         403 if mentions_rate_limit(&response.body) => IntegrationError::Unavailable,
-        400..=499 => IntegrationError::ScopeMismatch,
+        400..=499 => IntegrationError::HttpStatus(response.status),
         _ => IntegrationError::Unavailable,
     }
 }
@@ -915,11 +915,11 @@ mod refusal_tests {
                 403,
                 r#"{"message":"Resource not accessible by integration"}"#
             )),
-            IntegrationError::ScopeMismatch
+            IntegrationError::HttpStatus(403)
         );
         assert_eq!(
             refusal(&response(422, r#"{"message":"rate"}"#)),
-            IntegrationError::ScopeMismatch
+            IntegrationError::HttpStatus(422)
         );
         assert_eq!(refusal(&response(502, "")), IntegrationError::Unavailable);
     }

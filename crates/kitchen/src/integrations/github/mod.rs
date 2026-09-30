@@ -86,6 +86,27 @@ pub enum IntegrationError {
     /// The house does not permit this effect.
     #[error("integration effect is not permitted")]
     PermissionDenied,
+    /// The selected forge policy lacks this permission.
+    #[error("forge policy does not permit {0}")]
+    MissingPermission(crate::contracts::Permission),
+    /// The task grant names a different forge credential.
+    #[error("task grant credential differs from the forge binding for {0}")]
+    CredentialMismatch(crate::contracts::Permission),
+    /// The provider refused an HTTP request; no response body is exposed.
+    #[error("GitHub HTTP {0}")]
+    HttpStatus(u16),
+    /// A worker delivery has no running attempt under its current claim.
+    #[error("worker delivery requires a running attempt")]
+    AttemptNotRunning,
+    /// The worker could not be positively observed as live.
+    #[error("worker delivery requires a live worker observation")]
+    WorkerNotLive,
+    /// The backend could not establish the worker's state.
+    #[error("worker delivery cannot observe the worker")]
+    WorkerUnobservable,
+    /// A checked push failed a local worktree or claim preflight.
+    #[error("push preflight failed: {0}")]
+    PushPreflight(PushPreflight),
     /// Worker pushes need an installation token scoped to one repository.
     #[error(
         "worker push requires a GitHub App forge binding; use `kitchn forge bind --app-id ... --installation ...`"
@@ -122,16 +143,56 @@ impl IntegrationError {
             Self::InvalidInput => ErrorClass::InvalidInput,
             Self::ScopeMismatch
             | Self::PermissionDenied
+            | Self::MissingPermission(_)
+            | Self::CredentialMismatch(_)
+            | Self::HttpStatus(401 | 403)
+            | Self::AttemptNotRunning
+            | Self::WorkerNotLive
+            | Self::WorkerUnobservable
+            | Self::PushPreflight(_)
             | Self::AppRequiredForPush
             | Self::BudgetExhausted => ErrorClass::Refused,
             Self::StaleDecision => ErrorClass::Conflict,
-            Self::Timeout
+            Self::HttpStatus(_)
+            | Self::Timeout
             | Self::Unavailable
             | Self::NotFound
             | Self::LimitExceeded
             | Self::Unknown => ErrorClass::Execution,
         }
     }
+}
+
+/// Which local fact failed before a checked worker push could begin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PushPreflight {
+    /// The task has no live uncancelled claim.
+    #[error("task claim is absent, expired, or cancelled")]
+    Claim,
+    /// The current launch has no worker receipt.
+    #[error("current worker launch is absent")]
+    Worker,
+    /// Orca did not identify the invoking worktree.
+    #[error("Orca did not identify the invoking worktree")]
+    WorktreeContext,
+    /// The invocation is outside Orca's worktree path.
+    #[error("invocation is outside the recorded worktree")]
+    WorktreePath,
+    /// The worktree is not the current launch's worktree.
+    #[error("worktree does not match the current launch")]
+    WorktreeOwnership,
+    /// Orca associated the worktree with another repository.
+    #[error("worktree repository does not match the task")]
+    WorktreeRepository,
+    /// The task has no launched branch.
+    #[error("current launch has no branch")]
+    Branch,
+    /// The Git and Orca checkouts disagree with the launch record.
+    #[error("checkout branch or head differs from the current launch")]
+    Checkout,
+    /// The acceptance report resolves outside the launched worktree.
+    #[error("acceptance report resolves outside the worktree")]
+    AcceptanceReport,
 }
 
 impl From<crate::contracts::ContractError> for IntegrationError {

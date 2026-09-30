@@ -1297,9 +1297,10 @@ fn supervising_an_adopted_worker_to_its_end_allows_the_replacement() -> TestResu
         launch(&world, &task, fence, 1)?,
         LaunchOutcome::SuperviseFirst { .. }
     ));
+    world.backend.set_worker_state(&worker, WorkerState::Ready);
     assert_eq!(
         step(&world, &task, fence)?,
-        Supervision::Running(WorkerState::Starting)
+        Supervision::Running(WorkerState::Ready)
     );
     assert!(matches!(
         launch(&world, &task, fence, 1)?,

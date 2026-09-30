@@ -373,7 +373,7 @@ fn close_issue_requires_its_grant_and_reconciles_lost_response() -> TestResult {
     );
     assert_eq!(
         backend.effect(close()?),
-        Err(IntegrationError::PermissionDenied)
+        Err(IntegrationError::MissingPermission(Permission::CloseIssue))
     );
 
     let fixture = Fixture::new()?;
@@ -2096,7 +2096,9 @@ fn open_pull_request_requires_its_grant_and_reconciles_a_lost_response() -> Test
     );
     assert_eq!(
         backend.effect(mutation(open_action("Add x")?)?),
-        Err(IntegrationError::PermissionDenied)
+        Err(IntegrationError::MissingPermission(
+            Permission::OpenPullRequest
+        ))
     );
     // A house that permits it cannot open one for a task without the grant.
     let permitted = Fixture::new()?;

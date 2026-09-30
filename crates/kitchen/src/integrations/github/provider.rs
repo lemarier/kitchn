@@ -1039,7 +1039,7 @@ mod mutation_tests {
         );
         assert!(matches!(
             executor.effect(effect.mutation.clone()),
-            Err(IntegrationError::PermissionDenied)
+            Err(IntegrationError::MissingPermission(Permission::CloseIssue))
         ));
         let granted = HouseScope::new(
             HouseId::new("sample")?,

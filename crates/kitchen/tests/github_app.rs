@@ -210,6 +210,7 @@ struct FakeApi {
     remote: Arc<Mutex<Remote>>,
     public: Vec<u8>,
     clock: Arc<TestClock>,
+    app_id: u64,
 }
 
 fn respond(status: u16, body: &Value) -> Result<AppResponse, IntegrationError> {
@@ -245,7 +246,7 @@ impl FakeApi {
         let now = self.clock.seconds();
         let number = |name: &str| claims.get(name).and_then(Value::as_u64);
         header == json!({"alg":"RS256","typ":"JWT"})
-            && number("iss") == Some(APP_ID)
+            && number("iss") == Some(self.app_id)
             && number("iat").is_some_and(|iat| iat <= now)
             && number("exp").is_some_and(|exp| exp > now)
             && matches!((number("iat"), number("exp")), (Some(iat), Some(exp)) if exp - iat <= 600)
@@ -402,6 +403,7 @@ impl Fixture {
             remote: Arc::clone(&remote),
             public: key.public,
             clock: Arc::clone(&clock),
+            app_id: APP_ID,
         };
         Ok(Self {
             _directory: directory,
@@ -429,6 +431,79 @@ impl Fixture {
     fn remote(&self) -> TestResult<std::sync::MutexGuard<'_, Remote>> {
         Ok(self.remote.lock().map_err(|_| "poisoned")?)
     }
+}
+
+/// Run with KITCHEN_LIVE_POLICY_FIXTURE and KITCHEN_LIVE_FORGE_FIXTURE set to
+/// the read-only evidence paths. The private house files are never committed.
+#[test]
+#[ignore = "requires the supplied read-only live house and forge evidence"]
+fn live_house_policy_allows_delivery_and_fake_github_distinguishes_a_refused_mint() -> TestResult {
+    let policy = std::env::var("KITCHEN_LIVE_POLICY_FIXTURE")?;
+    let binding = std::env::var("KITCHEN_LIVE_FORGE_FIXTURE")?;
+    let house: HouseConfig = serde_json::from_slice(&fs::read(policy)?)?;
+    let binding: ForgeBinding = serde_json::from_slice(&fs::read(binding)?)?;
+    house.validate()?;
+    let scope = binding.scope(&house)?;
+    let repository = Repository::new("lemarier/kitchn")?;
+    for permission in [Permission::PushBranch, Permission::OpenPullRequest] {
+        scope.authorize_effect(&house.house, &repository, permission, 0)?;
+    }
+
+    let CredentialKind::GitHubApp(app) = binding.credential_kind else {
+        return Err("evidence binding is not a GitHub App".into());
+    };
+    let fixture = Fixture::new(true)?;
+    {
+        let mut remote = fixture.remote()?;
+        remote.installations.clear();
+        remote.installations.insert(
+            repository.to_string(),
+            (
+                app.installation.get(),
+                app.app_id.get(),
+                "kitchn-expediter".into(),
+            ),
+        );
+        remote.mint_status = Some(403);
+    }
+    let tokens = AppTokens::new(
+        app,
+        CredentialFile::new(binding.credential_ref(), fixture.key.clone())?,
+        FakeApi {
+            app_id: app.app_id.get(),
+            ..fixture.api.clone()
+        },
+        Arc::clone(&fixture.clock) as Arc<dyn Clock + Send + Sync>,
+    );
+    let credential = binding.credential_ref();
+    assert_eq!(
+        tokens.token(&credential, &TokenScope::for_push(&repository), TIMEOUT),
+        Err(IntegrationError::HttpStatus(403))
+    );
+    fixture.remote()?.mint_status = None;
+    assert!(
+        tokens
+            .token(&credential, &TokenScope::for_push(&repository), TIMEOUT)?
+            .starts_with("ghs_fake_")
+    );
+    let mutation = GitHubMutation {
+        repository: repository.clone(),
+        action: GitHubAction::OpenPullRequest {
+            head: BranchName::new("lemarier/issue-237-attempt-2")?,
+            expected_head: CommitId::new(&"a".repeat(40))?,
+            base: BranchName::new("main")?,
+            title: Text::new("Add gate guidance")?,
+            body: Text::new("Closes #237")?,
+            draft: false,
+        },
+    };
+    assert!(
+        tokens
+            .token(&credential, &TokenScope::for_mutation(&mutation), TIMEOUT)?
+            .starts_with("ghs_fake_")
+    );
+    assert_eq!(fixture.remote()?.mints().len(), 3);
+    Ok(())
 }
 
 fn comment_on(repository: &str) -> TestResult<GitHubMutation> {
@@ -607,7 +682,7 @@ fn a_grant_other_than_the_request_is_refused_and_not_cached() -> TestResult {
     fixture.remote()?.allowed.remove("issues");
     assert_eq!(
         tokens.token(&credential, &scope, TIMEOUT),
-        Err(IntegrationError::ScopeMismatch)
+        Err(IntegrationError::HttpStatus(422))
     );
     // A token about to expire is not used.
     fixture
@@ -652,7 +727,7 @@ fn an_invalid_or_foreign_key_sends_nothing_valid() -> TestResult {
     write_private(&fixture.key, &test_key(true)?.pem)?;
     assert_eq!(
         fixture.tokens()?.token(&credential, &scope, TIMEOUT),
-        Err(IntegrationError::ScopeMismatch)
+        Err(IntegrationError::HttpStatus(401))
     );
     assert!(fixture.remote()?.mints().is_empty());
 

@@ -1329,11 +1329,14 @@ fn coordinate_moves_a_launched_task_off_the_pickup_pass_once() -> TestResult {
         kitchen.message_worker_at(7, launched_at)?,
         Err(kitchen::Error::State(StateError::StaleFence { .. }))
     ));
+    kitchen
+        .backend
+        .set_worker_state(&kitchen.worker(7)?, WorkerState::Ready);
     let actions = acted(kitchen.coordinate()?)?;
     assert!(actions.contains(&CoordinateAction::Moved { task: task.clone() }));
     assert!(actions.contains(&CoordinateAction::Supervised {
         task: task.clone(),
-        outcome: Supervision::Running(WorkerState::Starting),
+        outcome: Supervision::Running(WorkerState::Ready),
     }));
     let moved = kitchen.store().task(&task)?;
     assert!(matches!(
@@ -1451,6 +1454,61 @@ fn an_old_coordinator_resuming_after_a_takeover_is_refused() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn transfer_keeps_a_lost_or_unobservable_worker_interrupted_until_live() -> TestResult {
+    use kitchen::state::AttemptState;
+    for uncertain in [
+        WorkerState::Missing,
+        WorkerState::Unknown,
+        WorkerState::Starting,
+    ] {
+        let kitchen = Kitchen::new()?;
+        kitchen.ready_seven();
+        acted(kitchen.pickup(false)?)?;
+        acted(kitchen.coordinate()?)?;
+        let task = kitchen.task(7)?;
+        let worker = kitchen.worker(7)?;
+        kitchen.backend.set_worker_state(&worker, uncertain);
+        let old_fence = kitchen.claim_fence(7)?;
+        let consumer = Pass::Coordinate.consumer(&repo()?)?;
+        kitchen.store().acquire_consumer(
+            &consumer,
+            &run_claimant()?,
+            kitchen::contracts::LeaseTtl::new(PASS_LEASE)?,
+            kitchen.clock.now(),
+        )?;
+        kitchen.clock.advance(PASS_LEASE.as_secs() + 1);
+        let actions = acted(kitchen.coordinate_on(&kitchen.backend, true)?)?;
+        assert!(actions.contains(&CoordinateAction::Moved { task: task.clone() }));
+        assert_ne!(kitchen.claim_fence(7)?, old_fence);
+        assert!(matches!(
+            kitchen
+                .store()
+                .task(&task)?
+                .attempts()
+                .last()
+                .ok_or("no attempt")?
+                .state(),
+            AttemptState::Interrupted { .. }
+        ));
+        kitchen
+            .backend
+            .set_worker_state(&worker, WorkerState::Ready);
+        acted(kitchen.coordinate()?)?;
+        assert_eq!(
+            kitchen
+                .store()
+                .task(&task)?
+                .attempts()
+                .last()
+                .ok_or("no attempt")?
+                .state(),
+            AttemptState::Running
+        );
+    }
+    Ok(())
+}
+
 /// Supervise and launch for `number` as the process holding `fence`.
 fn old_process_calls(
     kitchen: &Kitchen,
@@ -1560,6 +1618,10 @@ fn an_old_process_after_a_takeover_is_stale_and_its_uncertain_launch_is_reconcil
     assert_eq!(kitchen.backend.effects_performed(), 1);
     assert_eq!(kitchen.backend.launched_agents().len(), 1);
     // The current owner sees the same accepted attempt and worker.
+    kitchen
+        .backend
+        .set_worker_state(&kitchen.worker(7)?, WorkerState::Ready);
+    acted(kitchen.coordinate()?)?;
     let (_, current) = old_process_calls(&kitchen, 7, kitchen.claim_fence(7)?)?;
     let expected_worker = kitchen.worker(7)?;
     assert!(

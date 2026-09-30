@@ -1622,3 +1622,192 @@ fn coordinate_supervises_a_task_it_adopted_after_a_failed_pass() -> TestResult {
     assert_eq!(kitchen.backend.next_delivery(), Ok(None));
     Ok(())
 }
+
+/// What runs while a launch is paused.
+type During<'a> = Box<dyn FnOnce(&ResourceRef) + 'a>;
+
+/// A backend that pauses each launch after the fake started the worker and
+/// before the launch returns, so the receipt is not stored yet. It runs
+/// `during` with the new worker there, then returns the receipt, or loses
+/// the response when `lose_response` is set.
+struct PausedLaunch<'a> {
+    inner: &'a FakeBackend,
+    during: RefCell<Option<During<'a>>>,
+    lose_response: bool,
+}
+
+impl kitchen::contracts::EffectExecutor for PausedLaunch<'_> {
+    fn descriptor(&self) -> &kitchen::contracts::BackendDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn execute(
+        &self,
+        request: &kitchen::contracts::EffectRequest,
+    ) -> Result<kitchen::contracts::Receipt, kitchen::contracts::EffectFailure> {
+        let receipt = self.inner.execute(request)?;
+        let worker = receipt
+            .created()
+            .iter()
+            .find(|resource| resource.kind == kitchen::contracts::ResourceKind::Worker);
+        if let (Some(worker), Some(during)) = (worker, self.during.borrow_mut().take()) {
+            during(worker);
+        }
+        if self.lose_response {
+            return Err(kitchen::contracts::EffectFailure::Uncertain(
+                kitchen::contracts::UncertainReason::ResponseLost,
+            ));
+        }
+        Ok(receipt)
+    }
+
+    fn lookup(
+        &self,
+        request: &kitchen::contracts::EffectRequest,
+    ) -> Result<kitchen::contracts::Lookup, kitchen::contracts::BackendUnavailable> {
+        self.inner.lookup(request)
+    }
+}
+
+impl kitchen::contracts::WorkerBackend for PausedLaunch<'_> {
+    fn observe_worker(
+        &self,
+        worker: &ResourceRef,
+    ) -> Result<WorkerState, kitchen::contracts::BackendUnavailable> {
+        self.inner.observe_worker(worker)
+    }
+}
+
+impl Kitchen {
+    /// Run a pickup pass whose launch pauses as [`PausedLaunch`] describes.
+    fn pickup_paused<'a>(
+        &'a self,
+        lose_response: bool,
+        during: impl FnOnce(&ResourceRef) + 'a,
+    ) -> kitchen::Result<Outcome<PickupAction>> {
+        let backend = PausedLaunch {
+            inner: &self.backend,
+            during: RefCell::new(Some(Box::new(during))),
+            lose_response,
+        };
+        PickupPass {
+            store: self.store(),
+            house: &self.config,
+            backend: &backend,
+            forge: &self.forge,
+            clock: &self.clock,
+            settings: &self.settings,
+            take_over: false,
+        }
+        .run()
+    }
+}
+
+fn question(worker: &ResourceRef, id: &str) -> TestResult<MailMessage> {
+    Ok(MailMessage {
+        kind: MessageKind::Question,
+        outcome: None,
+        ..report(worker, id)?
+    })
+}
+
+#[test]
+fn coordinate_keeps_a_message_from_a_worker_whose_launch_is_still_in_flight() -> TestResult {
+    use kitchen::contracts::CoordinatorMailbox;
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    let during = RefCell::new(None);
+    acted(kitchen.pickup_paused(false, |worker| {
+        // The worker asks before the pickup pass stores its receipt.
+        let asked = question(worker, "early")
+            .and_then(|message| Ok(kitchen.backend.post(vec![message])?));
+        *during.borrow_mut() = Some((asked, kitchen.coordinate()));
+    })?)?;
+    let (asked, first) = during.into_inner().ok_or("the launch did not pause")?;
+    asked?;
+    let first = acted(first?)?;
+    assert!(
+        matches!(first.as_slice(), [CoordinateAction::Unacknowledged { .. }]),
+        "{first:?}"
+    );
+    // Once the launch is stored, the message reaches the task.
+    let task = kitchen.task(7)?;
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.contains(&CoordinateAction::Question {
+        task,
+        message: ExternalRef::new("early")?,
+    }));
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, CoordinateAction::Unroutable { .. }))
+    );
+    assert_eq!(kitchen.backend.next_delivery(), Ok(None));
+    Ok(())
+}
+
+/// Launch issue 7 with a lost response while its worker asks a question:
+/// the launch is uncertain and the question waits in the mailbox.
+fn launch_uncertain_with_question(kitchen: &Kitchen) -> TestResult {
+    kitchen.ready_seven();
+    let asked = RefCell::new(None);
+    acted(kitchen.pickup_paused(true, |worker| {
+        *asked.borrow_mut() = Some(
+            question(worker, "early")
+                .and_then(|message| Ok(kitchen.backend.post(vec![message])?)),
+        );
+    })?)?;
+    asked.into_inner().ok_or("the launch did not pause")??;
+    assert!(current_worker(&kitchen.store().task(&kitchen.task(7)?)?).is_none());
+    Ok(())
+}
+
+#[test]
+fn coordinate_reconciles_an_uncertain_launch_before_routing_its_worker() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    launch_uncertain_with_question(&kitchen)?;
+    let task = kitchen.task(7)?;
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.contains(&CoordinateAction::Moved { task: task.clone() }));
+    assert!(actions.contains(&CoordinateAction::Question {
+        task,
+        message: ExternalRef::new("early")?,
+    }));
+    assert!(kitchen.worker(7).is_ok());
+    use kitchen::contracts::CoordinatorMailbox;
+    assert_eq!(kitchen.backend.next_delivery(), Ok(None));
+    Ok(())
+}
+
+#[test]
+fn coordinate_keeps_the_message_while_the_launch_cannot_be_reconciled() -> TestResult {
+    use kitchen::contracts::CoordinatorMailbox;
+    let kitchen = Kitchen::new()?;
+    launch_uncertain_with_question(&kitchen)?;
+    let task = kitchen.task(7)?;
+    // Every lookup this pass makes fails, routing's and supervision's, so
+    // the launch stays uncertain. The count only needs to exceed them; a
+    // successful lookup would route the question and fail the asserts.
+    kitchen.backend.fail_lookups(8);
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, CoordinateAction::Unacknowledged { .. })),
+        "{actions:?}"
+    );
+    assert!(!actions.iter().any(|action| matches!(
+        action,
+        CoordinateAction::Unroutable { .. } | CoordinateAction::Question { .. }
+    )));
+    assert!(kitchen.backend.next_delivery()?.is_some());
+    // The backend answers again: the next pass routes the question.
+    kitchen.backend.fail_lookups(0);
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.contains(&CoordinateAction::Question {
+        task,
+        message: ExternalRef::new("early")?,
+    }));
+    assert_eq!(kitchen.backend.next_delivery(), Ok(None));
+    Ok(())
+}

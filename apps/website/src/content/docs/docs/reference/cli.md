@@ -523,8 +523,10 @@ before anything runs.
   with the head its branch shows on the forge. Questions wait for a person
   (`kitchn mailbox reply` on the house mailbox). A delivery stays unread only
   while a message in it waits for a scheduled task the pass does not own yet,
-  or for a report's attempt to end. Unreadable rows and messages no task can
-  take are acknowledged, and each is printed.
+  for a scheduled task's launch whose outcome is not recorded yet, or for a
+  report's attempt to end. The pass reconciles such launches on the tasks it
+  owns first. Unreadable rows and messages no task can take are acknowledged,
+  and each is printed.
 - `repair` assesses the open pull requests of settled scheduled tasks and
   prints each decision. It launches no repair writer.
 - `gate` evaluates up to three of those pull requests at their exact heads and

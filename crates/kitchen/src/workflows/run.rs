@@ -64,8 +64,8 @@ mod repair;
 mod tick;
 
 pub use attestation::{
-    ForgeReview, GATE_ATTESTATION_WORKFLOW, GateAttestation, RecordedAttestation, gate_attestation,
-    record_gate_attestation,
+    ForgeReview, GATE_ATTESTATION_WORKFLOW, GateAttestation, RecordedAttestation,
+    attest_gate_review, gate_attestation, record_gate_attestation,
 };
 pub use coordinate::{CoordinateAction, CoordinatePass, Unroutable};
 pub use gate::{GateAction, GatePass, GateResult, MAX_GATE_PULL_REQUESTS, NotMerged, ReportReason};
@@ -201,10 +201,28 @@ pub enum RunError {
     /// one of its writer tasks, or a launch on the branch created it.
     #[error("the recorder wrote the branch; a branch writer cannot record an attestation")]
     AttestationByWriter,
-    /// A different attestation is already recorded for this exact subject;
-    /// attestations are never rewritten.
-    #[error("a different attestation is already recorded for this head and base")]
+    /// An attestation is already recorded for this exact subject; the
+    /// reviewer command refuses even an identical repeat.
+    #[error("an attestation is already recorded for this head and base")]
     AttestationRecorded,
+    /// The pull request is no longer open.
+    #[error("the pull request is no longer open")]
+    AttestationClosed,
+    /// The forge's current pull request head differs from the reviewed head.
+    #[error("the pull request head moved since the review")]
+    AttestationStaleHead,
+    /// The forge's current pull request base differs from the reviewed base.
+    #[error("the pull request base moved since the review")]
+    AttestationStaleBase,
+    /// The forge does not show the claimed approval at the reviewed head.
+    #[error("the forge does not show this approved review at the reviewed head")]
+    AttestationReviewUnverified,
+    /// The forge cannot identify every branch commit author and committer.
+    #[error("the forge cannot identify every branch commit author and committer")]
+    AttestationWritersUnknown,
+    /// Risk classes must be complete and unambiguous.
+    #[error("risk classification must be `none` or one or more distinct classes")]
+    AttestationRiskInvalid,
     /// The merge gate's durable store refused an effect it could not
     /// authorize or build: no merge grant for the subject, a task whose
     /// evidence is not at the verdict's head and base, or a verdict lacking
@@ -227,15 +245,21 @@ impl RunError {
             | Self::RepositoryAmbiguous
             | Self::BackendArguments(_)
             | Self::RuntimeMismatch(_) => ErrorClass::InvalidInput,
+            Self::AttestationRiskInvalid => ErrorClass::InvalidInput,
             Self::NoBackend | Self::NoPickupSettings | Self::NoPassSettings => ErrorClass::Refused,
             Self::Mailbox(MailboxError::Fenced) => ErrorClass::Conflict,
             Self::Mailbox(MailboxError::Unavailable(_)) | Self::GateRecords => {
                 ErrorClass::Execution
             }
-            Self::AttestationNotIndependent | Self::AttestationByWriter | Self::GateRefused => {
-                ErrorClass::Refused
-            }
-            Self::AttestationRecorded => ErrorClass::Conflict,
+            Self::AttestationNotIndependent
+            | Self::AttestationByWriter
+            | Self::AttestationReviewUnverified
+            | Self::AttestationWritersUnknown
+            | Self::GateRefused => ErrorClass::Refused,
+            Self::AttestationRecorded
+            | Self::AttestationClosed
+            | Self::AttestationStaleHead
+            | Self::AttestationStaleBase => ErrorClass::Conflict,
         }
     }
 }

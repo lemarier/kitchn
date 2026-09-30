@@ -33,9 +33,8 @@
 //! session or at a worker's terminal, is never merged here
 //! ([`BranchWriters::person`]).
 //!
-//! Nothing in Kitchen records an attestation yet, so until a reviewer
-//! workflow does (#230), the scheduled gate reports every pull request as
-//! unattested and merges nothing.
+//! The `kitchn gate attest` command verifies and records a reviewer's
+//! attestation. The scheduled gate checks the evidence again before merging.
 
 use std::num::{NonZeroU32, NonZeroU64};
 
@@ -49,11 +48,11 @@ use crate::{
         Timestamp, Trigger, ValueKind,
     },
     integrations::github::{
-        GitHubClient, GitHubReadTransport, PullRequestCommit, Review, ReviewState,
+        GitHubClient, GitHubReadTransport, IssueState, PullRequestCommit, Review, ReviewState,
     },
     state::{
-        HouseStore, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, OwnershipEvent, StateError,
-        TaskRecord, WorkItem,
+        HouseStore, MarkerFact, MarkerKey, MarkerRecording, MarkerSchema, MarkerSubject,
+        OwnershipEvent, StateError, TaskRecord, WorkItem,
     },
     workflows::{
         coordination::{launched_workers, person_took_over, task_branch},
@@ -125,16 +124,16 @@ pub struct RecordedAttestation {
 /// branch and author are read from `forge`, the house's forge: a caller
 /// cannot name another branch to leave its own writer tasks out.
 /// `recorded_by` must not be a writer of that branch, and the claimed
-/// reviewer must not be the author. Recording the same attestation again is
-/// a no-op.
+/// reviewer must not be the author. An attestation for the same subject is
+/// refused, including an identical repeat.
 ///
 /// # Errors
 /// [`ContractError::CrossHouse`] for another house, a failed or incomplete
 /// read of the pull request, [`RunError::AttestationByWriter`] when
 /// `recorded_by` wrote the branch, [`RunError::AttestationNotIndependent`]
 /// for a reviewer who is the author, an empty login, or a pull request whose
-/// author the forge does not name, [`RunError::AttestationRecorded`] when a
-/// different attestation exists for the subject, and store errors.
+/// author the forge does not name, [`RunError::AttestationRecorded`] when an
+/// attestation exists for the subject, and store errors.
 pub fn record_gate_attestation<T: GitHubReadTransport>(
     store: &HouseStore,
     forge: &GitHubClient<T>,
@@ -175,12 +174,85 @@ pub fn record_gate_attestation<T: GitHubReadTransport>(
     )?;
     let fact = MarkerFact::workflow(schema()?, attestation)?;
     match store.record_marker(key, fact, recorded_by, now) {
-        Ok(_) => Ok(()),
+        Ok(MarkerRecording::Recorded(_)) => Ok(()),
+        Ok(MarkerRecording::AlreadyRecorded(_) | MarkerRecording::Superseded(_)) => {
+            Err(RunError::AttestationRecorded.into())
+        }
         Err(crate::Error::State(StateError::MarkerConflict)) => {
             Err(RunError::AttestationRecorded.into())
         }
         Err(error) => Err(error),
     }
+}
+
+/// Verify a review against the forge's current pull request and commit
+/// identities, then record it for the exact head and base. This is the
+/// reviewer command's entrypoint; the scheduled gate independently checks
+/// the same evidence before an effect.
+///
+/// # Errors
+/// Refuses a closed, moved, self-reviewed, unverified, or already attested
+/// pull request. Incomplete forge evidence and store failures are errors.
+pub fn attest_gate_review<T: GitHubReadTransport>(
+    store: &HouseStore,
+    forge: &GitHubClient<T>,
+    attestation: &GateAttestation,
+    recorded_by: &Claimant,
+    now: Timestamp,
+) -> Result<()> {
+    if &attestation.house != store.house() {
+        return Err(ContractError::CrossHouse {
+            expected: store.house().clone(),
+            found: attestation.house.clone(),
+        }
+        .into());
+    }
+    let pull_request = known(forge.pull_request(
+        store.house(),
+        &attestation.repository,
+        attestation.pull_request,
+    ))?;
+    if pull_request.state != IssueState::Open || pull_request.merged {
+        return Err(RunError::AttestationClosed.into());
+    }
+    if pull_request.head.sha != attestation.head {
+        return Err(RunError::AttestationStaleHead.into());
+    }
+    if pull_request.base.sha != attestation.base {
+        return Err(RunError::AttestationStaleBase.into());
+    }
+    let writers = BranchWriters::of(
+        &store.tasks()?,
+        &attestation.repository,
+        attestation.pull_request,
+        &BranchName::new(&pull_request.head.name)?,
+    );
+    if writers.includes(recorded_by.holder.as_str()) {
+        return Err(RunError::AttestationByWriter.into());
+    }
+    let commits = known(forge.pull_request_commits(
+        store.house(),
+        &attestation.repository,
+        attestation.pull_request,
+        &attestation.head,
+    ))?;
+    let commit_writers = commit_logins(&commits).ok_or(RunError::AttestationWritersUnknown)?;
+    if !independent(
+        &attestation.forge_review.reviewer,
+        pull_request.user.as_ref().map(|user| user.login.as_str()),
+        &commit_writers,
+    ) {
+        return Err(RunError::AttestationNotIndependent.into());
+    }
+    let reviews = known(forge.reviews(
+        store.house(),
+        &attestation.repository,
+        attestation.pull_request,
+    ))?;
+    if !review_verified(&reviews, &attestation.forge_review, &attestation.head) {
+        return Err(RunError::AttestationReviewUnverified.into());
+    }
+    record_gate_attestation(store, forge, attestation, recorded_by, now)
 }
 
 /// The attestation recorded for exactly this pull request, head, and base,

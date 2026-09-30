@@ -246,3 +246,57 @@ fn an_unknown_pass_is_invalid_input() -> TestResult {
     assert_eq!(output.status.code(), Some(2));
     Ok(())
 }
+
+#[test]
+fn gate_attest_requires_every_review_field_and_unambiguous_risk() -> TestResult {
+    let house = House::new()?;
+    let registry = house.registry().display().to_string();
+    let missing = house.kitchen(&[
+        "gate",
+        "attest",
+        "--registry",
+        &registry,
+        "--house",
+        "acme",
+        "--pull-request",
+        "12",
+    ])?;
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(text(&missing.stderr).contains("--head"));
+
+    let invalid = house.kitchen(&[
+        "gate",
+        "attest",
+        "--registry",
+        &registry,
+        "--house",
+        "acme",
+        "--pull-request",
+        "12",
+        "--head",
+        KITCHEN,
+        "--base",
+        KITCHEN,
+        "--reviewer",
+        "reviewer",
+        "--recorder",
+        "reviewer",
+        "--review-id",
+        "11",
+        "--result",
+        "clean",
+        "--read-only",
+        "true",
+        "--acceptance",
+        "complete",
+        "--hardware",
+        "complete",
+        "--risk",
+        "none",
+        "--risk",
+        "large-diff",
+    ])?;
+    assert_eq!(invalid.status.code(), Some(2), "{}", text(&invalid.stderr));
+    assert!(text(&invalid.stderr).contains("risk classification"));
+    Ok(())
+}

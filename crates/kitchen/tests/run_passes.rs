@@ -39,8 +39,8 @@ use kitchen::{
             CoordinateAction, CoordinatePass, ForgeReview, GateAction, GateAttestation, GatePass,
             GateResult, NotMerged, Outcome, PASS_LEASE, Pass, PickupAction, PickupLabels,
             PickupPass, PickupSettings, RepairAction, RepairPass, RepairSettings, ReportReason,
-            RunError, TASK_LEASE, TickPasses, Unroutable, Wait, pass_repository,
-            record_gate_attestation, run_claimant,
+            RunError, TASK_LEASE, TickPasses, Unroutable, Wait, attest_gate_review,
+            pass_repository, record_gate_attestation, run_claimant,
         },
         tick::{
             self, Pass as TickPass, PassFailure, PassOutcome, PassSchedule, PassTick, TickDecision,
@@ -2397,7 +2397,13 @@ fn gate_merges_an_attested_pull_request_at_its_exact_head() -> TestResult {
     let mut kitchen = settled_with_pull_request(true)?;
     kitchen.config = with_merge_grant(house_config()?)?;
     green_pull_request(&kitchen)?;
-    attest(&kitchen, 'd')?;
+    attest_gate_review(
+        kitchen.store(),
+        &kitchen.forge,
+        &attestation('d', "safety-reviewer", 11)?,
+        &common::scheduled("reviewer")?,
+        kitchen.clock.now(),
+    )?;
     let action = one_verdict(kitchen.gate()?)?;
     assert_eq!(action.verdict, Verdict::Merge, "{action:?}");
     assert_eq!(action.result, GateResult::Merged, "{action:?}");
@@ -2423,6 +2429,68 @@ fn gate_merges_an_attested_pull_request_at_its_exact_head() -> TestResult {
     ));
     assert!(matches!(kitchen.gate()?, Outcome::Idle));
     assert_eq!(merges(&kitchen).len(), 1);
+    Ok(())
+}
+
+#[test]
+fn reviewer_entrypoint_refuses_moved_self_reviewed_and_duplicate_subjects() -> TestResult {
+    let kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    let recorder = common::scheduled("reviewer")?;
+    let record = |value: &GateAttestation| {
+        attest_gate_review(
+            kitchen.store(),
+            &kitchen.forge,
+            value,
+            &recorder,
+            kitchen.clock.now(),
+        )
+    };
+    assert!(matches!(
+        record(&attestation('f', "safety-reviewer", 11)?),
+        Err(kitchen::Error::Run(RunError::AttestationStaleHead))
+    ));
+    assert!(matches!(
+        record(&attestation_on('d', 'f', "safety-reviewer", 11)?),
+        Err(kitchen::Error::Run(RunError::AttestationStaleBase))
+    ));
+    assert!(matches!(
+        record(&attestation('d', "kitchen-bot", 11)?),
+        Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
+    ));
+    commits(
+        &kitchen,
+        json!([commit_json(
+            'd',
+            Some("safety-reviewer"),
+            Some("kitchen-bot")
+        )?]),
+    );
+    assert!(matches!(
+        record(&attestation('d', "safety-reviewer", 11)?),
+        Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
+    ));
+    commits(
+        &kitchen,
+        json!([commit_json('d', Some("kitchen-bot"), Some("kitchen-bot"))?]),
+    );
+    let worker = kitchen.worker(7)?;
+    assert!(matches!(
+        attest_gate_review(
+            kitchen.store(),
+            &kitchen.forge,
+            &attestation('d', "safety-reviewer", 11)?,
+            &common::scheduled(worker.handle.as_str())?,
+            kitchen.clock.now(),
+        ),
+        Err(kitchen::Error::Run(RunError::AttestationByWriter))
+    ));
+    let valid = attestation('d', "safety-reviewer", 11)?;
+    record(&valid)?;
+    assert!(matches!(
+        record(&valid),
+        Err(kitchen::Error::Run(RunError::AttestationRecorded))
+    ));
     Ok(())
 }
 
@@ -3498,9 +3566,12 @@ fn gate_attestations_must_be_independent_and_are_never_rewritten() -> TestResult
         GateResult::ReportOnly(ReportReason::NotIndependent)
     );
     assert!(merges(&kitchen).is_empty());
-    // The same attestation again is a no-op; a different one is refused.
+    // Neither the same attestation nor a different one can replace it.
     set_pull_request(&kitchen, "/user", json!({"login": "someone-else"}))?;
-    record(&attestation('d', "kitchen-bot", 11)?)?;
+    assert!(matches!(
+        record(&attestation('d', "kitchen-bot", 11)?),
+        Err(kitchen::Error::Run(RunError::AttestationRecorded))
+    ));
     assert!(matches!(
         record(&attestation('d', "safety-reviewer", 11)?),
         Err(kitchen::Error::Run(RunError::AttestationRecorded))

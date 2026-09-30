@@ -619,8 +619,7 @@ before anything runs.
   under a new one. A merge that was sent and whose outcome the forge cannot
   prove blocks every later merge of that pull request, under any gate task
   and whatever risk decision was recorded for it, until a lookup shows it
-  merged or shows it can no longer merge. Kitchen has no command that
-  records attestations yet, so in practice the gate still only reports.
+  merged or shows it can no longer merge.
 
 Each pass takes its own lease first, so a second concurrent start does nothing
 and exits `3`. A pass that fails hands its lease to the next start. A pass that
@@ -631,6 +630,29 @@ process can no longer act on it; a replaced `pickup` can no longer claim or
 launch. The same flag lets `coordinate` take over scheduled task claims that
 expired because no pass renewed them for two hours. A pass with nothing to do prints `idle`, exits `0`, and launches or
 messages no worker.
+
+## `kitchn gate attest`
+
+A person or reviewer worker records a review after inspecting the committed
+base-to-head diff. The command reads the house's bound forge and store, checks
+that the pull request is open at those exact commits, that the forge shows the
+named approval at the head, and that the reviewer is neither the pull request
+author nor any commit author or committer. It also refuses a recorder named in
+the house's branch writer records and an attestation already recorded for that
+head and base. The scheduled gate checks these facts again before a merge.
+
+```sh
+kitchn gate attest --registry <dir> --house <id> [--store <dir>] [--repository <owner/name>] \
+  --pull-request <number> --head <sha> --base <sha> --reviewer <forge-login> \
+  --recorder <holder-or-worker-handle> --review-id <forge-review-id> \
+  --result clean|findings|partial|unavailable --read-only true|false \
+  --acceptance complete|incomplete --hardware complete|incomplete \
+  --risk none|equipment-safety|authorization-secrets|durable-data|public-contract-release|workflow-rules|dependencies|weakened-validation|large-diff
+```
+
+Repeat `--risk` for multiple classes; `none` must appear alone. The recorder
+must supply its actual holder or worker handle. The command records evidence;
+it does not approve risk classes or grant merge authority.
 
 ## `kitchn pickup`
 

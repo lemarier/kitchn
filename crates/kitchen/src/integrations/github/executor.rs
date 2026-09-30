@@ -71,6 +71,11 @@ impl<T: GitHubMutationTransport> GitHubExecutor<T> {
     pub const fn transport(&self) -> &T {
         &self.transport
     }
+    /// The selected house and forge identity for this executor.
+    #[must_use]
+    pub const fn scope(&self) -> &HouseScope {
+        &self.scope
+    }
     fn validate(&self, effect: &GitHubEffect) -> Result<(), IntegrationError> {
         effect.mutation.validate()?;
         if effect.requester != *self.scope.requester()

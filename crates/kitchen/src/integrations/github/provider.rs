@@ -1,7 +1,9 @@
 //! Provider-side mutation and reconciliation. Durable ownership lives in core.
+use super::client::encode_branch_path;
 use super::{
     CloseReason, CredentialRef, GhCli, GitHubAction, GitHubMutation, GitHubReadTransport,
-    HouseScope, IntegrationError, Label, LabelSetup, ReadLimits, ReadRequest, TokenScope,
+    HouseScope, IntegrationError, Label, LabelSetup, ReadLimits, ReadRequest, ReviewVerdict,
+    TokenScope,
 };
 use crate::contracts::{
     EffectFailure, ExternalRef, IdempotencyKey, NotAppliedReason, Receipt, UncertainReason,
@@ -451,6 +453,55 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                 base,
                 &marked(body.as_str(), key),
             ),
+            GitHubAction::ReviewPullRequest {
+                number,
+                expected_head,
+                verdict,
+                body,
+                ..
+            } => {
+                let entries = self.pages(&format!("{root}/pulls/{}/reviews", number.get()))?;
+                let expected = marked(body.as_str(), key);
+                let state = match verdict {
+                    ReviewVerdict::Approve => "APPROVED",
+                    ReviewVerdict::RequestChanges => "CHANGES_REQUESTED",
+                };
+                let mut found = None;
+                for entry in entries {
+                    if entry.get("body").and_then(Value::as_str) != Some(expected.as_str()) {
+                        continue;
+                    }
+                    let login = entry
+                        .pointer("/user/login")
+                        .and_then(Value::as_str)
+                        .ok_or(IntegrationError::Unknown)?;
+                    if !login.eq_ignore_ascii_case(self.scope.requester().as_str()) {
+                        continue;
+                    }
+                    if entry.get("commit_id").and_then(Value::as_str)
+                        != Some(expected_head.as_str())
+                        || entry.get("state").and_then(Value::as_str) != Some(state)
+                    {
+                        return Ok(Inspection::Conflict);
+                    }
+                    let id = entry
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .filter(|id| *id > 0)
+                        .ok_or(IntegrationError::Unknown)?;
+                    if found.replace(id).is_some() {
+                        return Err(IntegrationError::Unknown);
+                    }
+                }
+                match found {
+                    Some(id) => Ok(Inspection::Applied(Receipt::new(
+                        ExternalRef::new(&id.to_string())?,
+                        vec![],
+                        vec![],
+                    )?)),
+                    None => Ok(Inspection::Missing),
+                }
+            }
             GitHubAction::LinkSubIssue { parent, child } => self.relationship(
                 &format!("{root}/issues/{}/sub_issues", parent.get()),
                 child.get(),
@@ -676,6 +727,43 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                     "draft": draft,
                 }),
             ),
+            GitHubAction::ReviewPullRequest {
+                number,
+                expected_head,
+                expected_base,
+                expected_base_commit,
+                verdict,
+                body,
+            } => {
+                let pr = self.read(format!("{root}/pulls/{}", number.get()))?;
+                if pr.get("number").and_then(Value::as_u64) != Some(number.get())
+                    || pr.get("state").and_then(Value::as_str) != Some("open")
+                    || pr.pointer("/head/sha").and_then(Value::as_str)
+                        != Some(expected_head.as_str())
+                    || pr.pointer("/base/ref").and_then(Value::as_str)
+                        != Some(expected_base.as_str())
+                {
+                    return Err(IntegrationError::StaleDecision);
+                }
+                let tip = self.read(format!(
+                    "{root}/branches/{}",
+                    encode_branch_path(expected_base)
+                ))?;
+                if tip.pointer("/commit/sha").and_then(Value::as_str)
+                    != Some(expected_base_commit.as_str())
+                {
+                    return Err(IntegrationError::StaleDecision);
+                }
+                let event = match verdict {
+                    ReviewVerdict::Approve => "APPROVE",
+                    ReviewVerdict::RequestChanges => "REQUEST_CHANGES",
+                };
+                (
+                    "POST",
+                    format!("{root}/pulls/{}/reviews", number.get()),
+                    json!({"commit_id":expected_head.as_str(),"event":event,"body":marked(body.as_str(),key)}),
+                )
+            }
             GitHubAction::LinkSubIssue { parent, child } => {
                 let id = self.issue_id(&root, child.get())?;
                 (

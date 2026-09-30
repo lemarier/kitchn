@@ -200,6 +200,7 @@ impl HouseConfig {
                 | Permission::EditIssueRelationships
                 | Permission::PushBranch
                 | Permission::OpenPullRequest
+                | Permission::ReviewPullRequest
                 | Permission::RequestReview
                 | Permission::Merge
                 | Permission::Publish => true,

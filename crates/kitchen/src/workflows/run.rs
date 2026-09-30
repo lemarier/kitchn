@@ -61,6 +61,7 @@ mod coordinate;
 mod gate;
 mod pickup;
 mod repair;
+mod review;
 mod tick;
 
 pub use attestation::{
@@ -71,6 +72,7 @@ pub use coordinate::{CoordinateAction, CoordinatePass, Unroutable};
 pub use gate::{GateAction, GatePass, GateResult, MAX_GATE_PULL_REQUESTS, NotMerged, ReportReason};
 pub use pickup::{MAX_READY_INSPECTED, PickupAction, PickupLabels, PickupPass, PickupSettings};
 pub use repair::{RepairAction, RepairPass, RepairSettings, Wait};
+pub use review::{GateReview, GateReviewInput, post_gate_review};
 pub use tick::{TickPasses, failed_report};
 
 type Result<T> = std::result::Result<T, crate::Error>;
@@ -223,6 +225,20 @@ pub enum RunError {
     /// The forge cannot identify every branch commit author and committer.
     #[error("the forge cannot identify every branch commit author and committer")]
     AttestationWritersUnknown,
+    /// A request-changes review cannot claim approval evidence.
+    #[error("claim flags require an approve verdict")]
+    ReviewClaimsWithoutApproval,
+    /// A previous review submission may have reached the forge.
+    #[error(
+        "the review submission is uncertain; retry only after forge readback proves its outcome"
+    )]
+    ReviewUncertain,
+    /// The provider proved the review was not applied.
+    #[error("the forge refused this review submission")]
+    ReviewPostRefused,
+    /// The findings or claim flags are missing, malformed, or oversized.
+    #[error("invalid review findings or claim flags")]
+    ReviewBodyInvalid,
     /// The merge gate's durable store refused an effect it could not
     /// authorize or build: no merge grant for the subject, a task whose
     /// evidence is not at the verdict's head and base, or a verdict lacking
@@ -245,6 +261,7 @@ impl RunError {
             | Self::RepositoryAmbiguous
             | Self::BackendArguments(_)
             | Self::RuntimeMismatch(_) => ErrorClass::InvalidInput,
+            Self::ReviewClaimsWithoutApproval | Self::ReviewBodyInvalid => ErrorClass::InvalidInput,
             Self::NoBackend | Self::NoPickupSettings | Self::NoPassSettings => ErrorClass::Refused,
             Self::Mailbox(MailboxError::Fenced) => ErrorClass::Conflict,
             Self::Mailbox(MailboxError::Unavailable(_)) | Self::GateRecords => {
@@ -255,6 +272,8 @@ impl RunError {
             | Self::AttestationReviewUnverified
             | Self::AttestationBlockInvalid
             | Self::AttestationWritersUnknown
+            | Self::ReviewUncertain
+            | Self::ReviewPostRefused
             | Self::GateRefused => ErrorClass::Refused,
             Self::AttestationRecorded
             | Self::AttestationClosed

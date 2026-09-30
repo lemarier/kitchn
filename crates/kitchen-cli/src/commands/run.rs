@@ -35,7 +35,7 @@ use kitchen::{
         BackendKind, CredentialKind, ForgeCredential, HouseConfig, PickupConfig, credential_path,
         forge_binding, runtime_config,
     },
-    integrations::github::{CredentialFile, GhCli, GitHubClient, ReadLimits},
+    integrations::github::{CredentialFile, GhCli, GitHubClient, ReadLimits, TokenScope},
     scheduling::AgentFamily,
     state::{HouseStore, StoreOptions},
     workflows::{
@@ -331,7 +331,8 @@ impl Opened {
             CredentialKind::Token => ForgeCredential::Token(file),
             CredentialKind::GitHubApp(app) => ForgeCredential::App { app, key: file },
         })?;
-        Ok(GitHubClient::new(scope, transport, ReadLimits::default()))
+        Ok(GitHubClient::new(scope, transport, ReadLimits::default())
+            .with_read_access(TokenScope::for_reads(self.repository.clone()))?)
     }
 
     /// The house's bound worker backend for `caller` (a pass name, or the

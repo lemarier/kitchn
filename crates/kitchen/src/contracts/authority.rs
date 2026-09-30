@@ -56,6 +56,8 @@ closed_names! {
         PushBranch = "push-branch",
         /// Open a pull request.
         OpenPullRequest = "open-pull-request",
+        /// Submit a review on a pull request.
+        ReviewPullRequest = "review-pull-request",
         /// Request a review from a reviewer.
         RequestReview = "request-review",
         /// Merge a pull request.
@@ -96,6 +98,7 @@ impl Permission {
             | Self::EditIssueRelationships
             | Self::PushBranch
             | Self::OpenPullRequest
+            | Self::ReviewPullRequest
             | Self::RequestReview
             | Self::Merge
             | Self::ManageSchedule

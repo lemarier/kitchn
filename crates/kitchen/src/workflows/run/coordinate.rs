@@ -11,8 +11,8 @@ use crate::{
     ConsumerId, TaskId,
     contracts::{
         Capability, Clock, CoordinatorMailbox, Delivery, Evidence, EvidenceKind, EvidenceSubject,
-        EvidenceVerdict, ExternalRef, Fence, LeaseTtl, MailMessage, MessageKind, Timestamp,
-        WorkerOutcome,
+        EvidenceVerdict, ExternalRef, Fence, LeaseTtl, MailMessage, MessageKind, ResourceRef,
+        Timestamp, WorkerOutcome,
     },
     house::HouseConfig,
     integrations::github::{GitHubClient, GitHubReadTransport},
@@ -127,13 +127,58 @@ pub enum CoordinateAction {
         /// The message.
         message: ExternalRef,
     },
-    /// A delivery could not be handled completely and stays unacknowledged:
-    /// it holds a message from a worker of no task this pass owns, an
-    /// unreadable message, or a report whose task has not settled yet.
+    /// A delivery held rows Kitchen could not read. Waiting cannot make
+    /// them readable, so the delivery was acknowledged without acting on
+    /// them.
+    Unreadable {
+        /// The delivery.
+        delivery: ExternalRef,
+        /// How many rows could not be read.
+        rows: usize,
+    },
+    /// A message no task can take, acknowledged without acting.
+    Unroutable {
+        /// The message.
+        message: ExternalRef,
+        /// Why no task can take it.
+        reason: Unroutable,
+    },
+    /// A delivery could not be handled yet and stays unacknowledged: it
+    /// holds a message from a worker of a scheduled task this pass does not
+    /// own, or a report whose attempt has not ended.
     Unacknowledged {
         /// The delivery.
         delivery: ExternalRef,
     },
+}
+
+/// Why a delivered message reaches no task. Waiting cannot change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unroutable {
+    /// The backend named no sending worker.
+    NoWorker,
+    /// No stored task launched the sending worker.
+    UnknownWorker {
+        /// The worker.
+        worker: ResourceRef,
+    },
+    /// The sending worker belongs to a task scheduled passes do not run.
+    Unscheduled {
+        /// The task.
+        task: TaskId,
+    },
+}
+
+impl fmt::Display for Unroutable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoWorker => formatter.write_str("no sending worker"),
+            Self::UnknownWorker { worker } => {
+                write!(formatter, "no task launched worker {}", worker.handle)
+            }
+            Self::Unscheduled { task } => write!(formatter, "task {task} is not scheduled"),
+        }
+    }
 }
 
 impl fmt::Display for CoordinateAction {
@@ -163,6 +208,12 @@ impl fmt::Display for CoordinateAction {
             Self::Stale { task, message } => {
                 write!(formatter, "stale message {message} from task {task}")
             }
+            Self::Unreadable { delivery, rows } => {
+                write!(formatter, "delivery {delivery} had {rows} unreadable rows")
+            }
+            Self::Unroutable { message, reason } => {
+                write!(formatter, "unroutable message {message}: {reason}")
+            }
             Self::Unacknowledged { delivery } => {
                 write!(formatter, "delivery {delivery} kept unacknowledged")
             }
@@ -177,8 +228,11 @@ enum Route<'o> {
     /// A worker of a settled task, or an earlier worker of an owned task:
     /// nothing is left to act on.
     Stale(TaskId),
-    /// No task this pass may act for.
-    Unknown,
+    /// A worker of a scheduled task this pass does not own: another pass
+    /// holds it, or its claim expired. A later pass may own it.
+    Pending,
+    /// No task can take the message.
+    Unroutable(Unroutable),
 }
 
 /// A scheduled task this pass owns.
@@ -238,7 +292,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
     ) -> Result<Vec<CoordinateAction>> {
         // The mailbox is read even without owned tasks, so a late message
         // from a settled task's worker cannot hold it up.
-        let (mut actions, owned) = self.own(took_over)?;
+        let (mut actions, owned) = self.own(consumer, fence, took_over)?;
         let descriptor = self.backend.descriptor();
         let route = MailboxRoute::select(descriptor);
         let house_mailbox;
@@ -281,13 +335,14 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         for _ in 0..MAX_BATCHES {
             let Some(batch) = delivery else { break };
             super::renew(self.store, consumer, fence, self.clock)?;
-            let handled =
-                self.handle(&ctx, &policy, &owned, &batch, &mut supervised, &mut actions)?;
-            if !handled {
+            let Some(dropped) =
+                self.handle(&ctx, &policy, &owned, &batch, &mut supervised, &mut actions)?
+            else {
                 actions.push(CoordinateAction::Unacknowledged { delivery: batch.id });
                 break;
-            }
+            };
             delivery = mailbox.acknowledge(&batch.id).map_err(RunError::Mailbox)?;
+            actions.extend(dropped);
         }
         for owned in &owned {
             if !supervised.contains_key(&owned.task) {
@@ -321,8 +376,15 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
     /// A claim bound to a pickup pass that ended is moved to this pass; one
     /// whose pickup pass is still current is left to it. After this pass
     /// `took_over` an expired lease, every live claim is moved, so the
-    /// replaced process holds only stale fences.
-    fn own(&self, took_over: bool) -> Result<(Vec<CoordinateAction>, Vec<Owned>)> {
+    /// replaced process holds only stale fences. A claim bound to this pass,
+    /// at `consumer` and `pass_fence`, was adopted by [`start_coordinator`]
+    /// and is this pass's own.
+    fn own(
+        &self,
+        consumer: &ConsumerId,
+        pass_fence: Fence,
+        took_over: bool,
+    ) -> Result<(Vec<CoordinateAction>, Vec<Owned>)> {
         let claimant = run_claimant()?;
         let ttl = LeaseTtl::new(TASK_LEASE)?;
         let now = self.clock.now();
@@ -330,16 +392,21 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         let mut owned = Vec::new();
         for record in self.store.tasks()? {
             let task = record.spec().id.clone();
-            let scheduled = record
-                .spec()
-                .repository
-                .as_ref()
-                .is_some_and(|repository| issue_of(&record, repository).is_some());
-            if !scheduled {
+            if !scheduled(&record) {
                 continue;
             }
             if let Some(lease) = held_by_run(&record, now) {
                 let bound = lease.consumer();
+                if bound
+                    .is_some_and(|bound| &bound.consumer == consumer && bound.fence == pass_fence)
+                {
+                    actions.push(CoordinateAction::Adopted { task: task.clone() });
+                    owned.push(Owned {
+                        task,
+                        fence: lease.fence(),
+                    });
+                    continue;
+                }
                 if let Some(bound) = bound
                     && pass_current(self.store, bound, now)?
                 {
@@ -402,9 +469,11 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         Ok((actions, owned))
     }
 
-    /// Handle every actionable message of `batch`; true when the batch may
-    /// be acknowledged. A report is handled once supervision settled or
-    /// ended its attempt; until then the batch stays for the next pass.
+    /// Handle every actionable message of `batch`. Returns the actions to
+    /// record once the batch is acknowledged, for content no task can take,
+    /// or `None` while something in it is pending: a message for a
+    /// scheduled task this pass does not own, or a report whose attempt
+    /// supervision has not ended. A pending batch stays for the next pass.
     fn handle(
         &self,
         ctx: &Context<'_>,
@@ -413,8 +482,15 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         batch: &Delivery,
         supervised: &mut BTreeMap<TaskId, Supervision>,
         actions: &mut Vec<CoordinateAction>,
-    ) -> Result<bool> {
-        let mut handled = batch.unreadable == 0;
+    ) -> Result<Option<Vec<CoordinateAction>>> {
+        let mut handled = true;
+        let mut dropped = Vec::new();
+        if batch.unreadable > 0 {
+            dropped.push(CoordinateAction::Unreadable {
+                delivery: batch.id.clone(),
+                rows: batch.unreadable,
+            });
+        }
         for message in batch.actionable() {
             let (owned, record) = match self.route(owned, message)? {
                 Route::Owned(owned, record) => (owned, *record),
@@ -425,8 +501,15 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                     });
                     continue;
                 }
-                Route::Unknown => {
+                Route::Pending => {
                     handled = false;
+                    continue;
+                }
+                Route::Unroutable(reason) => {
+                    dropped.push(CoordinateAction::Unroutable {
+                        message: message.id.clone(),
+                        reason,
+                    });
                     continue;
                 }
             };
@@ -467,14 +550,15 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                 MessageKind::Heartbeat | MessageKind::Status | MessageKind::Other => {}
             }
         }
-        Ok(handled)
+        Ok(handled.then_some(dropped))
     }
 
     /// Where `message` belongs: the owned task whose current worker sent
-    /// it, or a worker whose task settled or whose attempt was replaced.
+    /// it, a worker whose task settled or whose attempt was replaced, or a
+    /// worker of a task this pass does not own.
     fn route<'o>(&self, owned: &'o [Owned], message: &MailMessage) -> Result<Route<'o>> {
         let Some(worker) = &message.worker else {
-            return Ok(Route::Unknown);
+            return Ok(Route::Unroutable(Unroutable::NoWorker));
         };
         for owned in owned {
             let record = self.store.task(&owned.task)?;
@@ -483,14 +567,23 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             }
         }
         for record in self.store.tasks()? {
-            let settled = matches!(record.state(), TaskState::Settled { .. });
-            let replaced = owned.iter().any(|owned| owned.task == record.spec().id);
-            if (settled || replaced) && launched_workers(&record).any(|view| &view.worker == worker)
-            {
-                return Ok(Route::Stale(record.spec().id.clone()));
+            if !launched_workers(&record).any(|view| &view.worker == worker) {
+                continue;
             }
+            let task = record.spec().id.clone();
+            let settled = matches!(record.state(), TaskState::Settled { .. });
+            let replaced = owned.iter().any(|owned| owned.task == task);
+            return Ok(if settled || replaced {
+                Route::Stale(task)
+            } else if scheduled(&record) {
+                Route::Pending
+            } else {
+                Route::Unroutable(Unroutable::Unscheduled { task })
+            });
         }
-        Ok(Route::Unknown)
+        Ok(Route::Unroutable(Unroutable::UnknownWorker {
+            worker: worker.clone(),
+        }))
     }
 
     /// The completion a successful report stands for: the head the forge
@@ -518,6 +611,16 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             addressed: Vec::new(),
         }))
     }
+}
+
+/// Whether `record` is a scheduled pickup task: one made from an issue of
+/// its repository.
+fn scheduled(record: &TaskRecord) -> bool {
+    record
+        .spec()
+        .repository
+        .as_ref()
+        .is_some_and(|repository| issue_of(record, repository).is_some())
 }
 
 /// A supervision step's outcome, or `None` when the task's fence went stale

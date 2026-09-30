@@ -31,7 +31,7 @@ use kitchen::{
         run::{
             CoordinateAction, CoordinatePass, GatePass, Outcome, PASS_LEASE, Pass, PickupAction,
             PickupLabels, PickupPass, PickupSettings, RepairAction, RepairPass, RunError,
-            TASK_LEASE, pass_repository, run_claimant,
+            TASK_LEASE, Unroutable, pass_repository, run_claimant,
         },
     },
 };
@@ -1453,5 +1453,172 @@ fn a_fork_pull_request_on_the_task_branch_name_is_not_kitchen_work() -> TestResu
     kitchen.forge().set(&format!("repos/{REPO}/pulls/12"), fork);
     assert!(matches!(kitchen.repair()?, Outcome::Idle));
     assert!(matches!(kitchen.gate()?, Outcome::Idle));
+    Ok(())
+}
+
+/// A message from a worker no stored task launched, modelled on `like`.
+fn stray(like: &ResourceRef, id: &str) -> TestResult<MailMessage> {
+    Ok(MailMessage {
+        worker: Some(ResourceRef {
+            handle: ExternalRef::new("worker-of-no-task")?,
+            ..like.clone()
+        }),
+        kind: MessageKind::Escalation,
+        ..report(like, id)?
+    })
+}
+
+#[test]
+fn coordinate_acknowledges_a_stray_worker_message_and_reads_the_next_batch() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    acted(kitchen.pickup(false)?)?;
+    let worker = kitchen.worker(7)?;
+    let message = stray(&worker, "stray")?;
+    let stranger = message.worker.clone().ok_or("no worker")?;
+    kitchen.backend.post(vec![message])?;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen.backend.post(vec![report(&worker, "done-7")?])?;
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/kitchen/issue-7"),
+        json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
+    );
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.contains(&CoordinateAction::Unroutable {
+        message: ExternalRef::new("stray")?,
+        reason: Unroutable::UnknownWorker { worker: stranger },
+    }));
+    assert!(actions.contains(&CoordinateAction::Supervised {
+        task: kitchen.task(7)?,
+        outcome: Supervision::Settled(Settlement::Succeeded),
+    }));
+    use kitchen::contracts::CoordinatorMailbox;
+    assert_eq!(kitchen.backend.next_delivery(), Ok(None));
+    Ok(())
+}
+
+#[test]
+fn coordinate_records_unreadable_rows_and_a_message_without_a_worker() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let anonymous = MailMessage {
+        worker: None,
+        kind: MessageKind::Other,
+        ..report(
+            &ResourceRef {
+                kind: kitchen::contracts::ResourceKind::Worker,
+                backend: backend_id()?,
+                handle: ExternalRef::new("unnamed")?,
+            },
+            "anonymous",
+        )?
+    };
+    kitchen.backend.post_with_unreadable(vec![anonymous], 2)?;
+    // Run adoption redelivers the batch under a new id.
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(matches!(
+        actions.as_slice(),
+        [
+            CoordinateAction::Unreadable { rows: 2, .. },
+            CoordinateAction::Unroutable {
+                message,
+                reason: Unroutable::NoWorker,
+            },
+        ] if message.as_str() == "anonymous"
+    ));
+    use kitchen::contracts::CoordinatorMailbox;
+    assert_eq!(kitchen.backend.next_delivery(), Ok(None));
+    Ok(())
+}
+
+#[test]
+fn coordinate_keeps_a_stray_message_while_its_batch_waits_for_an_owner() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    acted(kitchen.pickup(false)?)?;
+    let worker = kitchen.worker(7)?;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen
+        .backend
+        .post(vec![stray(&worker, "stray")?, report(&worker, "done-7")?])?;
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/kitchen/issue-7"),
+        json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
+    );
+    let task = kitchen.task(7)?;
+    kitchen.clock.advance(TASK_LEASE.as_secs() + 1);
+    // The report waits for whoever continues task 7, so nothing in its
+    // batch is acknowledged or reported as dropped yet.
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(matches!(
+        actions.as_slice(),
+        [
+            CoordinateAction::Uncertain { task: uncertain, .. },
+            CoordinateAction::Unacknowledged { .. },
+        ] if *uncertain == task
+    ));
+    let actions = acted(kitchen.coordinate_on(&kitchen.backend, true)?)?;
+    assert!(actions.contains(&CoordinateAction::TakenOver { task: task.clone() }));
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, CoordinateAction::Unroutable { .. }))
+    );
+    assert!(actions.contains(&CoordinateAction::Supervised {
+        task,
+        outcome: Supervision::Settled(Settlement::Succeeded),
+    }));
+    use kitchen::contracts::CoordinatorMailbox;
+    assert_eq!(kitchen.backend.next_delivery(), Ok(None));
+    Ok(())
+}
+
+#[test]
+fn coordinate_supervises_a_task_it_adopted_after_a_failed_pass() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    acted(kitchen.pickup(false)?)?;
+    let worker = kitchen.worker(7)?;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen.backend.post(vec![report(&worker, "done-7")?])?;
+    // The forge does not show the pushed branch yet: the pass fails after
+    // moving the task and relinquishes its lease.
+    assert!(kitchen.coordinate().is_err());
+    assert!(matches!(
+        kitchen.consumer(Pass::Coordinate)?,
+        Some(ConsumerState::Relinquished { .. })
+    ));
+    // A move interrupted between its relinquish and its claim leaves the
+    // task open for the next coordinator to adopt.
+    let task = kitchen.task(7)?;
+    kitchen
+        .store()
+        .relinquish(&task, kitchen.claim_fence(7)?, kitchen.clock.now())?;
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/kitchen/issue-7"),
+        json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
+    );
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.contains(&CoordinateAction::Adopted { task: task.clone() }));
+    assert!(actions.contains(&CoordinateAction::Supervised {
+        task: task.clone(),
+        outcome: Supervision::Settled(Settlement::Succeeded),
+    }));
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, CoordinateAction::Unacknowledged { .. }))
+    );
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Settled { .. }
+    ));
+    use kitchen::contracts::CoordinatorMailbox;
+    assert_eq!(kitchen.backend.next_delivery(), Ok(None));
     Ok(())
 }

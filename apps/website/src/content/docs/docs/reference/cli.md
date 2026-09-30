@@ -488,9 +488,9 @@ nothing and changes no live schedule.
 
 ## `kitchn run`
 
-One bounded scheduled pass, for a trigger such as the Kitchen tick, an Orca
-schedule, launchd, or cron. Each pass needs only the house; everything else
-defaults from it.
+One bounded scheduled pass, for a trigger such as an Orca schedule, launchd, or
+cron. `kitchn tick` does not run these passes yet. Each pass needs only the
+house; everything else defaults from it.
 
 ```sh
 kitchn run pickup     <house> <backend> [--ready-label ready] [--needs-spec-label needs-spec]
@@ -521,7 +521,10 @@ before anything runs.
   the backend when it declares them and from the house mailbox otherwise, and
   supervises each task once. A worker's successful report settles its task
   with the head its branch shows on the forge. Questions wait for a person
-  (`kitchn mailbox reply` on the house mailbox).
+  (`kitchn mailbox reply` on the house mailbox). A delivery stays unread only
+  while a message in it waits for a scheduled task the pass does not own yet,
+  or for a report's attempt to end. Unreadable rows and messages no task can
+  take are acknowledged, and each is printed.
 - `repair` assesses the open pull requests of settled scheduled tasks and
   prints each decision. It launches no repair writer.
 - `gate` evaluates up to three of those pull requests at their exact heads and

@@ -147,12 +147,25 @@ impl FakeBackend {
     /// # Errors
     /// [`ContractError::InvalidValue`] when the id cannot be formed.
     pub fn post(&self, messages: Vec<MailMessage>) -> Result<ExternalRef, ContractError> {
+        self.post_with_unreadable(messages, 0)
+    }
+
+    /// Queue one mailbox batch holding `messages` and `unreadable` rows
+    /// the backend could not identify, and return its delivery id.
+    ///
+    /// # Errors
+    /// [`ContractError::InvalidValue`] when the id cannot be formed.
+    pub fn post_with_unreadable(
+        &self,
+        messages: Vec<MailMessage>,
+        unreadable: usize,
+    ) -> Result<ExternalRef, ContractError> {
         let mut state = self.lock();
         let id = self.delivery_id(&mut state)?;
         state.mailbox.push_back(Delivery {
             id: id.clone(),
             messages,
-            unreadable: 0,
+            unreadable,
         });
         Ok(id)
     }

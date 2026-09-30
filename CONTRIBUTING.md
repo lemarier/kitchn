@@ -114,8 +114,11 @@ to those files. Keep domain decisions in the library. The CLI owns argument
 parsing, presentation, and exit codes: 0 for success, 2 for invalid input, and 1
 for execution or output failures. Scheduled prechecks follow the schedule
 contract instead: 0 for actionable, 1 for idle, 2 for invalid input, and 3 for
-read or output failures. Library errors must remain structured and must not echo
-credentials or raw private input.
+read or output failures. `kitchn run` passes use their own set: 0 when the pass
+acted or was idle, 2 for invalid input, 1 for execution or output failures, 3
+when another start holds the pass lease (busy, not a read failure as for a
+precheck), and 4 when the lease owner is uncertain. Library errors must remain
+structured and must not echo credentials or raw private input.
 
 Shared parents follow these rules:
 

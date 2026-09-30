@@ -23,8 +23,10 @@
 //! before acting, so the process it replaced holds only stale fences. Each
 //! move is a recorded relinquish and adoption; unresolved effects stay with
 //! the task and supervision reconciles them before anything else. A task
-//! whose claim expired because no pass ran is uncertain, and only a
-//! takeover continues it.
+//! relinquished by a failed pass is adopted by the next coordination pass
+//! under that pass's lease; that pass acts on it, and the pass after moves
+//! it to an unbound claim. A task whose claim expired because no pass ran
+//! is uncertain, and only a takeover continues it.
 //!
 //! A pass reads before it spends: when nothing is actionable it returns
 //! [`Outcome::Idle`] without launching or messaging any worker.
@@ -51,7 +53,7 @@ mod gate;
 mod pickup;
 mod repair;
 
-pub use coordinate::{CoordinateAction, CoordinatePass};
+pub use coordinate::{CoordinateAction, CoordinatePass, Unroutable};
 pub use gate::{GateAction, GatePass, MAX_GATE_PULL_REQUESTS};
 pub use pickup::{MAX_READY_INSPECTED, PickupAction, PickupLabels, PickupPass, PickupSettings};
 pub use repair::{RepairAction, RepairPass};

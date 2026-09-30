@@ -2090,7 +2090,29 @@ fn green_pull_request(kitchen: &Kitchen) -> TestResult {
         json!({"sha": head, "commit": {"committer": {"date": "1970-01-01T00:00:00Z"}}}),
     );
     forge.set(&format!("repos/{REPO}/issues/12/timeline"), json!([]));
+    // One commit, which the forge attributes to the house's own login.
+    commits(
+        kitchen,
+        json!([commit_json('d', Some("kitchen-bot"), Some("kitchen-bot"))?]),
+    );
     Ok(())
+}
+
+/// A pull request commit as the forge lists it: `author` and `committer`
+/// are the logins it links, or `None` where it links no account.
+fn commit_json(sha: char, author: Option<&str>, committer: Option<&str>) -> TestResult<Value> {
+    let account = |login: Option<&str>| login.map_or(Value::Null, |login| json!({"login": login}));
+    Ok(
+        json!({"sha": commit(sha)?.as_str(), "author": account(author),
+        "committer": account(committer)}),
+    )
+}
+
+const COMMITS: &str = "repos/origin89hq/firmware/pulls/12/commits";
+
+/// The forge lists `list` as the commits of pull request 12.
+fn commits(kitchen: &Kitchen, list: Value) {
+    kitchen.forge().set(COMMITS, list);
 }
 
 /// The house with a standing merge grant on the repository at the forge.
@@ -2211,6 +2233,207 @@ fn gate_merges_an_attested_pull_request_at_its_exact_head() -> TestResult {
     ));
     assert!(matches!(kitchen.gate()?, Outcome::Idle));
     assert_eq!(merges(&kitchen).len(), 1);
+    Ok(())
+}
+
+/// An outside recorder attests review 11, which the forge shows approved at
+/// head `d` by `reviewer`.
+fn attest_review_by(kitchen: &Kitchen, reviewer: &str) -> TestResult {
+    approved_by(kitchen, reviewer)?;
+    record_gate_attestation(
+        kitchen.store(),
+        &attestation('d', reviewer, 11)?,
+        "kitchen-bot",
+        &BranchName::new("kitchen/issue-7")?,
+        &common::scheduled("reviewer")?,
+        kitchen.clock.now(),
+    )?;
+    Ok(())
+}
+
+/// The gate only reports pull request 12, for `reason`: no verdict is
+/// recorded and nothing merges.
+fn assert_reported(kitchen: &Kitchen, reason: ReportReason, case: &str) -> TestResult {
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(action.result, GateResult::ReportOnly(reason), "{case}");
+    assert!(merges(kitchen).is_empty(), "{case}");
+    assert_eq!(verdict_markers(kitchen)?, 0, "{case}");
+    Ok(())
+}
+
+#[test]
+fn gate_merges_nothing_when_the_reviewer_is_a_commit_author_or_committer() -> TestResult {
+    // A scheduled worker pushed with Dana's own credentials, so the house
+    // records name only the runner and the worker, and the bot opened the
+    // pull request. Dana then approves the head. The forge attributes a
+    // commit to her, as its author or as its committer.
+    for (case, list) in [
+        (
+            "author and committer",
+            json!([commit_json('d', Some("dana"), Some("dana"))?]),
+        ),
+        (
+            "committer of an earlier commit",
+            json!([
+                commit_json('c', Some("kitchen-bot"), Some("Dana"))?,
+                commit_json('d', Some("kitchen-bot"), Some("kitchen-bot"))?,
+            ]),
+        ),
+        (
+            "author of the head",
+            json!([
+                commit_json('c', Some("kitchen-bot"), Some("kitchen-bot"))?,
+                commit_json('d', Some("DANA"), Some("web-flow"))?,
+            ]),
+        ),
+    ] {
+        let mut kitchen = settled_with_pull_request(true)?;
+        kitchen.config = with_merge_grant(house_config()?)?;
+        green_pull_request(&kitchen)?;
+        commits(&kitchen, list);
+        attest_review_by(&kitchen, "dana")?;
+        assert_reported(&kitchen, ReportReason::NotIndependent, case)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn gate_merges_for_a_reviewer_no_commit_names() -> TestResult {
+    // Dana's commits are on the branch; another login reviews it.
+    let mut kitchen = settled_with_pull_request(true)?;
+    kitchen.config = with_merge_grant(house_config()?)?;
+    green_pull_request(&kitchen)?;
+    commits(
+        &kitchen,
+        json!([
+            commit_json('c', Some("dana"), Some("dana"))?,
+            commit_json('d', Some("kitchen-bot"), Some("web-flow"))?,
+        ]),
+    );
+    attest(&kitchen, 'd')?;
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(action.result, GateResult::Merged, "{action:?}");
+    assert_eq!(merges(&kitchen).len(), 1);
+    assert!(
+        kitchen
+            .forge()
+            .reads
+            .borrow()
+            .iter()
+            .any(|read| read == COMMITS)
+    );
+    Ok(())
+}
+
+#[test]
+fn gate_only_reports_a_commit_the_forge_links_to_no_account() -> TestResult {
+    let unlinked = json!({});
+    for (case, list) in [
+        (
+            "no author",
+            json!([commit_json('d', None, Some("kitchen-bot"))?]),
+        ),
+        (
+            "no committer on an earlier commit",
+            json!([
+                commit_json('c', Some("kitchen-bot"), None)?,
+                commit_json('d', Some("kitchen-bot"), Some("kitchen-bot"))?,
+            ]),
+        ),
+        (
+            "an empty account",
+            json!([{"sha": commit('d')?.as_str(), "author": unlinked,
+                "committer": {"login": "kitchen-bot"}}]),
+        ),
+        ("no account fields", json!([{"sha": commit('d')?.as_str()}])),
+    ] {
+        let mut kitchen = settled_with_pull_request(true)?;
+        kitchen.config = with_merge_grant(house_config()?)?;
+        green_pull_request(&kitchen)?;
+        commits(&kitchen, list);
+        attest(&kitchen, 'd')?;
+        assert_reported(&kitchen, ReportReason::WriterIdentityUnknown, case)?;
+    }
+    Ok(())
+}
+
+/// `count` commits by the house's login, the last one head `d`.
+fn commit_page(count: usize) -> TestResult<Vec<Value>> {
+    let mut page = vec![commit_json('c', Some("kitchen-bot"), Some("kitchen-bot"))?; count];
+    if let Some(last) = page.last_mut() {
+        *last = commit_json('d', Some("kitchen-bot"), Some("kitchen-bot"))?;
+    }
+    Ok(page)
+}
+
+#[test]
+fn gate_reads_commits_up_to_the_bound_and_only_reports_beyond_it() -> TestResult {
+    use kitchen::integrations::github::MAX_PULL_REQUEST_COMMITS;
+    // Exactly the bound: a full first page, then an empty one.
+    let mut kitchen = settled_with_pull_request(true)?;
+    kitchen.config = with_merge_grant(house_config()?)?;
+    green_pull_request(&kitchen)?;
+    kitchen.forge().queue(
+        COMMITS,
+        vec![json!(commit_page(MAX_PULL_REQUEST_COMMITS)?), json!([])],
+    );
+    attest(&kitchen, 'd')?;
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(action.result, GateResult::Merged, "{action:?}");
+
+    // One more, on a second page: the writers are not read, whoever the
+    // extra commit names.
+    let mut kitchen = settled_with_pull_request(true)?;
+    kitchen.config = with_merge_grant(house_config()?)?;
+    green_pull_request(&kitchen)?;
+    kitchen.forge().queue(
+        COMMITS,
+        vec![
+            json!(commit_page(MAX_PULL_REQUEST_COMMITS)?),
+            json!(commit_page(1)?),
+        ],
+    );
+    attest(&kitchen, 'd')?;
+    assert_reported(&kitchen, ReportReason::CommitsOverBound, "one over")
+}
+
+#[test]
+fn gate_stops_when_the_commits_cannot_be_read_or_lack_the_head() -> TestResult {
+    for (case, list) in [
+        ("unavailable", None),
+        // The head moved under the read: the list is of another branch tip.
+        (
+            "without the head",
+            Some(json!([commit_json(
+                'c',
+                Some("kitchen-bot"),
+                Some("kitchen-bot")
+            )?])),
+        ),
+        ("empty", Some(json!([]))),
+    ] {
+        let mut kitchen = settled_with_pull_request(true)?;
+        kitchen.config = with_merge_grant(house_config()?)?;
+        green_pull_request(&kitchen)?;
+        match list {
+            Some(list) => commits(&kitchen, list),
+            None => {
+                kitchen.forge().responses.borrow_mut().remove(COMMITS);
+            }
+        }
+        attest(&kitchen, 'd')?;
+        assert!(kitchen.gate().is_err(), "{case}");
+        assert!(merges(&kitchen).is_empty(), "{case}");
+        assert_eq!(verdict_markers(&kitchen)?, 0, "{case}");
+        // The failed pass handed its lease on; with the commits readable
+        // the next one merges.
+        commits(
+            &kitchen,
+            json!([commit_json('d', Some("kitchen-bot"), Some("kitchen-bot"))?]),
+        );
+        let action = one_verdict(kitchen.gate()?)?;
+        assert_eq!(action.result, GateResult::Merged, "{case}: {action:?}");
+    }
     Ok(())
 }
 
@@ -2383,23 +2606,17 @@ fn approved_by(kitchen: &Kitchen, login: &str) -> TestResult {
 /// reports the pull request for an unknown writer identity and neither
 /// records a verdict nor merges.
 fn assert_writer_unknown(kitchen: &Kitchen, reviewer: &str) -> TestResult {
-    approved_by(kitchen, reviewer)?;
-    record_gate_attestation(
-        kitchen.store(),
-        &attestation('d', reviewer, 11)?,
-        "kitchen-bot",
-        &BranchName::new("kitchen/issue-7")?,
-        &common::scheduled("reviewer")?,
-        kitchen.clock.now(),
-    )?;
-    let action = one_verdict(kitchen.gate()?)?;
-    assert_eq!(
-        action.result,
-        GateResult::ReportOnly(ReportReason::WriterIdentityUnknown),
-        "{reviewer}"
+    attest_review_by(kitchen, reviewer)?;
+    assert_reported(kitchen, ReportReason::WriterIdentityUnknown, reviewer)?;
+    // The records alone refuse it: the commits were not read.
+    assert!(
+        !kitchen
+            .forge()
+            .reads
+            .borrow()
+            .iter()
+            .any(|read| read == COMMITS)
     );
-    assert!(merges(kitchen).is_empty(), "{reviewer}");
-    assert_eq!(verdict_markers(kitchen)?, 0, "{reviewer}");
     Ok(())
 }
 
@@ -2407,8 +2624,9 @@ fn assert_writer_unknown(kitchen: &Kitchen, reviewer: &str) -> TestResult {
 fn gate_merges_nothing_when_a_person_wrote_the_branch_under_a_session_name() -> TestResult {
     // Dana repaired the pull request as `session-dana`, pushing through the
     // house's forge login, and handed the round back. She then approves as
-    // the forge login `dana`: no name in the records matches it. Any other
-    // reviewer is refused too, since Dana's login is unknown.
+    // the forge login `dana`: no name in the records matches it, and every
+    // commit is attributed to the house's login. Any other reviewer is
+    // refused too, since Dana's login is unknown.
     for reviewer in ["dana", "safety-reviewer"] {
         let mut kitchen = settled_with_pull_request(true)?;
         kitchen.config = with_merge_grant(house_config()?)?;

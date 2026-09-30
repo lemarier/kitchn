@@ -65,7 +65,9 @@ pub use mutation::LabelSetup;
 pub use process::{CredentialFile, GhCli};
 mod client;
 mod evidence;
-pub use client::{GitHubClient, GitHubReadTransport, ReadLimits, ReadRequest};
+pub use client::{
+    GitHubClient, GitHubReadTransport, MAX_PULL_REQUEST_COMMITS, ReadLimits, ReadRequest,
+};
 pub use evidence::*;
 
 pub use scope::{CredentialRef, HouseScope};

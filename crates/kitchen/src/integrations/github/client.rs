@@ -63,6 +63,11 @@ impl Default for ReadLimits {
     }
 }
 
+/// Commits [`GitHubClient::pull_request_commits`] reads for one pull
+/// request. The forge lists at most 250 and drops the rest without saying
+/// so; this bound is below that, so a dropped commit is never read as absent.
+pub const MAX_PULL_REQUEST_COMMITS: usize = 100;
+
 /// A read request constructed by the scoped client, never by a workflow shell.
 #[derive(Debug, Clone)]
 pub struct ReadRequest {
@@ -552,6 +557,33 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
     ) -> Observation<CommitInfo> {
         match self.single::<CommitInfo>(house, repo, format!("commits/{head}")) {
             Observation::Known(info) if &info.sha != head => Observation::Unknown,
+            result => result,
+        }
+    }
+    /// Read every commit of a pull request, which must include `head`. More
+    /// than [`MAX_PULL_REQUEST_COMMITS`] is
+    /// [`IntegrationError::LimitExceeded`], never a truncated list; a list
+    /// without `head` is unknown.
+    pub fn pull_request_commits(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        number: IssueNumber,
+        head: &CommitId,
+    ) -> Observation<Vec<PullRequestCommit>> {
+        match self.pages::<PullRequestCommit>(
+            house,
+            repo,
+            &format!("pulls/{}/commits", number.get()),
+            None,
+            false,
+        ) {
+            Observation::Known(commits) if commits.len() > MAX_PULL_REQUEST_COMMITS => {
+                Observation::Unavailable(IntegrationError::LimitExceeded)
+            }
+            Observation::Known(commits) if !commits.iter().any(|commit| &commit.sha == head) => {
+                Observation::Unknown
+            }
             result => result,
         }
     }

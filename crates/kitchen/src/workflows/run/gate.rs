@@ -7,8 +7,12 @@
 //! attestation recorded for exactly the pull request's head and base
 //! ([`super::gate_attestation`]). The attestation counts only when the
 //! house's forge shows the review it names approved on that head by the
-//! claimed login, every branch writer's forge login is known, and the
-//! reviewer is none of them; otherwise the pull request is only reported.
+//! claimed login, the forge links every commit of the pull request to its
+//! author's and committer's logins, and the reviewer is none of them nor the
+//! pull request's author; otherwise the pull request is only reported. So is
+//! a branch a person wrote and a pull request of more than
+//! [`MAX_PULL_REQUEST_COMMITS`](crate::integrations::github::MAX_PULL_REQUEST_COMMITS)
+//! commits.
 //! A merge also needs the house's readiness-checked [`MergeGrant`] for that
 //! exact subject.
 //!
@@ -41,7 +45,8 @@ use crate::{
     },
     house::{HouseConfig, HouseError, MergeSubject},
     integrations::github::{
-        GitHubClient, GitHubExecutor, GitHubMutationTransport, IntegrationError, ReadLimits,
+        GitHubClient, GitHubExecutor, GitHubMutationTransport, IntegrationError, Observation,
+        ReadLimits,
     },
     state::{EffectOutcome, EffectState, HouseStore, StateError, TaskRecord, TaskState, reconcile},
     workflows::{
@@ -77,7 +82,7 @@ pub struct GatePass<'a, T> {
     /// The repository.
     pub repository: &'a Repository,
     /// The house's forge logins: the pull request authors eligible for
-    /// unattended merge, and the logins scheduled branch writers push as.
+    /// unattended merge.
     pub authors: &'a [String],
     /// Take over an expired pass lease, or an expired claim on a gate task,
     /// instead of stopping.
@@ -94,12 +99,18 @@ pub enum ReportReason {
     /// No attestation is recorded for the exact head and base.
     Unattested,
     /// A branch writer's forge login is unknown, so the reviewer cannot be
-    /// told apart from the writers: a person wrote the branch, or the house
-    /// names no forge login its scheduled writers push as.
+    /// told apart from the writers: the house records show a person wrote
+    /// the branch, or the forge links a commit's author or committer to no
+    /// account.
     WriterIdentityUnknown,
-    /// The attestation's reviewer is the pull request's author or a forge
-    /// login a branch writer pushed as, or the forge does not name the
-    /// author.
+    /// The pull request has more than
+    /// [`MAX_PULL_REQUEST_COMMITS`](crate::integrations::github::MAX_PULL_REQUEST_COMMITS)
+    /// commits, or their list exceeds the read budget, so its writers were
+    /// not read.
+    CommitsOverBound,
+    /// The attestation's reviewer is the pull request's author or the
+    /// forge login of a commit's author or committer, or the forge does not
+    /// name the pull request's author.
     NotIndependent,
     /// The forge does not show the attestation's review: none with its id,
     /// or not by the claimed login, not approved, or not on this head.
@@ -292,17 +303,41 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             .user
             .as_ref()
             .map(|user| user.login.as_str());
-        // A holder or worker handle is not a forge login, so the reviewer
-        // is compared only with logins every writer is known to push as.
-        let writers = attestation::BranchWriters::of(tasks, self.repository, number, &found.branch);
-        let Some(writers) = writers.forge_logins(self.authors) else {
+        // A holder or worker handle is not a forge login, and no record
+        // ties a person's session to one.
+        if attestation::BranchWriters::of(tasks, self.repository, number, &found.branch).person() {
+            return Ok(report(
+                &evidence,
+                GateGrants::default(),
+                ReportReason::WriterIdentityUnknown,
+            ));
+        }
+        // The writers are whoever the forge attributes the commits to: a
+        // worker can push with credentials of its own, so the house records
+        // do not say which login pushed.
+        let commits = match self.forge.pull_request_commits(
+            self.store.house(),
+            self.repository,
+            number,
+            &evidence.head,
+        ) {
+            Observation::Unavailable(IntegrationError::LimitExceeded) => {
+                return Ok(report(
+                    &evidence,
+                    GateGrants::default(),
+                    ReportReason::CommitsOverBound,
+                ));
+            }
+            read => known(read)?,
+        };
+        let Some(writers) = attestation::commit_logins(&commits) else {
             return Ok(report(
                 &evidence,
                 GateGrants::default(),
                 ReportReason::WriterIdentityUnknown,
             ));
         };
-        if !attestation::independent(&attested.forge_review.reviewer, author, writers) {
+        if !attestation::independent(&attested.forge_review.reviewer, author, &writers) {
             return Ok(report(
                 &evidence,
                 GateGrants::default(),

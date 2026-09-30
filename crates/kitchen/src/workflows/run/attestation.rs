@@ -15,14 +15,20 @@
 //! store can claim any login. The scheduled gate reads it back with
 //! [`gate_attestation`] and merges only after the house's forge shows that
 //! review approved, on exactly the head, by the claimed login, and that
-//! login is neither the author the forge reports nor a forge login a branch
-//! writer pushed as.
+//! login is neither the author the forge reports nor the forge login of any
+//! commit's author or committer ([`commit_logins`]).
 //!
-//! The house records name a writer by its holder or worker handle, which is
-//! not a forge login and is never compared with one. A scheduled writer
-//! pushes as the house's forge login. A person's forge login is recorded
-//! nowhere, so a branch a person wrote, in their own session or at a
-//! worker's terminal, is never merged here ([`BranchWriters::forge_logins`]).
+//! Who wrote the branch is read from the forge, not from the house records:
+//! those name a writer by its holder or worker handle, which is not a forge
+//! login, and a worker can push with credentials of its own. A commit the
+//! forge links to no account leaves a writer unknown, and the pull request
+//! is only reported. The forge links a commit to an account by the email in
+//! the commit, which whoever pushes chooses, so this rules out a reviewer
+//! the commits name and does not prove who pushed.
+//!
+//! The records add one refusal: a branch a person wrote, in their own
+//! session or at a worker's terminal, is never merged here
+//! ([`BranchWriters::person`]).
 //!
 //! Nothing in Kitchen records an attestation yet, so until a reviewer
 //! workflow does (#230), the scheduled gate reports every pull request as
@@ -39,7 +45,7 @@ use crate::{
         BranchName, Claimant, CommitId, ContractError, EvidenceSubject, IssueNumber, Repository,
         Timestamp, Trigger, ValueKind,
     },
-    integrations::github::{Review, ReviewState},
+    integrations::github::{PullRequestCommit, Review, ReviewState},
     state::{
         HouseStore, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, OwnershipEvent, StateError,
         TaskRecord, WorkItem,
@@ -194,10 +200,19 @@ pub(super) fn review_verified(reviews: &[Review], claimed: &ForgeReview, head: &
     })
 }
 
+/// The forge logins of every author and committer of `commits`, or `None`
+/// when the forge links one of them to no account.
+pub(super) fn commit_logins(commits: &[PullRequestCommit]) -> Option<Vec<&str>> {
+    commits
+        .iter()
+        .flat_map(|commit| [commit.author.as_deref(), commit.committer.as_deref()])
+        .collect()
+}
+
 /// Whether `login` did not write the branch: it is not empty, differs from
 /// the pull request's `author`, which must be known, and is none of the
-/// `writer_logins`, the forge logins the branch's writers pushed as.
-pub(super) fn independent(login: &str, author: Option<&str>, writer_logins: &[String]) -> bool {
+/// `writer_logins`, the forge logins of the branch's commits.
+pub(super) fn independent(login: &str, author: Option<&str>, writer_logins: &[&str]) -> bool {
     !login.is_empty()
         && author.is_some_and(|author| !author.eq_ignore_ascii_case(login))
         && !writer_logins
@@ -292,12 +307,11 @@ impl BranchWriters {
             .any(|writer| writer.eq_ignore_ascii_case(name))
     }
 
-    /// The forge logins the branch's writers pushed as, when every one is
-    /// verified: `house`, the logins Kitchen's unattended writers push
-    /// through. `None` when a person wrote the branch, since no record ties
-    /// a session to a forge login, or when `house` names no login.
-    pub(super) fn forge_logins<'a>(&self, house: &'a [String]) -> Option<&'a [String]> {
-        (!self.person && !house.is_empty()).then_some(house)
+    /// Whether a person wrote the branch. No record ties a session to a
+    /// forge login, so the gate merges no such branch whatever the forge
+    /// shows of its commits.
+    pub(super) const fn person(&self) -> bool {
+        self.person
     }
 }
 
@@ -328,7 +342,22 @@ fn key(
 
 #[cfg(test)]
 mod tests {
-    use super::{BranchWriters, independent};
+    use super::{BranchWriters, commit_logins, independent};
+    use crate::{
+        contracts::{CommitId, ContractError},
+        integrations::github::PullRequestCommit,
+    };
+
+    fn commit(
+        author: Option<&str>,
+        committer: Option<&str>,
+    ) -> Result<PullRequestCommit, ContractError> {
+        Ok(PullRequestCommit {
+            sha: CommitId::new(&"d".repeat(40))?,
+            author: author.map(str::to_owned),
+            committer: committer.map(str::to_owned),
+        })
+    }
 
     #[test]
     fn a_reviewer_must_differ_from_a_known_author() {
@@ -339,29 +368,46 @@ mod tests {
     }
 
     #[test]
-    fn a_reviewer_must_not_be_a_forge_login_a_writer_pushed_as() {
-        let house = ["kitchen-bot".to_owned()];
-        assert!(independent("safety-reviewer", Some("someone"), &house));
-        assert!(!independent("Kitchen-Bot", Some("someone"), &house));
+    fn a_reviewer_must_not_be_a_forge_login_of_a_commit() {
+        let writers = ["kitchen-bot"];
+        assert!(independent("safety-reviewer", Some("someone"), &writers));
+        assert!(!independent("Kitchen-Bot", Some("someone"), &writers));
     }
 
     #[test]
-    fn writers_have_forge_logins_only_when_none_is_a_person() {
-        let house = ["kitchen-bot".to_owned()];
-        let unattended = BranchWriters {
-            names: vec!["kitchn-run".to_owned(), "worker-1".to_owned()],
-            person: false,
-        };
-        assert_eq!(unattended.forge_logins(&house), Some(house.as_slice()));
-        // Without a house login, an unattended writer's login is unknown.
-        assert_eq!(unattended.forge_logins(&[]), None);
-        // A session name is not a login: it stays unknown whatever it is.
+    fn commit_logins_are_every_author_and_committer_or_unknown() -> Result<(), ContractError> {
+        let linked = [
+            commit(Some("kitchen-bot"), Some("web-flow"))?,
+            commit(Some("dana"), Some("kitchen-bot"))?,
+        ];
+        assert_eq!(
+            commit_logins(&linked),
+            Some(vec!["kitchen-bot", "web-flow", "dana", "kitchen-bot"])
+        );
+        assert_eq!(commit_logins(&[]), Some(Vec::new()));
+        // One unlinked author or committer leaves the writers unknown.
+        for unlinked in [
+            commit(None, Some("kitchen-bot"))?,
+            commit(Some("dana"), None)?,
+        ] {
+            assert_eq!(commit_logins(&[linked[0].clone(), unlinked]), None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_session_name_is_a_writer_name_and_never_a_login() {
         let person = BranchWriters {
             names: vec!["session-dana".to_owned()],
             person: true,
         };
-        assert_eq!(person.forge_logins(&house), None);
+        assert!(person.person());
         assert!(person.includes("Session-Dana"));
         assert!(!person.includes("dana"));
+        let unattended = BranchWriters {
+            names: vec!["kitchn-run".to_owned(), "worker-1".to_owned()],
+            person: false,
+        };
+        assert!(!unattended.person());
     }
 }

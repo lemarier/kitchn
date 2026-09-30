@@ -432,6 +432,33 @@ pub struct CommitPerson {
     #[serde(deserialize_with = "timestamp")]
     pub date: Timestamp,
 }
+/// One commit of a pull request, with the forge accounts its author and
+/// committer are linked to. The forge links a commit to an account by the
+/// email in the commit, so a login here is the forge's attribution, not
+/// proof of who pushed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullRequestCommit {
+    /// The commit.
+    pub sha: CommitId,
+    /// The author's forge login; `None` when the forge links no account.
+    #[serde(default, deserialize_with = "linked_login")]
+    pub author: Option<String>,
+    /// The committer's forge login; `None` when the forge links no account.
+    #[serde(default, deserialize_with = "linked_login")]
+    pub committer: Option<String>,
+}
+/// The login of a commit's linked account. The forge answers `null` or an
+/// empty object when it links none.
+fn linked_login<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    struct Account {
+        #[serde(default)]
+        login: Option<String>,
+    }
+    Ok(Option::<Account>::deserialize(deserializer)?
+        .and_then(|account| account.login)
+        .filter(|login| !login.is_empty()))
+}
 /// Required status contexts from branch protection.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 /// Provider response data.

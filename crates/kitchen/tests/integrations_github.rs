@@ -628,6 +628,70 @@ fn statuses_refuse_moved_head_and_partial_page() -> Result {
 }
 
 #[test]
+fn pull_request_commits_are_bounded_bound_to_the_head_and_keep_unlinked_accounts() -> Result {
+    let house = HouseId::new("sample")?;
+    let repo = Repository::new("sample/project")?;
+    let number = IssueNumber::new(12)?;
+    let head = kitchen::contracts::CommitId::new("1111111111111111111111111111111111111111")?;
+    let other = kitchen::contracts::CommitId::new("2222222222222222222222222222222222222222")?;
+    let read = |pages: Vec<std::result::Result<Value, IntegrationError>>| -> Result<_> {
+        let client = GitHubClient::new(scope()?, Fake::new(pages)?, ReadLimits::default());
+        Ok((
+            client.pull_request_commits(&house, &repo, number, &head),
+            client.transport().requests.borrow().clone(),
+        ))
+    };
+    // Linked, unlinked (`null`, an empty object, an absent field) accounts.
+    let (commits, requests) = read(vec![Ok(json!([
+        {"sha": other.as_str(), "author": {"login": "dana"}, "committer": null},
+        {"sha": head.as_str(), "author": {}, "commit": {"author": {"name": "Dana"}}},
+    ]))])?;
+    assert_eq!(
+        commits,
+        Observation::Known(vec![
+            PullRequestCommit {
+                sha: other.clone(),
+                author: Some("dana".into()),
+                committer: None,
+            },
+            PullRequestCommit {
+                sha: head.clone(),
+                author: None,
+                committer: None,
+            },
+        ])
+    );
+    assert_eq!(
+        requests,
+        ["repos/sample/project/pulls/12/commits?per_page=100&page=1"]
+    );
+    // A list without the head is of another branch tip.
+    let linked = |sha: &kitchen::contracts::CommitId| json!({"sha": sha.as_str(), "author": {"login": "dana"}, "committer": {"login": "dana"}});
+    assert_eq!(
+        read(vec![Ok(json!([linked(&other)]))])?.0,
+        Observation::Unknown
+    );
+    assert_eq!(read(vec![Ok(json!([]))])?.0, Observation::Unknown);
+    // Exactly the bound is read; one more is refused, never truncated.
+    let mut full = vec![linked(&other); MAX_PULL_REQUEST_COMMITS];
+    full[0] = linked(&head);
+    assert!(matches!(
+        read(vec![Ok(json!(full)), Ok(json!([]))])?.0,
+        Observation::Known(commits) if commits.len() == MAX_PULL_REQUEST_COMMITS
+    ));
+    assert_eq!(
+        read(vec![Ok(json!(full)), Ok(json!([linked(&other)]))])?.0,
+        Observation::Unavailable(IntegrationError::LimitExceeded)
+    );
+    // A failed second page is a failed read, not a shorter list.
+    assert_eq!(
+        read(vec![Ok(json!(full)), Err(IntegrationError::Timeout)])?.0,
+        Observation::Unavailable(IntegrationError::Timeout)
+    );
+    Ok(())
+}
+
+#[test]
 fn required_checks_presence_fails_closed_for_missing_and_app_bound_checks() -> Result {
     let head = kitchen::contracts::CommitId::new("1111111111111111111111111111111111111111")?;
     let checks = RequiredChecks {

@@ -146,7 +146,7 @@ pub fn run(args: TickArgs) -> Result<(String, bool), kitchen::Error> {
             )?;
             let text = match format {
                 TriggerFormat::Launchd => trigger_plist(&target),
-                TriggerFormat::Cron => trigger_cron(&target),
+                TriggerFormat::Cron => trigger_cron(&target)?,
             };
             Ok((text.trim_end().to_owned(), true))
         }

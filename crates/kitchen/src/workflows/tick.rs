@@ -264,8 +264,8 @@ pub struct PassReport {
     pub outcome: PassOutcome,
     /// Usage where known.
     pub usage: RunUsage,
-    /// The backend's own run references, linked as evidence, at most
-    /// [`MAX_RUN_EVIDENCE`].
+    /// The backend's own run references, linked as evidence. The tick keeps
+    /// only the first [`MAX_RUN_EVIDENCE`].
     pub backend_runs: Vec<ExternalRef>,
 }
 
@@ -451,7 +451,10 @@ fn tick_pass(
                 run,
                 fence,
             };
-            let ended = runner.run(pass, &context);
+            let mut ended = runner.run(pass, &context);
+            // The ledger links at most MAX_RUN_EVIDENCE backend runs; more
+            // must never cost the recorded outcome or abort the tick.
+            ended.backend_runs.truncate(MAX_RUN_EVIDENCE);
             let outcome = ended.outcome;
             let decision = match store.finish_run(run, fence, ended, clock.now()) {
                 Ok(()) => TickDecision::Ran { run, outcome },
@@ -567,10 +570,21 @@ pub fn trigger_plist(target: &TriggerTarget) -> String {
 
 /// A crontab line that runs the tick every interval. Printed for a person
 /// to install; Kitchen never edits a crontab.
-#[must_use]
-pub fn trigger_cron(target: &TriggerTarget) -> String {
+///
+/// # Errors
+/// [`TickError::TriggerInterval`] when the interval does not divide 60: cron
+/// restarts its minute step each hour, so `*/7` would not fire every seven
+/// minutes. launchd's `StartInterval` has no such limit.
+pub fn trigger_cron(target: &TriggerTarget) -> Result<String, TickError> {
+    if 60 % target.every.0 != 0 {
+        return Err(TickError::TriggerInterval);
+    }
     let command: Vec<String> = target.argv().iter().map(|arg| shell_quote(arg)).collect();
-    format!("*/{} * * * * {}", target.every.0, command.join(" "))
+    Ok(format!(
+        "*/{} * * * * {}",
+        target.every.0,
+        command.join(" ")
+    ))
 }
 
 fn xml_escape(text: &str) -> String {

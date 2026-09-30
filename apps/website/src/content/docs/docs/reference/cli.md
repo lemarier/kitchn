@@ -481,7 +481,8 @@ yet; until they are, every pass that runs is recorded as failed with "pass not
 available in this build".
 
 `runs` lists the ledger and reads only. `trigger` prints a launchd plist or a
-crontab line that runs the tick every `--every-minutes` (default 5); it installs
+crontab line that runs the tick every `--every-minutes` (default 5; for cron it
+must divide 60, since cron restarts its minute step each hour); it installs
 nothing and changes no live schedule.
 
 ## `kitchn pickup`

@@ -1128,9 +1128,19 @@ fn triggers_print_the_tick_command_and_refuse_unsafe_paths() -> TestResult {
         TriggerMinutes::new(5)?,
     )?;
     assert_eq!(
-        trigger_cron(&target),
+        trigger_cron(&target)?,
         r"*/5 * * * * '/usr/local/bin/kitchn' 'tick' '--registry' '/Users/me/it'\''s 100\% <mine>' '--house' 'origin89'"
     );
+    // Cron restarts its minute step each hour, so only divisors of 60 keep
+    // an even interval; launchd keeps any interval.
+    let uneven = TriggerTarget::new(
+        Path::new("/usr/local/bin/kitchn"),
+        Path::new("/Users/me/registry"),
+        origin89()?,
+        TriggerMinutes::new(7)?,
+    )?;
+    assert_eq!(trigger_cron(&uneven), Err(TickError::TriggerInterval));
+    assert!(trigger_plist(&uneven).contains("<integer>420</integer>"));
     let plist = trigger_plist(&target);
     assert!(plist.contains("<string>com.getkitchn.tick.origin89</string>"));
     assert!(plist.contains("    <string>/Users/me/it&apos;s 100% &lt;mine&gt;</string>\n"));
@@ -1159,5 +1169,42 @@ fn triggers_print_the_tick_command_and_refuse_unsafe_paths() -> TestResult {
         Some(TickError::TriggerInterval)
     );
     assert!(TriggerMinutes::new(59).is_ok());
+    Ok(())
+}
+
+/// Reports more backend runs than the ledger links.
+struct Flooding;
+
+impl PassRunner for Flooding {
+    fn run(&mut self, _pass: Pass, _run: &PassRun) -> PassReport {
+        let mut report = PassReport::new(PassOutcome::Done);
+        report.backend_runs = (0..MAX_RUN_EVIDENCE + 4)
+            .filter_map(|index| ExternalRef::new(&format!("run-{index}")).ok())
+            .collect();
+        report
+    }
+}
+
+#[test]
+fn a_pass_reporting_too_much_evidence_still_records_its_outcome() -> TestResult {
+    let house = House::new()?;
+    let store = house.open()?;
+    let config = config(&[("pickup", 15)])?;
+    let clock = Fixed::at(T0);
+    let report = tick::tick(&store, &config, &holder("tick-a")?, &mut Flooding, &clock)?;
+    assert!(matches!(
+        only_pass(&report)?.decision,
+        TickDecision::Ran {
+            outcome: PassOutcome::Done,
+            ..
+        }
+    ));
+    let Some(RunState::Ended { backend_runs, .. }) =
+        store.runs()?.last().map(|run| run.state.clone())
+    else {
+        return Err("the run ended".into());
+    };
+    assert_eq!(backend_runs.len(), MAX_RUN_EVIDENCE);
+    assert!(lease_idle(&store, "pickup")?);
     Ok(())
 }

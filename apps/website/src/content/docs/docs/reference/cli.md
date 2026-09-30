@@ -17,21 +17,26 @@ input and `3` when their inputs cannot be read. `decompose preview` exits `1`
 while ownership overlaps are unordered. `kitchn run` exits `3` when another pass
 of the same kind holds the lease and `4` when a previous pass's lease expired.
 
-Commands that take `--registry` use `$KITCHN_HOME` when set, otherwise
-`~/.kitchn`. Commands that take `--house` use the current checkout's GitHub
-remote to find its **stored repository binding** in that registry. All
-worktrees of that repository therefore select the same house. An unbound
-repository, unreadable remote, or ambiguous selection is refused and names
-`--house`; pass it explicitly when working outside a bound checkout. Explicit
-`--registry` and `--house` values take precedence. `house init` and `house
-setup` retain their own selection flow, and a generated scheduled trigger
-always carries both flags because it may run outside a checkout.
+## Defaults
 
-Commands that take `--store` default to the selected house's state store at
-`<registry>/private/<house>/store`. The store remains house scoped, even when
-several repositories bind to one house. Pass `--store` to use another
-initialized store instead. A store is never created on the way; a missing one
-fails.
+From a bound checkout, most commands accept short forms such as `kitchn tick`
+and `kitchn run gate`. An omitted `--registry` comes from `$KITCHN_HOME`, then
+`~/.kitchn`. An omitted `--house` comes from the stored binding for the
+checkout's GitHub origin repository in that registry. The checkout must have
+a readable origin remote whose repository matches the binding; a mismatched
+push URL, an unbound checkout, or an ambiguous selection is refused. Pass
+`--house` explicitly outside a bound checkout. Explicit flags take precedence.
+
+An omitted `--store` uses `<registry>/private/<house>/store`. The store stays
+house scoped even when several repositories bind to one house. It must already
+exist; pass `--store` for a different initialized store. `tick`, `run`, and
+`gate` use the house's only repository when there is one. In a house with
+several candidates, pass `--repository <owner/name>` or configure the
+repository for `tick` and `run`. Other commands may require an explicit
+repository. `house init` and `house setup` retain their
+own selection flows; `init` and `adopt` still need `--house` for an unbound
+target. Scheduled triggers carry explicit registry and house flags because
+they can run outside a checkout.
 
 ## `kitchn house init`
 
@@ -40,7 +45,7 @@ authority and activates no workflows.
 
 ```sh
 kitchn house init [options]
-kitchn house init --registry <dir> --config <house.json>
+kitchn house init --config <house.json>
 ```
 
 Without `--config`, it asks only for what it can't infer, prints the resulting
@@ -75,7 +80,7 @@ redirected store path, and a store inside a Git checkout.
 Install the house's configured pins from a verified bundle.
 
 ```sh
-kitchn house sync --registry <dir> --house <id> --bundle <bundle.json>
+kitchn house sync --bundle <bundle.json>
 ```
 
 ## `kitchn house update`
@@ -83,7 +88,7 @@ kitchn house sync --registry <dir> --house <id> --bundle <bundle.json>
 Change the pins, after the complete new bundle verifies.
 
 ```sh
-kitchn house update --registry <dir> --house <id> --bundle <bundle.json>
+kitchn house update --bundle <bundle.json>
 ```
 
 ## `kitchn house setup`
@@ -92,7 +97,7 @@ Adopt a repository by recording its binding in the registry. Writes nothing into
 the repository.
 
 ```sh
-kitchn house setup --registry <dir> [options]
+kitchn house setup [options]
 ```
 
 | Option | Description |
@@ -113,8 +118,8 @@ Approving needs that digest; if the file changed since the preview, nothing is
 stored. The file is never modified or deleted.
 
 ```sh
-kitchn house import --registry <dir> [--repository-path <dir>] [--json]
-kitchn house import --registry <dir> [--repository-path <dir>] --yes --digest <sha256>
+kitchn house import [--repository-path <dir>] [--json]
+kitchn house import [--repository-path <dir>] --yes --digest <sha256>
 ```
 
 ## `kitchn house doctor`
@@ -126,7 +131,7 @@ missing from the evidence are reported as unknown, never as passing. When branch
 (`requiredCheckApps`), only that app's runs count toward the check's history.
 
 ```sh
-kitchn house doctor --registry <dir> [--repository-path <dir>] [--evidence <file>] [--store <dir>] [--json]
+kitchn house doctor [--repository-path <dir>] [--evidence <file>] [--store <dir>] [--json]
 ```
 
 Exits 0 when configuration is complete and 1 when findings remain. Readiness
@@ -139,8 +144,8 @@ limit or more, before new work is refused.
 Preview, then create or add files from a house template.
 
 ```sh
-kitchn init <dir> --registry <dir> --template <name> [options]
-kitchn adopt <dir> --registry <dir> --template <name> [options]
+kitchn init <dir> --template <name> [options]
+kitchn adopt <dir> --template <name> [options]
 ```
 
 | Option | Description |
@@ -158,9 +163,9 @@ no credential: the token, or the app's private key, stays in a file you place in
 the house's private registry directory.
 
 ```sh
-kitchn forge bind --registry <dir> --house <id> --requester <login> [--credential github] [--posting-budget 20]
-kitchn forge bind --registry <dir> --house <id> --requester <app-slug>[bot] --app-id <id> --installation <id>
-kitchn forge show --registry <dir> --house <id>
+kitchn forge bind --requester <login> [--credential github] [--posting-budget 20]
+kitchn forge bind --requester <app-slug>[bot] --app-id <id> --installation <id>
+kitchn forge show
 ```
 
 With `--app-id` and `--installation`, the file holds the app's `.pem` private
@@ -181,9 +186,9 @@ prints a plan. `work` and the `pr` writer rounds (`follow-up`, `repair`) take a
 durable claim shared with scheduled runs; `review` and `gate` only read.
 
 ```sh
-kitchn work <issue> --facts <issue.json> --revision <sha> --registry <dir> [--store <dir>] --holder <you> [--json]
-kitchn pr <number> --facts <pr.json> [--as review|follow-up|repair|gate] --revision <sha> --registry <dir> [--store <dir>] --holder <you> [--json]
-kitchn hand-back <task> --registry <dir> [--store <dir>] --holder <you>
+kitchn work <issue> --facts <issue.json> --revision <sha> --holder <you> [--json]
+kitchn pr <number> --facts <pr.json> [--as review|follow-up|repair|gate] --revision <sha> --holder <you> [--json]
+kitchn hand-back <task> --holder <you>
 ```
 
 | Option | Description |
@@ -202,9 +207,9 @@ kitchn hand-back <task> --registry <dir> [--store <dir>] --holder <you>
 Preview an issue draft. Posts nothing.
 
 ```sh
-kitchn issue new --draft <draft.json> --revision <sha> --registry <dir> [--json]
-kitchn issue refine <issue> --draft <draft.json> --revision <sha> --registry <dir> [--json]
-kitchn issue acknowledge <task> --reason <text> [--accept-unknown] --registry <dir> [--store <dir>] --holder <you>
+kitchn issue new --draft <draft.json> --revision <sha> [--json]
+kitchn issue refine <issue> --draft <draft.json> --revision <sha> [--json]
+kitchn issue acknowledge <task> --reason <text> [--accept-unknown] --holder <you>
 ```
 
 `acknowledge` releases the subject of a draft that settled after writing, or
@@ -218,8 +223,8 @@ preview to the forge.
 
 ```sh
 kitchn decompose preview --proposal <proposal.json> [--json]
-kitchn decompose apply --proposal <proposal.json> --approve <sha256:...> --registry <dir> --house <id> [--store <dir>] --holder <you> [--json]
-kitchn decompose acknowledge (--registry <dir> | --store <dir>) --house <id> --task <task> --holder <you> --reason <text> [--without-forge] [--accept-unknown] [--json]
+kitchn decompose apply --proposal <proposal.json> --approve <sha256:...> --holder <you> [--json]
+kitchn decompose acknowledge --task <task> --holder <you> --reason <text> [--without-forge] [--accept-unknown] [--json]
 ```
 
 `preview` writes nothing. It prints a digest and exits 0 when the proposal can
@@ -241,8 +246,8 @@ Preview what the dishwasher would release, and record your approval.
 Releases nothing.
 
 ```sh
-kitchn cleanup preview (--registry <dir> | --store <dir>) --house <id> --inventory <inventory.json> [--remote origin] [--trigger manual] [--json]
-kitchn cleanup approve (--registry <dir> | --store <dir>) --house <id> --inventory <inventory.json> --holder <you> --digest <sha256:...>
+kitchn cleanup preview --inventory <inventory.json> [--remote origin] [--trigger manual] [--json]
+kitchn cleanup approve --inventory <inventory.json> --holder <you> --digest <sha256:...>
 ```
 
 The inventory is a snapshot exported from the backend; Git reads each listed
@@ -269,8 +274,7 @@ Post the gardener's stale-issue report and record the issue as handled, so the
 daily precheck stays idle for it until someone updates the issue again.
 
 ```sh
-kitchn gardener report-stale --registry <dir> --house <id> [--store <dir>] \
-  --repository <owner/name> --issue <n> --body <text> \
+kitchn gardener report-stale --repository <owner/name> --issue <n> --body <text> \
   --github-backend <id> --requester <login> --credential <name> --credential-file <path> --gh <path>
 ```
 
@@ -321,8 +325,8 @@ How full the house store is, and the retention pass that removes markers and
 settled tasks no workflow still needs.
 
 ```sh
-kitchn store capacity --house <id> (--registry <dir> | --store <dir>) [--json]
-kitchn store retain   --house <id> (--registry <dir> | --store <dir>) [--gh <path>] [--window-days 31] [--max-lookups 200] [--apply] [--json]
+kitchn store capacity [--json]
+kitchn store retain [--gh <path>] [--window-days 31] [--max-lookups 200] [--apply] [--json]
 ```
 
 `capacity` exits 1 when a table is at 80% of its limit or more. `retain` only
@@ -350,8 +354,8 @@ How full the house trust ledger is, and the archival that moves records no
 grant needs out of it.
 
 ```sh
-kitchn trust capacity --house <id> --ledger <dir> [--json]
-kitchn trust archive  --house <id> --ledger <dir> [--apply] [--json]
+kitchn trust capacity --ledger <dir> [--json]
+kitchn trust archive --ledger <dir> [--apply] [--json]
 ```
 
 The ledger holds at most 4096 entries and 8 MiB. When either limit is reached,
@@ -385,7 +389,7 @@ are performing, and the draft proposals that follow. It reads only; nothing is
 filed, and no guidance, grant, or schedule changes.
 
 ```sh
-kitchn audit --registry <dir> --house <id> [--store <dir>] --ledger <dir> \
+kitchn audit --ledger <dir> \
   (--orca <path> --runtime-dir <dir> | --schedule-evidence <file>) \
   [--open-proposal <key>... | --no-open-proposals] [--destination <owner/name>] [--json]
 ```
@@ -434,12 +438,11 @@ kitchn mailbox ask       <scope> --body <text> [--subject <text>] [--wait-secs 0
 kitchn mailbox answer    <scope> --question <id> [--wait-secs 0-900]
 kitchn mailbox escalate  <scope> --body <text> [--subject <text>]
 kitchn mailbox report    <scope> --outcome succeeded|failed [--clean yes|no] [--pushed yes|no] --body <text> [--subject <text>]
-kitchn mailbox questions --house <id> (--registry <dir> | --store <dir>)
-kitchn mailbox reply     --house <id> (--registry <dir> | --store <dir>) --question <id> --body <text> --by person|coordinator
+kitchn mailbox questions
+kitchn mailbox reply --question <id> --body <text> --by person|coordinator
 ```
 
-`<scope>` is `--house <id> (--registry <dir> | --store <dir>) --task <id>
---fence <n>`. A worker posts and reads only for its own task: the fence must
+`<scope>` is `--task <id> --fence <n>`. A worker posts and reads only for its own task: the fence must
 be one its open attempt ran under, so a worker whose attempt ended, or that
 names another task, is refused (exit 1), and another task's question reads as
 unknown (exit 2). `ask` prints the question id and waits up to `--wait-secs` for
@@ -466,13 +469,11 @@ backend schedule only start it; the house configuration's `tick` passes and
 the run ledger in the house store decide what runs.
 
 ```sh
-kitchn tick --registry <dir> --house <id> [--store <dir>] [--repository <owner/name>]
-            [<backend>] [<pickup options>]
-kitchn tick runs --registry <dir> --house <id> [--store <dir>]
-kitchn tick settle --registry <dir> --house <id> [--store <dir>] --pass <pass> --run <n> --reason <text> --holder <you>
+kitchn tick
+kitchn tick runs
+kitchn tick settle --pass <pass> --run <n> --reason <text> --holder <you>
 kitchn tick trigger launchd|cron --kitchn <abs path> --registry <abs dir> --house <id> [--every-minutes 1-59]
-kitchn tick configure --registry <abs dir> --house <id> [--repository <owner/name>]
-            [<backend>] [<pickup settings>]
+kitchn tick configure <backend or pickup setting> [--repository <owner/name>]
 ```
 
 A repair pass takes its branch prefix and report path from the pickup
@@ -554,16 +555,17 @@ the house; `pickup`, `coordinate`, and `repair` also need the worker backend
 options below. Everything else defaults from the house.
 
 ```sh
-kitchn run pickup     <house> <backend> [--ready-label ready] [--needs-spec-label needs-spec]
-                      [--human-label human-only] [--capacity 1] [--branch-prefix kitchen]
-                      [--report-path kitchen-report.md]
-kitchn run coordinate <house> <backend>
-kitchn run repair     <house> <backend> [--branch-prefix kitchen] [--report-path kitchen-report.md]
-kitchn run gate       <house>
+kitchn run pickup
+kitchn run coordinate
+kitchn run repair
+kitchn run gate
 ```
 
-`<house>` is `--registry <dir> --house <id> [--store <dir>] [--repository
-<owner/name>] [--take-over]`. The repository defaults to the house's only one.
+These forms use the inferred registry, house, and store, with optional
+`--repository <owner/name>` and `--take-over`. The repository defaults to the
+house's only one (or its stored runtime choice for these passes). Pickup,
+coordinate, and repair use the stored backend and pickup settings when
+configured; otherwise pass the needed flags explicitly.
 The forge is the house's forge binding, with `gh` (and `curl` for a GitHub App)
 from `PATH`. `<backend>` holds the host facts of the house's bound worker
 backend: for Orca, `--orca <absolute path> --runtime-dir <dir> --orca-run <run>
@@ -647,11 +649,11 @@ messages no worker.
 Post findings through the selected house's forge binding at an exact pull request head. The house must grant `review-pull-request` for the repository and forge credential. The command reads the live base tip, adds a `kitchen-attestation` block, persists the write intent, and reads back the posted review id. An uncertain submission is reconciled by its marker on retry and is never blindly posted again. `--attest` verifies and records an approved review for the scheduled gate; a binding whose login authored the pull request is refused by attestation.
 
 ```sh
-kitchn gate review --registry <dir> --house <id> [--store <dir>] [--repository <owner/name>] \
-  --pull-request <number> --head <40-character-sha> --verdict approve --body-file <findings.md> \
+kitchn gate review --pull-request <number> --head <40-character-sha> \
+  --verdict approve --body-file <findings.md> \
   --semantic clean --acceptance complete --hardware complete --risk none [--attest]
 
-kitchn gate review --registry <dir> --house <id> --pull-request <number> \
+kitchn gate review --pull-request <number> \
   --head <40-character-sha> --verdict request-changes --body-file <findings.md>
 ```
 
@@ -676,8 +678,7 @@ risk=none
 `semantic` is `clean`, `findings`, `partial`, or `unavailable`. `read_only` is `true` or `false`. `acceptance` and `hardware` are `complete` or `incomplete`. `risk` is `none` or a comma-separated list of distinct classes: `equipment-safety`, `authorization-secrets`, `durable-data`, `public-contract-release`, `workflow-rules`, `dependencies`, `weakened-validation`, and `large-diff`. The block must contain each key once, with no extra keys. Risk classes still require a separate human approval; this command does not grant one.
 
 ```sh
-kitchn gate attest --registry <dir> --house <id> [--store <dir>] [--repository <owner/name>] \
-  --pull-request <number> --review-id <forge-review-id>
+kitchn gate attest --pull-request <number> --review-id <forge-review-id>
 ```
 
 ## `kitchn pickup`

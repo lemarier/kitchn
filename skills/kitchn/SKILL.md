@@ -11,10 +11,11 @@ a schedule) needs their approval of that exact action, in this session.
 Approval never carries over to another action, and it is never saved as a
 standing grant. Installing this skill grants nothing.
 
-The CLI binary is `kitchn`. Every
-command below takes `--registry <dir>`: use the path the person gave for
-their house registry. If you don't know it, ask. Kitchen writes nothing into
-the repository's working tree.
+The CLI binary is `kitchn`. From a bound checkout, it infers the registry
+from `KITCHN_HOME` or `~/.kitchn`, the house from the checkout's stored
+repository binding, and the house store. Use the short forms below. If the
+checkout is unbound or selection is ambiguous, stop and resolve it with the
+person. Kitchen writes nothing into the repository's working tree.
 
 ## 1. Start every session
 
@@ -43,7 +44,7 @@ workflows to enable (`none` means interactive only). After they answer, run
 exactly:
 
 ```sh
-kitchn house setup --registry <dir> --repository <repository> --house <house> --workflows <list|none>
+kitchn house setup --workflows <list|none>
 ```
 
 Show the person the doctor report it prints. Any other resolution error
@@ -67,7 +68,7 @@ Write the issue facts you read from the forge to a temporary file:
 { "status": "open", "subIssues": [{ "number": 15, "status": "open", "blocked": false }], "independentParts": false }
 ```
 
-`kitchn work <issue> --facts <file> --revision <rev> --registry <dir> --holder <you> [orca flags] --json`
+`kitchn work <issue> --facts <file> --revision <rev> --holder <you> [orca flags] --json`
 
 - `coordinate`: list ready and waiting sub-issues. With `fanOut: true`, ask
   the person before starting each worker. Otherwise work them one at a time.
@@ -85,7 +86,7 @@ Facts at one head:
 { "state": "open", "head": "<40-hex sha>", "headBranch": "…", "baseBranch": "main", "mergeability": "clean", "review": "unreviewed" }
 ```
 
-`kitchn pr <number> --facts <file> [--as review|follow-up|repair|gate] --revision <rev> --registry <dir> --holder <you> [orca flags] --json`
+`kitchn pr <number> --facts <file> [--as review|follow-up|repair|gate] --revision <rev> --holder <you> [orca flags] --json`
 
 Kitchen reads the rounds already spent from the house store and applies the
 house's fix-round budget. `--fix-rounds <n>` can only lower that budget.
@@ -109,15 +110,15 @@ open. Write the draft to a temporary file:
 For a refinement, the target is `{ "type": "refine", "issue": 72, "comment": "…" }`
 and `removeLabels` is allowed.
 
-`kitchn issue new --draft <file> --revision <rev> --registry <dir> --json`
-`kitchn issue refine <n> --draft <file> --revision <rev> --registry <dir> --json`
+`kitchn issue new --draft <file> --revision <rev> --json`
+`kitchn issue refine <n> --draft <file> --revision <rev> --json`
 
 Show the person the whole preview: every issue, comment, label, and
 dependency, and the digest. A preview with open questions is not ready.
 Nothing is posted by these commands. Once the person approves that digest,
 post it with the same draft file:
 
-`kitchn issue apply --draft <file> --approve <digest> --registry <dir> --holder <you>`
+`kitchn issue apply --draft <file> --approve <digest> --holder <you>`
 
 It writes through the house's forge binding, and only the exact preview the
 digest names; a changed draft is refused until the person approves its new
@@ -130,7 +131,7 @@ A draft refused because an earlier draft settled after writing
 Show them the task and its writes, have them check those writes on the
 forge, and run with their reason:
 
-`kitchn issue acknowledge <task> --reason <why> --registry <dir> --holder <you>`
+`kitchn issue acknowledge <task> --reason <why> --holder <you>`
 
 With a forge binding it first re-reads the forge for writes whose outcome is
 unknown; without one, such a write stays unknown. Add `--accept-unknown`
@@ -142,7 +143,7 @@ your own.
 When you stop before the work is done, hand the claim back so scheduled runs
 or another session can adopt it:
 
-`kitchn hand-back <task> --registry <dir> --holder <you>`
+`kitchn hand-back <task> --holder <you>`
 
 ## 4. Scheduling
 

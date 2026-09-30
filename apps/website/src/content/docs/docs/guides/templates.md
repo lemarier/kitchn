@@ -10,8 +10,7 @@ shows you every change and adds only what is missing.
 ## Start a new repository
 
 ```sh
-kitchn init my-project --registry ~/.kitchn \
-  --house acme --repository acme/my-project \
+kitchn init my-project --house acme --repository acme/my-project \
   --template example --set project_name=my-project
 ```
 
@@ -37,14 +36,12 @@ empty answer, end of input or anything other than yes grants no consent.
 ## Adopt an existing repository
 
 ```sh
-kitchn adopt . --registry ~/.kitchn \
-  --house acme --repository acme/app \
-  --template example --set project_name=app
+kitchn adopt . --template example --set project_name=app
 ```
 
 Files that already exist and differ are reported as conflicts and left alone,
-even with `--yes`. Once the repository is bound in your registry, omit
-`--house` and `--repository`; kitchn resolves them from the git remote.
+even with `--yes`. This short form needs a bound checkout; for an unbound
+target, name its house and repository explicitly.
 
 `init` and `adopt` are the only commands that write into a repository, and only
 the template files you asked for. The binding itself stays in your registry.

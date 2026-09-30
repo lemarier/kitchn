@@ -5,6 +5,7 @@
 use std::fmt;
 
 use super::{KitchenPullRequest, Outcome, Pass, RunError, kitchen_pull_requests};
+use crate::workflows::tick::PassRun;
 use crate::{
     TaskId,
     contracts::{Clock, IssueNumber, Repository, Settlement, WorkerBackend},
@@ -43,6 +44,9 @@ pub struct RepairPass<'a, T> {
     pub repository: &'a Repository,
     /// Take over an expired pass lease instead of stopping.
     pub take_over: bool,
+    /// The house tick's run this pass serves, if a tick started it. The
+    /// pass only reads its tasks; it records each one it assesses.
+    pub tick: Option<&'a PassRun>,
 }
 
 /// What a repair pass decided about one pull request.
@@ -123,6 +127,7 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
         let mut candidates = Vec::with_capacity(found.len());
         let mut owners = Vec::with_capacity(found.len());
         for pull_request in found {
+            super::record(self.store, self.tick, &pull_request.task, self.clock)?;
             let record = self.store.task(&pull_request.task)?;
             if BranchFact::Stacked.holds(&record, &pull_request.branch) {
                 actions.push(RepairAction::Stacked {

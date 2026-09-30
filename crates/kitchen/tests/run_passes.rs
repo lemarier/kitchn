@@ -8,7 +8,7 @@ use std::{cell::RefCell, collections::BTreeMap, time::Duration};
 
 use common::{ManualClock, TestResult, WORKER_PERMISSIONS, backend_id, commit, credential, house};
 use kitchen::{
-    CredentialId,
+    CredentialId, HolderId,
     contracts::{
         BranchName, Capability, CapabilitySet, Clock, ExternalRef, Grant, MailMessage, MessageKind,
         PostingBudget, Repository, ResourceRef, Settlement, Text, WorkerOutcome, WorkerState,
@@ -19,9 +19,10 @@ use kitchen::{
         CredentialRef, GitHubClient, GitHubReadTransport, HouseScope, IntegrationError, ReadLimits,
         ReadRequest,
     },
+    scheduling::IntervalMinutes,
     state::{
-        ConsumerState, HouseStore, MailSender, PostKind, ReportedOutcome, StateError, TaskState,
-        WorkerPost,
+        ConsumerState, HouseStore, MailSender, PostKind, ReportedOutcome, RunState, StateError,
+        TaskState, WorkerPost,
     },
     workflows::{
         coordination::{Supervision, current_worker},
@@ -31,7 +32,11 @@ use kitchen::{
         run::{
             CoordinateAction, CoordinatePass, GatePass, Outcome, PASS_LEASE, Pass, PickupAction,
             PickupLabels, PickupPass, PickupSettings, RepairAction, RepairPass, RunError,
-            TASK_LEASE, Unroutable, pass_repository, run_claimant,
+            TASK_LEASE, TickPasses, Unroutable, pass_repository, run_claimant,
+        },
+        tick::{
+            self, Pass as TickPass, PassFailure, PassOutcome, PassSchedule, PassTick, TickDecision,
+            TickPolicy,
         },
     },
 };
@@ -294,6 +299,7 @@ impl Kitchen {
             clock: &self.clock,
             settings: &self.settings,
             take_over,
+            tick: None,
         }
         .run()
     }
@@ -310,6 +316,7 @@ impl Kitchen {
             forge: &self.forge,
             clock: &self.clock,
             take_over,
+            tick: None,
         }
         .run()
     }
@@ -327,6 +334,7 @@ impl Kitchen {
             clock: &self.clock,
             repository: &self.settings.repository,
             take_over: false,
+            tick: None,
         }
         .run()
     }
@@ -340,6 +348,7 @@ impl Kitchen {
             repository: &self.settings.repository,
             authors: &["kitchen-bot".to_owned()],
             take_over: false,
+            tick: None,
         }
         .run()
     }
@@ -790,6 +799,7 @@ fn pickup_refuses_before_its_lease_what_it_cannot_run() -> TestResult {
         clock: &kitchen.clock,
         settings: &settings,
         take_over: false,
+        tick: None,
     }
     .run();
     assert!(matches!(
@@ -1698,6 +1708,7 @@ impl Kitchen {
             clock: &self.clock,
             settings: &self.settings,
             take_over: false,
+            tick: None,
         }
         .run()
     }
@@ -1809,5 +1820,347 @@ fn coordinate_keeps_the_message_while_the_launch_cannot_be_reconciled() -> TestR
         message: ExternalRef::new("early")?,
     }));
     assert_eq!(kitchen.backend.next_delivery(), Ok(None));
+    Ok(())
+}
+
+// The house tick running the scheduled passes.
+
+impl kitchen::contracts::CoordinatorMailbox for PausedLaunch<'_> {
+    fn adopt_run(&self) -> Result<(), kitchen::contracts::MailboxError> {
+        self.inner.adopt_run()
+    }
+
+    fn next_delivery(
+        &self,
+    ) -> Result<Option<kitchen::contracts::Delivery>, kitchen::contracts::MailboxError> {
+        self.inner.next_delivery()
+    }
+
+    fn acknowledge(
+        &self,
+        delivery: &ExternalRef,
+    ) -> Result<Option<kitchen::contracts::Delivery>, kitchen::contracts::MailboxError> {
+        self.inner.acknowledge(delivery)
+    }
+
+    fn await_delivery(
+        &self,
+        wait: Duration,
+    ) -> Result<Option<kitchen::contracts::Delivery>, kitchen::contracts::MailboxError> {
+        self.inner.await_delivery(wait)
+    }
+}
+
+/// A clock that moves one second at every reading, so each step of a pass
+/// sees a later time than the step before.
+struct Stepping<'a>(&'a ManualClock);
+
+impl Clock for Stepping<'_> {
+    fn now(&self) -> kitchen::contracts::Timestamp {
+        self.0.advance(1);
+        self.0.now()
+    }
+}
+
+impl Kitchen {
+    /// Schedule `passes` on the house tick every 15 minutes.
+    fn schedule(&mut self, passes: &[TickPass]) -> TestResult {
+        let mut scheduled = BTreeMap::new();
+        for pass in passes {
+            scheduled.insert(
+                *pass,
+                PassSchedule {
+                    every_minutes: IntervalMinutes::new(15)?,
+                },
+            );
+        }
+        self.config.tick = Some(TickPolicy { passes: scheduled });
+        Ok(())
+    }
+
+    /// One house tick as `holder`, running due passes on `backend`.
+    fn tick_on(
+        &self,
+        backend: Option<&dyn kitchen::contracts::CoordinatorMailbox>,
+        clock: &dyn Clock,
+        holder: &str,
+    ) -> TestResult<Vec<PassTick>> {
+        let authors = ["kitchen-bot".to_owned()];
+        let mut passes = TickPasses {
+            store: self.store(),
+            house: &self.config,
+            backend,
+            forge: &self.forge,
+            clock,
+            repository: &self.settings.repository,
+            pickup: Some(&self.settings),
+            authors: &authors,
+        };
+        Ok(tick::tick(
+            self.store(),
+            &self.config,
+            &HolderId::new(holder)?,
+            &mut passes,
+            clock,
+        )?
+        .passes)
+    }
+
+    fn tick(&self, holder: &str) -> TestResult<Vec<PassTick>> {
+        self.tick_on(Some(&self.backend), &self.clock, holder)
+    }
+}
+
+/// The only pass's decision.
+fn decided(ticks: Vec<PassTick>) -> TestResult<TickDecision> {
+    match <[PassTick; 1]>::try_from(ticks) {
+        Ok([only]) => Ok(only.decision),
+        Err(ticks) => Err(format!("expected one pass, got {ticks:?}").into()),
+    }
+}
+
+fn ran(outcome: PassOutcome) -> impl Fn(&TickDecision) -> bool {
+    move |decision| matches!(decision, TickDecision::Ran { outcome: ran, .. } if *ran == outcome)
+}
+
+#[test]
+fn a_tick_runs_a_due_pickup_pass_and_records_its_task() -> TestResult {
+    let mut kitchen = Kitchen::new()?;
+    kitchen.schedule(&[TickPass::Pickup])?;
+    kitchen.ready_seven();
+
+    let decision = decided(kitchen.tick("tick-a")?)?;
+    assert!(ran(PassOutcome::Done)(&decision), "{decision:?}");
+    let (task, worker) = (kitchen.task(7)?, kitchen.worker(7)?);
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    let runs = kitchen.store().runs()?;
+    let [run] = runs.as_slice() else {
+        return Err(format!("expected one run, got {runs:?}").into());
+    };
+    assert_eq!(run.tasks, [task]);
+    assert!(
+        matches!(
+            &run.state,
+            RunState::Ended { outcome: PassOutcome::Done, backend_runs, .. }
+                if *backend_runs == [worker.handle]
+        ),
+        "{run:?}"
+    );
+    // The pass released its workflow lease like `kitchn run` does.
+    assert_eq!(kitchen.consumer(Pass::Pickup)?, Some(ConsumerState::Idle));
+
+    assert!(matches!(
+        decided(kitchen.tick("tick-b")?)?,
+        TickDecision::NotDue { .. }
+    ));
+    // Due again, pickup finds the issue claimed and records no task.
+    kitchen.clock.advance(15 * 60);
+    assert!(ran(PassOutcome::Idle)(&decided(kitchen.tick("tick-c")?)?));
+    let runs = kitchen.store().runs()?;
+    assert!(matches!(runs.as_slice(), [_, idle] if idle.tasks.is_empty()));
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_crash_mid_pass_leaves_the_tick_run_uncertain_and_blocks_the_pass() -> TestResult {
+    let mut kitchen = Kitchen::new()?;
+    kitchen.schedule(&[TickPass::Pickup])?;
+    kitchen.ready_seven();
+    // The process dies after the backend started the worker and before
+    // the launch receipt is stored.
+    let dying = PausedLaunch {
+        inner: &kitchen.backend,
+        during: RefCell::new(Some(Box::new(|_| {
+            std::panic::resume_unwind(Box::new("the tick process died"))
+        }))),
+        lose_response: false,
+    };
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        kitchen.tick_on(Some(&dying), &kitchen.clock, "tick-crashed")
+    }));
+    assert!(crashed.is_err());
+    let task = kitchen.task(7)?;
+    let runs = kitchen.store().runs()?;
+    assert!(
+        matches!(runs.as_slice(), [run] if run.state == RunState::Running && run.tasks == [task.clone()]),
+        "{runs:?}"
+    );
+    assert_eq!(kitchen.store().task(&task)?.unresolved_effects().count(), 1);
+
+    // While its tick lease lasts, the pass is busy.
+    assert!(matches!(
+        decided(kitchen.tick("tick-b")?)?,
+        TickDecision::Busy { .. }
+    ));
+    // Once it lapses the run is uncertain, and it blocks the pass on every
+    // later tick; nothing is launched again.
+    kitchen.clock.advance(tick::PASS_LEASE.as_secs() + 1);
+    for newly in [true, false] {
+        let ticks = kitchen.tick("tick-c")?;
+        assert!(
+            matches!(
+                ticks.as_slice(),
+                [PassTick {
+                    decision: TickDecision::Blocked { unresolved_effects: 1, .. },
+                    newly_uncertain,
+                    ..
+                }] if *newly_uncertain == newly
+            ),
+            "{ticks:?}"
+        );
+    }
+    assert!(matches!(
+        kitchen.store().runs()?.as_slice(),
+        [run] if matches!(run.state, RunState::Uncertain { .. })
+    ));
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_tick_and_kitchn_run_never_run_the_same_pass_at_once() -> TestResult {
+    let mut kitchen = Kitchen::new()?;
+    kitchen.schedule(&[TickPass::Pickup])?;
+    kitchen.ready_seven();
+    let consumer = Pass::Pickup.consumer(&repo()?)?;
+    let ttl = kitchen::contracts::LeaseTtl::new(PASS_LEASE)?;
+
+    // `kitchn run pickup` is mid-pass: the tick records a busy run.
+    let running =
+        kitchen
+            .store()
+            .acquire_consumer(&consumer, &run_claimant()?, ttl, kitchen.clock.now())?;
+    let busy = PassOutcome::Failed {
+        reason: PassFailure::Busy,
+    };
+    assert!(ran(busy)(&decided(kitchen.tick("tick-a")?)?));
+    // It died without a release: the tick never takes over.
+    kitchen.clock.advance(PASS_LEASE.as_secs() + 1);
+    let uncertain = PassOutcome::Failed {
+        reason: PassFailure::OwnerUncertain,
+    };
+    assert!(ran(uncertain)(&decided(kitchen.tick("tick-b")?)?));
+    assert_eq!(kitchen.backend.launched_agents().len(), 0);
+
+    // A person takes it over and ends it; then a tick mid-pass holds the
+    // lease against `kitchn run`.
+    let taken = kitchen.store().take_over_consumer(
+        &consumer,
+        &run_claimant()?,
+        ttl,
+        kitchen.clock.now(),
+    )?;
+    assert_ne!(taken.fence(), running.fence());
+    kitchen
+        .store()
+        .release_consumer(&consumer, taken.fence(), kitchen.clock.now())?;
+    kitchen.clock.advance(15 * 60);
+    let during = RefCell::new(None);
+    let launching = PausedLaunch {
+        inner: &kitchen.backend,
+        during: RefCell::new(Some(Box::new(|_| {
+            *during.borrow_mut() = Some(kitchen.pickup(false));
+        }))),
+        lose_response: false,
+    };
+    let decision = decided(kitchen.tick_on(Some(&launching), &kitchen.clock, "tick-c")?)?;
+    assert!(ran(PassOutcome::Done)(&decision), "{decision:?}");
+    assert!(matches!(
+        during
+            .borrow_mut()
+            .take()
+            .ok_or("the launch did not pause")??,
+        Outcome::Busy
+    ));
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_tick_pass_renews_its_run_while_it_acts() -> TestResult {
+    let mut kitchen = Kitchen::new()?;
+    kitchen.schedule(&[TickPass::Pickup])?;
+    kitchen.ready_seven();
+    let clock = Stepping(&kitchen.clock);
+    let seen = RefCell::new(None);
+    let launching = PausedLaunch {
+        inner: &kitchen.backend,
+        during: RefCell::new(Some(Box::new(|_| {
+            *seen.borrow_mut() = Some(kitchen.tick_on(Some(&kitchen.backend), &clock, "tick-b"));
+        }))),
+        lose_response: false,
+    };
+    let decision = decided(kitchen.tick_on(Some(&launching), &clock, "tick-a")?)?;
+    assert!(ran(PassOutcome::Done)(&decision), "{decision:?}");
+    let started = kitchen.store().runs()?.first().ok_or("no run")?.started_at;
+    // A second tick during the launch saw the lease renewed past its first
+    // expiry.
+    let seen = seen.borrow_mut().take().ok_or("the launch did not pause")?;
+    match decided(seen?)? {
+        TickDecision::Busy { expires_at, .. } => {
+            assert!(expires_at > started.saturating_add(tick::PASS_LEASE));
+        }
+        other => return Err(format!("expected busy, got {other:?}").into()),
+    }
+    Ok(())
+}
+
+#[test]
+fn a_tick_without_a_backend_refuses_the_passes_that_need_one() -> TestResult {
+    let mut kitchen = Kitchen::new()?;
+    kitchen.schedule(&[TickPass::Pickup, TickPass::Coordinate, TickPass::Gate])?;
+    kitchen.ready_seven();
+    let ticks = kitchen.tick_on(None, &kitchen.clock, "tick-a")?;
+    let refused = PassOutcome::Failed {
+        reason: PassFailure::Refused,
+    };
+    let decisions: Vec<(TickPass, bool)> = ticks
+        .iter()
+        .map(|tick| (tick.pass, ran(refused)(&tick.decision)))
+        .collect();
+    assert_eq!(
+        decisions,
+        [
+            (TickPass::Pickup, true),
+            (TickPass::Coordinate, true),
+            (TickPass::Gate, false)
+        ]
+    );
+    // The gate needs no backend; with no settled task it is idle.
+    assert!(
+        ticks
+            .last()
+            .is_some_and(|tick| ran(PassOutcome::Idle)(&tick.decision))
+    );
+    assert_eq!(kitchen.backend.launched_agents().len(), 0);
+    assert!(kitchen.store().tasks()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_tick_coordination_pass_records_the_tasks_it_continues() -> TestResult {
+    let mut kitchen = Kitchen::new()?;
+    kitchen.schedule(&[TickPass::Pickup, TickPass::Coordinate])?;
+    kitchen.ready_seven();
+    let ticks = kitchen.tick("tick-a")?;
+    assert!(
+        ticks
+            .iter()
+            .all(|tick| ran(PassOutcome::Done)(&tick.decision)),
+        "{ticks:?}"
+    );
+    let task = kitchen.task(7)?;
+    let runs = kitchen.store().runs()?;
+    let coordinate = runs
+        .iter()
+        .find(|run| run.pass == TickPass::Coordinate)
+        .ok_or("no coordination run")?;
+    // Coordination moved the task from the ended pickup pass to its own claim.
+    assert_eq!(coordinate.tasks, std::slice::from_ref(&task));
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Claimed { lease } if lease.consumer().is_none()
+    ));
     Ok(())
 }

@@ -37,7 +37,7 @@ use std::{collections::BTreeMap, fmt, path::Path, str::FromStr, time::Duration};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ConsumerId, ErrorClass, HolderId, HouseId, IdentifierError,
+    ConsumerId, ErrorClass, HolderId, HouseId, IdentifierError, TaskId,
     contracts::{Clock, ExternalRef, Fence, LeaseTtl, Timestamp},
     house::HouseConfig,
     scheduling::{IntervalMinutes, SchedulePolicy},
@@ -235,12 +235,20 @@ pub enum PassOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PassFailure {
-    /// This build of Kitchen cannot run the pass.
+    /// The build of Kitchen that recorded the run could not run the pass.
+    /// Kept for runs recorded before the tick ran the scheduled passes.
     NotAvailable,
     /// The pass refused: missing authority, capability, or configuration.
     Refused,
     /// The pass failed while running.
     Execution,
+    /// Another holder of the pass's workflow lease, such as `kitchn run`,
+    /// was running it; this run did nothing.
+    Busy,
+    /// The pass's workflow lease expired without a release: an earlier
+    /// pass may have died mid-way. The tick never takes over; a person
+    /// checks, then runs the pass with `--take-over`.
+    OwnerUncertain,
 }
 
 /// A run's usage, as far as the pass knows it.
@@ -290,6 +298,36 @@ pub struct PassRun {
     pub run: RunId,
     /// The tick lease fence the run holds.
     pub fence: Fence,
+}
+
+impl PassRun {
+    /// Record that the run is about to touch `task`, before the pass creates
+    /// intent or effects for it.
+    ///
+    /// # Errors
+    /// The errors of [`HouseStore::record_run_task`]; the pass stops.
+    pub fn record_task(
+        &self,
+        store: &HouseStore,
+        task: &TaskId,
+        clock: &dyn Clock,
+    ) -> crate::Result<()> {
+        store.record_run_task(self.run, self.fence, task, clock.now())
+    }
+
+    /// Extend the run's lease by [`PASS_LEASE`], never past its runtime.
+    ///
+    /// # Errors
+    /// The errors of [`HouseStore::renew_run`]; the pass stops.
+    pub fn renew(&self, store: &HouseStore, clock: &dyn Clock) -> crate::Result<()> {
+        store.renew_run(
+            self.run,
+            self.fence,
+            LeaseTtl::new(PASS_LEASE)?,
+            clock.now(),
+        )?;
+        Ok(())
+    }
 }
 
 /// Runs one bounded workflow pass. The tick calls it only while it holds the

@@ -1,25 +1,34 @@
 //! `kitchn tick`: the one command every trigger runs for a house.
 //!
-//! Without a subcommand it runs every due pass the house configures and
-//! records each run in the house store's run ledger. `runs` lists the ledger;
+//! Without a subcommand it runs every due pass the house configures, in
+//! process through the same scheduled passes as `kitchn run`, and records
+//! each run in the house store's run ledger. The forge and worker backend
+//! are resolved only for a pass that is due. `runs` lists the ledger;
 //! `settle` records that a person settled an uncertain run; `trigger` prints
-//! a launchd plist or crontab line that runs the tick and installs nothing. Due decisions, leases, and the ledger stay in
-//! [`kitchen::workflows::tick`].
+//! a launchd plist or crontab line that runs the tick and installs nothing.
+//! Due decisions, leases, and the ledger stay in
+//! [`kitchen::workflows::tick`]; the passes in [`kitchen::workflows::run`].
 
-use std::{fmt::Write as _, path::PathBuf};
+use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
 use kitchen::{
     HolderId, HouseId,
     adoption::HouseRegistry,
-    contracts::{Claimant, Clock, SystemClock, Text},
-    house::HouseError,
+    contracts::{Capability, Claimant, Clock, Repository, SystemClock, Text},
+    house::{HouseError, forge_binding},
     state::{HouseStore, RunId, RunSettle, RunState, StoreOptions},
-    workflows::tick::{
-        self, Pass, PassFailure, PassOutcome, PassReport, PassRun, PassRunner, TickDecision,
-        TriggerMinutes, TriggerTarget, trigger_cron, trigger_plist,
+    workflows::{
+        coordination::MailboxRoute,
+        run::{TickPasses, failed_report},
+        tick::{
+            self, Pass, PassFailure, PassOutcome, PassReport, PassRun, PassRunner, TickDecision,
+            TriggerMinutes, TriggerTarget, trigger_cron, trigger_plist,
+        },
     },
 };
+
+use super::run::{BackendArgs, Opened, PickupArgs};
 
 #[derive(Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
@@ -28,6 +37,14 @@ pub struct TickArgs {
     command: Option<TickCommand>,
     #[command(flatten)]
     house: Option<HouseScope>,
+    /// The repository pickup, repair, and the gate serve, as `owner/name`
+    /// (default: the house's only one).
+    #[arg(long)]
+    repository: Option<Repository>,
+    #[command(flatten)]
+    backend: BackendArgs,
+    #[command(flatten)]
+    pickup: PickupArgs,
 }
 
 #[derive(Subcommand)]
@@ -96,22 +113,69 @@ enum TriggerFormat {
     Cron,
 }
 
-/// Stands in for the scheduled pass commands of #225 until they land: every
-/// pass reports [`PassFailure::NotAvailable`], so the ledger shows the tick
-/// ran and nothing was done, and the tick exits 1.
-struct PendingPasses;
+/// Runs each due pass through [`TickPasses`], resolving first what that pass
+/// needs of the house's forge, worker backend, and pickup settings, as
+/// `kitchn run` does. A pass that cannot start records a failed run;
+/// `errors` keeps why.
+struct DuePasses<'a> {
+    opened: &'a Opened,
+    backend: &'a BackendArgs,
+    pickup: &'a PickupArgs,
+    clock: &'a SystemClock,
+    errors: BTreeMap<Pass, kitchen::Error>,
+}
 
-impl PendingPasses {
-    const fn report() -> PassReport {
-        PassReport::new(PassOutcome::Failed {
-            reason: PassFailure::NotAvailable,
-        })
+impl DuePasses<'_> {
+    fn run_pass(&self, pass: Pass, run: &PassRun) -> Result<PassReport, kitchen::Error> {
+        let opened = self.opened;
+        let settings = match pass {
+            Pass::Pickup => Some(super::run::settings(opened, self.pickup)?),
+            Pass::Coordinate | Pass::Repair | Pass::Gate => None,
+        };
+        let backend = match pass {
+            Pass::Pickup | Pass::Coordinate => Some(
+                opened.backend(
+                    self.backend,
+                    pass.as_str(),
+                    settings
+                        .as_ref()
+                        .map(|settings| settings.branch_prefix.clone()),
+                    MailboxRoute::House.worker_requirements(),
+                )?,
+            ),
+            Pass::Repair => Some(opened.backend(
+                self.backend,
+                pass.as_str(),
+                None,
+                &[Capability::WorkerStatusAndOutcome],
+            )?),
+            Pass::Gate => None,
+        };
+        let forge = opened.forge()?;
+        let authors = [forge_binding(&opened.registry, &opened.config.house)?
+            .requester
+            .to_string()];
+        TickPasses {
+            store: &opened.store,
+            house: &opened.config,
+            backend: backend.as_deref(),
+            forge: &forge,
+            clock: self.clock,
+            repository: &opened.repository,
+            pickup: settings.as_ref(),
+            authors: &authors,
+        }
+        .run_pass(pass, run)
     }
 }
 
-impl PassRunner for PendingPasses {
-    fn run(&mut self, _pass: Pass, _run: &PassRun) -> PassReport {
-        Self::report()
+impl PassRunner for DuePasses<'_> {
+    fn run(&mut self, pass: Pass, run: &PassRun) -> PassReport {
+        self.run_pass(pass, run).unwrap_or_else(|error| {
+            let report = failed_report(&error);
+            self.errors.insert(pass, error);
+            report
+        })
     }
 }
 
@@ -150,21 +214,42 @@ pub fn run(args: TickArgs) -> Result<(String, bool), kitchen::Error> {
             };
             Ok((text.trim_end().to_owned(), true))
         }
-        (None, Some(house)) => run_tick(house),
+        (None, Some(house)) => run_tick(house, args.repository, &args.backend, &args.pickup),
         (None, None) => Err(HouseError::InvalidInput.into()),
     }
 }
 
-fn run_tick(scope: HouseScope) -> Result<(String, bool), kitchen::Error> {
-    let (store, registry, house) = scope.open()?;
-    let config = registry.load(&house)?;
+fn run_tick(
+    scope: HouseScope,
+    repository: Option<Repository>,
+    backend: &BackendArgs,
+    pickup: &PickupArgs,
+) -> Result<(String, bool), kitchen::Error> {
+    let (Some(house), Some(registry)) = (scope.house, scope.registry) else {
+        return Err(HouseError::InvalidInput.into());
+    };
+    if scope
+        .store
+        .as_ref()
+        .is_some_and(|store| !store.is_absolute())
+    {
+        return Err(HouseError::InvalidInput.into());
+    }
+    let opened = Opened::open_parts(registry, &house, scope.store, repository)?;
     let clock = SystemClock;
     let holder = HolderId::new(&format!(
         "tick-{}-{}",
         std::process::id(),
         clock.now().as_unix_millis()
     ))?;
-    let report = tick::tick(&store, &config, &holder, &mut PendingPasses, &clock)?;
+    let mut passes = DuePasses {
+        opened: &opened,
+        backend,
+        pickup,
+        clock: &clock,
+        errors: BTreeMap::new(),
+    };
+    let report = tick::tick(&opened.store, &opened.config, &holder, &mut passes, &clock)?;
     let mut text = String::new();
     for pass in &report.passes {
         if !text.is_empty() {
@@ -172,7 +257,12 @@ fn run_tick(scope: HouseScope) -> Result<(String, bool), kitchen::Error> {
         }
         let _ = match &pass.decision {
             TickDecision::Ran { run, outcome } => {
-                write!(text, "{}: {run}: {}", pass.pass, outcome_text(*outcome))
+                write!(text, "{}: {run}: {}", pass.pass, outcome_text(*outcome)).and_then(|()| {
+                    match passes.errors.get(&pass.pass) {
+                        Some(error) => write!(text, ": {error}"),
+                        None => Ok(()),
+                    }
+                })
             }
             TickDecision::NotDue { next_due } => write!(
                 text,
@@ -320,6 +410,10 @@ const fn outcome_text(outcome: PassOutcome) -> &'static str {
             PassFailure::NotAvailable => "failed: pass not available in this build",
             PassFailure::Refused => "failed: refused",
             PassFailure::Execution => "failed",
+            PassFailure::Busy => "failed: another run of the pass holds its workflow lease",
+            PassFailure::OwnerUncertain => {
+                "failed: its workflow lease expired without a release; check what the last run did, then run `kitchn run <pass> --take-over`"
+            }
         },
     }
 }

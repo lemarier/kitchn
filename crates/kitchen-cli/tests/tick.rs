@@ -1,7 +1,9 @@
 //! The `kitchn tick` process contract against a temporary registry and house
-//! store, including `kitchn tick settle` for a run a crash left uncertain. The scheduled passes are not wired in yet (#225), so every pass
-//! that runs reports that it is not available; no workflow pass, backend,
-//! or live trigger runs, so none of this is live evidence.
+//! store, including `kitchn tick settle` for a run a crash left uncertain.
+//! The house has no installed instructions, so a due pickup pass runs and
+//! fails before any forge read or backend call; no backend or live trigger
+//! runs, so none of this is live evidence. A pass that acts is exercised in
+//! `crates/kitchen/tests/run_passes.rs` against fakes.
 
 use std::{
     error::Error,
@@ -20,6 +22,10 @@ use kitchen::{
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+/// Why a pickup pass stops in a house without installed instructions.
+const MISSING_INSTRUCTIONS: &str =
+    "pinned instructions are missing or modified; restore the verified bundle and sync";
 
 struct Kitchen {
     _dir: tempfile::TempDir,
@@ -189,7 +195,7 @@ fn a_crashed_run_blocks_the_pass_until_a_person_settles_it() -> TestResult {
     let output = kitchen.tick("origin89", &[])?;
     assert_eq!(
         stdout(&output).trim(),
-        "pickup: run 1: failed: pass not available in this build"
+        format!("pickup: run 1: failed: {MISSING_INSTRUCTIONS}")
     );
     Ok(())
 }
@@ -231,13 +237,13 @@ fn a_tick_records_each_due_pass_and_skips_it_until_due_again() -> TestResult {
     assert_eq!(first.status.code(), Some(1), "{}", stderr(&first));
     assert_eq!(
         stdout(&first).trim(),
-        "pickup: run 0: failed: pass not available in this build"
+        format!("pickup: run 0: failed: {MISSING_INSTRUCTIONS}")
     );
     let runs = kitchen.store("origin89")?.runs()?;
     assert!(matches!(
         runs.as_slice(),
         [run] if matches!(run.state, RunState::Ended {
-            outcome: PassOutcome::Failed { reason: PassFailure::NotAvailable },
+            outcome: PassOutcome::Failed { reason: PassFailure::Execution },
             ..
         })
     ));

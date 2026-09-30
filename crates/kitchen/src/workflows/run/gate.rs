@@ -5,6 +5,7 @@
 use std::fmt;
 
 use super::{Outcome, Pass, RunError, kitchen_pull_requests};
+use crate::workflows::tick::PassRun;
 use crate::{
     TaskId,
     contracts::{Clock, CommitId, IssueNumber, Repository},
@@ -39,6 +40,9 @@ pub struct GatePass<'a, T> {
     pub authors: &'a [String],
     /// Take over an expired pass lease instead of stopping.
     pub take_over: bool,
+    /// The house tick's run this pass serves, if a tick started it. The
+    /// pass only reads its tasks; it records each one it assesses.
+    pub tick: Option<&'a PassRun>,
 }
 
 /// The verdict on one pull request at one head.
@@ -92,6 +96,7 @@ impl<T: GitHubReadTransport> GatePass<'_, T> {
         );
         let mut actions = Vec::new();
         for pull_request in found.into_iter().take(MAX_GATE_PULL_REQUESTS) {
+            super::record(self.store, self.tick, &pull_request.task, self.clock)?;
             let evidence = collect_forge_evidence(
                 self.forge,
                 self.store.house(),

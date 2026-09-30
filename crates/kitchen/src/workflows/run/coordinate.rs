@@ -26,6 +26,7 @@ use crate::{
             start_coordinator, supervise, task_branch,
         },
         known,
+        tick::PassRun,
     },
 };
 
@@ -64,6 +65,10 @@ pub struct CoordinatePass<'a, T> {
     /// Take over an expired pass lease, and expired scheduled task claims,
     /// instead of stopping.
     pub take_over: bool,
+    /// The house tick's run this pass serves, if a tick started it: each
+    /// task is recorded on it before the pass moves, claims, or supervises
+    /// it, and it is renewed with the pass lease.
+    pub tick: Option<&'a PassRun>,
 }
 
 /// What a coordination pass did about one task or message.
@@ -352,7 +357,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         let mut delivery = mailbox.next_delivery().map_err(RunError::Mailbox)?;
         for _ in 0..MAX_BATCHES {
             let Some(batch) = delivery else { break };
-            super::renew(self.store, consumer, fence, self.clock)?;
+            super::renew(self.store, consumer, fence, self.tick, self.clock)?;
             let Some(dropped) =
                 self.handle(&ctx, &policy, &owned, &batch, &mut supervised, &mut actions)?
             else {
@@ -364,7 +369,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         }
         for owned in &owned {
             if !supervised.contains_key(&owned.task) {
-                super::renew(self.store, consumer, fence, self.clock)?;
+                super::renew(self.store, consumer, fence, self.tick, self.clock)?;
                 match still_owned(supervise(
                     &ctx,
                     &owned.task,
@@ -396,7 +401,8 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
     /// `took_over` an expired lease, every live claim is moved, so the
     /// replaced process holds only stale fences. A claim bound to this pass,
     /// at `consumer` and `pass_fence`, was adopted by [`start_coordinator`]
-    /// and is this pass's own.
+    /// and is this pass's own. Each task this pass continues is recorded on
+    /// its tick run first; the adoption itself only moved the claim.
     fn own(
         &self,
         consumer: &ConsumerId,
@@ -418,6 +424,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                 if bound
                     .is_some_and(|bound| &bound.consumer == consumer && bound.fence == pass_fence)
                 {
+                    super::record(self.store, self.tick, &task, self.clock)?;
                     actions.push(CoordinateAction::Adopted { task: task.clone() });
                     owned.push(Owned::new(task, lease.fence()));
                     continue;
@@ -427,6 +434,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                 {
                     continue;
                 }
+                super::record(self.store, self.tick, &task, self.clock)?;
                 if bound.is_none() && !took_over {
                     owned.push(Owned::new(task, lease.fence()));
                 } else if let Some(fence) =
@@ -442,6 +450,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             match record.state() {
                 TaskState::Claimed { lease } if lease.holder().as_str() == super::RUN_HOLDER => {
                     if self.take_over {
+                        super::record(self.store, self.tick, &task, self.clock)?;
                         let lease = self.store.take_over(&task, &claimant, ttl, now)?;
                         actions.push(CoordinateAction::TakenOver { task: task.clone() });
                         owned.push(Owned::new(task, lease.fence()));
@@ -458,6 +467,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                         Some(OwnershipEvent::Relinquished { .. })
                     ) =>
                 {
+                    super::record(self.store, self.tick, &task, self.clock)?;
                     match self.store.claim(&task, &claimant, ttl, now) {
                         Ok(lease) => {
                             actions.push(CoordinateAction::Adopted { task: task.clone() });

@@ -863,3 +863,34 @@ fn a_waiting_coordinator_wakes_on_a_post_and_an_idle_wait_ends_at_its_deadline()
     );
     Ok(())
 }
+
+#[test]
+fn an_expired_registered_reader_cannot_consume_mail() -> TestResult {
+    let world = world()?;
+    let work = launched(&world, 1)?;
+    let question = world.fixture.store.post_mail(
+        &sender(&work),
+        post(PostKind::Question, "Keep the old flag?")?,
+        world.now(),
+    )?;
+    let reader = mailbox(&world, work.consumer_fence)?;
+    let read = reader.next_delivery()?.ok_or("a batch")?;
+    // Its lease expires with nobody adopting yet. Re-reading loses nothing,
+    // but its acknowledgement must not consume the message before a
+    // successor adopts the mailbox.
+    world.clock.advance(601);
+    assert!(reader.acknowledge(&read.id).is_err());
+    let taken = world.fixture.store.take_over_consumer(
+        &consumer()?,
+        &common::scheduled("coordinator-2")?,
+        ttl(600)?,
+        world.now(),
+    )?;
+    let successor = mailbox(&world, taken.fence())?;
+    successor.adopt_run()?;
+    let adopted = successor
+        .next_delivery()?
+        .ok_or("the successor got nothing")?;
+    assert_eq!(ids(&adopted), [question]);
+    Ok(())
+}

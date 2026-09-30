@@ -3048,6 +3048,10 @@ impl StoreState {
         now: Timestamp,
     ) -> Result<Option<crate::contracts::Delivery>> {
         self.check_mail_reader(reader, now)?;
+        // Consuming needs a live lease: an expired or relinquished reader may
+        // still re-read (delivery is at least once), but never removes mail
+        // before its successor adopts the mailbox.
+        self.check_consumer(reader, now)?;
         self.mailbox.acknowledge(reader.fence, delivery)
     }
 

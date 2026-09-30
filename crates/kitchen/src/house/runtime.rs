@@ -344,6 +344,12 @@ fn replace_private_with(
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
     }
+    // Make the rename itself durable, as the registry does: without syncing
+    // the directory a crash could bring the old entry back.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 

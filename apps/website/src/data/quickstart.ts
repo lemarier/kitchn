@@ -210,7 +210,7 @@ export const steps: Step[] = [
       "The skill names the Orca worktree and the repository it resolved.",
       "Setup says the working tree is unchanged, and `git status` agrees.",
       "Doctor names each missing capability or access with its next step.",
-      "Starting a new repository instead? `kitchn init app --house acme --template <name>` previews the house template before writing it.",
+      "Starting a new repository instead? `kitchn init app --house acme --repository acme/app --template <name>` previews the house template before writing it.",
     ],
     tracking: [
       { issue: 17, what: "the /kitchn skill and its first-run setup" },

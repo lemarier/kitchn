@@ -90,7 +90,7 @@ export const commands: TermCommand[] = [
     summary: "Adopt a repository without touching it",
     docs: "/docs/start/quickstart/",
     lines: [
-      cmd("kitchn house setup --registry ~/.kitchn"),
+      cmd("kitchn house setup --registry ~/.kitchn --house acme --workflows none"),
       out("Repository acme/app, from the origin remote. House acme claims it."),
       ok("Bound acme/app in the house registry. Nothing was written to this repository."),
       warn("Doctor: setup incomplete"),

@@ -14,7 +14,7 @@ of a task already in progress.
   every file in the new snapshot verifies.
 
 ```sh
-kitchn house update --registry ~/.kitchn --house acme --bundle new-verified-bundle.json
+kitchn house update --house <id> --bundle new-verified-bundle.json
 ```
 
 Old snapshots are kept, so active tasks keep resolving the rules they started

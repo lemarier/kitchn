@@ -10,11 +10,13 @@ use std::{
 };
 
 use kitchen::{
-    HouseId,
+    HolderId, HouseId, TaskId,
     adoption::HouseRegistry,
+    contracts::{Clock, LeaseTtl, SystemClock, Timestamp},
     house::HouseConfig,
-    state::{HouseStore, RunState, StoreOptions},
-    workflows::tick::{PassFailure, PassOutcome},
+    scheduling::IntervalMinutes,
+    state::{HouseStore, RunStart, RunState, StoreOptions},
+    workflows::tick::{PASS_LEASE, Pass, PassFailure, PassOutcome, Repeat},
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -79,6 +81,78 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// A pickup run a crashed tick started two hours ago, optionally after
+/// recording a task.
+fn crashed_pickup(kitchen: &Kitchen, task: Option<&str>) -> TestResult {
+    let store = kitchen.store("origin89")?;
+    let started = Timestamp::from_unix_millis(
+        SystemClock
+            .now()
+            .as_unix_millis()
+            .saturating_sub(2 * 60 * 60 * 1000),
+    );
+    let RunStart::Started { run, fence, .. } = store.start_run(
+        Pass::Pickup,
+        IntervalMinutes::new(15)?,
+        Repeat::AfterReconcile,
+        &HolderId::new("tick-crashed")?,
+        LeaseTtl::new(PASS_LEASE)?,
+        started,
+    )?
+    else {
+        return Err("the crashed tick started pickup".into());
+    };
+    if let Some(task) = task {
+        store.record_run_task(run, fence, &TaskId::new(task)?, started)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_crashed_run_that_did_nothing_is_reconciled_before_the_pass_runs() -> TestResult {
+    let kitchen = Kitchen::new(&[("origin89", pickup_every(15))])?;
+    crashed_pickup(&kitchen, None)?;
+
+    let output = kitchen.tick("origin89", &[])?;
+    assert_eq!(
+        stdout(&output).trim(),
+        "pickup: run 1: failed: pass not available in this build \
+         (run 0 recorded as uncertain) (run 0 reconciled)"
+    );
+    let runs = kitchen.store("origin89")?.runs()?;
+    assert!(matches!(
+        runs.first().map(|run| &run.state),
+        Some(RunState::Recovered { .. })
+    ));
+    assert_eq!(runs.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_crashed_run_that_recorded_a_task_keeps_the_pass_waiting() -> TestResult {
+    let kitchen = Kitchen::new(&[("origin89", pickup_every(15))])?;
+    crashed_pickup(&kitchen, Some("pickup-task"))?;
+
+    for _ in 0..2 {
+        let output = kitchen.tick("origin89", &[])?;
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            stdout(&output).starts_with(
+                "pickup: waiting: run 0 is uncertain and not reconciled (0 unresolved effects)"
+            ),
+            "{}",
+            stdout(&output)
+        );
+    }
+    let runs = kitchen.store("origin89")?.runs()?;
+    assert_eq!(runs.len(), 1);
+    assert!(matches!(
+        runs.first().map(|run| &run.state),
+        Some(RunState::Uncertain { .. })
+    ));
+    Ok(())
 }
 
 #[test]

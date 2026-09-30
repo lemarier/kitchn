@@ -92,7 +92,7 @@ pub use retention::{
     MarkerRule, Presence, RetentionPolicy, RetentionReport, RetentionSubjects, RetiredMail,
     RetiredMarker, RetiredTask, StoreCapacity, TableUsage, TaskRetirement, marker_rule,
 };
-pub use runs::{MAX_RUNS_PER_PASS, RUN_RETENTION, RunId, RunRecord, RunStart, RunState};
+pub use runs::{MAX_RUNS_PER_PASS, RUN_RETENTION, RunId, RunRecord, RunSettle, RunStart, RunState};
 pub use snapshot::StoreOptions;
 pub use store::HouseStore;
 pub use usage::{

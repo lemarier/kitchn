@@ -2,27 +2,32 @@
 //!
 //! The ledger is the source of truth for when a pass last ran and how it
 //! ended; [`crate::workflows::tick`] owns the rules. It is bounded: retention
-//! drops ended runs older than [`RUN_RETENTION`] and keeps at most
-//! [`MAX_RUNS_PER_PASS`] ended runs per pass. A running entry is never
-//! dropped, and the pass lease allows at most one per pass.
+//! drops settled runs older than [`RUN_RETENTION`] and keeps at most
+//! [`MAX_RUNS_PER_PASS`] settled runs per pass. A running entry is never
+//! dropped, nor an uncertain one unless its pass is idempotent. The pass
+//! lease allows one running entry per pass, and a pass that is not
+//! idempotent does not start while it has an uncertain one.
 
 use std::{fmt, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    HolderId,
+    HolderId, TaskId,
     contracts::{ExternalRef, Fence, Timestamp},
-    workflows::tick::{MAX_RUN_EVIDENCE, Pass, PassOutcome, PassReport, RunUsage, TickError},
+    workflows::tick::{
+        MAX_PASS_RUNTIME, MAX_RUN_EVIDENCE, MAX_RUN_TASKS, Pass, PassOutcome, PassReport, Repeat,
+        RunUsage, TickError,
+    },
 };
 
-/// Ended runs the ledger keeps per pass.
+/// Settled (ended or recovered) runs the ledger keeps per pass.
 pub const MAX_RUNS_PER_PASS: usize = 64;
-/// How long the ledger keeps an ended run.
+/// How long the ledger keeps a settled run.
 pub const RUN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-/// Entries the ledger holds at most: every pass's ended runs and one
-/// running entry each.
-const MAX_RUNS: usize = Pass::ALL.len() * (MAX_RUNS_PER_PASS + 1);
+/// Entries the ledger holds at most: per pass, its kept runs, one running
+/// entry, and one uncertain entry awaiting reconciliation.
+const MAX_RUNS: usize = Pass::ALL.len() * (MAX_RUNS_PER_PASS + 2);
 
 /// A run's ledger id, unique within the house store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -62,10 +67,25 @@ pub enum RunState {
         backend_runs: Vec<ExternalRef>,
     },
     /// The lease expired before the run recorded an end. Whether the pass
-    /// finished its work is unknown.
+    /// finished its work is unknown. Unless the pass is idempotent, it does
+    /// not run again until this run is reconciled.
     Uncertain {
         /// When a later tick recorded it.
         reconciled_at: Timestamp,
+    },
+    /// A later tick reconciled an uncertain run: the tasks it touched have
+    /// no unresolved effects, and the runner established this outcome. The
+    /// run's own late end is refused.
+    Recovered {
+        /// When the reconciliation was recorded.
+        recovered_at: Timestamp,
+        /// How the run ended, as reconciled.
+        outcome: PassOutcome,
+        /// Usage where known.
+        usage: RunUsage,
+        /// The backend's own run references, linked as evidence only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        backend_runs: Vec<ExternalRef>,
     },
 }
 
@@ -83,17 +103,33 @@ pub struct RunRecord {
     pub fence: Fence,
     /// When it started.
     pub started_at: Timestamp,
+    /// Tasks the run said it would touch, recorded before it touched them.
+    /// Reconciliation checks their effects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<TaskId>,
     /// Where it stands.
     pub state: RunState,
 }
 
 impl RunRecord {
-    /// When the run left the running state, if it did.
+    /// When the run's outcome was settled, if it was.
     const fn settled_at(&self) -> Option<Timestamp> {
         match &self.state {
-            RunState::Running => None,
+            RunState::Running | RunState::Uncertain { .. } => None,
             RunState::Ended { ended_at, .. } => Some(*ended_at),
-            RunState::Uncertain { reconciled_at } => Some(*reconciled_at),
+            RunState::Recovered { recovered_at, .. } => Some(*recovered_at),
+        }
+    }
+
+    /// A live run under `fence`, or why not.
+    fn live(&self, fence: Fence) -> Result<(), TickError> {
+        if self.fence != fence {
+            return Err(TickError::NotRunOwner);
+        }
+        match self.state {
+            RunState::Running => Ok(()),
+            RunState::Uncertain { .. } | RunState::Recovered { .. } => Err(TickError::Superseded),
+            RunState::Ended { .. } => Err(TickError::AlreadyFinished),
         }
     }
 }
@@ -108,14 +144,24 @@ pub enum RunStart {
         /// The pass lease fence.
         fence: Fence,
         /// An earlier run recorded as uncertain first.
-        reconciled: Option<RunId>,
+        uncertain: Option<RunId>,
+    },
+    /// An uncertain run blocks the pass. The caller holds the pass lease
+    /// under `fence` to reconcile it and must settle or release it.
+    Reconcile {
+        /// The oldest uncertain run.
+        record: RunRecord,
+        /// The pass lease fence.
+        fence: Fence,
+        /// An earlier run recorded as uncertain first.
+        uncertain: Option<RunId>,
     },
     /// The pass is not due.
     NotDue {
         /// When it is due.
         next_due: Timestamp,
         /// An earlier run recorded as uncertain first.
-        reconciled: Option<RunId>,
+        uncertain: Option<RunId>,
     },
     /// Another tick holds the pass lease.
     Busy {
@@ -123,6 +169,19 @@ pub enum RunStart {
         holder: HolderId,
         /// When the lease expires.
         expires_at: Timestamp,
+    },
+}
+
+/// What [`crate::state::HouseStore::settle_run`] recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum RunSettle {
+    /// The run is recovered; the pass may run again.
+    Recovered,
+    /// The run stays uncertain and keeps blocking the pass.
+    Blocked {
+        /// Unresolved effects of the tasks the run touched.
+        unresolved_effects: usize,
     },
 }
 
@@ -162,7 +221,7 @@ impl RunLedger {
     }
 
     /// Record `pass`'s running entry, if any, as uncertain.
-    pub(crate) fn reconcile(&mut self, pass: Pass, now: Timestamp) -> Option<RunId> {
+    pub(crate) fn mark_uncertain(&mut self, pass: Pass, now: Timestamp) -> Option<RunId> {
         let run = self
             .runs
             .iter_mut()
@@ -171,14 +230,109 @@ impl RunLedger {
         Some(run.id)
     }
 
+    /// `pass`'s oldest uncertain run.
+    pub(crate) fn oldest_uncertain(&self, pass: Pass) -> Option<&RunRecord> {
+        self.runs
+            .iter()
+            .find(|run| run.pass == pass && matches!(run.state, RunState::Uncertain { .. }))
+    }
+
+    /// Uncertain `run`, or why it cannot be reconciled.
+    pub(crate) fn uncertain(&self, run: RunId) -> Result<&RunRecord, TickError> {
+        let record = self
+            .runs
+            .iter()
+            .find(|record| record.id == run)
+            .ok_or(TickError::UnknownRun)?;
+        match record.state {
+            RunState::Uncertain { .. } => Ok(record),
+            RunState::Running => Err(TickError::NotUncertain),
+            RunState::Ended { .. } | RunState::Recovered { .. } => Err(TickError::AlreadyFinished),
+        }
+    }
+
+    fn get_mut(&mut self, run: RunId) -> Result<&mut RunRecord, TickError> {
+        self.runs
+            .iter_mut()
+            .find(|record| record.id == run)
+            .ok_or(TickError::UnknownRun)
+    }
+
+    /// Check that `run` is live under `fence` and may still act at `now`.
+    pub(crate) fn check_live(
+        &self,
+        run: RunId,
+        fence: Fence,
+        now: Timestamp,
+    ) -> Result<Pass, TickError> {
+        let record = self
+            .runs
+            .iter()
+            .find(|record| record.id == run)
+            .ok_or(TickError::UnknownRun)?;
+        record.live(fence)?;
+        if now.saturating_since(record.started_at) >= MAX_PASS_RUNTIME {
+            return Err(TickError::RunTooLong);
+        }
+        Ok(record.pass)
+    }
+
+    /// Record that live `run` is about to touch `task`. Repeating is a no-op.
+    pub(crate) fn touch(
+        &mut self,
+        run: RunId,
+        fence: Fence,
+        task: &TaskId,
+    ) -> Result<(), TickError> {
+        let record = self.get_mut(run)?;
+        record.live(fence)?;
+        if record.tasks.contains(task) {
+            return Ok(());
+        }
+        if record.tasks.len() >= MAX_RUN_TASKS {
+            return Err(TickError::TooManyTasks { max: MAX_RUN_TASKS });
+        }
+        record.tasks.push(task.clone());
+        Ok(())
+    }
+
+    /// Settle uncertain `run` with its reconciled outcome.
+    pub(crate) fn recover(
+        &mut self,
+        run: RunId,
+        report: PassReport,
+        now: Timestamp,
+    ) -> Result<(), TickError> {
+        if report.backend_runs.len() > MAX_RUN_EVIDENCE {
+            return Err(TickError::TooMuchEvidence {
+                max: MAX_RUN_EVIDENCE,
+            });
+        }
+        let record = self.get_mut(run)?;
+        match record.state {
+            RunState::Uncertain { .. } => {
+                record.state = RunState::Recovered {
+                    recovered_at: now,
+                    outcome: report.outcome,
+                    usage: report.usage,
+                    backend_runs: report.backend_runs,
+                };
+                Ok(())
+            }
+            RunState::Running => Err(TickError::NotUncertain),
+            RunState::Ended { .. } | RunState::Recovered { .. } => Err(TickError::AlreadyFinished),
+        }
+    }
+
     pub(crate) fn start(
         &mut self,
         pass: Pass,
+        repeat: Repeat,
         holder: &HolderId,
         fence: Fence,
         now: Timestamp,
     ) -> RunId {
-        self.retain(pass, now);
+        self.retain(pass, repeat, now);
         let id = RunId(self.next);
         self.next = self.next.saturating_add(1);
         self.runs.push(RunRecord {
@@ -187,13 +341,15 @@ impl RunLedger {
             holder: holder.clone(),
             fence,
             started_at: now,
+            tasks: Vec::new(),
             state: RunState::Running,
         });
         id
     }
 
-    /// Record the end of `run`. A repeated identical end is a no-op; a late
-    /// end replaces an uncertain state with the run's outcome.
+    /// Record the end of `run`. A repeated identical end is a no-op. A run
+    /// that a later tick recorded as uncertain was superseded: its late end
+    /// is refused, and a reconciled outcome stays.
     pub(crate) fn finish(
         &mut self,
         run: RunId,
@@ -206,16 +362,12 @@ impl RunLedger {
                 max: MAX_RUN_EVIDENCE,
             });
         }
-        let record = self
-            .runs
-            .iter_mut()
-            .find(|record| record.id == run)
-            .ok_or(TickError::UnknownRun)?;
+        let record = self.get_mut(run)?;
         if record.fence != fence {
             return Err(TickError::NotRunOwner);
         }
         match &record.state {
-            RunState::Running | RunState::Uncertain { .. } => {
+            RunState::Running => {
                 record.state = RunState::Ended {
                     ended_at: now,
                     outcome: report.outcome,
@@ -236,32 +388,44 @@ impl RunLedger {
                 Ok(record.pass)
             }
             RunState::Ended { .. } => Err(TickError::AlreadyFinished),
+            RunState::Uncertain { .. } | RunState::Recovered { .. } => Err(TickError::Superseded),
         }
     }
 
-    /// Drop ended runs past [`RUN_RETENTION`], then the oldest ended runs
-    /// beyond [`MAX_RUNS_PER_PASS`] per pass, leaving room for the run of
-    /// `starting`. Running entries stay.
-    fn retain(&mut self, starting: Pass, now: Timestamp) {
+    /// Drop settled runs past [`RUN_RETENTION`], then the oldest settled
+    /// runs beyond [`MAX_RUNS_PER_PASS`] per pass, leaving room for the run
+    /// of `starting`. Running entries stay, and so do uncertain ones, except
+    /// those of `starting` when it is idempotent: they oblige nothing.
+    fn retain(&mut self, starting: Pass, repeat: Repeat, now: Timestamp) {
+        let droppable_at = |run: &RunRecord| match run.state {
+            RunState::Uncertain { reconciled_at }
+                if run.pass == starting && repeat == Repeat::Idempotent =>
+            {
+                Some(reconciled_at)
+            }
+            RunState::Running
+            | RunState::Uncertain { .. }
+            | RunState::Ended { .. }
+            | RunState::Recovered { .. } => run.settled_at(),
+        };
         self.runs.retain(|run| {
-            run.settled_at()
-                .is_none_or(|at| now.saturating_since(at) < RUN_RETENTION)
+            droppable_at(run).is_none_or(|at| now.saturating_since(at) < RUN_RETENTION)
         });
         for pass in Pass::ALL {
-            let ended = self
+            let settled = self
                 .runs
                 .iter()
-                .filter(|run| run.pass == pass && run.settled_at().is_some())
+                .filter(|run| run.pass == pass && droppable_at(run).is_some())
                 .count();
             let keep = if pass == starting {
                 MAX_RUNS_PER_PASS.saturating_sub(1)
             } else {
                 MAX_RUNS_PER_PASS
             };
-            let mut excess = ended.saturating_sub(keep);
+            let mut excess = settled.saturating_sub(keep);
             // Runs are appended in start order, so the first ones are oldest.
             self.runs.retain(|run| {
-                if excess > 0 && run.pass == pass && run.settled_at().is_some() {
+                if excess > 0 && run.pass == pass && droppable_at(run).is_some() {
                     excess -= 1;
                     false
                 } else {
@@ -276,8 +440,10 @@ impl RunLedger {
         let bounded = self.runs.len() <= MAX_RUNS
             && self.runs.iter().all(|run| {
                 run.id.0 < self.next
+                    && run.tasks.len() <= MAX_RUN_TASKS
                     && match &run.state {
-                        RunState::Ended { backend_runs, .. } => {
+                        RunState::Ended { backend_runs, .. }
+                        | RunState::Recovered { backend_runs, .. } => {
                             backend_runs.len() <= MAX_RUN_EVIDENCE
                         }
                         RunState::Running | RunState::Uncertain { .. } => true,

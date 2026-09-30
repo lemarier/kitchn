@@ -35,7 +35,7 @@ use crate::{
         retention::{
             self, Inventory, RetentionPolicy, RetentionReport, RetentionSubjects, StoreCapacity,
         },
-        runs::{RunId, RunLedger, RunRecord, RunStart},
+        runs::{RunId, RunLedger, RunRecord, RunSettle, RunStart},
         usage::{
             AttemptUsage, AttemptUsageEntry, HumanReply, MAX_HUMAN_REPLIES_PER_ATTEMPT, UsageError,
             UsageReport,
@@ -43,7 +43,7 @@ use crate::{
     },
     workflows::{
         intake,
-        tick::{Pass, PassReport},
+        tick::{Pass, PassReport, Recovery, Repeat, TickError},
     },
 };
 
@@ -3072,13 +3072,15 @@ impl StoreState {
         self.mailbox.last_posted()
     }
 
-    /// Start `pass` when it is due: reconcile a run whose lease expired,
+    /// Start `pass` when it is due: record a run whose lease expired as
+    /// uncertain, stop at an uncertain run unless the pass is idempotent,
     /// then take the pass lease and record a running entry, all in this
     /// transaction. A live lease leaves everything unchanged.
     pub(crate) fn start_run(
         &mut self,
         pass: Pass,
         every: IntervalMinutes,
+        repeat: Repeat,
         holder: &HolderId,
         ttl: LeaseTtl,
         now: Timestamp,
@@ -3098,7 +3100,22 @@ impl StoreState {
             }
             Some(ConsumerState::Idle | ConsumerState::Relinquished { .. }) | None => {}
         }
-        let reconciled = self.runs.reconcile(pass, now);
+        let uncertain = self.runs.mark_uncertain(pass, now);
+        let blocking = match repeat {
+            Repeat::AfterReconcile => self.runs.oldest_uncertain(pass).cloned(),
+            Repeat::Idempotent => None,
+        };
+        if let Some(record) = blocking {
+            let lease = match held {
+                Some(lease) => lease,
+                None => self.acquire_consumer(&consumer, &claimant, ttl, now)?,
+            };
+            return Ok(RunStart::Reconcile {
+                record,
+                fence: lease.fence,
+                uncertain,
+            });
+        }
         let every = Duration::from_secs(u64::from(every.get()).saturating_mul(60));
         if let Some(next_due) = self.runs.next_due(pass, every).filter(|due| *due > now) {
             if let Some(lease) = held {
@@ -3106,19 +3123,91 @@ impl StoreState {
             }
             return Ok(RunStart::NotDue {
                 next_due,
-                reconciled,
+                uncertain,
             });
         }
         let lease = match held {
             Some(lease) => lease,
             None => self.acquire_consumer(&consumer, &claimant, ttl, now)?,
         };
-        let run = self.runs.start(pass, holder, lease.fence, now);
+        let run = self.runs.start(pass, repeat, holder, lease.fence, now);
         Ok(RunStart::Started {
             run,
             fence: lease.fence,
-            reconciled,
+            uncertain,
         })
+    }
+
+    /// The pass lease `fence` holds live at `now`, or [`TickError::Superseded`].
+    fn check_pass_lease(&self, pass: Pass, fence: Fence, now: Timestamp) -> Result<ConsumerId> {
+        let consumer = pass.consumer()?;
+        let holds = self
+            .consumers
+            .get(&consumer)
+            .and_then(ConsumerRecord::lease)
+            .is_some_and(|lease| lease.fence == fence && lease.is_live(now));
+        if !holds {
+            return Err(TickError::Superseded.into());
+        }
+        Ok(consumer)
+    }
+
+    /// Settle uncertain `run` under the pass lease `fence`, then release the
+    /// lease. The run is recovered only when the runner established its
+    /// outcome and no task the run touched has an unresolved effect.
+    pub(crate) fn settle_run(
+        &mut self,
+        run: RunId,
+        fence: Fence,
+        recovery: Recovery,
+        now: Timestamp,
+    ) -> Result<RunSettle> {
+        let record = self.runs.uncertain(run)?;
+        let consumer = self.check_pass_lease(record.pass, fence, now)?;
+        let unresolved_effects = record
+            .tasks
+            .iter()
+            // Retention retires only tasks whose effects are all resolved.
+            .filter_map(|task| self.tasks.get(task))
+            .map(|task| task.unresolved_effects().count())
+            .fold(0_usize, usize::saturating_add);
+        let settle = match recovery {
+            Recovery::Ended(report) if unresolved_effects == 0 => {
+                self.runs.recover(run, report, now)?;
+                RunSettle::Recovered
+            }
+            Recovery::Ended(_) | Recovery::Unknown => RunSettle::Blocked { unresolved_effects },
+        };
+        self.release_consumer(&consumer, fence, now)?;
+        Ok(settle)
+    }
+
+    /// Extend live `run`'s pass lease, within
+    /// [`crate::workflows::tick::MAX_PASS_RUNTIME`].
+    pub(crate) fn renew_run(
+        &mut self,
+        run: RunId,
+        fence: Fence,
+        ttl: LeaseTtl,
+        now: Timestamp,
+    ) -> Result<Timestamp> {
+        let pass = self.runs.check_live(run, fence, now)?;
+        let consumer = self.check_pass_lease(pass, fence, now)?;
+        Ok(self.renew_consumer(&consumer, fence, ttl, now)?.expires_at)
+    }
+
+    /// Record that live `run` is about to touch `task`.
+    pub(crate) fn record_run_task(
+        &mut self,
+        run: RunId,
+        fence: Fence,
+        task: &TaskId,
+        now: Timestamp,
+    ) -> Result<()> {
+        let pass = self.runs.check_live(run, fence, now)?;
+        self.check_pass_lease(pass, fence, now)?;
+        self.runs.touch(run, fence, task)?;
+        Ok(())
     }
 
     /// Record how `run` ended and release its pass lease if it still holds it.

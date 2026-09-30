@@ -1,7 +1,11 @@
 //! The house tick against a temporary house store and a fake pass runner:
-//! due and not-due passes, duplicate ticks, a crash mid-run, ledger bounds
-//! and retention, cross-house refusal, and the printed triggers. No workflow
-//! pass, backend, or live trigger runs, so none of this is live evidence.
+//! due and not-due passes, duplicate ticks, a crash mid-run and its
+//! reconciliation, lease renewal and superseded runs, ledger bounds and
+//! retention, cross-house refusal, and the printed triggers. Effects go to
+//! the fake backend. No workflow pass, real backend, or live trigger runs,
+//! so none of this is live evidence.
+
+mod common;
 
 use std::{
     cell::Cell,
@@ -13,18 +17,20 @@ use std::{
 };
 
 use kitchen::{
-    ConsumerId, HolderId, HouseId,
-    contracts::{Clock, ContractError, ExternalRef, LeaseTtl, Timestamp},
+    ConsumerId, HolderId, HouseId, TaskId,
+    contracts::{
+        Clock, ContractError, ExternalRef, Fence, LeaseTtl, Timestamp, fake::ExecuteFault,
+    },
     house::{HouseConfig, HouseError},
     scheduling::IntervalMinutes,
     state::{
-        ConsumerState, HouseStore, MAX_RUNS_PER_PASS, RunId, RunStart, RunState, StoreOptions,
-        TokenCounts,
+        ConsumerState, EffectState, HouseStore, MAX_RUNS_PER_PASS, RunId, RunSettle, RunStart,
+        RunState, StoreOptions, TokenCounts, reconcile, run_effect,
     },
     workflows::tick::{
-        self, MAX_RUN_EVIDENCE, PASS_LEASE, Pass, PassFailure, PassOutcome, PassReport, PassRun,
-        PassRunner, RunUsage, TickDecision, TickError, TriggerMinutes, TriggerTarget, trigger_cron,
-        trigger_plist,
+        self, MAX_PASS_RUNTIME, MAX_RUN_EVIDENCE, MAX_RUN_TASKS, PASS_LEASE, Pass, PassFailure,
+        PassOutcome, PassRecovery, PassReport, PassRun, PassRunner, Recovery, Repeat, RunUsage,
+        TickDecision, TickError, TriggerMinutes, TriggerTarget, trigger_cron, trigger_plist,
     },
 };
 
@@ -51,22 +57,40 @@ impl Clock for Fixed {
     }
 }
 
-/// Records each pass it runs and reports `outcome`.
+/// Records each pass it runs and reports `outcome`. It reconciles an
+/// uncertain run that recorded no tasks as idle, and one that did as unknown.
 struct Recorder {
     ran: Vec<Pass>,
+    reconciled: Vec<RunId>,
     outcome: PassOutcome,
+    repeat: Repeat,
 }
 
 impl Recorder {
     const fn new(outcome: PassOutcome) -> Self {
         Self {
             ran: Vec::new(),
+            reconciled: Vec::new(),
             outcome,
+            repeat: Repeat::AfterReconcile,
         }
     }
 }
 
 impl PassRunner for Recorder {
+    fn reconcile(&mut self, _pass: Pass, uncertain: &PassRecovery) -> Recovery {
+        self.reconciled.push(uncertain.record.id);
+        if uncertain.record.tasks.is_empty() {
+            Recovery::Ended(PassReport::new(PassOutcome::Idle))
+        } else {
+            Recovery::Unknown
+        }
+    }
+
+    fn repeat(&self, _pass: Pass) -> Repeat {
+        self.repeat
+    }
+
     fn run(&mut self, pass: Pass, _run: &PassRun) -> PassReport {
         self.ran.push(pass);
         PassReport {
@@ -244,6 +268,10 @@ struct Overlapping<'a> {
 }
 
 impl PassRunner for Overlapping<'_> {
+    fn reconcile(&mut self, _pass: Pass, _uncertain: &PassRecovery) -> Recovery {
+        Recovery::Unknown
+    }
+
     fn run(&mut self, _pass: Pass, _run: &PassRun) -> PassReport {
         let (sender, receiver) = mpsc::channel();
         let (store, config) = (self.store.to_path_buf(), self.config.clone());
@@ -307,10 +335,11 @@ fn a_duplicate_tick_while_a_pass_runs_leaves_it_alone() -> TestResult {
 }
 
 /// A tick that crashed after starting `pickup`: its run stays open.
-fn crashed_run(store: &HouseStore) -> TestResult<(RunId, kitchen::contracts::Fence)> {
+fn crashed_run(store: &HouseStore) -> TestResult<(RunId, Fence)> {
     match store.start_run(
         Pass::Pickup,
         every(15)?,
+        Repeat::AfterReconcile,
         &holder("tick-crashed")?,
         LeaseTtl::new(PASS_LEASE)?,
         Timestamp::from_unix_millis(T0),
@@ -340,36 +369,405 @@ fn a_crash_mid_run_is_recorded_uncertain_and_reconciled_on_the_next_tick() -> Te
         Some(&RunState::Running)
     );
 
-    // Past the lease: the next tick records it as uncertain and runs again.
+    // Past the lease: the next tick records it as uncertain, reconciles it
+    // (it recorded no tasks), and only then runs the pass once.
     clock.set(T0 + 61 * MINUTE);
     let report = tick::tick(&store, &config, &holder("tick-c")?, &mut runner, &clock)?;
     let pass = report.passes.first().ok_or("one pass")?;
-    assert_eq!(pass.reconciled, Some(crashed));
+    assert_eq!(pass.uncertain, Some(crashed));
+    assert_eq!(pass.recovered, [crashed]);
     assert!(matches!(pass.decision, TickDecision::Ran { .. }));
+    assert_eq!(runner.reconciled, [crashed]);
     assert_eq!(runner.ran, [Pass::Pickup]);
-    let runs = store.runs()?;
+    let recovered = RunState::Recovered {
+        recovered_at: Timestamp::from_unix_millis(T0 + 61 * MINUTE),
+        outcome: PassOutcome::Idle,
+        usage: RunUsage::NotReported,
+        backend_runs: Vec::new(),
+    };
     assert_eq!(
-        runs.first().map(|run| &run.state),
-        Some(&RunState::Uncertain {
-            reconciled_at: Timestamp::from_unix_millis(T0 + 61 * MINUTE)
-        })
+        store.runs()?.first().map(|run| &run.state),
+        Some(&recovered)
     );
 
-    // A late end from the crashed run replaces the uncertain state and
-    // leaves the current lease alone.
-    store.finish_run(
+    // The crashed run was superseded: its late end is refused and the
+    // ledger keeps the reconciled outcome.
+    let late = store.finish_run(
         crashed,
         fence,
-        PassReport::new(PassOutcome::Idle),
+        PassReport::new(PassOutcome::Done),
         Timestamp::from_unix_millis(T0 + 62 * MINUTE),
+    );
+    assert_eq!(
+        late.err().as_ref().and_then(tick_error),
+        Some(TickError::Superseded)
+    );
+    assert_eq!(
+        store.runs()?.first().map(|run| &run.state),
+        Some(&recovered)
+    );
+    Ok(())
+}
+
+/// Reconciles an uncertain run the way a pass would: take over each task
+/// the run recorded and look its effects up with [`reconcile`].
+struct Reconciler<'a> {
+    store: &'a HouseStore,
+    backend: kitchen::contracts::fake::FakeBackend,
+    clock: &'a Fixed,
+    ran: Vec<Pass>,
+}
+
+impl PassRunner for Reconciler<'_> {
+    fn run(&mut self, pass: Pass, _run: &PassRun) -> PassReport {
+        self.ran.push(pass);
+        PassReport::new(PassOutcome::Done)
+    }
+
+    fn reconcile(&mut self, _pass: Pass, uncertain: &PassRecovery) -> Recovery {
+        let settled = uncertain.record.tasks.iter().all(|task| {
+            self.store
+                .take_over(
+                    task,
+                    &common::scheduled("pickup-recovery").unwrap_or_else(|_| unreachable!()),
+                    LeaseTtl::new(Duration::from_secs(600)).unwrap_or_else(|_| unreachable!()),
+                    self.clock.now(),
+                )
+                .and_then(|lease| {
+                    reconcile(self.store, &self.backend, task, lease.fence(), self.clock)
+                })
+                .is_ok_and(|report| report.unresolved.is_empty() && report.foreign.is_empty())
+        });
+        if settled {
+            Recovery::Ended(PassReport::new(PassOutcome::Done))
+        } else {
+            Recovery::Unknown
+        }
+    }
+}
+
+#[test]
+fn an_uncertain_effect_blocks_the_pass_until_it_is_reconciled() -> TestResult {
+    let house = House::new()?;
+    let store = house.open()?;
+    let config = config(&[("pickup", 15)])?;
+    let start = Timestamp::from_unix_millis(T0);
+
+    // The crashed run recorded its task, then launched a worker and lost
+    // the response: the launch may have happened.
+    let (crashed, run_fence) = crashed_run(&store)?;
+    let task: TaskId = common::task_id("pickup-task")?;
+    store.record_run_task(crashed, run_fence, &task, start)?;
+    store.create_task(common::spec("pickup-task")?, &common::creator()?, start)?;
+    let fence = store
+        .claim(
+            &task,
+            &common::scheduled("pickup-a")?,
+            common::ttl(600)?,
+            start,
+        )?
+        .fence();
+    store.start_attempt(&task, fence, start)?;
+    let backend = common::refusing()?;
+    backend.inject(ExecuteFault::ApplyThenLoseResponse);
+    let lost = run_effect(
+        &store,
+        &backend,
+        &common::grants()?,
+        common::plan(&task, fence, "launch", common::launch()?)?,
+        &Fixed::at(T0),
     )?;
+    assert!(matches!(lost.state(), EffectState::Uncertain { .. }));
+
+    // The lookup fails: the run stays uncertain and the pass does not run.
+    backend.fail_lookups(1);
+    let clock = Fixed::at(T0 + 61 * MINUTE);
+    let mut runner = Reconciler {
+        store: &store,
+        backend,
+        clock: &clock,
+        ran: Vec::new(),
+    };
+    let blocked = tick::tick(&store, &config, &holder("tick-b")?, &mut runner, &clock)?;
+    assert!(!blocked.healthy());
+    assert_eq!(
+        blocked.passes.first().map(|p| &p.decision),
+        Some(&TickDecision::NeedsAttention {
+            run: crashed,
+            unresolved_effects: 1
+        })
+    );
+    assert!(runner.ran.is_empty());
+    assert_eq!(store.runs()?.len(), 1);
+    // The lease is released, so the next tick can try again.
+    assert!(matches!(
+        store
+            .consumer(&tick_consumer("pickup")?)?
+            .map(|c| c.state().clone()),
+        Some(ConsumerState::Idle)
+    ));
+
+    // Once the first reconciliation's task claim lapses, the next lookup
+    // proves the launch applied: the run is recovered and the pass runs
+    // once, without launching again.
+    clock.set(T0 + 72 * MINUTE);
+    let report = tick::tick(&store, &config, &holder("tick-c")?, &mut runner, &clock)?;
+    let pass = report.passes.first().ok_or("one pass")?;
+    assert_eq!(pass.recovered, [crashed]);
+    assert!(matches!(pass.decision, TickDecision::Ran { .. }));
+    assert_eq!(runner.ran, [Pass::Pickup]);
+    assert_eq!(runner.backend.execute_calls(), 1);
     assert!(matches!(
         store.runs()?.first().map(|run| &run.state),
-        Some(RunState::Ended {
-            outcome: PassOutcome::Idle,
+        Some(RunState::Recovered {
+            outcome: PassOutcome::Done,
             ..
         })
     ));
+    Ok(())
+}
+
+#[test]
+fn an_idempotent_pass_reruns_past_an_uncertain_run() -> TestResult {
+    let house = House::new()?;
+    let store = house.open()?;
+    let config = config(&[("pickup", 15)])?;
+    let (crashed, run_fence) = crashed_run(&store)?;
+    store.record_run_task(
+        crashed,
+        run_fence,
+        &common::task_id("pickup-task")?,
+        Timestamp::from_unix_millis(T0),
+    )?;
+    let mut runner = Recorder::new(PassOutcome::Done);
+    runner.repeat = Repeat::Idempotent;
+
+    let clock = Fixed::at(T0 + 61 * MINUTE);
+    let report = tick::tick(&store, &config, &holder("tick-b")?, &mut runner, &clock)?;
+    let pass = report.passes.first().ok_or("one pass")?;
+    assert_eq!(pass.uncertain, Some(crashed));
+    assert!(pass.recovered.is_empty());
+    assert!(matches!(pass.decision, TickDecision::Ran { .. }));
+    assert_eq!(runner.ran, [Pass::Pickup]);
+    assert!(runner.reconciled.is_empty());
+    // The uncertain run stays as it was; it blocks nothing.
+    assert!(matches!(
+        store.runs()?.first().map(|run| &run.state),
+        Some(RunState::Uncertain { .. })
+    ));
+
+    // The same crash blocks a pass that makes no such claim.
+    let mut strict = Recorder::new(PassOutcome::Done);
+    clock.set(T0 + 80 * MINUTE);
+    let report = tick::tick(&store, &config, &holder("tick-c")?, &mut strict, &clock)?;
+    assert_eq!(
+        report.passes.first().map(|p| &p.decision),
+        Some(&TickDecision::NeedsAttention {
+            run: crashed,
+            unresolved_effects: 0
+        })
+    );
+    assert!(strict.ran.is_empty());
+    Ok(())
+}
+
+/// Runs passes but cannot establish how an uncertain run ended.
+struct Unsure(Vec<Pass>);
+
+impl PassRunner for Unsure {
+    fn run(&mut self, pass: Pass, _run: &PassRun) -> PassReport {
+        self.0.push(pass);
+        PassReport::new(PassOutcome::Idle)
+    }
+
+    fn reconcile(&mut self, _pass: Pass, _uncertain: &PassRecovery) -> Recovery {
+        Recovery::Unknown
+    }
+}
+
+/// A pass that runs past [`PASS_LEASE`]. With `renew`, it renews its run
+/// before the lease lapses; either way, a second tick on its own store
+/// handle fires once the original lease would have expired.
+struct Slow<'a> {
+    store: &'a Path,
+    config: &'a HouseConfig,
+    renew: bool,
+    renewed: Option<Timestamp>,
+    after: Vec<Result<(), Option<TickError>>>,
+    second: Option<tick::TickReport>,
+}
+
+impl PassRunner for Slow<'_> {
+    fn reconcile(&mut self, _pass: Pass, _uncertain: &PassRecovery) -> Recovery {
+        Recovery::Unknown
+    }
+
+    fn run(&mut self, _pass: Pass, run: &PassRun) -> PassReport {
+        let own = open(self.store);
+        if self.renew
+            && let Ok(store) = &own
+        {
+            self.renewed = store
+                .renew_run(
+                    run.run,
+                    run.fence,
+                    LeaseTtl::new(PASS_LEASE).unwrap_or_else(|_| unreachable!()),
+                    Timestamp::from_unix_millis(T0 + 50 * MINUTE),
+                )
+                .ok();
+        }
+        let (sender, receiver) = mpsc::channel();
+        let (path, config) = (self.store.to_path_buf(), self.config.clone());
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let result = open(&path).and_then(|store| {
+                    let mut idle = Unsure(Vec::new());
+                    let report = tick::tick(
+                        &store,
+                        &config,
+                        &holder("tick-b")?,
+                        &mut idle,
+                        &Fixed::at(T0 + 70 * MINUTE),
+                    )?;
+                    if !idle.0.is_empty() {
+                        return Err("the second tick ran a pass".into());
+                    }
+                    Ok(report)
+                });
+                let _ = sender.send(result.map_err(|error| error.to_string()));
+            });
+        });
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(report)) => self.second = Some(report),
+            Ok(Err(error)) => eprintln!("second tick: {error}"),
+            Err(error) => eprintln!("second tick: {error}"),
+        }
+        // What the first run may still do after the second tick.
+        if let Ok(store) = &own {
+            let now = Timestamp::from_unix_millis(T0 + 71 * MINUTE);
+            let error = |result: kitchen::Result<()>| result.map_err(|e| tick_error(&e));
+            self.after = vec![
+                error(
+                    store
+                        .renew_run(
+                            run.run,
+                            run.fence,
+                            LeaseTtl::new(PASS_LEASE).unwrap_or_else(|_| unreachable!()),
+                            now,
+                        )
+                        .map(|_| ()),
+                ),
+                error(store.record_run_task(
+                    run.run,
+                    run.fence,
+                    &TaskId::new("pickup-late").unwrap_or_else(|_| unreachable!()),
+                    now,
+                )),
+            ];
+        }
+        PassReport::new(PassOutcome::Done)
+    }
+}
+
+#[test]
+fn a_slow_run_that_renews_is_not_overtaken() -> TestResult {
+    let house = House::new()?;
+    let config = config(&[("pickup", 15)])?;
+    let mut runner = Slow {
+        store: &house.store,
+        config: &config,
+        renew: true,
+        renewed: None,
+        after: Vec::new(),
+        second: None,
+    };
+    let clock = Fixed::at(T0);
+    let first = tick::tick(
+        &house.open()?,
+        &config,
+        &holder("tick-a")?,
+        &mut runner,
+        &clock,
+    )?;
+    let renewed = Timestamp::from_unix_millis(T0 + 50 * MINUTE).saturating_add(PASS_LEASE);
+    assert_eq!(runner.renewed, Some(renewed));
+    let second = runner.second.ok_or("the second tick finished")?;
+    assert_eq!(
+        second.passes.first().map(|pass| &pass.decision),
+        Some(&TickDecision::Busy {
+            holder: holder("tick-a")?,
+            expires_at: renewed,
+        })
+    );
+    // The live run could still act, and its end was recorded.
+    assert_eq!(runner.after, [Ok(()), Ok(())]);
+    assert!(matches!(
+        first.passes.first().map(|p| &p.decision),
+        Some(TickDecision::Ran {
+            outcome: PassOutcome::Done,
+            ..
+        })
+    ));
+    let runs = house.open()?.runs()?;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs.first().map(|run| run.tasks.clone()),
+        Some(vec![TaskId::new("pickup-late")?])
+    );
+    Ok(())
+}
+
+#[test]
+fn a_slow_run_that_does_not_renew_is_superseded_and_fenced() -> TestResult {
+    let house = House::new()?;
+    let config = config(&[("pickup", 15)])?;
+    let mut runner = Slow {
+        store: &house.store,
+        config: &config,
+        renew: false,
+        renewed: None,
+        after: Vec::new(),
+        second: None,
+    };
+    let first = tick::tick(
+        &house.open()?,
+        &config,
+        &holder("tick-a")?,
+        &mut runner,
+        &Fixed::at(T0),
+    )?;
+    let second = runner.second.ok_or("the second tick finished")?;
+    let run = match first.passes.first().map(|p| &p.decision) {
+        Some(TickDecision::Superseded { run }) => *run,
+        other => return Err(format!("expected a superseded run, got {other:?}").into()),
+    };
+    // The second tick took the lease over, recorded the run as uncertain,
+    // and could not reconcile it, so the pass waits.
+    let pass = second.passes.first().ok_or("one pass")?;
+    assert_eq!(pass.uncertain, Some(run));
+    assert_eq!(
+        pass.decision,
+        TickDecision::NeedsAttention {
+            run,
+            unresolved_effects: 0
+        }
+    );
+    // The overtaken run can neither renew, record a task, nor end.
+    assert_eq!(
+        runner.after,
+        [
+            Err(Some(TickError::Superseded)),
+            Err(Some(TickError::Superseded))
+        ]
+    );
+    assert!(!first.healthy());
+    let runs = house.open()?.runs()?;
+    assert_eq!(runs.len(), 1);
+    assert!(matches!(
+        runs.first().map(|run| &run.state),
+        Some(RunState::Uncertain { .. })
+    ));
+    assert!(runs.first().is_some_and(|run| run.tasks.is_empty()));
     Ok(())
 }
 
@@ -384,7 +782,8 @@ fn a_crash_reconciled_before_the_pass_is_due_releases_the_lease() -> TestResult 
 
     let report = tick::tick(&store, &config, &holder("tick-b")?, &mut runner, &clock)?;
     let pass = report.passes.first().ok_or("one pass")?;
-    assert_eq!(pass.reconciled, Some(crashed));
+    assert_eq!(pass.uncertain, Some(crashed));
+    assert_eq!(pass.recovered, [crashed]);
     assert!(matches!(pass.decision, TickDecision::NotDue { .. }));
     assert!(runner.ran.is_empty());
     let consumer = store.consumer(&tick_consumer("pickup")?)?;
@@ -440,6 +839,7 @@ fn recording_an_end_refuses_other_owners_unknown_runs_and_conflicts() -> TestRes
     let other_fence = match store.start_run(
         Pass::Gate,
         every(15)?,
+        Repeat::AfterReconcile,
         &holder("tick-other")?,
         LeaseTtl::new(PASS_LEASE)?,
         Timestamp::from_unix_millis(T0),
@@ -482,6 +882,142 @@ fn recording_an_end_refuses_other_owners_unknown_runs_and_conflicts() -> TestRes
         refused(store.finish_run(unknown, fence, done(), now)),
         Some(TickError::UnknownRun)
     );
+    Ok(())
+}
+
+#[test]
+fn a_live_run_records_bounded_tasks_and_renews_within_its_runtime() -> TestResult {
+    let house = House::new()?;
+    let store = house.open()?;
+    let (run, fence) = crashed_run(&store)?;
+    let now = Timestamp::from_unix_millis(T0 + MINUTE);
+    let refused = |result: kitchen::Result<()>| result.err().as_ref().and_then(tick_error);
+
+    for index in 0..MAX_RUN_TASKS {
+        store.record_run_task(run, fence, &TaskId::new(&format!("task-{index}"))?, now)?;
+    }
+    // Recording a task twice is a no-op; one more is refused.
+    store.record_run_task(run, fence, &TaskId::new("task-0")?, now)?;
+    assert_eq!(
+        refused(store.record_run_task(run, fence, &TaskId::new("task-extra")?, now)),
+        Some(TickError::TooManyTasks { max: MAX_RUN_TASKS })
+    );
+    assert_eq!(
+        store.runs()?.first().map(|record| record.tasks.len()),
+        Some(MAX_RUN_TASKS)
+    );
+
+    // Renewal keeps the run alive only up to its maximum runtime.
+    let ttl = LeaseTtl::new(PASS_LEASE)?;
+    let mut at = Timestamp::from_unix_millis(T0);
+    while at.saturating_add(PASS_LEASE / 2)
+        < Timestamp::from_unix_millis(T0).saturating_add(MAX_PASS_RUNTIME)
+    {
+        at = at.saturating_add(PASS_LEASE / 2);
+        assert_eq!(
+            store.renew_run(run, fence, ttl, at)?,
+            at.saturating_add(PASS_LEASE)
+        );
+    }
+    let limit = Timestamp::from_unix_millis(T0).saturating_add(MAX_PASS_RUNTIME);
+    assert_eq!(
+        refused(store.renew_run(run, fence, ttl, limit).map(|_| ())),
+        Some(TickError::RunTooLong)
+    );
+
+    // Only an uncertain run can be settled; a live one keeps its lease.
+    assert_eq!(
+        refused(
+            store
+                .settle_run(run, fence, Recovery::Unknown, now)
+                .map(|_| ())
+        ),
+        Some(TickError::NotUncertain)
+    );
+    assert_eq!(
+        store.renew_run(run, fence, ttl, now)?,
+        now.saturating_add(PASS_LEASE)
+    );
+    store.finish_run(run, fence, PassReport::new(PassOutcome::Done), limit)?;
+    assert_eq!(
+        refused(store.renew_run(run, fence, ttl, limit).map(|_| ())),
+        Some(TickError::AlreadyFinished)
+    );
+    assert_eq!(
+        refused(
+            store
+                .settle_run(run, fence, Recovery::Unknown, limit)
+                .map(|_| ())
+        ),
+        Some(TickError::AlreadyFinished)
+    );
+    Ok(())
+}
+
+#[test]
+fn reconciling_under_a_live_lease_settles_or_keeps_blocking() -> TestResult {
+    let house = House::new()?;
+    let store = house.open()?;
+    let (crashed, _) = crashed_run(&store)?;
+    let later = Timestamp::from_unix_millis(T0 + 61 * MINUTE);
+    let start = || {
+        store.start_run(
+            Pass::Pickup,
+            every(15).unwrap_or_else(|_| unreachable!()),
+            Repeat::AfterReconcile,
+            &holder("tick-b").unwrap_or_else(|_| unreachable!()),
+            LeaseTtl::new(PASS_LEASE).unwrap_or_else(|_| unreachable!()),
+            later,
+        )
+    };
+    let RunStart::Reconcile {
+        record,
+        fence,
+        uncertain,
+    } = start()?
+    else {
+        return Err("expected a reconcile".into());
+    };
+    assert_eq!((record.id, uncertain), (crashed, Some(crashed)));
+    // While the reconciling tick holds the lease, a duplicate is busy.
+    assert!(matches!(start()?, RunStart::Busy { .. }));
+
+    // An unknown outcome keeps the run blocking and releases the lease.
+    assert_eq!(
+        store.settle_run(crashed, fence, Recovery::Unknown, later)?,
+        RunSettle::Blocked {
+            unresolved_effects: 0
+        }
+    );
+    // The released fence can no longer settle.
+    let refused = store.settle_run(
+        crashed,
+        fence,
+        Recovery::Ended(PassReport::new(PassOutcome::Done)),
+        later,
+    );
+    assert_eq!(
+        refused.err().as_ref().and_then(tick_error),
+        Some(TickError::Superseded)
+    );
+
+    let RunStart::Reconcile {
+        fence, uncertain, ..
+    } = start()?
+    else {
+        return Err("expected a reconcile".into());
+    };
+    assert_eq!(uncertain, None);
+    assert_eq!(
+        store.settle_run(
+            crashed,
+            fence,
+            Recovery::Ended(PassReport::new(PassOutcome::Idle)),
+            later,
+        )?,
+        RunSettle::Recovered
+    );
+    assert!(matches!(start()?, RunStart::Started { .. }));
     Ok(())
 }
 

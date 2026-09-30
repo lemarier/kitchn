@@ -16,8 +16,8 @@ use kitchen::{
     house::HouseError,
     state::{HouseStore, RunState, StoreOptions},
     workflows::tick::{
-        self, Pass, PassFailure, PassOutcome, PassReport, PassRun, PassRunner, TickDecision,
-        TriggerMinutes, TriggerTarget, trigger_cron, trigger_plist,
+        self, Pass, PassFailure, PassOutcome, PassRecovery, PassReport, PassRun, PassRunner,
+        Recovery, TickDecision, TriggerMinutes, TriggerTarget, trigger_cron, trigger_plist,
     },
 };
 
@@ -82,11 +82,27 @@ enum TriggerFormat {
 /// ran and nothing was done, and the tick exits 1.
 struct PendingPasses;
 
-impl PassRunner for PendingPasses {
-    fn run(&mut self, _pass: Pass, _run: &PassRun) -> PassReport {
+impl PendingPasses {
+    const fn report() -> PassReport {
         PassReport::new(PassOutcome::Failed {
             reason: PassFailure::NotAvailable,
         })
+    }
+}
+
+impl PassRunner for PendingPasses {
+    fn run(&mut self, _pass: Pass, _run: &PassRun) -> PassReport {
+        Self::report()
+    }
+
+    /// This build runs no pass work and records no tasks, so an interrupted
+    /// run of it did nothing either.
+    fn reconcile(&mut self, _pass: Pass, uncertain: &PassRecovery) -> Recovery {
+        if uncertain.record.tasks.is_empty() {
+            Recovery::Ended(Self::report())
+        } else {
+            Recovery::Unknown
+        }
     }
 }
 
@@ -145,6 +161,19 @@ fn run_tick(scope: HouseScope) -> Result<(String, bool), kitchen::Error> {
                 pass.pass,
                 next_due.as_unix_millis()
             ),
+            TickDecision::NeedsAttention {
+                run,
+                unresolved_effects,
+            } => write!(
+                text,
+                "{}: waiting: {run} is uncertain and not reconciled ({unresolved_effects} unresolved effects)",
+                pass.pass
+            ),
+            TickDecision::Superseded { run } => write!(
+                text,
+                "{}: {run} outlasted its lease; its end was refused",
+                pass.pass
+            ),
             TickDecision::Busy { holder, expires_at } => write!(
                 text,
                 "{}: busy: {} holds it until {}",
@@ -153,8 +182,11 @@ fn run_tick(scope: HouseScope) -> Result<(String, bool), kitchen::Error> {
                 expires_at.as_unix_millis()
             ),
         };
-        if let Some(run) = pass.reconciled {
+        if let Some(run) = pass.uncertain {
             let _ = write!(text, " ({run} recorded as uncertain)");
+        }
+        for run in &pass.recovered {
+            let _ = write!(text, " ({run} reconciled)");
         }
     }
     Ok((text, report.healthy()))
@@ -196,6 +228,18 @@ fn runs(scope: HouseScope) -> Result<(String, bool), kitchen::Error> {
                 text,
                 "uncertain, recorded at {}",
                 reconciled_at.as_unix_millis()
+            ),
+            RunState::Recovered {
+                recovered_at,
+                outcome,
+                backend_runs,
+                ..
+            } => write!(
+                text,
+                "{}, reconciled at {} ({} backend runs linked)",
+                outcome_text(*outcome),
+                recovered_at.as_unix_millis(),
+                backend_runs.len()
             ),
         };
     }

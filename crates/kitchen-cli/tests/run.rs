@@ -4,6 +4,7 @@
 #![cfg(unix)]
 
 use std::{
+    collections::BTreeSet,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -12,9 +13,16 @@ use std::{
 };
 
 use kitchen::{
-    HouseId,
-    contracts::{CommitId, LeaseTtl, Repository, Timestamp},
-    state::{HouseStore, StoreOptions},
+    BackendId, CredentialId, EffectName, HolderId, HouseId,
+    contracts::{
+        AttemptOutcome, AttemptStart, BranchName, CapabilityRequirements, Claimant, Clock,
+        CommitId, EvidenceRevision, Grant, HouseGrants, LeaseTtl, Operation, Permission,
+        Provenance, Repository, RetryPolicy, Role, TaskAuthority, TaskSpec, Text, Timestamp,
+        Workspace, fake::FakeBackend,
+    },
+    house::HouseConfig,
+    state::{EffectPlan, EffectState, HouseStore, StoreOptions, TaskState, run_effect},
+    workflows::pickup::{IssueRef, issue_task_id},
     workflows::run::{PASS_LEASE, Pass, run_claimant},
 };
 
@@ -149,6 +157,108 @@ fn now() -> TestResult<Timestamp> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
     Ok(Timestamp::from_unix_millis(u64::try_from(millis)?))
+}
+
+struct Fixed(Timestamp);
+
+impl Clock for Fixed {
+    fn now(&self) -> Timestamp {
+        self.0
+    }
+}
+
+fn gate_ready_task(house: &House) -> TestResult {
+    let repository = Repository::new("acme/app")?;
+    let house_id = HouseId::new("acme")?;
+    let backend_id = BackendId::new("orca")?;
+    let grant = Grant::repository(
+        Permission::LaunchWorker,
+        repository.clone(),
+        backend_id.clone(),
+        CredentialId::new("orca-local")?,
+    );
+    let grants = HouseGrants::new(house_id.clone(), [grant.clone()]);
+    let backend = FakeBackend::fully_capable(backend_id, house_id);
+    let store = house.store()?;
+    let task = issue_task_id(&IssueRef {
+        repository: repository.clone(),
+        number: kitchen::contracts::IssueNumber::new(7)?,
+    })?;
+    let claimant = Claimant::scheduled(HolderId::new("pickup")?);
+    let at = now()?;
+    store.create_task(
+        TaskSpec {
+            id: task.clone(),
+            role: Role::StationCook,
+            repository: Some(repository),
+            authority: TaskAuthority::delegate(&grants, [grant])?,
+            retry: RetryPolicy::new(1, Duration::from_secs(60))?,
+            provenance: Provenance {
+                kitchen: CommitId::new(KITCHEN)?,
+                house_guidance: CommitId::new(KITCHEN)?,
+                repository_instructions: None,
+            },
+            resources: BTreeSet::new(),
+            requires: CapabilityRequirements::new(),
+            agent: None,
+            work_type: None,
+        },
+        &claimant,
+        at,
+    )?;
+    let fence = store
+        .claim(
+            &task,
+            &claimant,
+            LeaseTtl::new(Duration::from_secs(60))?,
+            at,
+        )?
+        .fence();
+    let AttemptStart::Started(attempt) = store.start_attempt(&task, fence, at)? else {
+        return Err("pickup attempt did not start".into());
+    };
+    let launched = run_effect(
+        &store,
+        &backend,
+        &grants,
+        EffectPlan {
+            task: task.clone(),
+            fence,
+            name: EffectName::new("launch")?,
+            decided_at: EvidenceRevision::INITIAL,
+            effect: Operation::LaunchWorker {
+                role: Role::StationCook,
+                workspace: Workspace::Isolated,
+                brief: Text::new("Implement issue 7")?,
+                branch: Some(BranchName::new("kitchen/issue-7")?),
+                agent: None,
+            }
+            .into(),
+            consent: None,
+            basis: None,
+        },
+        &Fixed(at),
+    )?;
+    assert!(matches!(launched.state(), EffectState::Applied { .. }));
+    store.finish_attempt(&task, fence, attempt, AttemptOutcome::Succeeded, at)?;
+    assert!(matches!(
+        store.task(&task)?.state(),
+        TaskState::Settled { .. }
+    ));
+
+    let config_path = house.registry().join("houses/acme.json");
+    let mut config: HouseConfig = serde_json::from_slice(&fs::read(&config_path)?)?;
+    let merge = Grant::repository(
+        Permission::Merge,
+        Repository::new("acme/app")?,
+        BackendId::new("github")?,
+        CredentialId::new("github")?,
+    );
+    config.policy_limits.insert(merge.clone());
+    config.grants.insert(merge);
+    config.required_reviewers = ["reviewer".to_owned()].into();
+    fs::write(config_path, serde_json::to_vec(&config)?)?;
+    Ok(())
 }
 
 #[test]
@@ -375,5 +485,202 @@ fn gate_attest_reads_the_forge_review_and_records_its_author() -> TestResult {
     .ok_or("missing attestation")?;
     assert_eq!(stored.attestation.forge_review.reviewer, "reviewer");
     assert_eq!(stored.recorded_by.as_str(), "reviewer");
+    Ok(())
+}
+
+#[test]
+fn cli_attestation_is_consumed_by_gate_for_one_exact_head_merge() -> TestResult {
+    let house = House::new()?;
+    gate_ready_task(&house)?;
+    let head = "d".repeat(40);
+    let base = "e".repeat(40);
+    let body = format!(
+        "```kitchen-attestation\nhead={head}\nbase={base}\nsemantic=clean\nread_only=true\nacceptance=complete\nhardware=complete\nrisk=none\n```"
+    );
+    let fixtures = house.home.join("gate-forge");
+    fs::create_dir(&fixtures)?;
+    let put = |name: &str, value: serde_json::Value| -> TestResult {
+        fs::write(fixtures.join(name), serde_json::to_vec(&value)?)?;
+        Ok(())
+    };
+    let pr = serde_json::json!({
+        "number": 12, "state": "open", "draft": false, "merged": false,
+        "head": {"sha": head, "ref": "kitchen/issue-7", "repo": {"full_name": "acme/app"}},
+        "base": {"sha": base, "ref": "main", "repo": {"full_name": "acme/app"}},
+        "mergeable": true, "mergeable_state": "clean", "user": {"login": "octo-cat"}
+    });
+    put("pr", pr.clone())?;
+    let mut merged = pr;
+    merged["state"] = serde_json::json!("closed");
+    merged["merged"] = serde_json::json!(true);
+    merged["merge_commit_sha"] = serde_json::json!("9".repeat(40));
+    put("pr-merged", merged)?;
+    put("user", serde_json::json!({"login": "octo-cat"}))?;
+    put("repo", serde_json::json!({"default_branch": "main"}))?;
+    put(
+        "branch",
+        serde_json::json!({"name": "main", "commit": {"sha": base}}),
+    )?;
+    put(
+        "compare",
+        serde_json::json!({"behind_by": 0, "ahead_by": 1}),
+    )?;
+    put(
+        "checks",
+        serde_json::json!({"check_runs": [{
+            "name": "build", "head_sha": head, "status": "completed", "conclusion": "success"
+        }]}),
+    )?;
+    put("statuses", serde_json::json!([]))?;
+    put(
+        "protection",
+        serde_json::json!({"contexts": ["build"], "checks": []}),
+    )?;
+    put(
+        "reviews",
+        serde_json::json!([{
+            "id": 11, "user": {"login": "reviewer"}, "commit_id": head,
+            "state": "APPROVED", "body": body, "submitted_at": "1970-01-01T00:00:00Z"
+        }]),
+    )?;
+    put(
+        "commits",
+        serde_json::json!([{
+            "sha": head, "author": {"login": "octo-cat"}, "committer": {"login": "octo-cat"}
+        }]),
+    )?;
+    put(
+        "commit",
+        serde_json::json!({
+            "sha": head, "commit": {"committer": {"date": "1970-01-01T00:00:00Z"}}
+        }),
+    )?;
+    put("timeline", serde_json::json!([]))?;
+    put(
+        "closing",
+        serde_json::json!({"data": {"repository": {"issue": {
+            "closedByPullRequestsReferences": {"nodes": [{
+                "number": 12, "repository": {"nameWithOwner": "acme/app"}
+            }], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+        }}}}),
+    )?;
+    put(
+        "merge-state",
+        serde_json::json!({"data": {"repository": {"pullRequest": {
+            "headRefOid": head, "mergeStateStatus": "CLEAN"
+        }}}}),
+    )?;
+    put(
+        "threads",
+        serde_json::json!({"data": {"repository": {"pullRequest": {
+            "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+        }}}}),
+    )?;
+    let script = r#"#!/bin/sh
+dir='@FIXTURES@'
+printf '%s\n' "$*" >> "$dir/calls"
+case " $* " in
+  *" config get user "*) echo octo-cat ;;
+  *" graphql "*)
+    query=$(cat)
+    case "$query" in
+      *closedByPullRequestsReferences*) cat "$dir/closing" ;;
+      *mergeStateStatus*) cat "$dir/merge-state" ;;
+      *reviewThreads*) cat "$dir/threads" ;;
+      *) exit 1 ;;
+    esac ;;
+  *" --method PUT repos/acme/app/pulls/12/merge "*)
+    cat >> "$dir/merge-requests"
+    echo >> "$dir/merge-requests"
+    cp "$dir/pr-merged" "$dir/pr"
+    printf 'HTTP/2 200\r\n\r\n{"merged":true}\n' ;;
+  *" user "*) cat "$dir/user" ;;
+  *" repos/acme/app/pulls/12/reviews"*) cat "$dir/reviews" ;;
+  *" repos/acme/app/pulls/12/commits"*) cat "$dir/commits" ;;
+  *" repos/acme/app/pulls/12 "*) cat "$dir/pr" ;;
+  *" repos/acme/app/branches/main "*) cat "$dir/branch" ;;
+  *" repos/acme/app/compare/"*) cat "$dir/compare" ;;
+  *" repos/acme/app/commits/"*"/check-runs"*) cat "$dir/checks" ;;
+  *" repos/acme/app/commits/"*"/statuses"*) cat "$dir/statuses" ;;
+  *" repos/acme/app/commits/"*) cat "$dir/commit" ;;
+  *" repos/acme/app/branches/main/protection/required_status_checks "*) cat "$dir/protection" ;;
+  *" repos/acme/app/issues/7/timeline"*) cat "$dir/timeline" ;;
+  *" repos/acme/app "*) cat "$dir/repo" ;;
+  *) exit 1 ;;
+esac
+"#;
+    let gh = Path::new(house.path.split(':').next().ok_or("bin")?).join("gh");
+    fs::write(
+        &gh,
+        script.replace("@FIXTURES@", &fixtures.display().to_string()),
+    )?;
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))?;
+
+    let registry = house.registry().display().to_string();
+    let attested = house.kitchen(&[
+        "gate",
+        "attest",
+        "--registry",
+        &registry,
+        "--house",
+        "acme",
+        "--pull-request",
+        "12",
+        "--review-id",
+        "11",
+    ])?;
+    assert_eq!(
+        attested.status.code(),
+        Some(0),
+        "{}\n{}",
+        text(&attested.stderr),
+        fs::read_to_string(fixtures.join("calls"))?
+    );
+    let gated = house.pass("gate", &[])?;
+    assert_eq!(
+        gated.status.code(),
+        Some(0),
+        "{}\n{}",
+        text(&gated.stderr),
+        fs::read_to_string(fixtures.join("calls"))?
+    );
+    assert!(
+        text(&gated.stdout).contains("Merge, Merged"),
+        "{}\n{}",
+        text(&gated.stdout),
+        fs::read_to_string(fixtures.join("calls"))?
+    );
+    let requests = fs::read_to_string(fixtures.join("merge-requests"))?;
+    let requests: Vec<serde_json::Value> = requests
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        requests,
+        [serde_json::json!({"sha": head, "merge_method": "squash"})]
+    );
+    let gate_task = house
+        .store()?
+        .tasks()?
+        .into_iter()
+        .find(|record| record.spec().role == Role::Expediter)
+        .ok_or("missing gate task")?;
+    assert!(matches!(
+        gate_task.state(),
+        TaskState::Settled {
+            settlement: kitchen::contracts::Settlement::Succeeded,
+            ..
+        }
+    ));
+    let again = house.pass("gate", &[])?;
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again.stderr));
+    assert_eq!(text(&again.stdout).trim(), "idle");
+    assert_eq!(
+        fs::read_to_string(fixtures.join("merge-requests"))?,
+        requests
+            .iter()
+            .map(|request| format!("{request}\n"))
+            .collect::<String>()
+    );
     Ok(())
 }

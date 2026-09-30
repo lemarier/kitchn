@@ -3185,7 +3185,10 @@ fn a_legacy_task_spanning_heads_keeps_the_first_attempt_budget() -> TestResult {
     assert_eq!(gate_tasks(&kitchen)?[0].attempts()[0].started_at(), first);
     assert!(merges(&kitchen).is_empty());
 
-    green_and_attested_on(&kitchen, 'd', 'e')?;
+    // The original attestation at d still exists; restore the forge view
+    // without recording the same exact subject again.
+    set_pull_request(&kitchen, "/head/sha", json!(commit('d')?.as_str()))?;
+    green_on(&kitchen, 'd', 'e')?;
     let returned = one_verdict(kitchen.gate()?)?;
     assert_eq!(returned.head, commit('d')?);
     assert_eq!(

@@ -13,11 +13,12 @@ use std::{
 
 use common::{ManualClock, TestResult, WORKER_PERMISSIONS, backend_id, commit, credential, house};
 use kitchen::{
-    CredentialId, HolderId,
+    CredentialId, HolderId, WorkflowId,
     contracts::{
-        BranchName, Capability, CapabilitySet, CheckoutFact, CheckoutReport, Clock, EvidenceKind,
-        ExternalRef, Grant, MailMessage, MessageKind, PostingBudget, Repository, ResourceRef,
-        Settlement, Text, WorkerOutcome, WorkerState, fake::FakeBackend,
+        BranchName, Capability, CapabilitySet, CheckoutFact, CheckoutReport, Clock, Evidence,
+        EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef, Grant, LeaseTtl, MailMessage,
+        MessageKind, PostingBudget, Repository, ResourceRef, Settlement, Text, WorkerOutcome,
+        WorkerState, fake::FakeBackend,
     },
     house::HouseConfig,
     integrations::github::{
@@ -2988,6 +2989,68 @@ fn worn_gate_task_exhausts_the_subject_after_a_restart() -> TestResult {
     let fresh = one_verdict(kitchen.gate()?)?;
     assert_eq!(fresh.result, GateResult::Merged, "{fresh:?}");
     assert_eq!(gate_tasks(&kitchen)?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_legacy_task_spanning_heads_keeps_the_first_attempt_budget() -> TestResult {
+    let kitchen = gate_task_left_open(NotMerged::Moved)?;
+    let task = gate_tasks(&kitchen)?[0].spec().id.clone();
+    let first = gate_tasks(&kitchen)?[0].attempts()[0].started_at();
+    // Model an old gate task: its single attempt began at d, but its latest
+    // evidence now names f and no subject budget marker existed then.
+    let lease = kitchen.store().claim(
+        &task,
+        &run_claimant()?,
+        LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    kitchen.store().record_evidence(
+        &task,
+        lease.fence(),
+        Evidence {
+            kind: EvidenceKind::Check,
+            verdict: EvidenceVerdict::Pass,
+            subject: EvidenceSubject {
+                head: commit('f')?,
+                base: Some(commit('e')?),
+            },
+            source: ExternalRef::new("legacy-check")?,
+            observed_at: kitchen.clock.now(),
+        },
+        kitchen.clock.now(),
+    )?;
+    kitchen
+        .store()
+        .relinquish(&task, lease.fence(), kitchen.clock.now())?;
+    let old_markers = kitchen
+        .store()
+        .markers(&WorkflowId::new("merge-gate-budget")?)?;
+    assert_eq!(old_markers.len(), 1);
+    let retired = kitchen.store().retire_markers(
+        &old_markers
+            .into_iter()
+            .map(|marker| (marker.key().clone(), marker.fact().clone()))
+            .collect::<Vec<_>>(),
+    )?;
+    assert_eq!(retired.len(), 1);
+
+    kitchen.clock.advance(retry_deadline(&kitchen)? + 1);
+    let b = one_verdict(kitchen.gate()?)?;
+    assert_eq!(b.head, commit('f')?);
+    assert_eq!(b.result, GateResult::NotMerged(NotMerged::Exhausted));
+    assert_eq!(gate_tasks(&kitchen)?.len(), 1);
+    assert_eq!(gate_tasks(&kitchen)?[0].attempts()[0].started_at(), first);
+    assert!(merges(&kitchen).is_empty());
+
+    green_and_attested_on(&kitchen, 'd', 'e')?;
+    let returned = one_verdict(kitchen.gate()?)?;
+    assert_eq!(returned.head, commit('d')?);
+    assert_eq!(
+        returned.result,
+        GateResult::ReportOnly(ReportReason::ExhaustedForSubject)
+    );
+    assert!(merges(&kitchen).is_empty());
     Ok(())
 }
 

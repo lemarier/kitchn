@@ -481,6 +481,19 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
                 return Ok(action(predicted, standing));
             }
         }
+        // A legacy head returning after its deadline has no task at this
+        // subject to finish. Do not create a fresh generation for it.
+        if past_deadline(budget_start, self.clock.now())
+            && !tasks.iter().any(|record| {
+                record.spec().id == task
+                    && matches!(record.state(), TaskState::Open | TaskState::Claimed { .. })
+            })
+        {
+            return Ok(action(
+                predicted,
+                GateResult::ReportOnly(ReportReason::ExhaustedForSubject),
+            ));
+        }
         super::record(self.store, self.tick, &task, self.clock)?;
         match self.store.create_task(spec, claimant, self.clock.now()) {
             Ok(_) => {}
@@ -960,29 +973,19 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
     }
 
     /// Persist the first time this exact PR, head, and base entered the gate.
-    /// A pre-marker task supplies its first attempt only while its durable
-    /// evidence still names this subject. A changed head or base starts now.
+    /// A pre-marker task may have judged several heads while keeping one
+    /// attempt. Its first attempt bounds every unmarked subject of this PR.
     fn subject_budget_start(
         &self,
         claimant: &Claimant,
         tasks: &[TaskRecord],
         evidence: &GateEvidence,
     ) -> Result<Timestamp> {
-        let key = MarkerKey {
-            workflow: WorkflowId::new(GATE_BUDGET_WORKFLOW)?,
-            item: WorkItem::PullRequest {
-                repository: self.repository.clone(),
-                number: NonZeroU64::new(evidence.number.get()).ok_or(
-                    ContractError::InvalidValue {
-                        kind: ValueKind::Text,
-                    },
-                )?,
-            },
-            subject: MarkerSubject::Git(EvidenceSubject {
-                head: evidence.head.clone(),
-                base: Some(evidence.base.clone()),
-            }),
+        let subject = EvidenceSubject {
+            head: evidence.head.clone(),
+            base: Some(evidence.base.clone()),
         };
+        let key = self.budget_key(evidence.number, subject.clone())?;
         let schema = MarkerSchema::new(
             GATE_BUDGET_SCHEMA,
             NonZeroU32::new(1).ok_or(StateError::MarkerSchemaInvalid)?,
@@ -995,22 +998,44 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
         let started_at = tasks
             .iter()
             .filter(|record| gate_of(record, self.repository) == Some(evidence.number))
-            .filter(|record| {
-                record.evidence().subject().is_some_and(|subject| {
-                    subject.head == evidence.head && subject.base.as_ref() == Some(&evidence.base)
-                })
-            })
-            .filter_map(|record| {
-                record
+            .map(|record| -> Result<Option<Timestamp>> {
+                let Some(first) = record
                     .attempts()
                     .first()
                     .map(|attempt| attempt.started_at())
+                else {
+                    return Ok(None);
+                };
+                let Some(recorded) = record.evidence().subject() else {
+                    return Ok(None);
+                };
+                let marker = self
+                    .store
+                    .marker(&self.budget_key(evidence.number, recorded.clone())?)?;
+                let legacy = marker.is_none_or(|marker| first < marker.recorded_at());
+                Ok((legacy || recorded == &subject).then_some(first))
             })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .min()
             .unwrap_or(now);
         let fact = MarkerFact::workflow(schema, &SubjectBudget { started_at })?;
         self.store.record_marker(key, fact, claimant, now)?;
         Ok(started_at)
+    }
+
+    fn budget_key(&self, number: IssueNumber, subject: EvidenceSubject) -> Result<MarkerKey> {
+        Ok(MarkerKey {
+            workflow: WorkflowId::new(GATE_BUDGET_WORKFLOW)?,
+            item: WorkItem::PullRequest {
+                repository: self.repository.clone(),
+                number: NonZeroU64::new(number.get()).ok_or(ContractError::InvalidValue {
+                    kind: ValueKind::Text,
+                })?,
+            },
+            subject: MarkerSubject::Git(subject),
+        })
     }
 }
 

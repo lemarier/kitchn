@@ -809,7 +809,9 @@ pub struct WorkerView {
 }
 
 /// Every applied launch's worker, oldest first.
-fn launched_workers(record: &TaskRecord) -> impl DoubleEndedIterator<Item = WorkerView> + '_ {
+pub(crate) fn launched_workers(
+    record: &TaskRecord,
+) -> impl DoubleEndedIterator<Item = WorkerView> + '_ {
     record
         .effects()
         .iter()

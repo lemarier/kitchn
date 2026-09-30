@@ -14,7 +14,8 @@ description: Every kitchn command, its flags and exit codes.
 Scheduled prechecks (`gardener precheck`, `budget precheck`) use their own
 codes: `0` when there is work to do, `1` when there is none, `2` for invalid
 input and `3` when their inputs cannot be read. `decompose preview` exits `1`
-while ownership overlaps are unordered.
+while ownership overlaps are unordered. `kitchn run` exits `3` when another pass
+of the same kind holds the lease and `4` when a previous pass's lease expired.
 
 Commands that take `--store` default to the house state store that
 `house init` created at `<registry>/private/<house>/store`, located through
@@ -484,6 +485,54 @@ available in this build".
 crontab line that runs the tick every `--every-minutes` (default 5; for cron it
 must divide 60, since cron restarts its minute step each hour); it installs
 nothing and changes no live schedule.
+
+## `kitchn run`
+
+One bounded scheduled pass, for a trigger such as the Kitchen tick, an Orca
+schedule, launchd, or cron. Each pass needs only the house; everything else
+defaults from it.
+
+```sh
+kitchn run pickup     <house> <backend> [--ready-label ready] [--needs-spec-label needs-spec]
+                      [--human-label human-only] [--capacity 1] [--branch-prefix kitchen]
+                      [--report-path kitchen-report.md]
+kitchn run coordinate <house> <backend>
+kitchn run repair     <house> <backend>
+kitchn run gate       <house>
+```
+
+`<house>` is `--registry <dir> --house <id> [--store <dir>] [--repository
+<owner/name>] [--take-over]`. The repository defaults to the house's only one.
+The forge is the house's forge binding, with `gh` (and `curl` for a GitHub App)
+from `PATH`. `<backend>` holds the host facts of the house's bound worker
+backend: for Orca, `--orca <absolute path> --runtime-dir <dir> --orca-run <run>
+--orca-coordinator <terminal> --orca-repo <selector>`; for an HTTP backend,
+`--curl <absolute path>`. A missing one exits 2 and names what is needed. The
+backend must support what the pass requires; otherwise the pass is refused
+before anything runs.
+
+- `pickup` claims ready issues of the repository (label, stated acceptance
+  criteria, no open blocked-by link, not assigned or reserved), launches their
+  workers, and launches the next attempt of a scheduled task whose attempt
+  ended. While another scheduled task of the repository is unsettled, a new
+  issue waits: file overlap is not observed.
+- `coordinate` continues every scheduled task, reads worker deliveries from
+  the backend when it declares them and from the house mailbox otherwise, and
+  supervises each task once. A worker's successful report settles its task
+  with the head its branch shows on the forge. Questions wait for a person
+  (`kitchn mailbox reply` on the house mailbox).
+- `repair` assesses the open pull requests of settled scheduled tasks and
+  prints each decision. It launches no repair writer.
+- `gate` evaluates up to three of those pull requests at their exact heads and
+  prints each verdict. It records nothing and never merges.
+
+Each pass takes its own lease first, so a second concurrent start does nothing
+and exits `3`. A pass that fails hands its lease to the next start. A pass that
+died leaves an expired lease: the next start exits `4` until run with
+`--take-over`, which records the takeover. The same flag lets `coordinate` take
+over scheduled task claims that expired because no pass renewed them for two
+hours. A pass with nothing to do prints `idle`, exits `0`, and launches or
+messages no worker.
 
 ## `kitchn pickup`
 

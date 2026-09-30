@@ -56,6 +56,8 @@ enum Command {
     Mailbox(commands::mailbox::MailboxArgs),
     /// Run the house's due workflow passes once and record them in the run ledger.
     Tick(commands::tick::TickArgs),
+    /// One scheduled pass of pickup, coordination, repair, or the gate, for a trigger.
+    Run(commands::run::RunArgs),
     #[command(flatten)]
     Interactive(commands::interactive::InteractiveCommand),
 }
@@ -102,6 +104,8 @@ fn main() -> ExitCode {
         Some(Command::Audit(args)) => commands::audit::run(args),
         Some(Command::Mailbox(args)) => commands::mailbox::run(args),
         Some(Command::Tick(args)) => commands::tick::run(args),
+        // A pass reports through its own exit status, not the codes below.
+        Some(Command::Run(args)) => return commands::run::run(args),
         Some(Command::Interactive(command)) => commands::interactive::run(command),
         None => return output_status(Cli::command().print_help()),
     };

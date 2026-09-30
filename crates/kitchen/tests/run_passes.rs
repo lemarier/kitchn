@@ -5141,9 +5141,65 @@ fn refused_review_attempt_can_retry_and_settle_from_later_effect() -> TestResult
         task.effects()[1].state(),
         EffectState::Applied { .. }
     ));
-    assert!(matches!(task.state(), TaskState::Settled { .. }));
+    assert!(matches!(
+        task.state(),
+        TaskState::Settled {
+            settlement: Settlement::Succeeded,
+            ..
+        }
+    ));
     assert_eq!(post()?.id.get(), 19);
     assert_eq!(kitchen.forge().writes.borrow().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn three_refused_review_attempts_remain_refused_after_exhaustion() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    let reviews_path = format!("repos/{REPO}/pulls/12/reviews");
+    kitchen.forge().set(&reviews_path, json!([]));
+    kitchen
+        .forge()
+        .queue(&reviews_path, vec![json!({}), json!({}), json!({})]);
+    let (forge, executor) = review_fixture(&mut kitchen, "safety-reviewer")?;
+    let mut input = review_input(ReviewVerdict::Approve)?;
+    input.attest = false;
+    for _ in 0..5 {
+        assert!(matches!(
+            post_gate_review(
+                kitchen.store(),
+                &kitchen.config,
+                &forge,
+                &executor,
+                &kitchen.settings.instructions.provenance,
+                &kitchen.clock,
+                &input,
+            ),
+            Err(kitchen::Error::Run(RunError::ReviewPostRefused))
+        ));
+    }
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    let task = kitchen
+        .store()
+        .tasks()?
+        .into_iter()
+        .find(|task| task.spec().id.as_str().starts_with("gate-review-"))
+        .ok_or("review task")?;
+    assert_eq!(task.attempts().len(), 3);
+    assert_eq!(task.effects().len(), 3);
+    assert!(
+        task.effects()
+            .iter()
+            .all(|effect| matches!(effect.state(), EffectState::NotApplied { .. }))
+    );
+    assert!(matches!(
+        task.state(),
+        TaskState::Settled {
+            settlement: Settlement::Exhausted,
+            ..
+        }
+    ));
     Ok(())
 }
 

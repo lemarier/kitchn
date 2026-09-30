@@ -11,9 +11,9 @@ use crate::{
     EffectName, HolderId, TaskId,
     contracts::{
         AttemptOutcome, AttemptStart, BranchName, CapabilityRequirements, Claimant, Clock,
-        CommitId, Effect, EffectExecutor, GitHubAction, GitHubMutation, GrantScope, IssueNumber,
-        LeaseTtl, Permission, Provenance, Repository, RetryPolicy, ReviewVerdict, Role,
-        TaskAuthority, TaskSpec, Text,
+        CommitId, Effect, EffectExecutor, FailureClass, GitHubAction, GitHubMutation, GrantScope,
+        IssueNumber, LeaseTtl, Permission, Provenance, Repository, RetryPolicy, ReviewVerdict,
+        Role, TaskAuthority, TaskSpec, Text,
     },
     house::HouseConfig,
     integrations::github::{GitHubClient, GitHubExecutor, GitHubMutationTransport, IssueState},
@@ -81,6 +81,14 @@ fn risk(value: RiskClass) -> &'static str {
         RiskClass::WeakenedValidation => "weakened-validation",
         RiskClass::LargeDiff => "large-diff",
     }
+}
+
+fn conclusively_refused(task: &crate::state::TaskRecord) -> bool {
+    !task.effects().is_empty()
+        && task
+            .effects()
+            .iter()
+            .all(|effect| matches!(effect.state(), EffectState::NotApplied { .. }))
 }
 
 /// Produce the only attestation block in a review body.
@@ -283,7 +291,12 @@ pub fn post_gate_review<T: GitHubMutationTransport + Clone>(
         id
     } else {
         if matches!(task.state(), TaskState::Settled { .. }) {
-            return Err(RunError::ReviewUncertain.into());
+            return Err(if conclusively_refused(&task) {
+                RunError::ReviewPostRefused
+            } else {
+                RunError::ReviewUncertain
+            }
+            .into());
         }
         let lease = match store.claim(
             &id,
@@ -320,7 +333,14 @@ pub fn post_gate_review<T: GitHubMutationTransport + Clone>(
             }
             let attempt = match store.start_attempt(&id, fence, clock.now())? {
                 AttemptStart::Started(number) | AttemptStart::AlreadyRunning(number) => number,
-                AttemptStart::Exhausted => return Err(RunError::ReviewUncertain.into()),
+                AttemptStart::Exhausted => {
+                    return Err(if conclusively_refused(&store.task(&id)?) {
+                        RunError::ReviewPostRefused
+                    } else {
+                        RunError::ReviewUncertain
+                    }
+                    .into());
+                }
             };
             let record = run_effect(
                 store,
@@ -360,6 +380,13 @@ pub fn post_gate_review<T: GitHubMutationTransport + Clone>(
                 {
                     return Err(RunError::AttestationStaleBase.into());
                 }
+                store.finish_attempt(
+                    &id,
+                    fence,
+                    attempt,
+                    AttemptOutcome::Failed(FailureClass::Retryable),
+                    clock.now(),
+                )?;
                 return Err(RunError::ReviewPostRefused.into());
             }
             let Some(review_id) = applied(&store.task(&id)?)? else {

@@ -32,7 +32,11 @@
 //! the first start it refuses a branch an Orca worktree already has checked
 //! out, and it reports a collision Orca still made as a [`BranchCollision`].
 
-use std::{path::PathBuf, thread, time::Duration};
+use std::{
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -94,6 +98,7 @@ const SETTLED_WORKER_STATES: [&str; 4] = ["stopped", "failed", "succeeded", "aba
 const WRONG_BRANCH_STOP_ATTEMPTS: usize = 3;
 const BRANCH_POLLS: usize = 16;
 const BRANCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const BRANCH_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Most worktrees of the repository the branch check reads; a longer listing
 /// cannot show a branch is free, and the launch is refused.
@@ -801,6 +806,16 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// branch, and worktrees Orca created for it. An existing workspace is not
     /// listed: Orca's records do not name it, and the task already owns it.
     fn launch_receipt(&self, task: &str, dispatch: &str, shown: &WorkerShow) -> Option<Receipt> {
+        self.launch_receipt_until(task, dispatch, shown, None)
+    }
+
+    fn launch_receipt_until(
+        &self,
+        task: &str,
+        dispatch: &str,
+        shown: &WorkerShow,
+        deadline: Option<Instant>,
+    ) -> Option<Receipt> {
         let mut resources = vec![self.resource(ResourceKind::Worker, external(dispatch)?)];
         let worktrees: Vec<ExternalRef> = shown
             .worker
@@ -817,7 +832,11 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .terminal
             .as_ref()
             .and_then(|terminal| terminal.branch.clone())
-            .or_else(|| worktrees.first().and_then(|id| self.worktree_branch(id)));
+            .or_else(|| {
+                worktrees
+                    .first()
+                    .and_then(|id| self.worktree_branch_until(id, deadline))
+            });
         resources.extend(
             branch
                 .as_deref()
@@ -839,16 +858,26 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// is gone or cannot be read. A receipt without a branch confirms no
     /// requested branch, so a failed read holds such a launch rather than
     /// accepting it.
-    fn worktree_branch(&self, worktree: &ExternalRef) -> Option<String> {
+    fn worktree_branch_until(
+        &self,
+        worktree: &ExternalRef,
+        deadline: Option<Instant>,
+    ) -> Option<String> {
+        let timeout = match deadline {
+            Some(deadline) => self.observation_timeout(deadline)?,
+            None => self.config.call_timeout,
+        };
         let args = wire::Args::command(&["worktree", "show"])
             .value("worktree", &format!("id:{worktree}"))
             .json();
-        let shown: WorktreeShow = wire::typed(
-            self.call(args, self.config.call_timeout).ok()?,
-            "worktree show",
-        )
-        .ok()?;
+        let shown: WorktreeShow =
+            wire::typed(self.call(args, timeout).ok()?, "worktree show").ok()?;
         shown.worktree.and_then(|worktree| worktree.branch)
+    }
+
+    fn observation_timeout(&self, deadline: Instant) -> Option<Duration> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        (!remaining.is_zero()).then_some(remaining.min(self.config.call_timeout))
     }
 
     /// The Run's Tasks, with specs cut down by Orca's `--brief` listing.
@@ -1140,7 +1169,11 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             .iter()
             .find(|resource| resource.kind == ResourceKind::Worker)
             .cloned();
+        let deadline = Instant::now() + BRANCH_OBSERVATION_TIMEOUT.min(self.config.call_timeout);
         for poll in 0..BRANCH_POLLS {
+            if poll > 0 && self.observation_timeout(deadline).is_none() {
+                break;
+            }
             if let Some(actual) = receipt_branch(&receipt) {
                 if self.accepts_launch_branch(requested, &actual, workspace) {
                     return Ok(receipt);
@@ -1148,13 +1181,25 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 break;
             }
             if poll + 1 < BRANCH_POLLS {
-                thread::sleep(BRANCH_POLL_INTERVAL);
+                let Some(remaining) = self.observation_timeout(deadline) else {
+                    break;
+                };
+                thread::sleep(BRANCH_POLL_INTERVAL.min(remaining));
                 if let Some(dispatch) = worker.as_ref().and_then(|worker| self.dispatch_of(worker))
-                    && let Ok(Some(shown)) = self.show(dispatch)
-                    && let Some(updated) =
-                        self.launch_receipt(receipt.reference().as_str(), dispatch, &shown)
+                    && let Some(timeout) = self.observation_timeout(deadline)
+                    && let Ok(Some(shown)) = self.show_with_timeout(dispatch, timeout)
                 {
-                    receipt = updated;
+                    if dispatch_ended(&shown) {
+                        return Err(EffectFailure::Uncertain(UncertainReason::DispatchEnded));
+                    }
+                    if let Some(updated) = self.launch_receipt_until(
+                        receipt.reference().as_str(),
+                        dispatch,
+                        &shown,
+                        Some(deadline),
+                    ) {
+                        receipt = updated;
+                    }
                 }
             }
         }
@@ -1431,10 +1476,18 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     }
 
     pub(crate) fn show(&self, dispatch: &str) -> Result<Option<WorkerShow>, OrcaError> {
+        self.show_with_timeout(dispatch, self.config.call_timeout)
+    }
+
+    fn show_with_timeout(
+        &self,
+        dispatch: &str,
+        timeout: Duration,
+    ) -> Result<Option<WorkerShow>, OrcaError> {
         let args = wire::Args::command(&["orchestration", "worker-show"])
             .value("dispatch", dispatch)
             .json();
-        match self.call(args, self.config.call_timeout) {
+        match self.call(args, timeout) {
             Ok(value) => wire::typed(value, "worker show").map(Some),
             Err(OrcaError::Refused { code, .. }) if code == "dispatch_not_found" => Ok(None),
             Err(error) => Err(error),

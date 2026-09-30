@@ -8,7 +8,9 @@ mod orca_sim;
 
 use std::{
     collections::{BTreeSet, VecDeque},
-    time::Duration,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 use common::{
@@ -22,8 +24,9 @@ use kitchen::selection::{
 use kitchen::{
     BackendId, ConsumerId, CredentialId, EffectName,
     adapters::orca::{
-        BranchCollision, MAX_INVENTORY_PAGES, MAX_REPO_WORKTREES, OrcaBackend, OrcaConfig,
-        OrcaError, RetainedReason, TerminalAccounting, launch_marker, verify_branch,
+        BranchCollision, Invocation, MAX_INVENTORY_PAGES, MAX_REPO_WORKTREES, OrcaBackend,
+        OrcaConfig, OrcaError, OrcaRunner, RawOutput, RetainedReason, TerminalAccounting,
+        launch_marker, verify_branch,
     },
     contracts::{
         AttemptNumber, BackendUnavailable, BranchName, Capability, CapabilityRequirements,
@@ -2374,6 +2377,124 @@ fn launch_on(requested: &str, workspace: Workspace) -> TestResult<Operation> {
 
 fn stops(sim: &SimOrca) -> usize {
     sim.calls_to(&["orchestration", "worker-stop"]).len()
+}
+
+struct BranchPollRunner<'a> {
+    sim: &'a SimOrca,
+    show_count: AtomicUsize,
+    settle_on_second_show: Option<(&'static str, &'static str)>,
+    read_delay: Duration,
+}
+
+impl OrcaRunner for BranchPollRunner<'_> {
+    fn run(&self, invocation: &Invocation) -> Result<RawOutput, OrcaError> {
+        let path = invocation.args();
+        let branch_read = path.starts_with(&["orchestration".to_owned(), "worker-show".to_owned()])
+            || path.starts_with(&["worktree".to_owned(), "show".to_owned()]);
+        if let Some((state, outcome)) = self.settle_on_second_show
+            && path.starts_with(&["orchestration".to_owned(), "worker-show".to_owned()])
+            && self.show_count.fetch_add(1, Ordering::SeqCst) == 1
+        {
+            for worker in self.sim.state().workers.values_mut() {
+                worker.worker_state = state;
+                worker.outcome = outcome;
+            }
+        }
+        let result = self.sim.run(invocation)?;
+        if branch_read && !self.read_delay.is_zero() {
+            thread::sleep(self.read_delay.min(invocation.deadline()));
+            if self.read_delay >= invocation.deadline() {
+                return Err(OrcaError::Timeout);
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[test]
+fn branch_observation_shares_one_deadline_across_reads_and_sleeps() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().branch_reads_hidden = usize::MAX;
+    let runner = BranchPollRunner {
+        sim: &sim,
+        show_count: AtomicUsize::new(0),
+        settle_on_second_show: None,
+        read_delay: Duration::from_millis(200),
+    };
+    let mut setup = config(&sim)?;
+    setup.call_timeout = Duration::from_millis(800);
+    let backend = OrcaBackend::connect(setup, &runner)?;
+    let launch = request(
+        launch_on("lemarier/deadline", Workspace::Isolated)?,
+        "deadline",
+    )?;
+    let started = Instant::now();
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchUnconfirmedStopped
+        ))
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let state = sim.state();
+    let poll_reads: Vec<_> = state
+        .calls
+        .iter()
+        .zip(&state.deadlines)
+        .take_while(|(call, _)| {
+            !call.starts_with(&["orchestration".to_owned(), "worker-stop".to_owned()])
+        })
+        .filter(|(call, _)| {
+            call.starts_with(&["orchestration".to_owned(), "worker-show".to_owned()])
+                || call.starts_with(&["worktree".to_owned(), "show".to_owned()])
+        })
+        .map(|(_, timeout)| *timeout)
+        .collect();
+    assert!(
+        poll_reads.len() >= 4,
+        "both reads must occur during polling"
+    );
+    assert!(
+        poll_reads
+            .iter()
+            .skip(2)
+            .take(2)
+            .all(|timeout| *timeout < Duration::from_millis(800)),
+        "branch reads before stop: {poll_reads:?}"
+    );
+    assert!(poll_reads[2..4].windows(2).all(|pair| pair[1] <= pair[0]));
+    Ok(())
+}
+
+#[test]
+fn a_dispatch_ended_during_branch_poll_is_never_accepted() -> TestResult {
+    for (state, outcome) in [
+        ("failed", "failed"),
+        ("stopped", "failed"),
+        ("ready", "stopped"),
+    ] {
+        let sim = SimOrca::default();
+        sim.state().branch_reads_hidden = 2;
+        let runner = BranchPollRunner {
+            sim: &sim,
+            show_count: AtomicUsize::new(0),
+            settle_on_second_show: Some((state, outcome)),
+            read_delay: Duration::ZERO,
+        };
+        let backend = OrcaBackend::connect(config(&sim)?, &runner)?;
+        let launch = request(
+            launch_on("lemarier/ended-poll", Workspace::Isolated)?,
+            "ended-poll",
+        )?;
+        assert_eq!(
+            backend.execute(&launch),
+            Err(EffectFailure::Uncertain(UncertainReason::DispatchEnded)),
+            "{state}/{outcome}"
+        );
+        assert!(matches!(backend.resolve(&launch)?, Lookup::Ended(_)));
+        assert_eq!(stops(&sim), 0);
+    }
+    Ok(())
 }
 
 #[test]

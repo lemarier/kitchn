@@ -56,6 +56,9 @@ pub(super) fn gate_subject(
                 branch_matches
             };
             if matches.len() != 1 {
+                if matches.is_empty() && checkout_branch.is_none() {
+                    return Err(HouseError::UnmatchedCheckoutHead.into());
+                }
                 return Err(HouseError::MissingFlag {
                     flag: "--pull-request",
                 }

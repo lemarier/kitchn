@@ -21,6 +21,11 @@ pub enum HouseError {
     /// The checked out commit no longer matches the forge pull request.
     #[error("checkout --head is not the pull request's live forge head")]
     StaleCheckoutHead,
+    /// A detached checkout does not identify any open pull request head.
+    #[error(
+        "this checkout matches no open pull request head and may be stale; pass --pull-request (and --head) explicitly"
+    )]
+    UnmatchedCheckoutHead,
     /// Origin fetch and push URLs identify different repositories.
     #[error("cannot infer --house: origin fetch and push disagree on --repository")]
     CheckoutRepositoryMismatch,
@@ -131,6 +136,7 @@ impl HouseError {
             | Self::RepositoryUnidentified
             | Self::DirtyCheckout
             | Self::StaleCheckoutHead
+            | Self::UnmatchedCheckoutHead
             | Self::AmbiguousHouse { .. }
             | Self::RemotesDisagree { .. }
             | Self::BelowReadiness { .. }

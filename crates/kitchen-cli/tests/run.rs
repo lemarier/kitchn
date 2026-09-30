@@ -616,6 +616,75 @@ fn gate_inference_refuses_dirty_stale_missing_and_ambiguous_heads() -> TestResul
 }
 
 #[test]
+fn gate_inference_reports_detached_checkout_with_moved_pr_head() -> TestResult {
+    let house = House::new()?;
+    fs::write(house.checkout.join("reviewed.txt"), "reviewed")?;
+    git(&house.checkout, &["add", "reviewed.txt"])?;
+    git(
+        &house.checkout,
+        &[
+            "-c",
+            "user.name=Author",
+            "-c",
+            "user.email=author@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Reviewed",
+        ],
+    )?;
+    git(&house.checkout, &["checkout", "--quiet", "--detach"])?;
+
+    let moved_head = "a".repeat(40);
+    let pr = serde_json::json!({
+        "number": 12, "state": "open", "draft": false, "merged": false,
+        "head": {"sha": moved_head, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
+        "base": {"sha": KITCHEN, "ref": "main"}, "mergeable": true
+    });
+    let list = house.home.join("pulls.json");
+    let detail = house.home.join("pr.json");
+    fs::write(&list, serde_json::to_vec(&serde_json::json!([pr]))?)?;
+    fs::write(&detail, serde_json::to_vec(&pr)?)?;
+    let gh = Path::new(&house.path.split(':').next().ok_or("bin")?).join("gh");
+    fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" config get user \"*) echo octo-cat;;\n  *\" user \"*) echo '{{\"login\":\"octo-cat\"}}';;\n  *\"pulls?state=open\"*) cat '{}';;\n  *\"pulls/12\"*) cat '{}';;\n  *) exit 1;;\nesac\n",
+            list.display(),
+            detail.display()
+        ),
+    )?;
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))?;
+
+    let registry = house.registry().display().to_string();
+    for arguments in [
+        vec!["gate", "attest", "--review-id", "11"],
+        vec![
+            "gate",
+            "review",
+            "--verdict",
+            "approve",
+            "--body-file",
+            "unused.txt",
+        ],
+    ] {
+        let mut command = arguments;
+        command.extend(["--registry", &registry, "--house", "acme"]);
+        let result = house.kitchen(&command)?;
+        assert_eq!(result.status.code(), Some(1));
+        let error = text(&result.stderr);
+        assert!(
+            error.contains("matches no open pull request head"),
+            "{error}"
+        );
+        assert!(error.contains("may be stale"), "{error}");
+        assert!(error.contains("--pull-request"), "{error}");
+        assert!(error.contains("--head"), "{error}");
+    }
+    Ok(())
+}
+
+#[test]
 fn cli_attestation_is_consumed_by_gate_for_one_exact_head_merge() -> TestResult {
     let house = House::new()?;
     gate_ready_task(&house)?;

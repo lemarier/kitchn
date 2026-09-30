@@ -147,16 +147,22 @@ check; a house-scoped grant also covers that repository.
 
 Preview or change standing grants and their policy limits. A workflow selects
 its permissions; `--permission` selects one. Use `--repository` to select a
-served repository when working outside its checkout.
+served repository when working outside its checkout. A grant for a selected
+repository scopes every permission, including worker messaging, cancellation,
+and resource release, to that repository in both sets.
 
 ```sh
 kitchn house grant --registry <dir> --house <id> --repository <owner/name> --workflow pickup --preview
+kitchn house grant --registry <dir> --house <id> --repository <owner/name> --permission message-worker --house-wide --preview
 kitchn house revoke --registry <dir> --house <id> --repository <owner/name> --permission message-worker --preview
 kitchn house revoke --registry <dir> --house <id> --repository <owner/name> --permission message-worker --house-wide --preview
 ```
 
-`--preview` writes nothing; `--yes` applies without a prompt. A repository
-revoke removes matching repository-scoped entries for that repository. Its
+`--preview` writes nothing; `--yes` applies without a prompt. Granting with
+`--house-wide` creates house-scoped entries for permissions that support them;
+repository-bound forge actions and worker launch remain scoped to the selected
+repository. A repository revoke removes matching repository-scoped entries for
+that repository. Its
 preview names any matching house-scoped entries it retains. `--house-wide`
 explicitly revokes matching entries across the house, including grants for
 other repositories. Review its preview before applying it.

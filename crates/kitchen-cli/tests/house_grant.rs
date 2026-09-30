@@ -2,7 +2,7 @@
 use kitchen::{
     BackendId, CredentialId,
     adoption::HouseRegistry,
-    contracts::{ExternalRef, Grant, Permission, PostingBudget},
+    contracts::{ExternalRef, Grant, GrantScope, Permission, PostingBudget},
     house::{
         BackendBinding, BackendKind, CredentialKind, DoctorCode, FORGE_BINDING_SCHEMA,
         ForgeBinding, ForgeKind, HouseConfig, RepositoryConfig, Workflow, bind_forge, doctor,
@@ -37,6 +37,9 @@ fn fixture_with_second_repository(
     });
     if second_repository {
         config.repositories.insert("crabnebula/another".parse()?);
+        config
+            .posting_destinations
+            .insert("crabnebula/another".parse()?);
     }
     registry.initialize(&config)?;
     bind_forge(
@@ -384,5 +387,226 @@ fn doctor_accepts_repository_scoped_worker_effect_grants() -> TestResult {
     assert!(b_findings.iter().any(|finding| {
         finding.code == DoctorCode::Authority && finding.message.contains("message-worker")
     }));
+    Ok(())
+}
+
+#[test]
+fn pickup_grant_and_revoke_are_repository_scoped() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let registry = fixture_with_second_repository(temp.path(), true)?;
+    let house = "crabnebula".parse()?;
+    let a: kitchen::contracts::Repository = "crabnebula/tauri-fixture".parse()?;
+    let b: kitchen::contracts::Repository = "crabnebula/another".parse()?;
+    for repository in [&a, &b] {
+        let result = run(
+            &registry,
+            &[
+                "grant",
+                "--workflow",
+                "pickup",
+                "--repository",
+                repository.as_str(),
+                "--yes",
+            ],
+        )?;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if repository == &a {
+            let configured = registry.load(&house)?;
+            let authority = configured.authority()?;
+            for permission in [
+                Permission::LaunchWorker,
+                Permission::MessageWorker,
+                Permission::CancelWorker,
+                Permission::ReleaseResource,
+                Permission::PushBranch,
+                Permission::OpenPullRequest,
+            ] {
+                let (backend, credential) = if matches!(
+                    permission,
+                    Permission::PushBranch | Permission::OpenPullRequest
+                ) {
+                    (BackendId::new("github")?, CredentialId::new("github")?)
+                } else {
+                    (BackendId::new("orca")?, CredentialId::new("orca-host")?)
+                };
+                let a_grant =
+                    Grant::repository(permission, a.clone(), backend.clone(), credential.clone());
+                let b_grant = Grant::repository(permission, b.clone(), backend.clone(), credential);
+                assert!(configured.grants.contains(&a_grant));
+                assert!(configured.policy_limits.contains(&a_grant));
+                assert!(authority.covers(&a_grant));
+                assert!(!authority.covers(&b_grant));
+                assert!(
+                    authority
+                        .permitted(permission, &b_grant.scope, &backend)
+                        .is_err()
+                );
+            }
+        }
+    }
+    let configured = registry.load(&house)?;
+    let authority = configured.authority()?;
+    for permission in [
+        Permission::LaunchWorker,
+        Permission::MessageWorker,
+        Permission::CancelWorker,
+        Permission::ReleaseResource,
+        Permission::PushBranch,
+        Permission::OpenPullRequest,
+    ] {
+        let (backend, credential) = if matches!(
+            permission,
+            Permission::PushBranch | Permission::OpenPullRequest
+        ) {
+            (BackendId::new("github")?, CredentialId::new("github")?)
+        } else {
+            (BackendId::new("orca")?, CredentialId::new("orca-host")?)
+        };
+        let a_grant = Grant::repository(permission, a.clone(), backend.clone(), credential.clone());
+        let b_grant = Grant::repository(permission, b.clone(), backend, credential);
+        assert!(configured.grants.contains(&a_grant));
+        assert!(configured.policy_limits.contains(&a_grant));
+        assert!(configured.grants.contains(&b_grant));
+        assert!(configured.policy_limits.contains(&b_grant));
+        assert!(authority.covers(&a_grant));
+        assert!(authority.covers(&b_grant));
+    }
+    assert!(
+        configured
+            .grants
+            .iter()
+            .all(|grant| matches!(grant.scope, GrantScope::Repository(_)))
+    );
+    assert!(
+        configured
+            .policy_limits
+            .iter()
+            .all(|grant| matches!(grant.scope, GrantScope::Repository(_)))
+    );
+
+    let revoked = run(
+        &registry,
+        &[
+            "revoke",
+            "--workflow",
+            "pickup",
+            "--repository",
+            a.as_str(),
+            "--yes",
+        ],
+    )?;
+    assert!(
+        revoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    let after = registry.load(&house)?;
+    assert!(
+        after
+            .grants
+            .iter()
+            .all(|grant| grant.scope == GrantScope::Repository(b.clone()))
+    );
+    assert!(
+        after
+            .policy_limits
+            .iter()
+            .all(|grant| grant.scope == GrantScope::Repository(b.clone()))
+    );
+    assert_eq!(after.grants.len(), configured.grants.len() / 2);
+    assert_eq!(
+        after.policy_limits.len(),
+        configured.policy_limits.len() / 2
+    );
+    let after_authority = after.authority()?;
+    for permission in [
+        Permission::MessageWorker,
+        Permission::CancelWorker,
+        Permission::ReleaseResource,
+    ] {
+        let a_grant = Grant::repository(
+            permission,
+            a.clone(),
+            BackendId::new("orca")?,
+            CredentialId::new("orca-host")?,
+        );
+        let b_grant = Grant::repository(
+            permission,
+            b.clone(),
+            BackendId::new("orca")?,
+            CredentialId::new("orca-host")?,
+        );
+        assert!(!after_authority.covers(&a_grant));
+        assert!(after_authority.covers(&b_grant));
+    }
+    Ok(())
+}
+
+#[test]
+fn house_wide_grant_requires_explicit_flag() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let registry = fixture_with_second_repository(temp.path(), true)?;
+    let house = "crabnebula".parse()?;
+    let result = run(
+        &registry,
+        &[
+            "grant",
+            "--permission",
+            "message-worker",
+            "--repository",
+            "crabnebula/tauri-fixture",
+            "--house-wide",
+            "--yes",
+        ],
+    )?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let configured = registry.load(&house)?;
+    let shared = Grant::house(
+        Permission::MessageWorker,
+        BackendId::new("orca")?,
+        CredentialId::new("orca-host")?,
+    );
+    assert_eq!(configured.grants, BTreeSet::from([shared.clone()]));
+    assert_eq!(configured.policy_limits, BTreeSet::from([shared.clone()]));
+    assert!(configured.authority()?.covers(&Grant::repository(
+        Permission::MessageWorker,
+        "crabnebula/another".parse()?,
+        shared.destination,
+        shared.credential
+    )));
+    let review = run(
+        &registry,
+        &[
+            "grant",
+            "--permission",
+            "review-pull-request",
+            "--repository",
+            "crabnebula/tauri-fixture",
+            "--house-wide",
+            "--yes",
+        ],
+    )?;
+    assert!(
+        review.status.success(),
+        "{}",
+        String::from_utf8_lossy(&review.stderr)
+    );
+    let review_grant = Grant::repository(
+        Permission::ReviewPullRequest,
+        "crabnebula/tauri-fixture".parse()?,
+        BackendId::new("github")?,
+        CredentialId::new("github")?,
+    );
+    let after = registry.load(&house)?;
+    assert!(after.grants.contains(&review_grant));
+    assert!(after.policy_limits.contains(&review_grant));
     Ok(())
 }

@@ -33,7 +33,7 @@ pub struct GrantArgs {
     /// Repository to scope the grant to; inferred only when the house has one.
     #[arg(long)]
     repository: Option<Repository>,
-    /// Revoke matching authority across the whole house, including other repositories.
+    /// Grant house scope where supported, or revoke matching authority across the house.
     #[arg(long)]
     house_wide: bool,
     /// Show the exact change without writing or prompting.
@@ -45,9 +45,6 @@ pub struct GrantArgs {
 }
 
 pub fn run(args: GrantArgs, revoke: bool) -> Result<(String, bool), kitchen::Error> {
-    if args.house_wide && !revoke {
-        return Err(HouseError::InvalidInput.into());
-    }
     let root = match args.registry {
         Some(path) => super::house::canonical_root(path)?,
         None => std::env::var_os("HOME")
@@ -110,10 +107,16 @@ pub fn run(args: GrantArgs, revoke: bool) -> Result<(String, bool), kitchen::Err
             .collect()
     } else {
         match (args.workflow, args.permission) {
-            (Some(workflow), None) => workflow_grants(&registry, &current, workflow, &repository)?,
-            (None, Some(permission)) => {
-                BTreeSet::from([one_grant(&registry, &current, permission, &repository)?])
+            (Some(workflow), None) => {
+                workflow_grants(&registry, &current, workflow, &repository, args.house_wide)?
             }
+            (None, Some(permission)) => BTreeSet::from([one_grant(
+                &registry,
+                &current,
+                permission,
+                &repository,
+                args.house_wide,
+            )?]),
             _ => return Err(HouseError::InvalidInput.into()),
         }
     };
@@ -225,10 +228,11 @@ fn workflow_grants(
     house: &HouseConfig,
     workflow: Workflow,
     repository: &Repository,
+    house_wide: bool,
 ) -> Result<BTreeSet<Grant>, kitchen::Error> {
     selected_permissions(Some(workflow), None)?
         .iter()
-        .map(|permission| one_grant(registry, house, *permission, repository))
+        .map(|permission| one_grant(registry, house, *permission, repository, house_wide))
         .collect()
 }
 
@@ -250,6 +254,7 @@ fn one_grant(
     house: &HouseConfig,
     permission: Permission,
     repository: &Repository,
+    house_wide: bool,
 ) -> Result<Grant, kitchen::Error> {
     use Permission::*;
     // A Roger destination has no house binding to infer here; target-scoped
@@ -266,6 +271,7 @@ fn one_grant(
             | EditIssueRelationships
             | PushBranch
             | OpenPullRequest
+            | ReviewPullRequest
             | RequestReview
             | Merge
             | Publish
@@ -287,11 +293,12 @@ fn one_grant(
             | EditIssueRelationships
             | PushBranch
             | OpenPullRequest
+            | ReviewPullRequest
             | RequestReview
             | Merge
             | Publish
     );
-    Ok(if repository_scoped {
+    Ok(if !house_wide || repository_scoped {
         Grant::repository(permission, repository.clone(), destination, credential)
     } else {
         Grant::house(permission, destination, credential)

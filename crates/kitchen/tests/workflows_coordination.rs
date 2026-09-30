@@ -743,39 +743,35 @@ fn scheduled_work_refuses_a_persons_consent() -> TestResult {
 
 #[test]
 fn a_coordinator_does_not_start_on_a_backend_missing_required_capabilities() -> TestResult {
-    // Without deliveries the coordinator would never receive a question or a
-    // report, so it is refused like a backend without launch readiness.
-    for absent in [
-        Capability::WorkerLaunchReadiness,
-        Capability::WorkerDeliveries,
-    ] {
-        let limited = CapabilitySet::supporting(
-            Capability::ALL
-                .into_iter()
-                .filter(|capability| *capability != absent),
-        );
-        let world = World::with_capabilities(limited)?;
-        let error = start_coordinator(
-            &world.fixture.store,
-            world.backend.descriptor(),
-            &consumer()?,
-            &common::scheduled("tick")?,
-            ttl(600)?,
-            world.now(),
-        )
-        .err()
-        .ok_or_else(|| format!("coordinator started without {absent}"))?;
-        assert!(
-            matches!(
-                error,
-                kitchen::Error::Contract(ContractError::UnsupportedCapabilities { ref missing, ref partial })
-                    if missing == &[absent] && partial.is_empty()
-            ),
-            "{absent}: {error}"
-        );
-        assert_eq!(error.class(), ErrorClass::Refused);
-        assert!(world.fixture.store.consumer(&consumer()?)?.is_none());
-    }
+    // A backend without deliveries starts on the house mailbox instead
+    // (`house_mailbox.rs`); one without launch readiness never starts.
+    let absent = Capability::WorkerLaunchReadiness;
+    let limited = CapabilitySet::supporting(
+        Capability::ALL
+            .into_iter()
+            .filter(|capability| *capability != absent),
+    );
+    let world = World::with_capabilities(limited)?;
+    let error = start_coordinator(
+        &world.fixture.store,
+        world.backend.descriptor(),
+        &consumer()?,
+        &common::scheduled("tick")?,
+        ttl(600)?,
+        world.now(),
+    )
+    .err()
+    .ok_or_else(|| format!("coordinator started without {absent}"))?;
+    assert!(
+        matches!(
+            error,
+            kitchen::Error::Contract(ContractError::UnsupportedCapabilities { ref missing, ref partial })
+                if missing == &[absent] && partial.is_empty()
+        ),
+        "{absent}: {error}"
+    );
+    assert_eq!(error.class(), ErrorClass::Refused);
+    assert!(world.fixture.store.consumer(&consumer()?)?.is_none());
     Ok(())
 }
 

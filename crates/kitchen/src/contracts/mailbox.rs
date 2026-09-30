@@ -12,8 +12,9 @@
 //! then fenced from the mailbox, and the adopter receives every
 //! unacknowledged message, possibly regrouped under a new batch id. A handler
 //! that must not act twice deduplicates by message id, never by batch id.
-//! Coordination requires deliveries
-//! ([`crate::workflows::coordination::REQUIRED_WORKER_CAPABILITIES`]).
+//! Coordination reads deliveries from the backend when it declares them and
+//! from the house store's mailbox ([`crate::state::HouseMailbox`]) when it
+//! does not ([`crate::workflows::coordination::MailboxRoute`]).
 //!
 //! The contract says nothing about where the mailbox lives, so a backend
 //! may transport messages that Kitchen itself stores. Checked by

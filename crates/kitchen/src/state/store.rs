@@ -29,20 +29,25 @@ use std::path::Path;
 use crate::{
     ConsumerId, Error, HolderId, HouseId, TaskId, WorkflowId,
     contracts::{
-        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Claimant, Disposition,
-        EffectExecutor, EffectSeq, Evidence, EvidenceKind, EvidenceRevision, ExternalRef, Fence,
-        HouseGrants, IssueNumber, LeaseTtl, RecordedEvidence, TaskSpec, Text, Timestamp,
-        VerificationError,
+        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Claimant, ConsumerFence,
+        Delivery, Disposition, EffectExecutor, EffectSeq, Evidence, EvidenceKind, EvidenceRevision,
+        ExternalRef, Fence, HouseGrants, IssueNumber, LeaseTtl, RecordedEvidence, TaskSpec, Text,
+        Timestamp, VerificationError,
     },
     state::{
         CancelStatus, ConsumerRecord, Consumption, Creation, EffectOutcome, EffectPlan,
         EffectRecord, EffectStart, Lease, MarkerAttempt, MarkerFact, MarkerKey, MarkerRecording,
         RecoveryItem, Reservation, RiskDecision, TaskRecord, WorkflowMarker, WriteAcknowledgement,
         effects::SettledLookup,
+        mailbox::{
+            AnswerState, Answered, MAX_MAILBOX_MESSAGES, MailAnswer, MailSender, OpenQuestion,
+            WorkerPost,
+        },
         marker::{MarkerWrite, PairPlan},
         model::StoreState,
         retention::{
             Inventory, RetentionPolicy, RetentionReport, RetentionSubjects, StoreCapacity,
+            TableUsage,
         },
         snapshot::{SnapshotStore, StoreLayout, StoreOptions},
         usage::{AttemptUsageEntry, UsageReport},
@@ -52,6 +57,7 @@ use crate::{
 #[cfg(doc)]
 use crate::{
     contracts::ContractError,
+    state::MailError,
     state::{AttemptUsage, StateError, UsageError},
 };
 
@@ -134,6 +140,12 @@ impl HouseStore {
     #[must_use]
     pub const fn house(&self) -> &HouseId {
         self.engine.house()
+    }
+
+    /// The store's directory, which `kitchn` commands name with `--store`.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        self.engine.dir()
     }
 
     /// Create a task, recording who created it and under which trigger.
@@ -972,6 +984,85 @@ impl HouseStore {
     /// Returns a storage error.
     pub fn recovery_queue(&self, now: Timestamp) -> Result<Vec<RecoveryItem>> {
         self.read(|state| state.recovery_queue(now))
+    }
+
+    /// Post a worker's question, report, or escalation into the house
+    /// mailbox and return its message id.
+    ///
+    /// # Errors
+    /// [`MailError::NoOpenAttempt`] or [`MailError::NotSender`] unless
+    /// `sender` holds the task's open attempt, [`MailError::Full`],
+    /// [`MailError::TooLarge`], and [`StateError::TaskNotFound`] for a task
+    /// not in this house's store.
+    pub fn post_mail(
+        &self,
+        sender: &MailSender,
+        post: WorkerPost,
+        now: Timestamp,
+    ) -> Result<ExternalRef> {
+        self.transact(|state| state.post_mail(sender, post, now))
+    }
+
+    /// The answer to `question`, for the worker that asked it.
+    ///
+    /// # Errors
+    /// As for [`Self::post_mail`], plus [`MailError::UnknownMessage`] for a
+    /// message another task or attempt posted, and
+    /// [`MailError::NotAQuestion`].
+    pub fn mail_answer(&self, sender: &MailSender, question: &ExternalRef) -> Result<AnswerState> {
+        self.read(|state| state.mail_answer(sender, question))?
+    }
+
+    /// Answer a worker question. A person's answer is recorded as a human
+    /// reply on the asking attempt ([`Self::record_attempt_reply`]).
+    ///
+    /// # Errors
+    /// [`MailError::UnknownMessage`], [`MailError::NotAQuestion`],
+    /// [`MailError::AlreadyAnswered`] for a different earlier answer,
+    /// [`MailError::NoOwner`] for a person's answer while nobody owns the
+    /// task, and the reply's recording errors.
+    pub fn answer_mail(&self, question: &ExternalRef, answer: MailAnswer) -> Result<Answered> {
+        self.transact(|state| state.answer_mail(question, answer))
+    }
+
+    /// Unanswered questions, oldest first, at most `limit`.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub fn open_questions(&self, limit: usize) -> Result<Vec<OpenQuestion>> {
+        self.read(|state| state.open_questions(limit))?
+    }
+
+    /// How full the house mailbox is.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub fn mailbox_usage(&self) -> Result<TableUsage> {
+        self.read(|state| TableUsage {
+            used: state.mailbox_len(),
+            limit: MAX_MAILBOX_MESSAGES,
+        })
+    }
+
+    pub(crate) fn adopt_mailbox(&self, reader: &ConsumerFence, now: Timestamp) -> Result<()> {
+        self.transact(|state| state.adopt_mailbox(reader, now))
+    }
+
+    pub(crate) fn mail_delivery(
+        &self,
+        reader: &ConsumerFence,
+        now: Timestamp,
+    ) -> Result<Option<Delivery>> {
+        self.transact(|state| state.mail_delivery(reader, now))
+    }
+
+    pub(crate) fn acknowledge_mail(
+        &self,
+        reader: &ConsumerFence,
+        delivery: &ExternalRef,
+        now: Timestamp,
+    ) -> Result<Option<Delivery>> {
+        self.transact(|state| state.acknowledge_mail(reader, delivery, now))
     }
 
     fn transact<T>(&self, apply: impl FnOnce(&mut StoreState) -> Result<T>) -> Result<T> {

@@ -80,7 +80,7 @@ redirected store path, and a store inside a Git checkout.
 Install the house's configured pins from a verified bundle.
 
 ```sh
-kitchn house sync --bundle <bundle.json>
+kitchn house sync --house <id> --bundle <bundle.json>
 ```
 
 ## `kitchn house update`
@@ -88,7 +88,7 @@ kitchn house sync --bundle <bundle.json>
 Change the pins, after the complete new bundle verifies.
 
 ```sh
-kitchn house update --bundle <bundle.json>
+kitchn house update --house <id> --bundle <bundle.json>
 ```
 
 ## `kitchn house setup`
@@ -97,15 +97,15 @@ Adopt a repository by recording its binding in the registry. Writes nothing into
 the repository.
 
 ```sh
-kitchn house setup [options]
+kitchn house setup --house <id> --workflows <list|none> [--repository <owner/name>]
 ```
 
 | Option | Description |
 | --- | --- |
 | `--repository <owner/name>` | Repository identity. Read from the checkout's git remote when omitted; naming it skips the remote check, and the house allowlist still applies. |
-| `--house <id>` | House to use. Needed only when more than one house claims the repository; the choice is remembered in the registry. |
+| `--house <id>` | House to use. Name the chosen house for first setup; the choice is remembered in the registry. |
 | `--workflows <list>` | Comma-separated workflows, or `none`. Prompted when omitted. |
-| `--repository-path <dir>` | Checkout whose git remotes identify the repository (default: the current directory). Needs a GitHub remote. |
+| `--repository-path <dir>` | Checkout whose git remotes identify the repository (default: the current directory). Needs a GitHub remote unless `--repository` is given. |
 | `--preview` | Report the proposed setup without writing. |
 | `--evidence <file>` | Scoped, read-only observations from an integration. |
 | `--json` | Print the doctor report plus `preview`, `binding` and `written`. |
@@ -144,7 +144,7 @@ limit or more, before new work is refused.
 Preview, then create or add files from a house template.
 
 ```sh
-kitchn init <dir> --template <name> [options]
+kitchn init <dir> --house <id> --repository <owner/name> --template <name> [options]
 kitchn adopt <dir> --template <name> [options]
 ```
 

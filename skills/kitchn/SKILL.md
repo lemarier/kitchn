@@ -40,12 +40,14 @@ person. Kitchen writes nothing into the repository's working tree.
 If a command prints `claimed by house <house> but not set up`, the
 repository is not bound. Ask the person in plain chat (or your choice
 picker, never a `[y/N]` prompt): bind `<repository>` to `<house>`, and which
-workflows to enable (`none` means interactive only). After they answer, run
-exactly:
+workflows to enable (`none` means interactive only). After they answer, run:
 
 ```sh
-kitchn house setup --workflows <list|none>
+kitchn house setup --house <house> --workflows <list|none>
 ```
+
+Add `--repository <owner/name>` when the checkout cannot identify the approved
+repository from its Git remotes.
 
 Show the person the doctor report it prints. Any other resolution error
 (no house claims the repository, several do, or remotes disagree) stops the

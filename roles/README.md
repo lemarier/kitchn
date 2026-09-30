@@ -14,7 +14,7 @@ are examples to replace, not commands that activate a real house.
 ```sh
 kitchn house init --config /path/house.json
 kitchn house sync --house example --bundle /path/verified-bundle.json
-kitchn house setup
+kitchn house setup --house example --workflows none
 ```
 
 Without `--config`, `kitchn house init` asks for the house name and offers a
@@ -25,7 +25,8 @@ guidance in the same run. Every question has a flag; with piped input, missing
 answers fail with exit 2 and the flags to pass.
 
 The sync example names the house because setup has not yet bound the checkout.
-Setup asks for the house and workflows. Choose `none` for interactive-only work.
+The setup example selects interactive-only work. Choose other workflows only
+after reviewing their requirements.
 It writes nothing into the repository: the binding is stored in the registry,
 keyed by the repository, and setup finishes with a doctor report and next steps.
 The repository is identified from the checkout's Git remotes: the push
@@ -59,7 +60,7 @@ Disabling a workflow leaves its labels in place.
 
 ```sh
 kitchn house doctor --repository-path /absolute/checkout --json
-kitchn house update --bundle /path/new-verified-bundle.json
+kitchn house update --house example --bundle /path/new-verified-bundle.json
 ```
 
 Doctor's optional `--evidence /path/scoped-observation.json` accepts a

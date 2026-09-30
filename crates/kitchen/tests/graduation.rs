@@ -1009,3 +1009,26 @@ fn archiving_keeps_graduation_evidence_and_later_regressions() -> TestResult {
     assert_eq!(report.kept.streams_cited_by_grants, evidence.len());
     Ok(())
 }
+
+#[test]
+fn an_expired_decision_stops_holding_later_streams() -> TestResult {
+    let f = Fixture::new()?;
+    let l = ledger(&f)?;
+    let c = config(policy(3, 80)?)?;
+    let evidence = three_runs(&f, &l, "run", 'b')?;
+    l.graduate(
+        &f.store,
+        &c,
+        decision("grad:1", 'b', &[Permission::LaunchWorker], evidence)?,
+        at(NOW),
+    )?;
+    let (later, _) = run(&f, &l, "later", 'b', true, NOW + DAY)?;
+    // While the decision is in force, the later stream is kept for it.
+    let kept = l.preview_archive(at(NOW + 2 * DAY))?;
+    assert!(kept.streams.iter().all(|s| s.id != later));
+    assert_eq!(kept.kept.streams_after_graduation, 1);
+    // Once it expires unrevoked, nothing reads that stream for it any more.
+    let expired = l.preview_archive(at(NOW + 31 * DAY))?;
+    assert_eq!(expired.kept.streams_after_graduation, 0);
+    Ok(())
+}

@@ -466,9 +466,12 @@ fn select(doc: &Document, now: Timestamp) -> Selection {
         .iter()
         .filter(|observation| {
             doc.graduations.iter().any(|audit| match audit {
+                // Only an unexpired decision reads later streams (for its
+                // standing and reviews); an expired one pins nothing.
                 GraduationAudit::Decided(decision) => {
                     decision.scope == observation.attribution.scope
                         && observation.observed_at > decision.at
+                        && now < decision.expires_at
                 }
                 GraduationAudit::Revoked { .. } => false,
             })

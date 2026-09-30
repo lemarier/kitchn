@@ -81,9 +81,12 @@ enum TickCommand {
         holder: HolderId,
     },
     /// Print a launchd plist or crontab line that runs the tick. Installs
-    /// nothing. Backend flags given here are stored, owner-only, in the
-    /// house's private runtime configuration in the registry, and every tick
-    /// reads them there; the printed line carries no backend flags.
+    /// nothing. Backend and pickup flags given here are stored, owner-only,
+    /// in the house's private runtime configuration in the registry, and every
+    /// tick reads them there; the printed line carries none of them. This is
+    /// the only command that changes what is stored: a tick or run flag that
+    /// disagrees with it is refused. Nothing is stored unless the trigger
+    /// prints.
     Trigger {
         #[arg(value_enum)]
         format: TriggerFormat,
@@ -105,6 +108,9 @@ enum TickCommand {
         repository: Option<Repository>,
         #[command(flatten)]
         backend: BackendArgs,
+        /// Scheduled pickup settings, stored with the backend flags.
+        #[command(flatten)]
+        pickup: Box<PickupArgs>,
     },
 }
 
@@ -216,20 +222,22 @@ pub fn run(args: TickArgs) -> Result<(String, bool), kitchen::Error> {
                 every_minutes,
                 repository,
                 backend,
+                pickup,
             }),
             _,
         ) => {
-            store_runtime_flags(&registry, &house, repository, &backend)?;
+            // Render first: a trigger that cannot be printed stores nothing.
             let target = TriggerTarget::new(
                 &kitchn,
                 &registry,
-                house,
+                house.clone(),
                 TriggerMinutes::new(every_minutes)?,
             )?;
             let text = match format {
                 TriggerFormat::Launchd => trigger_plist(&target),
                 TriggerFormat::Cron => trigger_cron(&target)?,
             };
+            store_runtime_flags(&registry, &house, repository, &backend, &pickup)?;
             Ok((text.trim_end().to_owned(), true))
         }
         (None, Some(house)) => run_tick(house, args.repository, &args.backend, &args.pickup),
@@ -237,13 +245,15 @@ pub fn run(args: TickArgs) -> Result<(String, bool), kitchen::Error> {
     }
 }
 
-/// Store the backend and repository flags, overlaid on what the house
-/// already stores, when any was given. Nothing is written otherwise.
+/// Store the backend, repository, and pickup flags, overlaid on what the
+/// house already stores, when any was given. Nothing is written otherwise,
+/// and nothing is written unless the whole configuration validates.
 fn store_runtime_flags(
     registry: &Path,
     house: &HouseId,
     repository: Option<Repository>,
     flags: &BackendArgs,
+    pickup: &PickupArgs,
 ) -> Result<(), kitchen::Error> {
     let orca_given = [
         flags.orca.is_some(),
@@ -252,7 +262,8 @@ fn store_runtime_flags(
         flags.orca_coordinator.is_some(),
         flags.orca_repo.is_some(),
     ];
-    if repository.is_none() && flags.curl.is_none() && !orca_given.contains(&true) {
+    if repository.is_none() && flags.curl.is_none() && !pickup.any() && !orca_given.contains(&true)
+    {
         return Ok(());
     }
     let registry = HouseRegistry::new(registry)?;
@@ -262,6 +273,7 @@ fn store_runtime_flags(
         orca: None,
         curl: None,
         repository: None,
+        pickup: None,
     });
     if orca_given.contains(&true) {
         let stored = runtime.orca.take();
@@ -304,6 +316,9 @@ fn store_runtime_flags(
     }
     runtime.curl = flags.curl.clone().or(runtime.curl);
     runtime.repository = repository.or(runtime.repository);
+    if pickup.any() {
+        runtime.pickup = Some(pickup.overlay(runtime.pickup.take().unwrap_or_default()));
+    }
     store_runtime(&registry, &runtime)?;
     Ok(())
 }

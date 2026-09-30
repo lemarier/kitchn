@@ -44,6 +44,18 @@ case "$*" in
 esac
 "#;
 
+/// Like [`FAKE_GH`], but the open issue list holds issue 7, labeled
+/// `agent-ready`; a pickup that finds it inspects it, which the log shows.
+const FAKE_GH_WITH_ISSUE: &str = r#"#!/bin/sh
+echo "$*" >> "$(dirname "$0")/gh-calls"
+case "$*" in
+  "config get user"*) echo octo-cat ;;
+  "api --hostname github.com user") echo '{"login":"octo-cat"}' ;;
+  *"repos/acme/app/issues?state=open"*) echo '[{"repository_url":"https://api.github.com/repos/acme/app","id":1007,"number":7,"title":"Do it","state":"open","assignees":[],"labels":[{"name":"agent-ready","color":"0e8a16"}],"updated_at":"2026-01-01T00:00:00Z"}]' ;;
+  *) echo '[]' ;;
+esac
+"#;
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -352,5 +364,215 @@ fn storing_replaces_a_valid_configuration_and_refuses_partial_or_relative_input(
     let partial = fresh.trigger(&["--orca-run", "run-1"])?;
     assert_eq!(partial.status.code(), Some(2), "{}", text(&partial.stderr));
     assert!(!fresh.runtime_file().exists());
+    Ok(())
+}
+
+/// `kitchn run <pass>` for `acme`, with `extra` flags.
+fn run_pass(house: &House, pass: &str, extra: &[&str]) -> TestResult<Output> {
+    let registry = house.registry().display().to_string();
+    let mut args = vec!["run", pass, "--registry", &registry, "--house", "acme"];
+    args.extend_from_slice(extra);
+    house.kitchen(&args)
+}
+
+#[test]
+fn a_flag_that_disagrees_with_the_stored_runtime_is_refused_before_connecting() -> TestResult {
+    let elsewhere = "/somewhere/else";
+    let cases: [(&str, &str); 6] = [
+        ("--orca", elsewhere),
+        ("--runtime-dir", elsewhere),
+        ("--orca-run", "run-2"),
+        ("--orca-coordinator", "term-2"),
+        ("--orca-repo", "id:other"),
+        ("--repository", "acme/other"),
+    ];
+    for (flag, value) in cases {
+        let house = House::new()?;
+        let mut flags = house.orca_flags();
+        flags.extend(["--repository".to_owned(), "acme/app".to_owned()]);
+        let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+        let printed = text(&house.trigger(&flags)?.stdout);
+        let stored = fs::read(house.runtime_file())?;
+        let before = house.orca_calls();
+        // The scheduled tick and a direct pass refuse alike.
+        let direct = run_pass(&house, "coordinate", &[flag, value])?;
+        let direct_text = format!("{}{}", text(&direct.stdout), text(&direct.stderr));
+        assert_eq!(direct.status.code(), Some(2), "{flag}: {direct_text}");
+        assert!(direct_text.contains(flag), "{flag}: {direct_text}");
+        assert!(direct_text.contains("disagrees"), "{flag}: {direct_text}");
+        let words = shell_words(printed.trim().splitn(6, ' ').nth(5).unwrap_or_default())?;
+        let (program, args) = words.split_first().ok_or("empty trigger")?;
+        let tick = house
+            .command(program)
+            .args(args)
+            .args([flag, value])
+            .output()?;
+        let tick_text = format!("{}{}", text(&tick.stdout), text(&tick.stderr));
+        assert!(tick_text.contains(flag), "{flag}: {tick_text}");
+        assert_eq!(house.orca_calls(), before, "{flag}: contacted a backend");
+        assert_eq!(fs::read(house.runtime_file())?, stored, "{flag}: rewrote");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_flag_that_agrees_with_the_stored_runtime_is_accepted() -> TestResult {
+    let (house, _) = stored_house()?;
+    let agreeing = run_pass(
+        &house,
+        "coordinate",
+        &["--orca-run", "run-1", "--orca-repo", "id:app"],
+    )?;
+    assert_eq!(
+        agreeing.status.code(),
+        Some(0),
+        "{}",
+        text(&agreeing.stderr)
+    );
+    assert!(house.orca_calls().contains("--run=run-1"));
+    Ok(())
+}
+
+#[test]
+fn a_failed_trigger_command_leaves_the_stored_runtime_unchanged() -> TestResult {
+    let (house, _) = stored_house()?;
+    let stored = fs::read(house.runtime_file())?;
+    // 7 does not divide 60, so cron cannot render it.
+    let interval = house.trigger(&["--every-minutes", "7", "--orca-run", "run-2"])?;
+    assert_eq!(
+        interval.status.code(),
+        Some(2),
+        "{}",
+        text(&interval.stderr)
+    );
+    assert_eq!(fs::read(house.runtime_file())?, stored);
+    // An out-of-range interval.
+    let range = house.trigger(&["--every-minutes", "60", "--orca-run", "run-2"])?;
+    assert_eq!(range.status.code(), Some(2), "{}", text(&range.stderr));
+    assert_eq!(fs::read(house.runtime_file())?, stored);
+    // A relative kitchn path cannot be printed.
+    let registry = house.registry().display().to_string();
+    let path = house.kitchen(&[
+        "tick",
+        "trigger",
+        "cron",
+        "--kitchn",
+        "kitchn",
+        "--registry",
+        &registry,
+        "--house",
+        "acme",
+        "--orca-run",
+        "run-2",
+    ])?;
+    assert_eq!(path.status.code(), Some(2), "{}", text(&path.stderr));
+    assert_eq!(fs::read(house.runtime_file())?, stored);
+    // Invalid pickup settings, checked after rendering, are refused whole.
+    for bad in [
+        ["--capacity", "0"],
+        ["--report-path", "../out.md"],
+        ["--ready-label", ""],
+    ] {
+        let refused = house.trigger(&[bad[0], bad[1], "--orca-run", "run-2"])?;
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "{bad:?}: {}",
+            text(&refused.stderr)
+        );
+        assert_eq!(fs::read(house.runtime_file())?, stored, "{bad:?}");
+    }
+    // Nothing is created for a house with none stored.
+    let fresh = House::new()?;
+    let none = fresh.trigger(&["--every-minutes", "7", "--orca-run", "run-1"])?;
+    assert_eq!(none.status.code(), Some(2), "{}", text(&none.stderr));
+    assert!(!fresh.runtime_file().exists());
+    // A valid command still replaces it.
+    let valid = house.trigger(&["--orca-run", "run-2"])?;
+    assert_eq!(valid.status.code(), Some(0), "{}", text(&valid.stderr));
+    assert!(fs::read_to_string(house.runtime_file())?.contains("run-2"));
+    Ok(())
+}
+
+#[test]
+fn nondefault_pickup_settings_travel_through_a_printed_trigger() -> TestResult {
+    let house = House::new()?;
+    let mut flags = house.orca_flags();
+    flags.extend(
+        [
+            "--ready-label",
+            "agent-ready",
+            "--needs-spec-label",
+            "spec-me",
+            "--human-label",
+            "people-only",
+            "--capacity",
+            "3",
+            "--branch-prefix",
+            "bot",
+            "--report-path",
+            "reports/out.md",
+        ]
+        .map(str::to_owned),
+    );
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let trigger = house.trigger(&flags)?;
+    assert_eq!(trigger.status.code(), Some(0), "{}", text(&trigger.stderr));
+    let printed = text(&trigger.stdout);
+    // The line still carries no settings.
+    assert!(!printed.contains("agent-ready"), "{printed}");
+    assert!(!printed.contains("--capacity"), "{printed}");
+
+    let stored = fs::read_to_string(house.runtime_file())?;
+    for expected in [
+        "\"readyLabel\": \"agent-ready\"",
+        "\"needsSpecLabel\": \"spec-me\"",
+        "\"humanLabel\": \"people-only\"",
+        "\"capacity\": 3",
+        "\"branchPrefix\": \"bot\"",
+        "\"reportPath\": \"reports/out.md\"",
+    ] {
+        assert!(stored.contains(expected), "{expected}: {stored}");
+    }
+
+    // The stored ready label finds issue 7, which the default label would
+    // not, so the pickup inspects it.
+    script(&house.bin.join("gh"), FAKE_GH_WITH_ISSUE)?;
+    let fired = house.fire(&printed)?;
+    let gh = fs::read_to_string(house.bin.join("gh-calls")).unwrap_or_default();
+    assert!(
+        gh.contains("issues/7"),
+        "{gh}\n{}{}",
+        text(&fired.stdout),
+        text(&fired.stderr)
+    );
+
+    let defaults = House::new()?;
+    let mut orca = defaults.orca_flags();
+    orca.extend(["--repository".to_owned(), "acme/app".to_owned()]);
+    let orca: Vec<&str> = orca.iter().map(String::as_str).collect();
+    let printed_defaults = text(&defaults.trigger(&orca)?.stdout);
+    script(&defaults.bin.join("gh"), FAKE_GH_WITH_ISSUE)?;
+    defaults.fire(&printed_defaults)?;
+    let gh = fs::read_to_string(defaults.bin.join("gh-calls")).unwrap_or_default();
+    assert!(!gh.contains("issues/7"), "{gh}");
+
+    // A later trigger keeps the stored settings it was not given.
+    let again = house.trigger(&["--capacity", "2"])?;
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again.stderr));
+    let stored = fs::read_to_string(house.runtime_file())?;
+    assert!(stored.contains("\"capacity\": 2"), "{stored}");
+    assert!(
+        stored.contains("\"readyLabel\": \"agent-ready\""),
+        "{stored}"
+    );
+
+    // A pickup flag that disagrees is refused before any call.
+    let calls = house.orca_calls();
+    let refused = run_pass(&house, "pickup", &["--ready-label", "ready"])?;
+    let combined = format!("{}{}", text(&refused.stdout), text(&refused.stderr));
+    assert_eq!(refused.status.code(), Some(2), "{combined}");
+    assert!(combined.contains("--ready-label"), "{combined}");
+    assert_eq!(house.orca_calls(), calls);
     Ok(())
 }

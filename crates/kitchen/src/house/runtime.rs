@@ -22,7 +22,7 @@ use super::{HouseConfig, HouseError};
 use crate::{
     ErrorClass, HouseId,
     adoption::{FileMode, HouseRegistry, NewFile, RelativePath, decode, encode},
-    contracts::{ExternalRef, Repository},
+    contracts::{BranchName, ExternalRef, Repository},
 };
 
 /// Schema of a stored [`RuntimeConfig`].
@@ -46,6 +46,73 @@ pub struct OrcaHost {
     pub repo: ExternalRef,
 }
 
+/// The most unsettled pickup tasks a stored capacity may allow.
+const MAX_PICKUP_CAPACITY: u32 = 64;
+/// The longest label or path a stored pickup setting may hold.
+const MAX_PICKUP_TEXT: usize = 256;
+
+/// The scheduled pickup pass's settings for one house.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PickupConfig {
+    /// The label that marks an issue ready for an agent.
+    pub ready_label: String,
+    /// The label that marks an issue needing a specification pass.
+    pub needs_spec_label: String,
+    /// The label that reserves an issue for a person.
+    pub human_label: String,
+    /// Most unsettled scheduled pickup tasks in the repository.
+    pub capacity: u32,
+    /// Workers create `<prefix>/issue-<number>`.
+    pub branch_prefix: String,
+    /// Where each worker writes its evidence report in its workspace.
+    pub report_path: String,
+}
+
+impl Default for PickupConfig {
+    fn default() -> Self {
+        Self {
+            ready_label: "ready".to_owned(),
+            needs_spec_label: "needs-spec".to_owned(),
+            human_label: "human-only".to_owned(),
+            capacity: 1,
+            branch_prefix: "kitchen".to_owned(),
+            report_path: "kitchen-report.md".to_owned(),
+        }
+    }
+}
+
+impl PickupConfig {
+    /// Check that every label is plain text, the capacity is between 1 and
+    /// 64, the branch prefix is a valid branch name, and the report path is
+    /// a plain relative path that stays inside the workspace.
+    ///
+    /// # Errors
+    /// [`RuntimeError::Invalid`] for any of those failing.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        let plain = |text: &str| {
+            !text.trim().is_empty()
+                && text.len() <= MAX_PICKUP_TEXT
+                && !text.chars().any(char::is_control)
+        };
+        let labels = [&self.ready_label, &self.needs_spec_label, &self.human_label];
+        let path = &self.report_path;
+        let contained = plain(path)
+            && !path.starts_with('/')
+            && !path.split('/').any(|part| part == ".." || part.is_empty());
+        if labels.iter().all(|label| plain(label))
+            && (1..=MAX_PICKUP_CAPACITY).contains(&self.capacity)
+            && plain(&self.branch_prefix)
+            && BranchName::new(&self.branch_prefix).is_ok()
+            && contained
+        {
+            Ok(())
+        } else {
+            Err(RuntimeError::Invalid)
+        }
+    }
+}
+
 /// Host facts for one house. Contains no credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -63,6 +130,9 @@ pub struct RuntimeConfig {
     /// The repository a multi-repository house's passes serve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<Repository>,
+    /// The scheduled pickup pass's settings. Absent means the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pickup: Option<PickupConfig>,
 }
 
 /// A runtime configuration was refused. Paths and values are never echoed.
@@ -96,8 +166,8 @@ impl RuntimeError {
 }
 
 impl RuntimeConfig {
-    /// Check the schema, the house, that every path is absolute, and that the
-    /// repository is one of the house's.
+    /// Check the schema, the house, that every path is absolute, that the
+    /// repository is one of the house's, and the pickup settings.
     ///
     /// # Errors
     /// [`RuntimeError::Invalid`] for any of those failing.
@@ -112,7 +182,16 @@ impl RuntimeConfig {
             .repository
             .as_ref()
             .is_none_or(|repository| house.repositories.contains(repository));
-        if self.schema == RUNTIME_SCHEMA && self.house == house.house && absolute && repository {
+        let pickup = self
+            .pickup
+            .as_ref()
+            .is_none_or(|pickup| pickup.validate().is_ok());
+        if self.schema == RUNTIME_SCHEMA
+            && self.house == house.house
+            && absolute
+            && repository
+            && pickup
+        {
             Ok(())
         } else {
             Err(RuntimeError::Invalid)

@@ -9,8 +9,8 @@ use kitchen::{
     adoption::HouseRegistry,
     contracts::{ExternalRef, Repository},
     house::{
-        HouseConfig, OrcaHost, RUNTIME_SCHEMA, RuntimeConfig, RuntimeError, RuntimeOutcome,
-        runtime_config, store_runtime,
+        HouseConfig, OrcaHost, PickupConfig, RUNTIME_SCHEMA, RuntimeConfig, RuntimeError,
+        RuntimeOutcome, runtime_config, store_runtime,
     },
 };
 
@@ -57,6 +57,11 @@ impl Fixture {
             }),
             curl: Some(PathBuf::from("/usr/bin/curl")),
             repository: Some(self.repository.clone()),
+            pickup: Some(PickupConfig {
+                ready_label: "agent-ready".to_owned(),
+                capacity: 2,
+                ..PickupConfig::default()
+            }),
         })
     }
 
@@ -201,5 +206,74 @@ fn a_file_others_can_access_or_a_link_is_refused() -> TestResult {
         runtime_config(&fixture.registry, &fixture.house),
         Err(RuntimeError::NotPrivate)
     ));
+    Ok(())
+}
+
+#[test]
+fn pickup_settings_round_trip_and_default_when_absent() -> TestResult {
+    let fixture = Fixture::new()?;
+    let runtime = fixture.runtime()?;
+    store_runtime(&fixture.registry, &runtime)?;
+    let stored = runtime_config(&fixture.registry, &fixture.house)?.ok_or("stored")?;
+    assert_eq!(stored.pickup, runtime.pickup);
+    let text = fs::read_to_string(fixture.file())?;
+    assert!(text.contains("\"readyLabel\": \"agent-ready\""), "{text}");
+
+    // A file without the field reads as none, which means the defaults.
+    let bare = RuntimeConfig {
+        pickup: None,
+        ..runtime
+    };
+    store_runtime(&fixture.registry, &bare)?;
+    let text = fs::read_to_string(fixture.file())?;
+    assert!(!text.contains("pickup"), "{text}");
+    let stored = runtime_config(&fixture.registry, &fixture.house)?.ok_or("stored")?;
+    assert_eq!(stored.pickup, None);
+    Ok(())
+}
+
+#[test]
+fn invalid_pickup_settings_are_never_stored() -> TestResult {
+    type Break = fn(&mut PickupConfig);
+    let breaks: [(&str, Break); 8] = [
+        ("empty label", |p| p.ready_label.clear()),
+        ("control in label", |p| p.human_label = "a\nb".to_owned()),
+        ("zero capacity", |p| p.capacity = 0),
+        ("huge capacity", |p| p.capacity = 65),
+        ("bad branch prefix", |p| p.branch_prefix = "a b".to_owned()),
+        ("absolute report path", |p| {
+            p.report_path = "/etc/report".to_owned()
+        }),
+        ("escaping report path", |p| {
+            p.report_path = "../report.md".to_owned()
+        }),
+        ("empty report segment", |p| {
+            p.report_path = "a//b.md".to_owned()
+        }),
+    ];
+    for (what, damage) in breaks {
+        let fixture = Fixture::new()?;
+        let mut runtime = fixture.runtime()?;
+        if let Some(pickup) = runtime.pickup.as_mut() {
+            damage(pickup);
+        }
+        assert!(
+            matches!(
+                store_runtime(&fixture.registry, &runtime),
+                Err(RuntimeError::Invalid)
+            ),
+            "{what}"
+        );
+        assert!(!fixture.file().exists(), "{what}");
+    }
+    // The boundaries themselves are accepted.
+    let fixture = Fixture::new()?;
+    let mut runtime = fixture.runtime()?;
+    runtime.pickup = Some(PickupConfig {
+        capacity: 64,
+        report_path: "reports/out.md".to_owned(),
+        ..PickupConfig::default()
+    });
+    store_runtime(&fixture.registry, &runtime)?;
     Ok(())
 }

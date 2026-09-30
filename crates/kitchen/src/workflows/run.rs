@@ -164,6 +164,12 @@ pub enum RunError {
     /// give; the text names them.
     #[error("this house's worker backend needs {0}")]
     BackendArguments(&'static str),
+    /// A flag disagrees with the house's stored runtime configuration; the
+    /// text names the flag. Only `kitchn tick trigger` changes what is stored.
+    #[error(
+        "{0} disagrees with the house's stored runtime configuration; change it with `kitchn tick trigger`"
+    )]
+    RuntimeMismatch(&'static str),
     /// The worker mailbox refused or could not be read.
     #[error("worker mailbox: {0}")]
     Mailbox(#[source] MailboxError),
@@ -183,7 +189,8 @@ impl RunError {
             Self::UnknownPass
             | Self::RepositoryOutsideHouse
             | Self::RepositoryAmbiguous
-            | Self::BackendArguments(_) => ErrorClass::InvalidInput,
+            | Self::BackendArguments(_)
+            | Self::RuntimeMismatch(_) => ErrorClass::InvalidInput,
             Self::NoBackend | Self::NoPickupSettings => ErrorClass::Refused,
             Self::Mailbox(MailboxError::Fenced) => ErrorClass::Conflict,
             Self::Mailbox(MailboxError::Unavailable(_)) => ErrorClass::Execution,

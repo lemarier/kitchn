@@ -32,8 +32,8 @@ use kitchen::{
         BranchName, Capability, CoordinatorMailbox, ExternalRef, Repository, SystemClock, Text,
     },
     house::{
-        BackendKind, CredentialKind, ForgeCredential, HouseConfig, credential_path, forge_binding,
-        runtime_config,
+        BackendKind, CredentialKind, ForgeCredential, HouseConfig, PickupConfig, credential_path,
+        forge_binding, runtime_config,
     },
     integrations::github::{CredentialFile, GhCli, GitHubClient, ReadLimits},
     scheduling::AgentFamily,
@@ -134,27 +134,112 @@ pub(super) struct BackendArgs {
     pub(super) curl: Option<PathBuf>,
 }
 
-#[derive(Args)]
+/// The scheduled pickup settings. Unset flags use the house's stored ones,
+/// or the defaults when none are stored; a flag that disagrees with the
+/// stored settings is refused, and only `kitchn tick trigger` changes them.
+#[derive(Args, Default)]
 pub(super) struct PickupArgs {
-    /// The label that marks an issue ready for an agent.
-    #[arg(long, default_value = "ready")]
-    ready_label: String,
-    /// The label that marks an issue needing a specification pass.
-    #[arg(long, default_value = "needs-spec")]
-    needs_spec_label: String,
-    /// The label that reserves an issue for a person.
-    #[arg(long, default_value = "human-only")]
-    human_label: String,
-    /// Most unsettled scheduled pickup tasks in the repository. A pass still
-    /// launches at most one writer, since file overlap is not observed.
-    #[arg(long, default_value_t = 1)]
-    capacity: u32,
-    /// Workers create `<prefix>/issue-<number>`.
-    #[arg(long, default_value = "kitchen")]
-    branch_prefix: String,
-    /// Where each worker writes its evidence report in its workspace.
-    #[arg(long, default_value = "kitchen-report.md")]
-    report_path: String,
+    /// The label that marks an issue ready for an agent (default: ready).
+    #[arg(long)]
+    ready_label: Option<String>,
+    /// The label that marks an issue needing a specification pass (default:
+    /// needs-spec).
+    #[arg(long)]
+    needs_spec_label: Option<String>,
+    /// The label that reserves an issue for a person (default: human-only).
+    #[arg(long)]
+    human_label: Option<String>,
+    /// Most unsettled scheduled pickup tasks in the repository, 1 to 64
+    /// (default: 1). A pass still launches at most one writer, since file
+    /// overlap is not observed.
+    #[arg(long)]
+    capacity: Option<u32>,
+    /// Workers create `<prefix>/issue-<number>` (default: kitchen).
+    #[arg(long)]
+    branch_prefix: Option<String>,
+    /// Where each worker writes its evidence report in its workspace
+    /// (default: kitchen-report.md).
+    #[arg(long)]
+    report_path: Option<String>,
+}
+
+impl PickupArgs {
+    /// Whether any setting was given.
+    pub(super) const fn any(&self) -> bool {
+        self.ready_label.is_some()
+            || self.needs_spec_label.is_some()
+            || self.human_label.is_some()
+            || self.capacity.is_some()
+            || self.branch_prefix.is_some()
+            || self.report_path.is_some()
+    }
+
+    /// The given settings over `base`.
+    pub(super) fn overlay(&self, base: PickupConfig) -> PickupConfig {
+        PickupConfig {
+            ready_label: self.ready_label.clone().unwrap_or(base.ready_label),
+            needs_spec_label: self
+                .needs_spec_label
+                .clone()
+                .unwrap_or(base.needs_spec_label),
+            human_label: self.human_label.clone().unwrap_or(base.human_label),
+            capacity: self.capacity.unwrap_or(base.capacity),
+            branch_prefix: self.branch_prefix.clone().unwrap_or(base.branch_prefix),
+            report_path: self.report_path.clone().unwrap_or(base.report_path),
+        }
+    }
+
+    /// The settings a pass uses: the stored ones, or the defaults, and the
+    /// flags only where they agree with what is stored.
+    fn resolve(&self, stored: Option<PickupConfig>) -> Result<PickupConfig, RunError> {
+        let Some(stored) = stored else {
+            return Ok(self.overlay(PickupConfig::default()));
+        };
+        agree(
+            "--ready-label",
+            self.ready_label.as_ref(),
+            Some(&stored.ready_label),
+        )?;
+        agree(
+            "--needs-spec-label",
+            self.needs_spec_label.as_ref(),
+            Some(&stored.needs_spec_label),
+        )?;
+        agree(
+            "--human-label",
+            self.human_label.as_ref(),
+            Some(&stored.human_label),
+        )?;
+        agree("--capacity", self.capacity.as_ref(), Some(&stored.capacity))?;
+        agree(
+            "--branch-prefix",
+            self.branch_prefix.as_ref(),
+            Some(&stored.branch_prefix),
+        )?;
+        agree(
+            "--report-path",
+            self.report_path.as_ref(),
+            Some(&stored.report_path),
+        )?;
+        Ok(stored)
+    }
+}
+
+/// The flag's value when it agrees with the stored one, the stored one when
+/// no flag was given.
+///
+/// # Errors
+/// [`RunError::RuntimeMismatch`] naming `flag` when both exist and differ.
+pub(super) fn agree<'a, T: PartialEq>(
+    flag: &'static str,
+    given: Option<&'a T>,
+    stored: Option<&'a T>,
+) -> Result<Option<&'a T>, RunError> {
+    match (given, stored) {
+        (Some(given), Some(stored)) if given != stored => Err(RunError::RuntimeMismatch(flag)),
+        (Some(value), _) | (None, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
 }
 
 /// The house, its store, and the repository one pass serves.
@@ -189,12 +274,17 @@ impl Opened {
         let config = registry.load(house)?;
         let store = HouseStore::open(store, house.clone(), StoreOptions::default())?;
         // A house with several repositories may store which one its passes
-        // serve; the stored file is read only when that decides.
+        // serve. The stored file is read when that decides or a repository
+        // was named, and a named one must agree with it.
         let repository = match repository {
             None if config.repositories.len() > 1 => {
                 runtime_config(&registry, house)?.and_then(|stored| stored.repository)
             }
-            named => named,
+            None => None,
+            Some(named) => {
+                let stored = runtime_config(&registry, house)?.and_then(|stored| stored.repository);
+                agree("--repository", Some(&named), stored.as_ref())?.cloned()
+            }
         };
         let repository = pass_repository(&config, repository)?;
         Ok(Self {
@@ -233,27 +323,39 @@ impl Opened {
     ) -> Result<Box<dyn CoordinatorMailbox>, kitchen::Error> {
         let (_, kind) = backend_binding(&self.config)?;
         let missing = |needs| kitchen::Error::from(RunError::BackendArguments(needs));
-        // Flags win; the house's stored runtime configuration fills the rest.
+        // The house's stored runtime configuration fills what flags leave
+        // out. A flag that disagrees with it is refused before connecting.
         let stored = runtime_config(&self.registry, &self.config.house)?;
         match kind {
             BackendKind::Orca => {
                 let stored = stored.and_then(|stored| stored.orca);
+                let stored = stored.as_ref();
                 let (Some(orca), Some(runtime_dir), Some(run), Some(coordinator), Some(repo)) = (
-                    args.orca
-                        .as_ref()
-                        .or(stored.as_ref().map(|orca| &orca.executable)),
-                    args.runtime_dir
-                        .as_ref()
-                        .or(stored.as_ref().map(|orca| &orca.runtime_dir)),
-                    args.orca_run
-                        .as_ref()
-                        .or(stored.as_ref().map(|orca| &orca.run)),
-                    args.orca_coordinator
-                        .as_ref()
-                        .or(stored.as_ref().map(|orca| &orca.coordinator)),
-                    args.orca_repo
-                        .as_ref()
-                        .or(stored.as_ref().map(|orca| &orca.repo)),
+                    agree(
+                        "--orca",
+                        args.orca.as_ref(),
+                        stored.map(|orca| &orca.executable),
+                    )?,
+                    agree(
+                        "--runtime-dir",
+                        args.runtime_dir.as_ref(),
+                        stored.map(|orca| &orca.runtime_dir),
+                    )?,
+                    agree(
+                        "--orca-run",
+                        args.orca_run.as_ref(),
+                        stored.map(|orca| &orca.run),
+                    )?,
+                    agree(
+                        "--orca-coordinator",
+                        args.orca_coordinator.as_ref(),
+                        stored.map(|orca| &orca.coordinator),
+                    )?,
+                    agree(
+                        "--orca-repo",
+                        args.orca_repo.as_ref(),
+                        stored.map(|orca| &orca.repo),
+                    )?,
                 ) else {
                     return Err(missing(ORCA_ARGUMENTS));
                 };
@@ -279,12 +381,12 @@ impl Opened {
                 )?))
             }
             BackendKind::Http => {
-                let Some(curl) = args
-                    .curl
-                    .as_ref()
-                    .or(stored.as_ref().and_then(|stored| stored.curl.as_ref()))
-                    .filter(|curl| curl.is_absolute())
-                else {
+                let curl = agree(
+                    "--curl",
+                    args.curl.as_ref(),
+                    stored.as_ref().and_then(|stored| stored.curl.as_ref()),
+                )?;
+                let Some(curl) = curl.filter(|curl| curl.is_absolute()) else {
                     return Err(missing(HTTP_ARGUMENTS));
                 };
                 Ok(Box::new(resolve_http_backend(
@@ -415,22 +517,26 @@ pub(super) fn settings(
     opened: &Opened,
     args: &PickupArgs,
 ) -> Result<PickupSettings, kitchen::Error> {
+    let stored =
+        runtime_config(&opened.registry, &opened.config.house)?.and_then(|stored| stored.pickup);
+    let pickup = args.resolve(stored)?;
+    pickup.validate()?;
     let resolved = resolve_instructions(opened.registry.root(), &opened.config, None)?;
     Ok(PickupSettings {
         repository: opened.repository.clone(),
         labels: PickupLabels {
-            ready: args.ready_label.clone(),
-            needs_spec: args.needs_spec_label.clone(),
-            human_only: args.human_label.clone(),
+            ready: pickup.ready_label,
+            needs_spec: pickup.needs_spec_label,
+            human_only: pickup.human_label,
         },
-        capacity: args.capacity,
-        branch_prefix: BranchName::new(&args.branch_prefix)?,
+        capacity: pickup.capacity,
+        branch_prefix: BranchName::new(&pickup.branch_prefix)?,
         instructions: PinnedInstructions {
             house: resolved.house,
             provenance: resolved.provenance,
             entrypoint: Text::new(&resolved.entrypoint.to_string_lossy())?,
         },
-        report_path: Text::new(&args.report_path)?,
+        report_path: Text::new(&pickup.report_path)?,
     })
 }
 

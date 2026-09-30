@@ -595,3 +595,65 @@ fn house_wide_grant_requires_explicit_flag() -> TestResult {
     assert!(after.policy_limits.contains(&review_grant));
     Ok(())
 }
+
+#[test]
+fn doctor_points_missing_merge_authority_at_the_gate_path() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let registry = fixture(temp.path())?;
+    let house = registry.load(&"crabnebula".parse()?)?;
+    let bound = RepositoryConfig {
+        schema: 2,
+        house: house.house.clone(),
+        repository: "crabnebula/tauri-fixture".parse()?,
+        workflows: BTreeSet::from([Workflow::Gate]),
+        additional_reviewers: BTreeSet::new(),
+        additional_checks: BTreeSet::new(),
+    };
+    let findings = doctor(&registry, &bound, None)?.findings;
+    let merge = findings
+        .iter()
+        .find(|finding| finding.code == DoctorCode::Authority && finding.message.contains("merge"))
+        .ok_or("no merge authority finding")?;
+    assert!(
+        merge.next_step.contains("kitchn gate attest"),
+        "{}",
+        merge.next_step
+    );
+    assert!(
+        !merge.next_step.contains("--permission merge"),
+        "{}",
+        merge.next_step
+    );
+    Ok(())
+}
+
+#[test]
+fn grant_without_registry_uses_kitchn_home() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let registry = fixture(temp.path())?;
+    let before = registry.load(&"crabnebula".parse()?)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
+        .args([
+            "house",
+            "grant",
+            "--house",
+            "crabnebula",
+            "--workflow",
+            "pickup",
+            "--yes",
+        ])
+        .env("KITCHN_HOME", registry.root())
+        .env("HOME", temp.path().join("elsewhere"))
+        .current_dir(temp.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = registry.load(&"crabnebula".parse()?)?;
+    assert!(after.grants.len() > before.grants.len());
+    assert!(!temp.path().join("elsewhere/.kitchn").exists());
+    Ok(())
+}

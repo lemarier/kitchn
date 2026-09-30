@@ -394,7 +394,33 @@ pub fn doctor(
                 !house.grants.iter().any(|held| held.covers(&grant))
             });
             if missing {
-                findings.push(DoctorFinding { code: DoctorCode::Authority, message: format!("Scheduled {workflow} lacks {permission} for {}{}.", repository.repository, if binding.is_some() { "" } else { " (backend or forge binding missing)" }), next_step: format!("Bind the required backend or forge if absent, then run kitchn house grant --registry '{}' --house {} --repository {} --permission {} and approve its preview.", registry.root().display(), house.house, repository.repository, permission) });
+                let next_step = if *permission == Permission::Merge {
+                    format!(
+                        "Merge is authorized per pull request, never by kitchn house grant: configure a repository-scoped merge grant for {} and a matching policy limit in the house config; an independent reviewer then records the approved review with `kitchn gate attest`, and the scheduled gate verifies it at the exact head.",
+                        repository.repository
+                    )
+                } else {
+                    format!(
+                        "Bind the required backend or forge if absent, then run kitchn house grant --registry '{}' --house {} --repository {} --permission {} and approve its preview.",
+                        registry.root().display(),
+                        house.house,
+                        repository.repository,
+                        permission
+                    )
+                };
+                findings.push(DoctorFinding {
+                    code: DoctorCode::Authority,
+                    message: format!(
+                        "Scheduled {workflow} lacks {permission} for {}{}.",
+                        repository.repository,
+                        if binding.is_some() {
+                            ""
+                        } else {
+                            " (backend or forge binding missing)"
+                        }
+                    ),
+                    next_step,
+                });
             }
         }
     }

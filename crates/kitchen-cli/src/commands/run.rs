@@ -136,7 +136,7 @@ pub(super) struct BackendArgs {
 
 /// The scheduled pickup settings. Unset flags use the house's stored ones,
 /// or the defaults when none are stored; a flag that disagrees with the
-/// stored settings is refused, and only `kitchn tick trigger` changes them.
+/// stored settings is refused, and only `kitchn tick configure` changes them.
 #[derive(Args, Default)]
 pub(super) struct PickupArgs {
     /// The label that marks an issue ready for an agent (default: ready).
@@ -408,9 +408,9 @@ impl Opened {
 
 /// What an Orca house's passes need, from flags or the stored runtime
 /// configuration.
-const ORCA_ARGUMENTS: &str = "--orca, --runtime-dir, --orca-run, --orca-coordinator, and --orca-repo (or store them with `kitchn tick trigger`)";
+const ORCA_ARGUMENTS: &str = "--orca, --runtime-dir, --orca-run, --orca-coordinator, and --orca-repo (or store them with `kitchn tick configure`)";
 /// What an HTTP house's passes need.
-const HTTP_ARGUMENTS: &str = "an absolute --curl path (or store it with `kitchn tick trigger`)";
+const HTTP_ARGUMENTS: &str = "an absolute --curl path (or store it with `kitchn tick configure`)";
 
 /// Per-call deadline for an HTTP worker backend.
 const HTTP_CALL_TIMEOUT: Duration = Duration::from_secs(20);

@@ -277,11 +277,37 @@ pub fn store_runtime(
     Ok(RuntimeOutcome::Replaced)
 }
 
+/// How many unique temporary names one replacement tries before giving up.
+const TEMPORARY_ATTEMPTS: usize = 8;
+
 /// Replace the validated file by renaming an owner-only temporary over it,
 /// so a reader sees the old or the new contents, never a partial file.
 fn replace_private(path: &Path, contents: &[u8]) -> Result<(), HouseError> {
+    replace_private_with(path, contents, temporary_suffix)
+}
+
+/// A per-call temporary name part: the process and 64 random bits.
+fn temporary_suffix() -> std::io::Result<String> {
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random).map_err(|_| std::io::Error::other("no entropy"))?;
+    Ok(format!(
+        "{}.{:016x}",
+        std::process::id(),
+        u64::from_le_bytes(random)
+    ))
+}
+
+/// [`replace_private`] with the temporary names supplied. The temporary is
+/// created with `create_new` under a name no other writer shares; a name that
+/// already exists belongs to someone else and is never opened or removed. Only
+/// a temporary this call created is removed, and only when the replacement
+/// fails.
+fn replace_private_with(
+    path: &Path,
+    contents: &[u8],
+    mut suffix: impl FnMut() -> std::io::Result<String>,
+) -> Result<(), HouseError> {
     use std::io::Write as _;
-    let temporary = path.with_extension("json.tmp");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -289,12 +315,32 @@ fn replace_private(path: &Path, contents: &[u8]) -> Result<(), HouseError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let written = options.open(&temporary).and_then(|mut file| {
-        file.write_all(contents)?;
-        file.sync_all()
-    });
-    if let Err(error) = written.and_then(|()| std::fs::rename(&temporary, path)) {
-        // The temporary is this call's own file: create_new made it.
+    let mut created = None;
+    for _ in 0..TEMPORARY_ATTEMPTS {
+        let mut name = path.as_os_str().to_owned();
+        name.push(format!(".{}.tmp", suffix()?));
+        let temporary = PathBuf::from(name);
+        match options.open(&temporary) {
+            Ok(file) => {
+                created = Some((temporary, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let Some((temporary, mut file)) = created else {
+        return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
+    };
+    let written = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            drop(file);
+            std::fs::rename(&temporary, path)
+        });
+    if let Err(error) = written {
+        // create_new made this file, so it is this call's own to remove.
         let _ = std::fs::remove_file(&temporary);
         return Err(error.into());
     }
@@ -310,5 +356,67 @@ fn private_file(metadata: &std::fs::Metadata) -> bool {
     #[cfg(not(unix))]
     {
         metadata.is_file()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn names<'a>(list: &'a [&'a str]) -> impl FnMut() -> std::io::Result<String> + 'a {
+        let mut next = list.iter();
+        move || Ok((*next.next().unwrap_or(&"exhausted")).to_owned())
+    }
+
+    #[test]
+    fn a_foreign_temporary_is_kept_and_the_next_name_is_used() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("runtime.json");
+        std::fs::write(&path, b"old")?;
+        let foreign = dir.path().join("runtime.json.same.tmp");
+        std::fs::write(&foreign, b"someone else's write")?;
+        replace_private_with(&path, b"new", names(&["same", "other"]))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert_eq!(std::fs::read(&path)?, b"new");
+        assert_eq!(std::fs::read(&foreign)?, b"someone else's write");
+        assert!(!dir.path().join("runtime.json.other.tmp").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn only_collisions_fail_without_touching_the_foreign_files() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("runtime.json");
+        std::fs::write(&path, b"old")?;
+        let foreign = dir.path().join("runtime.json.same.tmp");
+        std::fs::write(&foreign, b"theirs")?;
+        let refused = replace_private_with(&path, b"new", || Ok("same".to_owned()));
+        assert!(matches!(
+            refused,
+            Err(HouseError::Io(std::io::ErrorKind::AlreadyExists))
+        ));
+        assert_eq!(std::fs::read(&path)?, b"old");
+        assert_eq!(std::fs::read(&foreign)?, b"theirs");
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_rename_removes_only_its_own_temporary() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // A directory at the destination makes the rename fail.
+        let path = dir.path().join("runtime.json");
+        std::fs::create_dir(&path)?;
+        let foreign = dir.path().join("runtime.json.a.tmp");
+        std::fs::write(&foreign, b"theirs")?;
+        assert!(replace_private_with(&path, b"new", names(&["a", "b"])).is_err());
+        assert!(!dir.path().join("runtime.json.b.tmp").exists());
+        assert_eq!(std::fs::read(&foreign)?, b"theirs");
+        Ok(())
+    }
+
+    #[test]
+    fn generated_suffixes_differ() -> std::io::Result<()> {
+        assert_ne!(temporary_suffix()?, temporary_suffix()?);
+        Ok(())
     }
 }

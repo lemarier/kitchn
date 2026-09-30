@@ -165,9 +165,9 @@ pub enum RunError {
     #[error("this house's worker backend needs {0}")]
     BackendArguments(&'static str),
     /// A flag disagrees with the house's stored runtime configuration; the
-    /// text names the flag. Only `kitchn tick trigger` changes what is stored.
+    /// text names the flag. Only `kitchn tick configure` changes what is stored.
     #[error(
-        "{0} disagrees with the house's stored runtime configuration; change it with `kitchn tick trigger`"
+        "{0} disagrees with the house's stored runtime configuration; change it with `kitchn tick configure`"
     )]
     RuntimeMismatch(&'static str),
     /// The worker mailbox refused or could not be read.

@@ -74,6 +74,20 @@ impl Fixture {
     }
 }
 
+/// Leftover temporary files next to the stored configuration.
+fn temporaries(fixture: &Fixture) -> TestResult<Vec<String>> {
+    let mut names = Vec::new();
+    if let Some(directory) = fixture.file().parent() {
+        for entry in fs::read_dir(directory)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".tmp") {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
 #[test]
 fn nothing_is_stored_until_a_configuration_is() -> TestResult {
     let fixture = Fixture::new()?;
@@ -126,7 +140,7 @@ fn a_different_valid_configuration_replaces_the_stored_one() -> TestResult {
         fs::metadata(fixture.file())?.permissions().mode() & 0o077,
         0
     );
-    assert!(!fixture.file().with_extension("json.tmp").exists());
+    assert!(temporaries(&fixture)?.is_empty());
     Ok(())
 }
 
@@ -275,5 +289,81 @@ fn invalid_pickup_settings_are_never_stored() -> TestResult {
         ..PickupConfig::default()
     });
     store_runtime(&fixture.registry, &runtime)?;
+    Ok(())
+}
+
+#[test]
+fn a_foreign_temporary_file_is_never_deleted_by_a_store() -> TestResult {
+    let fixture = Fixture::new()?;
+    store_runtime(&fixture.registry, &fixture.runtime()?)?;
+    let foreign = fixture.file().with_extension("json.tmp");
+    fs::write(&foreign, "someone else's write")?;
+    let mut changed = fixture.runtime()?;
+    changed.curl = None;
+    assert_eq!(
+        store_runtime(&fixture.registry, &changed)?,
+        RuntimeOutcome::Replaced
+    );
+    assert_eq!(fs::read_to_string(&foreign)?, "someone else's write");
+    assert_eq!(
+        runtime_config(&fixture.registry, &fixture.house)?,
+        Some(changed)
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrent_stores_each_finish_and_leave_one_valid_owner_only_file() -> TestResult {
+    let fixture = Fixture::new()?;
+    store_runtime(&fixture.registry, &fixture.runtime()?)?;
+    let candidates: Vec<RuntimeConfig> = (1..=8_u32)
+        .map(|capacity| -> TestResult<RuntimeConfig> {
+            let mut runtime = fixture.runtime()?;
+            runtime.pickup = Some(PickupConfig {
+                capacity,
+                ..PickupConfig::default()
+            });
+            Ok(runtime)
+        })
+        .collect::<Result<_, _>>()?;
+    let barrier = std::sync::Barrier::new(candidates.len());
+    let results: Vec<Result<RuntimeOutcome, RuntimeError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = candidates
+            .iter()
+            .map(|runtime| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    (0..20)
+                        .map(|_| store_runtime(&fixture.registry, runtime))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|outcomes| {
+                            outcomes
+                                .last()
+                                .copied()
+                                .unwrap_or(RuntimeOutcome::Unchanged)
+                        })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect()
+    });
+    assert_eq!(results.len(), candidates.len());
+    for result in &results {
+        assert!(result.is_ok(), "{result:?}");
+    }
+    let stored = runtime_config(&fixture.registry, &fixture.house)?;
+    assert!(
+        stored
+            .as_ref()
+            .is_some_and(|stored| candidates.contains(stored))
+    );
+    assert_eq!(
+        fs::metadata(fixture.file())?.permissions().mode() & 0o077,
+        0
+    );
+    assert!(temporaries(&fixture)?.is_empty());
     Ok(())
 }

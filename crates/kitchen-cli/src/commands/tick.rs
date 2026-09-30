@@ -5,7 +5,8 @@
 //! each run in the house store's run ledger. The forge and worker backend
 //! are resolved only for a pass that is due. `runs` lists the ledger;
 //! `settle` records that a person settled an uncertain run; `trigger` prints
-//! a launchd plist or crontab line that runs the tick and installs nothing.
+//! a launchd plist or crontab line that runs the tick and installs nothing;
+//! `configure` stores the house's backend and pickup settings.
 //! Due decisions, leases, and the ledger stay in
 //! [`kitchen::workflows::tick`]; the passes in [`kitchen::workflows::run`].
 
@@ -21,8 +22,8 @@ use kitchen::{
     adoption::HouseRegistry,
     contracts::{Capability, Claimant, Clock, Repository, SystemClock, Text},
     house::{
-        HouseError, OrcaHost, RUNTIME_SCHEMA, RuntimeConfig, forge_binding, runtime_config,
-        store_runtime,
+        HouseError, OrcaHost, RUNTIME_SCHEMA, RuntimeConfig, RuntimeOutcome, forge_binding,
+        runtime_config, store_runtime,
     },
     state::{HouseStore, RunId, RunSettle, RunState, StoreOptions},
     workflows::{
@@ -81,12 +82,9 @@ enum TickCommand {
         holder: HolderId,
     },
     /// Print a launchd plist or crontab line that runs the tick. Installs
-    /// nothing. Backend and pickup flags given here are stored, owner-only,
-    /// in the house's private runtime configuration in the registry, and every
-    /// tick reads them there; the printed line carries none of them. This is
-    /// the only command that changes what is stored: a tick or run flag that
-    /// disagrees with it is refused. Nothing is stored unless the trigger
-    /// prints.
+    /// nothing and stores nothing: the line names only the registry and the
+    /// house, and every tick reads its backend and pickup settings from the
+    /// runtime configuration `tick configure` stores.
     Trigger {
         #[arg(value_enum)]
         format: TriggerFormat,
@@ -102,13 +100,27 @@ enum TickCommand {
         /// Minutes between ticks, 1 to 59. Each pass still runs only when due.
         #[arg(long, default_value_t = 5)]
         every_minutes: u8,
+    },
+    /// Store the house's backend, repository, and pickup settings, owner-only,
+    /// in its private runtime configuration in the registry. Every tick and
+    /// `kitchn run` reads them there. This is the only command that changes
+    /// what is stored: a tick or run flag that disagrees with it is refused.
+    /// Flags given here overlay what is already stored; nothing is stored
+    /// unless the whole configuration validates.
+    Configure {
+        /// Absolute path of the house registry.
+        #[arg(long)]
+        registry: PathBuf,
+        /// The house the settings belong to.
+        #[arg(long)]
+        house: HouseId,
         /// The repository a multi-repository house's passes serve, as
-        /// `owner/name`. Stored with the backend flags.
+        /// `owner/name`.
         #[arg(long)]
         repository: Option<Repository>,
         #[command(flatten)]
         backend: BackendArgs,
-        /// Scheduled pickup settings, stored with the backend flags.
+        /// Scheduled pickup settings.
         #[command(flatten)]
         pickup: Box<PickupArgs>,
     },
@@ -220,41 +232,46 @@ pub fn run(args: TickArgs) -> Result<(String, bool), kitchen::Error> {
                 registry,
                 house,
                 every_minutes,
-                repository,
-                backend,
-                pickup,
             }),
             _,
         ) => {
-            // Render first: a trigger that cannot be printed stores nothing.
             let target = TriggerTarget::new(
                 &kitchn,
                 &registry,
-                house.clone(),
+                house,
                 TriggerMinutes::new(every_minutes)?,
             )?;
             let text = match format {
                 TriggerFormat::Launchd => trigger_plist(&target),
                 TriggerFormat::Cron => trigger_cron(&target)?,
             };
-            store_runtime_flags(&registry, &house, repository, &backend, &pickup)?;
             Ok((text.trim_end().to_owned(), true))
         }
+        (
+            Some(TickCommand::Configure {
+                registry,
+                house,
+                repository,
+                backend,
+                pickup,
+            }),
+            _,
+        ) => configure(&registry, &house, repository, &backend, &pickup),
         (None, Some(house)) => run_tick(house, args.repository, &args.backend, &args.pickup),
         (None, None) => Err(HouseError::InvalidInput.into()),
     }
 }
 
 /// Store the backend, repository, and pickup flags, overlaid on what the
-/// house already stores, when any was given. Nothing is written otherwise,
-/// and nothing is written unless the whole configuration validates.
-fn store_runtime_flags(
+/// house already stores. Nothing is written when none was given or the
+/// whole configuration does not validate.
+fn configure(
     registry: &Path,
     house: &HouseId,
     repository: Option<Repository>,
     flags: &BackendArgs,
     pickup: &PickupArgs,
-) -> Result<(), kitchen::Error> {
+) -> Result<(String, bool), kitchen::Error> {
     let orca_given = [
         flags.orca.is_some(),
         flags.runtime_dir.is_some(),
@@ -264,7 +281,7 @@ fn store_runtime_flags(
     ];
     if repository.is_none() && flags.curl.is_none() && !pickup.any() && !orca_given.contains(&true)
     {
-        return Ok(());
+        return Err(HouseError::InvalidInput.into());
     }
     let registry = HouseRegistry::new(registry)?;
     let mut runtime = runtime_config(&registry, house)?.unwrap_or(RuntimeConfig {
@@ -319,8 +336,15 @@ fn store_runtime_flags(
     if pickup.any() {
         runtime.pickup = Some(pickup.overlay(runtime.pickup.take().unwrap_or_default()));
     }
-    store_runtime(&registry, &runtime)?;
-    Ok(())
+    let outcome = match store_runtime(&registry, &runtime)? {
+        RuntimeOutcome::Created => "stored",
+        RuntimeOutcome::Replaced => "updated",
+        RuntimeOutcome::Unchanged => "unchanged",
+    };
+    Ok((
+        format!("{outcome} the runtime configuration of house {house}"),
+        true,
+    ))
 }
 
 fn run_tick(

@@ -533,6 +533,13 @@ impl Kitchen {
     /// Launch issue 7 and report it done on the backend's mailbox, with the
     /// branch tip on the forge.
     fn launch_and_finish(&self) -> TestResult<ResourceRef> {
+        let worker = self.launch_and_finish_unlinked()?;
+        self.store()
+            .link_pull_request(&self.task(7)?, self.claim_fence(7)?, pr(12)?)?;
+        Ok(worker)
+    }
+
+    fn launch_and_finish_unlinked(&self) -> TestResult<ResourceRef> {
         self.ready_seven();
         assert!(matches!(self.pickup(false)?, Outcome::Acted(_)));
         let worker = self.worker(7)?;
@@ -640,6 +647,9 @@ fn pickup_launches_one_writer_per_repository_even_with_capacity_for_two() -> Tes
         &format!("repos/{REPO}/branches/kitchen/issue-7"),
         json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
     );
+    kitchen
+        .store()
+        .link_pull_request(&kitchen.task(7)?, kitchen.claim_fence(7)?, pr(12)?)?;
     acted(kitchen.coordinate()?)?;
     let actions = acted(kitchen.pickup(false)?)?;
     assert!(matches!(
@@ -1071,6 +1081,29 @@ fn coordinate_settles_a_reported_task_and_acknowledges_the_report() -> TestResul
 }
 
 #[test]
+fn coordinate_holds_a_successful_report_until_a_pr_is_linked() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.launch_and_finish_unlinked()?;
+    let task = kitchen.task(7)?;
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.iter().any(|action| matches!(action,
+        CoordinateAction::AwaitingDelivery { task: held, .. } if held == &task)));
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Claimed { .. }
+    ));
+    kitchen
+        .store()
+        .link_pull_request(&task, kitchen.claim_fence(7)?, pr(12)?)?;
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.contains(&CoordinateAction::Supervised {
+        task,
+        outcome: Supervision::Settled(Settlement::Succeeded),
+    }));
+    Ok(())
+}
+
+#[test]
 fn coordinate_keeps_a_report_until_the_backend_shows_the_worker_settled() -> TestResult {
     let kitchen = Kitchen::new()?;
     let worker = kitchen.launch_and_finish()?;
@@ -1481,6 +1514,9 @@ fn coordinate_on_the_house_route_reports_a_question_for_a_person() -> TestResult
         },
         kitchen.clock.now(),
     )?;
+    kitchen
+        .store()
+        .link_pull_request(&task, kitchen.claim_fence(7)?, pr(12)?)?;
     let actions = acted(kitchen.coordinate()?)?;
     assert!(actions.contains(&CoordinateAction::Supervised {
         task: task.clone(),
@@ -2028,6 +2064,9 @@ fn settled_stating(checkout: CheckoutReport) -> TestResult<Kitchen> {
         &format!("repos/{REPO}/branches/kitchen/issue-7"),
         json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
     );
+    kitchen
+        .store()
+        .link_pull_request(&kitchen.task(7)?, kitchen.claim_fence(7)?, pr(12)?)?;
     acted(kitchen.coordinate()?)?;
     assert!(matches!(
         kitchen.store().task(&kitchen.task(7)?)?.state(),
@@ -3855,6 +3894,9 @@ fn gate_merges_nothing_when_a_person_took_the_branch_workers_terminal() -> TestR
         &format!("repos/{REPO}/branches/kitchen/issue-7"),
         json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
     );
+    kitchen
+        .store()
+        .link_pull_request(&kitchen.task(7)?, kitchen.claim_fence(7)?, pr(12)?)?;
     acted(kitchen.coordinate()?)?;
     pull_request(kitchen.forge(), 7, 12, true)?;
     kitchen
@@ -4031,6 +4073,9 @@ fn coordinate_acknowledges_a_stray_worker_message_and_reads_the_next_batch() -> 
         &format!("repos/{REPO}/branches/kitchen/issue-7"),
         json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
     );
+    kitchen
+        .store()
+        .link_pull_request(&kitchen.task(7)?, kitchen.claim_fence(7)?, pr(12)?)?;
     let actions = acted(kitchen.coordinate()?)?;
     assert!(actions.contains(&CoordinateAction::Unroutable {
         message: ExternalRef::new("stray")?,
@@ -4094,6 +4139,9 @@ fn coordinate_keeps_a_stray_message_while_its_batch_waits_for_an_owner() -> Test
         &format!("repos/{REPO}/branches/kitchen/issue-7"),
         json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
     );
+    kitchen
+        .store()
+        .link_pull_request(&kitchen.task(7)?, kitchen.claim_fence(7)?, pr(12)?)?;
     let task = kitchen.task(7)?;
     kitchen.clock.advance(TASK_LEASE.as_secs() + 1);
     // The report waits for whoever continues task 7, so nothing in its
@@ -4132,6 +4180,9 @@ fn coordinate_supervises_a_task_it_adopted_after_a_failed_pass() -> TestResult {
         .backend
         .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
     kitchen.backend.post(vec![report(&worker, "done-7")?])?;
+    kitchen
+        .store()
+        .link_pull_request(&kitchen.task(7)?, kitchen.claim_fence(7)?, pr(12)?)?;
     // The forge does not show the pushed branch yet: the pass fails after
     // moving the task and relinquishes its lease.
     assert!(kitchen.coordinate().is_err());
@@ -4744,6 +4795,9 @@ fn a_tick_coordination_pass_records_a_handed_over_task_before_claiming_it() -> T
         .backend
         .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
     kitchen.backend.post(vec![report(&worker, "done-7")?])?;
+    kitchen
+        .store()
+        .link_pull_request(&kitchen.task(7)?, kitchen.claim_fence(7)?, pr(12)?)?;
     // A coordination pass fails and relinquishes its lease; its task is
     // handed over open, relinquished by the scheduled runner.
     assert!(kitchen.coordinate().is_err());
@@ -4823,6 +4877,11 @@ impl Kitchen {
             &format!("repos/{REPO}/branches/kitchen/issue-{number}"),
             json!({"name": format!("kitchen/issue-{number}"), "commit": {"sha": commit('d')?.as_str()}}),
         );
+        self.store().link_pull_request(
+            &self.task(number)?,
+            self.claim_fence(number)?,
+            pr(100 + number)?,
+        )?;
         acted(self.coordinate()?)?;
         let task = self.task(number)?;
         if !matches!(self.store().task(&task)?.state(), TaskState::Settled { .. }) {

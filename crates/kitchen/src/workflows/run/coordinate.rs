@@ -112,6 +112,13 @@ pub enum CoordinateAction {
         /// Its result.
         outcome: Supervision,
     },
+    /// The worker finished its work but has not delivered a pull request.
+    AwaitingDelivery {
+        /// The task awaiting a pull request.
+        task: TaskId,
+        /// The worker completion held for later processing.
+        message: ExternalRef,
+    },
     /// A worker asked a question, which waits for a person: on the house
     /// route through `kitchn mailbox reply`, otherwise through the backend.
     Question {
@@ -205,6 +212,12 @@ impl fmt::Display for CoordinateAction {
             ),
             Self::Supervised { task, outcome } => {
                 write!(formatter, "supervised task {task}: {outcome:?}")
+            }
+            Self::AwaitingDelivery { task, message } => {
+                write!(
+                    formatter,
+                    "task {task} awaits pull request delivery after {message}"
+                )
             }
             Self::Question { task, message } => {
                 write!(
@@ -545,6 +558,20 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                     message: message.id.clone(),
                 }),
                 MessageKind::WorkerDone => {
+                    if message.outcome == Some(WorkerOutcome::Succeeded)
+                        && task_branch(&record).is_some()
+                        && record.spec().repository.as_ref().is_some_and(|repository| {
+                            super::issue_of(&record, repository).is_some()
+                        })
+                        && record.pull_request().is_none()
+                    {
+                        handled = false;
+                        actions.push(CoordinateAction::AwaitingDelivery {
+                            task: owned.task.clone(),
+                            message: message.id.clone(),
+                        });
+                        continue;
+                    }
                     let completion = match message.outcome {
                         Some(WorkerOutcome::Succeeded) => self.completion(&record, message)?,
                         Some(WorkerOutcome::Failed | WorkerOutcome::Cancelled) | None => None,

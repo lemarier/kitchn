@@ -187,6 +187,19 @@ enum Auth {
 }
 
 impl GhCli {
+    /// A repository-scoped token for Git's credential helper. The caller
+    /// must check task authority before asking for it and keep it off argv.
+    pub fn push_token(
+        &self,
+        reference: &CredentialRef,
+        repository: &Repository,
+    ) -> Result<String, IntegrationError> {
+        self.verified_token(
+            reference,
+            Some(&TokenScope::for_push(repository)),
+            Duration::from_secs(20),
+        )
+    }
     /// Select the binary and private credential binding without invoking them.
     ///
     /// # Errors

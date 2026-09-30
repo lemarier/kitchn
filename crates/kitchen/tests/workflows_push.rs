@@ -12,16 +12,20 @@ use common::{TestResult, commit, ttl};
 use kitchen::{
     BackendId, ErrorClass, TaskId,
     contracts::{
-        BranchName, CommitId, ContractError, Fence, Grant, HouseGrants, IssueNumber, Permission,
-        Repository, TaskAuthority,
+        BackendDescriptor, BackendUnavailable, BranchName, Capability, CapabilitySet, CommitId,
+        ContractError, EffectExecutor, EffectFailure, EffectRequest, ExternalRef, Fence,
+        GitHubEffect, GitHubMutation, Grant, HouseGrants, IssueNumber, Lookup, Permission,
+        PostingBudget, Receipt, Repository, ResourceKind, TaskAuthority, Text,
     },
     state::StateError,
     workflows::{
-        coordination::{LaunchOutcome, launch_worker},
+        coordination::{LaunchOutcome, Standing, launch_worker},
+        interactive::ForgeWriter,
         pickup::{Base, ClaimOutcome, TaskTemplate, WorkerBrief, claim_issue, issue_task_id},
         push::{
-            GitConfigKey, LayersPermit, PullRequests, PushBoundary, PushIntent, PushOutcome,
-            PushPermit, PushRefusal, RefUpdater, RemoteBranches, UpdateFailure,
+            GitConfigKey, LayersPermit, OpenOutcome, OpenRequest, PullRequests, PushBoundary,
+            PushIntent, PushOutcome, PushPermit, PushRefusal, RefUpdater, RemoteBranches,
+            UpdateFailure, open_task_pull_request, owns_worktree,
         },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
     },
@@ -107,6 +111,158 @@ fn pushing_on(grants: &HouseGrants, requested: Vec<Grant>, base: Base) -> TestRe
     };
     launch(&setup, &WorkerBrief { base, ..brief(5)? })?;
     Ok(setup)
+}
+
+#[test]
+fn a_worker_can_use_only_its_current_launch_worktree() -> TestResult {
+    let grants = push_grant_list()?;
+    let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
+    let record = setup.world.fixture.store.task(&setup.task)?;
+    let owned = record
+        .effects()
+        .iter()
+        .find_map(|effect| match effect.state() {
+            kitchen::state::EffectState::Applied { receipt, .. } => receipt
+                .created()
+                .iter()
+                .find(|resource| resource.kind == ResourceKind::Worktree)
+                .map(|resource| resource.handle.clone()),
+            _ => None,
+        })
+        .ok_or("no launched worktree")?;
+    assert!(owns_worktree(&record, &owned));
+    assert!(!owns_worktree(
+        &record,
+        &ExternalRef::new("another-worktree")?
+    ));
+    Ok(())
+}
+
+struct OpeningForge {
+    descriptor: BackendDescriptor,
+    calls: Cell<u32>,
+}
+
+impl OpeningForge {
+    fn new() -> TestResult<Self> {
+        Ok(Self {
+            descriptor: BackendDescriptor {
+                backend: github()?,
+                house: common::house()?,
+                worker_selection: None,
+                capabilities: CapabilitySet::supporting([
+                    Capability::ForgeMutation,
+                    Capability::EffectLookup,
+                ]),
+            },
+            calls: Cell::new(0),
+        })
+    }
+}
+
+impl EffectExecutor for OpeningForge {
+    fn descriptor(&self) -> &BackendDescriptor {
+        &self.descriptor
+    }
+
+    fn execute(&self, _: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        self.calls.set(self.calls.get() + 1);
+        Receipt::new(
+            ExternalRef::new("https://github.com/origin89hq/firmware/pull/7").map_err(|_| {
+                EffectFailure::NotApplied(kitchen::contracts::NotAppliedReason::Rejected)
+            })?,
+            Vec::new(),
+            Vec::new(),
+        )
+        .map_err(|_| EffectFailure::NotApplied(kitchen::contracts::NotAppliedReason::Rejected))
+    }
+
+    fn lookup(&self, _: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        Ok(Lookup::Unknown)
+    }
+}
+
+impl ForgeWriter for OpeningForge {
+    fn github_effect(&self, mutation: GitHubMutation) -> kitchen::Result<GitHubEffect> {
+        Ok(GitHubEffect {
+            requester: ExternalRef::new("kitchen-bot")?,
+            mutation,
+            posting_budget: PostingBudget::new(10)?,
+        })
+    }
+}
+
+#[test]
+fn a_worker_opens_one_pr_and_retry_reuses_the_durable_effect() -> TestResult {
+    let mut grants = push_grant_list()?;
+    grants.push(Grant::house(
+        Permission::OpenPullRequest,
+        github()?,
+        common::credential()?,
+    ));
+    let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
+    let forge = OpeningForge::new()?;
+    let head = commit('d')?;
+    let base = branch("main")?;
+    let title = Text::new("feat: add driver")?;
+    let body = Text::new("Closes #5")?;
+    let open = || {
+        open_task_pull_request(
+            &setup.world.fixture.store,
+            &setup.world.grants,
+            &setup.github,
+            &setup.world.clock,
+            &forge,
+            &Standing,
+            OpenRequest {
+                task: setup.task.clone(),
+                fence: setup.fence,
+                head: head.clone(),
+                base: base.clone(),
+                title: title.clone(),
+                body: body.clone(),
+            },
+        )
+    };
+    assert_eq!(open()?, OpenOutcome::Opened(number(7)?));
+    assert_eq!(open()?, OpenOutcome::Opened(number(7)?));
+    assert_eq!(forge.calls.get(), 1);
+    assert_eq!(
+        setup.world.fixture.store.task(&setup.task)?.pull_request(),
+        Some(number(7)?)
+    );
+    Ok(())
+}
+
+#[test]
+fn opening_a_worker_pr_requires_the_separate_open_grant() -> TestResult {
+    let grants = push_grant_list()?;
+    let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
+    let forge = OpeningForge::new()?;
+    let result = open_task_pull_request(
+        &setup.world.fixture.store,
+        &setup.world.grants,
+        &setup.github,
+        &setup.world.clock,
+        &forge,
+        &Standing,
+        OpenRequest {
+            task: setup.task.clone(),
+            fence: setup.fence,
+            head: commit('d')?,
+            base: branch("main")?,
+            title: Text::new("feat: driver")?,
+            body: Text::new("Part of #5")?,
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(kitchen::Error::Contract(ContractError::PermissionDenied {
+            permission: Permission::OpenPullRequest
+        }))
+    ));
+    assert_eq!(forge.calls.get(), 0);
+    Ok(())
 }
 
 fn pushing() -> TestResult<Pushing> {

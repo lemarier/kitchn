@@ -23,7 +23,9 @@
 //! credentials can still push directly is a limit of credential isolation
 //! (#6, #13), not of this module.
 
+use sha2::{Digest, Sha256};
 use std::{
+    fmt::Write as _,
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
@@ -33,19 +35,171 @@ use std::{
 };
 
 use crate::{
-    BackendId, HouseId, TaskId,
+    BackendId, EffectName, HouseId, TaskId,
     contracts::{
-        BranchName, Clock, CommitId, Fence, GrantScope, HouseGrants, IssueNumber, Permission,
-        Repository,
+        BranchName, Clock, CommitId, Effect, ExternalRef, Fence, GitHubAction, GitHubMutation,
+        GrantScope, HouseGrants, IssueNumber, Operation, Permission, Repository, ResourceKind,
+        Text,
     },
     house::StackTool,
     integrations::github::{GitHubClient, GitHubReadTransport, Observation},
-    state::{HouseStore, StateError, TaskRecord, TaskState},
+    state::{EffectPlan, EffectState, HouseStore, StateError, TaskRecord, TaskState, run_effect},
     workflows::{
-        coordination::{BranchFact, CoordinationError, held_branches, task_branch},
+        coordination::{
+            BranchFact, ConsentSource, CoordinationError, current_worker, held_branches,
+            task_branch,
+        },
+        interactive::ForgeWriter,
         repair::{Observed, PullRequestState, PullRequestView, observe_pull_request},
     },
 };
+
+/// The durable result of opening a task's pull request. An uncertain result
+/// must be reconciled before another submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenOutcome {
+    /// The forge confirmed a pull request and the task linked it.
+    Opened(IssueNumber),
+    /// The forge definitely did not apply the effect.
+    NotApplied,
+    /// The effect may have applied and needs reconciliation.
+    Uncertain,
+}
+
+/// Whether this task already published its latest launched branch through
+/// the checked boundary. An unpublished task must not replace a remote ref.
+#[must_use]
+pub fn task_published(record: &TaskRecord) -> bool {
+    task_branch(record).is_some_and(|branch| BranchFact::Published.holds(record, &branch))
+}
+
+/// Whether the current attempt's applied launch receipt created this exact
+/// worktree handle. A branch name or filesystem path alone does not prove it.
+#[must_use]
+pub fn owns_worktree(record: &TaskRecord, worktree: &ExternalRef) -> bool {
+    let Some(worker) = current_worker(record) else {
+        return false;
+    };
+    record.effects().iter().any(|effect| {
+        effect.request().attempt() == worker.attempt
+            && matches!(
+                effect.request().effect(),
+                Effect::Worker(Operation::LaunchWorker { .. })
+            )
+            && matches!(effect.state(), EffectState::Applied { receipt, .. } if
+                receipt.created().contains(&worker.worker)
+                    && receipt.created().iter().any(|resource|
+                        resource.kind == ResourceKind::Worktree && &resource.handle == worktree))
+    })
+}
+
+/// Open the task branch's pull request through the persisted effect path.
+/// The branch, live claim, and both grants are checked before the intent is
+/// recorded. A retry uses the same effect name at the same head.
+pub struct OpenRequest {
+    /// Task receiving the pull request.
+    pub task: TaskId,
+    /// Current claim fence.
+    pub fence: Fence,
+    /// Branch revision to submit.
+    pub head: CommitId,
+    /// Pull request base branch.
+    pub base: BranchName,
+    /// Pull request title.
+    pub title: Text,
+    /// Pull request body.
+    pub body: Text,
+}
+
+/// Submit and link a worker pull request with persisted intent.
+pub fn open_task_pull_request(
+    store: &HouseStore,
+    grants: &HouseGrants,
+    destination: &BackendId,
+    clock: &dyn Clock,
+    forge: &dyn ForgeWriter,
+    consent: &dyn ConsentSource,
+    request: OpenRequest,
+) -> Result<OpenOutcome> {
+    let OpenRequest {
+        task,
+        fence,
+        head,
+        base,
+        title,
+        body,
+    } = request;
+    let (record, binding) = bind(
+        store,
+        grants,
+        destination,
+        clock,
+        &task,
+        fence,
+        &[Permission::PushBranch, Permission::OpenPullRequest],
+    )?;
+    let binding = binding.map_err(|_| CoordinationError::BranchMismatch)?;
+    let mut digest = Sha256::new();
+    for part in [binding.branch.as_str(), head.as_str()] {
+        digest.update(part.len().to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    let mut name = String::from("open-pull-request-");
+    for byte in digest.finalize().iter().take(16) {
+        let _ = write!(name, "{byte:02x}");
+    }
+    let name = EffectName::new(&name)?;
+    let effect: Effect = forge
+        .github_effect(GitHubMutation {
+            repository: binding.repository.clone(),
+            action: GitHubAction::OpenPullRequest {
+                head: binding.branch,
+                expected_head: head,
+                base,
+                title,
+                body,
+                draft: false,
+            },
+        })?
+        .into();
+    let revision = record.evidence().revision();
+    let record = run_effect(
+        store,
+        forge,
+        grants,
+        EffectPlan {
+            task: task.clone(),
+            fence,
+            name,
+            decided_at: revision,
+            consent: consent.consent(&task, &effect, revision),
+            effect,
+            basis: None,
+        },
+        clock,
+    )?;
+    let outcome = match record.state() {
+        EffectState::Applied { receipt, .. } => {
+            let prefix = format!("https://github.com/{}/pull/", binding.repository);
+            let number = receipt
+                .reference()
+                .as_str()
+                .strip_prefix(&prefix)
+                .and_then(|value| value.parse::<u64>().ok())
+                .and_then(|value| IssueNumber::new(value).ok());
+            number.map_or(OpenOutcome::Uncertain, OpenOutcome::Opened)
+        }
+        EffectState::NotApplied { .. } => OpenOutcome::NotApplied,
+        EffectState::Intended
+        | EffectState::Uncertain { .. }
+        | EffectState::Unresolvable { .. }
+        | EffectState::Waived { .. } => OpenOutcome::Uncertain,
+    };
+    if let OpenOutcome::Opened(number) = outcome {
+        store.link_pull_request(&task, fence, number)?;
+    }
+    Ok(outcome)
+}
 
 type Result<T> = std::result::Result<T, crate::Error>;
 
@@ -703,6 +857,7 @@ pub struct GitRemote {
     config: IsolatedGitConfig,
     deadline: Duration,
     url_bases: Vec<String>,
+    transport_url: Option<String>,
 }
 
 /// The URL prefixes of GitHub repositories, followed by `owner/name`.
@@ -716,6 +871,34 @@ const GITHUB_URL_BASES: [&str; 3] = [
 const MAX_URL_BASE_BYTES: usize = 512;
 
 impl GitRemote {
+    /// The checked-out branch and its head, read without consulting ambient
+    /// Git configuration. A detached head or malformed answer is unknown.
+    #[must_use]
+    pub fn checkout(&self) -> Option<(BranchName, CommitId)> {
+        let (Some(0), branch) = self.run(&["symbolic-ref", "--quiet", "HEAD"])? else {
+            return None;
+        };
+        let branch = String::from_utf8(branch).ok()?;
+        let branch = BranchName::new(branch.trim().strip_prefix("refs/heads/")?).ok()?;
+        let (Some(0), head) = self.run(&["rev-parse", "--verify", "HEAD"])? else {
+            return None;
+        };
+        Some((
+            branch,
+            CommitId::new(String::from_utf8(head).ok()?.trim()).ok()?,
+        ))
+    }
+
+    /// The checkout's last recorded remote head. A missing tracking ref is
+    /// the only acceptable expectation for a first push.
+    #[must_use]
+    pub fn tracking_head(&self, branch: &BranchName) -> Option<CommitId> {
+        let reference = format!("refs/remotes/{}/{}", self.remote, branch);
+        let (Some(0), head) = self.run(&["rev-parse", "--verify", "--quiet", &reference])? else {
+            return None;
+        };
+        CommitId::new(String::from_utf8(head).ok()?.trim()).ok()
+    }
     /// Longest remote name accepted, in bytes.
     pub const MAX_REMOTE_BYTES: usize = 64;
 
@@ -759,7 +942,16 @@ impl GitRemote {
                 .iter()
                 .map(|base| (*base).to_owned())
                 .collect(),
+            transport_url: None,
         })
+    }
+
+    /// Use the house credential over HTTPS for network calls after the
+    /// checkout's original remote has been checked against this repository.
+    #[must_use]
+    pub fn with_github_https_transport(mut self, repository: &Repository) -> Self {
+        self.transport_url = Some(format!("https://github.com/{repository}.git"));
+        self
     }
 
     /// Accept repositories under these URL bases instead of GitHub's, such
@@ -990,6 +1182,7 @@ const MAX_SETTING_BYTES: usize = 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsolatedGitConfig {
     path: PathBuf,
+    credential_helpers: Vec<(String, String)>,
 }
 
 impl IsolatedGitConfig {
@@ -1061,7 +1254,19 @@ impl IsolatedGitConfig {
         staged
             .persist(&path)
             .map_err(|_| CoordinationError::GitConfigUnwritten)?;
-        Ok(Self { path })
+        let credential_helpers = settings
+            .iter()
+            .filter_map(|setting| match setting {
+                PushSetting::CredentialHelper { .. } => {
+                    Some((setting.key(), setting.value().to_owned()))
+                }
+                PushSetting::UserName(_) | PushSetting::UserEmail(_) => None,
+            })
+            .collect();
+        Ok(Self {
+            path,
+            credential_helpers,
+        })
     }
 
     /// The file's path.
@@ -1118,7 +1323,11 @@ pub(crate) fn pinned_git_config(remote: &str) -> Vec<(String, String)> {
 /// [`pinned_git_config`] as `GIT_CONFIG_COUNT` entries, which Git ranks
 /// above every configuration file.
 pub(crate) fn git_environment(config: &IsolatedGitConfig, remote: &str) -> Vec<(String, String)> {
-    let pins = pinned_git_config(remote);
+    let mut pins = pinned_git_config(remote);
+    // A checkout may contain another credential helper. Reset the helper
+    // list above its local configuration, then install only Kitchen's.
+    pins.push(("credential.helper".to_owned(), String::new()));
+    pins.extend(config.credential_helpers.iter().cloned());
     let mut env = Vec::with_capacity(pins.len() * 2 + 5);
     env.extend([
         ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
@@ -1203,7 +1412,8 @@ impl RemoteBranches for GitRemote {
 
     fn head(&self, branch: &BranchName) -> Observed<Option<CommitId>> {
         let reference = format!("refs/heads/{branch}");
-        let Some((Some(0), stdout)) = self.run(&["ls-remote", &self.remote, &reference]) else {
+        let destination = self.transport_url.as_deref().unwrap_or(&self.remote);
+        let Some((Some(0), stdout)) = self.run(&["ls-remote", destination, &reference]) else {
             return Observed::Unknown;
         };
         let Ok(stdout) = String::from_utf8(stdout) else {
@@ -1300,7 +1510,7 @@ impl GitRemote {
                 update.replaces().map_or("", CommitId::as_str)
             ));
         }
-        args.push(destination.clone());
+        args.push(self.transport_url.as_ref().unwrap_or(destination).clone());
         args.extend(
             updates
                 .iter()

@@ -13,6 +13,7 @@ pub mod house_init;
 pub mod interactive;
 pub mod mailbox;
 pub mod pickup;
+pub mod push;
 pub mod run;
 pub mod scaffold;
 pub mod store;

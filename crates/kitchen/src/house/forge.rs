@@ -666,27 +666,39 @@ fn executor<T: GitHubMutationTransport>(
     connect: impl FnOnce(ForgeCredential) -> Result<T, ForgeError>,
 ) -> Result<GitHubExecutor<T>, ForgeError> {
     let scope = binding.scope(config)?;
-    let file = match open_credential(registry, &binding.house, &binding.credential)? {
-        Ok(file) => file,
-        Err(status) => {
-            return Err(ForgeError::CredentialUnavailable {
-                house: binding.house,
-                credential: binding.credential,
-                status,
-            });
-        }
-    };
-    let file = CredentialFile::opened(binding.credential_ref(), file);
-    let transport = connect(match binding.credential_kind {
-        CredentialKind::Token => ForgeCredential::Token(file),
-        CredentialKind::GitHubApp(app) => ForgeCredential::App { app, key: file },
-    })?;
+    let credential = checked_forge_credential(registry, &binding)?;
+    let transport = connect(credential)?;
     Ok(GitHubExecutor::new(
         binding.backend,
         scope,
         transport,
         ReadLimits::default(),
     ))
+}
+
+/// Open the binding's credential with the house directory and file checks.
+///
+/// # Errors
+/// Refuses missing, redirected, or unsafe house credentials.
+pub fn checked_forge_credential(
+    registry: &HouseRegistry,
+    binding: &ForgeBinding,
+) -> Result<ForgeCredential, ForgeError> {
+    let file = match open_credential(registry, &binding.house, &binding.credential)? {
+        Ok(file) => file,
+        Err(status) => {
+            return Err(ForgeError::CredentialUnavailable {
+                house: binding.house.clone(),
+                credential: binding.credential.clone(),
+                status,
+            });
+        }
+    };
+    let file = CredentialFile::opened(binding.credential_ref(), file);
+    Ok(match binding.credential_kind {
+        CredentialKind::Token => ForgeCredential::Token(file),
+        CredentialKind::GitHubApp(app) => ForgeCredential::App { app, key: file },
+    })
 }
 
 /// The house's forge, for looking up what earlier writes did. Every

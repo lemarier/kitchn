@@ -664,6 +664,21 @@ pub(crate) fn launch_rendered(
             house_mailbox_brief(ctx.store, task, fence)
         ))?,
     };
+    // The worker may have no `kitchn` on PATH. The same executable that
+    // launched it names the checked delivery command in its brief.
+    let executable =
+        std::env::current_exe().map_err(|_| CoordinationError::InvalidBriefArgument)?;
+    let executable = executable
+        .to_str()
+        .ok_or(CoordinationError::InvalidBriefArgument)?;
+    let push_command = format!(
+        "Push: run {} push --store {} --house {} --task {} from this worktree after committing; it pushes with the house forge credential and opens the pull request. Add `--acceptance-done` only when your evidence report contains `Acceptance: done` after checking every item; otherwise the pull request says `Part of` the issue.",
+        shell_quote(executable),
+        shell_quote(&ctx.store.dir().to_string_lossy()),
+        ctx.store.house(),
+        task,
+    );
+    let text = Text::new(&format!("{}\n{}", text.as_str(), push_command))?;
     // A selection the executor cannot launch is a configuration problem no
     // retry fixes: refuse it before an attempt is spent on it.
     if let Some(resolved) = &record.spec().agent {
@@ -809,6 +824,10 @@ pub(crate) fn launch_rendered(
         | EffectState::Unresolvable { .. }
         | EffectState::Waived { .. } => Ok(LaunchOutcome::Uncertain),
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// What a request to stop a worker established.

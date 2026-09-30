@@ -575,7 +575,8 @@ fn unstopped_worker(ctx: &Context<'_>, record: &TaskRecord, fence: Fence) -> Opt
 ///
 /// # Errors
 /// Returns brief, store, and authority failures, such as a brief that does
-/// not match the task or a superseded consumer. A task's agent selection that
+/// not match the task, a superseded consumer, or [`StateError::StaleFence`]
+/// for a process that no longer owns the task. A task's agent selection that
 /// the backend cannot launch is refused before any attempt starts.
 pub fn launch_worker(
     ctx: &Context<'_>,
@@ -585,6 +586,15 @@ pub fn launch_worker(
     brief: &WorkerBrief,
 ) -> Result<LaunchOutcome> {
     let record = ctx.store.task(task)?;
+    // A process that lost the task is told so before any answer that would
+    // have it continue: `SuperviseFirst` and `BranchHeld` are for the owner.
+    match record.state() {
+        TaskState::Open => return Err(StateError::StaleFence { presented: fence }.into()),
+        TaskState::Claimed { lease } if lease.fence() != fence => {
+            return Err(StateError::StaleFence { presented: fence }.into());
+        }
+        TaskState::Claimed { .. } | TaskState::Settled { .. } => {}
+    }
     // Follow-ups an earlier worker could not receive or did not address go
     // into the next brief, so none is dropped.
     let follow_ups = outstanding_follow_ups(ctx.store, &record)?;
@@ -809,7 +819,9 @@ pub struct WorkerView {
 }
 
 /// Every applied launch's worker, oldest first.
-fn launched_workers(record: &TaskRecord) -> impl DoubleEndedIterator<Item = WorkerView> + '_ {
+pub(crate) fn launched_workers(
+    record: &TaskRecord,
+) -> impl DoubleEndedIterator<Item = WorkerView> + '_ {
     record
         .effects()
         .iter()

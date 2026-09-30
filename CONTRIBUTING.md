@@ -99,6 +99,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #194 attempt usage records | `state/usage.rs` | The usage and pull-request fields on `AttemptRecord` and `TaskRecord` and their `HouseStore` methods in `state/model.rs` and `state/store.rs` (with #4); the usage count on retired tasks in `state/retention.rs` (with #85); tests in `crates/kitchen/tests/attempt_usage.rs` |
 | #45 brigade audit | `workflows/audit.rs` | `kitchn audit` in `crates/kitchen-cli/src/commands/audit.rs`; tests in `crates/kitchen/tests/brigade_audit.rs` and `crates/kitchen-cli/tests/audit.rs`; reads trust records from #12, attempt usage from #194, and schedule budgets from #40 |
 | #208 reply and usage recording from coordination | `AnswerSource`, the reply recording in `handle_question`, and `record_worker_usage` in `workflows/coordination.rs` (with #8) | Tests in `crates/kitchen/tests/workflows_coordination.rs` |
+| #225 scheduled runner passes | `workflows/run.rs`, `workflows/run/` | `kitchn run` in `crates/kitchen-cli/src/commands/run.rs`; tests in `crates/kitchen/tests/run_passes.rs` and `crates/kitchen-cli/tests/run.rs`. The #218 tick invokes these commands |
 | #218 house mailbox | `state/mailbox.rs` | The mailbox table, its store methods and the retention rule in `state/model.rs`, `state/store.rs` and `state/retention.rs` (with #4 and #85); `MailboxRoute` and the house mailbox brief line in `workflows/coordination.rs` (with #8); `kitchn mailbox` in `crates/kitchen-cli/src/commands/mailbox.rs`; tests in `crates/kitchen/tests/house_mailbox.rs` and `crates/kitchen-cli/tests/mailbox.rs` |
 | #218 house tick and run ledger | `workflows/tick.rs`, `state/runs.rs` | The ledger table and its store methods in `state/model.rs` and `state/store.rs` (with #4); the `tick` field in `house/config.rs` (with #5); `kitchn tick` in `crates/kitchen-cli/src/commands/tick.rs`; tests in `crates/kitchen/tests/house_tick.rs` and `crates/kitchen-cli/tests/tick.rs`. The pass runners come from #225 |
 | #195 HTTP worker backend | `adapters/http/` | `BackendKind::Http`, `HttpEndpoint`, and the binding's `endpoint` in `house/backend.rs` and `resolve_http_backend` in `adapters/resolve.rs` (with #191); the shared credential opener in `house/forge.rs` (with #140); tests in `crates/kitchen/tests/http_backend.rs` and the fake service in `crates/kitchen/tests/http_sim/`; the protocol reference `docs/reference/http-backend` on the website |
@@ -113,8 +114,11 @@ to those files. Keep domain decisions in the library. The CLI owns argument
 parsing, presentation, and exit codes: 0 for success, 2 for invalid input, and 1
 for execution or output failures. Scheduled prechecks follow the schedule
 contract instead: 0 for actionable, 1 for idle, 2 for invalid input, and 3 for
-read or output failures. Library errors must remain structured and must not echo
-credentials or raw private input.
+read or output failures. `kitchn run` passes use their own set: 0 when the pass
+acted or was idle, 2 for invalid input, 1 for execution or output failures, 3
+when another start holds the pass lease (busy, not a read failure as for a
+precheck), and 4 when the lease owner is uncertain. Library errors must remain
+structured and must not echo credentials or raw private input.
 
 Shared parents follow these rules:
 

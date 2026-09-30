@@ -107,6 +107,9 @@ pub enum Error {
     /// A house tick or run ledger call was refused.
     #[error(transparent)]
     Tick(#[from] crate::workflows::tick::TickError),
+    /// A scheduled runner pass refused its input or mailbox.
+    #[error(transparent)]
+    Run(#[from] crate::workflows::run::RunError),
 }
 
 impl Error {
@@ -141,6 +144,7 @@ impl Error {
             Self::Audit(error) => error.class(),
             Self::Mail(error) => error.class(),
             Self::Tick(error) => error.class(),
+            Self::Run(error) => error.class(),
         }
     }
 }

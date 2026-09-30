@@ -1091,6 +1091,127 @@ fn an_old_coordinator_resuming_after_a_takeover_is_refused() -> TestResult {
     Ok(())
 }
 
+/// Supervise and launch for `number` as the process holding `fence`.
+fn old_process_calls(
+    kitchen: &Kitchen,
+    number: u64,
+    fence: kitchen::contracts::Fence,
+) -> TestResult<(
+    kitchen::Result<Supervision>,
+    kitchen::Result<kitchen::workflows::coordination::LaunchOutcome>,
+)> {
+    use kitchen::workflows::{
+        coordination::{
+            Context, Standing, SupervisionInput, SupervisionPolicy, launch_worker, supervise,
+        },
+        pickup::{Base, WorkerBrief, work_branch},
+    };
+    let grants = kitchen.config.authority()?;
+    let ctx = Context {
+        store: kitchen.store(),
+        backend: &kitchen.backend,
+        grants: &grants,
+        clock: &kitchen.clock,
+        consent: &Standing,
+    };
+    let task = kitchen.task(number)?;
+    let policy = SupervisionPolicy {
+        readiness_deadline: Duration::from_secs(600),
+        question_deadline: Duration::from_secs(600),
+        idle_deadline: Duration::from_secs(600),
+        claim_ttl: kitchen::contracts::LeaseTtl::new(TASK_LEASE)?,
+    };
+    let brief = WorkerBrief {
+        issue: IssueRef {
+            repository: repo()?,
+            number: kitchen::contracts::IssueNumber::new(number)?,
+        },
+        branch: work_branch(&format!("kitchen/issue-{number}"))?,
+        base: Base::DefaultBranch,
+        instructions: kitchen.settings.instructions.clone(),
+        acceptance: vec![Text::new("The firmware builds with the new driver.")?],
+        budget: kitchen.config.follow_up_budget(),
+        report_path: kitchen.settings.report_path.clone(),
+    };
+    Ok((
+        supervise(&ctx, &task, fence, &policy, &SupervisionInput::default()),
+        launch_worker(
+            &ctx,
+            &task,
+            fence,
+            kitchen::contracts::Workspace::Isolated,
+            &brief,
+        ),
+    ))
+}
+
+#[test]
+fn an_old_process_after_a_takeover_is_stale_and_its_uncertain_launch_is_reconciled_once()
+-> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    // The old pickup launches, but the response is lost: the launch effect
+    // is recorded as uncertain and the worker exists on the backend.
+    kitchen
+        .backend
+        .inject(kitchen::contracts::fake::ExecuteFault::ApplyThenLoseResponse);
+    acted(kitchen.pickup(false)?)?;
+    let old_fence = kitchen.claim_fence(7)?;
+    let unresolved = |kitchen: &Kitchen| -> TestResult<bool> {
+        Ok(kitchen
+            .store()
+            .task(&kitchen.task(7)?)?
+            .effects()
+            .iter()
+            .any(|effect| {
+                matches!(
+                    effect.state(),
+                    kitchen::state::EffectState::Intended
+                        | kitchen::state::EffectState::Uncertain { .. }
+                )
+            }))
+    };
+    assert!(unresolved(&kitchen)?);
+    assert_eq!(kitchen.backend.effects_performed(), 1);
+    // A new coordinator takes the task over and reconciles before acting.
+    let actions = acted(kitchen.coordinate()?)?;
+    let task = kitchen.task(7)?;
+    assert!(actions.contains(&CoordinateAction::Moved { task: task.clone() }));
+    assert_ne!(kitchen.claim_fence(7)?, old_fence);
+    assert!(!unresolved(&kitchen)?);
+    assert!(kitchen.worker(7).is_ok());
+    // The old process resumes: both calls say it lost the task, with no
+    // answer that would have it continue, and nothing is launched again.
+    let (supervised, launched) = old_process_calls(&kitchen, 7, old_fence)?;
+    assert!(
+        matches!(
+            supervised,
+            Err(kitchen::Error::State(StateError::StaleFence { .. }))
+        ),
+        "{supervised:?}"
+    );
+    assert!(
+        matches!(
+            launched,
+            Err(kitchen::Error::State(StateError::StaleFence { .. }))
+        ),
+        "{launched:?}"
+    );
+    assert_eq!(kitchen.backend.effects_performed(), 1);
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    // The current owner is told to supervise the existing worker instead.
+    let (_, current) = old_process_calls(&kitchen, 7, kitchen.claim_fence(7)?)?;
+    assert!(
+        matches!(
+            current,
+            Ok(kitchen::workflows::coordination::LaunchOutcome::SuperviseFirst { .. })
+        ),
+        "{current:?}"
+    );
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
 #[test]
 fn coordinate_leaves_an_expired_task_claim_until_a_takeover() -> TestResult {
     let kitchen = Kitchen::new()?;

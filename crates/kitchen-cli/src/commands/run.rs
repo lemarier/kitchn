@@ -49,6 +49,9 @@ use kitchen::{
 };
 
 #[derive(Args)]
+#[command(
+    after_help = "--registry defaults to KITCHN_HOME or ~/.kitchn. --house defaults to this checkout's stored repository binding. Scheduled invocations should pass both explicitly."
+)]
 pub struct RunArgs {
     #[command(subcommand)]
     pass: RunCommand,

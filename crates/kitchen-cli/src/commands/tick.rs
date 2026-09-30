@@ -39,7 +39,11 @@ use kitchen::{
 use super::run::{BackendArgs, Opened, PickupArgs};
 
 #[derive(Args)]
-#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+#[command(
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
+    after_help = "--registry defaults to KITCHN_HOME or ~/.kitchn. --house defaults to this checkout's stored repository binding. Trigger definitions always include both flags explicitly."
+)]
 pub struct TickArgs {
     #[command(subcommand)]
     command: Option<TickCommand>,

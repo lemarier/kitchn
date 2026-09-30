@@ -12,6 +12,9 @@ use kitchen::{
 use super::run::Opened;
 
 #[derive(Args)]
+#[command(
+    after_help = "--registry defaults to KITCHN_HOME or ~/.kitchn; --house uses this checkout's stored repository binding unless specified."
+)]
 pub struct GateArgs {
     #[command(subcommand)]
     command: GateCommand,

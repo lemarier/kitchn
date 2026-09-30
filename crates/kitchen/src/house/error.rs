@@ -9,6 +9,15 @@ pub enum HouseError {
     /// House selection did not identify exactly one allowed house.
     #[error("house selection is missing, ambiguous, or outside the repository allowlist")]
     HouseSelection,
+    /// A CLI context default could not be resolved; the caller must name it.
+    #[error("cannot resolve {flag} from this checkout; pass {flag} explicitly")]
+    MissingFlag {
+        /// The CLI option needed to continue.
+        flag: &'static str,
+    },
+    /// Origin fetch and push URLs identify different repositories.
+    #[error("cannot infer --house: origin fetch and push disagree on --repository")]
+    CheckoutRepositoryMismatch,
     /// Repository policy attempts to weaken house policy.
     #[error("repository policy cannot relax house constraints")]
     PolicyRelaxation,
@@ -100,7 +109,9 @@ impl HouseError {
     #[must_use]
     pub const fn class(&self) -> ErrorClass {
         match self {
-            Self::InvalidInput => ErrorClass::InvalidInput,
+            Self::InvalidInput | Self::MissingFlag { .. } | Self::CheckoutRepositoryMismatch => {
+                ErrorClass::InvalidInput
+            }
             Self::HouseSelection
             | Self::PolicyRelaxation
             | Self::InsideRepository

@@ -128,6 +128,47 @@ pub fn checkout_remotes(start: &Path) -> Result<CheckoutRemotes, HouseError> {
     }
 }
 
+/// The repository named by `origin`'s fetch URL, if every rewritten push URL
+/// names that same repository. CLI defaults use this before reading a binding.
+///
+/// # Errors
+/// [`HouseError::CheckoutRepositoryMismatch`] when a push destination names
+/// another repository; otherwise the path, Git, and unidentified errors of
+/// [`checkout_remotes`].
+pub fn origin_repository(start: &Path) -> Result<Repository, HouseError> {
+    fn repositories(urls: &str) -> Result<BTreeSet<Repository>, HouseError> {
+        let mut repositories = BTreeSet::new();
+        let mut count = 0;
+        for url in urls.lines() {
+            count += 1;
+            if count > MAX_REMOTE_LINES {
+                return Err(HouseError::RepositoryUnidentified);
+            }
+            repositories.insert(parse_remote_url(url).ok_or(HouseError::RepositoryUnidentified)?);
+        }
+        (!repositories.is_empty())
+            .then_some(repositories)
+            .ok_or(HouseError::RepositoryUnidentified)
+    }
+
+    // Git expands insteadOf and pushInsteadOf in get-url. Read both sides,
+    // including all configured URLs, before permitting a registry lookup.
+    let fetch = repositories(&git(start, &["remote", "get-url", "--all", "origin"])?)?;
+    let push = repositories(&git(
+        start,
+        &["remote", "get-url", "--push", "--all", "origin"],
+    )?)?;
+    let mut fetch = fetch.into_iter();
+    let repository = match (fetch.next(), fetch.next()) {
+        (Some(repository), None) => repository,
+        _ => return Err(HouseError::RepositoryUnidentified),
+    };
+    if push.iter().any(|destination| destination != &repository) {
+        return Err(HouseError::CheckoutRepositoryMismatch);
+    }
+    Ok(repository)
+}
+
 /// The remote whose push destination identifies the checkout.
 fn selected_remote(start: &Path) -> Result<RemoteName, HouseError> {
     let branch = optional_git(start, &["symbolic-ref", "--quiet", "HEAD"])?;

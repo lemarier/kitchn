@@ -17,10 +17,21 @@ input and `3` when their inputs cannot be read. `decompose preview` exits `1`
 while ownership overlaps are unordered. `kitchn run` exits `3` when another pass
 of the same kind holds the lease and `4` when a previous pass's lease expired.
 
-Commands that take `--store` default to the house state store that
-`house init` created at `<registry>/private/<house>/store`, located through
-`--registry`. Pass `--store` to use another initialized store instead. A store
-is never created on the way; a missing one fails.
+Commands that take `--registry` use `$KITCHN_HOME` when set, otherwise
+`~/.kitchn`. Commands that take `--house` use the current checkout's GitHub
+remote to find its **stored repository binding** in that registry. All
+worktrees of that repository therefore select the same house. An unbound
+repository, unreadable remote, or ambiguous selection is refused and names
+`--house`; pass it explicitly when working outside a bound checkout. Explicit
+`--registry` and `--house` values take precedence. `house init` and `house
+setup` retain their own selection flow, and a generated scheduled trigger
+always carries both flags because it may run outside a checkout.
+
+Commands that take `--store` default to the selected house's state store at
+`<registry>/private/<house>/store`. The store remains house scoped, even when
+several repositories bind to one house. Pass `--store` to use another
+initialized store instead. A store is never created on the way; a missing one
+fails.
 
 ## `kitchn house init`
 
@@ -38,7 +49,7 @@ brackets. Each question has a flag:
 
 | Flag | Default |
 | --- | --- |
-| `--registry <dir>` | `~/.kitchn` |
+| `--registry <dir>` | `$KITCHN_HOME`, then `~/.kitchn` |
 | `--house <id>` | none: always asked |
 | `--repositories <owner/name,...>` | the checkout's GitHub remote |
 | `--posting-destinations <owner/name,...>` | the repositories |

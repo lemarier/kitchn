@@ -61,6 +61,8 @@ impl Kitchen {
 
     fn run(&self, args: &[&str]) -> TestResult<Output> {
         Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
+            .env_remove("KITCHN_HOME")
+            .env("HOME", &self.root)
             .args(args)
             .output()?)
     }
@@ -299,12 +301,15 @@ fn retain_refuses_invalid_arguments_before_any_write() -> TestResult {
     for extra in [
         &["--window-days", "30", "--apply"][..],
         &["--max-lookups", "1001", "--apply"],
-        &["--gh", "/usr/bin/gh", "--apply"],
         &["--registry", "registry", "--gh", "gh", "--apply"],
     ] {
         let output = kitchen.retain(extra)?;
         assert_eq!(output.status.code(), Some(2), "{extra:?}");
     }
+    // --gh can now use the default registry path. This fixture has no house
+    // configuration there, so it refuses before changing the store.
+    let no_registry = kitchen.retain(&["--gh", "/usr/bin/gh", "--apply"])?;
+    assert_eq!(no_registry.status.code(), Some(1), "{no_registry:?}");
     let output = kitchen.run(&[
         "store", "capacity", "--house", "origin89", "--store", "store",
     ])?;

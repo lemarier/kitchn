@@ -611,10 +611,15 @@ before anything runs.
   after the head and base branch are read again. Without an attestation, or
   with any other verdict, it records nothing. A pass that records a merge
   verdict and does not merge, because the head moved or the forge could not
-  be read again, continues the same attempt on the next pass. When the
+  be read again, continues the same attempt on the next pass, for seven days
+  from its first pass. After that the gate task settles as exhausted and the
+  pull request is only reported until its head or base changes. When the
   house's pinned revisions or grants changed since, the next pass first
   reconciles and settles the pull request's earlier gate task, then merges
-  under a new one. Kitchen has no command that
+  under a new one. A merge that was sent and whose outcome the forge cannot
+  prove blocks every later merge of that pull request, under any gate task
+  and whatever risk decision was recorded for it, until a lookup shows it
+  merged or shows it can no longer merge. Kitchen has no command that
   records attestations yet, so in practice the gate still only reports.
 
 Each pass takes its own lease first, so a second concurrent start does nothing

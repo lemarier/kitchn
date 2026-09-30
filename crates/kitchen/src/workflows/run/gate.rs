@@ -24,9 +24,18 @@
 //! changed gets a new task, and so does a pull request whose task under the
 //! current specification settled or has little ownership history left. The
 //! pull request's other gate tasks are reconciled and settled first, and
-//! nothing is recorded or merged until they are. A pass that does not merge
+//! nothing is recorded or merged until they are. An effect of any gate task
+//! of the pull request, settled or not, whose outcome the forge has not
+//! proven bars every merge of that pull request: a risk decision about it
+//! lets its own task settle, and says nothing about a merge request that may
+//! still land. Only a lookup that proves the effect applied or absent lifts
+//! that. A pass that does not merge
 //! leaves the task's attempt interrupted, and the next pass continues that
-//! attempt instead of spending another. The verdict and
+//! attempt instead of spending another, until the task's retry deadline:
+//! past it the attempt ends and the task settles as exhausted. The pull
+//! request is then only reported while its head and base stay the ones that
+//! task last judged; a new head or base is new evidence and gets a new task.
+//! The verdict and
 //! its merge intent are persisted through [`HouseGateStore`], the provider's
 //! head and the base branch tip are read again ([`GateRun::next_merge`]),
 //! and only then is that exact intent submitted; a moved head or base
@@ -47,10 +56,10 @@ use crate::workflows::tick::PassRun;
 use crate::{
     BackendId, TaskId,
     contracts::{
-        AttemptStart, CapabilityRequirements, Claimant, Clock, CommitId, EffectExecutor,
-        EffectFailure, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef,
-        Fence, IdempotencyKey, IssueNumber, NotAppliedReason, Provenance, Repository, RetryPolicy,
-        Role, TaskAuthority, TaskSpec,
+        AttemptOutcome, AttemptStart, CapabilityRequirements, Claimant, Clock, CommitId,
+        EffectExecutor, EffectFailure, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
+        ExternalRef, FailureClass, Fence, IdempotencyKey, IssueNumber, Lookup, NotAppliedReason,
+        Provenance, Repository, RetryPolicy, Role, Settlement, TaskAuthority, TaskSpec, Timestamp,
     },
     house::{HouseConfig, HouseError, MergeSubject},
     integrations::github::{
@@ -59,7 +68,7 @@ use crate::{
     },
     state::{
         EffectOutcome, EffectState, HouseStore, MAX_OWNERSHIP_HISTORY, StateError, TaskRecord,
-        TaskState, reconcile,
+        TaskState, reconcile, reread_settled,
     },
     workflows::{
         gate::{
@@ -146,6 +155,9 @@ pub enum ReportReason {
     /// The claim on the gate task, or on an earlier gate task of the pull
     /// request, expired without a release; rerun with a takeover.
     TaskUncertain,
+    /// A gate task of the pull request spent its retries on exactly this
+    /// head and base. The same evidence is not retried; a person decides.
+    ExhaustedForSubject,
 }
 
 /// Why a recorded merge verdict did not merge in this pass.
@@ -167,10 +179,11 @@ pub enum NotMerged {
     /// The forge accepted the merge but does not read it back as merged at
     /// the head yet.
     Unconfirmed,
-    /// An earlier effect of the gate task, or of an earlier gate task of
-    /// the pull request, is unresolved; it is reconciled, never repeated.
+    /// An earlier effect of the gate task, or of another gate task of the
+    /// pull request, settled or not, has no proven outcome, whatever risk
+    /// decision covers it; it is looked up, never repeated.
     Reconciling,
-    /// The gate task's attempts are spent.
+    /// The gate task's attempts are spent, or its retry deadline passed.
     Exhausted,
 }
 
@@ -439,14 +452,26 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
         };
         let task = spec.id.clone();
         // Another gate task of the pull request, under an earlier
-        // specification or generation, may hold an unresolved merge. It is
-        // reconciled and settled before this one takes its place.
-        for stale in tasks.iter().filter(|record| {
-            gate_of(record, self.repository) == Some(number)
-                && record.spec().id != task
-                && !matches!(record.state(), TaskState::Settled { .. })
+        // specification or generation, may have sent a merge whose outcome
+        // is not proven. Settled or not, it bars this one; an unsettled task
+        // is also reconciled and settled before this one takes its place.
+        for earlier in tasks.iter().filter(|record| {
+            gate_of(record, self.repository) == Some(number) && record.spec().id != task
         }) {
-            if let Some(standing) = self.retire(stale, claimant, &merge)? {
+            let standing = match earlier.state() {
+                TaskState::Settled { .. } if self.unproven_settled(earlier, &merge)? => {
+                    Some(GateResult::NotMerged(NotMerged::Reconciling))
+                }
+                TaskState::Settled { settlement, .. } => (*settlement == Settlement::Exhausted
+                    && earlier.evidence().subject().is_some_and(|judged| {
+                        judged.head == evidence.head && judged.base.as_ref() == Some(&evidence.base)
+                    }))
+                .then_some(GateResult::ReportOnly(ReportReason::ExhaustedForSubject)),
+                TaskState::Open | TaskState::Claimed { .. } => {
+                    self.retire(earlier, claimant, &merge)?
+                }
+            };
+            if let Some(standing) = standing {
                 return Ok(action(predicted, standing));
             }
         }
@@ -519,8 +544,7 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
         let (task, fence) = (owned.task, owned.fence);
         let now = self.clock.now();
         let executor = self.executor(merge);
-        let reconciled = reconcile(self.store, &executor, task, fence, self.clock)?;
-        if !reconciled.unresolved.is_empty() || !reconciled.foreign.is_empty() {
+        if self.unproven(&executor, task, fence)? {
             return Ok((Verdict::Merge, Merge::Not(NotMerged::Reconciling)));
         }
         // Every pass that does not merge relinquishes the task, which
@@ -556,6 +580,20 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
                 },
                 now,
             )?;
+        }
+        // The store checks the retry deadline only when an attempt starts.
+        // A continued attempt past it ends here, before any new verdict or
+        // intent, which settles the task as exhausted. Its evidence names
+        // the subject it was exhausted on.
+        if past_deadline(&self.store.task(task)?, now) {
+            self.store.finish_attempt(
+                task,
+                fence,
+                attempt,
+                AttemptOutcome::Failed(FailureClass::Retryable),
+                now,
+            )?;
+            return Ok((Verdict::Merge, Merge::Not(NotMerged::Exhausted)));
         }
         let house_grants = super::standing_grants(self.house)?;
         let mut markers = HouseGateStore {
@@ -623,7 +661,7 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
                             task,
                             fence,
                             attempt,
-                            crate::contracts::AttemptOutcome::Succeeded,
+                            AttemptOutcome::Succeeded,
                             self.clock.now(),
                         )?;
                         Merge::Done
@@ -713,9 +751,77 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
         .with_merge_grant(merge.clone())
     }
 
+    /// Reconcile the effects of gate task `task`, held under `fence`, and
+    /// say whether any still lacks a proven outcome. An effect under a risk
+    /// decision counts: the decision is about its task, and the request may
+    /// still land. Such an effect is looked up too, and only a conclusive
+    /// answer is recorded.
+    fn unproven(&self, executor: &dyn EffectExecutor, task: &TaskId, fence: Fence) -> Result<bool> {
+        let reconciled = reconcile(self.store, executor, task, fence, self.clock)?;
+        if !reconciled.unresolved.is_empty() || !reconciled.foreign.is_empty() {
+            return Ok(true);
+        }
+        // What `reconcile` leaves unproven is waived under a current
+        // decision, which it does not look up.
+        let descriptor = executor.descriptor();
+        let mut unproven = false;
+        for effect in self.store.task(task)?.effects() {
+            if effect.state().is_resolved() {
+                continue;
+            }
+            let request = effect.request();
+            let found = if request.backend() == &descriptor.backend
+                && descriptor.supports_lookup(request.effect())
+            {
+                executor.lookup(request)
+            } else {
+                Ok(Lookup::Unknown)
+            };
+            let outcome = match found {
+                Ok(Lookup::Applied(receipt)) => EffectOutcome::Applied(receipt),
+                Ok(Lookup::Absent) => EffectOutcome::NotApplied(NotAppliedReason::ConfirmedAbsent),
+                Ok(Lookup::Unknown) | Err(_) => {
+                    unproven = true;
+                    continue;
+                }
+            };
+            let recorded = self.store.record_submission_outcome(
+                task,
+                fence,
+                effect.seq(),
+                effect.submissions(),
+                outcome,
+                self.clock.now(),
+            )?;
+            unproven |= !recorded.state().is_resolved();
+        }
+        Ok(unproven)
+    }
+
+    /// Whether `settled`, a settled gate task of the pull request, has an
+    /// effect the forge still cannot prove applied or absent. Each such
+    /// effect is looked up again, and a conclusive answer is recorded.
+    fn unproven_settled(&self, settled: &TaskRecord, merge: &MergeGrant) -> Result<bool> {
+        if settled
+            .effects()
+            .iter()
+            .all(|effect| effect.state().is_resolved())
+        {
+            return Ok(false);
+        }
+        let reread = reread_settled(
+            self.store,
+            &self.executor(merge),
+            &settled.spec().id,
+            self.clock,
+        )?;
+        Ok(!reread.unresolved.is_empty() || !reread.foreign.is_empty())
+    }
+
     /// Reconcile and settle `stale`, an earlier gate task of the pull
     /// request. `Some` says why it still stands; no task replaces it until
-    /// it settled.
+    /// it settled, and it never settles with an effect whose outcome is not
+    /// proven.
     fn retire(
         &self,
         stale: &TaskRecord,
@@ -739,9 +845,10 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             Ok(fence) => fence,
             Err(refusal) => return Ok(Some(GateResult::ReportOnly(refused(refusal)))),
         };
-        let settled = reconcile(self.store, &self.executor(merge), stale, fence, self.clock)
-            .and_then(|reconciled| {
-                if !reconciled.unresolved.is_empty() || !reconciled.foreign.is_empty() {
+        let settled = self
+            .unproven(&self.executor(merge), stale, fence)
+            .and_then(|unproven| {
+                if unproven {
                     return Ok(false);
                 }
                 match self.store.settle_cancelled(stale, fence, self.clock.now()) {
@@ -829,6 +936,15 @@ const PASS_EVENTS: usize = 3;
 /// next claim.
 fn room(record: &TaskRecord, events: usize) -> bool {
     record.ownership().len().saturating_add(events) <= MAX_OWNERSHIP_HISTORY
+}
+
+/// Whether `record`'s retry deadline passed at `now`: its first attempt
+/// started longer ago than its retry policy allows, the rule the store
+/// applies when an attempt starts.
+fn past_deadline(record: &TaskRecord, now: Timestamp) -> bool {
+    record.attempts().first().is_some_and(|first| {
+        now.saturating_since(first.started_at()) > record.spec().retry.max_elapsed()
+    })
 }
 
 /// The pull request a gate task of `repository` was created for, under any

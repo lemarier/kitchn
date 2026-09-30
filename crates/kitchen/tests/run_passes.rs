@@ -5,7 +5,7 @@
 mod common;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
     rc::Rc,
     time::Duration,
@@ -26,8 +26,8 @@ use kitchen::{
     },
     scheduling::IntervalMinutes,
     state::{
-        ConsumerState, HouseStore, MailSender, PostKind, ReportedOutcome, RunState, StateError,
-        TaskState, WorkerPost,
+        ConsumerState, EffectOutcome, EffectState, HouseStore, MailSender, PostKind,
+        ReportedOutcome, RiskAction, RiskDecision, RunState, StateError, TaskState, WorkerPost,
     },
     workflows::{
         coordination::{Supervision, current_worker},
@@ -87,6 +87,9 @@ struct Forge {
     reads: Rc<RefCell<Vec<String>>>,
     /// Submitted writes: endpoint and body.
     writes: Rc<RefCell<Vec<(String, Value)>>>,
+    /// While set, a write is received and its answer lost: nothing applies
+    /// and the caller cannot tell.
+    lose_writes: Rc<Cell<bool>>,
 }
 
 impl Forge {
@@ -96,6 +99,7 @@ impl Forge {
             queued: Rc::new(RefCell::new(BTreeMap::new())),
             reads: Rc::new(RefCell::new(Vec::new())),
             writes: Rc::new(RefCell::new(Vec::new())),
+            lose_writes: Rc::new(Cell::new(false)),
         }
     }
 
@@ -192,6 +196,11 @@ impl GitHubMutationTransport for Forge {
         self.writes
             .borrow_mut()
             .push((endpoint.clone(), request.body().clone()));
+        if self.lose_writes.get() {
+            return Err(EffectFailure::Uncertain(
+                kitchen::contracts::UncertainReason::ResponseLost,
+            ));
+        }
         let pull = endpoint
             .strip_suffix("/merge")
             .map(str::to_owned)
@@ -2177,15 +2186,23 @@ fn pull_request_now(kitchen: &Kitchen) -> TestResult<Value> {
         .ok_or("no pull request")?)
 }
 
-/// The forge shows pull request 12 ready at head `at` on base `e`: checks
-/// green, the required reviewer approved the head, nothing outstanding.
+/// The forge shows pull request 12 ready at head `at` on base `e`
+/// ([`green_on`]).
 fn green_at(kitchen: &Kitchen, at: char) -> TestResult {
+    green_on(kitchen, at, 'e')
+}
+
+/// The forge shows pull request 12 ready at head `at` on a base branch
+/// whose tip is `base`: checks green, the required reviewer approved the
+/// head, nothing outstanding.
+fn green_on(kitchen: &Kitchen, at: char, base: char) -> TestResult {
     let forge = kitchen.forge();
     let head = commit(at)?;
     let head = head.as_str();
+    set_pull_request(kitchen, "/base/sha", json!(commit(base)?.as_str()))?;
     forge.set(
         &format!("repos/{REPO}/branches/main"),
-        json!({"name": "main", "commit": {"sha": commit('e')?.as_str()}}),
+        json!({"name": "main", "commit": {"sha": commit(base)?.as_str()}}),
     );
     forge.set(&format!("repos/{REPO}"), json!({"default_branch": "main"}));
     forge.set(
@@ -2193,7 +2210,7 @@ fn green_at(kitchen: &Kitchen, at: char) -> TestResult {
         json!({"data": {"repository": {"pullRequest": {"headRefOid": head, "mergeStateStatus": "CLEAN"}}}}),
     );
     forge.set(
-        &format!("repos/{REPO}/compare/{}...{head}", commit('e')?.as_str()),
+        &format!("repos/{REPO}/compare/{}...{head}", commit(base)?.as_str()),
         json!({"behind_by": 0, "ahead_by": 1}),
     );
     forge.set(
@@ -2261,12 +2278,18 @@ fn with_merge_grant(mut config: HouseConfig) -> TestResult<HouseConfig> {
 /// An attestation of pull request 12 at `head` on base `e`, resting on
 /// forge review `id` by `reviewer`.
 fn attestation(head: char, reviewer: &str, id: u64) -> TestResult<GateAttestation> {
+    attestation_on(head, 'e', reviewer, id)
+}
+
+/// An attestation of pull request 12 at `head` on base `base`, resting on
+/// forge review `id` by `reviewer`.
+fn attestation_on(head: char, base: char, reviewer: &str, id: u64) -> TestResult<GateAttestation> {
     Ok(GateAttestation {
         house: house()?,
         repository: repo()?,
         pull_request: pr(12)?,
         head: commit(head)?,
-        base: commit('e')?,
+        base: commit(base)?,
         forge_review: ForgeReview {
             id: std::num::NonZeroU64::new(id).ok_or("review id")?,
             reviewer: reviewer.to_owned(),
@@ -2949,6 +2972,299 @@ fn gate_reports_an_earlier_task_whose_ownership_history_is_full() -> TestResult 
     ));
     assert_eq!(gate_tasks(&kitchen)?.len(), 1);
     assert!(merges(&kitchen).is_empty());
+    Ok(())
+}
+
+/// Pull request 12 is ready at head `head` on a base branch whose tip is
+/// `base`, and an independent reviewer's attestation of exactly that is
+/// recorded.
+fn green_and_attested_on(kitchen: &Kitchen, head: char, base: char) -> TestResult {
+    set_pull_request(kitchen, "/head/sha", json!(commit(head)?.as_str()))?;
+    green_on(kitchen, head, base)?;
+    record_as(
+        kitchen,
+        &attestation_on(head, base, "safety-reviewer", 11)?,
+        &common::scheduled("reviewer")?,
+    )?;
+    Ok(())
+}
+
+/// A house with a merge grant whose gate pass sent the merge of pull
+/// request 12 at head `d` and lost the answer. The forge shows the pull
+/// request open at `d`, which proves nothing either way. The owner then
+/// handed the effect over and decided the gate task may only settle
+/// unsuccessfully.
+fn merge_sent_and_waived() -> TestResult<Kitchen> {
+    let mut kitchen = settled_with_pull_request(true)?;
+    kitchen.config = with_merge_grant(house_config()?)?;
+    green_pull_request(&kitchen)?;
+    attest(&kitchen, 'd')?;
+    kitchen.forge().lose_writes.set(true);
+    let action = one_verdict(kitchen.gate()?)?;
+    kitchen.forge().lose_writes.set(false);
+    assert_eq!(
+        action.result,
+        GateResult::NotMerged(NotMerged::Uncertain),
+        "{action:?}"
+    );
+    assert_eq!(merges(&kitchen).len(), 1);
+    let (store, now) = (kitchen.store(), kitchen.clock.now());
+    let record = gate_tasks(&kitchen)?.pop().ok_or("no gate task")?;
+    let task = record.spec().id.clone();
+    let sent = record.effects().last().ok_or("no merge intent")?;
+    let fence = store
+        .claim(
+            &task,
+            &common::scheduled("owner")?,
+            kitchen::contracts::LeaseTtl::new(TASK_LEASE)?,
+            now,
+        )?
+        .fence();
+    store.record_effect_outcome(&task, fence, sent.seq(), EffectOutcome::Unresolvable, now)?;
+    let waived = store.accept_risk(
+        &task,
+        fence,
+        sent.seq(),
+        RiskDecision {
+            effect: sent.request().key().clone(),
+            decided_by: HolderId::new("owner")?,
+            revision: record.evidence().revision(),
+            action: RiskAction::SettleUnsuccessfully,
+        },
+        now,
+    )?;
+    assert!(matches!(waived.state(), EffectState::Waived { .. }));
+    store.relinquish(&task, fence, now)?;
+    // The decision covers the effect: the task reports nothing unresolved.
+    assert_eq!(store.task(&task)?.unresolved_effects().count(), 0);
+    Ok(kitchen)
+}
+
+/// The gate pass only reports that it is reconciling: no gate task beyond
+/// the first exists, and no write beyond the first merge was sent.
+fn assert_barred(kitchen: &Kitchen, case: &str) -> TestResult {
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(
+        action.result,
+        GateResult::NotMerged(NotMerged::Reconciling),
+        "{case}: {action:?}"
+    );
+    assert_eq!(gate_tasks(kitchen)?.len(), 1, "{case}");
+    assert_eq!(merges(kitchen).len(), 1, "{case}");
+    Ok(())
+}
+
+#[test]
+fn gate_sends_no_merge_while_an_earlier_one_has_no_proven_outcome() -> TestResult {
+    let mut kitchen = merge_sent_and_waived()?;
+    let earlier = gate_tasks(&kitchen)?[0].spec().id.clone();
+    // Under the same task, the waived merge still bars another.
+    assert_barred(&kitchen, "same task")?;
+    // The base branch moves, the pull request is attested on the new tip,
+    // and the house's specification changes: the verdict is a merge at a
+    // subject the earlier one never covered, under another gate task.
+    green_and_attested_on(&kitchen, 'd', 'a')?;
+    change_gate_specification(&mut kitchen)?;
+    assert_barred(&kitchen, "new task")?;
+    // The earlier task was not cancelled away, and its merge is still
+    // waived, not resolved.
+    let record = kitchen.store().task(&earlier)?;
+    assert!(matches!(record.state(), TaskState::Open), "{record:?}");
+    assert!(matches!(
+        record.effects().last().map(|effect| effect.state()),
+        Some(EffectState::Waived { .. })
+    ));
+    // The owner settles the earlier task, as the decision allows. Its
+    // merge is no more proven than before.
+    let now = kitchen.clock.now();
+    let fence = kitchen
+        .store()
+        .claim(
+            &earlier,
+            &common::scheduled("owner")?,
+            kitchen::contracts::LeaseTtl::new(TASK_LEASE)?,
+            now,
+        )?
+        .fence();
+    kitchen.store().settle_cancelled(&earlier, fence, now)?;
+    assert_barred(&kitchen, "settled task")?;
+    Ok(())
+}
+
+#[test]
+fn gate_merges_once_the_forge_proves_the_earlier_merge_absent() -> TestResult {
+    for settle_first in [false, true] {
+        let mut kitchen = merge_sent_and_waived()?;
+        let earlier = gate_tasks(&kitchen)?[0].spec().id.clone();
+        change_gate_specification(&mut kitchen)?;
+        if settle_first {
+            let now = kitchen.clock.now();
+            let fence = kitchen
+                .store()
+                .claim(
+                    &earlier,
+                    &common::scheduled("owner")?,
+                    kitchen::contracts::LeaseTtl::new(TASK_LEASE)?,
+                    now,
+                )?
+                .fence();
+            kitchen.store().settle_cancelled(&earlier, fence, now)?;
+        }
+        // The head moves: the request sent for head d can no longer merge,
+        // which the lookup reads as proof of absence.
+        green_and_attested_on(&kitchen, 'f', 'a')?;
+        let action = one_verdict(kitchen.gate()?)?;
+        assert_eq!(
+            action.result,
+            GateResult::Merged,
+            "{settle_first}: {action:?}"
+        );
+        let writes = merges(&kitchen);
+        assert_eq!(writes.len(), 2, "{settle_first}");
+        assert_eq!(writes[1].1["sha"], commit('f')?.as_str(), "{settle_first}");
+        let record = kitchen.store().task(&earlier)?;
+        assert!(
+            matches!(
+                record.state(),
+                TaskState::Settled {
+                    settlement: Settlement::Cancelled,
+                    ..
+                }
+            ),
+            "{settle_first}: {record:?}"
+        );
+        assert!(
+            matches!(
+                record.effects().last().map(|effect| effect.state()),
+                Some(EffectState::NotApplied { .. })
+            ),
+            "{settle_first}: {record:?}"
+        );
+        assert_eq!(gate_tasks(&kitchen)?.len(), 2, "{settle_first}");
+    }
+    Ok(())
+}
+
+#[test]
+fn gate_never_repeats_a_merge_the_forge_shows_landed() -> TestResult {
+    let mut kitchen = merge_sent_and_waived()?;
+    green_and_attested_on(&kitchen, 'd', 'a')?;
+    change_gate_specification(&mut kitchen)?;
+    // The lost request lands after all. The pull request is closed, so the
+    // pass has nothing to judge and sends nothing.
+    set_pull_request(&kitchen, "/merged", json!(true))?;
+    set_pull_request(&kitchen, "/state", json!("closed"))?;
+    assert!(matches!(kitchen.gate()?, Outcome::Idle));
+    assert_eq!(gate_tasks(&kitchen)?.len(), 1);
+    assert_eq!(merges(&kitchen).len(), 1);
+    Ok(())
+}
+
+/// The retry deadline of the house's one gate task, in seconds from its
+/// first attempt.
+fn retry_deadline(kitchen: &Kitchen) -> TestResult<u64> {
+    let tasks = gate_tasks(kitchen)?;
+    let task = tasks.first().ok_or("no gate task")?;
+    Ok(task.spec().retry.max_elapsed().as_secs())
+}
+
+#[test]
+fn gate_ends_a_continued_attempt_past_the_retry_deadline() -> TestResult {
+    // The gate task's attempt was interrupted by a pass that did not merge.
+    // The pull request is green and attested at head f.
+    let kitchen = gate_task_left_open(NotMerged::Moved)?;
+    kitchen.clock.advance(retry_deadline(&kitchen)? + 1);
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(action.head, commit('f')?);
+    assert_eq!(
+        action.result,
+        GateResult::NotMerged(NotMerged::Exhausted),
+        "{action:?}"
+    );
+    assert!(merges(&kitchen).is_empty());
+    let tasks = gate_tasks(&kitchen)?;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].attempts().len(), 1);
+    assert!(
+        matches!(
+            tasks[0].state(),
+            TaskState::Settled {
+                settlement: Settlement::Exhausted,
+                ..
+            }
+        ),
+        "{:?}",
+        tasks[0].state()
+    );
+    // No intent was recorded for head f: the only one is the abandoned
+    // intent for head d.
+    assert_eq!(tasks[0].effects().len(), 1);
+    // On the same head and base no new task retries the same evidence.
+    let again = one_verdict(kitchen.gate()?)?;
+    assert_eq!(
+        again.result,
+        GateResult::ReportOnly(ReportReason::ExhaustedForSubject),
+        "{again:?}"
+    );
+    assert_eq!(gate_tasks(&kitchen)?.len(), 1);
+    assert!(merges(&kitchen).is_empty());
+    // A moved base is new evidence, and so is a new head: a new generation
+    // of the task merges.
+    green_and_attested_on(&kitchen, 'f', 'a')?;
+    move_head_before_the_merge(&kitchen, '1')?;
+    let moved = one_verdict(kitchen.gate()?)?;
+    assert_eq!(
+        moved.result,
+        GateResult::NotMerged(NotMerged::Moved),
+        "{moved:?}"
+    );
+    assert_eq!(gate_tasks(&kitchen)?.len(), 2);
+    green_and_attested_on(&kitchen, '1', 'a')?;
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(action.result, GateResult::Merged, "{action:?}");
+    let writes = merges(&kitchen);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].1["sha"], commit('1')?.as_str());
+    assert_eq!(gate_tasks(&kitchen)?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn gate_continues_an_attempt_up_to_the_retry_deadline() -> TestResult {
+    // Exactly at the deadline the budget is not yet spent.
+    let kitchen = gate_task_left_open(NotMerged::Moved)?;
+    kitchen.clock.advance(retry_deadline(&kitchen)?);
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(action.result, GateResult::Merged, "{action:?}");
+    let tasks = gate_tasks(&kitchen)?;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].attempts().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn gate_reconciles_an_unresolved_merge_past_the_retry_deadline() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    kitchen.config = with_merge_grant(house_config()?)?;
+    green_pull_request(&kitchen)?;
+    attest(&kitchen, 'd')?;
+    kitchen.forge().lose_writes.set(true);
+    let lost = one_verdict(kitchen.gate()?)?;
+    kitchen.forge().lose_writes.set(false);
+    assert_eq!(lost.result, GateResult::NotMerged(NotMerged::Uncertain));
+    kitchen.clock.advance(retry_deadline(&kitchen)? + 1);
+    // Past the deadline the sent merge is still looked up, and the task is
+    // neither ended nor replaced while its outcome is unknown.
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(
+        action.result,
+        GateResult::NotMerged(NotMerged::Reconciling),
+        "{action:?}"
+    );
+    let tasks = gate_tasks(&kitchen)?;
+    assert_eq!(tasks.len(), 1);
+    assert!(matches!(tasks[0].state(), TaskState::Open));
+    assert_eq!(merges(&kitchen).len(), 1);
     Ok(())
 }
 

@@ -196,6 +196,8 @@ fn init_creates_the_house_store_that_commands_default_to() -> TestResult {
     let kitchn = |args: &[&str]| -> TestResult<Output> {
         Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
             .current_dir(&root)
+            .env_remove("KITCHN_HOME")
+            .env("HOME", &home)
             .args(args)
             .output()?)
     };
@@ -237,9 +239,10 @@ fn init_creates_the_house_store_that_commands_default_to() -> TestResult {
         &registry_arg,
     ])?;
     assert_eq!(ghost.status.code(), Some(1), "{ghost:?}");
-    // Without either flag there is nothing to locate the store from.
+    // The registry defaults to HOME/.kitchn even outside a checkout when
+    // the house was named explicitly.
     let neither = kitchn(&["store", "capacity", "--house", "acme"])?;
-    assert_eq!(neither.status.code(), Some(2), "{neither:?}");
+    assert_eq!(neither.status.code(), Some(0), "{neither:?}");
 
     // Registering a reviewed file creates the store as well.
     let manual = root.join("manual");

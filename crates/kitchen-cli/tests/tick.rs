@@ -65,6 +65,8 @@ impl Kitchen {
 
     fn kitchn(&self, args: &[&str]) -> TestResult<Output> {
         Ok(Command::new(env!("CARGO_BIN_EXE_kitchn"))
+            .env_remove("KITCHN_HOME")
+            .env("HOME", &self.root)
             .args(args)
             .output()?)
     }

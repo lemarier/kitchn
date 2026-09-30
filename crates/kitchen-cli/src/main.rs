@@ -15,7 +15,7 @@ use kitchen::{ErrorClass, HouseId, TaskId};
     name = "kitchn",
     version,
     about = "Portable agent workflows",
-    after_help = "Docs: https://getkitchn.com/docs/"
+    after_help = "Defaults: --registry uses KITCHN_HOME, then ~/.kitchn; --house uses this checkout's stored repository binding. Pass either flag explicitly to override. Scheduled triggers must carry both flags.\nDocs: https://getkitchn.com/docs/"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -65,7 +65,26 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let raw_arguments: Vec<_> = std::env::args_os().collect();
+    let arguments = match commands::defaults::arguments(raw_arguments.clone()) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            let _ = writeln!(io::stderr().lock(), "error: {error}");
+            let precheck = matches!(
+                (
+                    raw_arguments.get(1).and_then(|arg| arg.to_str()),
+                    raw_arguments.get(2).and_then(|arg| arg.to_str())
+                ),
+                (Some("gardener" | "budget"), Some("precheck"))
+            );
+            return ExitCode::from(match error.class() {
+                ErrorClass::InvalidInput => 2,
+                _ if precheck => 3,
+                _ => 1,
+            });
+        }
+    };
+    let cli = match Cli::try_parse_from(arguments) {
         Ok(cli) => cli,
         Err(error) => {
             if matches!(

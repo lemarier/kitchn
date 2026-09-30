@@ -3,6 +3,7 @@ pub mod audit;
 pub mod budget;
 pub mod cleanup;
 pub mod decompose;
+pub mod defaults;
 pub mod forge;
 pub mod gardener;
 pub mod gate;

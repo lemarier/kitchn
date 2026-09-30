@@ -111,7 +111,7 @@ struct HouseArgs {
 
 /// Where the house's bound worker backend runs on this host.
 #[derive(Args)]
-struct BackendArgs {
+pub(super) struct BackendArgs {
     /// Absolute path of the Orca executable, for a house bound to Orca.
     #[arg(long)]
     orca: Option<PathBuf>,
@@ -134,7 +134,7 @@ struct BackendArgs {
 }
 
 #[derive(Args)]
-struct PickupArgs {
+pub(super) struct PickupArgs {
     /// The label that marks an issue ready for an agent.
     #[arg(long, default_value = "ready")]
     ready_label: String,
@@ -157,21 +157,37 @@ struct PickupArgs {
 }
 
 /// The house, its store, and the repository one pass serves.
-struct Opened {
-    registry: HouseRegistry,
-    config: HouseConfig,
-    store: HouseStore,
-    repository: Repository,
+pub(super) struct Opened {
+    pub(super) registry: HouseRegistry,
+    pub(super) config: HouseConfig,
+    pub(super) store: HouseStore,
+    pub(super) repository: Repository,
 }
 
 impl Opened {
     fn open(args: &HouseArgs) -> Result<Self, kitchen::Error> {
-        let registry = HouseRegistry::new(super::house::canonical_root(args.registry.clone())?)?;
-        let config = registry.load(&args.house)?;
-        let store =
-            super::house::store_or_default(args.store.clone(), Some(&args.registry), &args.house)?;
-        let store = HouseStore::open(store, args.house.clone(), StoreOptions::default())?;
-        let repository = pass_repository(&config, args.repository.clone())?;
+        Self::open_parts(
+            args.registry.clone(),
+            &args.house,
+            args.store.clone(),
+            args.repository.clone(),
+        )
+    }
+
+    /// Open `house` from `registry`, with `store` or the default one, for
+    /// `repository` or the house's only one.
+    pub(super) fn open_parts(
+        registry: PathBuf,
+        house: &HouseId,
+        store: Option<PathBuf>,
+        repository: Option<Repository>,
+    ) -> Result<Self, kitchen::Error> {
+        let root = super::house::canonical_root(registry)?;
+        let store = super::house::store_or_default(store, Some(&root), house)?;
+        let registry = HouseRegistry::new(root)?;
+        let config = registry.load(house)?;
+        let store = HouseStore::open(store, house.clone(), StoreOptions::default())?;
+        let repository = pass_repository(&config, repository)?;
         Ok(Self {
             registry,
             config,
@@ -182,7 +198,7 @@ impl Opened {
 
     /// The house's forge reads, over its forge binding's checked credential,
     /// with `gh` (and `curl` for a GitHub App) from `PATH`.
-    fn forge(&self) -> Result<GitHubClient<GhCli>, kitchen::Error> {
+    pub(super) fn forge(&self) -> Result<GitHubClient<GhCli>, kitchen::Error> {
         let binding = forge_binding(&self.registry, &self.config.house)?;
         let scope = binding.scope(&self.config)?;
         let file = CredentialFile::new(
@@ -196,13 +212,13 @@ impl Opened {
         Ok(GitHubClient::new(scope, transport, ReadLimits::default()))
     }
 
-    /// The house's bound worker backend for `pass`, which must support
-    /// `required`. Orca names each worker's workspace after its branch
-    /// without `branch_prefix`.
-    fn backend(
+    /// The house's bound worker backend for `caller` (a pass name, or the
+    /// tick), which must support `required`. Orca names each worker's
+    /// workspace after its branch without `branch_prefix`.
+    pub(super) fn backend(
         &self,
         args: &BackendArgs,
-        pass: Pass,
+        caller: &str,
         branch_prefix: Option<BranchName>,
         required: &[Capability],
     ) -> Result<Box<dyn CoordinatorMailbox>, kitchen::Error> {
@@ -251,7 +267,7 @@ impl Opened {
                     &self.config,
                     HttpSession {
                         run: ExternalRef::new(&format!("kitchen-{}", self.config.house))?,
-                        coordinator: ExternalRef::new(pass.as_str())?,
+                        coordinator: ExternalRef::new(caller)?,
                         curl: curl.clone(),
                         call_timeout: HTTP_CALL_TIMEOUT,
                     },
@@ -276,10 +292,10 @@ pub fn run(args: RunArgs) -> ExitCode {
         } => Opened::open(&house).and_then(|opened| {
             // The route is decided by the backend's own descriptor inside
             // the pass; only supervision is required to connect.
-            let settings = settings(&opened, pickup)?;
+            let settings = settings(&opened, &pickup)?;
             let backend = opened.backend(
                 &backend,
-                Pass::Pickup,
+                Pass::Pickup.as_str(),
                 Some(settings.branch_prefix.clone()),
                 MailboxRoute::House.worker_requirements(),
             )?;
@@ -293,6 +309,7 @@ pub fn run(args: RunArgs) -> ExitCode {
                     clock: &clock,
                     settings: &settings,
                     take_over: house.take_over,
+                    tick: None,
                 }
                 .run()?,
             )
@@ -300,7 +317,7 @@ pub fn run(args: RunArgs) -> ExitCode {
         RunCommand::Coordinate { house, backend } => Opened::open(&house).and_then(|opened| {
             let backend = opened.backend(
                 &backend,
-                Pass::Coordinate,
+                Pass::Coordinate.as_str(),
                 None,
                 MailboxRoute::House.worker_requirements(),
             )?;
@@ -313,6 +330,7 @@ pub fn run(args: RunArgs) -> ExitCode {
                     forge: &forge,
                     clock: &clock,
                     take_over: house.take_over,
+                    tick: None,
                 }
                 .run()?,
             )
@@ -320,7 +338,7 @@ pub fn run(args: RunArgs) -> ExitCode {
         RunCommand::Repair { house, backend } => Opened::open(&house).and_then(|opened| {
             let backend = opened.backend(
                 &backend,
-                Pass::Repair,
+                Pass::Repair.as_str(),
                 None,
                 &[Capability::WorkerStatusAndOutcome],
             )?;
@@ -334,6 +352,7 @@ pub fn run(args: RunArgs) -> ExitCode {
                     clock: &clock,
                     repository: &opened.repository,
                     take_over: house.take_over,
+                    tick: None,
                 }
                 .run()?,
             )
@@ -352,6 +371,7 @@ pub fn run(args: RunArgs) -> ExitCode {
                     repository: &opened.repository,
                     authors: &authors,
                     take_over: house.take_over,
+                    tick: None,
                 }
                 .run()?,
             )
@@ -360,14 +380,17 @@ pub fn run(args: RunArgs) -> ExitCode {
     report(result)
 }
 
-fn settings(opened: &Opened, args: PickupArgs) -> Result<PickupSettings, kitchen::Error> {
+pub(super) fn settings(
+    opened: &Opened,
+    args: &PickupArgs,
+) -> Result<PickupSettings, kitchen::Error> {
     let resolved = resolve_instructions(opened.registry.root(), &opened.config, None)?;
     Ok(PickupSettings {
         repository: opened.repository.clone(),
         labels: PickupLabels {
-            ready: args.ready_label,
-            needs_spec: args.needs_spec_label,
-            human_only: args.human_label,
+            ready: args.ready_label.clone(),
+            needs_spec: args.needs_spec_label.clone(),
+            human_only: args.human_label.clone(),
         },
         capacity: args.capacity,
         branch_prefix: BranchName::new(&args.branch_prefix)?,

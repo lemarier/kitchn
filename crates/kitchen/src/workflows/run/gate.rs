@@ -5,9 +5,10 @@
 use std::fmt;
 
 use super::{Outcome, Pass, RunError, kitchen_pull_requests};
+use crate::workflows::tick::PassRun;
 use crate::{
-    TaskId,
-    contracts::{Clock, CommitId, IssueNumber, Repository},
+    ConsumerId, TaskId,
+    contracts::{Clock, CommitId, Fence, IssueNumber, Repository},
     house::HouseConfig,
     integrations::github::{GitHubClient, GitHubReadTransport},
     state::HouseStore,
@@ -39,6 +40,9 @@ pub struct GatePass<'a, T> {
     pub authors: &'a [String],
     /// Take over an expired pass lease instead of stopping.
     pub take_over: bool,
+    /// The house tick's run this pass serves, if a tick started it. The
+    /// pass only reads its tasks; it records each one it assesses.
+    pub tick: Option<&'a PassRun>,
 }
 
 /// The verdict on one pull request at one head.
@@ -78,13 +82,16 @@ impl<T: GitHubReadTransport> GatePass<'_, T> {
             return Err(RunError::RepositoryOutsideHouse.into());
         }
         let consumer = Pass::Gate.consumer(self.repository)?;
-        super::under_lease(self.store, &consumer, self.take_over, self.clock, |_| {
-            self.pass()
+        super::under_lease(self.store, &consumer, self.take_over, self.clock, |fence| {
+            self.pass(&consumer, fence)
         })
     }
 
-    fn pass(&self) -> Result<Vec<GateAction>> {
-        let found = kitchen_pull_requests(self.store, self.forge, self.repository)?;
+    /// Evaluate the pull requests, renewing the pass lease and the tick run
+    /// before each forge lookup and each evaluation.
+    fn pass(&self, consumer: &ConsumerId, fence: Fence) -> Result<Vec<GateAction>> {
+        let renew = || super::renew(self.store, consumer, fence, self.tick, self.clock);
+        let found = kitchen_pull_requests(self.store, self.forge, self.repository, &renew)?;
         let policy = ForgeGatePolicy::for_house(
             self.house,
             self.authors.to_vec(),
@@ -92,6 +99,8 @@ impl<T: GitHubReadTransport> GatePass<'_, T> {
         );
         let mut actions = Vec::new();
         for pull_request in found.into_iter().take(MAX_GATE_PULL_REQUESTS) {
+            renew()?;
+            super::record(self.store, self.tick, &pull_request.task, self.clock)?;
             let evidence = collect_forge_evidence(
                 self.forge,
                 self.store.house(),

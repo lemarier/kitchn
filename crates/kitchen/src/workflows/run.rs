@@ -30,6 +30,10 @@
 //!
 //! A pass reads before it spends: when nothing is actionable it returns
 //! [`Outcome::Idle`] without launching or messaging any worker.
+//!
+//! The house tick runs these passes in process through [`TickPasses`], with
+//! the tick's run in each pass's `tick` field: the pass records a task on the
+//! run before it touches it and renews the run with its own lease.
 
 use std::{fmt, str::FromStr, time::Duration};
 
@@ -45,6 +49,7 @@ use crate::{
     workflows::{
         coordination::{MailboxRoute, task_branch},
         pickup::{IssueRef, TaskTemplate, issue_task_id, stable_hash},
+        tick::PassRun,
     },
 };
 
@@ -52,11 +57,13 @@ mod coordinate;
 mod gate;
 mod pickup;
 mod repair;
+mod tick;
 
 pub use coordinate::{CoordinateAction, CoordinatePass, Unroutable};
 pub use gate::{GateAction, GatePass, MAX_GATE_PULL_REQUESTS};
 pub use pickup::{MAX_READY_INSPECTED, PickupAction, PickupLabels, PickupPass, PickupSettings};
 pub use repair::{RepairAction, RepairPass};
+pub use tick::{TickPasses, failed_report};
 
 type Result<T> = std::result::Result<T, crate::Error>;
 
@@ -160,6 +167,12 @@ pub enum RunError {
     /// The worker mailbox refused or could not be read.
     #[error("worker mailbox: {0}")]
     Mailbox(#[source] MailboxError),
+    /// The pass needs the house's worker backend and none was given.
+    #[error("this pass needs the house's worker backend")]
+    NoBackend,
+    /// Pickup needs its settings and none were given.
+    #[error("pickup needs its settings")]
+    NoPickupSettings,
 }
 
 impl RunError {
@@ -171,6 +184,7 @@ impl RunError {
             | Self::RepositoryOutsideHouse
             | Self::RepositoryAmbiguous
             | Self::BackendArguments(_) => ErrorClass::InvalidInput,
+            Self::NoBackend | Self::NoPickupSettings => ErrorClass::Refused,
             Self::Mailbox(MailboxError::Fenced) => ErrorClass::Conflict,
             Self::Mailbox(MailboxError::Unavailable(_)) => ErrorClass::Execution,
         }
@@ -273,11 +287,29 @@ fn under_lease<A>(
     finish(store, consumer, lease.fence(), clock, body(lease.fence()))
 }
 
-/// Extend the pass lease before the pass's next effect. A pass whose lease
-/// was taken over, or ran out, stops here with the store's refusal.
-fn renew(store: &HouseStore, consumer: &ConsumerId, fence: Fence, clock: &dyn Clock) -> Result<()> {
+/// Extend the pass lease, and the tick run the pass serves, before the
+/// pass's next effect. A pass whose lease or tick run was taken over, or ran
+/// out, stops here with the store's refusal.
+fn renew(
+    store: &HouseStore,
+    consumer: &ConsumerId,
+    fence: Fence,
+    tick: Option<&PassRun>,
+    clock: &dyn Clock,
+) -> Result<()> {
     store.renew_consumer(consumer, fence, LeaseTtl::new(PASS_LEASE)?, clock.now())?;
-    Ok(())
+    tick.map_or(Ok(()), |run| run.renew(store, clock))
+}
+
+/// Record `task` on the tick run the pass serves, if any, before the pass
+/// touches it.
+fn record(
+    store: &HouseStore,
+    tick: Option<&PassRun>,
+    task: &TaskId,
+    clock: &dyn Clock,
+) -> Result<()> {
+    tick.map_or(Ok(()), |run| run.record_task(store, task, clock))
 }
 
 /// End a pass holding `consumer` at `fence` with `result`.
@@ -420,10 +452,12 @@ const MAX_SETTLED_LOOKUPS: usize = 16;
 /// `repository`, found through each issue's linked pull requests by the
 /// task's branch. At most [`MAX_SETTLED_LOOKUPS`] tasks are looked up, newest
 /// first; a lookup that fails stops the pass rather than reading as none.
+/// `renew` runs before each lookup and stops the pass when it fails.
 fn kitchen_pull_requests<T: GitHubReadTransport>(
     store: &HouseStore,
     forge: &GitHubClient<T>,
     repository: &Repository,
+    renew: &dyn Fn() -> Result<()>,
 ) -> Result<Vec<KitchenPullRequest>> {
     let mut settled: Vec<(Timestamp, TaskRecord, IssueRef)> = store
         .tasks()?
@@ -445,6 +479,7 @@ fn kitchen_pull_requests<T: GitHubReadTransport>(
         let Some(branch) = task_branch(&record) else {
             continue;
         };
+        renew()?;
         let linked =
             super::known(forge.linked_pull_requests(store.house(), repository, issue.number))?;
         if let Some(linked) = linked.into_iter().find(|linked| {

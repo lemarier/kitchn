@@ -5,9 +5,10 @@
 use std::fmt;
 
 use super::{KitchenPullRequest, Outcome, Pass, RunError, kitchen_pull_requests};
+use crate::workflows::tick::PassRun;
 use crate::{
-    TaskId,
-    contracts::{Clock, IssueNumber, Repository, Settlement, WorkerBackend},
+    ConsumerId, TaskId,
+    contracts::{Clock, Fence, IssueNumber, Repository, Settlement, WorkerBackend},
     house::HouseConfig,
     integrations::github::{GitHubClient, GitHubReadTransport},
     selection::WorkType,
@@ -43,6 +44,9 @@ pub struct RepairPass<'a, T> {
     pub repository: &'a Repository,
     /// Take over an expired pass lease instead of stopping.
     pub take_over: bool,
+    /// The house tick's run this pass serves, if a tick started it. The
+    /// pass only reads its tasks; it records each one it assesses.
+    pub tick: Option<&'a PassRun>,
 }
 
 /// What a repair pass decided about one pull request.
@@ -99,13 +103,16 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
             return Err(RunError::RepositoryOutsideHouse.into());
         }
         let consumer = Pass::Repair.consumer(self.repository)?;
-        super::under_lease(self.store, &consumer, self.take_over, self.clock, |_| {
-            self.pass()
+        super::under_lease(self.store, &consumer, self.take_over, self.clock, |fence| {
+            self.pass(&consumer, fence)
         })
     }
 
-    fn pass(&self) -> Result<Vec<RepairAction>> {
-        let found = kitchen_pull_requests(self.store, self.forge, self.repository)?;
+    /// Assess the pull requests, renewing the pass lease and the tick run
+    /// before each forge lookup and each writer observation.
+    fn pass(&self, consumer: &ConsumerId, fence: Fence) -> Result<Vec<RepairAction>> {
+        let renew = || super::renew(self.store, consumer, fence, self.tick, self.clock);
+        let found = kitchen_pull_requests(self.store, self.forge, self.repository, &renew)?;
         if found.is_empty() {
             return Ok(Vec::new());
         }
@@ -123,6 +130,8 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
         let mut candidates = Vec::with_capacity(found.len());
         let mut owners = Vec::with_capacity(found.len());
         for pull_request in found {
+            renew()?;
+            super::record(self.store, self.tick, &pull_request.task, self.clock)?;
             let record = self.store.task(&pull_request.task)?;
             if BranchFact::Stacked.holds(&record, &pull_request.branch) {
                 actions.push(RepairAction::Stacked {

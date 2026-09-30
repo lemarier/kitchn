@@ -449,7 +449,8 @@ backend schedule only start it; the house configuration's `tick` passes and
 the run ledger in the house store decide what runs.
 
 ```sh
-kitchn tick --registry <dir> --house <id> [--store <dir>]
+kitchn tick --registry <dir> --house <id> [--store <dir>] [--repository <owner/name>]
+            [<backend>] [<pickup options>]
 kitchn tick runs --registry <dir> --house <id> [--store <dir>]
 kitchn tick settle --registry <dir> --house <id> [--store <dir>] --pass <pass> --run <n> --reason <text> --holder <you>
 kitchn tick trigger launchd|cron --kitchn <abs path> --registry <abs dir> --house <id> [--every-minutes 1-59]
@@ -477,21 +478,33 @@ settled runs per pass for at most 30 days; it never drops a running or
 uncertain run. The tick exits 1 when a pass failed, is blocked, or outlasted its
 lease, or when the house configures no passes.
 
-The scheduled pickup, coordination, repair and gate passes are not wired in
-yet; until they are, every pass that runs is recorded as failed with "pass not
-available in this build".
+A due pass runs the same scheduled pass as [`kitchn run`](#kitchn-run), in
+process, with the same `<backend>` and pickup options; the forge and backend
+are resolved only when a pass is due, and only `pickup`, `coordinate`, and
+`repair` need the backend. The pass takes its `kitchn run` lease too, so a tick
+and a `kitchn run` of the same pass never act at once: whichever starts second
+does nothing, and the tick records the run as failed because another run holds
+the lease. Before a pass acts on a task it records the task on its run, and it
+renews the run whenever it renews its own lease. A pass that cannot start, such
+as one without the backend options it needs, is recorded as failed and the
+reason is printed. The tick never takes over an expired `kitchn run` lease or
+task claim: it records the run as failed until a person checks what the last
+run did and runs the pass with `kitchn run <pass> --take-over`. A launched
+worker's backend reference is linked as run evidence.
 
 `runs` lists the ledger and reads only. `trigger` prints a launchd plist or a
 crontab line that runs the tick every `--every-minutes` (default 5; for cron it
 must divide 60, since cron restarts its minute step each hour); it installs
-nothing and changes no live schedule.
+nothing and changes no live schedule. The printed command names only the registry and the
+house, so a house whose passes need worker backend options must add them to it
+by hand for now.
 
 ## `kitchn run`
 
 One bounded scheduled pass, for a trigger such as an Orca schedule, launchd, or
-cron. `kitchn tick` does not run these passes yet. `gate` needs only the house;
-`pickup`, `coordinate`, and `repair` also need the worker backend options below.
-Everything else defaults from the house.
+cron. `kitchn tick` runs the same passes when they are due. `gate` needs only
+the house; `pickup`, `coordinate`, and `repair` also need the worker backend
+options below. Everything else defaults from the house.
 
 ```sh
 kitchn run pickup     <house> <backend> [--ready-label ready] [--needs-spec-label needs-spec]

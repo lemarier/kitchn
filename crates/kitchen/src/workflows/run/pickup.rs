@@ -9,7 +9,7 @@ use crate::{
     ConsumerId, TaskId,
     contracts::{
         AttemptNumber, BranchName, Clock, ContractError, Effect, Fence, LeaseTtl, Operation,
-        Repository, Text, WorkerBackend, Workspace,
+        Repository, ResourceRef, Text, WorkerBackend, Workspace,
     },
     house::HouseConfig,
     integrations::github::{GitHubClient, GitHubReadTransport, Issue, IssueDetail, IssueState},
@@ -22,6 +22,7 @@ use crate::{
             PickupPolicy, PinnedInstructions, Readiness, TaskTemplate, WorkerBrief, claim_issue,
             select, work_branch,
         },
+        tick::PassRun,
     },
 };
 
@@ -80,6 +81,10 @@ pub struct PickupPass<'a, T> {
     pub settings: &'a PickupSettings,
     /// Take over an expired pass lease instead of stopping.
     pub take_over: bool,
+    /// The house tick's run this pass serves, if a tick started it: each
+    /// task is recorded on it before its claim, and it is renewed with the
+    /// pass lease.
+    pub tick: Option<&'a PassRun>,
 }
 
 /// What a pickup pass did about one issue.
@@ -93,6 +98,8 @@ pub enum PickupAction {
         task: TaskId,
         /// The attempt launched.
         attempt: AttemptNumber,
+        /// The worker the backend created, its own reference.
+        worker: ResourceRef,
     },
     /// Claimed, or held from an earlier pass, but not launched now.
     NotLaunched {
@@ -137,6 +144,7 @@ impl fmt::Display for PickupAction {
                 issue,
                 task,
                 attempt,
+                ..
             } => write!(
                 formatter,
                 "launched {issue} task {task} attempt {}",
@@ -270,7 +278,8 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
         // Selection picks only while no scheduled task is unsettled, so the
         // first pick is the one writer.
         if let Some(pick) = selection.picks.into_iter().next() {
-            super::renew(self.store, consumer, lease, self.clock)?;
+            super::renew(self.store, consumer, lease, self.tick, self.clock)?;
+            super::record(self.store, self.tick, &pick.task, self.clock)?;
             match claim_issue(self.store, template, &pick.issue, &claimant, ttl, now)? {
                 ClaimOutcome::Claimed(claim) | ClaimOutcome::Adopted(claim) => {
                     let body = details
@@ -288,7 +297,7 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
             return Ok(actions);
         }
         for (record, issue, fence) in retries {
-            super::renew(self.store, consumer, lease, self.clock)?;
+            super::renew(self.store, consumer, lease, self.tick, self.clock)?;
             let task = record.spec().id.clone();
             if !issues.iter().any(|open| open.number == issue.number) {
                 actions.push(PickupAction::IssueClosed { task });
@@ -303,6 +312,7 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
             let brief = self.brief(issue, Base::DefaultBranch, detail.body.as_deref())?;
             // The task moves to this pass's claim before the launch, so the
             // claim it had cannot also act on it.
+            super::record(self.store, self.tick, &task, self.clock)?;
             let Some(fence) = transfer(self.store, &task, fence, &claimant, now)? else {
                 actions.push(PickupAction::Moved { task });
                 continue;
@@ -410,10 +420,11 @@ fn launch(
             Workspace::Isolated,
             brief,
         )? {
-            LaunchOutcome::Accepted { attempt, .. } => PickupAction::Launched {
+            LaunchOutcome::Accepted { attempt, worker } => PickupAction::Launched {
                 issue,
                 task,
                 attempt,
+                worker,
             },
             outcome => PickupAction::NotLaunched {
                 issue,

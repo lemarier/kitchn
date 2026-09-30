@@ -1335,11 +1335,17 @@ fn coordinate_moves_a_launched_task_off_the_pickup_pass_once() -> TestResult {
         task: task.clone(),
         outcome: Supervision::Running(WorkerState::Starting),
     }));
+    let moved = kitchen.store().task(&task)?;
+    assert!(matches!(
+        moved.attempts().last().map(|attempt| attempt.state()),
+        Some(kitchen::state::AttemptState::Running)
+    ));
     // Later passes keep the same claim.
     let owned_at = kitchen.claim_fence(7)?;
     let actions = acted(kitchen.coordinate()?)?;
     assert!(!actions.contains(&CoordinateAction::Moved { task }));
     assert_eq!(kitchen.claim_fence(7)?, owned_at);
+    assert!(kitchen.message_worker_at(7, owned_at)?.is_ok());
     Ok(())
 }
 
@@ -1553,12 +1559,14 @@ fn an_old_process_after_a_takeover_is_stale_and_its_uncertain_launch_is_reconcil
     );
     assert_eq!(kitchen.backend.effects_performed(), 1);
     assert_eq!(kitchen.backend.launched_agents().len(), 1);
-    // The current owner is told to supervise the existing worker instead.
+    // The current owner sees the same accepted attempt and worker.
     let (_, current) = old_process_calls(&kitchen, 7, kitchen.claim_fence(7)?)?;
+    let expected_worker = kitchen.worker(7)?;
     assert!(
         matches!(
-            current,
-            Ok(kitchen::workflows::coordination::LaunchOutcome::SuperviseFirst { .. })
+            &current,
+            Ok(kitchen::workflows::coordination::LaunchOutcome::Accepted { attempt, worker })
+                if attempt.get() == 1 && worker == &expected_worker
         ),
         "{current:?}"
     );

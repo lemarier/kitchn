@@ -49,7 +49,7 @@ use kitchen::{
         Context, Standing, Supervision, SupervisionInput, SupervisionPolicy, supervise,
     },
 };
-use orca_sim::{Fault, SimAutomation, SimOrca, SimWorker};
+use orca_sim::{Fault, SimAutomation, SimOrca, SimTask, SimWorker};
 use serde_json::json;
 
 fn orca_id() -> TestResult<BackendId> {
@@ -1154,6 +1154,44 @@ fn mailbox_messages_are_typed_and_acknowledged_explicitly() -> TestResult {
 }
 
 #[test]
+fn mailbox_routes_a_question_by_its_assigned_terminal() -> TestResult {
+    let sim = SimOrca::default();
+    let backend = connect(&sim)?;
+    sim.state().tasks.push(SimTask {
+        id: "task_1".into(),
+        title: "kitchen:launch".into(),
+        spec: String::new(),
+        status: "dispatched",
+        dispatch: Some("ctx_1".into()),
+    });
+    sim.state().mail = VecDeque::from([json!({
+        "deliveryId": "delivery_question",
+        "messages": [{
+            "id": "msg_question", "type": "question",
+            "from_handle": "term_ctx_1", "subject": "Need a choice?"
+        }, {
+            "id": "msg_report", "type": "worker_done",
+            "from_handle": "term_ctx_1",
+            "payload": "{\"taskId\":\"task_1\",\"dispatchId\":\"ctx_1\",\"outcome\":\"failed\"}"
+        }, {
+            "id": "msg_other", "type": "question",
+            "from_handle": "term_unknown"
+        }, {
+            "id": "msg_mismatch", "type": "question",
+            "from_handle": "term_ctx_1",
+            "payload": "{\"dispatchId\":\"ctx_other\"}"
+        }]
+    })]);
+    let delivery = backend.next_delivery()?.ok_or("delivery")?;
+    assert_eq!(delivery.messages[0].worker, Some(worker("ctx_1")?));
+    assert_eq!(delivery.messages[1].worker, Some(worker("ctx_1")?));
+    assert_eq!(delivery.messages[1].outcome, Some(WorkerOutcome::Failed));
+    assert_eq!(delivery.messages[2].worker, None);
+    assert_eq!(delivery.messages[3].worker, None);
+    Ok(())
+}
+
+#[test]
 fn adoption_moves_the_mailbox_to_the_new_coordinator() -> TestResult {
     let sim = SimOrca::default();
     let old = connect(&sim)?;
@@ -1937,11 +1975,18 @@ fn heartbeats_do_not_end_a_wait() -> TestResult {
     assert!(wait.iter().any(|arg| arg == "--wait"));
     assert_eq!(flag(wait, "types"), Some("worker_done,escalation,question"));
     assert_eq!(flag(wait, "timeout-ms"), Some("60000"));
+    let state = sim.state();
+    let wait_index = state
+        .calls
+        .iter()
+        .rposition(|call| call == wait)
+        .ok_or("wait call recorded")?;
     assert_eq!(
-        sim.state().deadlines.last().copied(),
+        state.deadlines.get(wait_index).copied(),
         Some(Duration::from_secs(65)),
         "the subprocess outlives Orca's wait"
     );
+    drop(state);
     backend.await_delivery(Duration::from_secs(86_400))?;
     let calls = sim.calls_to(&["orchestration", "check"]);
     assert_eq!(

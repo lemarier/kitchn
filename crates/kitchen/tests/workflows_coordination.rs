@@ -1115,12 +1115,17 @@ fn a_replacement_launches_only_after_the_adopted_worker_is_shown_stopped() -> Te
         );
         assert!(matches!(
             launch(&world, &task, fence, 1)?,
-            LaunchOutcome::SuperviseFirst { .. }
+            LaunchOutcome::Accepted { attempt, worker: current }
+                if attempt.get() == 1 && current == worker
         ));
 
         world
             .backend
             .set_worker_state(&worker, WorkerState::Settled(stopped));
+        assert!(matches!(
+            step(&world, &task, fence)?,
+            Supervision::Retry { .. }
+        ));
         assert!(matches!(
             launch(&world, &task, fence, 1)?,
             LaunchOutcome::Accepted { .. }
@@ -1287,8 +1292,7 @@ fn a_launch_is_accepted_when_the_backend_reports_the_exact_branch() -> TestResul
 fn supervising_an_adopted_worker_to_its_end_allows_the_replacement() -> TestResult {
     let world = World::new()?;
     let (task, fence, worker) = adopted_with_live_worker(&world)?;
-    // The adopting coordinator supervises first: the worker still runs, so
-    // nothing new launches.
+    // Before supervision, the adopted attempt still needs to be resumed.
     assert!(matches!(
         launch(&world, &task, fence, 1)?,
         LaunchOutcome::SuperviseFirst { .. }
@@ -1299,7 +1303,8 @@ fn supervising_an_adopted_worker_to_its_end_allows_the_replacement() -> TestResu
     );
     assert!(matches!(
         launch(&world, &task, fence, 1)?,
-        LaunchOutcome::SuperviseFirst { .. }
+        LaunchOutcome::Accepted { attempt, worker: current }
+            if attempt.get() == 1 && current == worker
     ));
 
     // It then fails; supervision accounts for the failure, and only after

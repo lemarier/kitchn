@@ -232,8 +232,12 @@ Worker push requires a GitHub App forge binding. Bind the house with
 the app installation must cover the task repository. Kitchen requests an
 installation token limited to that repository and contents write. A house
 bound to a personal token is refused before that credential is read or passed
-to a child process. `--acceptance-done` requires the worker's evidence report
-to contain `Acceptance: done`; otherwise the pull request body says `Part of`
+to a child process. Before updating the branch, Kitchen also checks that the
+task's push and pull request grants use the bound forge credential and that
+the forge scope permits both effects. If either check fails, correct the house
+grant or forge binding before retrying. `--acceptance-done` requires the
+worker's evidence report to contain `Acceptance: done`; otherwise the pull
+request body says `Part of`
 the issue. A refused or uncertain push must be reconciled before retrying.
 
 ## `kitchn work`, `kitchn pr` and `kitchn hand-back`

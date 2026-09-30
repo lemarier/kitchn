@@ -11,9 +11,14 @@ use kitchen::{
     HouseId, TaskId,
     adapters::orca::{Invocation, OrcaRunner, SystemRunner},
     adoption::HouseRegistry,
-    contracts::{Clock, ExternalRef, GrantScope, Permission, SystemClock, Text},
+    contracts::{
+        Clock, ExternalRef, GrantScope, HouseGrants, Permission, Repository, SystemClock,
+        TaskAuthority, Text,
+    },
     house::{CredentialKind, checked_forge_credential, forge_binding, runtime_config},
-    integrations::github::{GitHubClient, GitHubExecutor, IntegrationError, ReadLimits},
+    integrations::github::{
+        GitHubClient, GitHubExecutor, HouseScope, IntegrationError, ReadLimits,
+    },
     state::{AttemptState, HouseStore, StoreOptions, TaskState},
     workflows::{
         coordination::{Standing, current_worker, task_branch},
@@ -111,14 +116,15 @@ impl PushArgs {
         let grants = house.authority()?;
         let binding = forge_binding(&registry, &self.house)?;
         require_app_binding(binding.credential_kind)?;
-        for permission in [Permission::PushBranch, Permission::OpenPullRequest] {
-            record.spec().authority.authorize(
-                &grants,
-                permission,
-                &GrantScope::Repository(repository.clone()),
-                &binding.backend,
-            )?;
-        }
+        let scope = binding.scope(&house)?;
+        authorize_delivery(
+            &record.spec().authority,
+            &grants,
+            &scope,
+            &repository,
+            &binding.backend,
+            &binding.credential,
+        )?;
         let fence = lease.fence();
         Ok(Selected {
             registry,
@@ -129,6 +135,31 @@ impl PushArgs {
             repository,
         })
     }
+}
+
+fn authorize_delivery(
+    authority: &TaskAuthority,
+    grants: &HouseGrants,
+    scope: &HouseScope,
+    repository: &Repository,
+    backend: &kitchen::BackendId,
+    credential: &kitchen::CredentialId,
+) -> Result<(), kitchen::Error> {
+    for permission in [Permission::PushBranch, Permission::OpenPullRequest] {
+        let selected = authority.authorize(
+            grants,
+            permission,
+            &GrantScope::Repository(repository.clone()),
+            backend,
+        )?;
+        if &selected != credential {
+            return Err(IntegrationError::PermissionDenied.into());
+        }
+        // Check the executor's policy before the branch update: it may be
+        // narrower than the task's grant after a forge binding change.
+        scope.authorize_effect(grants.house(), repository, permission, 0)?;
+    }
+    Ok(())
 }
 
 fn require_app_binding(kind: CredentialKind) -> Result<(), IntegrationError> {
@@ -420,7 +451,77 @@ fn executable(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kitchen::integrations::github::{AppId, GitHubApp, InstallationId};
+    use kitchen::{
+        BackendId, CredentialId,
+        contracts::{Grant, PostingBudget},
+        integrations::github::{AppId, CredentialRef, GitHubApp, InstallationId},
+    };
+
+    #[test]
+    fn delivery_checks_both_forge_permissions_before_push() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let house = HouseId::new("house")?;
+        let repository = Repository::new("owner/repo")?;
+        let backend = BackendId::new("github")?;
+        let credential = CredentialId::new("app")?;
+        let grants = [Permission::PushBranch, Permission::OpenPullRequest].map(|permission| {
+            Grant::repository(
+                permission,
+                repository.clone(),
+                backend.clone(),
+                credential.clone(),
+            )
+        });
+        let current = HouseGrants::new(house.clone(), grants.clone());
+        let authority = TaskAuthority::delegate(&current, grants)?;
+        let requester = ExternalRef::new("bot[bot]")?;
+        let budget = PostingBudget::new(2)?;
+        let scope = |permitted: Vec<Permission>| {
+            HouseScope::new(
+                house.clone(),
+                [repository.clone()],
+                requester.clone(),
+                CredentialRef::new(house.clone(), credential.clone(), requester.clone()),
+                budget,
+                permitted,
+            )
+        };
+        authorize_delivery(
+            &authority,
+            &current,
+            &scope(vec![Permission::PushBranch, Permission::OpenPullRequest])?,
+            &repository,
+            &backend,
+            &credential,
+        )?;
+        assert!(matches!(
+            authorize_delivery(
+                &authority,
+                &current,
+                &scope(vec![Permission::PushBranch])?,
+                &repository,
+                &backend,
+                &credential
+            ),
+            Err(kitchen::Error::Integration(
+                IntegrationError::PermissionDenied
+            ))
+        ));
+        assert!(matches!(
+            authorize_delivery(
+                &authority,
+                &current,
+                &scope(vec![Permission::PushBranch, Permission::OpenPullRequest])?,
+                &repository,
+                &backend,
+                &CredentialId::new("other")?
+            ),
+            Err(kitchen::Error::Integration(
+                IntegrationError::PermissionDenied
+            ))
+        ));
+        Ok(())
+    }
 
     #[test]
     fn worker_push_requires_an_app_binding() -> Result<(), Box<dyn std::error::Error>> {

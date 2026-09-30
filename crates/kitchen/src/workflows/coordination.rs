@@ -1252,6 +1252,10 @@ fn supervise_step(
     let Some(view) = open_worker(&record) else {
         return Ok(Supervision::AwaitingLaunch);
     };
+    // A prior pass can stop after adopting the claim but before it observes
+    // the worker. Restore the interrupted attempt even when observation is
+    // unavailable or the worker remains Ready for several passes.
+    ctx.store.continue_attempt(task, fence, now)?;
     let Ok(state) = ctx.backend.observe_worker(&view.worker) else {
         return Ok(Supervision::Unobservable);
     };

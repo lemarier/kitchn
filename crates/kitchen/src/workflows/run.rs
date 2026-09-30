@@ -626,7 +626,13 @@ fn transfer(
         Err(error) => return Err(error),
     }
     match store.claim(task, claimant, LeaseTtl::new(TASK_LEASE)?, now) {
-        Ok(lease) => Ok(Some(lease.fence())),
+        Ok(lease) => {
+            // Relinquishing fences the previous pass and interrupts its attempt.
+            // The worker itself keeps running, so attach that attempt to the
+            // new claim before the worker can deliver through Kitchen.
+            store.continue_attempt(task, lease.fence(), now)?;
+            Ok(Some(lease.fence()))
+        }
         Err(crate::Error::State(
             StateError::ClaimHeld { .. }
             | StateError::LeaseExpired { .. }

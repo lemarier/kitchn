@@ -195,8 +195,8 @@ impl GhCli {
         Self::with(executable, Auth::Token(credential))
     }
     /// Select the binary and a GitHub App's token source. Each call runs with
-    /// an installation token limited to the request's [`TokenScope`]; a call
-    /// without one, such as an unscoped client read, is refused.
+    /// an installation token limited to the request's [`TokenScope`]. Calls
+    /// without a repository scope are refused.
     ///
     /// # Errors
     /// Refuses a relative executable path.

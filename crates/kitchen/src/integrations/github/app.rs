@@ -110,6 +110,12 @@ pub enum AppPermission {
     Issues,
     /// `pull_requests`: pull requests.
     PullRequests,
+    /// `checks`: check runs on commits.
+    Checks,
+    /// `statuses`: commit statuses.
+    Statuses,
+    /// `administration`: branch-protection requirements.
+    Administration,
 }
 
 impl AppPermission {
@@ -120,13 +126,23 @@ impl AppPermission {
             Self::Contents => "contents",
             Self::Issues => "issues",
             Self::PullRequests => "pull_requests",
+            Self::Checks => "checks",
+            Self::Statuses => "statuses",
+            Self::Administration => "administration",
         }
     }
 
     fn parse(name: &str) -> Option<Self> {
-        [Self::Contents, Self::Issues, Self::PullRequests]
-            .into_iter()
-            .find(|permission| permission.as_str() == name)
+        [
+            Self::Contents,
+            Self::Issues,
+            Self::PullRequests,
+            Self::Checks,
+            Self::Statuses,
+            Self::Administration,
+        ]
+        .into_iter()
+        .find(|permission| permission.as_str() == name)
     }
 }
 
@@ -159,6 +175,24 @@ pub struct TokenScope {
 }
 
 impl TokenScope {
+    /// Read access for a repository. Check runs, commit statuses, and branch
+    /// protection need separate permissions requested only for those reads.
+    #[must_use]
+    pub fn for_read(repository: &Repository, extra: Option<AppPermission>) -> Self {
+        use AppPermission::{Contents, Issues, PullRequests};
+        let mut permissions: BTreeMap<_, _> = [Contents, Issues, PullRequests]
+            .into_iter()
+            .map(|permission| (permission, Access::Read))
+            .collect();
+        if let Some(extra) = extra {
+            permissions.insert(extra, Access::Read);
+        }
+        Self {
+            repository: repository.clone(),
+            permissions,
+        }
+    }
+
     /// The scope a GitHub effect needs: its repository, write access for the
     /// change, and read access for what inspecting it reads.
     ///

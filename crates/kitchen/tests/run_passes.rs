@@ -38,8 +38,8 @@ use kitchen::{
             CoordinateAction, CoordinatePass, GateAction, GateAttestation, GatePass, GateResult,
             NotMerged, Outcome, PASS_LEASE, Pass, PickupAction, PickupLabels, PickupPass,
             PickupSettings, RepairAction, RepairPass, RepairSettings, ReportReason, Reviewer,
-            RunError, TASK_LEASE, TickPasses, Unroutable, pass_repository, record_gate_attestation,
-            run_claimant,
+            RunError, TASK_LEASE, TickPasses, Unroutable, Wait, pass_repository,
+            record_gate_attestation, run_claimant,
         },
         tick::{
             self, Pass as TickPass, PassFailure, PassOutcome, PassSchedule, PassTick, TickDecision,
@@ -1579,6 +1579,162 @@ fn a_repair_round_waiting_for_its_next_attempt_blocks_no_writer() -> TestResult 
     let actions = acted(kitchen.pickup(false)?)?;
     assert!(
         matches!(actions.as_slice(), [PickupAction::Launched { .. }]),
+        "{actions:?}"
+    );
+    Ok(())
+}
+
+/// A person's interactive session.
+fn person_session() -> TestResult<kitchen::contracts::Claimant> {
+    Ok(kitchen::contracts::Claimant {
+        holder: HolderId::new("session-dana")?,
+        trigger: kitchen::contracts::Trigger::Interactive,
+        consumer: None,
+    })
+}
+
+/// A person holds `pr` round 1 of pull request `number` interactively, as
+/// `kitchn pr` claims it: no worker launch is recorded.
+fn person_holds_round(
+    kitchen: &Kitchen,
+    number: u64,
+) -> TestResult<(kitchen::TaskId, kitchen::contracts::Fence)> {
+    let template = kitchen::workflows::run::task_template(
+        &kitchen.config,
+        kitchen::workflows::coordination::MailboxRoute::Backend,
+        kitchen.settings.instructions.provenance.clone(),
+    )?;
+    let task = kitchen::workflows::repair::repair_task_id(&repo()?, pr(number)?, 1)?;
+    let work_type = kitchen::selection::WorkType::fix();
+    let spec = kitchen::contracts::TaskSpec {
+        id: task.clone(),
+        role: kitchen::contracts::Role::StationCook,
+        repository: Some(repo()?),
+        authority: template.authority.clone(),
+        retry: template.retry,
+        provenance: template.provenance.clone(),
+        resources: std::collections::BTreeSet::new(),
+        requires: kitchen::contracts::CapabilityRequirements::new(),
+        agent: None,
+        work_type: Some(work_type),
+    };
+    let person = person_session()?;
+    kitchen
+        .store()
+        .create_task(spec, &person, kitchen.clock.now())?;
+    let lease = kitchen.store().claim(
+        &task,
+        &person,
+        kitchen::contracts::LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    Ok((task, lease.fence()))
+}
+
+#[test]
+fn repair_waits_while_a_person_holds_a_round_of_another_pull_request() -> TestResult {
+    let kitchen = settled_with_pull_request(false)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    // A person repairs pull request 40 of the same repository through
+    // `kitchn pr`; nothing tells whether it touches pull request 12's files.
+    let (held, fence) = person_holds_round(&kitchen, 40)?;
+    let actions = acted(kitchen.repair()?)?;
+    assert_eq!(
+        actions,
+        [RepairAction::Waiting {
+            pull_request: pr(12)?,
+            task: round_task(1)?,
+            wait: Wait::WriterOpen,
+        }]
+    );
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    assert!(matches!(
+        kitchen.store().task(&round_task(1)?),
+        Err(kitchen::Error::State(StateError::TaskNotFound(_)))
+    ));
+    // Once the person hands the round back, the scheduled writer launches.
+    kitchen
+        .store()
+        .relinquish(&held, fence, kitchen.clock.now())?;
+    let actions = acted(kitchen.repair()?)?;
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [RepairAction::Launched { round: 1, .. }]
+        ),
+        "{actions:?}"
+    );
+    assert_eq!(kitchen.backend.launched_agents().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn pickup_picks_nothing_while_a_person_holds_a_pull_request_round() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    let (held, fence) = person_holds_round(&kitchen, 40)?;
+    kitchen.ready_seven();
+    assert!(matches!(kitchen.pickup(false)?, Outcome::Idle));
+    assert_eq!(kitchen.backend.launched_agents().len(), 0);
+    assert!(matches!(
+        kitchen.store().task(&kitchen.task(7)?),
+        Err(kitchen::Error::State(StateError::TaskNotFound(_)))
+    ));
+    kitchen
+        .store()
+        .relinquish(&held, fence, kitchen.clock.now())?;
+    let actions = acted(kitchen.pickup(false)?)?;
+    assert!(
+        matches!(actions.as_slice(), [PickupAction::Launched { task, .. }] if *task == kitchen.task(7)?),
+        "{actions:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn pickup_relaunches_nothing_while_a_person_works_another_issue() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    open_issues(
+        kitchen.forge(),
+        vec![issue_json(7, &["ready"]), issue_json(8, &["ready"])],
+    );
+    ready_issue(kitchen.forge(), 7, ACCEPTANCE);
+    ready_issue(kitchen.forge(), 8, ACCEPTANCE);
+    let template = kitchen::workflows::run::task_template(
+        &kitchen.config,
+        kitchen::workflows::coordination::MailboxRoute::Backend,
+        kitchen.settings.instructions.provenance.clone(),
+    )?;
+    let ttl = kitchen::contracts::LeaseTtl::new(TASK_LEASE)?;
+    let claim = |number, claimant: &kitchen::contracts::Claimant| -> TestResult<_> {
+        Ok(kitchen::workflows::pickup::claim_issue(
+            kitchen.store(),
+            &template,
+            &IssueRef {
+                repository: repo()?,
+                number: kitchen::contracts::IssueNumber::new(number)?,
+            },
+            claimant,
+            ttl,
+            kitchen.clock.now(),
+        )?)
+    };
+    // The runner claimed 7 without a launch; a person works 8 through
+    // `kitchn work`, with no launch recorded.
+    claim(7, &run_claimant()?)?;
+    let person = claim(8, &person_session()?)?;
+    let kitchen::workflows::pickup::ClaimOutcome::Claimed(lease) = person else {
+        return Err(format!("the person did not claim 8: {person:?}").into());
+    };
+    assert!(matches!(kitchen.pickup(false)?, Outcome::Idle));
+    assert_eq!(kitchen.backend.launched_agents().len(), 0);
+    kitchen
+        .store()
+        .relinquish(&kitchen.task(8)?, lease.fence(), kitchen.clock.now())?;
+    let actions = acted(kitchen.pickup(false)?)?;
+    assert!(
+        matches!(actions.as_slice(), [PickupAction::Launched { task, .. }] if *task == kitchen.task(7)?),
         "{actions:?}"
     );
     Ok(())

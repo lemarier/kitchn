@@ -13,8 +13,9 @@
 //! over as [`HandOver::WorktreeUnknown`].
 //!
 //! A pass launches at most one writer per repository, and none while
-//! another scheduled writer of the repository has not settled, since file
-//! overlap is not observed. The round is claimed under this pass's lease,
+//! another branch writer of the repository may be working, since file
+//! overlap is not observed: a pickup task, a repair round, or a person's
+//! `work` task or `pr` round. The round is claimed under this pass's lease,
 //! so a pass whose lease was taken over cannot launch it; the coordination
 //! pass supervises the writer once this pass ends.
 
@@ -102,7 +103,8 @@ pub struct RepairPass<'a, T> {
 /// Why a repair the policy decided was not launched in this pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wait {
-    /// Another scheduled writer of the repository has not settled.
+    /// Another branch writer of the repository, scheduled or a person's,
+    /// may be working.
     WriterOpen,
     /// This pass already launched its one writer.
     OnePerPass,

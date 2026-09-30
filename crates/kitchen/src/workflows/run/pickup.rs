@@ -5,8 +5,8 @@
 use std::fmt;
 
 use super::{
-    Outcome, Pass, RunError, TASK_LEASE, awaiting_launch, held_by_run, issue_of, run_claimant,
-    scheduled_repair, transfer, writing,
+    Outcome, Pass, RunError, TASK_LEASE, awaiting_launch, held_by_run, issue_of, repair_of,
+    run_claimant, transfer, writer_open, writing,
 };
 use crate::{
     ConsumerId, TaskId,
@@ -224,15 +224,11 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
             )?;
         let tasks = self.store.tasks()?;
         // One writer per repository: file overlap is not observed, so a pass
-        // launches at most one writer, and none while another scheduled
-        // task of the repository has an open attempt. Selection already
-        // leaves new issues while any scheduled task is unsettled.
-        let writer_open = tasks.iter().any(|record| {
-            issue_of(record, repository).is_some()
-                && !matches!(record.state(), TaskState::Settled { .. })
-                && !awaiting_launch(record)
-        }) || repairing(&tasks, repository);
-        let retries: Vec<(&TaskRecord, IssueRef, Fence)> = if writer_open {
+        // launches at most one writer, and none while another branch writer
+        // of the repository, scheduled or a person's, may be working.
+        // Selection already leaves new issues while any pickup task is
+        // unsettled or a repair round may be working.
+        let retries: Vec<(&TaskRecord, IssueRef, Fence)> = if writer_open(&tasks, repository) {
             Vec::new()
         } else {
             tasks
@@ -438,12 +434,13 @@ fn launch(
     )
 }
 
-/// Whether a scheduled repair round of `repository` may be working: its
-/// writer counts against the repository's one writer.
+/// Whether a repair or follow-up round of `repository`, scheduled or a
+/// person's, may be working: its writer counts against the repository's one
+/// writer.
 fn repairing(tasks: &[TaskRecord], repository: &Repository) -> bool {
     tasks
         .iter()
-        .any(|record| scheduled_repair(record, repository) && writing(record))
+        .any(|record| repair_of(record, repository).is_some() && writing(record))
 }
 
 fn has_label(issue: &Issue, name: &str) -> bool {

@@ -69,7 +69,7 @@ pub use attestation::{
 pub use coordinate::{CoordinateAction, CoordinatePass, Unroutable};
 pub use gate::{GateAction, GatePass, GateResult, MAX_GATE_PULL_REQUESTS, NotMerged, ReportReason};
 pub use pickup::{MAX_READY_INSPECTED, PickupAction, PickupLabels, PickupPass, PickupSettings};
-pub use repair::{RepairAction, RepairPass, RepairSettings};
+pub use repair::{RepairAction, RepairPass, RepairSettings, Wait};
 pub use tick::{TickPasses, failed_report};
 
 type Result<T> = std::result::Result<T, crate::Error>;
@@ -476,20 +476,32 @@ fn scheduled_writer(record: &TaskRecord, repository: &Repository) -> bool {
     issue_of(record, repository).is_some() || scheduled_repair(record, repository)
 }
 
-/// Whether a scheduled writer of `repository` may be working: it has not
-/// settled and does not wait for its next launch. While one may, no pass
-/// launches another writer there, since file overlap is not observed. A
-/// task waiting for a launch that never comes, such as a repair round
-/// whose pull request merged, blocks nothing.
+/// Whether `record` writes a branch of `repository`: a pickup or `work`
+/// task, or a repair or follow-up round, scheduled or a person's.
+fn branch_writer(record: &TaskRecord, repository: &Repository) -> bool {
+    issue_of(record, repository).is_some() || repair_of(record, repository).is_some()
+}
+
+/// Whether any branch writer of `repository` may be working ([`writing`]).
+/// While one may, no pass launches another writer there, since file
+/// overlap is not observed. A task waiting for a launch that never comes,
+/// such as a repair round whose pull request merged, blocks nothing.
 fn writer_open(tasks: &[TaskRecord], repository: &Repository) -> bool {
     tasks
         .iter()
-        .any(|record| scheduled_writer(record, repository) && writing(record))
+        .any(|record| branch_writer(record, repository) && writing(record))
 }
 
-/// Whether `record` has not settled and does not wait for its next launch.
+/// Whether `record` may be writing its branch: it has not settled, and
+/// either someone other than the scheduled runner holds it (a person's
+/// session works without a recorded launch, and an expired claim may still
+/// be working), or it does not wait for its next launch.
 fn writing(record: &TaskRecord) -> bool {
-    !matches!(record.state(), TaskState::Settled { .. }) && !awaiting_launch(record)
+    match record.state() {
+        TaskState::Settled { .. } => false,
+        TaskState::Claimed { lease } if lease.holder().as_str() != RUN_HOLDER => true,
+        TaskState::Claimed { .. } | TaskState::Open => !awaiting_launch(record),
+    }
 }
 
 /// Whether the task needs a launch: never launched, its latest attempt

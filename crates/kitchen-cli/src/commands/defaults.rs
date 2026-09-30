@@ -19,23 +19,28 @@ enum Scope {
 /// Fill omitted CLI scope flags before Clap checks required arguments. A
 /// stored repository binding is the only source for an inferred house.
 pub fn arguments(mut args: Vec<OsString>) -> Result<Vec<OsString>, kitchen::Error> {
+    let insertion = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let option_args = &args[..insertion];
     if args.len() < 2
-        || args
+        || option_args
             .iter()
             .any(|arg| arg == "--help" || arg == "-h" || arg == "--version" || arg == "-V")
     {
         return Ok(args);
     }
-    let scope = scope(&args);
+    let scope = scope(option_args);
     if scope == Scope::None {
         return Ok(args);
     }
-    let registry_present = has_flag(&args, "--registry");
-    let house_present = has_flag(&args, "--house");
+    let registry_present = has_flag(option_args, "--registry");
+    let house_present = has_flag(option_args, "--house");
     let needs_registry = matches!(scope, Scope::Registry | Scope::Both);
     let needs_house = matches!(scope, Scope::House | Scope::Both);
     let registry = if registry_present {
-        flag_value(&args, "--registry").map(PathBuf::from)
+        flag_value(option_args, "--registry").map(PathBuf::from)
     } else if needs_registry || (needs_house && !house_present) {
         Some(default_registry()?)
     } else {
@@ -50,10 +55,6 @@ pub fn arguments(mut args: Vec<OsString>) -> Result<Vec<OsString>, kitchen::Erro
     } else {
         None
     };
-    let insertion = args
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or(args.len());
     let mut defaults = Vec::new();
     if needs_registry && !registry_present {
         defaults.push(OsString::from("--registry"));
@@ -76,16 +77,29 @@ fn bound_origin_house(
     checkout: &std::path::Path,
 ) -> Result<String, HouseError> {
     let repository = origin_repository(checkout).map_err(|error| match error {
-        HouseError::CheckoutRepositoryMismatch => error,
-        _ => HouseError::MissingFlag { flag: "--house" },
+        HouseError::RepositoryUnidentified => HouseError::MissingFlag { flag: "--house" },
+        other => other,
     })?;
     let root = super::house::canonical_root(registry_root.to_path_buf())?;
     let registry = HouseRegistry::new(root)?;
     let binding = registry
-        .binding(&repository)?
+        .binding(&repository)
+        .map_err(unresolved_house)?
         .ok_or(HouseError::MissingFlag { flag: "--house" })?;
-    binding.validate(&registry.load(&binding.house)?)?;
+    let house = registry.load(&binding.house).map_err(unresolved_house)?;
+    binding.validate(&house).map_err(unresolved_house)?;
     Ok(binding.house.to_string())
+}
+
+fn unresolved_house(error: HouseError) -> HouseError {
+    match error {
+        HouseError::InvalidInput
+        | HouseError::HouseSelection
+        | HouseError::Io(std::io::ErrorKind::NotFound) => {
+            HouseError::MissingFlag { flag: "--house" }
+        }
+        other => other,
+    }
 }
 
 fn scope(args: &[OsString]) -> Scope {
@@ -148,4 +162,17 @@ fn default_registry() -> Result<PathBuf, HouseError> {
         .map(|home| PathBuf::from(home).join(".kitchn"))
         .filter(|root| root.is_absolute())
         .ok_or(HouseError::MissingFlag { flag: "--registry" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unresolved_house_preserves_io_failures() {
+        assert!(matches!(
+            unresolved_house(HouseError::Io(std::io::ErrorKind::PermissionDenied)),
+            HouseError::Io(std::io::ErrorKind::PermissionDenied)
+        ));
+    }
 }

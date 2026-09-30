@@ -250,6 +250,89 @@ fn unbound_and_missing_remote_name_house_flag() -> TestResult {
 }
 
 #[test]
+fn damaged_missing_and_mismatched_binding_name_house_flag() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let registry = HouseRegistry::new(root.join("registry"))?;
+    let crab: HouseConfig = serde_json::from_str(include_str!(
+        "../../kitchen/tests/fixtures/house/crabnebula.json"
+    ))?;
+    let other: HouseConfig = serde_json::from_str(include_str!(
+        "../../kitchen/tests/fixtures/house/origin89.json"
+    ))?;
+    registry.initialize(&crab)?;
+    registry.initialize(&other)?;
+    registry.bind_repository(&RepositoryConfig {
+        schema: 2,
+        house: crab.house.clone(),
+        repository: "crabnebula/tauri-fixture".parse()?,
+        workflows: Default::default(),
+        additional_reviewers: Default::default(),
+        additional_checks: Default::default(),
+    })?;
+    let checkout = root.join("checkout");
+    fs::create_dir(&checkout)?;
+    git(&checkout, &["init", "--quiet"])?;
+    git(
+        &checkout,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/crabnebula/tauri-fixture.git",
+        ],
+    )?;
+    let binding = registry
+        .root()
+        .join("repositories/crabnebula/tauri-fixture.json");
+    let original = fs::read(&binding)?;
+    let house = registry.root().join("houses/crabnebula.json");
+    let original_house = fs::read(&house)?;
+    for (binding_bytes, house_bytes) in [
+        (b"not json".to_vec(), original_house.clone()),
+        (original.clone(), Vec::new()),
+        (
+            String::from_utf8(original.clone())?
+                .replace("\"crabnebula\"", "\"origin89\"")
+                .into_bytes(),
+            original_house.clone(),
+        ),
+    ] {
+        fs::write(&binding, binding_bytes)?;
+        if house_bytes.is_empty() {
+            fs::remove_file(&house)?;
+        } else {
+            fs::write(&house, house_bytes)?;
+        }
+        let output = cli(&checkout, registry.root(), &["store", "capacity"])?;
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8(output.stderr)?.contains("cannot resolve --house"),
+            "expected a missing house flag"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn positional_flag_after_separator_does_not_hide_registry_default() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let output = cli(
+        &root,
+        &root.join("registry"),
+        &["init", "--template", "missing", "--", "--registry"],
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        !stderr.contains("the following required arguments were not provided")
+            && !stderr.contains("a value is required for '--registry'"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn ambiguous_origin_is_refused_without_overriding_an_explicit_house() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;

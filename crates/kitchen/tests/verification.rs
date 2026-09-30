@@ -622,7 +622,10 @@ fn only_verification_on_the_named_environment_counts() -> TestResult {
     let run = verifying(&["vm:linux", "host:linux"])?;
     let current = subject('a', None)?;
     let required = BTreeSet::from([target("device:phone")?, target("host:linux")?]);
-    for kind in [EvidenceKind::Check, EvidenceKind::WorkerReport] {
+    for kind in [
+        EvidenceKind::Check,
+        EvidenceKind::WorkerReport(kitchen::contracts::CheckoutReport::default()),
+    ] {
         run.record(evidence(kind, EvidenceVerdict::Pass, current.clone())?)?;
     }
     run.run("vm:linux", EvidenceVerdict::Pass, &current)?;

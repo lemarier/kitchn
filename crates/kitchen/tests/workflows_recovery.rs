@@ -108,7 +108,7 @@ fn completion(addressed: Vec<ExternalRef>) -> TestResult<Completion> {
         requested: branch("lemarier/issue-1")?,
         observed_branch: "lemarier/issue-1".to_owned(),
         report: Evidence {
-            kind: EvidenceKind::WorkerReport,
+            kind: EvidenceKind::WorkerReport(kitchen::contracts::CheckoutReport::default()),
             verdict: EvidenceVerdict::Pass,
             subject: EvidenceSubject {
                 head: common::commit('d')?,

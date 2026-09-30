@@ -8,9 +8,10 @@
 //! (#148). The writer works in a new isolated checkout of the pushed
 //! branch; the checkout of the branch's earlier writer is never written. Its
 //! work counts as preserved only when that writer settled successfully,
-//! the backend shows its worker settled, and the pull request's head is the
-//! head its recorded report named. Otherwise the pull request is handed
-//! over as [`HandOver::WorktreeUnknown`].
+//! the backend shows its worker settled, and its latest recorded report
+//! names the pull request's head and states the checkout clean and pushed.
+//! Otherwise the pull request is handed over as
+//! [`HandOver::WorktreeUnknown`].
 //!
 //! A pass launches at most one writer per repository, and none while
 //! another branch writer of the repository may be working, since file
@@ -619,23 +620,39 @@ fn strongest(held: Writer, next: Writer) -> Writer {
 }
 
 /// The branch's earlier work, from the house's records. It is preserved
-/// when `last`, the branch's latest writer, settled successfully with a
-/// report naming `head`, the pull request's head now, and no writer is
-/// working: every commit it reported is pushed, and the repair writer uses
-/// a new checkout. Anything else is unknown.
+/// only when `last`, the branch's latest writer, settled successfully, no
+/// writer is working, and the worker report it settled on names `head`, the
+/// pull request's head now, and states the checkout clean and pushed: the
+/// repair writer then uses a new checkout without losing anything. A report
+/// that is silent about its checkout, or states it dirty or ahead of the
+/// remote, leaves the work unknown.
 fn worktree(last: &TaskRecord, writer: &Writer, head: &CommitId) -> WorktreeView {
-    let reported = matches!(
+    let settled = matches!(
         last.state(),
         TaskState::Settled {
             settlement: Settlement::Succeeded,
             ..
         }
-    ) && last.evidence().items().iter().any(|evidence| {
-        evidence.kind == EvidenceKind::WorkerReport
-            && evidence.verdict == EvidenceVerdict::Pass
-            && &evidence.subject.head == head
-    });
-    let known = if *writer == Writer::None && reported {
+    );
+    let report = last
+        .evidence()
+        .items()
+        .iter()
+        .rev()
+        .find_map(|evidence| match evidence.kind {
+            EvidenceKind::WorkerReport(checkout) => Some((evidence, checkout)),
+            EvidenceKind::Check
+            | EvidenceKind::Verification(_)
+            | EvidenceKind::AuthorizedVerification(_) => None,
+        });
+    let preserved = settled
+        && *writer == Writer::None
+        && report.is_some_and(|(evidence, checkout)| {
+            evidence.verdict == EvidenceVerdict::Pass
+                && &evidence.subject.head == head
+                && checkout.clean_and_pushed()
+        });
+    let known = if preserved {
         Observed::Known(false)
     } else {
         Observed::Unknown

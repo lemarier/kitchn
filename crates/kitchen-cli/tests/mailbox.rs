@@ -194,7 +194,16 @@ fn a_worker_reports_and_escalates_only_for_its_own_task() -> TestResult {
         "report",
         "task-1",
         one,
-        &["--outcome", "succeeded", "--body", "Done."],
+        &[
+            "--outcome",
+            "succeeded",
+            "--clean",
+            "yes",
+            "--pushed",
+            "no",
+            "--body",
+            "Done.",
+        ],
     )?;
     assert!(report.status.success(), "{report:?}");
     posted(&report, "report: ")?;
@@ -235,6 +244,13 @@ fn invalid_worker_input_is_refused_before_anything_is_stored() -> TestResult {
         &["--outcome", "maybe", "--body", "?"],
     )?;
     assert_eq!(outcome.status.code(), Some(2));
+    let checkout = kitchen.worker(
+        "report",
+        "task-1",
+        fence,
+        &["--outcome", "succeeded", "--clean", "mostly", "--body", "?"],
+    )?;
+    assert_eq!(checkout.status.code(), Some(2));
     let listed = kitchen.run(&["questions"])?;
     assert_eq!(stdout(&listed)?, "mailbox: 0 of 512\nno open questions\n");
     Ok(())

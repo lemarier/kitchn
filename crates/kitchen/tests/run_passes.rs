@@ -15,9 +15,9 @@ use common::{ManualClock, TestResult, WORKER_PERMISSIONS, backend_id, commit, cr
 use kitchen::{
     CredentialId, HolderId,
     contracts::{
-        BranchName, Capability, CapabilitySet, Clock, ExternalRef, Grant, MailMessage, MessageKind,
-        PostingBudget, Repository, ResourceRef, Settlement, Text, WorkerOutcome, WorkerState,
-        fake::FakeBackend,
+        BranchName, Capability, CapabilitySet, CheckoutFact, CheckoutReport, Clock, EvidenceKind,
+        ExternalRef, Grant, MailMessage, MessageKind, PostingBudget, Repository, ResourceRef,
+        Settlement, Text, WorkerOutcome, WorkerState, fake::FakeBackend,
     },
     house::HouseConfig,
     integrations::github::{
@@ -512,7 +512,23 @@ impl Kitchen {
     }
 }
 
+/// A worker's checkout with nothing uncommitted or unpushed, as it states it.
+const CLEAN_AND_PUSHED: CheckoutReport = CheckoutReport {
+    clean: CheckoutFact::Yes,
+    pushed: CheckoutFact::Yes,
+};
+
+/// A successful report whose worker states a clean, pushed checkout.
 fn report(worker: &ResourceRef, id: &str) -> TestResult<MailMessage> {
+    report_with(worker, id, CLEAN_AND_PUSHED)
+}
+
+/// A successful report stating `checkout`.
+fn report_with(
+    worker: &ResourceRef,
+    id: &str,
+    checkout: CheckoutReport,
+) -> TestResult<MailMessage> {
     Ok(MailMessage {
         id: ExternalRef::new(id)?,
         kind: MessageKind::WorkerDone,
@@ -520,6 +536,7 @@ fn report(worker: &ResourceRef, id: &str) -> TestResult<MailMessage> {
         outcome: Some(WorkerOutcome::Succeeded),
         subject: None,
         body: Some(Text::new("Done; the firmware builds.")?),
+        checkout,
     })
 }
 
@@ -1382,6 +1399,7 @@ fn coordinate_on_the_house_route_reports_a_question_for_a_person() -> TestResult
         WorkerPost {
             kind: PostKind::Report {
                 outcome: ReportedOutcome::Succeeded,
+                checkout: CLEAN_AND_PUSHED,
             },
             subject: None,
             body: Text::new("Done.")?,
@@ -1390,9 +1408,20 @@ fn coordinate_on_the_house_route_reports_a_question_for_a_person() -> TestResult
     )?;
     let actions = acted(kitchen.coordinate()?)?;
     assert!(actions.contains(&CoordinateAction::Supervised {
-        task,
+        task: task.clone(),
         outcome: Supervision::Settled(Settlement::Succeeded),
     }));
+    // The checkout the worker stated is kept on its report evidence.
+    let record = kitchen.store().task(&task)?;
+    assert!(
+        record
+            .evidence()
+            .items()
+            .iter()
+            .any(|evidence| evidence.kind == EvidenceKind::WorkerReport(CLEAN_AND_PUSHED)),
+        "{:?}",
+        record.evidence()
+    );
     Ok(())
 }
 
@@ -1802,6 +1831,112 @@ fn repair_hands_over_when_the_head_is_not_the_reported_one() -> TestResult {
         }]
     );
     assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+/// Issue 7 settled on a report stating `checkout`, with pull request 12
+/// conflicting at the reported head.
+fn settled_stating(checkout: CheckoutReport) -> TestResult<Kitchen> {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    acted(kitchen.pickup(false)?)?;
+    let worker = kitchen.worker(7)?;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen
+        .backend
+        .post(vec![report_with(&worker, "done-7", checkout)?])?;
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/kitchen/issue-7"),
+        json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
+    );
+    acted(kitchen.coordinate()?)?;
+    assert!(matches!(
+        kitchen.store().task(&kitchen.task(7)?)?.state(),
+        TaskState::Settled {
+            settlement: Settlement::Succeeded,
+            ..
+        }
+    ));
+    pull_request(kitchen.forge(), 7, 12, false)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/issues/7/timeline"), json!([]));
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    Ok(kitchen)
+}
+
+#[test]
+fn repair_hands_over_unless_the_report_states_a_clean_pushed_checkout() -> TestResult {
+    let stated = |clean, pushed| CheckoutReport { clean, pushed };
+    for checkout in [
+        // Uncommitted work left in the checkout.
+        stated(CheckoutFact::No, CheckoutFact::Yes),
+        // Commits not pushed, or the checkout ahead of the remote.
+        stated(CheckoutFact::Yes, CheckoutFact::No),
+        // A report that says nothing about its checkout, as Orca's
+        // worker_done and every report before this field.
+        CheckoutReport::default(),
+        stated(CheckoutFact::Yes, CheckoutFact::Unknown),
+    ] {
+        let kitchen = settled_stating(checkout)?;
+        let actions = acted(kitchen.repair()?)?;
+        assert_eq!(
+            actions,
+            [RepairAction::Decided {
+                pull_request: pr(12)?,
+                task: kitchen.task(7)?,
+                decision: RepairDecision::HandOver(HandOver::WorktreeUnknown),
+            }],
+            "{checkout:?}"
+        );
+        assert_eq!(kitchen.backend.launched_agents().len(), 1, "{checkout:?}");
+    }
+    // Stated clean and pushed at the head, the repair writer launches.
+    let kitchen = settled_stating(CLEAN_AND_PUSHED)?;
+    let actions = acted(kitchen.repair()?)?;
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [RepairAction::Launched { round: 1, .. }]
+        ),
+        "{actions:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn reports_recorded_before_the_checkout_field_read_as_unknown() -> TestResult {
+    assert_eq!(
+        serde_json::from_str::<EvidenceKind>(r#""worker-report""#)?,
+        EvidenceKind::WorkerReport(CheckoutReport::default())
+    );
+    let current = EvidenceKind::WorkerReport(CLEAN_AND_PUSHED);
+    assert_eq!(
+        serde_json::from_str::<EvidenceKind>(&serde_json::to_string(&current)?)?,
+        current
+    );
+    assert_eq!(
+        serde_json::from_str::<EvidenceKind>(r#""check""#)?,
+        EvidenceKind::Check
+    );
+    assert_eq!(
+        serde_json::from_str::<PostKind>(r#"{"type":"report","outcome":"succeeded"}"#)?,
+        PostKind::Report {
+            outcome: ReportedOutcome::Succeeded,
+            checkout: CheckoutReport::default(),
+        }
+    );
+    // A statement Kitchen does not know is refused, not read as a yes.
+    assert!(
+        serde_json::from_str::<EvidenceKind>(
+            r#"{"worker-report":{"clean":"mostly","pushed":"yes"}}"#
+        )
+        .is_err()
+    );
     Ok(())
 }
 

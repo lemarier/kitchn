@@ -676,7 +676,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             observed_branch: branch.as_str().to_owned(),
             requested: branch,
             report: Evidence {
-                kind: EvidenceKind::WorkerReport,
+                kind: EvidenceKind::WorkerReport(message.checkout),
                 verdict: EvidenceVerdict::Pass,
                 subject: EvidenceSubject { head, base: None },
                 source: message.id.clone(),

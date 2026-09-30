@@ -36,16 +36,57 @@ impl fmt::Display for EvidenceRevision {
     }
 }
 
+/// One fact a worker states about its checkout when it reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckoutFact {
+    /// The worker did not say, or its report predates the question.
+    #[default]
+    Unknown,
+    /// The worker stated the fact holds.
+    Yes,
+    /// The worker stated the fact does not hold.
+    No,
+}
+
+/// The worker's checkout at report time, as the worker stated it. Nothing
+/// here was observed by Kitchen; a report that says nothing is unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckoutReport {
+    /// The checkout had no uncommitted or untracked changes.
+    #[serde(default)]
+    pub clean: CheckoutFact,
+    /// Every local commit was pushed and the checkout's head was the
+    /// remote branch tip.
+    #[serde(default)]
+    pub pushed: CheckoutFact,
+}
+
+impl CheckoutReport {
+    /// Whether the worker stated both that its checkout was clean and that
+    /// it matched the remote branch.
+    #[must_use]
+    pub const fn clean_and_pushed(self) -> bool {
+        matches!(
+            (self.clean, self.pushed),
+            (CheckoutFact::Yes, CheckoutFact::Yes)
+        )
+    }
+}
+
 /// What an evidence item attests. Workflow owners add the kinds their
 /// policies evaluate, such as reviews or approvals.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", from = "EvidenceKindRecord")]
 #[non_exhaustive]
 pub enum EvidenceKind {
     /// A CI or local check result.
     Check,
-    /// A worker's own completion report.
-    WorkerReport,
+    /// A worker's own completion report, with the checkout it stated. A
+    /// report recorded before reports carried their checkout reads as
+    /// unknown.
+    WorkerReport(CheckoutReport),
     /// A verification run that names its environment but not the access that
     /// ran it. It never satisfies a verification requirement; it remains so
     /// records written before [`Self::AuthorizedVerification`] stay readable.
@@ -54,6 +95,50 @@ pub enum EvidenceKind {
     /// a verification environment. Distinct from checks: CI, unit, and
     /// simulated results never use it.
     AuthorizedVerification(VerificationAccess),
+}
+
+/// How an [`EvidenceKind`] is read from a record: the current form, or a
+/// worker report written before reports carried their checkout.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EvidenceKindRecord {
+    Legacy(LegacyEvidenceKind),
+    Current(CurrentEvidenceKind),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum LegacyEvidenceKind {
+    WorkerReport,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum CurrentEvidenceKind {
+    Check,
+    WorkerReport(CheckoutReport),
+    Verification(VerificationTarget),
+    AuthorizedVerification(VerificationAccess),
+}
+
+impl From<EvidenceKindRecord> for EvidenceKind {
+    fn from(record: EvidenceKindRecord) -> Self {
+        match record {
+            EvidenceKindRecord::Legacy(LegacyEvidenceKind::WorkerReport) => {
+                Self::WorkerReport(CheckoutReport::default())
+            }
+            EvidenceKindRecord::Current(CurrentEvidenceKind::Check) => Self::Check,
+            EvidenceKindRecord::Current(CurrentEvidenceKind::WorkerReport(checkout)) => {
+                Self::WorkerReport(checkout)
+            }
+            EvidenceKindRecord::Current(CurrentEvidenceKind::Verification(target)) => {
+                Self::Verification(target)
+            }
+            EvidenceKindRecord::Current(CurrentEvidenceKind::AuthorizedVerification(access)) => {
+                Self::AuthorizedVerification(access)
+            }
+        }
+    }
 }
 
 /// The exact revision evidence is about: a head commit and, for a change

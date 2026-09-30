@@ -169,6 +169,7 @@ fn the_house_mailbox_conforms_with_adoption_fencing() -> TestResult {
         post(
             PostKind::Report {
                 outcome: ReportedOutcome::Succeeded,
+                checkout: kitchen::contracts::CheckoutReport::default(),
             },
             "Done.",
         )?,
@@ -615,6 +616,7 @@ fn answers_reach_only_the_asking_worker_and_record_a_persons_time() -> TestResul
         post(
             PostKind::Report {
                 outcome: ReportedOutcome::Failed,
+                checkout: kitchen::contracts::CheckoutReport::default(),
             },
             "Blocked.",
         )?,
@@ -808,6 +810,7 @@ fn coordination_runs_on_a_backend_without_deliveries_through_the_house_mailbox()
         post(
             PostKind::Report {
                 outcome: ReportedOutcome::Succeeded,
+                checkout: kitchen::contracts::CheckoutReport::default(),
             },
             "Implemented; report at reports/issue.md.",
         )?,

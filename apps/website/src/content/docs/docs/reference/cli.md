@@ -422,7 +422,7 @@ task and fence.
 kitchn mailbox ask       <scope> --body <text> [--subject <text>] [--wait-secs 0-900]
 kitchn mailbox answer    <scope> --question <id> [--wait-secs 0-900]
 kitchn mailbox escalate  <scope> --body <text> [--subject <text>]
-kitchn mailbox report    <scope> --outcome succeeded|failed --body <text> [--subject <text>]
+kitchn mailbox report    <scope> --outcome succeeded|failed [--clean yes|no] [--pushed yes|no] --body <text> [--subject <text>]
 kitchn mailbox questions --house <id> (--registry <dir> | --store <dir>)
 kitchn mailbox reply     --house <id> (--registry <dir> | --store <dir>) --question <id> --body <text> --by person|coordinator
 ```
@@ -436,6 +436,12 @@ the answer; `answer` reads it later. `reply --by person` also records the
 person's time on the asking attempt, and is refused while the task has no
 owner, such as during a coordinator handover. A repeated identical reply
 changes nothing; a different one exits 1.
+
+`report --clean` states whether the worker's checkout had no uncommitted or
+untracked changes, and `--pushed` whether its HEAD was the remote branch tip
+with nothing unpushed. A report without them records the checkout as unknown,
+and scheduled repair then hands the pull request over instead of repairing
+it from a new checkout.
 
 The mailbox holds at most 512 messages, 64 per task, and 32 waiting per task;
 a full mailbox refuses the post instead of dropping it. Bodies and answers are

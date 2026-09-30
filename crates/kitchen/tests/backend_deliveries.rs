@@ -30,6 +30,7 @@ fn message(id: &str, kind: MessageKind) -> TestResult<MailMessage> {
         outcome: None,
         subject: None,
         body: None,
+        checkout: kitchen::contracts::CheckoutReport::default(),
     })
 }
 

@@ -99,7 +99,7 @@ fn stalled_step(
 
 fn report(verdict: EvidenceVerdict) -> TestResult<Evidence> {
     Ok(Evidence {
-        kind: EvidenceKind::WorkerReport,
+        kind: EvidenceKind::WorkerReport(kitchen::contracts::CheckoutReport::default()),
         verdict,
         subject: EvidenceSubject {
             head: commit('d')?,

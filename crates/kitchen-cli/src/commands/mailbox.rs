@@ -16,7 +16,7 @@ use std::{
 use clap::{Args, Subcommand, ValueEnum};
 use kitchen::{
     HouseId, TaskId,
-    contracts::{Clock, ExternalRef, SystemClock, Text},
+    contracts::{CheckoutFact, CheckoutReport, Clock, ExternalRef, SystemClock, Text},
     house::HouseError,
     state::{
         AnswerState, Answered, Answerer, HouseStore, MailAnswer, MailSender, PostKind,
@@ -77,6 +77,14 @@ enum MailboxCommand {
         message: Message,
         #[arg(long, value_enum)]
         outcome: Outcome,
+        /// Whether the checkout has no uncommitted or untracked changes.
+        /// Unknown when not given.
+        #[arg(long, value_enum)]
+        clean: Option<Stated>,
+        /// Whether every commit is pushed and HEAD is the remote branch tip.
+        /// Unknown when not given.
+        #[arg(long, value_enum)]
+        pushed: Option<Stated>,
     },
     /// Person or coordinator: list unanswered questions. Reads only.
     Questions {
@@ -141,6 +149,23 @@ enum Outcome {
     Failed,
 }
 
+/// A worker's yes or no about its checkout.
+#[derive(Clone, Copy, ValueEnum)]
+enum Stated {
+    Yes,
+    No,
+}
+
+impl Stated {
+    const fn fact(stated: Option<Self>) -> CheckoutFact {
+        match stated {
+            Some(Self::Yes) => CheckoutFact::Yes,
+            Some(Self::No) => CheckoutFact::No,
+            None => CheckoutFact::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum By {
     Person,
@@ -186,6 +211,8 @@ pub fn run(args: MailboxArgs) -> Result<(String, bool), kitchen::Error> {
             worker,
             message,
             outcome,
+            clean,
+            pushed,
         } => {
             let (store, sender) = worker.open()?;
             let outcome = match outcome {
@@ -195,7 +222,13 @@ pub fn run(args: MailboxArgs) -> Result<(String, bool), kitchen::Error> {
             let id = post(
                 &store,
                 &sender,
-                PostKind::Report { outcome },
+                PostKind::Report {
+                    outcome,
+                    checkout: CheckoutReport {
+                        clean: Stated::fact(clean),
+                        pushed: Stated::fact(pushed),
+                    },
+                },
                 message,
                 &clock,
             )?;

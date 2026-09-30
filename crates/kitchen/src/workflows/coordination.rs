@@ -235,7 +235,7 @@ fn house_mailbox_brief(store: &HouseStore, task: &TaskId, fence: Fence) -> Strin
         fence.get()
     );
     format!(
-        "Mailbox: this backend does not carry worker messages, so report to the coordinator through Kitchen's house mailbox, and only for this task. Ask a question with `kitchn mailbox ask {scope} --body <text> --wait-secs 600`, which waits for the answer; read a late answer with `kitchn mailbox answer {scope} --question <id>`. Escalate with `kitchn mailbox escalate {scope} --body <text>`. When done, report once with `kitchn mailbox report {scope} --outcome succeeded|failed --body <summary>`."
+        "Mailbox: this backend does not carry worker messages, so report to the coordinator through Kitchen's house mailbox, and only for this task. Ask a question with `kitchn mailbox ask {scope} --body <text> --wait-secs 600`, which waits for the answer; read a late answer with `kitchn mailbox answer {scope} --question <id>`. Escalate with `kitchn mailbox escalate {scope} --body <text>`. When done, report once with `kitchn mailbox report {scope} --outcome succeeded|failed --clean yes|no --pushed yes|no --body <summary>`: `--clean yes` only when `git status --porcelain` prints nothing, and `--pushed yes` only when your checkout's HEAD is the remote branch tip with nothing unpushed."
     )
 }
 
@@ -1235,7 +1235,7 @@ fn supervise_step(
             if completion.observed_branch != completion.requested.as_str() {
                 return Ok(Supervision::Escalate(Escalation::BranchMismatch));
             }
-            if completion.report.kind != EvidenceKind::WorkerReport
+            if !matches!(completion.report.kind, EvidenceKind::WorkerReport(_))
                 || completion.report.verdict != EvidenceVerdict::Pass
             {
                 return Ok(Supervision::Escalate(Escalation::MissingEvidence));

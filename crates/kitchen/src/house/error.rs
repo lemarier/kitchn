@@ -101,7 +101,7 @@ pub enum HouseError {
     MergeNeedsReadiness,
     /// Guided grants cannot prepare a merge without the gate's subject and evidence.
     #[error(
-        "merge cannot be granted by this command; configure a repository-scoped merge grant and matching policy limit in the house config, then let the gate attest and authorize each pull request at its exact head"
+        "merge cannot be granted by this command; configure a repository-scoped merge grant and matching policy limit in the house config; an independent reviewer then records the approved review with `kitchn gate attest`, and the scheduled gate verifies it and authorizes each pull request at its exact head"
     )]
     MergeGrantNeedsGate,
     /// Bounded filesystem I/O failed.

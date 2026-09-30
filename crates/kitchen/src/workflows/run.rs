@@ -191,9 +191,11 @@ pub enum RunError {
     /// and none were given.
     #[error("this pass needs its settings")]
     NoPassSettings,
-    /// A gate attestation names a reviewer who wrote the branch: the pull
-    /// request's author or a worker a launch of the branch created.
-    #[error("the attesting reviewer wrote the branch; an attestation must be independent")]
+    /// A gate attestation names the pull request's author as its reviewer,
+    /// or no reviewer.
+    #[error(
+        "the attesting reviewer is the pull request's author; an attestation must be independent"
+    )]
     AttestationNotIndependent,
     /// A gate attestation's recorder wrote the branch: it created or held
     /// one of its writer tasks, or a launch on the branch created it.

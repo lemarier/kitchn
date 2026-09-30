@@ -593,8 +593,10 @@ before anything runs.
   prints each verdict. It merges one only when an independent reviewer's
   attestation is recorded for exactly its head and base, the forge shows the
   review it names approved on that head by the claimed login, that login is
-  not the author, the house's forge login, or a branch writer, and the
-  house's merge grant covers it. The merge is a squash matched to that head, submitted only
+  neither the author nor the house's forge login, and the house's merge grant
+  covers it. A branch a person wrote, through `kitchn work`, `kitchn pr`, or a
+  worker's terminal, is only reported: a session name is not a forge login,
+  so the reviewer cannot be told apart from that writer. The merge is a squash matched to that head, submitted only
   after the head and base branch are read again. Without an attestation, or
   with any other verdict, it records nothing. Kitchen has no command that
   records attestations yet, so in practice the gate still only reports.

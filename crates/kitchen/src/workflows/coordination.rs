@@ -415,8 +415,14 @@ impl BranchFact {
 
 /// Whether supervision recorded that a person holds `worker`'s terminal.
 fn person_held(record: &TaskRecord, worker: &ResourceRef) -> bool {
-    held_key(worker).is_ok_and(|key| record.has_consumed(&key))
+    person_took_over(record, worker)
         && !released_key(worker).is_ok_and(|key| record.has_consumed(&key))
+}
+
+/// Whether supervision ever recorded a person at `worker`'s terminal,
+/// whether or not the hold was released since.
+pub(crate) fn person_took_over(record: &TaskRecord, worker: &ResourceRef) -> bool {
+    held_key(worker).is_ok_and(|key| record.has_consumed(&key))
 }
 
 /// What [`release_held_branch`] did.

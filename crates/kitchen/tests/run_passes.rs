@@ -2294,16 +2294,7 @@ fn gate_attestations_must_be_independent_and_are_never_rewritten() -> TestResult
             kitchen.clock.now(),
         )
     };
-    // The branch's own worker and the pull request's author are refused
-    // as reviewers.
-    let worker = kitchen.worker(7)?;
-    assert!(matches!(
-        record(
-            &attestation('d', worker.handle.as_str(), 11)?,
-            "kitchen-bot"
-        ),
-        Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
-    ));
+    // The pull request's author is refused as its reviewer.
     assert!(matches!(
         record(&attestation('d', "Kitchen-Bot", 11)?, "kitchen-bot"),
         Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
@@ -2375,6 +2366,90 @@ fn a_branch_writer_cannot_record_an_attestation_for_another_reviewer() -> TestRe
         .is_none()
     );
     Ok(())
+}
+
+/// The forge shows review 11 of pull request 12 approved at head `d` by
+/// `login`.
+fn approved_by(kitchen: &Kitchen, login: &str) -> TestResult {
+    kitchen.forge().set(
+        &format!("repos/{REPO}/pulls/12/reviews"),
+        json!([{"id": 11, "user": {"login": login}, "commit_id": commit('d')?.as_str(),
+            "state": "APPROVED", "submitted_at": "1970-01-01T00:00:00Z"}]),
+    );
+    Ok(())
+}
+
+/// An outside recorder attests review 11 by `reviewer`; the gate then
+/// reports the pull request for an unknown writer identity and neither
+/// records a verdict nor merges.
+fn assert_writer_unknown(kitchen: &Kitchen, reviewer: &str) -> TestResult {
+    approved_by(kitchen, reviewer)?;
+    record_gate_attestation(
+        kitchen.store(),
+        &attestation('d', reviewer, 11)?,
+        "kitchen-bot",
+        &BranchName::new("kitchen/issue-7")?,
+        &common::scheduled("reviewer")?,
+        kitchen.clock.now(),
+    )?;
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(
+        action.result,
+        GateResult::ReportOnly(ReportReason::WriterIdentityUnknown),
+        "{reviewer}"
+    );
+    assert!(merges(kitchen).is_empty(), "{reviewer}");
+    assert_eq!(verdict_markers(kitchen)?, 0, "{reviewer}");
+    Ok(())
+}
+
+#[test]
+fn gate_merges_nothing_when_a_person_wrote_the_branch_under_a_session_name() -> TestResult {
+    // Dana repaired the pull request as `session-dana`, pushing through the
+    // house's forge login, and handed the round back. She then approves as
+    // the forge login `dana`: no name in the records matches it. Any other
+    // reviewer is refused too, since Dana's login is unknown.
+    for reviewer in ["dana", "safety-reviewer"] {
+        let mut kitchen = settled_with_pull_request(true)?;
+        kitchen.config = with_merge_grant(house_config()?)?;
+        green_pull_request(&kitchen)?;
+        let (round, fence) = person_holds_round(&kitchen, 12)?;
+        kitchen
+            .store()
+            .relinquish(&round, fence, kitchen.clock.now())?;
+        assert_writer_unknown(&kitchen, reviewer)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn gate_merges_nothing_when_a_person_took_the_branch_workers_terminal() -> TestResult {
+    let mut kitchen = Kitchen::new()?;
+    kitchen.config = with_merge_grant(house_config()?)?;
+    kitchen.ready_seven();
+    assert!(matches!(kitchen.pickup(false)?, Outcome::Acted(_)));
+    let worker = kitchen.worker(7)?;
+    // A person takes the worker's terminal over; supervision records it.
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::UserTakeover);
+    acted(kitchen.coordinate()?)?;
+    // The worker then settles and reports, and its pull request is green.
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen.backend.post(vec![report(&worker, "done-7")?])?;
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/kitchen/issue-7"),
+        json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
+    );
+    acted(kitchen.coordinate()?)?;
+    pull_request(kitchen.forge(), 7, 12, true)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/issues/7/timeline"), json!([]));
+    green_pull_request(&kitchen)?;
+    assert_writer_unknown(&kitchen, "safety-reviewer")
 }
 
 #[test]

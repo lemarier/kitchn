@@ -7,16 +7,22 @@
 //! An attestation rests on a forge review ([`ForgeReview`]): its id and the
 //! login the reviewer claims. Only [`record_gate_attestation`] writes one. It
 //! refuses a claimant who wrote the branch, and a claimed reviewer who is
-//! the pull request's author or a branch writer. A recorded attestation is
-//! never rewritten: a different one for the same subject is refused, and a
-//! moved head or base needs a new attestation.
+//! the pull request's author. A recorded attestation is never rewritten: a
+//! different one for the same subject is refused, and a moved head or base
+//! needs a new attestation.
 //!
 //! The record authenticates nothing by itself: anyone who can open the
 //! store can claim any login. The scheduled gate reads it back with
 //! [`gate_attestation`] and merges only after the house's forge shows that
 //! review approved, on exactly the head, by the claimed login, and that
-//! login is neither the author the forge reports, a login Kitchen writes
-//! through, nor a branch writer.
+//! login is neither the author the forge reports nor a forge login a branch
+//! writer pushed as.
+//!
+//! The house records name a writer by its holder or worker handle, which is
+//! not a forge login and is never compared with one. A scheduled writer
+//! pushes as the house's forge login. A person's forge login is recorded
+//! nowhere, so a branch a person wrote, in their own session or at a
+//! worker's terminal, is never merged here ([`BranchWriters::forge_logins`]).
 //!
 //! Nothing in Kitchen records an attestation yet, so until a reviewer
 //! workflow does (#230), the scheduled gate reports every pull request as
@@ -28,10 +34,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{RunError, repair_of};
 use crate::{
-    HouseId, WorkflowId,
+    HolderId, HouseId, WorkflowId,
     contracts::{
         BranchName, Claimant, CommitId, ContractError, EvidenceSubject, IssueNumber, Repository,
-        Timestamp, ValueKind,
+        Timestamp, Trigger, ValueKind,
     },
     integrations::github::{Review, ReviewState},
     state::{
@@ -39,7 +45,7 @@ use crate::{
         TaskRecord, WorkItem,
     },
     workflows::{
-        coordination::{launched_workers, task_branch},
+        coordination::{launched_workers, person_took_over, task_branch},
         gate::{RiskClass, SemanticReview},
     },
 };
@@ -96,14 +102,14 @@ pub struct GateAttestation {
 /// Record `attestation` for its exact subject. `author` is the pull
 /// request's author and `branch` its head branch, as the forge reports
 /// them. `recorded_by` must not be a branch writer, and the claimed
-/// reviewer must be neither `author` nor a branch writer. Recording the
-/// same attestation again is a no-op.
+/// reviewer must not be `author`. Recording the same attestation again is a
+/// no-op.
 ///
 /// # Errors
 /// [`ContractError::CrossHouse`] for another house,
 /// [`RunError::AttestationByWriter`] when `recorded_by` wrote the branch,
-/// [`RunError::AttestationNotIndependent`] for a reviewer who wrote the
-/// branch or an empty login, [`RunError::AttestationRecorded`] when a
+/// [`RunError::AttestationNotIndependent`] for a reviewer who is `author`
+/// or an empty login, [`RunError::AttestationRecorded`] when a
 /// different attestation exists for the subject, and store errors.
 pub fn record_gate_attestation(
     store: &HouseStore,
@@ -129,12 +135,7 @@ pub fn record_gate_attestation(
     if writers.includes(recorded_by.holder.as_str()) {
         return Err(RunError::AttestationByWriter.into());
     }
-    if !independent(
-        &attestation.forge_review.reviewer,
-        Some(author),
-        &[],
-        &writers,
-    ) {
+    if !independent(&attestation.forge_review.reviewer, Some(author), &[]) {
         return Err(RunError::AttestationNotIndependent.into());
     }
     let key = key(
@@ -194,20 +195,14 @@ pub(super) fn review_verified(reviews: &[Review], claimed: &ForgeReview, head: &
 }
 
 /// Whether `login` did not write the branch: it is not empty, differs from
-/// the pull request's `author`, which must be known, and is neither one of
-/// the `forge_writers` Kitchen's workers write through nor a branch writer.
-pub(super) fn independent(
-    login: &str,
-    author: Option<&str>,
-    forge_writers: &[String],
-    writers: &BranchWriters,
-) -> bool {
+/// the pull request's `author`, which must be known, and is none of the
+/// `writer_logins`, the forge logins the branch's writers pushed as.
+pub(super) fn independent(login: &str, author: Option<&str>, writer_logins: &[String]) -> bool {
     !login.is_empty()
         && author.is_some_and(|author| !author.eq_ignore_ascii_case(login))
-        && !forge_writers
+        && !writer_logins
             .iter()
             .any(|writer| writer.eq_ignore_ascii_case(login))
-        && !writers.includes(login)
 }
 
 /// Who wrote a pull request's branch in the house's records: every holder
@@ -216,7 +211,13 @@ pub(super) fn independent(
 /// person's or scheduled), and every worker a launch on the branch created.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct BranchWriters {
+    /// Holders and worker handles, as the house records name them. These
+    /// are not forge logins.
     names: Vec<String>,
+    /// A person wrote the branch: an interactive holder created or held one
+    /// of its writer tasks, or a person took one of its workers' terminals
+    /// over.
+    person: bool,
 }
 
 impl BranchWriters {
@@ -227,35 +228,76 @@ impl BranchWriters {
         branch: &BranchName,
     ) -> Self {
         let mut names = Vec::new();
+        let mut person = false;
+        let mut holder = |holder: &HolderId, trigger: &Trigger| {
+            names.push(holder.as_str().to_owned());
+            match trigger {
+                Trigger::Interactive => person = true,
+                Trigger::Scheduled | Trigger::Event(_) => {}
+            }
+        };
+        let mut workers = Vec::new();
         for record in tasks {
             let writes = task_branch(record).as_ref() == Some(branch)
                 || repair_of(record, repository).is_some_and(|(number, _)| number == pull_request);
             if writes {
-                names.push(record.created_by().holder.as_str().to_owned());
-                names.extend(record.ownership().iter().filter_map(|event| match event {
-                    OwnershipEvent::Claimed { holder, .. }
-                    | OwnershipEvent::Adopted { holder, .. }
-                    | OwnershipEvent::TakenOver { holder, .. } => Some(holder.as_str().to_owned()),
-                    OwnershipEvent::Relinquished { .. } | OwnershipEvent::Released { .. } => None,
-                }));
+                let created = record.created_by();
+                holder(&created.holder, &created.trigger);
+                for event in record.ownership() {
+                    match event {
+                        OwnershipEvent::Claimed {
+                            holder: by,
+                            trigger,
+                            ..
+                        }
+                        | OwnershipEvent::Adopted {
+                            holder: by,
+                            trigger,
+                            ..
+                        }
+                        | OwnershipEvent::TakenOver {
+                            holder: by,
+                            trigger,
+                            ..
+                        } => holder(by, trigger),
+                        OwnershipEvent::Relinquished { .. } | OwnershipEvent::Released { .. } => {}
+                    }
+                }
             }
-            names.extend(
+            workers.extend(
                 launched_workers(record)
                     .filter(|view| view.branch.as_ref() == Some(branch))
-                    .map(|view| view.worker.handle.as_str().to_owned()),
+                    .map(|view| {
+                        (
+                            view.worker.handle.as_str().to_owned(),
+                            person_took_over(record, &view.worker),
+                        )
+                    }),
             );
+        }
+        for (handle, taken_over) in workers {
+            names.push(handle);
+            person |= taken_over;
         }
         names.sort_unstable();
         names.dedup();
-        Self { names }
+        Self { names, person }
     }
 
-    /// Whether `name`, a login or holder, is one of the writers, ignoring
-    /// ASCII case.
+    /// Whether `name`, a holder or worker handle, is one of the writers,
+    /// ignoring ASCII case.
     pub(super) fn includes(&self, name: &str) -> bool {
         self.names
             .iter()
             .any(|writer| writer.eq_ignore_ascii_case(name))
+    }
+
+    /// The forge logins the branch's writers pushed as, when every one is
+    /// verified: `house`, the logins Kitchen's unattended writers push
+    /// through. `None` when a person wrote the branch, since no record ties
+    /// a session to a forge login, or when `house` names no login.
+    pub(super) fn forge_logins<'a>(&self, house: &'a [String]) -> Option<&'a [String]> {
+        (!self.person && !house.is_empty()).then_some(house)
     }
 }
 
@@ -288,45 +330,38 @@ fn key(
 mod tests {
     use super::{BranchWriters, independent};
 
-    fn writers(names: &[&str]) -> BranchWriters {
-        BranchWriters {
-            names: names.iter().map(|name| (*name).to_owned()).collect(),
-        }
-    }
-
     #[test]
     fn a_reviewer_must_differ_from_a_known_author() {
-        let none = writers(&[]);
-        assert!(independent("Reviewer", Some("kitchen-bot"), &[], &none));
-        assert!(!independent("Reviewer", Some("reviewer"), &[], &none));
-        assert!(!independent("Reviewer", None, &[], &none));
-        assert!(!independent("", Some("kitchen-bot"), &[], &none));
+        assert!(independent("Reviewer", Some("kitchen-bot"), &[]));
+        assert!(!independent("Reviewer", Some("reviewer"), &[]));
+        assert!(!independent("Reviewer", None, &[]));
+        assert!(!independent("", Some("kitchen-bot"), &[]));
     }
 
     #[test]
-    fn a_reviewer_must_not_write_the_branch() {
-        let forge = ["kitchen-bot".to_owned()];
-        let branch = writers(&["session-dana", "worker-1"]);
-        assert!(independent(
-            "safety-reviewer",
-            Some("someone"),
-            &forge,
-            &branch
-        ));
-        // Kitchen's own forge login, a person who held a writer task, and
-        // a worker a launch created are all writers.
-        assert!(!independent(
-            "Kitchen-Bot",
-            Some("someone"),
-            &forge,
-            &branch
-        ));
-        assert!(!independent(
-            "session-dana",
-            Some("someone"),
-            &forge,
-            &branch
-        ));
-        assert!(!independent("worker-1", Some("someone"), &forge, &branch));
+    fn a_reviewer_must_not_be_a_forge_login_a_writer_pushed_as() {
+        let house = ["kitchen-bot".to_owned()];
+        assert!(independent("safety-reviewer", Some("someone"), &house));
+        assert!(!independent("Kitchen-Bot", Some("someone"), &house));
+    }
+
+    #[test]
+    fn writers_have_forge_logins_only_when_none_is_a_person() {
+        let house = ["kitchen-bot".to_owned()];
+        let unattended = BranchWriters {
+            names: vec!["kitchn-run".to_owned(), "worker-1".to_owned()],
+            person: false,
+        };
+        assert_eq!(unattended.forge_logins(&house), Some(house.as_slice()));
+        // Without a house login, an unattended writer's login is unknown.
+        assert_eq!(unattended.forge_logins(&[]), None);
+        // A session name is not a login: it stays unknown whatever it is.
+        let person = BranchWriters {
+            names: vec!["session-dana".to_owned()],
+            person: true,
+        };
+        assert_eq!(person.forge_logins(&house), None);
+        assert!(person.includes("Session-Dana"));
+        assert!(!person.includes("dana"));
     }
 }

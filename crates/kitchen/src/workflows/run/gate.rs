@@ -7,9 +7,10 @@
 //! attestation recorded for exactly the pull request's head and base
 //! ([`super::gate_attestation`]). The attestation counts only when the
 //! house's forge shows the review it names approved on that head by the
-//! claimed login, and that login did not write the branch; otherwise the
-//! pull request is only reported. A merge also needs the house's
-//! readiness-checked [`MergeGrant`] for that exact subject.
+//! claimed login, every branch writer's forge login is known, and the
+//! reviewer is none of them; otherwise the pull request is only reported.
+//! A merge also needs the house's readiness-checked [`MergeGrant`] for that
+//! exact subject.
 //!
 //! Only a pull request whose verdict, evaluated without history, is a
 //! merge is recorded. It gets a gate task, claimed under this pass's lease,
@@ -75,8 +76,8 @@ pub struct GatePass<'a, T> {
     pub clock: &'a dyn Clock,
     /// The repository.
     pub repository: &'a Repository,
-    /// Pull request authors eligible for unattended merge, such as the
-    /// house's forge login.
+    /// The house's forge logins: the pull request authors eligible for
+    /// unattended merge, and the logins scheduled branch writers push as.
     pub authors: &'a [String],
     /// Take over an expired pass lease, or an expired claim on a gate task,
     /// instead of stopping.
@@ -92,8 +93,13 @@ pub struct GatePass<'a, T> {
 pub enum ReportReason {
     /// No attestation is recorded for the exact head and base.
     Unattested,
-    /// The attestation's reviewer wrote the branch, or the forge does not
-    /// name the pull request's author.
+    /// A branch writer's forge login is unknown, so the reviewer cannot be
+    /// told apart from the writers: a person wrote the branch, or the house
+    /// names no forge login its scheduled writers push as.
+    WriterIdentityUnknown,
+    /// The attestation's reviewer is the pull request's author or a forge
+    /// login a branch writer pushed as, or the forge does not name the
+    /// author.
     NotIndependent,
     /// The forge does not show the attestation's review: none with its id,
     /// or not by the claimed login, not approved, or not on this head.
@@ -286,13 +292,17 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             .user
             .as_ref()
             .map(|user| user.login.as_str());
+        // A holder or worker handle is not a forge login, so the reviewer
+        // is compared only with logins every writer is known to push as.
         let writers = attestation::BranchWriters::of(tasks, self.repository, number, &found.branch);
-        if !attestation::independent(
-            &attested.forge_review.reviewer,
-            author,
-            self.authors,
-            &writers,
-        ) {
+        let Some(writers) = writers.forge_logins(self.authors) else {
+            return Ok(report(
+                &evidence,
+                GateGrants::default(),
+                ReportReason::WriterIdentityUnknown,
+            ));
+        };
+        if !attestation::independent(&attested.forge_review.reviewer, author, writers) {
             return Ok(report(
                 &evidence,
                 GateGrants::default(),

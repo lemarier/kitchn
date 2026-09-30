@@ -366,6 +366,50 @@ changing either file. The last happens when `ledger.json` was restored from an
 older copy; restore the ledger that committed those batches, or reconcile the
 archive file by hand. An archived stream no longer supports new grant proposals.
 
+## `kitchn audit`
+
+Preview the brigade audit of one house: how stations, guidance, and schedules
+are performing, and the draft proposals that follow. It reads only; nothing is
+filed, and no guidance, grant, or schedule changes.
+
+```sh
+kitchn audit --registry <dir> --house <id> [--store <dir>] --ledger <dir> \
+  (--orca <path> --runtime-dir <dir> | --schedule-evidence <file>) \
+  [--open-proposal <key>... | --no-open-proposals] [--destination <owner/name>] [--json]
+```
+
+The report lists repeated confirmed findings per station and work type,
+schedules near their run budget or mostly idle, and stations whose work types'
+first-pass acceptance has diverged. Each item states its sample size and lists
+up to 20 evidence links, then how many more links and private sources there
+are. Simulated deliveries are counted apart and never support a proposal.
+Each draft proposes a guidance change, a work type or role split, or a
+schedule change, and applying it needs the owner's decision.
+
+Drafts are proposed only when the house budget and the open proposals are both
+known; otherwise the report says why and lists the withheld proposal keys.
+
+- Paths: `--ledger`, `--orca`, `--runtime-dir`, and `--schedule-evidence` must
+  be absolute; a relative path is refused as invalid input.
+- Budget: `--orca` lists every house schedule through the house's bound
+  backend, and the run is refused while the house budget is exhausted.
+  `--schedule-evidence` is a JSON file of observed schedule runs; it may omit
+  schedules, so the budget is unknown and nothing is proposed. The budget is
+  also unknown when the observed runs do not reach back to the window's start.
+- Open proposals: each draft carries a hidden `kitchn:brigade-audit` marker
+  with its key. Read the keys of the open issues and pass every one with
+  `--open-proposal`, or pass `--no-open-proposals` when none is open. The
+  preview does not read the forge and never assumes that nothing is open.
+
+At most 10 drafts come out of one run; the rest are listed as deferred. The
+ledger, store, and schedules must all belong to `--house`. Reports and drafts
+hold typed names, counts, and public-safe links only: an `https` link on the
+house's bound forge to an issue, pull request, or commit in `--destination`,
+the posting destination the drafts will be filed in, or a schedule consumer.
+Without `--destination` no forge link is published.
+Other sources, finding text, transcripts, and backend handles stay in the
+house.
+
 ## `kitchn pickup`
 
 Offline pickup diagnostics.

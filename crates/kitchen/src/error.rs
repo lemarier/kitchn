@@ -98,6 +98,9 @@ pub enum Error {
     /// An attempt usage record was refused.
     #[error(transparent)]
     Usage(#[from] crate::state::UsageError),
+    /// Brigade audit failure.
+    #[error(transparent)]
+    Audit(#[from] crate::workflows::audit::AuditError),
 }
 
 impl Error {
@@ -129,6 +132,7 @@ impl Error {
             Self::Backend(error) => error.class(),
             Self::Sampling(error) => error.class(),
             Self::Usage(error) => error.class(),
+            Self::Audit(error) => error.class(),
         }
     }
 }

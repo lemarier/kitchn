@@ -1,4 +1,5 @@
 //! Thin command adapters; policy and storage stay in the library.
+pub mod audit;
 pub mod budget;
 pub mod cleanup;
 pub mod decompose;

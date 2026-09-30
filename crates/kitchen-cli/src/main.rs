@@ -50,6 +50,8 @@ enum Command {
     Store(commands::store::StoreArgs),
     /// Report how full the trust ledger is and preview or apply its archival.
     Trust(commands::trust::TrustArgs),
+    /// Preview the brigade audit and its draft proposals. Reads only.
+    Audit(commands::audit::AuditArgs),
     #[command(flatten)]
     Interactive(commands::interactive::InteractiveCommand),
 }
@@ -93,6 +95,7 @@ fn main() -> ExitCode {
         Some(Command::Forge(args)) => commands::forge::run(args),
         Some(Command::Store(args)) => commands::store::run(args),
         Some(Command::Trust(args)) => commands::trust::run(args),
+        Some(Command::Audit(args)) => commands::audit::run(args),
         Some(Command::Interactive(command)) => commands::interactive::run(command),
         None => return output_status(Cli::command().print_help()),
     };

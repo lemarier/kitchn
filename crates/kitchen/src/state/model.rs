@@ -1674,6 +1674,38 @@ impl StoreState {
         }
     }
 
+    pub(crate) fn finish_attempt_exhausted(
+        &mut self,
+        id: &TaskId,
+        fence: Fence,
+        number: AttemptNumber,
+        now: Timestamp,
+    ) -> Result<()> {
+        let task = self.task_mut(id)?;
+        task.owned_lease(fence, now, false)?;
+        let unresolved = task.blocking_settlement(false);
+        if unresolved > 0 {
+            return fail(StateError::UnresolvedEffects { count: unresolved });
+        }
+        let attempt = task
+            .attempt(number)
+            .ok_or(StateError::AttemptNotFound(number))?;
+        if attempt.fence != fence {
+            return fail(StateError::StaleFence { presented: fence });
+        }
+        if attempt.state != AttemptState::Running {
+            return fail(StateError::NoRunningAttempt);
+        }
+        let attempt = task
+            .running_attempt_mut(fence)
+            .ok_or(StateError::NoRunningAttempt)?;
+        attempt.state = AttemptState::Finished {
+            outcome: AttemptOutcome::Failed(FailureClass::Retryable),
+            at: now,
+        };
+        task.settle(Settlement::Exhausted, fence, now)
+    }
+
     pub(crate) fn request_cancel(
         &mut self,
         id: &TaskId,

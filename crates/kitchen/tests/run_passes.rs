@@ -13,11 +13,12 @@ use std::{
 
 use common::{ManualClock, TestResult, WORKER_PERMISSIONS, backend_id, commit, credential, house};
 use kitchen::{
-    CredentialId, HolderId,
+    CredentialId, HolderId, WorkflowId,
     contracts::{
-        BranchName, Capability, CapabilitySet, CheckoutFact, CheckoutReport, Clock, EvidenceKind,
-        ExternalRef, Grant, MailMessage, MessageKind, PostingBudget, Repository, ResourceRef,
-        Settlement, Text, WorkerOutcome, WorkerState, fake::FakeBackend,
+        BranchName, Capability, CapabilitySet, CheckoutFact, CheckoutReport, Clock, Evidence,
+        EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef, Grant, LeaseTtl, MailMessage,
+        MessageKind, PostingBudget, Repository, ResourceRef, Settlement, Text, WorkerOutcome,
+        WorkerState, fake::FakeBackend,
     },
     house::HouseConfig,
     integrations::github::{
@@ -2674,10 +2675,10 @@ fn gate_does_not_merge_when_the_head_moves_after_the_verdict() -> TestResult {
 fn gate_passes_that_do_not_merge_continue_one_attempt() -> TestResult {
     let mut kitchen = settled_with_pull_request(true)?;
     kitchen.config = with_merge_grant(house_config()?)?;
-    // The head moves under the merge in more passes than a gate task has
-    // attempts. Each pass relinquishes the task with its attempt open.
+    // Each pass relinquishes its task with an attempt open. A new subject
+    // gets a new generation, so no task inherits another head's clock.
     let mut head = 'd';
-    for next in ['1', '2', '3', '4'] {
+    for (index, next) in ['1', '2', '3', '4'].into_iter().enumerate() {
         green_at(&kitchen, head)?;
         attest(&kitchen, head)?;
         move_head_before_the_merge(&kitchen, next)?;
@@ -2688,12 +2689,19 @@ fn gate_passes_that_do_not_merge_continue_one_attempt() -> TestResult {
             "{head}: {action:?}"
         );
         let tasks = gate_tasks(&kitchen)?;
-        assert_eq!(tasks.len(), 1, "{head}");
-        assert_eq!(tasks[0].attempts().len(), 1, "{head}");
-        assert!(matches!(tasks[0].state(), TaskState::Open), "{head}");
+        assert_eq!(tasks.len(), index + 1, "{head}");
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| matches!(task.state(), TaskState::Open))
+                .count(),
+            1,
+            "{head}"
+        );
+        assert!(tasks.iter().all(|task| task.attempts().len() == 1));
         head = next;
     }
-    // The head then holds still: the same attempt merges it.
+    // The head then holds still: its fresh task merges it.
     green_at(&kitchen, head)?;
     attest(&kitchen, head)?;
     let action = one_verdict(kitchen.gate()?)?;
@@ -2702,15 +2710,21 @@ fn gate_passes_that_do_not_merge_continue_one_attempt() -> TestResult {
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].1["sha"], commit(head)?.as_str());
     let tasks = gate_tasks(&kitchen)?;
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].attempts().len(), 1);
-    assert!(matches!(
-        tasks[0].state(),
-        TaskState::Settled {
-            settlement: Settlement::Succeeded,
-            ..
-        }
-    ));
+    assert_eq!(tasks.len(), 5);
+    assert!(tasks.iter().all(|task| task.attempts().len() == 1));
+    assert_eq!(
+        tasks
+            .iter()
+            .filter(|task| matches!(
+                task.state(),
+                TaskState::Settled {
+                    settlement: Settlement::Succeeded,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
     Ok(())
 }
 
@@ -2871,7 +2885,25 @@ fn gate_merges_after_the_house_returns_to_an_earlier_specification() -> TestResu
 #[test]
 fn gate_replaces_a_task_whose_ownership_history_is_nearly_full() -> TestResult {
     let kitchen = gate_task_left_open(NotMerged::Unread)?;
-    let worn = gate_tasks(&kitchen)?[0].spec().id.clone();
+    let worn = wear_gate_task(&kitchen)?;
+    // The next pass settles it while its history still has room, and
+    // merges under the next generation.
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(action.result, GateResult::Merged, "{action:?}");
+    assert!(matches!(
+        kitchen.store().task(&worn)?.state(),
+        TaskState::Settled {
+            settlement: Settlement::Cancelled,
+            ..
+        }
+    ));
+    assert_eq!(gate_tasks(&kitchen)?.len(), 2);
+    assert_eq!(merges(&kitchen).len(), 1);
+    Ok(())
+}
+
+fn wear_gate_task(kitchen: &Kitchen) -> TestResult<kitchen::TaskId> {
+    let worn = gate_tasks(kitchen)?[0].spec().id.clone();
     // Many passes held the task and gave it back without merging.
     let ttl = kitchen::contracts::LeaseTtl::new(TASK_LEASE)?;
     while kitchen.store().task(&worn)?.ownership().len() + 6
@@ -2884,12 +2916,154 @@ fn gate_replaces_a_task_whose_ownership_history_is_nearly_full() -> TestResult {
             .store()
             .relinquish(&worn, lease.fence(), kitchen.clock.now())?;
     }
-    // The next pass settles it while its history still has room, and
-    // merges under the next generation.
+    Ok(worn)
+}
+
+#[test]
+fn replacement_gate_task_inherits_the_subject_deadline() -> TestResult {
+    let kitchen = gate_task_left_open(NotMerged::Unread)?;
+    let worn = wear_gate_task(&kitchen)?;
+    kitchen.clock.advance(retry_deadline(&kitchen)? - 1);
+    let endpoint = format!("repos/{REPO}/pulls/12");
+    let at_d = pull_request_now(&kitchen)?;
+    kitchen
+        .forge()
+        .queue(&endpoint, vec![at_d.clone(), at_d.clone()]);
+    kitchen.forge().responses.borrow_mut().remove(&endpoint);
+    let within = one_verdict(kitchen.gate()?)?;
+    assert_eq!(within.result, GateResult::NotMerged(NotMerged::Unread));
+    assert_eq!(gate_tasks(&kitchen)?.len(), 2);
+    assert!(matches!(
+        kitchen.store().task(&worn)?.state(),
+        TaskState::Settled {
+            settlement: Settlement::Cancelled,
+            ..
+        }
+    ));
+    kitchen.forge().set(&endpoint, at_d);
+    kitchen.clock.advance(2);
+    let after = one_verdict(kitchen.gate()?)?;
+    assert_eq!(after.result, GateResult::NotMerged(NotMerged::Exhausted));
+    assert!(matches!(
+        gate_tasks(&kitchen)?
+            .into_iter()
+            .find(|record| record.spec().id != worn)
+            .ok_or("missing replacement")?
+            .state(),
+        TaskState::Settled {
+            settlement: Settlement::Exhausted,
+            ..
+        }
+    ));
+    assert!(merges(&kitchen).is_empty());
+    Ok(())
+}
+
+#[test]
+fn worn_gate_task_exhausts_the_subject_after_a_restart() -> TestResult {
+    let mut kitchen = gate_task_left_open(NotMerged::Unread)?;
+    let worn = wear_gate_task(&kitchen)?;
+    kitchen.fixture.store = kitchen.fixture.reopen()?;
+    kitchen.clock.advance(retry_deadline(&kitchen)? + 1);
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(
+        action.result,
+        GateResult::ReportOnly(ReportReason::ExhaustedForSubject),
+        "{action:?}"
+    );
+    assert!(matches!(
+        kitchen.store().task(&worn)?.state(),
+        TaskState::Settled {
+            settlement: Settlement::Exhausted,
+            ..
+        }
+    ));
+    assert_eq!(gate_tasks(&kitchen)?.len(), 1);
+    assert!(merges(&kitchen).is_empty());
+    let again = one_verdict(kitchen.gate()?)?;
+    assert_eq!(
+        again.result,
+        GateResult::ReportOnly(ReportReason::ExhaustedForSubject)
+    );
+    green_and_attested_on(&kitchen, 'f', 'e')?;
+    let fresh = one_verdict(kitchen.gate()?)?;
+    assert_eq!(fresh.result, GateResult::Merged, "{fresh:?}");
+    assert_eq!(gate_tasks(&kitchen)?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_legacy_task_spanning_heads_keeps_the_first_attempt_budget() -> TestResult {
+    let kitchen = gate_task_left_open(NotMerged::Moved)?;
+    let task = gate_tasks(&kitchen)?[0].spec().id.clone();
+    let first = gate_tasks(&kitchen)?[0].attempts()[0].started_at();
+    // Model an old gate task: its single attempt began at d, but its latest
+    // evidence now names f and no subject budget marker existed then.
+    let lease = kitchen.store().claim(
+        &task,
+        &run_claimant()?,
+        LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    kitchen.store().record_evidence(
+        &task,
+        lease.fence(),
+        Evidence {
+            kind: EvidenceKind::Check,
+            verdict: EvidenceVerdict::Pass,
+            subject: EvidenceSubject {
+                head: commit('f')?,
+                base: Some(commit('e')?),
+            },
+            source: ExternalRef::new("legacy-check")?,
+            observed_at: kitchen.clock.now(),
+        },
+        kitchen.clock.now(),
+    )?;
+    kitchen
+        .store()
+        .relinquish(&task, lease.fence(), kitchen.clock.now())?;
+    let old_markers = kitchen
+        .store()
+        .markers(&WorkflowId::new("merge-gate-budget")?)?;
+    assert_eq!(old_markers.len(), 1);
+    let retired = kitchen.store().retire_markers(
+        &old_markers
+            .into_iter()
+            .map(|marker| (marker.key().clone(), marker.fact().clone()))
+            .collect::<Vec<_>>(),
+    )?;
+    assert_eq!(retired.len(), 1);
+
+    kitchen.clock.advance(retry_deadline(&kitchen)? + 1);
+    let b = one_verdict(kitchen.gate()?)?;
+    assert_eq!(b.head, commit('f')?);
+    assert_eq!(b.result, GateResult::NotMerged(NotMerged::Exhausted));
+    assert_eq!(gate_tasks(&kitchen)?.len(), 1);
+    assert_eq!(gate_tasks(&kitchen)?[0].attempts()[0].started_at(), first);
+    assert!(merges(&kitchen).is_empty());
+
+    green_and_attested_on(&kitchen, 'd', 'e')?;
+    let returned = one_verdict(kitchen.gate()?)?;
+    assert_eq!(returned.head, commit('d')?);
+    assert_eq!(
+        returned.result,
+        GateResult::ReportOnly(ReportReason::ExhaustedForSubject)
+    );
+    assert!(merges(&kitchen).is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_new_head_gets_a_fresh_budget_after_the_old_head_expires() -> TestResult {
+    let kitchen = gate_task_left_open(NotMerged::Unread)?;
+    let old = gate_tasks(&kitchen)?[0].spec().id.clone();
+    kitchen.clock.advance(retry_deadline(&kitchen)? + 1);
+    green_and_attested_on(&kitchen, 'f', 'e')?;
     let action = one_verdict(kitchen.gate()?)?;
     assert_eq!(action.result, GateResult::Merged, "{action:?}");
     assert!(matches!(
-        kitchen.store().task(&worn)?.state(),
+        kitchen.store().task(&old)?.state(),
         TaskState::Settled {
             settlement: Settlement::Cancelled,
             ..
@@ -3171,11 +3345,11 @@ fn retry_deadline(kitchen: &Kitchen) -> TestResult<u64> {
 #[test]
 fn gate_ends_a_continued_attempt_past_the_retry_deadline() -> TestResult {
     // The gate task's attempt was interrupted by a pass that did not merge.
-    // The pull request is green and attested at head f.
-    let kitchen = gate_task_left_open(NotMerged::Moved)?;
+    // The pull request is still at the task's original head.
+    let kitchen = gate_task_left_open(NotMerged::Unread)?;
     kitchen.clock.advance(retry_deadline(&kitchen)? + 1);
     let action = one_verdict(kitchen.gate()?)?;
-    assert_eq!(action.head, commit('f')?);
+    assert_eq!(action.head, commit('d')?);
     assert_eq!(
         action.result,
         GateResult::NotMerged(NotMerged::Exhausted),
@@ -3196,8 +3370,7 @@ fn gate_ends_a_continued_attempt_past_the_retry_deadline() -> TestResult {
         "{:?}",
         tasks[0].state()
     );
-    // No intent was recorded for head f: the only one is the abandoned
-    // intent for head d.
+    // No second intent was recorded after the deadline.
     assert_eq!(tasks[0].effects().len(), 1);
     // On the same head and base no new task retries the same evidence.
     let again = one_verdict(kitchen.gate()?)?;
@@ -3210,7 +3383,7 @@ fn gate_ends_a_continued_attempt_past_the_retry_deadline() -> TestResult {
     assert!(merges(&kitchen).is_empty());
     // A moved base is new evidence, and so is a new head: a new generation
     // of the task merges.
-    green_and_attested_on(&kitchen, 'f', 'a')?;
+    green_and_attested_on(&kitchen, 'd', 'a')?;
     move_head_before_the_merge(&kitchen, '1')?;
     let moved = one_verdict(kitchen.gate()?)?;
     assert_eq!(
@@ -3225,14 +3398,14 @@ fn gate_ends_a_continued_attempt_past_the_retry_deadline() -> TestResult {
     let writes = merges(&kitchen);
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].1["sha"], commit('1')?.as_str());
-    assert_eq!(gate_tasks(&kitchen)?.len(), 2);
+    assert_eq!(gate_tasks(&kitchen)?.len(), 3);
     Ok(())
 }
 
 #[test]
 fn gate_continues_an_attempt_up_to_the_retry_deadline() -> TestResult {
     // Exactly at the deadline the budget is not yet spent.
-    let kitchen = gate_task_left_open(NotMerged::Moved)?;
+    let kitchen = gate_task_left_open(NotMerged::Unread)?;
     kitchen.clock.advance(retry_deadline(&kitchen)?);
     let action = one_verdict(kitchen.gate()?)?;
     assert_eq!(action.result, GateResult::Merged, "{action:?}");

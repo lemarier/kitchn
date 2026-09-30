@@ -306,6 +306,22 @@ impl HouseStore {
         self.transact(|state| state.finish_attempt(id, fence, attempt, outcome, now))
     }
 
+    /// Finish a running attempt as exhausted when its workflow's durable
+    /// subject budget has expired across task generations. The caller must
+    /// verify that deadline; unresolved effects still prevent settlement.
+    ///
+    /// # Errors
+    /// Refuses a stale claim, a non-running attempt, or unresolved effects.
+    pub(crate) fn finish_attempt_exhausted(
+        &self,
+        id: &TaskId,
+        fence: Fence,
+        attempt: AttemptNumber,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.transact(|state| state.finish_attempt_exhausted(id, fence, attempt, now))
+    }
+
     /// Request cancellation. Needs no claim; an open task without unresolved
     /// effects settles immediately, otherwise its owner must stop its
     /// workers and settle it. Cancellation proves no rollback: an uncertain

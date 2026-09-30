@@ -151,8 +151,13 @@ fn markers_of_a_closed_item_retire_and_others_stay() -> TestResult {
     let closed_pr = key("merge-gate", pull_request(1)?, 'a')?;
     let open_pr = key("merge-gate", pull_request(2)?, 'a')?;
     let unobserved = key("merge-gate", pull_request(3)?, 'a')?;
+    let closed_budget = key("merge-gate-budget", pull_request(1)?, 'a')?;
+    let open_budget = key("merge-gate-budget", pull_request(2)?, 'a')?;
     for marker in [&closed_pr, &open_pr, &unobserved] {
         record(&fixture, marker, fact("gate.verdict/1")?, 1)?;
+    }
+    for marker in [&closed_budget, &open_budget] {
+        record(&fixture, marker, fact("gate.subject-budget/1")?, 1)?;
     }
     let mut inventory = closed(&[pull_request(1)?]);
     inventory.observe(pull_request(2)?, Presence::Present);
@@ -163,7 +168,7 @@ fn markers_of_a_closed_item_retire_and_others_stay() -> TestResult {
         .store
         .preview_retention(&policy, &inventory, at(2))?;
     assert!(!preview.applied);
-    assert_eq!(preview.markers.len(), 1);
+    assert_eq!(preview.markers.len(), 2);
     assert!(fixture.store.marker(&closed_pr)?.is_some());
 
     let report = fixture
@@ -171,12 +176,25 @@ fn markers_of_a_closed_item_retire_and_others_stay() -> TestResult {
         .retain(&policy, &inventory, &creator()?, at(2))?;
     assert!(report.applied);
     assert_eq!(report.markers, preview.markers);
-    assert_eq!(report.markers[0].key, closed_pr);
-    assert_eq!(report.markers[0].reason, MarkerRetirement::ItemGone);
+    assert!(report.markers.iter().any(|marker| marker.key == closed_pr));
+    assert!(
+        report
+            .markers
+            .iter()
+            .any(|marker| marker.key == closed_budget)
+    );
+    assert!(
+        report
+            .markers
+            .iter()
+            .all(|marker| marker.reason == MarkerRetirement::ItemGone)
+    );
     assert_eq!(fixture.store.marker(&closed_pr)?, None);
+    assert_eq!(fixture.store.marker(&closed_budget)?, None);
     // An open or unobserved pull request keeps every head's verdict, which
     // the gate's fix budget counts.
     assert!(fixture.store.marker(&open_pr)?.is_some());
+    assert!(fixture.store.marker(&open_budget)?.is_some());
     assert!(fixture.store.marker(&unobserved)?.is_some());
     // A second pass finds nothing more.
     assert!(

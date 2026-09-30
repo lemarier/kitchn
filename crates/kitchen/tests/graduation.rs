@@ -97,6 +97,7 @@ fn config(policy: GraduationPolicy) -> TestResult<HouseConfig> {
         follow_up: None,
         backend: None,
         graduation: BTreeMap::from([(scope()?.work_type, policy)]),
+        tick: None,
     })
 }
 fn spec(name: &str, guidance: char) -> TestResult<TaskSpec> {

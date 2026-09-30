@@ -441,6 +441,36 @@ a full mailbox refuses the post instead of dropping it. Bodies and answers are
 at most 8 KiB. `kitchn store retain` removes handled messages once their
 attempt ended or their task settled.
 
+## `kitchn tick`
+
+The one command a trigger runs for a house. launchd, cron, GitHub Actions or a
+backend schedule only start it; the house configuration's `tick` passes and
+the run ledger in the house store decide what runs.
+
+```sh
+kitchn tick --registry <dir> --house <id> [--store <dir>]
+kitchn tick runs --registry <dir> --house <id> [--store <dir>]
+kitchn tick trigger launchd|cron --kitchn <abs path> --registry <abs dir> --house <id> [--every-minutes 1-59]
+```
+
+Each configured pass runs when it never ran or its last run started at least
+`everyMinutes` ago. A pass runs under its own lease in the house store, so a
+second trigger that fires while it runs prints `busy` and changes nothing. A
+run whose lease expired (one hour) before it recorded an end is recorded as
+uncertain by the next tick, which then decides again. Each run records its
+start, end, outcome, usage where the pass reports it, and up to 8 backend run
+references as evidence. The ledger keeps the newest 64 ended runs per pass for
+at most 30 days. The tick exits 1 when a pass failed or the house configures
+no passes.
+
+The scheduled pickup, coordination, repair and gate passes are not wired in
+yet; until they are, every pass that runs is recorded as failed with "pass not
+available in this build".
+
+`runs` lists the ledger and reads only. `trigger` prints a launchd plist or a
+crontab line that runs the tick every `--every-minutes` (default 5); it installs
+nothing and changes no live schedule.
+
 ## `kitchn pickup`
 
 Offline pickup diagnostics.

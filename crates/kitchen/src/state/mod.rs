@@ -47,6 +47,9 @@
 //! - Each attempt carries its backend-reported usage or an explicit
 //!   [`AttemptUsage::NotReported`]; human time is derived from recorded
 //!   replies and interactive claims, never reported ([`AttemptUsageEntry`]).
+//! - Tick pass runs are recorded in a bounded run ledger ([`RunRecord`]);
+//!   each pass runs under its own consumer lease, taken in the same
+//!   transaction that records the run.
 
 mod consumer;
 mod effects;
@@ -55,6 +58,7 @@ mod mailbox;
 mod marker;
 mod model;
 mod retention;
+mod runs;
 pub(crate) mod snapshot;
 mod store;
 mod usage;
@@ -88,6 +92,7 @@ pub use retention::{
     MarkerRule, Presence, RetentionPolicy, RetentionReport, RetentionSubjects, RetiredMail,
     RetiredMarker, RetiredTask, StoreCapacity, TableUsage, TaskRetirement, marker_rule,
 };
+pub use runs::{MAX_RUNS_PER_PASS, RUN_RETENTION, RunId, RunRecord, RunStart, RunState};
 pub use snapshot::StoreOptions;
 pub use store::HouseStore;
 pub use usage::{

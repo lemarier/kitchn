@@ -24,6 +24,7 @@ pub mod recovery;
 pub mod repair;
 pub mod sampling;
 pub mod stack;
+pub mod tick;
 pub mod train;
 pub mod triage;
 

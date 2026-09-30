@@ -34,6 +34,7 @@ use crate::{
         ExternalRef, Fence, HouseGrants, IssueNumber, LeaseTtl, RecordedEvidence, TaskSpec, Text,
         Timestamp, VerificationError,
     },
+    scheduling::IntervalMinutes,
     state::{
         CancelStatus, ConsumerRecord, Consumption, Creation, EffectOutcome, EffectPlan,
         EffectRecord, EffectStart, Lease, MarkerAttempt, MarkerFact, MarkerKey, MarkerRecording,
@@ -49,9 +50,11 @@ use crate::{
             Inventory, RetentionPolicy, RetentionReport, RetentionSubjects, StoreCapacity,
             TableUsage,
         },
+        runs::{RunId, RunRecord, RunStart},
         snapshot::{SnapshotStore, StoreLayout, StoreOptions},
         usage::{AttemptUsageEntry, UsageReport},
     },
+    workflows::tick::{Pass, PassReport},
 };
 
 #[cfg(doc)]
@@ -59,6 +62,7 @@ use crate::{
     contracts::ContractError,
     state::MailError,
     state::{AttemptUsage, StateError, UsageError},
+    workflows::tick::TickError,
 };
 
 type Result<T> = std::result::Result<T, Error>;
@@ -1067,6 +1071,49 @@ impl HouseStore {
         now: Timestamp,
     ) -> Result<Option<Delivery>> {
         self.transact(|state| state.acknowledge_mail(reader, delivery, now))
+    }
+
+    /// Start a tick pass when it is due: record a run whose pass lease
+    /// expired as uncertain, then take the lease and record a running entry,
+    /// in one transaction. A live lease is [`RunStart::Busy`] and changes
+    /// nothing, so a duplicate trigger is harmless.
+    ///
+    /// # Errors
+    /// Consumer capacity and storage errors.
+    pub fn start_run(
+        &self,
+        pass: Pass,
+        every: IntervalMinutes,
+        holder: &HolderId,
+        ttl: LeaseTtl,
+        now: Timestamp,
+    ) -> Result<RunStart> {
+        self.transact(|state| state.start_run(pass, every, holder, ttl, now))
+    }
+
+    /// Record how a run ended and release its pass lease if it still holds
+    /// it. Repeating the same end is a no-op.
+    ///
+    /// # Errors
+    /// [`TickError::UnknownRun`], [`TickError::NotRunOwner`] for another
+    /// fence, [`TickError::AlreadyFinished`] for a different earlier end,
+    /// and [`TickError::TooMuchEvidence`].
+    pub fn finish_run(
+        &self,
+        run: RunId,
+        fence: Fence,
+        report: PassReport,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.transact(|state| state.finish_run(run, fence, report, now))
+    }
+
+    /// The run ledger, oldest first.
+    ///
+    /// # Errors
+    /// Returns a storage error.
+    pub fn runs(&self) -> Result<Vec<RunRecord>> {
+        self.read(|state| state.runs().to_vec())
     }
 
     fn transact<T>(&self, apply: impl FnOnce(&mut StoreState) -> Result<T>) -> Result<T> {

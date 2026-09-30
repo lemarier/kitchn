@@ -75,6 +75,7 @@ fn house_config() -> TestResult<HouseConfig> {
         follow_up: None,
         backend: None,
         graduation: std::collections::BTreeMap::new(),
+        tick: None,
     })
 }
 

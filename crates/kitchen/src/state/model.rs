@@ -22,6 +22,7 @@ use crate::{
         ScheduleRequirements, Settlement, SubmittedEffects, TaskSpec, Text, Timestamp, Trigger,
         UncertainReason,
     },
+    scheduling::IntervalMinutes,
     state::{
         ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerAttempt, MarkerFact,
         MarkerKey, MarkerRecording, StateError, WorkItem, WorkflowMarker,
@@ -34,12 +35,16 @@ use crate::{
         retention::{
             self, Inventory, RetentionPolicy, RetentionReport, RetentionSubjects, StoreCapacity,
         },
+        runs::{RunId, RunLedger, RunRecord, RunStart},
         usage::{
             AttemptUsage, AttemptUsageEntry, HumanReply, MAX_HUMAN_REPLIES_PER_ATTEMPT, UsageError,
             UsageReport,
         },
     },
-    workflows::intake,
+    workflows::{
+        intake,
+        tick::{Pass, PassReport},
+    },
 };
 
 /// The persisted schema version.
@@ -1188,6 +1193,9 @@ pub(crate) struct StoreState {
     /// Worker messages and their answers ([`crate::state::HouseMailbox`]).
     #[serde(default, skip_serializing_if = "Mailbox::is_empty")]
     mailbox: Mailbox,
+    /// Tick pass runs ([`crate::workflows::tick`]).
+    #[serde(default, skip_serializing_if = "RunLedger::is_empty")]
+    runs: RunLedger,
 }
 
 /// Deserialize a map, rejecting a repeated key instead of letting a later
@@ -1248,6 +1256,7 @@ impl StoreState {
             schedules: Vec::new(),
             retention_cursor: None,
             mailbox: Mailbox::new(),
+            runs: RunLedger::new(),
         }
     }
 
@@ -3063,6 +3072,80 @@ impl StoreState {
         self.mailbox.last_posted()
     }
 
+    /// Start `pass` when it is due: reconcile a run whose lease expired,
+    /// then take the pass lease and record a running entry, all in this
+    /// transaction. A live lease leaves everything unchanged.
+    pub(crate) fn start_run(
+        &mut self,
+        pass: Pass,
+        every: IntervalMinutes,
+        holder: &HolderId,
+        ttl: LeaseTtl,
+        now: Timestamp,
+    ) -> Result<RunStart> {
+        let consumer = pass.consumer()?;
+        let claimant = Claimant::scheduled(holder.clone());
+        let mut held = None;
+        match self.consumers.get(&consumer).map(ConsumerRecord::state) {
+            Some(ConsumerState::Held { lease }) if lease.is_live(now) => {
+                return Ok(RunStart::Busy {
+                    holder: lease.holder.clone(),
+                    expires_at: lease.expires_at,
+                });
+            }
+            Some(ConsumerState::Held { .. }) => {
+                held = Some(self.take_over_consumer(&consumer, &claimant, ttl, now)?);
+            }
+            Some(ConsumerState::Idle | ConsumerState::Relinquished { .. }) | None => {}
+        }
+        let reconciled = self.runs.reconcile(pass, now);
+        let every = Duration::from_secs(u64::from(every.get()).saturating_mul(60));
+        if let Some(next_due) = self.runs.next_due(pass, every).filter(|due| *due > now) {
+            if let Some(lease) = held {
+                self.release_consumer(&consumer, lease.fence, now)?;
+            }
+            return Ok(RunStart::NotDue {
+                next_due,
+                reconciled,
+            });
+        }
+        let lease = match held {
+            Some(lease) => lease,
+            None => self.acquire_consumer(&consumer, &claimant, ttl, now)?,
+        };
+        let run = self.runs.start(pass, holder, lease.fence, now);
+        Ok(RunStart::Started {
+            run,
+            fence: lease.fence,
+            reconciled,
+        })
+    }
+
+    /// Record how `run` ended and release its pass lease if it still holds it.
+    pub(crate) fn finish_run(
+        &mut self,
+        run: RunId,
+        fence: Fence,
+        report: PassReport,
+        now: Timestamp,
+    ) -> Result<()> {
+        let pass = self.runs.finish(run, fence, report, now)?;
+        let consumer = pass.consumer()?;
+        let holds = self
+            .consumers
+            .get(&consumer)
+            .and_then(ConsumerRecord::lease)
+            .is_some_and(|lease| lease.fence == fence);
+        if holds {
+            self.release_consumer(&consumer, fence, now)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn runs(&self) -> &[RunRecord] {
+        self.runs.runs()
+    }
+
     /// Check invariants that the type system cannot express.
     pub(crate) fn validate(&self) -> std::result::Result<(), Corruption> {
         if self.tasks.len() > MAX_TASKS
@@ -3072,7 +3155,7 @@ impl StoreState {
             return Err(Corruption::LimitExceeded);
         }
         self.markers.validate()?;
-        if !self.mailbox.validate() {
+        if !self.mailbox.validate() || !self.runs.validate() {
             return Err(Corruption::LimitExceeded);
         }
         for record in self.consumers.values() {

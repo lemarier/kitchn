@@ -817,6 +817,7 @@ mod tests {
             follow_up: None,
             backend: None,
             graduation: Default::default(),
+            tick: None,
         };
         let registry = HouseRegistry::new(root.join("registry"))?;
         registry.initialize(&config)?;

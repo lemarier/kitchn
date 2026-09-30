@@ -54,6 +54,8 @@ enum Command {
     Audit(commands::audit::AuditArgs),
     /// Worker questions, reports, and escalations kept in the house store, and their answers.
     Mailbox(commands::mailbox::MailboxArgs),
+    /// Run the house's due workflow passes once and record them in the run ledger.
+    Tick(commands::tick::TickArgs),
     #[command(flatten)]
     Interactive(commands::interactive::InteractiveCommand),
 }
@@ -99,6 +101,7 @@ fn main() -> ExitCode {
         Some(Command::Trust(args)) => commands::trust::run(args),
         Some(Command::Audit(args)) => commands::audit::run(args),
         Some(Command::Mailbox(args)) => commands::mailbox::run(args),
+        Some(Command::Tick(args)) => commands::tick::run(args),
         Some(Command::Interactive(command)) => commands::interactive::run(command),
         None => return output_status(Cli::command().print_help()),
     };

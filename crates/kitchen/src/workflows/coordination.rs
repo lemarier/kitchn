@@ -599,7 +599,9 @@ pub fn launch_worker(
 /// [`launch_worker`] for a brief rendered by `render` from the task's spec
 /// and its outstanding follow-ups, naming exactly `branch`. A `stacked`
 /// branch is recorded as a stack layer before the launch. Every check and
-/// outcome is the same as [`launch_worker`]'s.
+/// outcome is the same as [`launch_worker`]'s. `render` validates what it
+/// writes, as [`crate::workflows::pickup::write_standing`] does for the
+/// lines every brief carries.
 ///
 /// # Errors
 /// As [`launch_worker`], and whatever `render` returns.

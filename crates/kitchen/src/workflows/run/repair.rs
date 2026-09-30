@@ -43,8 +43,8 @@ use crate::{
         },
         known,
         pickup::{
-            FollowUpBudget, PinnedInstructions, TaskTemplate, check_standing, is_shell_safe,
-            resolve_agent, write_standing,
+            FollowUpBudget, PinnedInstructions, TaskTemplate, is_shell_safe, resolve_agent,
+            write_standing,
         },
         recovery::QueuedFollowUp,
         repair::{
@@ -683,11 +683,6 @@ impl RepairBrief<'_> {
         if spec.repository.as_ref() != Some(self.repository) {
             return Err(CoordinationError::BriefMismatch.into());
         }
-        check_standing(
-            spec,
-            &self.settings.instructions,
-            &self.settings.report_path,
-        )?;
         let base = BranchName::new(&self.pull_request.base.name)
             .ok()
             .filter(is_shell_safe)
@@ -735,7 +730,7 @@ impl RepairBrief<'_> {
             self.budget,
             &self.settings.report_path,
             follow_ups,
-        );
+        )?;
         if !self.findings.is_empty() {
             let _ = writeln!(
                 text,

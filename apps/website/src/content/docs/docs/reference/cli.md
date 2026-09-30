@@ -631,6 +631,21 @@ launch. The same flag lets `coordinate` take over scheduled task claims that
 expired because no pass renewed them for two hours. A pass with nothing to do prints `idle`, exits `0`, and launches or
 messages no worker.
 
+## `kitchn gate review`
+
+Post findings through the selected house's forge binding at an exact pull request head. The house must grant `review-pull-request` for the repository and forge credential. The command reads the live base tip, adds a `kitchen-attestation` block, persists the write intent, and reads back the posted review id. An uncertain submission is reconciled by its marker on retry and is never blindly posted again. `--attest` verifies and records an approved review for the scheduled gate; a binding whose login authored the pull request is refused by attestation.
+
+```sh
+kitchn gate review --registry <dir> --house <id> [--store <dir>] [--repository <owner/name>] \
+  --pull-request <number> --head <40-character-sha> --verdict approve --body-file <findings.md> \
+  --semantic clean --acceptance complete --hardware complete --risk none [--attest]
+
+kitchn gate review --registry <dir> --house <id> --pull-request <number> \
+  --head <40-character-sha> --verdict request-changes --body-file <findings.md>
+```
+
+Approval requires all four claim flags. `request-changes` refuses claim flags and `--attest`. The review uses the house's forge identity and its PullRequests write permission; posting a review alone never grants merge authority. A moved head or base refuses submission. The body file must not contain its own attestation block.
+
 ## `kitchn gate attest`
 
 An independent reviewer posts an approved forge review on the exact pull request head. The review body must contain one fenced `kitchen-attestation` block. The base SHA must match the live base branch tip; the PR object's base SHA can lag it. Kitchen takes the reviewer login and all claims from that review, checks the PR author, every branch commit author and committer, and the house's launched worker handles, then records the attestation. The scheduled gate reads the same review and claims again before considering a merge.

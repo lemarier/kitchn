@@ -55,7 +55,7 @@ pub(crate) mod process;
 mod scope;
 pub use crate::contracts::{
     CloseReason, GitHubAction, GitHubMutation, IssueNumber, LabelDefinition, MergeMethod,
-    PostingBudget,
+    PostingBudget, ReviewVerdict,
 };
 pub use app::{
     Access, AppApi, AppAuth, AppId, AppPermission, AppRequest, AppResponse, AppTokens, CurlApi,

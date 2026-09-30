@@ -203,6 +203,30 @@ pub enum GitHubAction {
         /// Open it as a draft rather than ready for review.
         draft: bool,
     },
+    /// Submit one exact-head review with a durable idempotency marker.
+    ReviewPullRequest {
+        /// Destination pull request.
+        number: IssueNumber,
+        /// Reviewed head.
+        expected_head: CommitId,
+        /// Reviewed base branch.
+        expected_base: BranchName,
+        /// Reviewed base tip.
+        expected_base_commit: CommitId,
+        /// Review outcome.
+        verdict: ReviewVerdict,
+        /// Findings and structured attestation block.
+        body: Text,
+    },
+}
+/// Review outcome accepted by the forge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewVerdict {
+    /// Approve this head.
+    Approve,
+    /// Request changes on this head.
+    RequestChanges,
 }
 /// GitHub's issue closure reasons. Duplicate retains the referenced issue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +271,10 @@ impl GitHubMutation {
             GitHubAction::CreateIssue { title, body } => validate_title_body(title, body),
             GitHubAction::OpenPullRequest { head, base, .. } if head == base => Err(invalid()),
             GitHubAction::OpenPullRequest { title, body, .. } => validate_title_body(title, body),
+            GitHubAction::ReviewPullRequest { body, .. } if body.as_str().len() > 60 * 1024 => {
+                Err(invalid())
+            }
+            GitHubAction::ReviewPullRequest { .. } => Ok(()),
             GitHubAction::LinkSubIssue { parent, child } if parent == child => Err(invalid()),
             GitHubAction::LinkDependency { issue, blocker } if issue == blocker => Err(invalid()),
             GitHubAction::LinkSubIssue { .. } | GitHubAction::LinkDependency { .. } => Ok(()),
@@ -300,6 +328,7 @@ impl GitHubEffect {
             }
             GitHubAction::CreateIssue { .. } => Permission::CreateIssue,
             GitHubAction::OpenPullRequest { .. } => Permission::OpenPullRequest,
+            GitHubAction::ReviewPullRequest { .. } => Permission::ReviewPullRequest,
             GitHubAction::LinkSubIssue { .. } | GitHubAction::LinkDependency { .. } => {
                 Permission::EditIssueRelationships
             }

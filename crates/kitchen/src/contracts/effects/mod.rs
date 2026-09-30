@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 pub use github::{
     CloseReason, GitHubAction, GitHubEffect, GitHubMutation, IssueNumber, LabelDefinition,
-    MergeMethod, PostingBudget,
+    MergeMethod, PostingBudget, ReviewVerdict,
 };
 pub use roger::{
     AskKind, AskRisk, DecisionBinding, DecisionOwner, MAX_ASKS_PER_TASK, RogerAsk, RogerEffect,
@@ -86,6 +86,8 @@ closed_names! {
         CloseIssue = "close_issue",
         /// The `open_pull_request` effect.
         OpenPullRequest = "open_pull_request",
+        /// Submit an exact-head review.
+        ReviewPullRequest = "review_pull_request",
         /// The `ask` effect.
         Ask = "ask",
         /// The `install_disabled_schedule` effect.
@@ -118,6 +120,7 @@ impl EffectKind {
             Self::MergePullRequest => Capability::LookupMergePullRequest,
             Self::CloseIssue => Capability::LookupCloseIssue,
             Self::OpenPullRequest => Capability::LookupOpenPullRequest,
+            Self::ReviewPullRequest => Capability::LookupReviewPullRequest,
             Self::Ask => Capability::LookupAsk,
             Self::InstallDisabledSchedule => Capability::LookupInstallDisabledSchedule,
             Self::SetScheduleState => Capability::LookupSetScheduleState,
@@ -144,6 +147,7 @@ impl EffectKind {
             Self::MergePullRequest => Capability::IdempotentMergePullRequest,
             Self::CloseIssue => Capability::IdempotentCloseIssue,
             Self::OpenPullRequest => Capability::IdempotentOpenPullRequest,
+            Self::ReviewPullRequest => Capability::IdempotentReviewPullRequest,
             Self::Ask => Capability::IdempotentAsk,
             Self::InstallDisabledSchedule => Capability::IdempotentInstallDisabledSchedule,
             Self::SetScheduleState => Capability::IdempotentSetScheduleState,
@@ -202,6 +206,7 @@ impl Effect {
                 GitHubAction::MergePullRequest { .. } => EffectKind::MergePullRequest,
                 GitHubAction::CloseIssue { .. } => EffectKind::CloseIssue,
                 GitHubAction::OpenPullRequest { .. } => EffectKind::OpenPullRequest,
+                GitHubAction::ReviewPullRequest { .. } => EffectKind::ReviewPullRequest,
             },
             Self::Roger(_) => EffectKind::Ask,
             Self::Schedule(effect) => match effect {

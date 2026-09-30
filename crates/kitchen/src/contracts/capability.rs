@@ -127,8 +127,12 @@ closed_names! {
         IdempotentCloseIssue = "effect.idempotent.close_issue",
         /// Look up an `open_pull_request` effect's outcome by its persisted request.
         LookupOpenPullRequest = "effect.lookup.open_pull_request",
+        /// Reconcile a pull request review by its durable marker.
+        LookupReviewPullRequest = "effect.lookup.review_pull_request",
         /// Resubmitting an `open_pull_request` effect's key never repeats it.
         IdempotentOpenPullRequest = "effect.idempotent.open_pull_request",
+        /// Native same-key review idempotency, when a backend provides it.
+        IdempotentReviewPullRequest = "effect.idempotent.review_pull_request",
         /// Look up a `ask` effect's outcome by its persisted request.
         LookupAsk = "effect.lookup.ask",
         /// Resubmitting a `ask` effect's key never repeats it.

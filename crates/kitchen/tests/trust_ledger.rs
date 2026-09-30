@@ -1074,6 +1074,7 @@ fn unknown_revocation_and_privileged_proposals_are_refused() -> TestResult {
         Permission::CloseIssue,
         Permission::PushBranch,
         Permission::OpenPullRequest,
+        Permission::ReviewPullRequest,
         Permission::Merge,
         Permission::ManageSchedule,
         Permission::ActivateSchedule,

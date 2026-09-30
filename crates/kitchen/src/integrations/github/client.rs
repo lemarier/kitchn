@@ -130,6 +130,7 @@ pub struct GitHubClient<T> {
     scope: HouseScope,
     transport: T,
     limits: ReadLimits,
+    read_access: Option<super::TokenScope>,
 }
 impl<T: GitHubReadTransport> GitHubClient<T> {
     /// Select the house before any I/O.
@@ -138,7 +139,30 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             scope,
             transport,
             limits,
+            read_access: None,
         }
+    }
+    /// Scope this client's reads to one repository and App token permission set.
+    /// Token credentials ignore this scope; App credentials require it.
+    ///
+    /// # Errors
+    /// Refuses a repository outside the selected house.
+    pub fn with_read_access(mut self, access: super::TokenScope) -> Result<Self, IntegrationError> {
+        self.scope
+            .authorize_read(self.scope.house(), access.repository())?;
+        self.read_access = Some(access);
+        Ok(self)
+    }
+    fn read_access(
+        &self,
+        repository: &Repository,
+        extra: Option<super::AppPermission>,
+    ) -> Option<super::TokenScope> {
+        self.read_access
+            .as_ref()
+            .filter(|access| access.repository() == repository && extra.is_none())
+            .cloned()
+            .or_else(|| Some(super::TokenScope::for_read(repository, extra)))
     }
     /// House policy used for every request.
     #[must_use]
@@ -244,7 +268,7 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             let mut closing_complete = false;
             for _ in 0..self.limits.pages {
                 let request = ReadRequest {
-                    access: Some(super::TokenScope::for_read(repo, None)),
+                    access: self.read_access(repo, None),
                     endpoint: "graphql".into(),
                     graphql: Some(json!({
                         "query":"query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){issue(number:$number){closedByPullRequestsReferences(first:100,after:$cursor){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage endCursor}}}}}",
@@ -312,7 +336,7 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             let mut result = Vec::new();
             for (repository, linked_number) in refs {
                 let request = ReadRequest {
-                    access: Some(super::TokenScope::for_read(&repository, None)),
+                    access: self.read_access(&repository, None),
                     endpoint: format!("repos/{repository}/pulls/{linked_number}"),
                     graphql: None,
                 };
@@ -439,7 +463,7 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
         observe((|| {
             self.scope.authorize_read(house, repo)?;
             let request = ReadRequest {
-                access: Some(super::TokenScope::for_read(repo, None)),
+                access: self.read_access(repo, None),
                 endpoint: "graphql".into(),
                 graphql: Some(json!({
                     "query":"query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid mergeStateStatus}}}",
@@ -650,7 +674,7 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             let mut result = Vec::new();
             for _ in 0..self.limits.pages {
                 let request = ReadRequest {
-                    access: Some(super::TokenScope::for_read(repo, None)),
+                    access: self.read_access(repo, None),
                     endpoint: "graphql".into(),
                     graphql: Some(json!({
                         "query": "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated} pageInfo{hasNextPage endCursor}}}}}",
@@ -714,7 +738,7 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             self.scope.authorize_read(house, repo)?;
             self.fetch(
                 &ReadRequest {
-                    access: Some(super::TokenScope::for_read(repo, extra)),
+                    access: self.read_access(repo, extra),
                     endpoint: if endpoint.is_empty() {
                         format!("repos/{repo}")
                     } else {
@@ -754,7 +778,7 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             for page in 1..=self.limits.pages {
                 let separator = if endpoint.contains('?') { '&' } else { '?' };
                 let request = ReadRequest {
-                    access: Some(super::TokenScope::for_read(repo, extra)),
+                    access: self.read_access(repo, extra),
                     endpoint: format!("repos/{repo}/{endpoint}{separator}per_page=100&page={page}"),
                     graphql: None,
                 };

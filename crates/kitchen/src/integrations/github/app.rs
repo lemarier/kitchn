@@ -216,10 +216,40 @@ impl TokenScope {
             Action::OpenPullRequest { .. } => {
                 &[(PullRequests, Access::Write), (Contents, Access::Read)]
             }
+            Action::ReviewPullRequest { .. } => {
+                &[(PullRequests, Access::Write), (Contents, Access::Read)]
+            }
         };
         Self {
             repository: mutation.repository.clone(),
             permissions: permissions.iter().copied().collect(),
+        }
+    }
+
+    /// The repository-scoped token for posting and verifying a gate review.
+    #[must_use]
+    pub fn for_review(repository: Repository) -> Self {
+        Self {
+            repository,
+            permissions: [
+                (AppPermission::PullRequests, Access::Write),
+                (AppPermission::Contents, Access::Read),
+            ]
+            .into(),
+        }
+    }
+
+    /// Read-only scope for one repository's issues, pull requests, and refs.
+    #[must_use]
+    pub fn for_reads(repository: Repository) -> Self {
+        Self {
+            repository,
+            permissions: [
+                (AppPermission::Contents, Access::Read),
+                (AppPermission::Issues, Access::Read),
+                (AppPermission::PullRequests, Access::Read),
+            ]
+            .into(),
         }
     }
 

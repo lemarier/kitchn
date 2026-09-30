@@ -17,13 +17,13 @@ use kitchen::{
     contracts::{
         BranchName, Capability, CapabilitySet, CheckoutFact, CheckoutReport, Clock, Evidence,
         EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef, Grant, LeaseTtl, MailMessage,
-        MessageKind, PostingBudget, Repository, ResourceRef, Settlement, Text, WorkerOutcome,
-        WorkerState, fake::FakeBackend,
+        MessageKind, PostingBudget, Repository, ResourceRef, ReviewVerdict, Settlement, Text,
+        WorkerOutcome, WorkerState, fake::FakeBackend,
     },
     house::HouseConfig,
     integrations::github::{
-        CredentialRef, GitHubClient, GitHubMutationTransport, GitHubReadTransport, HouseScope,
-        IntegrationError, MutationRequest, ReadLimits, ReadRequest,
+        CredentialRef, GitHubClient, GitHubExecutor, GitHubMutationTransport, GitHubReadTransport,
+        HouseScope, IntegrationError, MutationRequest, ReadLimits, ReadRequest, TokenScope,
     },
     scheduling::IntervalMinutes,
     state::{
@@ -37,10 +37,10 @@ use kitchen::{
         repair::{HandOver, RepairDecision, Skip},
         run::{
             CoordinateAction, CoordinatePass, ForgeReview, GateAction, GateAttestation, GatePass,
-            GateResult, NotMerged, Outcome, PASS_LEASE, Pass, PickupAction, PickupLabels,
-            PickupPass, PickupSettings, RepairAction, RepairPass, RepairSettings, ReportReason,
-            RunError, TASK_LEASE, TickPasses, Unroutable, Wait, attest_gate_review,
-            pass_repository, record_gate_attestation, run_claimant,
+            GateResult, GateReviewInput, NotMerged, Outcome, PASS_LEASE, Pass, PickupAction,
+            PickupLabels, PickupPass, PickupSettings, RepairAction, RepairPass, RepairSettings,
+            ReportReason, RunError, TASK_LEASE, TickPasses, Unroutable, Wait, attest_gate_review,
+            pass_repository, post_gate_review, record_gate_attestation, run_claimant,
         },
         tick::{
             self, Pass as TickPass, PassFailure, PassOutcome, PassSchedule, PassTick, TickDecision,
@@ -86,11 +86,14 @@ struct Forge {
     responses: Rc<RefCell<BTreeMap<String, Value>>>,
     queued: Rc<RefCell<BTreeMap<String, VecDeque<Value>>>>,
     reads: Rc<RefCell<Vec<String>>>,
+    read_accesses: Rc<RefCell<Vec<Option<TokenScope>>>>,
     /// Submitted writes: endpoint and body.
     writes: Rc<RefCell<Vec<(String, Value)>>>,
     /// While set, a write is received and its answer lost: nothing applies
     /// and the caller cannot tell.
     lose_writes: Rc<Cell<bool>>,
+    /// The next review applies but its response is lost.
+    lose_review_reply: Rc<Cell<bool>>,
 }
 
 impl Forge {
@@ -99,8 +102,10 @@ impl Forge {
             responses: Rc::new(RefCell::new(BTreeMap::new())),
             queued: Rc::new(RefCell::new(BTreeMap::new())),
             reads: Rc::new(RefCell::new(Vec::new())),
+            read_accesses: Rc::new(RefCell::new(Vec::new())),
             writes: Rc::new(RefCell::new(Vec::new())),
             lose_writes: Rc::new(Cell::new(false)),
+            lose_review_reply: Rc::new(Cell::new(false)),
         }
     }
 
@@ -164,6 +169,9 @@ impl GitHubReadTransport for Forge {
     ) -> Result<Vec<u8>, IntegrationError> {
         let key = Self::key(request);
         self.reads.borrow_mut().push(key.clone());
+        self.read_accesses
+            .borrow_mut()
+            .push(request.access().cloned());
         let queued = self
             .queued
             .borrow_mut()
@@ -187,7 +195,7 @@ impl GitHubReadTransport for Forge {
 impl GitHubMutationTransport for Forge {
     fn submit(
         &self,
-        _: &CredentialRef,
+        credential: &CredentialRef,
         request: &MutationRequest,
         _: Duration,
         _: usize,
@@ -201,6 +209,23 @@ impl GitHubMutationTransport for Forge {
             return Err(EffectFailure::Uncertain(
                 kitchen::contracts::UncertainReason::ResponseLost,
             ));
+        }
+        if endpoint.ends_with("/reviews") {
+            let mut responses = self.responses.borrow_mut();
+            let entries = responses
+                .get_mut(&endpoint)
+                .and_then(Value::as_array_mut)
+                .ok_or(EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
+            entries.push(json!({"id": 19, "user": {"login": credential.requester().as_str()},
+                "commit_id": request.body()["commit_id"],
+                "state": if request.body()["event"] == "APPROVE" { "APPROVED" } else { "CHANGES_REQUESTED" },
+                "body": request.body()["body"], "submitted_at": "1970-01-01T00:00:00Z"}));
+            if self.lose_review_reply.replace(false) {
+                return Err(EffectFailure::Uncertain(
+                    kitchen::contracts::UncertainReason::ResponseLost,
+                ));
+            }
+            return Ok(json!({"id":19}).to_string().into_bytes());
         }
         let pull = endpoint
             .strip_suffix("/merge")
@@ -4873,5 +4898,322 @@ fn a_repair_pass_stops_when_a_forge_read_outlasts_its_lease() -> TestResult {
         Some(ConsumerState::Relinquished { .. })
     ));
     assert_eq!(acted(kitchen.repair()?)?.len(), 2);
+    Ok(())
+}
+
+/// A separate forge identity for the expediter, with review write authority.
+fn review_fixture(
+    kitchen: &mut Kitchen,
+    login: &str,
+) -> TestResult<(GitHubClient<Forge>, GitHubExecutor<Forge>)> {
+    let grant = Grant::repository(
+        kitchen::contracts::Permission::ReviewPullRequest,
+        repo()?,
+        kitchen::BackendId::new("github")?,
+        CredentialId::new("forge")?,
+    );
+    kitchen.config.grants.insert(grant.clone());
+    kitchen.config.policy_limits.insert(grant);
+    let requester = ExternalRef::new(login)?;
+    let scope = HouseScope::new(
+        house()?,
+        [repo()?],
+        requester.clone(),
+        CredentialRef::new(house()?, CredentialId::new("forge")?, requester),
+        PostingBudget::new(3)?,
+        [kitchen::contracts::Permission::ReviewPullRequest],
+    )?;
+    let forge = GitHubClient::new(
+        scope.clone(),
+        kitchen.forge().clone(),
+        ReadLimits::default(),
+    );
+    let executor = GitHubExecutor::new(
+        kitchen::BackendId::new("github")?,
+        scope,
+        kitchen.forge().clone(),
+        ReadLimits::default(),
+    );
+    Ok((forge, executor))
+}
+
+fn review_input(verdict: ReviewVerdict) -> TestResult<GateReviewInput> {
+    Ok(GateReviewInput {
+        repository: repo()?,
+        pull_request: pr(12)?,
+        head: commit('d')?,
+        verdict,
+        findings: "The committed diff is clean.".to_owned(),
+        semantic: Some(kitchen::workflows::gate::SemanticReview::Clean),
+        acceptance: Some(true),
+        hardware: Some(true),
+        risk: Some(Vec::new()),
+        attest: true,
+    })
+}
+
+#[test]
+fn posted_review_round_trips_through_attestation_and_scheduled_gate() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    kitchen.config = with_merge_grant(house_config()?)?;
+    green_pull_request(&kitchen)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    let (forge, executor) = review_fixture(&mut kitchen, "safety-reviewer")?;
+    let review = post_gate_review(
+        kitchen.store(),
+        &kitchen.config,
+        &forge,
+        &executor,
+        &kitchen.settings.instructions.provenance,
+        &kitchen.clock,
+        &review_input(ReviewVerdict::Approve)?,
+    )?;
+    assert_eq!(review.id.get(), 19);
+    assert!(review.attested);
+    let posted = kitchen.forge().writes.borrow();
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].0, format!("repos/{REPO}/pulls/12/reviews"));
+    assert!(
+        posted[0].1["body"]
+            .as_str()
+            .ok_or("body")?
+            .contains("```kitchen-attestation")
+    );
+    drop(posted);
+    assert_eq!(
+        recorded_at_d(&kitchen)?
+            .ok_or("attestation")?
+            .attestation
+            .forge_review
+            .id
+            .get(),
+        19
+    );
+    let action = one_verdict(kitchen.gate()?)?;
+    assert_eq!(action.result, GateResult::Merged, "{action:?}");
+    assert_eq!(kitchen.forge().writes.borrow().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn stale_head_and_request_changes_claims_never_post() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    let (forge, executor) = review_fixture(&mut kitchen, "safety-reviewer")?;
+    let mut input = review_input(ReviewVerdict::Approve)?;
+    input.head = commit('c')?;
+    assert!(matches!(
+        post_gate_review(
+            kitchen.store(),
+            &kitchen.config,
+            &forge,
+            &executor,
+            &kitchen.settings.instructions.provenance,
+            &kitchen.clock,
+            &input
+        ),
+        Err(kitchen::Error::Run(RunError::AttestationStaleHead))
+    ));
+    let mut input = review_input(ReviewVerdict::RequestChanges)?;
+    input.attest = false;
+    assert!(matches!(
+        post_gate_review(
+            kitchen.store(),
+            &kitchen.config,
+            &forge,
+            &executor,
+            &kitchen.settings.instructions.provenance,
+            &kitchen.clock,
+            &input
+        ),
+        Err(kitchen::Error::Run(RunError::ReviewClaimsWithoutApproval))
+    ));
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn uncertain_review_post_is_found_by_marker_without_a_second_post() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    let (forge, executor) = review_fixture(&mut kitchen, "safety-reviewer")?;
+    kitchen.forge().lose_review_reply.set(true);
+    let mut input = review_input(ReviewVerdict::Approve)?;
+    input.attest = false;
+    assert!(matches!(
+        post_gate_review(
+            kitchen.store(),
+            &kitchen.config,
+            &forge,
+            &executor,
+            &kitchen.settings.instructions.provenance,
+            &kitchen.clock,
+            &input
+        ),
+        Err(kitchen::Error::Run(RunError::ReviewUncertain))
+    ));
+    let recovered = post_gate_review(
+        kitchen.store(),
+        &kitchen.config,
+        &forge,
+        &executor,
+        &kitchen.settings.instructions.provenance,
+        &kitchen.clock,
+        &input,
+    )?;
+    assert_eq!(recovered.id.get(), 19);
+    assert_eq!(kitchen.forge().writes.borrow().len(), 1);
+    assert!(kitchen.store().tasks()?.iter().any(|task| {
+        task.spec().id.as_str().starts_with("gate-review-")
+            && matches!(task.state(), TaskState::Settled { .. })
+    }));
+    Ok(())
+}
+
+#[test]
+fn review_by_pull_request_author_posts_but_cannot_attest() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    let (forge, executor) = review_fixture(&mut kitchen, "kitchen-bot")?;
+    let input = review_input(ReviewVerdict::Approve)?;
+    assert!(matches!(
+        post_gate_review(
+            kitchen.store(),
+            &kitchen.config,
+            &forge,
+            &executor,
+            &kitchen.settings.instructions.provenance,
+            &kitchen.clock,
+            &input
+        ),
+        Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
+    ));
+    assert_eq!(kitchen.forge().writes.borrow().len(), 1);
+    assert!(recorded_at_d(&kitchen)?.is_none());
+    // A retry finds the same post and again refuses the non-independent attestation.
+    assert!(matches!(
+        post_gate_review(
+            kitchen.store(),
+            &kitchen.config,
+            &forge,
+            &executor,
+            &kitchen.settings.instructions.provenance,
+            &kitchen.clock,
+            &input
+        ),
+        Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
+    ));
+    assert_eq!(kitchen.forge().writes.borrow().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn request_changes_posts_one_unattested_review_without_claim_flags() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    let (forge, executor) = review_fixture(&mut kitchen, "safety-reviewer")?;
+    let mut input = review_input(ReviewVerdict::RequestChanges)?;
+    input.semantic = None;
+    input.acceptance = None;
+    input.hardware = None;
+    input.risk = None;
+    input.attest = false;
+    let review = post_gate_review(
+        kitchen.store(),
+        &kitchen.config,
+        &forge,
+        &executor,
+        &kitchen.settings.instructions.provenance,
+        &kitchen.clock,
+        &input,
+    )?;
+    assert_eq!(review.id.get(), 19);
+    assert!(!review.attested);
+    assert_eq!(
+        kitchen.forge().writes.borrow()[0].1["event"],
+        "REQUEST_CHANGES"
+    );
+    assert!(recorded_at_d(&kitchen)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn base_moving_between_review_checks_is_refused_without_posting() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    let base_path = format!("repos/{REPO}/branches/main");
+    kitchen.forge().queue(
+        &base_path,
+        vec![json!({"name":"main", "commit":{"sha":commit('e')?.as_str()}})],
+    );
+    kitchen.forge().set(
+        &base_path,
+        json!({"name":"main", "commit":{"sha":commit('f')?.as_str()}}),
+    );
+    let (forge, executor) = review_fixture(&mut kitchen, "safety-reviewer")?;
+    assert!(matches!(
+        post_gate_review(
+            kitchen.store(),
+            &kitchen.config,
+            &forge,
+            &executor,
+            &kitchen.settings.instructions.provenance,
+            &kitchen.clock,
+            &review_input(ReviewVerdict::Approve)?
+        ),
+        Err(kitchen::Error::Run(RunError::AttestationStaleBase))
+    ));
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn gate_review_reads_carry_the_app_token_scope() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    let (forge, _) = review_fixture(&mut kitchen, "safety-reviewer")?;
+    let scoped = forge.with_read_access(TokenScope::for_review(repo()?))?;
+    let start = kitchen.forge().read_accesses.borrow().len();
+    assert!(matches!(
+        scoped.pull_request(&house()?, &repo()?, pr(12)?),
+        kitchen::integrations::github::Observation::Known(_)
+    ));
+    assert!(matches!(
+        scoped.branch_tip(&house()?, &repo()?, &BranchName::new("main")?),
+        kitchen::integrations::github::Observation::Known(_)
+    ));
+    let accesses = kitchen.forge().read_accesses.borrow();
+    assert_eq!(accesses.len() - start, 2);
+    for access in &accesses[start..] {
+        let scope = access.as_ref().ok_or("missing app token scope")?;
+        assert_eq!(scope.repository(), &repo()?);
+        assert_eq!(
+            scope.permissions().collect::<Vec<_>>(),
+            vec![
+                (
+                    kitchen::integrations::github::AppPermission::Contents,
+                    kitchen::integrations::github::Access::Read
+                ),
+                (
+                    kitchen::integrations::github::AppPermission::PullRequests,
+                    kitchen::integrations::github::Access::Write
+                ),
+            ]
+        );
+    }
     Ok(())
 }

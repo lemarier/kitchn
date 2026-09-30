@@ -389,6 +389,8 @@ schedule change, and applying it needs the owner's decision.
 Drafts are proposed only when the house budget and the open proposals are both
 known; otherwise the report says why and lists the withheld proposal keys.
 
+- Paths: `--ledger`, `--orca`, `--runtime-dir`, and `--schedule-evidence` must
+  be absolute; a relative path is refused as invalid input.
 - Budget: `--orca` lists every house schedule through the house's bound
   backend, and the run is refused while the house budget is exhausted.
   `--schedule-evidence` is a JSON file of observed schedule runs; it may omit

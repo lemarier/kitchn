@@ -73,6 +73,7 @@ impl Kitchen {
             kind: BackendKind::Orca.into(),
             backend: orca,
             credential,
+            endpoint: None,
         });
         if policy {
             house.schedules = Some(serde_json::from_value(serde_json::json!({

@@ -615,8 +615,9 @@ fn a_confirmed_inspection_sample_counts_as_a_finding_of_the_delivery() -> TestRe
     assert_eq!(
         proposal.evidence,
         LinkedEvidence {
-            total: 3,
+            total: 4,
             links: vec![
+                forge(pr("inspected")?.as_str())?,
                 forge(pr("reviewed")?.as_str())?,
                 forge(&review("reviewed"))?
             ],

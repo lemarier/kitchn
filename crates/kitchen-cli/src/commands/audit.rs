@@ -65,8 +65,9 @@ pub struct AuditArgs {
     /// House-scoped Orca runtime storage shared by every caller.
     #[arg(long, requires = "orca")]
     runtime_dir: Option<PathBuf>,
-    /// Absolute path of a JSON file of observed schedule runs. It may omit
-    /// schedules, so the preview reports without proposing.
+    /// Absolute path of a JSON file of observed schedule runs; a relative
+    /// path is refused, as is a relative `--ledger`. It may omit schedules,
+    /// so the preview reports without proposing.
     #[arg(long)]
     schedule_evidence: Option<PathBuf>,
     /// Key of a proposal still open on the forge; repeat for each, so that

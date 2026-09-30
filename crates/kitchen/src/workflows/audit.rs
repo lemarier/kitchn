@@ -962,10 +962,14 @@ fn read_ledger(ledger: &Ledger, tallies: &mut Tallies) -> Result<u32, TrustError
                 EvidenceMode::Live => {}
             }
             entry.deliveries = entry.deliveries.saturating_add(1);
-            live.insert(stream, (scope.station, scope.work_type.clone()));
             let Measurement::Observed { value: pr, .. } = &observation.pull_request else {
+                live.insert(stream, (scope.station, scope.work_type.clone(), None));
                 continue;
             };
+            live.insert(
+                stream,
+                (scope.station, scope.work_type.clone(), Some(&pr.source)),
+            );
             if let Measurement::Observed { value, .. } = &pr.first_pass {
                 entry.first_pass.judged = entry.first_pass.judged.saturating_add(1);
                 if *value {
@@ -984,13 +988,17 @@ fn read_ledger(ledger: &Ledger, tallies: &mut Tallies) -> Result<u32, TrustError
             }
         }
         for inspection in &doc.inspections {
-            let Some((station, work_type)) = live.get(&inspection.plan().observation) else {
+            let Some((station, work_type, delivered)) = live.get(&inspection.plan().observation)
+            else {
                 continue;
             };
             let entry = tally(tallies, *station, work_type);
             for sample in inspection.samples() {
                 if let Some(SampleResult::Confirmed { finding, .. }) = &sample.result {
                     entry.findings.insert(finding.source.clone());
+                    if let Some(pr) = delivered {
+                        entry.delivered.insert((*pr).clone());
+                    }
                 }
             }
         }

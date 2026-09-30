@@ -511,8 +511,9 @@ and it stores them there, replacing a valid file and overlaying flags you leave
 out on what is stored, then prints whether it stored, updated, or left the file
 unchanged. It refuses a call that gives no flag. It validates every argument
 before it writes, and it writes through a uniquely named owner-only temporary
-that it renames over the file, so a failed call leaves the file as it was and a
-temporary file from another writer is never removed. `configure` is the only
+that it renames over the file, so a call that fails validation or storage leaves
+the file as it was, and a temporary file from another writer is never removed. To
+recover from an invalid file, remove it and run `configure` again. `configure` is the only
 command that changes the file; `trigger` never writes it and takes none of these
 flags. The tick and `kitchn run` read the file. A flag on their command
 line that names a different value than the stored one is refused before any

@@ -142,7 +142,7 @@ pub enum RuntimeError {
     /// The file is damaged, for another house or schema, or names a relative
     /// path or a repository outside the house.
     #[error(
-        "the house's runtime configuration is invalid; store it again with `kitchn tick trigger`"
+        "the house's runtime configuration is invalid; remove it, then store it again with `kitchn tick configure`"
     )]
     Invalid,
     /// Other users can access the file, or it is not a regular file.

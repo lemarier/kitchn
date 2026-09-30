@@ -57,7 +57,8 @@ enum MailboxCommand {
         /// The question's id, as `ask` printed it.
         #[arg(long)]
         question: ExternalRef,
-        /// Seconds to wait for the answer, at most 900.
+        /// Seconds to wait for the answer, at most 900. Without an answer
+        /// by then it prints `answer: pending` and exits 0.
         #[arg(long, default_value_t = 0)]
         wait_secs: u64,
     },

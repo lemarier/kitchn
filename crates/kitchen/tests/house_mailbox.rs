@@ -821,3 +821,45 @@ fn coordination_runs_on_a_backend_without_deliveries_through_the_house_mailbox()
     assert_eq!(done.outcome, Some(WorkerOutcome::Succeeded));
     Ok(())
 }
+
+#[test]
+fn a_waiting_coordinator_wakes_on_a_post_and_an_idle_wait_ends_at_its_deadline() -> TestResult {
+    let world = world()?;
+    let work = launched(&world, 1)?;
+    let coordinator = mailbox(&world, work.consumer_fence)?;
+    coordinator.adopt_run()?;
+    let started = std::time::Instant::now();
+    assert_eq!(
+        coordinator.await_delivery(Duration::from_millis(300))?,
+        None
+    );
+    assert!(started.elapsed() >= Duration::from_millis(300));
+
+    // Another process handle posts while the coordinator waits.
+    let worker_store = world.fixture.reopen()?;
+    let (sender, now) = (sender(&work), world.now());
+    let (posted, delivery) = std::thread::scope(|scope| {
+        let poster = scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            worker_store.post_mail(
+                &sender,
+                WorkerPost {
+                    kind: PostKind::Escalation,
+                    subject: None,
+                    body: Text::new("Blocked on credentials.")?,
+                },
+                now,
+            )
+        });
+        let delivery = coordinator.await_delivery(Duration::from_secs(30));
+        (poster.join(), delivery)
+    });
+    let posted = posted.map_err(|_| "the poster panicked")??;
+    let delivery = delivery?.ok_or("the wait ended without the post")?;
+    assert_eq!(ids(&delivery), [posted]);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "woke on the post"
+    );
+    Ok(())
+}

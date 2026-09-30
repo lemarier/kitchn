@@ -3055,6 +3055,10 @@ impl StoreState {
         self.mailbox.len()
     }
 
+    pub(crate) const fn mail_last_posted(&self) -> u64 {
+        self.mailbox.last_posted()
+    }
+
     /// Check invariants that the type system cannot express.
     pub(crate) fn validate(&self) -> std::result::Result<(), Corruption> {
         if self.tasks.len() > MAX_TASKS

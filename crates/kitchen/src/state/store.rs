@@ -1044,6 +1044,10 @@ impl HouseStore {
         })
     }
 
+    pub(crate) fn mail_last_posted(&self) -> Result<u64> {
+        self.read(StoreState::mail_last_posted)
+    }
+
     pub(crate) fn adopt_mailbox(&self, reader: &ConsumerFence, now: Timestamp) -> Result<()> {
         self.transact(|state| state.adopt_mailbox(reader, now))
     }

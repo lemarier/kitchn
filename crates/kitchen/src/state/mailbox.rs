@@ -370,6 +370,11 @@ impl Mailbox {
         self.messages.len()
     }
 
+    /// The last message sequence issued, which changes on every post.
+    pub(crate) const fn last_posted(&self) -> u64 {
+        self.last_message
+    }
+
     /// Remove the acknowledged messages with these sequence numbers.
     pub(crate) fn retire(&mut self, retired: &[ExternalRef]) {
         let acknowledged_through = self.acknowledged_through;
@@ -599,6 +604,10 @@ impl Mailbox {
                     && mail.seq <= self.last_message
                     && mail.body.as_str().len() <= MAX_MAIL_BODY_BYTES
                     && mail
+                        .subject
+                        .as_ref()
+                        .is_none_or(|subject| subject.as_str().len() <= MAX_MAIL_SUBJECT_BYTES)
+                    && mail
                         .answer
                         .as_ref()
                         .is_none_or(|answer| answer.body.as_str().len() <= MAX_MAIL_BODY_BYTES)
@@ -811,13 +820,29 @@ impl CoordinatorMailbox for HouseMailbox<'_> {
             if delivery.as_ref().is_some_and(|batch| !batch.is_idle()) {
                 return Ok(delivery);
             }
-            let left = deadline.map_or(Duration::ZERO, |deadline| {
-                deadline.saturating_duration_since(Instant::now())
-            });
-            if left.is_zero() {
-                return Ok(delivery);
+            // Wait under the shared lock until a worker posts, so workers
+            // are not held off by a write transaction on every poll.
+            let seen = self
+                .store
+                .mail_last_posted()
+                .map_err(|error| mailbox_error(&error))?;
+            loop {
+                let left = deadline.map_or(Duration::ZERO, |deadline| {
+                    deadline.saturating_duration_since(Instant::now())
+                });
+                if left.is_zero() {
+                    return Ok(delivery);
+                }
+                thread::sleep(left.min(POLL_INTERVAL));
+                if self
+                    .store
+                    .mail_last_posted()
+                    .map_err(|error| mailbox_error(&error))?
+                    != seen
+                {
+                    break;
+                }
             }
-            thread::sleep(left.min(POLL_INTERVAL));
         }
     }
 }

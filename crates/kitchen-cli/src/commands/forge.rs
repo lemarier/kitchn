@@ -198,7 +198,7 @@ fn key_text(app: GitHubApp, path: &Path, status: CredentialStatus) -> String {
     let file = path.display();
     match status {
         CredentialStatus::Ready => format!(
-            "Private key file {file} of GitHub App {} is ready. Kitchen reads it only to mint installation tokens when it writes and never copies it.",
+            "Private key file {file} of GitHub App {} is ready. Kitchen reads it only to mint installation tokens when it accesses GitHub and never copies it.",
             app.app_id
         ),
         CredentialStatus::NotRegularFile
@@ -210,7 +210,7 @@ fn key_text(app: GitHubApp, path: &Path, status: CredentialStatus) -> String {
         CredentialStatus::Missing | CredentialStatus::Exposed => {
             let directory = quote(&path.parent().unwrap_or(path).display().to_string());
             format!(
-                "Private key file {file} is {status}. Place the .pem private key of GitHub App {} there, readable only by you, for example:\n  mkdir -p {directory} && (umask 077; cp <downloaded-key.pem> {target})\nKitchen reads it only to mint installation tokens when it writes and never copies it.",
+                "Private key file {file} is {status}. Place the .pem private key of GitHub App {} there, readable only by you, for example:\n  mkdir -p {directory} && (umask 077; cp <downloaded-key.pem> {target})\nKitchen reads it only to mint installation tokens when it accesses GitHub and never copies it.",
                 app.app_id,
                 target = quote(&file.to_string()),
             )

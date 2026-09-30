@@ -275,7 +275,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
         mutation.validate()?;
         self.scope
             .authorize_read(self.scope.house(), &mutation.repository)?;
-        self.access = Some(TokenScope::for_mutation(mutation));
+        self.access = Some(TokenScope::for_read(&mutation.repository, None));
         let root = format!("repos/{}", mutation.repository);
         let reference = receipt(key)?;
         match &mutation.action {
@@ -579,8 +579,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
         mutation: &GitHubMutation,
         key: &IdempotencyKey,
     ) -> Result<MutationRequest, IntegrationError> {
-        let access = TokenScope::for_mutation(mutation);
-        self.access = Some(access.clone());
+        self.access = Some(TokenScope::for_read(&mutation.repository, None));
         let root = format!("repos/{}", mutation.repository);
         let (method, endpoint, body) = match &mutation.action {
             GitHubAction::CloseIssue { number, reason, .. } => {
@@ -698,7 +697,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             method,
             endpoint,
             body,
-            access,
+            access: TokenScope::for_mutation(mutation),
         })
     }
     fn issue_id(&mut self, root: &str, number: u64) -> Result<u64, IntegrationError> {

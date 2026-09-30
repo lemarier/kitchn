@@ -27,9 +27,9 @@ use kitchen::{
     },
     integrations::github::{
         Access, AppApi, AppAuth, AppId, AppPermission, AppRequest, AppResponse, AppTokens,
-        CredentialFile, CredentialRef, CurlApi, GhCli, GitHubApp, GitHubExecutor,
+        CredentialFile, CredentialRef, CurlApi, GhCli, GitHubApp, GitHubClient, GitHubExecutor,
         GitHubMutationTransport, HouseScope, InstallationId, Installed, IntegrationError,
-        ReadLimits, TokenScope,
+        Observation, ReadLimits, TokenScope,
     },
 };
 use ring::signature::{self, KeyPair, UnparsedPublicKey};
@@ -182,6 +182,9 @@ impl Remote {
                 ("issues", "write"),
                 ("contents", "write"),
                 ("pull_requests", "write"),
+                ("checks", "read"),
+                ("statuses", "read"),
+                ("administration", "read"),
             ]
             .into_iter()
             .map(|(name, access)| (name.to_owned(), access.to_owned()))
@@ -730,6 +733,253 @@ fn house_scope() -> TestResult<HouseScope> {
     )?)
 }
 
+fn comment_request(executor: &GitHubExecutor<GhCli>) -> TestResult<EffectRequest> {
+    Ok(EffectRequest::new(
+        HouseId::new("acme")?,
+        BackendId::new("github")?,
+        CredentialId::new("github")?,
+        TaskId::new("task-1")?,
+        AttemptNumber::FIRST,
+        IdempotencyKey::from_ref(ExternalRef::new("comment-1")?),
+        executor.effect(comment_on("acme/app")?)?.into(),
+    ))
+}
+
+fn minted_permissions(fixture: &Fixture) -> TestResult<Vec<Value>> {
+    fixture
+        .remote()?
+        .mints()
+        .iter()
+        .map(|mint| {
+            let body = mint.body.as_ref().ok_or("missing mint body")?;
+            if body.get("repositories") != Some(&json!(["app"])) {
+                return Err("token is not repository scoped".into());
+            }
+            body.get("permissions")
+                .cloned()
+                .ok_or_else(|| "missing mint permissions".into())
+        })
+        .collect()
+}
+
+fn fake_gh_reads(directory: &Path, head: &CommitId) -> TestResult<PathBuf> {
+    let gh = directory.join("gh-reads");
+    fs::write(
+        directory.join("issues.json"),
+        json!([{
+            "repository_url": "https://api.github.com/repos/acme/app",
+            "id": 10, "number": 1, "title": "Ready", "state": "open",
+            "assignees": [], "labels": [], "updated_at": "2026-09-30T00:00:00Z"
+        }])
+        .to_string(),
+    )?;
+    fs::write(
+        directory.join("pr.json"),
+        json!({
+            "number": 2, "state": "open", "draft": false, "merged": false,
+            "head": {"sha": head.as_str(), "ref": "topic"},
+            "base": {"sha": head.as_str(), "ref": "main"}, "mergeable": true
+        })
+        .to_string(),
+    )?;
+    fs::write(
+        directory.join("checks.json"),
+        json!({"check_runs": [{
+            "name": "build", "head_sha": head.as_str(),
+            "status": "completed", "conclusion": "success"
+        }]})
+        .to_string(),
+    )?;
+    fs::write(
+        directory.join("statuses.json"),
+        json!([{
+            "context": "legacy", "state": "success", "sha": head.as_str()
+        }])
+        .to_string(),
+    )?;
+    fs::write(
+        directory.join("required.json"),
+        json!({"contexts": ["build"], "checks": []}).to_string(),
+    )?;
+    common::executable::write_executable(
+        &gh,
+        format!(
+            r#"#!/bin/sh
+printf '%s %s\n' "$GH_TOKEN" "$*" >> '{dir}/log'
+case "$*" in
+  *"--method GET repos/acme/app/issues?"*) cat '{dir}/issues.json' ;;
+  *"--method GET repos/acme/app/pulls/2"*) cat '{dir}/pr.json' ;;
+  *"/check-runs?"*) cat '{dir}/checks.json' ;;
+  *"/statuses?"*) cat '{dir}/statuses.json' ;;
+  *"/protection/required_status_checks"*) cat '{dir}/required.json' ;;
+  *) exit 2 ;;
+esac
+"#,
+            dir = directory.display()
+        ),
+    )?;
+    Ok(gh)
+}
+
+#[test]
+fn app_reads_pickup_and_gate_evidence_with_read_only_repository_tokens() -> TestResult {
+    let fixture = Fixture::new(true)?;
+    let head = CommitId::new("4f2a9c1e0b7d3a5f6c8e9d0a1b2c3d4e5f6a7b8c")?;
+    let gh = fake_gh_reads(&fixture.root, &head)?;
+    let client = GitHubClient::new(
+        house_scope()?,
+        GhCli::app(gh, fixture.tokens()?)?,
+        ReadLimits::default(),
+    );
+    let house = HouseId::new("acme")?;
+    let repo = Repository::new("acme/app")?;
+    assert!(
+        matches!(client.issues(&house, &repo), Observation::Known(issues) if issues.len() == 1)
+    );
+    assert!(
+        matches!(client.pull_request(&house, &repo, IssueNumber::new(2)?), Observation::Known(pr) if pr.head.sha == head)
+    );
+    assert!(
+        matches!(client.checks(&house, &repo, &head), Observation::Known(checks) if checks.len() == 1)
+    );
+    assert!(
+        matches!(client.statuses(&house, &repo, &head), Observation::Known(statuses) if statuses.len() == 1)
+    );
+    assert!(
+        matches!(client.required_checks(&house, &repo, &BranchName::new("main")?), Observation::Known(required) if required.contexts == ["build"])
+    );
+    let mints = fixture
+        .calls()?
+        .into_iter()
+        .filter(|call| call.endpoint.ends_with("/access_tokens"))
+        .collect::<Vec<_>>();
+    assert_eq!(mints.len(), 4);
+    for mint in &mints {
+        assert_eq!(
+            mint.body.as_ref().and_then(|body| body.get("repositories")),
+            Some(&json!(["app"]))
+        );
+        let permissions = mint
+            .body
+            .as_ref()
+            .and_then(|body| body.get("permissions"))
+            .and_then(Value::as_object)
+            .ok_or("missing permissions")?;
+        assert!(permissions.values().all(|level| level == "read"));
+        assert_eq!(permissions.get("issues"), Some(&json!("read")));
+        assert_eq!(permissions.get("pull_requests"), Some(&json!("read")));
+        assert_eq!(permissions.get("contents"), Some(&json!("read")));
+    }
+    assert_eq!(
+        mints[0]
+            .body
+            .as_ref()
+            .and_then(|body| body.pointer("/permissions/checks")),
+        None
+    );
+    assert_eq!(
+        mints[1]
+            .body
+            .as_ref()
+            .and_then(|body| body.pointer("/permissions/checks")),
+        Some(&json!("read"))
+    );
+    assert_eq!(
+        mints[2]
+            .body
+            .as_ref()
+            .and_then(|body| body.pointer("/permissions/statuses")),
+        Some(&json!("read"))
+    );
+    assert_eq!(
+        mints[3]
+            .body
+            .as_ref()
+            .and_then(|body| body.pointer("/permissions/administration")),
+        Some(&json!("read"))
+    );
+    Ok(())
+}
+
+#[test]
+fn app_read_outside_installation_is_refused_before_gh() -> TestResult {
+    let fixture = Fixture::new(true)?;
+    let head = CommitId::new("4f2a9c1e0b7d3a5f6c8e9d0a1b2c3d4e5f6a7b8c")?;
+    let gh = fake_gh_reads(&fixture.root, &head)?;
+    let scope = HouseScope::new(
+        HouseId::new("acme")?,
+        [Repository::new("acme/app")?, Repository::new("acme/other")?],
+        ExternalRef::new(LOGIN)?,
+        credential_ref(LOGIN)?,
+        PostingBudget::new(5)?,
+        [Permission::PostComment],
+    )?;
+    let client = GitHubClient::new(
+        scope,
+        GhCli::app(gh, fixture.tokens()?)?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        client.issues(&HouseId::new("acme")?, &Repository::new("acme/other")?),
+        Observation::Unavailable(IntegrationError::ScopeMismatch)
+    );
+    assert!(gh_calls(&fixture.root)?.is_empty());
+    assert!(fixture.remote()?.mints().is_empty());
+    Ok(())
+}
+
+#[test]
+fn comment_lookup_mints_only_a_repository_read_token() -> TestResult {
+    let fixture = Fixture::new(true)?;
+    let executor = GitHubExecutor::new(
+        BackendId::new("github")?,
+        house_scope()?,
+        GhCli::app(fake_gh(&fixture.root)?, fixture.tokens()?)?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        executor.lookup(&comment_request(&executor)?)?,
+        Lookup::Unknown
+    );
+    assert_eq!(
+        minted_permissions(&fixture)?,
+        [json!({"contents":"read","issues":"read","pull_requests":"read"})]
+    );
+    assert_eq!(
+        gh_calls(&fixture.root)?,
+        [("ghs_fake_1".into(), "GET".into())]
+    );
+    Ok(())
+}
+
+#[test]
+fn comment_execution_reads_with_read_scope_and_submits_with_write_scope() -> TestResult {
+    let fixture = Fixture::new(true)?;
+    let executor = GitHubExecutor::new(
+        BackendId::new("github")?,
+        house_scope()?,
+        GhCli::app(fake_gh(&fixture.root)?, fixture.tokens()?)?,
+        ReadLimits::default(),
+    );
+    assert!(executor.execute(&comment_request(&executor)?).is_ok());
+    assert_eq!(
+        minted_permissions(&fixture)?,
+        [
+            json!({"contents":"read","issues":"read","pull_requests":"read"}),
+            json!({"issues":"write"}),
+        ]
+    );
+    assert_eq!(
+        gh_calls(&fixture.root)?,
+        [
+            ("ghs_fake_1".into(), "GET".into()),
+            ("ghs_fake_2".into(), "POST".into()),
+            ("ghs_fake_1".into(), "GET".into()),
+        ]
+    );
+    Ok(())
+}
+
 #[test]
 fn a_refresh_between_a_lost_response_and_its_reconciliation_posts_once() -> TestResult {
     let fixture = Fixture::new(true)?;
@@ -775,12 +1025,19 @@ fn a_refresh_between_a_lost_response_and_its_reconciliation_posts_once() -> Test
         calls,
         [
             ("ghs_fake_1".to_owned(), "GET".to_owned()),
-            ("ghs_fake_1".to_owned(), "POST".to_owned()),
-            ("ghs_fake_2".to_owned(), "GET".to_owned()),
-            ("ghs_fake_2".to_owned(), "GET".to_owned()),
+            ("ghs_fake_2".to_owned(), "POST".to_owned()),
+            ("ghs_fake_3".to_owned(), "GET".to_owned()),
+            ("ghs_fake_3".to_owned(), "GET".to_owned()),
         ]
     );
-    assert_eq!(fixture.remote()?.mints().len(), 2);
+    assert_eq!(
+        minted_permissions(&fixture)?,
+        [
+            json!({"contents":"read","issues":"read","pull_requests":"read"}),
+            json!({"issues":"write"}),
+            json!({"contents":"read","issues":"read","pull_requests":"read"}),
+        ]
+    );
     Ok(())
 }
 

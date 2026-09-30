@@ -422,7 +422,7 @@ task and fence.
 kitchn mailbox ask       <scope> --body <text> [--subject <text>] [--wait-secs 0-900]
 kitchn mailbox answer    <scope> --question <id> [--wait-secs 0-900]
 kitchn mailbox escalate  <scope> --body <text> [--subject <text>]
-kitchn mailbox report    <scope> --outcome succeeded|failed --body <text> [--subject <text>]
+kitchn mailbox report    <scope> --outcome succeeded|failed [--clean yes|no] [--pushed yes|no] --body <text> [--subject <text>]
 kitchn mailbox questions --house <id> (--registry <dir> | --store <dir>)
 kitchn mailbox reply     --house <id> (--registry <dir> | --store <dir>) --question <id> --body <text> --by person|coordinator
 ```
@@ -436,6 +436,12 @@ the answer; `answer` reads it later. `reply --by person` also records the
 person's time on the asking attempt, and is refused while the task has no
 owner, such as during a coordinator handover. A repeated identical reply
 changes nothing; a different one exits 1.
+
+`report --clean` states whether the worker's checkout had no uncommitted or
+untracked changes, and `--pushed` whether its HEAD was the remote branch tip
+with nothing unpushed. A report without them records the checkout as unknown,
+and scheduled repair then hands the pull request over instead of repairing
+it from a new checkout.
 
 The mailbox holds at most 512 messages, 64 per task, and 32 waiting per task;
 a full mailbox refuses the post instead of dropping it. Bodies and answers are
@@ -457,6 +463,10 @@ kitchn tick trigger launchd|cron --kitchn <abs path> --registry <abs dir> --hous
 kitchn tick configure --registry <abs dir> --house <id> [--repository <owner/name>]
             [<backend>] [<pickup settings>]
 ```
+
+A repair pass takes its branch prefix and report path from the pickup
+options, and repair and the gate read the house's pinned instructions as
+`kitchn run` does.
 
 Each configured pass runs when it never ran or its last run started at least
 `everyMinutes` ago. A pass runs under its own lease in the house store, so a
@@ -537,7 +547,7 @@ kitchn run pickup     <house> <backend> [--ready-label ready] [--needs-spec-labe
                       [--human-label human-only] [--capacity 1] [--branch-prefix kitchen]
                       [--report-path kitchen-report.md]
 kitchn run coordinate <house> <backend>
-kitchn run repair     <house> <backend>
+kitchn run repair     <house> <backend> [--branch-prefix kitchen] [--report-path kitchen-report.md]
 kitchn run gate       <house>
 ```
 
@@ -556,7 +566,9 @@ before anything runs.
   workers, and launches the next attempt of a scheduled task whose attempt
   ended. File overlap is not observed, so a pass launches at most one writer
   per repository whatever `--capacity` says, and a new issue waits while
-  another scheduled task of the repository is unsettled.
+  another scheduled task of the repository is unsettled or any branch writer
+  of the repository may be working, a person's `kitchn work` or `kitchn pr`
+  session included.
 - `coordinate` continues every scheduled task, reads worker deliveries from
   the backend when it declares them and from the house mailbox otherwise, and
   supervises each task once. A worker's successful report settles its task
@@ -568,9 +580,47 @@ before anything runs.
   owns first. Unreadable rows and messages no task can take are acknowledged,
   and each is printed.
 - `repair` assesses the open pull requests of settled scheduled tasks and
-  prints each decision. It launches no repair writer.
+  prints each decision. For a conflict it launches one repair writer in a new
+  checkout of the pushed branch, with a brief quoting the change requests on
+  the current head, while the house's fix-round budget lasts. It launches none
+  while another branch writer of the repository may be working, scheduled or
+  a person's, and at most one per pass. When the branch's last writer did not
+  settle successfully with a report of the current head that states its
+  checkout clean and pushed (`kitchn mailbox report --clean yes --pushed
+  yes`), the pull request is handed over instead. A round whose writer's
+  attempt ended without settling it gets its next attempt only through the
+  same decision; once that writer ran, it is the branch's last writer, so the
+  pull request is handed over. `--branch-prefix` and `--report-path` are
+  pickup's: `repair` reads the stored pickup settings and refuses a flag that
+  names another value. The `coordinate` pass supervises repair writers like
+  pickup workers.
 - `gate` evaluates up to three of those pull requests at their exact heads and
-  prints each verdict. It records nothing and never merges.
+  prints each verdict. It merges one only when an independent reviewer's
+  attestation is recorded for exactly its head and base, whoever recorded it
+  wrote no part of the branch, the forge shows the
+  review it names approved on that head by the claimed login, that login is
+  neither the pull request's author nor the author or committer GitHub shows
+  for any of its commits, and the house's merge grant covers it. The pull
+  request is only reported when GitHub links a commit's author or committer
+  to no account, or when it has more than 100 commits. GitHub links a commit
+  by the email in it, so this check rules out a reviewer the commits name; it
+  does not prove who pushed. A branch a person wrote, through `kitchn work`,
+  `kitchn pr`, or a worker's terminal, is only reported too: a session name
+  is not a forge login, so the reviewer cannot be told apart from that
+  writer. The merge is a squash matched to that head, submitted only
+  after the head and base branch are read again. Without an attestation, or
+  with any other verdict, it records nothing. A pass that records a merge
+  verdict and does not merge, because the head moved or the forge could not
+  be read again, continues the same attempt on the next pass, for seven days
+  from its first pass. After that the gate task settles as exhausted and the
+  pull request is only reported until its head or base changes. When the
+  house's pinned revisions or grants changed since, the next pass first
+  reconciles and settles the pull request's earlier gate task, then merges
+  under a new one. A merge that was sent and whose outcome the forge cannot
+  prove blocks every later merge of that pull request, under any gate task
+  and whatever risk decision was recorded for it, until a lookup shows it
+  merged or shows it can no longer merge. Kitchen has no command that
+  records attestations yet, so in practice the gate still only reports.
 
 Each pass takes its own lease first, so a second concurrent start does nothing
 and exits `3`. A pass that fails hands its lease to the next start. A pass that

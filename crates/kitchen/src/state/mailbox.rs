@@ -49,11 +49,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ConsumerId, ErrorClass, TaskId,
     contracts::{
-        AttemptNumber, BackendDescriptor, BackendUnavailable, Capability, Clock, ConsumerFence,
-        ContractError, CoordinatorMailbox, Delivery, Effect, EffectExecutor, EffectFailure,
-        EffectRequest, ExternalRef, Fence, Lookup, MAX_MAILBOX_WAIT, MailMessage, MailboxError,
-        MessageKind, Operation, Receipt, ResourceKind, ResourceObservation, ResourceRef, Support,
-        Text, Timestamp, VerificationEnvironments, WorkerBackend, WorkerOutcome, WorkerState,
+        AttemptNumber, BackendDescriptor, BackendUnavailable, Capability, CheckoutReport, Clock,
+        ConsumerFence, ContractError, CoordinatorMailbox, Delivery, Effect, EffectExecutor,
+        EffectFailure, EffectRequest, ExternalRef, Fence, Lookup, MAX_MAILBOX_WAIT, MailMessage,
+        MailboxError, MessageKind, Operation, Receipt, ResourceKind, ResourceObservation,
+        ResourceRef, Support, Text, Timestamp, VerificationEnvironments, WorkerBackend,
+        WorkerOutcome, WorkerState,
     },
     state::{AttemptState, EffectState, HouseStore, OwnershipEvent, StateError, TaskRecord},
 };
@@ -155,6 +156,10 @@ pub enum PostKind {
     Report {
         /// The reported outcome.
         outcome: ReportedOutcome,
+        /// The checkout the worker stated; a report posted before reports
+        /// carried it reads as unknown.
+        #[serde(default)]
+        checkout: CheckoutReport,
     },
     /// The worker needs the coordinator to act.
     Escalation,
@@ -302,11 +307,15 @@ impl StoredMail {
             kind: self.kind.message_kind(),
             worker: self.worker.clone(),
             outcome: match self.kind {
-                PostKind::Report { outcome } => Some(outcome.into()),
+                PostKind::Report { outcome, .. } => Some(outcome.into()),
                 PostKind::Question | PostKind::Escalation => None,
             },
             subject: self.subject.clone(),
             body: Some(self.body.clone()),
+            checkout: match self.kind {
+                PostKind::Report { checkout, .. } => checkout,
+                PostKind::Question | PostKind::Escalation => CheckoutReport::default(),
+            },
         })
     }
 }

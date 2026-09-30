@@ -4,16 +4,19 @@
 
 use std::fmt;
 
-use super::{Outcome, Pass, RunError, TASK_LEASE, held_by_run, issue_of, run_claimant, transfer};
+use super::{
+    Outcome, Pass, RunError, TASK_LEASE, awaiting_launch, held_by_run, issue_of, repair_of,
+    run_claimant, transfer, writer_open, writing,
+};
 use crate::{
     ConsumerId, TaskId,
     contracts::{
-        AttemptNumber, BranchName, Clock, ContractError, Effect, Fence, LeaseTtl, Operation,
-        Repository, ResourceRef, Text, WorkerBackend, Workspace,
+        AttemptNumber, BranchName, Clock, ContractError, Fence, LeaseTtl, Repository, ResourceRef,
+        Text, WorkerBackend, Workspace,
     },
     house::HouseConfig,
     integrations::github::{GitHubClient, GitHubReadTransport, Issue, IssueDetail, IssueState},
-    state::{AttemptState, HouseStore, TaskRecord, TaskState},
+    state::{HouseStore, TaskRecord, TaskState},
     workflows::{
         coordination::{BranchFact, Context, LaunchOutcome, MailboxRoute, Standing, task_branch},
         known,
@@ -221,15 +224,11 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
             )?;
         let tasks = self.store.tasks()?;
         // One writer per repository: file overlap is not observed, so a pass
-        // launches at most one writer, and none while another scheduled
-        // task of the repository has an open attempt. Selection already
-        // leaves new issues while any scheduled task is unsettled.
-        let writer_open = tasks.iter().any(|record| {
-            issue_of(record, repository).is_some()
-                && !matches!(record.state(), TaskState::Settled { .. })
-                && !awaiting_launch(record)
-        });
-        let retries: Vec<(&TaskRecord, IssueRef, Fence)> = if writer_open {
+        // launches at most one writer, and none while another branch writer
+        // of the repository, scheduled or a person's, may be working.
+        // Selection already leaves new issues while any pickup task is
+        // unsettled or a repair round may be working.
+        let retries: Vec<(&TaskRecord, IssueRef, Fence)> = if writer_open(&tasks, repository) {
             Vec::new()
         } else {
             tasks
@@ -261,7 +260,7 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
         if selection.picks.is_empty() && retries.is_empty() {
             return Ok(Vec::new());
         }
-        let grants = self.house.authority()?;
+        let grants = super::standing_grants(self.house)?;
         let ctx = Context {
             store: self.store,
             backend: self.backend,
@@ -360,7 +359,7 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
         let busy = tasks.iter().any(|record| {
             issue_of(record, repository).is_some_and(|other| other.number != issue.number)
                 && !matches!(record.state(), TaskState::Settled { .. })
-        });
+        }) || repairing(tasks, repository);
         let readiness = if has_label(issue, &labels.needs_spec)
             || acceptance(detail.body.as_deref()).is_empty()
         {
@@ -435,30 +434,13 @@ fn launch(
     )
 }
 
-/// Whether the task needs a launch: never launched, its latest attempt
-/// finished and it did not settle, or its latest attempt is open with no
-/// launch recorded (a pass stopped between starting the attempt and
-/// submitting the launch). A recorded launch, even one whose outcome is
-/// unknown, is left to supervision.
-fn awaiting_launch(record: &TaskRecord) -> bool {
-    if matches!(record.state(), TaskState::Settled { .. }) {
-        return false;
-    }
-    let Some(attempt) = record.attempts().last() else {
-        return true;
-    };
-    match attempt.state() {
-        AttemptState::Running | AttemptState::Interrupted { .. } => {
-            !record.effects().iter().any(|effect| {
-                effect.request().attempt() == attempt.number()
-                    && matches!(
-                        effect.request().effect(),
-                        Effect::Worker(Operation::LaunchWorker { .. })
-                    )
-            })
-        }
-        AttemptState::Finished { .. } | AttemptState::Cancelled { .. } => true,
-    }
+/// Whether a repair or follow-up round of `repository`, scheduled or a
+/// person's, may be working: its writer counts against the repository's one
+/// writer.
+fn repairing(tasks: &[TaskRecord], repository: &Repository) -> bool {
+    tasks
+        .iter()
+        .any(|record| repair_of(record, repository).is_some() && writing(record))
 }
 
 fn has_label(issue: &Issue, name: &str) -> bool {

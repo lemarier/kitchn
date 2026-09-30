@@ -23,7 +23,8 @@
 use std::time::Duration;
 
 use crate::contracts::{
-    BackendUnavailable, ExternalRef, ResourceRef, Text, WorkerBackend, WorkerOutcome,
+    BackendUnavailable, CheckoutReport, ExternalRef, ResourceRef, Text, WorkerBackend,
+    WorkerOutcome,
 };
 
 #[cfg(doc)]
@@ -64,6 +65,10 @@ pub struct MailMessage {
     pub subject: Option<Text>,
     /// The body, truncated to Kitchen's text bound.
     pub body: Option<Text>,
+    /// The checkout the worker stated on [`MessageKind::WorkerDone`];
+    /// unknown on every other message and whenever the backend carries no
+    /// such statement.
+    pub checkout: CheckoutReport,
 }
 
 /// One unacknowledged mailbox batch. The backend replays it until acknowledged.
@@ -189,6 +194,7 @@ mod tests {
             outcome: None,
             subject: None,
             body: None,
+            checkout: CheckoutReport::default(),
         })
     }
 

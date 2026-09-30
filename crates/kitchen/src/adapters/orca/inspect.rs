@@ -8,9 +8,9 @@ use serde_json::Value;
 use crate::{
     adapters::orca::{OrcaBackend, OrcaError, OrcaRunner, backend, wire},
     contracts::{
-        CoordinatorMailbox, Delivery, ExternalRef, Liveness, MAX_MAILBOX_WAIT, MAX_TEXT_BYTES,
-        MailMessage, MailboxError, MessageKind, ResourceKind, ResourceRef, Text, WorkerOutcome,
-        WorkerState,
+        CheckoutReport, CoordinatorMailbox, Delivery, ExternalRef, Liveness, MAX_MAILBOX_WAIT,
+        MAX_TEXT_BYTES, MailMessage, MailboxError, MessageKind, ResourceKind, ResourceRef, Text,
+        WorkerOutcome, WorkerState,
     },
 };
 
@@ -339,6 +339,8 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             outcome,
             subject: bounded_text(message.subject.as_deref()),
             body: bounded_text(message.body.as_deref()),
+            // Orca's worker_done carries no checkout statement.
+            checkout: CheckoutReport::default(),
         })
     }
 }

@@ -20,7 +20,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use kitchen::{
     HolderId, HouseId,
     adoption::HouseRegistry,
-    contracts::{Capability, Claimant, Clock, Repository, SystemClock, Text},
+    contracts::{BranchName, Claimant, Clock, Repository, SystemClock, Text},
     house::{
         HouseError, OrcaHost, RUNTIME_SCHEMA, RuntimeConfig, RuntimeOutcome, forge_binding,
         runtime_config, store_runtime,
@@ -28,7 +28,7 @@ use kitchen::{
     state::{HouseStore, RunId, RunSettle, RunState, StoreOptions},
     workflows::{
         coordination::MailboxRoute,
-        run::{TickPasses, failed_report},
+        run::{RepairSettings, TickPasses, failed_report},
         tick::{
             self, Pass, PassFailure, PassOutcome, PassReport, PassRun, PassRunner, TickDecision,
             TriggerMinutes, TriggerTarget, trigger_cron, trigger_plist,
@@ -165,6 +165,23 @@ impl DuePasses<'_> {
             Pass::Pickup => Some(super::run::settings(opened, self.pickup)?),
             Pass::Coordinate | Pass::Repair | Pass::Gate => None,
         };
+        // Repair briefs name the pinned instructions and the report path
+        // pickup briefs name; a gate task records the same revisions.
+        let instructions = match pass {
+            Pass::Repair | Pass::Gate => Some(super::run::instructions(opened)?),
+            Pass::Pickup | Pass::Coordinate => None,
+        };
+        let repair_pickup = match pass {
+            Pass::Repair => Some(super::run::pickup_config(opened, self.pickup)?),
+            Pass::Pickup | Pass::Coordinate | Pass::Gate => None,
+        };
+        let repair = match (&instructions, &repair_pickup) {
+            (Some(instructions), Some(pickup)) => Some(RepairSettings {
+                instructions: instructions.clone(),
+                report_path: Text::new(&pickup.report_path)?,
+            }),
+            (Some(_) | None, _) => None,
+        };
         let backend = match pass {
             Pass::Pickup | Pass::Coordinate => Some(
                 opened.backend(
@@ -176,18 +193,24 @@ impl DuePasses<'_> {
                     MailboxRoute::House.worker_requirements(),
                 )?,
             ),
-            Pass::Repair => Some(opened.backend(
-                self.backend,
-                pass.as_str(),
-                None,
-                &[Capability::WorkerStatusAndOutcome],
-            )?),
+            // A repair writer is supervised like a pickup worker, and its
+            // workspace is named without pickup's branch prefix.
+            Pass::Repair => Some(
+                opened.backend(
+                    self.backend,
+                    pass.as_str(),
+                    repair_pickup
+                        .as_ref()
+                        .map(|pickup| BranchName::new(&pickup.branch_prefix))
+                        .transpose()?,
+                    MailboxRoute::House.worker_requirements(),
+                )?,
+            ),
             Pass::Gate => None,
         };
         let forge = opened.forge()?;
-        let authors = [forge_binding(&opened.registry, &opened.config.house)?
-            .requester
-            .to_string()];
+        let binding = forge_binding(&opened.registry, &opened.config.house)?;
+        let authors = [binding.requester.to_string()];
         TickPasses {
             store: &opened.store,
             house: &opened.config,
@@ -196,6 +219,11 @@ impl DuePasses<'_> {
             clock: self.clock,
             repository: &opened.repository,
             pickup: settings.as_ref(),
+            repair: repair.as_ref(),
+            provenance: instructions
+                .as_ref()
+                .map(|instructions| &instructions.provenance),
+            forge_backend: &binding.backend,
             authors: &authors,
         }
         .run_pass(pass, run)

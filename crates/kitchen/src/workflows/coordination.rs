@@ -235,7 +235,7 @@ fn house_mailbox_brief(store: &HouseStore, task: &TaskId, fence: Fence) -> Strin
         fence.get()
     );
     format!(
-        "Mailbox: this backend does not carry worker messages, so report to the coordinator through Kitchen's house mailbox, and only for this task. Ask a question with `kitchn mailbox ask {scope} --body <text> --wait-secs 600`, which waits for the answer; read a late answer with `kitchn mailbox answer {scope} --question <id>`. Escalate with `kitchn mailbox escalate {scope} --body <text>`. When done, report once with `kitchn mailbox report {scope} --outcome succeeded|failed --body <summary>`."
+        "Mailbox: this backend does not carry worker messages, so report to the coordinator through Kitchen's house mailbox, and only for this task. Ask a question with `kitchn mailbox ask {scope} --body <text> --wait-secs 600`, which waits for the answer; read a late answer with `kitchn mailbox answer {scope} --question <id>`. Escalate with `kitchn mailbox escalate {scope} --body <text>`. When done, report once with `kitchn mailbox report {scope} --outcome succeeded|failed --clean yes|no --pushed yes|no --body <summary>`: `--clean yes` only when `git status --porcelain` prints nothing, and `--pushed yes` only when your checkout's HEAD is the remote branch tip with nothing unpushed."
     )
 }
 
@@ -415,8 +415,14 @@ impl BranchFact {
 
 /// Whether supervision recorded that a person holds `worker`'s terminal.
 fn person_held(record: &TaskRecord, worker: &ResourceRef) -> bool {
-    held_key(worker).is_ok_and(|key| record.has_consumed(&key))
+    person_took_over(record, worker)
         && !released_key(worker).is_ok_and(|key| record.has_consumed(&key))
+}
+
+/// Whether supervision ever recorded a person at `worker`'s terminal,
+/// whether or not the hold was released since.
+pub(crate) fn person_took_over(record: &TaskRecord, worker: &ResourceRef) -> bool {
+    held_key(worker).is_ok_and(|key| record.has_consumed(&key))
 }
 
 /// What [`release_held_branch`] did.
@@ -585,6 +591,35 @@ pub fn launch_worker(
     workspace: Workspace,
     brief: &WorkerBrief,
 ) -> Result<LaunchOutcome> {
+    launch_rendered(
+        ctx,
+        task,
+        fence,
+        workspace,
+        &brief.branch,
+        matches!(brief.base, Base::Stack { .. }),
+        |spec, follow_ups| brief.render_with(spec, follow_ups),
+    )
+}
+
+/// [`launch_worker`] for a brief rendered by `render` from the task's spec
+/// and its outstanding follow-ups, naming exactly `branch`. A `stacked`
+/// branch is recorded as a stack layer before the launch. Every check and
+/// outcome is the same as [`launch_worker`]'s. `render` validates what it
+/// writes, as [`crate::workflows::pickup::write_standing`] does for the
+/// lines every brief carries.
+///
+/// # Errors
+/// As [`launch_worker`], and whatever `render` returns.
+pub(crate) fn launch_rendered(
+    ctx: &Context<'_>,
+    task: &TaskId,
+    fence: Fence,
+    workspace: Workspace,
+    branch: &BranchName,
+    stacked: bool,
+    render: impl FnOnce(&crate::contracts::TaskSpec, &[QueuedFollowUp]) -> Result<Text>,
+) -> Result<LaunchOutcome> {
     let record = ctx.store.task(task)?;
     // A process that lost the task is told so before any answer that would
     // have it continue: `SuperviseFirst` and `BranchHeld` are for the owner.
@@ -598,10 +633,10 @@ pub fn launch_worker(
     // Follow-ups an earlier worker could not receive or did not address go
     // into the next brief, so none is dropped.
     let follow_ups = outstanding_follow_ups(ctx.store, &record)?;
-    let text = brief.render_with(record.spec(), &follow_ups)?;
-    if held_branches(&record).contains(&brief.branch) {
+    let text = render(record.spec(), &follow_ups)?;
+    if held_branches(&record).contains(branch) {
         return Ok(LaunchOutcome::BranchHeld {
-            branch: brief.branch.clone(),
+            branch: branch.clone(),
         });
     }
     if let Some(worker) = unstopped_worker(ctx, &record, fence) {
@@ -634,10 +669,10 @@ pub fn launch_worker(
         }
         Err(error) => return Err(error),
     };
-    if matches!(brief.base, Base::Stack { .. }) {
+    if stacked {
         // The push boundary reads the layer from this record, never from
         // the writer.
-        BranchFact::Stacked.record(ctx.store, task, fence, &brief.branch, ctx.clock.now())?;
+        BranchFact::Stacked.record(ctx.store, task, fence, branch, ctx.clock.now())?;
     }
     let record = ctx.store.task(task)?;
     // Held follow-ups in this brief are delivered by it: marked before the
@@ -651,7 +686,7 @@ pub fn launch_worker(
         role,
         workspace,
         brief: text,
-        branch: Some(brief.branch.clone()),
+        branch: Some(branch.clone()),
         // The store refuses a launch that differs from the task's selection
         // or that the backend does not declare support for.
         agent: record
@@ -690,8 +725,7 @@ pub fn launch_worker(
             // requested branch, and a receipt naming another one stops the
             // worker before it works.
             let wrong_branch = receipt.created().iter().any(|resource| {
-                resource.kind == ResourceKind::Branch
-                    && resource.handle.as_str() != brief.branch.as_str()
+                resource.kind == ResourceKind::Branch && resource.handle.as_str() != branch.as_str()
             });
             if wrong_branch {
                 return stop_misplaced(ctx, task, fence, attempt, worker);
@@ -1207,7 +1241,7 @@ fn supervise_step(
             if completion.observed_branch != completion.requested.as_str() {
                 return Ok(Supervision::Escalate(Escalation::BranchMismatch));
             }
-            if completion.report.kind != EvidenceKind::WorkerReport
+            if !matches!(completion.report.kind, EvidenceKind::WorkerReport(_))
                 || completion.report.verdict != EvidenceVerdict::Pass
             {
                 return Ok(Supervision::Escalate(Escalation::MissingEvidence));

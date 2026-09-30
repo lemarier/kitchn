@@ -88,7 +88,10 @@ pub use effects::{
     ScheduleEffect, ScheduleRequirements, SubmittedEffects,
 };
 pub use error::ContractError;
-pub use evidence::{Evidence, EvidenceKind, EvidenceRevision, EvidenceSubject, EvidenceVerdict};
+pub use evidence::{
+    CheckoutFact, CheckoutReport, Evidence, EvidenceKind, EvidenceRevision, EvidenceSubject,
+    EvidenceVerdict,
+};
 pub use mailbox::{
     CoordinatorMailbox, Delivery, MAX_MAILBOX_WAIT, MailMessage, MailboxError, MessageKind,
 };

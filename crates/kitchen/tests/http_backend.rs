@@ -190,6 +190,7 @@ fn message(id: &str, kind: MessageKind) -> TestResult<MailMessage> {
         outcome: None,
         subject: Some(Text::new("subject")?),
         body: None,
+        checkout: kitchen::contracts::CheckoutReport::default(),
     })
 }
 

@@ -10,14 +10,14 @@
 //! ([`PassFailure::OwnerUncertain`]).
 
 use super::{
-    CoordinatePass, GatePass, Outcome, PickupAction, PickupPass, PickupSettings, RepairPass,
-    RunError,
+    CoordinatePass, GatePass, Outcome, PickupAction, PickupPass, PickupSettings, RepairAction,
+    RepairPass, RepairSettings, RunError,
 };
 use crate::{
-    ErrorClass,
-    contracts::{Clock, CoordinatorMailbox, ExternalRef, Repository},
+    BackendId, ErrorClass,
+    contracts::{Clock, CoordinatorMailbox, ExternalRef, Provenance, Repository},
     house::HouseConfig,
-    integrations::github::{GitHubClient, GitHubReadTransport},
+    integrations::github::{GitHubClient, GitHubMutationTransport},
     state::HouseStore,
     workflows::tick::{
         MAX_RUN_EVIDENCE, Pass, PassFailure, PassOutcome, PassReport, PassRun, PassRunner,
@@ -45,17 +45,27 @@ pub struct TickPasses<'a, T> {
     /// What pickup picks up, for `repository`. Without it pickup fails with
     /// [`RunError::NoPickupSettings`].
     pub pickup: Option<&'a PickupSettings>,
+    /// What repair briefs name. Without it repair fails with
+    /// [`RunError::NoPassSettings`].
+    pub repair: Option<&'a RepairSettings>,
+    /// The pinned revisions a gate task records. Without them the gate
+    /// fails with [`RunError::NoPassSettings`].
+    pub provenance: Option<&'a Provenance>,
+    /// The forge backend of the house's forge binding, where the gate
+    /// merges.
+    pub forge_backend: &'a BackendId,
     /// Pull request authors eligible for unattended merge, for the gate.
     pub authors: &'a [String],
 }
 
-impl<T: GitHubReadTransport> TickPasses<'_, T> {
+impl<T: GitHubMutationTransport + Clone> TickPasses<'_, T> {
     /// Run `pass` once under the tick's `run` and report how it ended.
     ///
     /// # Errors
     /// [`RunError::NoBackend`] for a pass that needs the worker backend when
     /// none was given, [`RunError::NoPickupSettings`] for pickup without its
-    /// settings, and the pass's own errors.
+    /// settings, [`RunError::NoPassSettings`] for repair or the gate without
+    /// theirs, and the pass's own errors.
     pub fn run_pass(&self, pass: Pass, run: &PassRun) -> Result<PassReport> {
         let backend = || self.backend.ok_or(RunError::NoBackend);
         let tick = Some(run);
@@ -96,17 +106,20 @@ impl<T: GitHubReadTransport> TickPasses<'_, T> {
                     forge: self.forge,
                     clock: self.clock,
                     repository,
+                    settings: self.repair.ok_or(RunError::NoPassSettings)?,
                     take_over: false,
                     tick,
                 }
                 .run()?,
-                |_| None,
+                repair_worker,
             ),
             Pass::Gate => report(
                 GatePass {
                     store: self.store,
                     house: self.house,
                     forge: self.forge,
+                    forge_backend: self.forge_backend,
+                    provenance: self.provenance.ok_or(RunError::NoPassSettings)?,
                     clock: self.clock,
                     repository,
                     authors: self.authors,
@@ -120,7 +133,7 @@ impl<T: GitHubReadTransport> TickPasses<'_, T> {
     }
 }
 
-impl<T: GitHubReadTransport> PassRunner for TickPasses<'_, T> {
+impl<T: GitHubMutationTransport + Clone> PassRunner for TickPasses<'_, T> {
     fn run(&mut self, pass: Pass, run: &PassRun) -> PassReport {
         self.run_pass(pass, run)
             .unwrap_or_else(|error| failed_report(&error))
@@ -167,5 +180,16 @@ fn launched_worker(action: &PickupAction) -> Option<ExternalRef> {
         | PickupAction::IssueClosed { .. }
         | PickupAction::StackedRetry { .. }
         | PickupAction::Moved { .. } => None,
+    }
+}
+
+/// The backend's reference to the worker a repair launch created.
+fn repair_worker(action: &RepairAction) -> Option<ExternalRef> {
+    match action {
+        RepairAction::Launched { worker, .. } => Some(worker.handle.clone()),
+        RepairAction::Decided { .. }
+        | RepairAction::Stacked { .. }
+        | RepairAction::NotLaunched { .. }
+        | RepairAction::Waiting { .. } => None,
     }
 }

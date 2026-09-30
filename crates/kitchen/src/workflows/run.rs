@@ -40,29 +40,37 @@ use std::{fmt, str::FromStr, time::Duration};
 use crate::{
     ConsumerId, ErrorClass, HolderId, TaskId,
     contracts::{
-        Claimant, Clock, ConsumerFence, ExecutorKind, Fence, IssueNumber, LeaseTtl, MailboxError,
-        Provenance, Repository, RetryPolicy, Role, TaskAuthority, Timestamp,
+        Claimant, Clock, ConsumerFence, Effect, ExecutorKind, Fence, HouseGrants, IssueNumber,
+        LeaseTtl, MailboxError, Operation, Permission, Provenance, Repository, RetryPolicy, Role,
+        TaskAuthority, Timestamp, Trigger,
     },
     house::HouseConfig,
     integrations::github::{GitHubClient, GitHubReadTransport, HeadLocation, IssueState},
-    state::{ConsumerState, HouseStore, Lease, StateError, TaskRecord, TaskState},
+    selection::WorkType,
+    state::{AttemptState, ConsumerState, HouseStore, Lease, StateError, TaskRecord, TaskState},
     workflows::{
         coordination::{MailboxRoute, task_branch},
         pickup::{IssueRef, TaskTemplate, issue_task_id, stable_hash},
+        repair::repair_task_id,
         tick::PassRun,
     },
 };
 
+mod attestation;
 mod coordinate;
 mod gate;
 mod pickup;
 mod repair;
 mod tick;
 
+pub use attestation::{
+    ForgeReview, GATE_ATTESTATION_WORKFLOW, GateAttestation, RecordedAttestation, gate_attestation,
+    record_gate_attestation,
+};
 pub use coordinate::{CoordinateAction, CoordinatePass, Unroutable};
-pub use gate::{GateAction, GatePass, MAX_GATE_PULL_REQUESTS};
+pub use gate::{GateAction, GatePass, GateResult, MAX_GATE_PULL_REQUESTS, NotMerged, ReportReason};
 pub use pickup::{MAX_READY_INSPECTED, PickupAction, PickupLabels, PickupPass, PickupSettings};
-pub use repair::{RepairAction, RepairPass};
+pub use repair::{RepairAction, RepairPass, RepairSettings, Wait};
 pub use tick::{TickPasses, failed_report};
 
 type Result<T> = std::result::Result<T, crate::Error>;
@@ -179,6 +187,34 @@ pub enum RunError {
     /// Pickup needs its settings and none were given.
     #[error("pickup needs its settings")]
     NoPickupSettings,
+    /// Repair needs its brief settings, or the gate its pinned revisions,
+    /// and none were given.
+    #[error("this pass needs its settings")]
+    NoPassSettings,
+    /// A gate attestation names the pull request's author as its reviewer,
+    /// or no reviewer, or the forge names no author.
+    #[error(
+        "the attesting reviewer is the pull request's author; an attestation must be independent"
+    )]
+    AttestationNotIndependent,
+    /// A gate attestation's recorder wrote the branch: it created or held
+    /// one of its writer tasks, or a launch on the branch created it.
+    #[error("the recorder wrote the branch; a branch writer cannot record an attestation")]
+    AttestationByWriter,
+    /// A different attestation is already recorded for this exact subject;
+    /// attestations are never rewritten.
+    #[error("a different attestation is already recorded for this head and base")]
+    AttestationRecorded,
+    /// The merge gate's durable store refused an effect it could not
+    /// authorize or build: no merge grant for the subject, a task whose
+    /// evidence is not at the verdict's head and base, or a verdict lacking
+    /// what its effect needs.
+    #[error("the merge gate refused the effect for this pull request")]
+    GateRefused,
+    /// The merge gate's durable records are incomplete: a marker names an
+    /// unknown effect or its history dropped facts.
+    #[error("the merge gate's records are incomplete")]
+    GateRecords,
 }
 
 impl RunError {
@@ -191,9 +227,15 @@ impl RunError {
             | Self::RepositoryAmbiguous
             | Self::BackendArguments(_)
             | Self::RuntimeMismatch(_) => ErrorClass::InvalidInput,
-            Self::NoBackend | Self::NoPickupSettings => ErrorClass::Refused,
+            Self::NoBackend | Self::NoPickupSettings | Self::NoPassSettings => ErrorClass::Refused,
             Self::Mailbox(MailboxError::Fenced) => ErrorClass::Conflict,
-            Self::Mailbox(MailboxError::Unavailable(_)) => ErrorClass::Execution,
+            Self::Mailbox(MailboxError::Unavailable(_)) | Self::GateRecords => {
+                ErrorClass::Execution
+            }
+            Self::AttestationNotIndependent | Self::AttestationByWriter | Self::GateRefused => {
+                ErrorClass::Refused
+            }
+            Self::AttestationRecorded => ErrorClass::Conflict,
         }
     }
 }
@@ -345,8 +387,18 @@ fn finish<A>(
     }
 }
 
-/// The task template scheduled pickup creates tasks from: the house's
-/// standing grants delegated whole, its agent policy, the pinned
+/// The house's standing grants. A configured merge grant is issued through
+/// the readiness check ([`HouseConfig::issue_authority`]); only the gate's
+/// [`crate::workflows::gate::MergeGrant`] for an exact subject can use it.
+///
+/// # Errors
+/// Rejects a house whose configuration or grants are invalid.
+pub(crate) fn standing_grants(house: &HouseConfig) -> Result<HouseGrants> {
+    Ok(house.issue_authority(&[], &[])?.grants().clone())
+}
+
+/// The task template scheduled pickup and repair create tasks from: the
+/// house's standing grants delegated except merge, its agent policy, the pinned
 /// `provenance`, and the worker capabilities `route` needs.
 ///
 /// # Errors
@@ -356,9 +408,18 @@ pub fn task_template(
     route: MailboxRoute,
     provenance: Provenance,
 ) -> Result<TaskTemplate> {
-    let grants = house.authority()?;
+    let grants = standing_grants(house)?;
     Ok(TaskTemplate {
-        authority: TaskAuthority::delegate(&grants, house.grants.iter().cloned())?,
+        // A worker never merges: only the gate's readiness-checked merge
+        // grant can, so a merge grant is not delegated to worker tasks.
+        authority: TaskAuthority::delegate(
+            &grants,
+            house
+                .grants
+                .iter()
+                .filter(|grant| grant.permission != Permission::Merge)
+                .cloned(),
+        )?,
         retry: RetryPolicy::new(ATTEMPTS, RETRY_BUDGET)?,
         provenance,
         requires: crate::contracts::CapabilityRequirements::new().with(
@@ -387,6 +448,95 @@ fn issue_of(record: &TaskRecord, repository: &Repository) -> Option<IssueRef> {
         .ok()
         .filter(|derived| derived == id)
         .map(|_| issue)
+}
+
+/// The pull request and round a repair task of `repository` was created
+/// for, confirmed by deriving the task id again, or `None` for another kind
+/// of task. Scheduled and interactive repair rounds share these ids.
+fn repair_of(record: &TaskRecord, repository: &Repository) -> Option<(IssueNumber, u8)> {
+    let spec = record.spec();
+    if spec.role != Role::StationCook
+        || spec.repository.as_ref() != Some(repository)
+        || spec.work_type != Some(WorkType::fix())
+    {
+        return None;
+    }
+    let (round, rest) = spec.id.as_str().strip_prefix("repair")?.split_once('-')?;
+    let (_, number) = rest.rsplit_once('-')?;
+    let round: u8 = round.parse().ok()?;
+    let number = IssueNumber::new(number.parse().ok()?).ok()?;
+    repair_task_id(repository, number, round)
+        .ok()
+        .filter(|derived| derived == &spec.id)
+        .map(|_| (number, round))
+}
+
+/// Whether `record` is a repair round a scheduled repair pass created. A
+/// round a person started interactively is theirs, never the runner's.
+fn scheduled_repair(record: &TaskRecord, repository: &Repository) -> bool {
+    record.created_by().holder.as_str() == RUN_HOLDER
+        && record.created_by().trigger == Trigger::Scheduled
+        && repair_of(record, repository).is_some()
+}
+
+/// Whether `record` is a writer task a scheduled pass created in
+/// `repository`: a pickup task or a scheduled repair round.
+fn scheduled_writer(record: &TaskRecord, repository: &Repository) -> bool {
+    issue_of(record, repository).is_some() || scheduled_repair(record, repository)
+}
+
+/// Whether `record` writes a branch of `repository`: a pickup or `work`
+/// task, or a repair or follow-up round, scheduled or a person's.
+fn branch_writer(record: &TaskRecord, repository: &Repository) -> bool {
+    issue_of(record, repository).is_some() || repair_of(record, repository).is_some()
+}
+
+/// Whether any branch writer of `repository` may be working ([`writing`]).
+/// While one may, no pass launches another writer there, since file
+/// overlap is not observed. A task waiting for a launch that never comes,
+/// such as a repair round whose pull request merged, blocks nothing.
+fn writer_open(tasks: &[TaskRecord], repository: &Repository) -> bool {
+    tasks
+        .iter()
+        .any(|record| branch_writer(record, repository) && writing(record))
+}
+
+/// Whether `record` may be writing its branch: it has not settled, and
+/// either someone other than the scheduled runner holds it (a person's
+/// session works without a recorded launch, and an expired claim may still
+/// be working), or it does not wait for its next launch.
+fn writing(record: &TaskRecord) -> bool {
+    match record.state() {
+        TaskState::Settled { .. } => false,
+        TaskState::Claimed { lease } if lease.holder().as_str() != RUN_HOLDER => true,
+        TaskState::Claimed { .. } | TaskState::Open => !awaiting_launch(record),
+    }
+}
+
+/// Whether the task needs a launch: never launched, its latest attempt
+/// finished and it did not settle, or its latest attempt is open with no
+/// launch recorded (a pass stopped between starting the attempt and
+/// submitting the launch). A recorded launch, even one whose outcome is
+/// unknown, is left to supervision.
+fn awaiting_launch(record: &TaskRecord) -> bool {
+    if matches!(record.state(), TaskState::Settled { .. }) {
+        return false;
+    }
+    let Some(attempt) = record.attempts().last() else {
+        return true;
+    };
+    match attempt.state() {
+        AttemptState::Running | AttemptState::Interrupted { .. } => {
+            !record.effects().iter().any(|effect| {
+                effect.request().attempt() == attempt.number()
+                    && matches!(
+                        effect.request().effect(),
+                        Effect::Worker(Operation::LaunchWorker { .. })
+                    )
+            })
+        }
+        AttemptState::Finished { .. } | AttemptState::Cancelled { .. } => true,
+    }
 }
 
 /// The scheduled runner's live claim on `record`, if it holds one.
@@ -440,6 +590,59 @@ fn transfer(
             | StateError::TaskSettled { .. },
         )) => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+/// Why a pass could not take a task for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// Another holder has it, a pass still running holds it, or it settled.
+    Held,
+    /// The runner's claim expired without a release; only a takeover
+    /// continues it.
+    Uncertain,
+}
+
+/// Take `task` for the pass `claimant` acts under: an open task is
+/// claimed (an adoption when it was relinquished), a live runner claim of
+/// an ended pass or of coordination is moved, and an expired runner claim
+/// is taken over only with `take_over`.
+fn take_for_pass(
+    store: &HouseStore,
+    task: &TaskId,
+    claimant: &Claimant,
+    take_over: bool,
+    now: Timestamp,
+) -> Result<std::result::Result<Fence, Refusal>> {
+    let record = store.task(task)?;
+    let ttl = LeaseTtl::new(TASK_LEASE)?;
+    if let Some(lease) = held_by_run(&record, now) {
+        if let Some(bound) = lease.consumer()
+            && pass_current(store, bound, now)?
+        {
+            return Ok(Err(Refusal::Held));
+        }
+        return Ok(transfer(store, task, lease.fence(), claimant, now)?.ok_or(Refusal::Held));
+    }
+    match record.state() {
+        TaskState::Open => match store.claim(task, claimant, ttl, now) {
+            Ok(lease) => Ok(Ok(lease.fence())),
+            Err(crate::Error::State(
+                StateError::ClaimHeld { .. } | StateError::TaskSettled { .. },
+            )) => Ok(Err(Refusal::Held)),
+            Err(crate::Error::State(StateError::LeaseExpired { .. })) => {
+                Ok(Err(Refusal::Uncertain))
+            }
+            Err(error) => Err(error),
+        },
+        TaskState::Claimed { lease } if lease.holder().as_str() == RUN_HOLDER => {
+            if take_over {
+                Ok(Ok(store.take_over(task, claimant, ttl, now)?.fence()))
+            } else {
+                Ok(Err(Refusal::Uncertain))
+            }
+        }
+        TaskState::Claimed { .. } | TaskState::Settled { .. } => Ok(Err(Refusal::Held)),
     }
 }
 

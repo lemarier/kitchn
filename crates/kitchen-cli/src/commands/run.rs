@@ -43,7 +43,7 @@ use kitchen::{
         pickup::PinnedInstructions,
         run::{
             CoordinatePass, GatePass, Outcome, Pass, PickupLabels, PickupPass, PickupSettings,
-            RepairPass, RunError, pass_repository,
+            RepairPass, RepairSettings, RunError, pass_repository,
         },
     },
 };
@@ -74,15 +74,19 @@ enum RunCommand {
         backend: BackendArgs,
     },
     /// Assess the pull requests of settled scheduled tasks for conflict
-    /// repair and report each decision. Launches no writer.
+    /// repair, and launch one repair writer within the house's follow-up
+    /// budget when no other writer of the repository is open.
     Repair {
         #[command(flatten)]
         house: HouseArgs,
         #[command(flatten)]
         backend: BackendArgs,
+        #[command(flatten)]
+        repair: RepairArgs,
     },
     /// Evaluate the pull requests of settled scheduled tasks at their exact
-    /// heads and report each verdict. Records nothing and merges nothing.
+    /// heads, and merge one whose attested verdict is a merge the house
+    /// grants. Others are only reported.
     Gate {
         #[command(flatten)]
         house: HouseArgs,
@@ -240,6 +244,22 @@ pub(super) fn agree<'a, T: PartialEq>(
         (Some(value), _) | (None, Some(value)) => Ok(Some(value)),
         (None, None) => Ok(None),
     }
+}
+
+/// What a repair writer shares with pickup workers. Unset flags use the
+/// house's stored pickup settings, or the defaults when none are stored; a
+/// flag that disagrees with the stored settings is refused, as for pickup.
+#[derive(Args)]
+struct RepairArgs {
+    /// Scheduled branches are named `<prefix>/issue-<number>`; the worker
+    /// backend names a repair writer's workspace without it (default:
+    /// kitchen).
+    #[arg(long)]
+    branch_prefix: Option<String>,
+    /// Where each repair writer writes its evidence report in its workspace
+    /// (default: kitchen-report.md).
+    #[arg(long)]
+    report_path: Option<String>,
 }
 
 /// The house, its store, and the repository one pass serves.
@@ -468,12 +488,31 @@ pub fn run(args: RunArgs) -> ExitCode {
                 .run()?,
             )
         }),
-        RunCommand::Repair { house, backend } => Opened::open(&house).and_then(|opened| {
+        RunCommand::Repair {
+            house,
+            backend,
+            repair,
+        } => Opened::open(&house).and_then(|opened| {
+            // The branch prefix and report path are pickup's, as the tick
+            // reads them.
+            let pickup = pickup_config(
+                &opened,
+                &PickupArgs {
+                    branch_prefix: repair.branch_prefix,
+                    report_path: repair.report_path,
+                    ..PickupArgs::default()
+                },
+            )?;
+            let settings = RepairSettings {
+                instructions: instructions(&opened)?,
+                report_path: Text::new(&pickup.report_path)?,
+            };
+            // A repair writer is supervised like a pickup worker.
             let backend = opened.backend(
                 &backend,
                 Pass::Repair.as_str(),
-                None,
-                &[Capability::WorkerStatusAndOutcome],
+                Some(BranchName::new(&pickup.branch_prefix)?),
+                MailboxRoute::House.worker_requirements(),
             )?;
             let forge = opened.forge()?;
             render(
@@ -484,6 +523,7 @@ pub fn run(args: RunArgs) -> ExitCode {
                     forge: &forge,
                     clock: &clock,
                     repository: &opened.repository,
+                    settings: &settings,
                     take_over: house.take_over,
                     tick: None,
                 }
@@ -492,14 +532,16 @@ pub fn run(args: RunArgs) -> ExitCode {
         }),
         RunCommand::Gate { house } => Opened::open(&house).and_then(|opened| {
             let forge = opened.forge()?;
-            let authors = [forge_binding(&opened.registry, &opened.config.house)?
-                .requester
-                .to_string()];
+            let binding = forge_binding(&opened.registry, &opened.config.house)?;
+            let authors = [binding.requester.to_string()];
+            let provenance = instructions(&opened)?.provenance;
             render(
                 GatePass {
                     store: &opened.store,
                     house: &opened.config,
                     forge: &forge,
+                    forge_backend: &binding.backend,
+                    provenance: &provenance,
                     clock: &clock,
                     repository: &opened.repository,
                     authors: &authors,
@@ -513,15 +555,34 @@ pub fn run(args: RunArgs) -> ExitCode {
     report(result)
 }
 
-pub(super) fn settings(
+/// The pickup settings a pass uses: the house's stored ones, or the
+/// defaults, with the flags where they agree.
+pub(super) fn pickup_config(
     opened: &Opened,
     args: &PickupArgs,
-) -> Result<PickupSettings, kitchen::Error> {
+) -> Result<PickupConfig, kitchen::Error> {
     let stored =
         runtime_config(&opened.registry, &opened.config.house)?.and_then(|stored| stored.pickup);
     let pickup = args.resolve(stored)?;
     pickup.validate()?;
+    Ok(pickup)
+}
+
+/// The house's pinned instructions, from its verified snapshot.
+pub(super) fn instructions(opened: &Opened) -> Result<PinnedInstructions, kitchen::Error> {
     let resolved = resolve_instructions(opened.registry.root(), &opened.config, None)?;
+    Ok(PinnedInstructions {
+        house: resolved.house,
+        provenance: resolved.provenance,
+        entrypoint: Text::new(&resolved.entrypoint.to_string_lossy())?,
+    })
+}
+
+pub(super) fn settings(
+    opened: &Opened,
+    args: &PickupArgs,
+) -> Result<PickupSettings, kitchen::Error> {
+    let pickup = pickup_config(opened, args)?;
     Ok(PickupSettings {
         repository: opened.repository.clone(),
         labels: PickupLabels {
@@ -531,11 +592,7 @@ pub(super) fn settings(
         },
         capacity: pickup.capacity,
         branch_prefix: BranchName::new(&pickup.branch_prefix)?,
-        instructions: PinnedInstructions {
-            house: resolved.house,
-            provenance: resolved.provenance,
-            entrypoint: Text::new(&resolved.entrypoint.to_string_lossy())?,
-        },
+        instructions: instructions(opened)?,
         report_path: Text::new(&pickup.report_path)?,
     })
 }

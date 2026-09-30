@@ -10,10 +10,10 @@ use serde_json::Value;
 use crate::{
     BackendId, HouseId,
     contracts::{
-        BackendDescriptor, Capability, CapabilitySet, Delivery, EffectFailure, EffectRequest,
-        ExternalRef, Liveness, Lookup, MAX_TEXT_BYTES, MailMessage, MessageKind, NotAppliedReason,
-        Receipt, ResourceObservation, ResourceRef, Support, Text, UncertainReason, WorkerOutcome,
-        WorkerState,
+        BackendDescriptor, Capability, CapabilitySet, CheckoutReport, Delivery, EffectFailure,
+        EffectRequest, ExternalRef, Liveness, Lookup, MAX_TEXT_BYTES, MailMessage, MessageKind,
+        NotAppliedReason, Receipt, ResourceObservation, ResourceRef, Support, Text,
+        UncertainReason, WorkerOutcome, WorkerState,
     },
     scheduling::AgentFamily,
     selection::{EffortSupport, SelectionSupport},
@@ -472,6 +472,8 @@ fn mail_message(message: MessageBody, backend: &BackendId) -> Option<MailMessage
         },
         subject: bounded_text(message.subject.as_deref()),
         body: bounded_text(message.body.as_deref()),
+        // The HTTP protocol carries no checkout statement.
+        checkout: CheckoutReport::default(),
     })
 }
 

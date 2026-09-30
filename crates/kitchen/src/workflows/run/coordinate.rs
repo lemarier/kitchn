@@ -5,7 +5,8 @@
 use std::{cell::Cell, collections::BTreeMap, fmt, time::Duration};
 
 use super::{
-    Outcome, RunError, TASK_LEASE, held_by_run, issue_of, pass_current, run_claimant, transfer,
+    Outcome, RunError, TASK_LEASE, held_by_run, pass_current, run_claimant, scheduled_writer,
+    transfer,
 };
 use crate::{
     ConsumerId, TaskId,
@@ -343,7 +344,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         {
             mailbox.adopt_run().map_err(RunError::Mailbox)?;
         }
-        let grants = self.house.authority()?;
+        let grants = super::standing_grants(self.house)?;
         let ctx = Context {
             store: self.store,
             backend: self.backend,
@@ -675,7 +676,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             observed_branch: branch.as_str().to_owned(),
             requested: branch,
             report: Evidence {
-                kind: EvidenceKind::WorkerReport,
+                kind: EvidenceKind::WorkerReport(message.checkout),
                 verdict: EvidenceVerdict::Pass,
                 subject: EvidenceSubject { head, base: None },
                 source: message.id.clone(),
@@ -686,14 +687,14 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
     }
 }
 
-/// Whether `record` is a scheduled pickup task: one made from an issue of
-/// its repository.
+/// Whether `record` is a scheduled writer task: one made from an issue of
+/// its repository, or a repair round a scheduled repair pass created.
 fn scheduled(record: &TaskRecord) -> bool {
     record
         .spec()
         .repository
         .as_ref()
-        .is_some_and(|repository| issue_of(record, repository).is_some())
+        .is_some_and(|repository| scheduled_writer(record, repository))
 }
 
 /// Whether a launch of `record` has no recorded outcome yet: it may have

@@ -679,7 +679,7 @@ impl VerificationReport {
                                 (&access.target, authorized.contains(access))
                             }
                             EvidenceKind::Verification(observed) => (observed, false),
-                            EvidenceKind::Check | EvidenceKind::WorkerReport => continue,
+                            EvidenceKind::Check | EvidenceKind::WorkerReport(_) => continue,
                         };
                         if observed != target {
                             continue;

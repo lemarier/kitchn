@@ -140,7 +140,7 @@ impl HouseScope {
     ) -> Result<(), IntegrationError> {
         self.authorize_read(house, repository)?;
         if !self.permitted.contains(&permission) {
-            return Err(IntegrationError::PermissionDenied);
+            return Err(IntegrationError::MissingPermission(permission));
         }
         if submissions >= self.budget.limit() {
             return Err(IntegrationError::BudgetExhausted);

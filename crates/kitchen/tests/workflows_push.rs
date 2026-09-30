@@ -15,22 +15,25 @@ use kitchen::{
         BackendDescriptor, BackendUnavailable, BranchName, Capability, CapabilitySet, CommitId,
         ContractError, EffectExecutor, EffectFailure, EffectRequest, ExternalRef, Fence,
         GitHubEffect, GitHubMutation, Grant, HouseGrants, IssueNumber, Lookup, Permission,
-        PostingBudget, Receipt, Repository, ResourceKind, TaskAuthority, Text,
+        PostingBudget, Receipt, Repository, ResourceKind, TaskAuthority, Text, WorkerState,
     },
     state::StateError,
     workflows::{
-        coordination::{LaunchOutcome, Standing, launch_worker},
+        coordination::{
+            LaunchOutcome, Standing, Supervision, SupervisionInput, launch_worker, supervise,
+        },
         interactive::ForgeWriter,
         pickup::{Base, ClaimOutcome, TaskTemplate, WorkerBrief, claim_issue, issue_task_id},
         push::{
             GitConfigKey, LayersPermit, OpenOutcome, OpenRequest, PullRequests, PushBoundary,
             PushIntent, PushOutcome, PushPermit, PushRefusal, RefUpdater, RemoteBranches,
-            UpdateFailure, last_pushed_head, open_task_pull_request, owns_worktree,
+            UpdateFailure, delivery_worker_live, last_pushed_head, open_task_pull_request,
+            owns_worktree,
         },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
     },
 };
-use workflows_support::{World, branch, brief, issue, template, under_consumer};
+use workflows_support::{World, branch, brief, issue, supervision, template, under_consumer};
 
 fn number(value: u64) -> TestResult<IssueNumber> {
     Ok(IssueNumber::new(value)?)
@@ -135,6 +138,112 @@ fn a_worker_can_use_only_its_current_launch_worktree() -> TestResult {
         &record,
         &ExternalRef::new("another-worktree")?
     ));
+    Ok(())
+}
+
+#[test]
+fn delivery_requires_a_running_attempt_and_positive_live_worker_observation() -> TestResult {
+    let grants = push_grant_list()?;
+    let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
+    let record = setup.world.fixture.store.task(&setup.task)?;
+    let worker =
+        kitchen::workflows::coordination::current_worker(&record).ok_or("no launched worker")?;
+    assert_eq!(
+        delivery_worker_live(&record, &setup.world.backend),
+        Err(kitchen::integrations::github::IntegrationError::WorkerNotLive)
+    );
+    setup
+        .world
+        .backend
+        .set_worker_state(&worker.worker, WorkerState::Ready);
+    assert_eq!(delivery_worker_live(&record, &setup.world.backend), Ok(()));
+    for (state, expected) in [
+        (
+            WorkerState::Missing,
+            kitchen::integrations::github::IntegrationError::WorkerNotLive,
+        ),
+        (
+            WorkerState::Unknown,
+            kitchen::integrations::github::IntegrationError::WorkerUnobservable,
+        ),
+    ] {
+        setup.world.backend.set_worker_state(&worker.worker, state);
+        assert_eq!(
+            delivery_worker_live(&record, &setup.world.backend),
+            Err(expected)
+        );
+    }
+    setup
+        .world
+        .backend
+        .set_worker_state(&worker.worker, WorkerState::Ready);
+    setup
+        .world
+        .fixture
+        .store
+        .relinquish(&setup.task, setup.fence, setup.world.now())?;
+    let interrupted = setup.world.fixture.store.task(&setup.task)?;
+    assert_eq!(
+        delivery_worker_live(&interrupted, &setup.world.backend),
+        Err(kitchen::integrations::github::IntegrationError::AttemptNotRunning)
+    );
+    Ok(())
+}
+
+#[test]
+fn transferred_worker_pushes_only_after_coordination_observes_it_live() -> TestResult {
+    let mut setup = pushing()?;
+    let record = setup.world.fixture.store.task(&setup.task)?;
+    let worker =
+        kitchen::workflows::coordination::current_worker(&record).ok_or("no launched worker")?;
+    setup
+        .world
+        .fixture
+        .store
+        .relinquish(&setup.task, setup.fence, setup.world.now())?;
+    let claimant = common::scheduled("replacement")?;
+    setup.fence = setup
+        .world
+        .fixture
+        .store
+        .claim(&setup.task, &claimant, ttl(300)?, setup.world.now())?
+        .fence();
+    let head = commit('d')?;
+    let intent = update_intent(Some(head.clone()))?;
+    let next = commit('e')?;
+    let reads = Reads::new(open(5)?, Observed::Known(Some(head.clone())));
+    let updater = Recorder::answering(Ok(()));
+    let push = || boundary(&setup, &reads, &updater).push(&setup.task, setup.fence, &intent, &next);
+    assert!(matches!(
+        push(),
+        Err(kitchen::Error::Integration(
+            kitchen::integrations::github::IntegrationError::AttemptNotRunning
+        ))
+    ));
+    assert!(updater.calls.borrow().is_empty());
+    setup
+        .world
+        .backend
+        .set_worker_state(&worker.worker, WorkerState::Ready);
+    assert_eq!(
+        supervise(
+            &setup.world.ctx(),
+            &setup.task,
+            setup.fence,
+            &supervision()?,
+            &SupervisionInput::default(),
+        )?,
+        Supervision::Running(WorkerState::Ready)
+    );
+    assert_eq!(
+        delivery_worker_live(
+            &setup.world.fixture.store.task(&setup.task)?,
+            &setup.world.backend
+        ),
+        Ok(())
+    );
+    assert!(matches!(push()?, PushOutcome::Pushed { .. }));
+    assert_eq!(updater.calls.borrow().len(), 1);
     Ok(())
 }
 
@@ -743,6 +852,29 @@ fn a_lost_race_and_a_lost_answer_are_reported_not_hidden() -> TestResult {
         assert_eq!(outcome, expected);
         assert_eq!(updater.calls.borrow().len(), 1);
     }
+    Ok(())
+}
+
+#[test]
+fn a_refused_app_token_mint_reports_its_http_status_before_git_push() -> TestResult {
+    let setup = pushing()?;
+    let head = commit('d')?;
+    let reads = Reads::new(open(5)?, Observed::Known(Some(head.clone())));
+    let updater = Recorder::answering(Err(UpdateFailure::Credential(
+        kitchen::integrations::github::IntegrationError::HttpStatus(403),
+    )));
+    assert!(matches!(
+        boundary(&setup, &reads, &updater).push(
+            &setup.task,
+            setup.fence,
+            &update_intent(Some(head))?,
+            &commit('e')?,
+        ),
+        Err(kitchen::Error::Integration(
+            kitchen::integrations::github::IntegrationError::HttpStatus(403)
+        ))
+    ));
+    assert_eq!(updater.calls.borrow().len(), 1);
     Ok(())
 }
 

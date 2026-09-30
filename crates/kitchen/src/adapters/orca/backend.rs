@@ -192,6 +192,10 @@ struct OrcaTask {
     #[serde(default)]
     spec: Option<String>,
     status: String,
+    #[serde(default)]
+    assignee_handle: Option<String>,
+    #[serde(default)]
+    dispatch_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -526,7 +530,9 @@ pub(crate) fn worker_state(
         ("succeeded", _) => WorkerState::Settled(WorkerOutcome::Succeeded),
         ("failed", _) | ("in_progress", "failed") => WorkerState::Settled(WorkerOutcome::Failed),
         ("in_progress", "starting") => WorkerState::Starting,
-        ("in_progress", "ready") if waiting => WorkerState::AwaitingReply,
+        // A waiting worker counts as awaiting a reply only while its process
+        // is shown live; otherwise it has no positive liveness evidence.
+        ("in_progress", "ready") if waiting && liveness == "live" => WorkerState::AwaitingReply,
         ("in_progress", "ready") if liveness == "live" => WorkerState::Ready,
         // Accepted, but the agent is not yet shown to be running.
         ("in_progress", "ready") => WorkerState::Starting,
@@ -883,6 +889,31 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// The Run's Tasks, with specs cut down by Orca's `--brief` listing.
     fn run_tasks(&self) -> Result<Vec<OrcaTask>, OrcaError> {
         self.list_tasks(true)
+    }
+
+    /// Active Task assignments identify the Dispatch behind a mailbox
+    /// sender terminal. Orca questions do not carry a Dispatch in payload.
+    pub(crate) fn sender_dispatches(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, String>, OrcaError> {
+        let mut senders = std::collections::BTreeMap::new();
+        let mut ambiguous = std::collections::BTreeSet::new();
+        for task in self.run_tasks()? {
+            if task.status != "dispatched" {
+                continue;
+            }
+            if let (Some(handle), Some(dispatch)) = (task.assignee_handle, task.dispatch_id) {
+                // A terminal assigned to several active Tasks is ambiguous.
+                if ambiguous.contains(&handle) {
+                    continue;
+                }
+                if senders.insert(handle.clone(), dispatch).is_some() {
+                    senders.remove(&handle);
+                    ambiguous.insert(handle);
+                }
+            }
+        }
+        Ok(senders)
     }
 
     /// The Run's Tasks with their full specs. `--brief` collapses whitespace
@@ -2048,8 +2079,16 @@ mod tests {
             WorkerState::Starting
         );
         assert_eq!(
-            worker_state("ready", "in_progress", "unverifiable", true),
+            worker_state("ready", "in_progress", "live", true),
             WorkerState::AwaitingReply
+        );
+        assert_eq!(
+            worker_state("ready", "in_progress", "unverifiable", true),
+            WorkerState::Starting
+        );
+        assert_eq!(
+            worker_state("ready", "in_progress", "exited", true),
+            WorkerState::Starting
         );
         assert_eq!(
             worker_state("starting", "in_progress", "live", false),

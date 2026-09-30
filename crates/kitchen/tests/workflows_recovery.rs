@@ -602,6 +602,7 @@ fn a_resume_the_worker_cannot_receive_is_escalated() -> TestResult {
     let world = World::new()?;
     let (task, fence) = claim(&world, 3)?;
     let worker = launched(&world, &task, fence)?;
+    world.backend.set_worker_state(&worker, WorkerState::Ready);
     let refused = RecoverySignals {
         provider: Some(ProviderInterruption::RateLimit),
         ..idle(&worker, None)

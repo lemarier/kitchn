@@ -1115,12 +1115,17 @@ fn a_replacement_launches_only_after_the_adopted_worker_is_shown_stopped() -> Te
         );
         assert!(matches!(
             launch(&world, &task, fence, 1)?,
-            LaunchOutcome::SuperviseFirst { .. }
+            LaunchOutcome::Accepted { attempt, worker: current }
+                if attempt.get() == 1 && current == worker
         ));
 
         world
             .backend
             .set_worker_state(&worker, WorkerState::Settled(stopped));
+        assert!(matches!(
+            step(&world, &task, fence)?,
+            Supervision::Retry { .. }
+        ));
         assert!(matches!(
             launch(&world, &task, fence, 1)?,
             LaunchOutcome::Accepted { .. }
@@ -1287,19 +1292,20 @@ fn a_launch_is_accepted_when_the_backend_reports_the_exact_branch() -> TestResul
 fn supervising_an_adopted_worker_to_its_end_allows_the_replacement() -> TestResult {
     let world = World::new()?;
     let (task, fence, worker) = adopted_with_live_worker(&world)?;
-    // The adopting coordinator supervises first: the worker still runs, so
-    // nothing new launches.
+    // Before supervision, the adopted attempt still needs to be resumed.
     assert!(matches!(
         launch(&world, &task, fence, 1)?,
         LaunchOutcome::SuperviseFirst { .. }
     ));
+    world.backend.set_worker_state(&worker, WorkerState::Ready);
     assert_eq!(
         step(&world, &task, fence)?,
-        Supervision::Running(WorkerState::Starting)
+        Supervision::Running(WorkerState::Ready)
     );
     assert!(matches!(
         launch(&world, &task, fence, 1)?,
-        LaunchOutcome::SuperviseFirst { .. }
+        LaunchOutcome::Accepted { attempt, worker: current }
+            if attempt.get() == 1 && current == worker
     ));
 
     // It then fails; supervision accounts for the failure, and only after
@@ -1508,6 +1514,46 @@ fn a_parked_adopted_worker_resumes_when_the_provider_works() -> TestResult {
     let resumed: TestResult<Supervision> = tick(ProviderCheck::Working);
     assert_eq!(resumed?, Supervision::Resumed);
     assert_eq!(attempt_count(&world, &task)?, 1);
+    Ok(())
+}
+
+#[test]
+fn provider_recovery_does_not_resume_an_adopted_worker_still_starting() -> TestResult {
+    use kitchen::state::AttemptState;
+    use kitchen::workflows::recovery::{ProviderCheck, ProviderInterruption, RecoverySignals};
+    let world = World::new()?;
+    let (task, fence, worker) = adopted_with_budget(&world, 1)?;
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Starting);
+    let refused = RecoverySignals {
+        provider: Some(ProviderInterruption::Quota),
+        ..workflows_support::signals(&worker, Some(common::at(1)))
+    };
+    let effects = world.backend.effects_performed();
+    let outcome = supervise(
+        &world.ctx(),
+        &task,
+        fence,
+        &supervision()?,
+        &SupervisionInput {
+            signals: Some(&refused),
+            provider: ProviderCheck::Working,
+            ..SupervisionInput::default()
+        },
+    )?;
+    assert_eq!(outcome, Supervision::Running(WorkerState::Starting));
+    assert_eq!(world.backend.effects_performed(), effects);
+    assert!(matches!(
+        world
+            .fixture
+            .store
+            .task(&task)?
+            .attempts()
+            .last()
+            .map(|attempt| attempt.state()),
+        Some(AttemptState::Interrupted { .. })
+    ));
     Ok(())
 }
 

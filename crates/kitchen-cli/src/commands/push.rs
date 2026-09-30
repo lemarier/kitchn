@@ -9,18 +9,31 @@ use std::{
 use clap::Args;
 use kitchen::{
     HouseId, TaskId,
-    adapters::orca::{Invocation, OrcaRunner, SystemRunner},
+    adapters::{
+        OrcaSession,
+        orca::{
+            DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, Invocation,
+            OrcaRunner, SystemRunner,
+        },
+        resolve_backend,
+    },
     adoption::HouseRegistry,
-    contracts::{Clock, ExternalRef, GrantScope, Permission, SystemClock, Text},
+    contracts::{
+        Capability, Clock, ExternalRef, GrantScope, HouseGrants, Permission, Repository,
+        SystemClock, TaskAuthority, Text,
+    },
     house::{CredentialKind, checked_forge_credential, forge_binding, runtime_config},
-    integrations::github::{GitHubClient, GitHubExecutor, IntegrationError, ReadLimits},
+    integrations::github::{
+        GitHubClient, GitHubExecutor, HouseScope, IntegrationError, PushPreflight, ReadLimits,
+    },
+    scheduling::AgentFamily,
     state::{AttemptState, HouseStore, StoreOptions, TaskState},
     workflows::{
         coordination::{Standing, current_worker, task_branch},
         pickup::{IssueRef, issue_task_id},
         push::{
             GitHubPullRequests, GitHubRemoteBranches, GitRemote, IsolatedGitConfig, OpenOutcome,
-            OpenRequest, PullRequests, PushBoundary, PushIntent, PushOutcome,
+            OpenRequest, PullRequests, PushBoundary, PushIntent, PushOutcome, delivery_worker_live,
             open_task_pull_request, owns_worktree,
         },
         repair::Observed,
@@ -84,24 +97,19 @@ impl PushArgs {
         let store = HouseStore::open(&store_path, self.house.clone(), StoreOptions::default())?;
         let record = store.task(&self.task)?;
         let TaskState::Claimed { lease } = record.state() else {
-            return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+            return Err(IntegrationError::PushPreflight(PushPreflight::Claim).into());
         };
         if !lease.is_live(SystemClock.now()) || record.cancel_request().is_some() {
-            return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+            return Err(IntegrationError::PushPreflight(PushPreflight::Claim).into());
         }
         let worker = current_worker(&record)
-            .ok_or(kitchen::integrations::github::IntegrationError::PermissionDenied)?;
+            .ok_or(IntegrationError::PushPreflight(PushPreflight::Worker))?;
         let attempt = record
             .attempts()
             .last()
-            .ok_or(kitchen::integrations::github::IntegrationError::PermissionDenied)?;
-        if attempt.number() != worker.attempt
-            || !matches!(
-                attempt.state(),
-                AttemptState::Running | AttemptState::Interrupted { .. }
-            )
-        {
-            return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+            .ok_or(IntegrationError::AttemptNotRunning)?;
+        if attempt.number() != worker.attempt || attempt.state() != AttemptState::Running {
+            return Err(IntegrationError::AttemptNotRunning.into());
         }
         let repository = record
             .spec()
@@ -111,14 +119,15 @@ impl PushArgs {
         let grants = house.authority()?;
         let binding = forge_binding(&registry, &self.house)?;
         require_app_binding(binding.credential_kind)?;
-        for permission in [Permission::PushBranch, Permission::OpenPullRequest] {
-            record.spec().authority.authorize(
-                &grants,
-                permission,
-                &GrantScope::Repository(repository.clone()),
-                &binding.backend,
-            )?;
-        }
+        let scope = binding.scope(&house)?;
+        authorize_delivery(
+            &record.spec().authority,
+            &grants,
+            &scope,
+            &repository,
+            &binding.backend,
+            &binding.credential,
+        )?;
         let fence = lease.fence();
         Ok(Selected {
             registry,
@@ -129,6 +138,31 @@ impl PushArgs {
             repository,
         })
     }
+}
+
+fn authorize_delivery(
+    authority: &TaskAuthority,
+    grants: &HouseGrants,
+    scope: &HouseScope,
+    repository: &Repository,
+    backend: &kitchen::BackendId,
+    credential: &kitchen::CredentialId,
+) -> Result<(), kitchen::Error> {
+    for permission in [Permission::PushBranch, Permission::OpenPullRequest] {
+        let selected = authority.authorize(
+            grants,
+            permission,
+            &GrantScope::Repository(repository.clone()),
+            backend,
+        )?;
+        if &selected != credential {
+            return Err(IntegrationError::CredentialMismatch(permission).into());
+        }
+        // Check the executor's policy before the branch update: it may be
+        // narrower than the task's grant after a forge binding change.
+        scope.authorize_effect(grants.house(), repository, permission, 0)?;
+    }
+    Ok(())
 }
 
 fn require_app_binding(kind: CredentialKind) -> Result<(), IntegrationError> {
@@ -144,6 +178,24 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
     let runtime = runtime_config(&selected.registry, &args.house)?
         .and_then(|runtime| runtime.orca)
         .ok_or(kitchen::house::HouseError::HouseSelection)?;
+    let backend = resolve_backend(
+        &selected.house,
+        OrcaSession {
+            run: runtime.run.clone(),
+            coordinator: runtime.coordinator.clone(),
+            repo: runtime.repo.clone(),
+            base_branch: None,
+            branch_prefix: None,
+            agent: AgentFamily::Claude,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+            launch_timeout: DEFAULT_LAUNCH_TIMEOUT,
+            runtime_dir: runtime.runtime_dir.clone(),
+            reservation_timeout: DEFAULT_RESERVATION_TIMEOUT,
+        },
+        SystemRunner::new(runtime.executable.clone()),
+        &[Capability::WorkerStatusAndOutcome],
+    )?;
+    delivery_worker_live(&selected.record, &backend)?;
     let current = SystemRunner::new(runtime.executable).run(&Invocation::new(
         vec!["worktree".into(), "current".into(), "--json".into()],
         DEADLINE,
@@ -154,7 +206,7 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
     let current: serde_json::Value = serde_json::from_slice(&current.stdout)
         .map_err(|_| kitchen::integrations::github::IntegrationError::Unknown)?;
     if current["ok"] != true {
-        return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+        return Err(IntegrationError::PushPreflight(PushPreflight::WorktreeContext).into());
     }
     let worktree = &current["result"]["worktree"];
     let worktree_id = worktree["id"]
@@ -172,19 +224,20 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
                 .map_err(|_| kitchen::house::HouseError::HouseSelection)?,
         )
     {
-        return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+        return Err(IntegrationError::PushPreflight(PushPreflight::WorktreePath).into());
     }
     let worktree_id = ExternalRef::new(worktree_id)?;
-    if !owns_worktree(&selected.record, &worktree_id)
-        || worktree["projectId"].as_str() != Some(&format!("github:{}", selected.repository))
-    {
-        return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+    if !owns_worktree(&selected.record, &worktree_id) {
+        return Err(IntegrationError::PushPreflight(PushPreflight::WorktreeOwnership).into());
+    }
+    if worktree["projectId"].as_str() != Some(&format!("github:{}", selected.repository)) {
+        return Err(IntegrationError::PushPreflight(PushPreflight::WorktreeRepository).into());
     }
     if args.acceptance_done {
         acceptance_reported(&selected, Path::new(worktree_path))?;
     }
     let branch = task_branch(&selected.record)
-        .ok_or(kitchen::integrations::github::IntegrationError::PermissionDenied)?;
+        .ok_or(IntegrationError::PushPreflight(PushPreflight::Branch))?;
     let git = executable("git").ok_or(kitchen::house::HouseError::InvalidInput)?;
     let config = IsolatedGitConfig::create(
         &git,
@@ -210,7 +263,7 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
         || worktree["branch"].as_str() != Some(&format!("refs/heads/{branch}"))
         || worktree["head"].as_str() != Some(head.as_str())
     {
-        return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+        return Err(IntegrationError::PushPreflight(PushPreflight::Checkout).into());
     }
     let binding = forge_binding(&selected.registry, &args.house)?;
     let gh = connect_gh(checked_forge_credential(&selected.registry, &binding)?)?;
@@ -396,7 +449,7 @@ fn acceptance_reported(selected: &Selected, worktree: &Path) -> Result<(), kitch
         .canonicalize()
         .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
     if !canonical_file.starts_with(canonical_worktree) {
-        return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
+        return Err(IntegrationError::PushPreflight(PushPreflight::AcceptanceReport).into());
     }
     let file = std::fs::File::open(canonical_file)
         .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
@@ -420,7 +473,77 @@ fn executable(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kitchen::integrations::github::{AppId, GitHubApp, InstallationId};
+    use kitchen::{
+        BackendId, CredentialId,
+        contracts::{Grant, PostingBudget},
+        integrations::github::{AppId, CredentialRef, GitHubApp, InstallationId},
+    };
+
+    #[test]
+    fn delivery_checks_both_forge_permissions_before_push() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let house = HouseId::new("house")?;
+        let repository = Repository::new("owner/repo")?;
+        let backend = BackendId::new("github")?;
+        let credential = CredentialId::new("app")?;
+        let grants = [Permission::PushBranch, Permission::OpenPullRequest].map(|permission| {
+            Grant::repository(
+                permission,
+                repository.clone(),
+                backend.clone(),
+                credential.clone(),
+            )
+        });
+        let current = HouseGrants::new(house.clone(), grants.clone());
+        let authority = TaskAuthority::delegate(&current, grants)?;
+        let requester = ExternalRef::new("bot[bot]")?;
+        let budget = PostingBudget::new(2)?;
+        let scope = |permitted: Vec<Permission>| {
+            HouseScope::new(
+                house.clone(),
+                [repository.clone()],
+                requester.clone(),
+                CredentialRef::new(house.clone(), credential.clone(), requester.clone()),
+                budget,
+                permitted,
+            )
+        };
+        authorize_delivery(
+            &authority,
+            &current,
+            &scope(vec![Permission::PushBranch, Permission::OpenPullRequest])?,
+            &repository,
+            &backend,
+            &credential,
+        )?;
+        assert!(matches!(
+            authorize_delivery(
+                &authority,
+                &current,
+                &scope(vec![Permission::PushBranch])?,
+                &repository,
+                &backend,
+                &credential
+            ),
+            Err(kitchen::Error::Integration(
+                IntegrationError::MissingPermission(Permission::OpenPullRequest)
+            ))
+        ));
+        assert!(matches!(
+            authorize_delivery(
+                &authority,
+                &current,
+                &scope(vec![Permission::PushBranch, Permission::OpenPullRequest])?,
+                &repository,
+                &backend,
+                &CredentialId::new("other")?
+            ),
+            Err(kitchen::Error::Integration(
+                IntegrationError::CredentialMismatch(Permission::PushBranch)
+            ))
+        ));
+        Ok(())
+    }
 
     #[test]
     fn worker_push_requires_an_app_binding() -> Result<(), Box<dyn std::error::Error>> {

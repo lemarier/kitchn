@@ -41,15 +41,15 @@ use crate::{
     contracts::{
         BranchName, Clock, CommitId, Effect, ExternalRef, Fence, GitHubAction, GitHubMutation,
         GrantScope, HouseGrants, IssueNumber, Operation, Permission, Repository, ResourceKind,
-        Text,
+        Text, WorkerBackend, WorkerState,
     },
     house::StackTool,
     integrations::github::{
         CredentialRef, GhCli, GitHubClient, GitHubReadTransport, IntegrationError, Observation,
     },
     state::{
-        EffectPlan, EffectState, HouseStore, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject,
-        StateError, TaskRecord, TaskState, WorkItem, run_effect,
+        AttemptState, EffectPlan, EffectState, HouseStore, MarkerFact, MarkerKey, MarkerSchema,
+        MarkerSubject, StateError, TaskRecord, TaskState, WorkItem, run_effect,
     },
     workflows::{
         coordination::{
@@ -146,6 +146,28 @@ pub fn owns_worktree(record: &TaskRecord, worktree: &ExternalRef) -> bool {
                     && receipt.created().iter().any(|resource|
                         resource.kind == ResourceKind::Worktree && &resource.handle == worktree))
     })
+}
+
+/// Confirm the current attempt can deliver and its launched worker is live.
+/// An interrupted attempt or an uncertain backend observation grants nothing.
+pub fn delivery_worker_live(
+    record: &TaskRecord,
+    backend: &dyn WorkerBackend,
+) -> std::result::Result<(), IntegrationError> {
+    let worker = current_worker(record).ok_or(IntegrationError::WorkerNotLive)?;
+    let attempt = record
+        .attempts()
+        .last()
+        .ok_or(IntegrationError::AttemptNotRunning)?;
+    if attempt.number() != worker.attempt || attempt.state() != AttemptState::Running {
+        return Err(IntegrationError::AttemptNotRunning);
+    }
+    match backend.observe_worker(&worker.worker) {
+        Ok(WorkerState::Ready | WorkerState::AwaitingReply) => Ok(()),
+        Ok(WorkerState::Unknown) => Err(IntegrationError::WorkerUnobservable),
+        Ok(_) => Err(IntegrationError::WorkerNotLive),
+        Err(_) => Err(IntegrationError::WorkerUnobservable),
+    }
 }
 
 /// Open the task branch's pull request through the persisted effect path.
@@ -568,6 +590,8 @@ pub enum UpdateFailure {
     /// The checkout's Git configuration gained this redirecting entry after
     /// the check. Nothing was sent.
     Redirected(GitConfigKey),
+    /// Credential setup failed before any Git update was sent.
+    Credential(IntegrationError),
     /// The remote may or may not have applied the update.
     Uncertain,
 }
@@ -687,6 +711,14 @@ pub(crate) fn bind(
     };
     if held_branches(&record).contains(&branch) {
         return Ok((record, Err(PushRefusal::BranchHeld)));
+    }
+    let worker = current_worker(&record).ok_or(IntegrationError::AttemptNotRunning)?;
+    let attempt = record
+        .attempts()
+        .last()
+        .ok_or(IntegrationError::AttemptNotRunning)?;
+    if attempt.number() != worker.attempt || attempt.state() != AttemptState::Running {
+        return Err(IntegrationError::AttemptNotRunning.into());
     }
     let binding = Binding {
         stacked: BranchFact::Stacked.holds(&record, &branch),
@@ -885,6 +917,7 @@ impl PushBoundary<'_> {
                 Err(UpdateFailure::Redirected(key)) => {
                     PushOutcome::Refused(PushRefusal::CheckoutRedirect(key))
                 }
+                Err(UpdateFailure::Credential(error)) => return Err(error.into()),
                 Err(UpdateFailure::Uncertain) => PushOutcome::Uncertain,
             },
         )
@@ -1688,7 +1721,7 @@ impl GitRemote {
             };
             let token = gh
                 .push_token(reference, repository)
-                .map_err(|_| UpdateFailure::Uncertain)?;
+                .map_err(UpdateFailure::Credential)?;
             let mut env = git_environment(&self.config, &self.remote);
             let count = env
                 .iter()

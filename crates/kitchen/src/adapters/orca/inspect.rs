@@ -154,6 +154,8 @@ struct CheckMessage {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
+    from_handle: Option<String>,
+    #[serde(default)]
     subject: Option<String>,
     #[serde(default)]
     body: Option<String>,
@@ -298,12 +300,15 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             return Ok(None);
         };
         let id = ExternalRef::new(&id).map_err(|_| OrcaError::Malformed { what: "mailbox" })?;
+        // Assignment lookup enriches sender-only messages. Payload dispatches
+        // remain usable when the Task listing is unavailable or over its bound.
+        let senders = self.sender_dispatches().unwrap_or_default();
         let mut unreadable = 0_usize;
         let messages = check
             .messages
             .into_iter()
             .filter_map(|message| {
-                let parsed = self.mail_message(message);
+                let parsed = self.mail_message(message, &senders);
                 if parsed.is_none() {
                     unreadable = unreadable.saturating_add(1);
                 }
@@ -317,16 +322,32 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }))
     }
 
-    fn mail_message(&self, message: CheckMessage) -> Option<MailMessage> {
+    fn mail_message(
+        &self,
+        message: CheckMessage,
+        senders: &std::collections::BTreeMap<String, String>,
+    ) -> Option<MailMessage> {
         let id = ExternalRef::new(&message.id).ok()?;
         let kind = message_kind(&message.kind);
-        let report = message
-            .payload
-            .and_then(|payload| serde_json::from_value::<ReportPayload>(payload).ok());
-        let worker = report
+        // Orca's payload is a JSON string. Older fake responses used an
+        // object; accept both without treating arbitrary body text as IDs.
+        let report = message.payload.and_then(|payload| match payload {
+            Value::String(text) => serde_json::from_str::<ReportPayload>(&text).ok(),
+            value => serde_json::from_value::<ReportPayload>(value).ok(),
+        });
+        let reported_dispatch = report
             .as_ref()
-            .and_then(|report| report.dispatch_id.as_deref())
-            .and_then(|dispatch| self.worker_ref(dispatch));
+            .and_then(|report| report.dispatch_id.as_deref());
+        let assigned_dispatch = message
+            .from_handle
+            .as_deref()
+            .and_then(|from| senders.get(from).map(String::as_str));
+        let dispatch = match (reported_dispatch, assigned_dispatch) {
+            (Some(reported), Some(assigned)) if reported != assigned => None,
+            (Some(reported), _) => Some(reported),
+            (None, assigned) => assigned,
+        };
+        let worker = dispatch.and_then(|dispatch| self.worker_ref(dispatch));
         let outcome = match (kind, report.as_ref().and_then(|r| r.outcome.as_deref())) {
             (MessageKind::WorkerDone, Some("succeeded")) => Some(WorkerOutcome::Succeeded),
             (MessageKind::WorkerDone, Some("failed")) => Some(WorkerOutcome::Failed),

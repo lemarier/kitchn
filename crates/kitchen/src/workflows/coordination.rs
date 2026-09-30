@@ -1262,6 +1262,11 @@ fn supervise_step(
         state,
         WorkerState::Starting | WorkerState::Ready | WorkerState::AwaitingReply
     );
+    // Orca reports Starting before it has a live fleet verdict. Only Ready
+    // or AwaitingReply proves the worker survived the claim transfer.
+    if matches!(state, WorkerState::Ready | WorkerState::AwaitingReply) {
+        ctx.store.continue_attempt(task, fence, now)?;
+    }
     // A person's terminal is theirs, whichever source reports it.
     let taken_over = state == WorkerState::UserTakeover
         || (live && signals.is_some_and(|signals| signals.terminal == TerminalHolder::Person));
@@ -1281,7 +1286,7 @@ fn supervise_step(
     let stalled = signals
         .and_then(RecoverySignals::idle_since)
         .is_some_and(|since| now.saturating_since(since) > policy.idle_deadline);
-    if live
+    if matches!(state, WorkerState::Ready | WorkerState::AwaitingReply)
         && !person
         && let Some(signals) = signals
         && let Some(interruption) = signals.provider

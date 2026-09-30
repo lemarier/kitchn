@@ -626,6 +626,8 @@ fn transfer(
         Err(error) => return Err(error),
     }
     match store.claim(task, claimant, LeaseTtl::new(TASK_LEASE)?, now) {
+        // The new claim does not prove the worker survived. Supervision
+        // resumes its interrupted attempt only after observing a live worker.
         Ok(lease) => Ok(Some(lease.fence())),
         Err(crate::Error::State(
             StateError::ClaimHeld { .. }

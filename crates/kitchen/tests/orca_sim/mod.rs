@@ -601,6 +601,8 @@ impl SimState {
                         task.spec.clone()
                     },
                     "status": task.status,
+                    "assignee_handle": task.dispatch.as_ref().map(|dispatch| format!("term_{dispatch}")),
+                    "dispatch_id": task.dispatch,
                 })).collect::<Vec<_>>(),
             })),
             ["orchestration", "dispatch-show"] => {

@@ -269,6 +269,7 @@ const MARKER_RULES: &[(&str, MarkerRule)] = &[
     // The gate's fix and hand-over budgets count every head of an open pull
     // request, so its verdicts stay until the pull request closes.
     ("gate.verdict", MarkerRule::UntilItemGone),
+    ("gate.subject-budget", MarkerRule::UntilItemGone),
     ("gate.base-read-failures", MarkerRule::LatestSubject),
     ("ready-report", MarkerRule::LatestSubject),
     // Superseded in place per issue, so one per open issue.

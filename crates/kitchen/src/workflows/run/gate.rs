@@ -44,7 +44,10 @@
 //! performed here: they stay with a person. This pass never merges through
 //! the stack tool.
 
-use std::fmt;
+use std::{
+    fmt,
+    num::{NonZeroU32, NonZeroU64},
+};
 
 use super::{
     KitchenPullRequest, Outcome, Pass, Refusal, RunError, attestation, gate_attestation,
@@ -54,12 +57,13 @@ use crate::workflows::known;
 use crate::workflows::pickup::stable_hash;
 use crate::workflows::tick::PassRun;
 use crate::{
-    BackendId, TaskId,
+    BackendId, TaskId, WorkflowId,
     contracts::{
         AttemptOutcome, AttemptStart, CapabilityRequirements, Claimant, Clock, CommitId,
-        EffectExecutor, EffectFailure, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict,
-        ExternalRef, FailureClass, Fence, IdempotencyKey, IssueNumber, Lookup, NotAppliedReason,
+        ContractError, EffectExecutor, EffectFailure, Evidence, EvidenceKind, EvidenceSubject,
+        EvidenceVerdict, ExternalRef, Fence, IdempotencyKey, IssueNumber, Lookup, NotAppliedReason,
         Provenance, Repository, RetryPolicy, Role, Settlement, TaskAuthority, TaskSpec, Timestamp,
+        ValueKind,
     },
     house::{HouseConfig, HouseError, MergeSubject},
     integrations::github::{
@@ -67,8 +71,9 @@ use crate::{
         ReadLimits,
     },
     state::{
-        EffectOutcome, EffectState, HouseStore, MAX_OWNERSHIP_HISTORY, StateError, TaskRecord,
-        TaskState, reconcile, reread_settled,
+        EffectOutcome, EffectState, HouseStore, MAX_OWNERSHIP_HISTORY, MarkerFact, MarkerKey,
+        MarkerSchema, MarkerSubject, StateError, TaskRecord, TaskState, WorkItem, reconcile,
+        reread_settled,
     },
     workflows::{
         gate::{
@@ -444,7 +449,8 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
                 ));
             }
         }
-        let Some(spec) = self.gate_task(tasks, number)? else {
+        let budget_start = self.subject_budget_start(claimant, tasks, &evidence)?;
+        let Some(spec) = self.gate_task(tasks, &evidence)? else {
             return Ok(action(
                 predicted,
                 GateResult::ReportOnly(ReportReason::TaskHeld),
@@ -468,7 +474,7 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
                     }))
                 .then_some(GateResult::ReportOnly(ReportReason::ExhaustedForSubject)),
                 TaskState::Open | TaskState::Claimed { .. } => {
-                    self.retire(earlier, claimant, &merge)?
+                    self.retire(earlier, claimant, &merge, budget_start, &evidence)?
                 }
             };
             if let Some(standing) = standing {
@@ -506,6 +512,7 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
                 task: &task,
                 fence,
                 claimant,
+                budget_start,
             },
             &evidence,
             grants,
@@ -585,14 +592,9 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
         // A continued attempt past it ends here, before any new verdict or
         // intent, which settles the task as exhausted. Its evidence names
         // the subject it was exhausted on.
-        if past_deadline(&self.store.task(task)?, now) {
-            self.store.finish_attempt(
-                task,
-                fence,
-                attempt,
-                AttemptOutcome::Failed(FailureClass::Retryable),
-                now,
-            )?;
+        if past_deadline(owned.budget_start, now) {
+            self.store
+                .finish_attempt_exhausted(task, fence, attempt, now)?;
             return Ok((Verdict::Merge, Merge::Not(NotMerged::Exhausted)));
         }
         let house_grants = super::standing_grants(self.house)?;
@@ -827,12 +829,18 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
         stale: &TaskRecord,
         claimant: &Claimant,
         merge: &MergeGrant,
+        budget_start: Timestamp,
+        evidence: &GateEvidence,
     ) -> Result<Option<GateResult>> {
         // Taking it would fail on its full ownership history and stop the
         // pass; a person settles it.
         if !room(stale, PASS_EVENTS) {
             return Ok(Some(GateResult::ReportOnly(ReportReason::TaskHeld)));
         }
+        let expired_here = past_deadline(budget_start, self.clock.now())
+            && stale.evidence().subject().is_some_and(|subject| {
+                subject.head == evidence.head && subject.base.as_ref() == Some(&evidence.base)
+            });
         let stale = &stale.spec().id;
         super::record(self.store, self.tick, stale, self.clock)?;
         let fence = match take_for_pass(
@@ -845,27 +853,52 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             Ok(fence) => fence,
             Err(refusal) => return Ok(Some(GateResult::ReportOnly(refused(refusal)))),
         };
-        let settled = self
+        let outcome = self
             .unproven(&self.executor(merge), stale, fence)
             .and_then(|unproven| {
                 if unproven {
-                    return Ok(false);
+                    return Ok(Some(GateResult::NotMerged(NotMerged::Reconciling)));
+                }
+                if expired_here {
+                    let attempt =
+                        match self
+                            .store
+                            .continue_attempt(stale, fence, self.clock.now())?
+                        {
+                            Some(attempt) => Some(attempt),
+                            None => {
+                                match self.store.start_attempt(stale, fence, self.clock.now())? {
+                                    AttemptStart::Started(attempt)
+                                    | AttemptStart::AlreadyRunning(attempt) => Some(attempt),
+                                    AttemptStart::Exhausted => None,
+                                }
+                            }
+                        };
+                    if let Some(attempt) = attempt {
+                        self.store.finish_attempt_exhausted(
+                            stale,
+                            fence,
+                            attempt,
+                            self.clock.now(),
+                        )?;
+                    }
+                    return Ok(Some(GateResult::ReportOnly(
+                        ReportReason::ExhaustedForSubject,
+                    )));
                 }
                 match self.store.settle_cancelled(stale, fence, self.clock.now()) {
-                    Ok(()) => Ok(true),
-                    Err(crate::Error::State(StateError::UnresolvedEffects { .. })) => Ok(false),
+                    Ok(()) => Ok(None),
+                    Err(crate::Error::State(StateError::UnresolvedEffects { .. })) => {
+                        Ok(Some(GateResult::NotMerged(NotMerged::Reconciling)))
+                    }
                     Err(error) => Err(error),
                 }
             });
         // A task that still stands goes back for the next pass.
-        if !matches!(settled, Ok(true)) {
+        if matches!(self.store.task(stale)?.state(), TaskState::Claimed { .. }) {
             self.store.relinquish(stale, fence, self.clock.now())?;
         }
-        Ok(if settled? {
-            None
-        } else {
-            Some(GateResult::NotMerged(NotMerged::Reconciling))
-        })
+        outcome
     }
 
     /// The specification of the gate task this pass uses for pull request
@@ -874,15 +907,19 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
     /// settling it later. A task that settled, such as the one of an
     /// earlier specification the house returned to, is never reused.
     /// `None` when every generation is spent.
-    fn gate_task(&self, tasks: &[TaskRecord], number: IssueNumber) -> Result<Option<TaskSpec>> {
+    fn gate_task(&self, tasks: &[TaskRecord], evidence: &GateEvidence) -> Result<Option<TaskSpec>> {
         for generation in 0..=u8::MAX {
-            let spec = self.gate_spec(number, generation)?;
+            let spec = self.gate_spec(evidence.number, generation)?;
             let usable = tasks
                 .iter()
                 .find(|record| record.spec().id == spec.id)
                 .is_none_or(|existing| {
                     !matches!(existing.state(), TaskState::Settled { .. })
                         && room(existing, 2 * PASS_EVENTS)
+                        && existing.evidence().subject().is_none_or(|subject| {
+                            subject.head == evidence.head
+                                && subject.base.as_ref() == Some(&evidence.base)
+                        })
                 });
             if usable {
                 return Ok(Some(spec));
@@ -921,10 +958,72 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
         )?;
         Ok(spec)
     }
+
+    /// Persist the first time this exact PR, head, and base entered the gate.
+    /// A pre-marker task supplies its first attempt only while its durable
+    /// evidence still names this subject. A changed head or base starts now.
+    fn subject_budget_start(
+        &self,
+        claimant: &Claimant,
+        tasks: &[TaskRecord],
+        evidence: &GateEvidence,
+    ) -> Result<Timestamp> {
+        let key = MarkerKey {
+            workflow: WorkflowId::new(GATE_BUDGET_WORKFLOW)?,
+            item: WorkItem::PullRequest {
+                repository: self.repository.clone(),
+                number: NonZeroU64::new(evidence.number.get()).ok_or(
+                    ContractError::InvalidValue {
+                        kind: ValueKind::Text,
+                    },
+                )?,
+            },
+            subject: MarkerSubject::Git(EvidenceSubject {
+                head: evidence.head.clone(),
+                base: Some(evidence.base.clone()),
+            }),
+        };
+        let schema = MarkerSchema::new(
+            GATE_BUDGET_SCHEMA,
+            NonZeroU32::new(1).ok_or(StateError::MarkerSchemaInvalid)?,
+        )?;
+        if let Some(marker) = self.store.marker(&key)? {
+            let saved: SubjectBudget = marker.fact().decode(&schema)?;
+            return Ok(saved.started_at);
+        }
+        let now = self.clock.now();
+        let started_at = tasks
+            .iter()
+            .filter(|record| gate_of(record, self.repository) == Some(evidence.number))
+            .filter(|record| {
+                record.evidence().subject().is_some_and(|subject| {
+                    subject.head == evidence.head && subject.base.as_ref() == Some(&evidence.base)
+                })
+            })
+            .filter_map(|record| {
+                record
+                    .attempts()
+                    .first()
+                    .map(|attempt| attempt.started_at())
+            })
+            .min()
+            .unwrap_or(now);
+        let fact = MarkerFact::workflow(schema, &SubjectBudget { started_at })?;
+        self.store.record_marker(key, fact, claimant, now)?;
+        Ok(started_at)
+    }
 }
 
 /// The kind every gate task id starts with.
 const GATE_TASK: &str = "gate";
+const GATE_BUDGET_WORKFLOW: &str = "merge-gate-budget";
+const GATE_BUDGET_SCHEMA: &str = "gate.subject-budget";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SubjectBudget {
+    started_at: Timestamp,
+}
 
 /// Ownership events one pass may add to a gate task: a claim, or a
 /// relinquish and a claim when it moves the task off an ended pass, and the
@@ -941,10 +1040,8 @@ fn room(record: &TaskRecord, events: usize) -> bool {
 /// Whether `record`'s retry deadline passed at `now`: its first attempt
 /// started longer ago than its retry policy allows, the rule the store
 /// applies when an attempt starts.
-fn past_deadline(record: &TaskRecord, now: Timestamp) -> bool {
-    record.attempts().first().is_some_and(|first| {
-        now.saturating_since(first.started_at()) > record.spec().retry.max_elapsed()
-    })
+fn past_deadline(started_at: Timestamp, now: Timestamp) -> bool {
+    now.saturating_since(started_at) > super::RETRY_BUDGET
 }
 
 /// The pull request a gate task of `repository` was created for, under any
@@ -976,6 +1073,7 @@ struct Owned<'a> {
     task: &'a TaskId,
     fence: Fence,
     claimant: &'a Claimant,
+    budget_start: Timestamp,
 }
 
 /// What submitting a recorded merge verdict came to.

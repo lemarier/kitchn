@@ -2,13 +2,18 @@
 
 use std::{collections::BTreeSet, num::NonZeroU64, time::Duration};
 
-use super::{RunError, attest_gate_review, attestation::parse_review_block, gate_attestation};
+use super::{
+    RunError, attest_gate_review,
+    attestation::{check_review_independence, parse_review_block},
+    gate_attestation,
+};
 use crate::{
     EffectName, HolderId, TaskId,
     contracts::{
         AttemptOutcome, AttemptStart, BranchName, CapabilityRequirements, Claimant, Clock,
-        CommitId, GitHubAction, GitHubMutation, GrantScope, IssueNumber, LeaseTtl, Permission,
-        Provenance, Repository, RetryPolicy, ReviewVerdict, Role, TaskAuthority, TaskSpec, Text,
+        CommitId, Effect, EffectExecutor, GitHubAction, GitHubMutation, GrantScope, IssueNumber,
+        LeaseTtl, Permission, Provenance, Repository, RetryPolicy, ReviewVerdict, Role,
+        TaskAuthority, TaskSpec, Text,
     },
     house::HouseConfig,
     integrations::github::{GitHubClient, GitHubExecutor, GitHubMutationTransport, IssueState},
@@ -149,15 +154,17 @@ pub fn post_gate_review<T: GitHubMutationTransport + Clone>(
     clock: &dyn Clock,
     input: &GateReviewInput,
 ) -> Result<GateReview> {
-    if store.house() != &house.house
-        || forge.scope().house() != store.house()
-        || forge.scope().credential() != executor.scope().credential()
-    {
+    if store.house() != &house.house || forge.scope().house() != store.house() {
         return Err(crate::contracts::ContractError::CrossHouse {
             expected: store.house().clone(),
             found: house.house.clone(),
         }
         .into());
+    }
+    if forge.scope().credential() != executor.scope().credential()
+        || forge.scope().requester() != executor.scope().requester()
+    {
+        return Err(crate::integrations::github::IntegrationError::ScopeMismatch.into());
     }
     // Validate every caller-supplied claim before durable or external effects.
     if input.verdict == ReviewVerdict::RequestChanges
@@ -175,6 +182,16 @@ pub fn post_gate_review<T: GitHubMutationTransport + Clone>(
     }
     if pr.head.sha != input.head {
         return Err(RunError::AttestationStaleHead.into());
+    }
+    if input.verdict == ReviewVerdict::Approve {
+        check_review_independence(
+            store,
+            forge,
+            &input.repository,
+            input.pull_request,
+            &pr,
+            executor.scope().requester().as_str(),
+        )?;
     }
     let base_branch = BranchName::new(&pr.base.name)?;
     let base = known(forge.branch_tip(store.house(), &input.repository, &base_branch))?;
@@ -221,8 +238,27 @@ pub fn post_gate_review<T: GitHubMutationTransport + Clone>(
         agent: None,
         work_type: None,
     };
-    store.create_task(spec, &claimant, clock.now())?;
+    let conflicting_spec = match store.create_task(spec, &claimant, clock.now()) {
+        Ok(_) => false,
+        Err(crate::Error::State(StateError::TaskConflict(_))) => true,
+        Err(error) => return Err(error),
+    };
     let task = store.task(&id)?;
+    if let Some(persisted) = task.effects().first() {
+        let request = persisted.request();
+        let expected: Effect = effect.clone().into();
+        if task.effects().len() != 1
+            || request.house() != store.house()
+            || request.backend() != &executor.descriptor().backend
+            || request.credential() != executor.scope().credential().name()
+            || request.task() != &id
+            || request.effect() != &expected
+        {
+            return Err(StateError::TaskConflict(id).into());
+        }
+    } else if conflicting_spec {
+        return Err(StateError::TaskConflict(id).into());
+    }
     let applied = |task: &crate::state::TaskRecord| -> Result<Option<NonZeroU64>> {
         match task.effects().first().map(|effect| effect.state()) {
             Some(EffectState::Applied { receipt, .. }) => Ok(Some(

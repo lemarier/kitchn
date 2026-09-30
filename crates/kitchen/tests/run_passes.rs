@@ -5057,12 +5057,33 @@ fn uncertain_review_post_is_found_by_marker_without_a_second_post() -> TestResul
         ),
         Err(kitchen::Error::Run(RunError::ReviewUncertain))
     ));
+    let other_backend = GitHubExecutor::new(
+        kitchen::BackendId::new("other-github")?,
+        executor.scope().clone(),
+        kitchen.forge().clone(),
+        ReadLimits::default(),
+    );
+    assert!(matches!(
+        post_gate_review(
+            kitchen.store(),
+            &kitchen.config,
+            &forge,
+            &other_backend,
+            &kitchen.settings.instructions.provenance,
+            &kitchen.clock,
+            &input,
+        ),
+        Err(kitchen::Error::State(StateError::TaskConflict(_)))
+    ));
+    assert_eq!(kitchen.forge().writes.borrow().len(), 1);
+    let mut changed = kitchen.settings.instructions.provenance.clone();
+    changed.repository_instructions = Some(commit('f')?);
     let recovered = post_gate_review(
         kitchen.store(),
         &kitchen.config,
         &forge,
         &executor,
-        &kitchen.settings.instructions.provenance,
+        &changed,
         &kitchen.clock,
         &input,
     )?;
@@ -5076,7 +5097,7 @@ fn uncertain_review_post_is_found_by_marker_without_a_second_post() -> TestResul
 }
 
 #[test]
-fn review_by_pull_request_author_posts_but_cannot_attest() -> TestResult {
+fn review_by_pull_request_author_creates_no_intent_or_post() -> TestResult {
     let mut kitchen = settled_with_pull_request(true)?;
     green_pull_request(&kitchen)?;
     kitchen
@@ -5096,9 +5117,16 @@ fn review_by_pull_request_author_posts_but_cannot_attest() -> TestResult {
         ),
         Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
     ));
-    assert_eq!(kitchen.forge().writes.borrow().len(), 1);
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    assert!(
+        !kitchen.store().tasks()?.iter().any(|task| task
+            .spec()
+            .id
+            .as_str()
+            .starts_with("gate-review-"))
+    );
     assert!(recorded_at_d(&kitchen)?.is_none());
-    // A retry finds the same post and again refuses the non-independent attestation.
+    // A retry is refused before creating intent too.
     assert!(matches!(
         post_gate_review(
             kitchen.store(),
@@ -5111,7 +5139,75 @@ fn review_by_pull_request_author_posts_but_cannot_attest() -> TestResult {
         ),
         Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
     ));
-    assert_eq!(kitchen.forge().writes.borrow().len(), 1);
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn review_by_branch_committer_creates_no_intent_or_post() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    commits(
+        &kitchen,
+        json!([commit_json(
+            'd',
+            Some("other-author"),
+            Some("safety-reviewer")
+        )?]),
+    );
+    let (forge, executor) = review_fixture(&mut kitchen, "safety-reviewer")?;
+    assert!(matches!(
+        post_gate_review(
+            kitchen.store(),
+            &kitchen.config,
+            &forge,
+            &executor,
+            &kitchen.settings.instructions.provenance,
+            &kitchen.clock,
+            &review_input(ReviewVerdict::Approve)?,
+        ),
+        Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
+    ));
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    assert!(
+        !kitchen.store().tasks()?.iter().any(|task| task
+            .spec()
+            .id
+            .as_str()
+            .starts_with("gate-review-"))
+    );
+    Ok(())
+}
+
+#[test]
+fn review_with_unknown_commit_writer_creates_no_intent_or_post() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    commits(
+        &kitchen,
+        json!([commit_json('d', None, Some("kitchen-bot"))?]),
+    );
+    let (forge, executor) = review_fixture(&mut kitchen, "safety-reviewer")?;
+    assert!(matches!(
+        post_gate_review(
+            kitchen.store(),
+            &kitchen.config,
+            &forge,
+            &executor,
+            &kitchen.settings.instructions.provenance,
+            &kitchen.clock,
+            &review_input(ReviewVerdict::Approve)?,
+        ),
+        Err(kitchen::Error::Run(RunError::AttestationWritersUnknown))
+    ));
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    assert!(
+        !kitchen.store().tasks()?.iter().any(|task| task
+            .spec()
+            .id
+            .as_str()
+            .starts_with("gate-review-"))
+    );
     Ok(())
 }
 

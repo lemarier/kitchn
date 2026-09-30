@@ -220,24 +220,14 @@ pub fn attest_gate_review<T: GitHubReadTransport>(
         return Err(RunError::AttestationStaleBase.into());
     }
     let reviewer = review.user.login.as_str();
-    let writers = BranchWriters::of(
-        &store.tasks()?,
+    check_review_independence(
+        store,
+        forge,
         repository,
         pull_number,
-        &BranchName::new(&pull_request.head.name)?,
-    );
-    if writers.includes(reviewer) {
-        return Err(RunError::AttestationByWriter.into());
-    }
-    let commits = known(forge.pull_request_commits(store.house(), repository, pull_number, &head))?;
-    let commit_writers = commit_logins(&commits).ok_or(RunError::AttestationWritersUnknown)?;
-    if !independent(
+        &pull_request,
         reviewer,
-        pull_request.user.as_ref().map(|user| user.login.as_str()),
-        &commit_writers,
-    ) {
-        return Err(RunError::AttestationNotIndependent.into());
-    }
+    )?;
     let attestation = GateAttestation {
         house: store.house().clone(),
         repository: repository.clone(),
@@ -257,6 +247,45 @@ pub fn attest_gate_review<T: GitHubReadTransport>(
     let recorded_by = Claimant::interactive(HolderId::new(reviewer)?);
     record_gate_attestation(store, forge, &attestation, &recorded_by, now)?;
     Ok(attestation)
+}
+
+/// Refuse an approval by a PR author or branch writer before it is posted or
+/// recorded. Both callers use the same forge and house evidence.
+pub(super) fn check_review_independence<T: GitHubReadTransport>(
+    store: &HouseStore,
+    forge: &GitHubClient<T>,
+    repository: &Repository,
+    pull_number: IssueNumber,
+    pull_request: &crate::integrations::github::PullRequest,
+    reviewer: &str,
+) -> Result<()> {
+    let writers = BranchWriters::of(
+        &store.tasks()?,
+        repository,
+        pull_number,
+        &BranchName::new(&pull_request.head.name)?,
+    );
+    if writers.includes(reviewer) {
+        return Err(RunError::AttestationByWriter.into());
+    }
+    if writers.person() {
+        return Err(RunError::AttestationWritersUnknown.into());
+    }
+    let commits = known(forge.pull_request_commits(
+        store.house(),
+        repository,
+        pull_number,
+        &pull_request.head.sha,
+    ))?;
+    let commit_writers = commit_logins(&commits).ok_or(RunError::AttestationWritersUnknown)?;
+    if !independent(
+        reviewer,
+        pull_request.user.as_ref().map(|user| user.login.as_str()),
+        &commit_writers,
+    ) {
+        return Err(RunError::AttestationNotIndependent.into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]

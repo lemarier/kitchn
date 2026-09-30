@@ -63,6 +63,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #11 dishwasher | `workflows/cleanup.rs` | Ownership and preservation tests |
 | #12 trust and inspector | `trust/`, `workflows/inspector.rs` | Evidence and autonomy tests |
 | #49 post-merge inspection sampling | `workflows/sampling.rs` | Sampling tests in `crates/kitchen/tests/inspection_sampling.rs`; sampling marker rules in `state/retention.rs`; sample result time in `workflows/inspector.rs`; trust records and inspections from #12, merge grants from #9, house budgets from #40 |
+| #44 graduation policy | `trust/graduation.rs` | The house `graduation` policy field in `house/config.rs`; graduation retention rules in `trust/archive.rs`; graduation tests in `crates/kitchen/tests/graduation.rs`; trust records from #12 |
 | #106, #134 schedule budget pass and tick | `workflows/budget.rs`, `kitchen-cli/src/commands/budget.rs` | Budget tests in `crates/kitchen/tests/schedule_budgets.rs`, `crates/kitchen-cli/tests/budget.rs` |
 | #190 budget window task per window length | The window task choice and overlapping-window reconciliation in `workflows/budget.rs`; `exhausted_schema` in `scheduling/budget.rs` | Length-change tests in `crates/kitchen/tests/schedule_budgets.rs` |
 | #13 end-to-end validation and operations | — | End-to-end harness in `crates/kitchen/tests/e2e_*`; operational docs in `docs/` |

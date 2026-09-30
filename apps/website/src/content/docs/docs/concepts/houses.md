@@ -27,6 +27,7 @@ write it for you from a few answers or register one you wrote and reviewed.
 | `policyLimits` | Limits kept separate from grants. |
 | `backend` | The [worker backend](#the-worker-backend) commands build for this house. |
 | `mergeReadiness` | Optional. The readiness level (`checked`, `reliable` or `covered`) each work type must reach before the merge gate may merge in a repository with a merge grant. Readiness never grants merge authority. Below the level, a merge needs an owner's Roger approval for that exact pull request, head and base; Kitchen persists the Ask, with the work type, levels and reason, before it is sent. Unobserved readiness counts as `unready`. |
+| `graduation` | Optional. Thresholds per work type for moving from supervised to unattended runs: `minSupervisedRuns`, `minFirstPassPercent`, `windowDays`, `onGuidanceChange` (`reset` or `re-evaluate`) and `onRegression` (`report` or `pause-schedule`). Only live runs claimed interactively on the current `guidance` count. Meeting them grants nothing: the owner records an expiring, revocable decision whose grants stay within `policyLimits` and never include merge, publication, schedule activation or equipment. A confirmed regression after the decision suspends it and reports it for review. |
 
 Permission given during an interactive session is never promoted into a
 standing grant.

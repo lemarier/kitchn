@@ -846,6 +846,7 @@ fn house_config() -> TestResult<HouseConfig> {
         disk_pressure: None,
         follow_up: None,
         backend: None,
+        graduation: Default::default(),
     })
 }
 

@@ -8,13 +8,15 @@
 //! live outside repositories.
 //!
 //! Earned standing is tied to the exact instruction pins of the evidence tasks:
-//! changing any pin voids it until new evidence is earned. Re-evaluating trust
-//! per guidance revision by policy is planned in #44.
+//! changing any pin voids it until new evidence is earned. Graduation to
+//! unattended runs handles guidance changes by house policy through explicit
+//! owner decisions ([`GraduationDecision`]).
 //!
 //! History stays until an operator archives records no grant needs; see
 //! [`Ledger::archive`].
 mod archive;
 mod error;
+mod graduation;
 mod model;
 mod store;
 
@@ -23,6 +25,7 @@ pub use archive::{
     ArchivedStream, KeptRecords,
 };
 pub use error::TrustError;
+pub use graduation::*;
 pub use model::*;
 pub use store::EARNED_AUTONOMY_PERMISSIONS;
 pub use store::{Capacity, Ledger};

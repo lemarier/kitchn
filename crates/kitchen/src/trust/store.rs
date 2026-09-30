@@ -8,8 +8,9 @@ use crate::{
         snapshot::{Snapshot, SnapshotStore, StoreLayout},
     },
     trust::{
-        Archival, AutonomyGrant, AutonomyProposal, GrantAudit, MAX_HISTORY, MAX_ITEMS, Measurement,
-        Observation, StationScope, TaskBinding, TrustError,
+        Archival, AutonomyGrant, AutonomyProposal, GraduationAudit, GrantAudit, MAX_HISTORY,
+        MAX_ITEMS, Measurement, Observation, StationScope, TaskBinding, TrustError,
+        graduation::validate_audits,
     },
     workflows::inspector::Inspection,
 };
@@ -80,6 +81,10 @@ pub(crate) struct Document {
     /// ledger that was never archived keeps its schema-4 encoding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) archivals: Vec<Archival>,
+    /// Owner graduation decisions; absent until the first one, like
+    /// `archivals`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) graduations: Vec<GraduationAudit>,
 }
 
 impl Document {
@@ -182,7 +187,7 @@ impl Document {
         if Archival::committed_bytes(&self.archivals).is_none() {
             return Err(TrustError::Corrupt);
         }
-        Ok(())
+        validate_audits(&self.graduations, house, &revisions)
     }
 
     /// History entries counted against [`MAX_HISTORY`]. Each archival
@@ -193,6 +198,7 @@ impl Document {
             + self.grants.len()
             + self.inspections.len()
             + self.archivals.len()
+            + self.graduations.len()
     }
 
     pub(crate) fn latest(
@@ -224,6 +230,7 @@ impl Snapshot for Document {
             grants: Vec::new(),
             inspections: Vec::new(),
             archivals: Vec::new(),
+            graduations: Vec::new(),
         }
     }
 
@@ -635,8 +642,8 @@ impl Ledger {
     /// ([`Provenance`](crate::contracts::Provenance) is compared for equality).
     /// Any change to the Kitchen, house-guidance, or repository-instruction pin
     /// therefore voids earned standing until new evidence is earned under the
-    /// new pins. This fails closed; policy-based re-evaluation per guidance
-    /// revision belongs to the graduation work in #44.
+    /// new pins. This fails closed; per-policy handling of a guidance change
+    /// applies only to graduation decisions ([`Ledger::graduated_standing`]).
     ///
     /// # Errors
     /// Rejects absent or altered bindings and cross-house tasks. A failure
@@ -700,6 +707,18 @@ impl Ledger {
             if doc.entries() > MAX_HISTORY {
                 return Err(TrustError::Exhausted);
             }
+            doc.validate(house)?;
+            Ok(result)
+        })
+    }
+    /// A write that may use the revocation reserve and adds no entry.
+    pub(crate) fn transact_priority<T>(
+        &self,
+        apply: impl FnOnce(&mut Document) -> Result<T, TrustError>,
+    ) -> Result<T, TrustError> {
+        let house = self.house();
+        self.engine.transact_priority(|doc| {
+            let result = apply(doc)?;
             doc.validate(house)?;
             Ok(result)
         })

@@ -229,6 +229,28 @@ pub struct PullRequest {
     #[serde(default)]
     pub merge_commit_sha: Option<CommitId>,
 }
+/// Open pull-request list item used to select a checkout's PR.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OpenPullRequest {
+    /// Repository-local PR number.
+    pub number: IssueNumber,
+    /// Current lifecycle.
+    pub state: IssueState,
+    /// Head commit, branch, and repository identity.
+    pub head: GitRef,
+    /// Base branch; list selection does not need its commit.
+    pub base: PullRequestBaseRef,
+    /// Author identity.
+    pub user: Option<User>,
+}
+
+/// Base branch in a pull-request list item.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullRequestBaseRef {
+    /// Branch name.
+    #[serde(rename = "ref")]
+    pub name: String,
+}
 /// Whether the PR source is inside the selected repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadLocation {
@@ -243,11 +265,60 @@ impl PullRequest {
     /// Classify the source repository without guessing after a fork is deleted.
     #[must_use]
     pub fn head_location(&self, destination: &Repository) -> HeadLocation {
-        match self.head.repo.as_ref() {
-            Some(repo) if &repo.full_name == destination => HeadLocation::SameRepository,
-            Some(_) => HeadLocation::Fork,
-            None => HeadLocation::Unknown,
-        }
+        head_location(&self.head, destination)
+    }
+}
+
+impl OpenPullRequest {
+    /// Classify the source repository without guessing after a fork is deleted.
+    #[must_use]
+    pub fn head_location(&self, destination: &Repository) -> HeadLocation {
+        head_location(&self.head, destination)
+    }
+}
+
+fn head_location(head: &GitRef, destination: &Repository) -> HeadLocation {
+    match head.repo.as_ref() {
+        Some(repo) if &repo.full_name == destination => HeadLocation::SameRepository,
+        Some(_) => HeadLocation::Fork,
+        None => HeadLocation::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod pull_request_list_tests {
+    use super::{HeadLocation, IssueState, OpenPullRequest};
+    use crate::contracts::{CommitId, IssueNumber, Repository};
+
+    #[test]
+    fn github_list_item_without_merged_deserializes() -> Result<(), Box<dyn std::error::Error>> {
+        let head = "a".repeat(40);
+        let response = serde_json::json!([{
+            "number": 12,
+            "state": "open",
+            "draft": false,
+            "merged_at": null,
+            "head": {"sha": head, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
+            "base": {"sha": "b".repeat(40), "ref": "main"},
+            "user": {"login": "author"}
+        }]);
+        let pulls: Vec<OpenPullRequest> = serde_json::from_value(response)?;
+        assert_eq!(pulls.len(), 1);
+        let pull = &pulls[0];
+        assert_eq!(pull.number, IssueNumber::new(12)?);
+        assert_eq!(pull.state, IssueState::Open);
+        assert_eq!(pull.head.sha, CommitId::new(&head)?);
+        assert_eq!(pull.head.name, "review-branch");
+        assert_eq!(pull.base.name, "main");
+        assert_eq!(
+            pull.user.as_ref().map(|user| user.login.as_str()),
+            Some("author")
+        );
+        assert_eq!(
+            pull.head_location(&Repository::new("acme/app")?),
+            HeadLocation::SameRepository
+        );
+        Ok(())
     }
 }
 

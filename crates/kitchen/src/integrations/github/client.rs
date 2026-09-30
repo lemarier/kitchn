@@ -427,7 +427,7 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
         &self,
         house: &HouseId,
         repo: &Repository,
-    ) -> Observation<Vec<PullRequest>> {
+    ) -> Observation<Vec<OpenPullRequest>> {
         self.pages_with_permission(
             house,
             repo,

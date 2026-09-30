@@ -452,6 +452,14 @@ fn gate_attest_reads_the_forge_review_and_records_its_author() -> TestResult {
         }))?,
     )?;
     fs::write(
+        fixtures.join("pulls"),
+        serde_json::to_vec(&serde_json::json!([{
+            "number": 12, "state": "open",
+            "head": {"sha": sha, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
+            "base": {"ref": "main"}, "user": {"login": "author"}
+        }]))?,
+    )?;
+    fs::write(
         fixtures.join("branch"),
         serde_json::to_vec(&serde_json::json!({
             "name": "main", "commit": {"sha": sha}
@@ -471,7 +479,7 @@ fn gate_attest_reads_the_forge_review_and_records_its_author() -> TestResult {
         }]))?,
     )?;
     let script = format!(
-        "#!/bin/sh\ncase \" $* \" in\n  *\" config get user \"*) echo octo-cat;;\n  *\" user \"*) cat '{}/user';;\n  *\"pulls/12/reviews\"*) cat '{}/reviews';;\n  *\"pulls/12/commits\"*) cat '{}/commits';;\n  *\"branches/main\"*) cat '{}/branch';;\n  *\"pulls?state=open\"*) printf '['; cat '{}/pr'; printf ']';;\n  *\"pulls/12\"*) cat '{}/pr';;\n  *) exit 1;;\nesac\n",
+        "#!/bin/sh\ncase \" $* \" in\n  *\" config get user \"*) echo octo-cat;;\n  *\" user \"*) cat '{}/user';;\n  *\"pulls/12/reviews\"*) cat '{}/reviews';;\n  *\"pulls/12/commits\"*) cat '{}/commits';;\n  *\"branches/main\"*) cat '{}/branch';;\n  *\"pulls?state=open\"*) cat '{}/pulls';;\n  *\"pulls/12\"*) cat '{}/pr';;\n  *) exit 1;;\nesac\n",
         fixtures.display(),
         fixtures.display(),
         fixtures.display(),
@@ -553,9 +561,9 @@ fn gate_inference_refuses_dirty_stale_missing_and_ambiguous_heads() -> TestResul
     let fixture = house.home.join("pulls.json");
     let pr = |number, head: &str| {
         serde_json::json!({
-            "number": number, "state": "open", "draft": false, "merged": false,
+            "number": number, "state": "open",
             "head": {"sha": head, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
-            "base": {"sha": sha, "ref": "main"}, "mergeable": true
+            "base": {"ref": "main"}, "user": {"login": "author"}
         })
     };
     let gh = Path::new(&house.path.split(':').next().ok_or("bin")?).join("gh");
@@ -607,7 +615,11 @@ fn gate_inference_refuses_dirty_stale_missing_and_ambiguous_heads() -> TestResul
     )?;
     fs::write(
         house.home.join("pr.json"),
-        serde_json::to_vec(&pr(12, KITCHEN))?,
+        serde_json::to_vec(&serde_json::json!({
+            "number": 12, "state": "open", "draft": false, "merged": false,
+            "head": {"sha": KITCHEN, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
+            "base": {"sha": sha, "ref": "main"}, "mergeable": true
+        }))?,
     )?;
     let stale = command()?;
     assert_eq!(stale.status.code(), Some(1));
@@ -637,14 +649,19 @@ fn gate_inference_reports_detached_checkout_with_moved_pr_head() -> TestResult {
 
     let moved_head = "a".repeat(40);
     let pr = serde_json::json!({
-        "number": 12, "state": "open", "draft": false, "merged": false,
+        "number": 12, "state": "open",
         "head": {"sha": moved_head, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
-        "base": {"sha": KITCHEN, "ref": "main"}, "mergeable": true
+        "base": {"ref": "main"}, "user": {"login": "author"}
     });
     let list = house.home.join("pulls.json");
     let detail = house.home.join("pr.json");
     fs::write(&list, serde_json::to_vec(&serde_json::json!([pr]))?)?;
-    fs::write(&detail, serde_json::to_vec(&pr)?)?;
+    let mut detailed = pr;
+    detailed["draft"] = serde_json::json!(false);
+    detailed["merged"] = serde_json::json!(false);
+    detailed["mergeable"] = serde_json::json!(true);
+    detailed["base"]["sha"] = serde_json::json!(KITCHEN);
+    fs::write(&detail, serde_json::to_vec(&detailed)?)?;
     let gh = Path::new(&house.path.split(':').next().ok_or("bin")?).join("gh");
     fs::write(
         &gh,

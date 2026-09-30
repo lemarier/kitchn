@@ -26,6 +26,10 @@ use crate::{
         ConsumerEvent, ConsumerRecord, ConsumerState, Corruption, Limit, MarkerAttempt, MarkerFact,
         MarkerKey, MarkerRecording, StateError, WorkItem, WorkflowMarker,
         effects::{Found, SettledLookup},
+        mailbox::{
+            AnswerState, Answered, Answerer, MailAnswer, MailError, MailSender, Mailbox,
+            OpenQuestion, WorkerPost,
+        },
         marker::{MarkerRefusal, MarkerWrite, Markers, PairPlan},
         retention::{
             self, Inventory, RetentionPolicy, RetentionReport, RetentionSubjects, StoreCapacity,
@@ -781,7 +785,17 @@ impl TaskRecord {
     /// Accept a recorded fact from the current owner, or from the owner that
     /// settled the task: usage often arrives after the attempt that settled it.
     fn check_recorder(&self, fence: Fence) -> Result<()> {
-        let recorder = match &self.state {
+        if self.recorder() == Some(fence) {
+            Ok(())
+        } else {
+            fail(StateError::StaleFence { presented: fence })
+        }
+    }
+
+    /// The fence that may record facts now: the current claim's, or the
+    /// settling owner's once the task settled.
+    fn recorder(&self) -> Option<Fence> {
+        match &self.state {
             TaskState::Claimed { lease } => Some(lease.fence),
             TaskState::Settled { .. } => match self.ownership.last() {
                 Some(OwnershipEvent::Released { fence, .. }) => Some(*fence),
@@ -794,11 +808,6 @@ impl TaskRecord {
                 | None => None,
             },
             TaskState::Open => None,
-        };
-        if recorder == Some(fence) {
-            Ok(())
-        } else {
-            fail(StateError::StaleFence { presented: fence })
         }
     }
 
@@ -1176,6 +1185,9 @@ pub(crate) struct StoreState {
     /// continues after it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retention_cursor: Option<WorkItem>,
+    /// Worker messages and their answers ([`crate::state::HouseMailbox`]).
+    #[serde(default, skip_serializing_if = "Mailbox::is_empty")]
+    mailbox: Mailbox,
 }
 
 /// Deserialize a map, rejecting a repeated key instead of letting a later
@@ -1235,6 +1247,7 @@ impl StoreState {
             markers: Markers::new(),
             schedules: Vec::new(),
             retention_cursor: None,
+            mailbox: Mailbox::new(),
         }
     }
 
@@ -2789,6 +2802,7 @@ impl StoreState {
         now: Timestamp,
     ) -> RetentionReport {
         let mut report = retention::plan(&self.tasks, self.markers.iter(), policy, inventory, now);
+        report.mail = retention::mail_plan(&self.mailbox, &self.tasks);
         report.intake = intake::plan_house_compaction(self.markers.iter(), &self.tasks)
             .into_iter()
             .map(|(summary, _)| summary)
@@ -2823,13 +2837,23 @@ impl StoreState {
             .map(|retired| retired.key.clone())
             .collect();
         self.markers.remove_all(&keys);
+        // Planned before the tasks go, so a retired task's messages retire
+        // for its settlement.
+        report.mail = retention::mail_plan(&self.mailbox, &self.tasks);
+        let mail: Vec<ExternalRef> = report
+            .mail
+            .iter()
+            .map(|retired| retired.id.clone())
+            .collect();
+        self.mailbox.retire(&mail);
         for retired in &report.tasks {
             self.tasks.remove(&retired.task);
         }
         if let Some(item) = inventory.last_lookup() {
             self.retention_cursor = Some(item.clone());
         }
-        report.applied = compacted || !keys.is_empty() || !report.tasks.is_empty();
+        report.applied =
+            compacted || !keys.is_empty() || !report.tasks.is_empty() || !mail.is_empty();
         Ok(report)
     }
 
@@ -2940,6 +2964,101 @@ impl StoreState {
         tasks.chain(handed_over).chain(consumers).collect()
     }
 
+    pub(crate) fn post_mail(
+        &mut self,
+        sender: &MailSender,
+        post: WorkerPost,
+        now: Timestamp,
+    ) -> Result<ExternalRef> {
+        let task = self
+            .tasks
+            .get(&sender.task)
+            .ok_or_else(|| Error::State(StateError::TaskNotFound(sender.task.clone())))?;
+        self.mailbox.post(task, sender, post, now)
+    }
+
+    pub(crate) fn mail_answer(
+        &self,
+        sender: &MailSender,
+        question: &ExternalRef,
+    ) -> Result<AnswerState> {
+        self.mailbox
+            .answer_for(self.task(&sender.task)?, sender, question)
+    }
+
+    /// Record `answer` to `question`. A person's answer is also recorded as a
+    /// human reply on the asking attempt, by the task's current recorder, in
+    /// the same transaction.
+    pub(crate) fn answer_mail(
+        &mut self,
+        question: &ExternalRef,
+        answer: MailAnswer,
+    ) -> Result<Answered> {
+        let (mail, answered) = self.mailbox.question(question, &answer)?;
+        if answered == Answered::Duplicate {
+            return Ok(answered);
+        }
+        let (task, attempt, asked_at) = (mail.task().clone(), mail.attempt(), mail.posted_at());
+        match answer.by {
+            Answerer::Person => {
+                let fence = self.task(&task)?.recorder().ok_or(MailError::NoOwner)?;
+                self.record_attempt_reply(&task, fence, attempt, question, asked_at, answer.at)?;
+            }
+            Answerer::Coordinator => {}
+        }
+        self.mailbox.set_answer(question, answer)?;
+        Ok(Answered::Recorded)
+    }
+
+    pub(crate) fn open_questions(&self, limit: usize) -> Result<Vec<OpenQuestion>> {
+        self.mailbox.open_questions(limit)
+    }
+
+    /// Make the coordinator at `reader` read the mailbox. Its consumer lease
+    /// must be current and live, and no reader with a larger fence may hold
+    /// the mailbox.
+    pub(crate) fn adopt_mailbox(&mut self, reader: &ConsumerFence, now: Timestamp) -> Result<()> {
+        self.check_consumer(reader, now)?;
+        self.mailbox.register(&reader.consumer, reader.fence)
+    }
+
+    /// The first reader registers with a current lease; after that only the
+    /// registered reader reads, until another adopts the mailbox.
+    fn check_mail_reader(&mut self, reader: &ConsumerFence, now: Timestamp) -> Result<()> {
+        match self.mailbox.reads(reader.fence) {
+            Some(true) => Ok(()),
+            Some(false) => Err(MailError::Fenced.into()),
+            None => self.adopt_mailbox(reader, now),
+        }
+    }
+
+    pub(crate) fn mail_delivery(
+        &mut self,
+        reader: &ConsumerFence,
+        now: Timestamp,
+    ) -> Result<Option<crate::contracts::Delivery>> {
+        self.check_mail_reader(reader, now)?;
+        self.mailbox.delivery(reader.fence)
+    }
+
+    pub(crate) fn acknowledge_mail(
+        &mut self,
+        reader: &ConsumerFence,
+        delivery: &ExternalRef,
+        now: Timestamp,
+    ) -> Result<Option<crate::contracts::Delivery>> {
+        self.check_mail_reader(reader, now)?;
+        self.mailbox.acknowledge(reader.fence, delivery)
+    }
+
+    pub(crate) fn mailbox_len(&self) -> usize {
+        self.mailbox.len()
+    }
+
+    pub(crate) const fn mail_last_posted(&self) -> u64 {
+        self.mailbox.last_posted()
+    }
+
     /// Check invariants that the type system cannot express.
     pub(crate) fn validate(&self) -> std::result::Result<(), Corruption> {
         if self.tasks.len() > MAX_TASKS
@@ -2949,6 +3068,9 @@ impl StoreState {
             return Err(Corruption::LimitExceeded);
         }
         self.markers.validate()?;
+        if !self.mailbox.validate() {
+            return Err(Corruption::LimitExceeded);
+        }
         for record in self.consumers.values() {
             record.validate(self.next_fence)?;
         }

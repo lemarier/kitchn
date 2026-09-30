@@ -101,6 +101,9 @@ pub enum Error {
     /// Brigade audit failure.
     #[error(transparent)]
     Audit(#[from] crate::workflows::audit::AuditError),
+    /// A house mailbox call was refused.
+    #[error(transparent)]
+    Mail(#[from] crate::state::MailError),
 }
 
 impl Error {
@@ -133,6 +136,7 @@ impl Error {
             Self::Sampling(error) => error.class(),
             Self::Usage(error) => error.class(),
             Self::Audit(error) => error.class(),
+            Self::Mail(error) => error.class(),
         }
     }
 }

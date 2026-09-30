@@ -158,14 +158,27 @@ impl ConsentSource for Standing {
     }
 }
 
-/// Worker backend capabilities supervision needs: isolated launch, positive
-/// readiness, messaging, status, cancellation of a stalled launch, and worker
-/// deliveries, without which the coordinator never receives a question or a
-/// report ([`crate::contracts::CoordinatorMailbox`]). They
+/// Worker backend capabilities supervision needs on either mailbox route:
+/// isolated launch, positive readiness, messaging, status, and cancellation
+/// of a stalled launch.
+pub const SUPERVISION_CAPABILITIES: [Capability; 5] = [
+    Capability::WorkerLaunchIsolated,
+    Capability::WorkerLaunchReadiness,
+    Capability::WorkerMessaging,
+    Capability::WorkerStatusAndOutcome,
+    Capability::WorkerCancel,
+];
+
+/// Worker backend capabilities supervision needs on
+/// [`MailboxRoute::Backend`]: [`SUPERVISION_CAPABILITIES`] plus worker
+/// deliveries, without which the backend never hands the coordinator a
+/// question or a report ([`crate::contracts::CoordinatorMailbox`]). They
 /// are checked when a coordinator starts, and a task records them as its
 /// [`crate::contracts::ExecutorKind::Worker`] requirements
 /// ([`crate::contracts::CapabilityRequirements`]), which the store applies to
-/// worker backends only, never to forge or Roger executors.
+/// worker backends only, never to forge or Roger executors. A task for
+/// [`MailboxRoute::House`] records [`MailboxRoute::worker_requirements`]
+/// instead.
 pub const REQUIRED_WORKER_CAPABILITIES: [Capability; 6] = [
     Capability::WorkerLaunchIsolated,
     Capability::WorkerLaunchReadiness,
@@ -174,6 +187,57 @@ pub const REQUIRED_WORKER_CAPABILITIES: [Capability; 6] = [
     Capability::WorkerCancel,
     Capability::WorkerDeliveries,
 ];
+
+/// Where a coordinator reads worker deliveries: questions, reports, and
+/// escalations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MailboxRoute {
+    /// The worker backend declares full worker deliveries and carries them.
+    Backend,
+    /// The backend declares none, or only partial support: workers post
+    /// through `kitchn mailbox` into the house store, and the coordinator
+    /// reads them through [`crate::state::HouseMailbox`]. Each worker's
+    /// brief says how.
+    House,
+}
+
+impl MailboxRoute {
+    /// The route for workers on `backend`. Coordinator start, the worker
+    /// brief, and the coordinator's reads all use this one selection.
+    #[must_use]
+    pub fn select(backend: &BackendDescriptor) -> Self {
+        if backend.capabilities.supports(Capability::WorkerDeliveries) {
+            Self::Backend
+        } else {
+            Self::House
+        }
+    }
+
+    /// What the worker backend must support on this route.
+    #[must_use]
+    pub const fn worker_requirements(self) -> &'static [Capability] {
+        match self {
+            Self::Backend => &REQUIRED_WORKER_CAPABILITIES,
+            Self::House => &SUPERVISION_CAPABILITIES,
+        }
+    }
+}
+
+/// The brief lines that tell a worker on [`MailboxRoute::House`] how to
+/// reach its coordinator: the exact `kitchn mailbox` commands with its task
+/// and launch fence.
+fn house_mailbox_brief(store: &HouseStore, task: &TaskId, fence: Fence) -> String {
+    let scope = format!(
+        "--store {} --house {} --task {} --fence {}",
+        quote(&store.dir().to_string_lossy()),
+        store.house(),
+        task,
+        fence.get()
+    );
+    format!(
+        "Mailbox: this backend does not carry worker messages, so report to the coordinator through Kitchen's house mailbox, and only for this task. Ask a question with `kitchn mailbox ask {scope} --body <text> --wait-secs 600`, which waits for the answer; read a late answer with `kitchn mailbox answer {scope} --question <id>`. Escalate with `kitchn mailbox escalate {scope} --body <text>`. When done, report once with `kitchn mailbox report {scope} --outcome succeeded|failed --body <summary>`."
+    )
+}
 
 /// What coordination acts through.
 #[derive(Clone, Copy)]
@@ -537,6 +601,14 @@ pub fn launch_worker(
     // outcomes above use no brief, so an oversized context cannot hide them;
     // it is still refused before an attempt starts.
     let text = deliberation::context_brief(&deliberation::task_context(ctx.store, task)?, &text)?;
+    let text = match MailboxRoute::select(ctx.backend.descriptor()) {
+        MailboxRoute::Backend => text,
+        MailboxRoute::House => Text::new(&format!(
+            "{}\n{}",
+            text.as_str(),
+            house_mailbox_brief(ctx.store, task, fence)
+        ))?,
+    };
     // A selection the executor cannot launch is a configuration problem no
     // retry fixes: refuse it before an attempt is spent on it.
     if let Some(resolved) = &record.spec().agent {
@@ -2071,9 +2143,12 @@ pub enum CoordinatorStart {
 }
 
 /// Start a coordinator: check that the worker backend supports what
-/// supervision needs, then take the durable single-consumer lease for
-/// `consumer`, adopting relinquished work through recorded adoptions.
-/// A duplicate tick is refused by the lease, not by prompt text.
+/// supervision needs on its [`MailboxRoute`], then take the durable
+/// single-consumer lease for `consumer`, adopting relinquished work through
+/// recorded adoptions. A duplicate tick is refused by the lease, not by
+/// prompt text. On [`MailboxRoute::House`], read the mailbox through
+/// [`crate::state::HouseMailbox`] with the returned lease and call its
+/// `adopt_run` first.
 ///
 /// # Errors
 /// Returns [`ContractError::UnsupportedCapabilities`] naming every missing
@@ -2094,7 +2169,12 @@ pub fn start_coordinator(
         }
         .into());
     }
-    backend.capabilities.require(REQUIRED_WORKER_CAPABILITIES)?;
+    backend.capabilities.require(
+        MailboxRoute::select(backend)
+            .worker_requirements()
+            .iter()
+            .copied(),
+    )?;
     let previous = store
         .consumer(consumer)?
         .and_then(|record| match record.state() {

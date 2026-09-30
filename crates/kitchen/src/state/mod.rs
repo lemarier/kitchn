@@ -40,6 +40,10 @@
 //!   scoped [`RiskDecision`] allows one specific action.
 //! - One retention policy ([`RetentionPolicy`]) removes markers and settled
 //!   tasks no workflow still needs, only on positive outside evidence.
+//! - Workers without a backend mailbox post questions, reports, and
+//!   escalations into the house mailbox ([`HouseMailbox`]), which a single
+//!   fenced coordinator reads; retention removes acknowledged messages once
+//!   their attempt ended.
 //! - Each attempt carries its backend-reported usage or an explicit
 //!   [`AttemptUsage::NotReported`]; human time is derived from recorded
 //!   replies and interactive claims, never reported ([`AttemptUsageEntry`]).
@@ -47,6 +51,7 @@
 mod consumer;
 mod effects;
 mod error;
+mod mailbox;
 mod marker;
 mod model;
 mod retention;
@@ -58,6 +63,11 @@ mod verification;
 pub use consumer::{ConsumerEvent, ConsumerRecord, ConsumerState, MAX_CONSUMER_HISTORY};
 pub use effects::{ReconcileReport, reconcile, reread_settled, run_effect};
 pub use error::{Corruption, Limit, StateError, StorageOperation};
+pub use mailbox::{
+    AnswerState, Answered, Answerer, HouseMailbox, MAX_MAIL_BATCH, MAX_MAIL_BODY_BYTES,
+    MAX_MAIL_PER_TASK, MAX_MAIL_SUBJECT_BYTES, MAX_MAILBOX_MESSAGES, MAX_UNACKNOWLEDGED_PER_TASK,
+    MailAnswer, MailError, MailSender, OpenQuestion, PostKind, ReportedOutcome, WorkerPost,
+};
 pub use marker::{
     IssueRevision, MAX_MARKER_HISTORY, MAX_MARKER_PAYLOAD_BYTES, MAX_MARKERS, MarkerAttempt,
     MarkerFact, MarkerKey, MarkerPayload, MarkerRecording, MarkerSchema, MarkerSubject,
@@ -74,9 +84,9 @@ pub use model::{
     RiskDecision, TaskRecord, TaskState, WriteAcknowledgement,
 };
 pub use retention::{
-    CAPACITY_WARNING_PERCENT, Inventory, MIN_TASK_WINDOW, MarkerRetirement, MarkerRule, Presence,
-    RetentionPolicy, RetentionReport, RetentionSubjects, RetiredMarker, RetiredTask, StoreCapacity,
-    TableUsage, TaskRetirement, marker_rule,
+    CAPACITY_WARNING_PERCENT, Inventory, MIN_TASK_WINDOW, MailRetirement, MarkerRetirement,
+    MarkerRule, Presence, RetentionPolicy, RetentionReport, RetentionSubjects, RetiredMail,
+    RetiredMarker, RetiredTask, StoreCapacity, TableUsage, TaskRetirement, marker_rule,
 };
 pub use snapshot::StoreOptions;
 pub use store::HouseStore;

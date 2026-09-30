@@ -8,6 +8,7 @@ pub mod gardener;
 pub mod house;
 pub mod house_init;
 pub mod interactive;
+pub mod mailbox;
 pub mod pickup;
 pub mod scaffold;
 pub mod store;

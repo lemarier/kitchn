@@ -203,6 +203,10 @@ impl<S: Snapshot> SnapshotStore<S> {
         &self.house
     }
 
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Apply `apply` to the snapshot under the exclusive lock, and replace
     /// the snapshot if the content changed. An error from `apply` writes
     /// nothing.

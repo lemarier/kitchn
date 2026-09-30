@@ -410,6 +410,37 @@ Without `--destination` no forge link is published.
 Other sources, finding text, transcripts, and backend handles stay in the
 house.
 
+## `kitchn mailbox`
+
+The house mailbox, for workers whose backend carries no worker messages.
+Coordination picks it when the worker backend does not declare worker
+deliveries, and each worker's brief then gives it the exact commands with its
+task and fence.
+
+```sh
+kitchn mailbox ask       <scope> --body <text> [--subject <text>] [--wait-secs 0-900]
+kitchn mailbox answer    <scope> --question <id> [--wait-secs 0-900]
+kitchn mailbox escalate  <scope> --body <text> [--subject <text>]
+kitchn mailbox report    <scope> --outcome succeeded|failed --body <text> [--subject <text>]
+kitchn mailbox questions --house <id> (--registry <dir> | --store <dir>)
+kitchn mailbox reply     --house <id> (--registry <dir> | --store <dir>) --question <id> --body <text> --by person|coordinator
+```
+
+`<scope>` is `--house <id> (--registry <dir> | --store <dir>) --task <id>
+--fence <n>`. A worker posts and reads only for its own task: the fence must
+be one its open attempt ran under, so a worker whose attempt ended, or that
+names another task, is refused (exit 1), and another task's question reads as
+unknown (exit 2). `ask` prints the question id and waits up to `--wait-secs` for
+the answer; `answer` reads it later. `reply --by person` also records the
+person's time on the asking attempt, and is refused while the task has no
+owner, such as during a coordinator handover. A repeated identical reply
+changes nothing; a different one exits 1.
+
+The mailbox holds at most 512 messages, 64 per task, and 32 waiting per task;
+a full mailbox refuses the post instead of dropping it. Bodies and answers are
+at most 8 KiB. `kitchn store retain` removes handled messages once their
+attempt ended or their task settled.
+
 ## `kitchn pickup`
 
 Offline pickup diagnostics.

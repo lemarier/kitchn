@@ -22,6 +22,11 @@
 //!   and retire with it; a report counts them, so a preview shows what usage
 //!   evidence a pass would remove.
 //!
+//! - An acknowledged house mailbox message retires once its attempt ended
+//!   or its task settled or left the store: its worker is gone, so nobody
+//!   reads its answer. An unacknowledged message is always kept, since the
+//!   coordinator has not handled it.
+//!
 //! Everything else is kept, including every marker dedupe still needs
 //! (asked questions, deliberation threads, reports owed to an owner) and
 //! every task of an unknown family. Intake markers follow their owner's
@@ -48,11 +53,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BackendId, HouseId, TaskId, WorkflowId,
-    contracts::{IssueNumber, ResourceRef, Settlement, Timestamp},
+    contracts::{ExternalRef, IssueNumber, ResourceRef, Settlement, Timestamp},
     integrations::github::{GitHubClient, GitHubReadTransport, IssueState, Observation},
     state::{
-        AttemptUsage, EffectState, MAX_CONSUMERS, MAX_MARKERS, MAX_TASKS, MarkerFact, MarkerKey,
-        MarkerSchema, StateError, TaskRecord, TaskState, WorkItem, WorkflowMarker,
+        AttemptState, AttemptUsage, EffectState, MAX_CONSUMERS, MAX_MARKERS, MAX_TASKS, MarkerFact,
+        MarkerKey, MarkerSchema, StateError, TaskRecord, TaskState, WorkItem, WorkflowMarker,
+        mailbox::Mailbox,
     },
     workflows::{budget, intake::LedgerCompaction, pickup, repair},
 };
@@ -335,6 +341,29 @@ pub enum TaskRetirement {
     ItemGone,
 }
 
+/// Why an acknowledged mailbox message was retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum MailRetirement {
+    /// The attempt that posted it ended.
+    AttemptEnded,
+    /// Its task settled or is no longer in the store.
+    TaskSettled,
+}
+
+/// One mailbox message a retention pass removes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetiredMail {
+    /// The message id.
+    pub id: ExternalRef,
+    /// Its task.
+    pub task: TaskId,
+    /// Why.
+    pub reason: MailRetirement,
+}
+
 /// One marker a retention pass removes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -369,6 +398,9 @@ pub struct RetentionReport {
     pub tasks: Vec<RetiredTask>,
     /// Intake compaction per repository.
     pub intake: Vec<LedgerCompaction>,
+    /// Acknowledged mailbox messages removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mail: Vec<RetiredMail>,
 }
 
 /// Entries used in one bounded table.
@@ -708,7 +740,46 @@ pub(super) fn plan<'a>(
         markers: retired_markers,
         tasks: retired_tasks,
         intake: Vec::new(),
+        mail: Vec::new(),
     }
+}
+
+/// The acknowledged mailbox messages no worker still reads. Needs no
+/// outside evidence: the store records attempts and settlement itself.
+pub(super) fn mail_plan(
+    mailbox: &Mailbox,
+    tasks: &BTreeMap<TaskId, TaskRecord>,
+) -> Vec<RetiredMail> {
+    mailbox
+        .stored()
+        .filter(|(_, acknowledged)| *acknowledged)
+        .filter_map(|(mail, _)| {
+            let reason = match tasks.get(mail.task()) {
+                None => MailRetirement::TaskSettled,
+                Some(task) if matches!(task.state(), TaskState::Settled { .. }) => {
+                    MailRetirement::TaskSettled
+                }
+                Some(task) => {
+                    let open = task.attempts().last().is_some_and(|attempt| {
+                        attempt.number() == mail.attempt()
+                            && matches!(
+                                attempt.state(),
+                                AttemptState::Running | AttemptState::Interrupted { .. }
+                            )
+                    });
+                    if open {
+                        return None;
+                    }
+                    MailRetirement::AttemptEnded
+                }
+            };
+            Some(RetiredMail {
+                id: mail.id().ok()?,
+                task: mail.task().clone(),
+                reason,
+            })
+        })
+        .collect()
 }
 
 type Group<'a> = (&'a WorkflowId, &'a WorkItem, Option<&'a MarkerSchema>);

@@ -9,9 +9,9 @@
 //! it exercised.
 //!
 //! [`run_mailbox`] checks the coordinator mailbox against batches the caller
-//! seeded; it acknowledges them, so it consumes the seeded messages.
-//! Coordination cannot run without worker deliveries, so a backend that does
-//! not declare them fails it.
+//! seeded; it acknowledges them, so it consumes the seeded messages. A
+//! mailbox that does not declare worker deliveries fails it; coordination on
+//! such a backend reads the house mailbox instead, which declares them.
 //!
 //! The worker launch requests a branch. [`run_worker`] uses
 //! `kitchen/<run_tag>`; a backend that can only create branches under a

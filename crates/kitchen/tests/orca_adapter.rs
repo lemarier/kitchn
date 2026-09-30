@@ -41,7 +41,10 @@ use kitchen::{
         ScheduleField, ScheduleSpec, ScheduleState, ScheduleWorkspace, TimeOfDay, Timezone,
         WorkflowName,
     },
-    state::{EffectPlan, EffectState, reconcile, run_effect},
+    state::{AttemptState, EffectPlan, EffectState, reconcile, run_effect},
+    workflows::coordination::{
+        Context, Standing, Supervision, SupervisionInput, SupervisionPolicy, supervise,
+    },
 };
 use orca_sim::{Fault, SimAutomation, SimOrca, SimWorker};
 use serde_json::json;
@@ -209,7 +212,7 @@ fn simulated_orca_passes_the_shared_contract_on_a_branch_under_its_own_prefix() 
         Some("kitchen-sim-run-1")
     );
     let probe = backend.lookup_launch(&key("sim-run-1-probe")?)?;
-    let Lookup::Applied(receipt) = probe else {
+    let Lookup::Ended(receipt) = probe else {
         return Err("the probe launch was not found by its key".into());
     };
     verify_branch(&receipt, branch.as_str())?;
@@ -279,10 +282,10 @@ fn a_host_whose_actual_prefix_differs_from_the_configured_one_fails_and_stops() 
     assert_eq!(
         backend.execute(&launch),
         Err(EffectFailure::Uncertain(
-            UncertainReason::BranchMismatchStopped
+            UncertainReason::BranchPrefixMismatchStopped
         ))
     );
-    assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
+    assert!(matches!(backend.resolve(&launch)?, Lookup::Ended(_)));
     assert_eq!(stops(&sim), 1);
     Ok(())
 }
@@ -1768,7 +1771,14 @@ fn a_launch_that_never_became_ready_is_a_failed_launch() -> TestResult {
     let sim = SimOrca::default();
     let backend = connect(&sim)?;
     sim.state().start_state = "failed";
-    let receipt = backend.execute(&request(launch_op("Implement it.")?, "failed-start")?)?;
+    let launch = request(launch_op("Implement it.")?, "failed-start")?;
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::DispatchEnded))
+    );
+    let Lookup::Ended(receipt) = backend.resolve(&launch)? else {
+        return Err("failed dispatch was not ended".into());
+    };
     assert_eq!(
         backend.observe_worker(&launched(&receipt)?)?,
         WorkerState::Settled(WorkerOutcome::Failed),
@@ -2419,7 +2429,7 @@ fn a_requested_branch_is_passed_as_the_name_that_yields_it() -> TestResult {
             "bare-prefixed"
         )?),
         Err(EffectFailure::Uncertain(
-            UncertainReason::BranchMismatchStopped
+            UncertainReason::BranchPrefixMismatchStopped
         ))
     );
     Ok(())
@@ -2471,7 +2481,7 @@ fn a_branch_that_never_appears_is_stopped_as_unconfirmed() -> TestResult {
         ))
     );
     assert_eq!(stops(&sim), 1);
-    assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
+    assert!(matches!(backend.resolve(&launch)?, Lookup::Ended(_)));
     assert_eq!(
         backend.verify_launch_branch(launch.key(), &branch("kitchen/issue-237")?),
         Err(OrcaError::BranchUnconfirmed {
@@ -2479,6 +2489,84 @@ fn a_branch_that_never_appears_is_stopped_as_unconfirmed() -> TestResult {
         })
     );
     assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_branch_revealed_after_stop_never_revives_the_launch() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (task, fence) = running_task(&fixture, "task-late-branch", &[Permission::LaunchWorker])?;
+    let sim = SimOrca::default();
+    sim.state().branch_reads_hidden = usize::MAX;
+    let backend = connect(&sim)?;
+    let clock = ManualClock::starting_at(1);
+    let grants = house_grants(&[Permission::LaunchWorker])?;
+    let launch = plan(
+        &task,
+        fence,
+        "launch-1",
+        launch_on("lemarier/issue-7", Workspace::Isolated)?,
+    )?;
+    let first = run_effect(&fixture.store, &backend, &grants, launch.clone(), &clock)?;
+    assert!(matches!(
+        first.state(),
+        EffectState::Uncertain {
+            reason: UncertainReason::BranchUnconfirmedStopped,
+            ..
+        }
+    ));
+    assert_eq!(stops(&sim), 1);
+
+    sim.state().branch_reads_hidden = 0;
+    assert_eq!(
+        backend.verify_launch_branch(first.request().key(), &branch("lemarier/issue-7")?),
+        Err(OrcaError::LaunchEnded {
+            requested: "lemarier/issue-7".to_owned(),
+        })
+    );
+    let report = reconcile(&fixture.store, &backend, &task, fence, &clock)?;
+    assert!(report.unresolved.is_empty());
+    assert!(matches!(
+        report.resolved[0].state(),
+        EffectState::Ended { .. }
+    ));
+    let repeated = run_effect(&fixture.store, &backend, &grants, launch, &clock)?;
+    assert!(matches!(repeated.state(), EffectState::Ended { .. }));
+    assert_eq!(
+        fixture.store.task(&task)?.attempts()[0].state(),
+        AttemptState::Running
+    );
+    let ctx = Context {
+        store: &fixture.store,
+        backend: &backend,
+        grants: &grants,
+        clock: &clock,
+        consent: &Standing,
+    };
+    let policy = SupervisionPolicy {
+        readiness_deadline: Duration::from_secs(120),
+        question_deadline: Duration::from_secs(600),
+        idle_deadline: Duration::from_secs(240),
+        claim_ttl: ttl(60)?,
+    };
+    assert_eq!(
+        supervise(&ctx, &task, fence, &policy, &SupervisionInput::default())?,
+        Supervision::AwaitingLaunch
+    );
+    assert!(matches!(
+        fixture.store.task(&task)?.attempts()[0].state(),
+        AttemptState::Finished { .. }
+    ));
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
+    assert_eq!(stops(&sim), 1);
+
+    let next = request(
+        launch_on("lemarier/issue-7-attempt-2", Workspace::Isolated)?,
+        "launch-attempt-2",
+    )?;
+    let fresh = backend.execute(&next)?;
+    verify_branch(&fresh, "lemarier/issue-7-attempt-2")?;
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 2);
     Ok(())
 }
 
@@ -2495,7 +2583,7 @@ fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
     assert_eq!(
         backend.execute(&launch),
         Err(EffectFailure::Uncertain(
-            UncertainReason::BranchMismatchStopped
+            UncertainReason::BranchPrefixMismatchStopped
         )),
         "a worker on the wrong branch is not an accepted launch"
     );
@@ -2520,11 +2608,9 @@ fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
     // again; lookup does not call the launch applied.
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::Uncertain(
-            UncertainReason::BranchMismatchStopped
-        ))
+        Err(EffectFailure::Uncertain(UncertainReason::DispatchEnded))
     );
-    assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
+    assert!(matches!(backend.resolve(&launch)?, Lookup::Ended(_)));
     assert_eq!(sim.calls_to(&["orchestration", "task-create"]).len(), 1);
     assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
     assert_eq!(stops(&sim), 1);
@@ -2592,7 +2678,7 @@ fn a_stop_that_fails_is_retried_then_reported_as_a_running_mismatch() -> TestRes
     assert_eq!(
         backend.execute(&launch),
         Err(EffectFailure::Uncertain(
-            UncertainReason::BranchMismatchStopped
+            UncertainReason::BranchPrefixMismatchStopped
         ))
     );
     assert_eq!(stops(&sim), 4);
@@ -2624,7 +2710,7 @@ fn a_stop_that_fails_once_is_retried_within_the_launch() -> TestResult {
     assert_eq!(
         backend.execute(&launch),
         Err(EffectFailure::Uncertain(
-            UncertainReason::BranchMismatchStopped
+            UncertainReason::BranchPrefixMismatchStopped
         ))
     );
     assert_eq!(stops(&sim), 2);
@@ -2805,12 +2891,10 @@ fn a_collision_is_stopped_released_and_reported_with_its_owner() -> TestResult {
             actual: Some("lemarier/issue-6-2".to_owned()),
         })
     );
-    assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
+    assert!(matches!(backend.resolve(&launch)?, Lookup::Ended(_)));
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::Uncertain(
-            UncertainReason::BranchMismatchStopped
-        ))
+        Err(EffectFailure::Uncertain(UncertainReason::DispatchEnded))
     );
     assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
     assert_eq!(stops(&sim), 1);
@@ -3205,13 +3289,13 @@ fn an_exited_worker_keeps_its_launch_and_is_never_started_again() -> TestResult 
     sim.exit_worker(dispatch.handle.as_str())?;
     assert_eq!(
         backend.lookup_launch(launch.key())?,
-        Lookup::Applied(receipt.clone())
+        Lookup::Ended(receipt.clone())
     );
-    assert_eq!(backend.resolve(&launch)?, Lookup::Applied(receipt.clone()));
+    assert_eq!(backend.resolve(&launch)?, Lookup::Ended(receipt.clone()));
     assert_eq!(
-        backend.execute(&launch)?,
-        receipt,
-        "resubmission returns it"
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(UncertainReason::DispatchEnded)),
+        "resubmission never adopts the failed dispatch"
     );
     assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
     assert_eq!(sim.state().workers.len(), 1);
@@ -3227,7 +3311,10 @@ fn an_exited_worker_keeps_its_launch_and_is_never_started_again() -> TestResult 
     )?;
     let receipt = backend.execute(&on_branch)?;
     sim.exit_worker(launched(&receipt)?.handle.as_str())?;
-    assert_eq!(backend.execute(&on_branch)?, receipt);
+    assert_eq!(
+        backend.execute(&on_branch),
+        Err(EffectFailure::Uncertain(UncertainReason::DispatchEnded))
+    );
     assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 2);
     assert_eq!(stops(&sim), 0);
     Ok(())
@@ -3261,12 +3348,12 @@ fn a_lost_launch_whose_worker_exited_is_reconciled_without_a_second_worker() -> 
     // Running the effect again reconciles first: the lookup finds the
     // original Dispatch although its Task is `ready` again.
     let again = run_effect(&fixture.store, &backend, &grants, launch.clone(), &clock)?;
-    let EffectState::Applied { receipt, .. } = again.state() else {
-        return Err("the launch was not resolved as applied".into());
+    let EffectState::Ended { receipt, .. } = again.state() else {
+        return Err("the failed dispatch was not resolved as ended".into());
     };
     assert_eq!(launched(receipt)?.handle.as_str(), dispatch);
     let once_more = run_effect(&fixture.store, &backend, &grants, launch, &clock)?;
-    assert!(matches!(once_more.state(), EffectState::Applied { .. }));
+    assert!(matches!(once_more.state(), EffectState::Ended { .. }));
     assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
     assert_eq!(sim.state().workers.len(), 1, "no second worker");
     Ok(())

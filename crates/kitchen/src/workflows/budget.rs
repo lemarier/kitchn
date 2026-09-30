@@ -234,6 +234,7 @@ fn pause_all(
             EffectState::Applied { .. } => actions.push(PassAction::Repaused(exhaustion)),
             EffectState::Intended
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::NotApplied { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. } => {
@@ -975,6 +976,7 @@ fn deliver(
         }
         EffectState::Intended
         | EffectState::Uncertain { .. }
+        | EffectState::Ended { .. }
         | EffectState::NotApplied { .. }
         | EffectState::Unresolvable { .. }
         | EffectState::Waived { .. } => Ok(Delivery::NotDelivered {

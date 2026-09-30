@@ -273,6 +273,13 @@ pub enum EffectState {
         /// When recorded.
         at: Timestamp,
     },
+    /// A launch made a dispatch, but the dispatch stopped or failed.
+    Ended {
+        /// The dispatch and resources this attempt created.
+        receipt: Receipt,
+        /// When recorded.
+        at: Timestamp,
+    },
     /// Definitely not applied.
     NotApplied {
         /// Why.
@@ -304,7 +311,7 @@ impl EffectState {
     #[must_use]
     pub const fn is_resolved(&self) -> bool {
         match self {
-            Self::Applied { .. } | Self::NotApplied { .. } => true,
+            Self::Applied { .. } | Self::Ended { .. } | Self::NotApplied { .. } => true,
             Self::Intended
             | Self::Uncertain { .. }
             | Self::Unresolvable { .. }
@@ -324,6 +331,7 @@ impl EffectState {
             | Self::Intended
             | Self::Uncertain { .. }
             | Self::Applied { .. }
+            | Self::Ended { .. }
             | Self::NotApplied { .. }
             | Self::Unresolvable { .. } => None,
         }
@@ -337,6 +345,7 @@ impl EffectState {
             Self::Intended
             | Self::Uncertain { .. }
             | Self::Applied { .. }
+            | Self::Ended { .. }
             | Self::NotApplied { .. } => false,
         }
     }
@@ -346,7 +355,7 @@ impl EffectState {
         match self {
             Self::Intended | Self::Uncertain { .. } => true,
             Self::Unresolvable { .. } | Self::Waived { .. } => self.is_handed_over(current),
-            Self::Applied { .. } | Self::NotApplied { .. } => false,
+            Self::Applied { .. } | Self::Ended { .. } | Self::NotApplied { .. } => false,
         }
     }
 
@@ -406,6 +415,8 @@ pub struct RiskDecision {
 pub enum EffectOutcome {
     /// Applied, with a receipt.
     Applied(Receipt),
+    /// A launch dispatch stopped or failed; its resources remain owned.
+    Ended(Receipt),
     /// Definitely not applied.
     NotApplied(NotAppliedReason),
     /// Still unknown.
@@ -841,6 +852,7 @@ impl TaskRecord {
         }
         let reconciled = match &existing.state {
             EffectState::Applied { .. }
+            | EffectState::Ended { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. } => {
                 return Ok(EffectStart::Resolved(existing.clone()));
@@ -940,6 +952,7 @@ impl TaskRecord {
                 EffectState::Intended
                 | EffectState::Uncertain { .. }
                 | EffectState::Applied { .. }
+                | EffectState::Ended { .. }
                 | EffectState::Unresolvable { .. }
                 | EffectState::Waived { .. } => submitted.add(effect.request.effect().executor()),
             }
@@ -1987,7 +2000,7 @@ impl StoreState {
             .ok_or(Error::State(StateError::EffectNotFound(seq)))?;
         let stale = effect.submissions != submission
             && match outcome {
-                EffectOutcome::Applied(_) => false,
+                EffectOutcome::Applied(_) | EffectOutcome::Ended(_) => false,
                 EffectOutcome::NotApplied(_)
                 | EffectOutcome::Uncertain(_)
                 | EffectOutcome::Unresolvable => true,
@@ -2055,6 +2068,13 @@ impl StoreState {
                 | EffectState::Uncertain { .. }
                 | EffectState::Unresolvable { .. }
                 | EffectState::Waived { .. },
+                Found::Ended(receipt),
+            ) => Some(EffectState::Ended { receipt, at: now }),
+            (
+                EffectState::Intended
+                | EffectState::Uncertain { .. }
+                | EffectState::Unresolvable { .. }
+                | EffectState::Waived { .. },
                 Found::Absent,
             ) => Some(EffectState::NotApplied {
                 reason: NotAppliedReason::ConfirmedAbsent,
@@ -2063,9 +2083,11 @@ impl StoreState {
             (EffectState::Applied { receipt, .. }, Found::Applied(found)) if *receipt == found => {
                 None
             }
+            (EffectState::Ended { receipt, .. }, Found::Ended(found)) if *receipt == found => None,
             (EffectState::NotApplied { .. }, Found::Absent) => None,
-            (EffectState::Applied { .. }, Found::Applied(_) | Found::Absent)
-            | (EffectState::NotApplied { .. }, Found::Applied(_)) => {
+            (EffectState::Applied { .. }, Found::Applied(_) | Found::Ended(_) | Found::Absent)
+            | (EffectState::Ended { .. }, Found::Applied(_) | Found::Ended(_) | Found::Absent)
+            | (EffectState::NotApplied { .. }, Found::Applied(_) | Found::Ended(_)) => {
                 return fail(StateError::ConflictingOutcome(seq));
             }
         };
@@ -2229,6 +2251,7 @@ impl StoreState {
             | EffectState::Intended
             | EffectState::Uncertain { .. }
             | EffectState::Applied { .. }
+            | EffectState::Ended { .. }
             | EffectState::NotApplied { .. } => {
                 return fail(StateError::NotHandedOver(seq));
             }
@@ -3538,6 +3561,10 @@ fn apply_outcome(
         ) => Some(EffectState::Applied { receipt, at: now }),
         (
             EffectState::Unresolvable { .. } | EffectState::Waived { .. },
+            EffectOutcome::Ended(receipt),
+        ) => Some(EffectState::Ended { receipt, at: now }),
+        (
+            EffectState::Unresolvable { .. } | EffectState::Waived { .. },
             EffectOutcome::NotApplied(reason),
         ) => Some(EffectState::NotApplied { reason, at: now }),
         (EffectState::Applied { receipt, .. }, EffectOutcome::Applied(reported))
@@ -3545,16 +3572,24 @@ fn apply_outcome(
         {
             return fail(StateError::ConflictingOutcome(seq));
         }
-        (EffectState::Applied { .. }, EffectOutcome::NotApplied(_))
-        | (EffectState::NotApplied { .. }, EffectOutcome::Applied(_)) => {
+        (EffectState::Applied { .. }, EffectOutcome::NotApplied(_) | EffectOutcome::Ended(_))
+        | (EffectState::Ended { .. }, EffectOutcome::Applied(_) | EffectOutcome::NotApplied(_))
+        | (EffectState::NotApplied { .. }, EffectOutcome::Applied(_) | EffectOutcome::Ended(_)) => {
+            return fail(StateError::ConflictingOutcome(seq));
+        }
+        (EffectState::Ended { receipt, .. }, EffectOutcome::Ended(reported))
+            if *receipt != reported =>
+        {
             return fail(StateError::ConflictingOutcome(seq));
         }
         (
             EffectState::Applied { .. }
+            | EffectState::Ended { .. }
             | EffectState::NotApplied { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. },
             EffectOutcome::Applied(_)
+            | EffectOutcome::Ended(_)
             | EffectOutcome::NotApplied(_)
             | EffectOutcome::Uncertain(_)
             | EffectOutcome::Unresolvable,
@@ -3569,6 +3604,7 @@ fn apply_outcome(
 fn state_for(outcome: EffectOutcome, at: Timestamp) -> EffectState {
     match outcome {
         EffectOutcome::Applied(receipt) => EffectState::Applied { receipt, at },
+        EffectOutcome::Ended(receipt) => EffectState::Ended { receipt, at },
         EffectOutcome::NotApplied(reason) => EffectState::NotApplied { reason, at },
         EffectOutcome::Uncertain(reason) => EffectState::Uncertain { reason, at },
         EffectOutcome::Unresolvable => EffectState::Unresolvable { at },

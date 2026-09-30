@@ -123,12 +123,20 @@ pub enum OrcaError {
     StateMismatch,
     /// The launched worker's confirmed branch violates Orca's naming rule
     /// for the requested branch.
-    #[error("launched branch {actual:?} is not the requested {requested}")]
+    #[error(
+        "launched branch {actual:?} is not the requested {requested}; check that --branch-prefix matches Orca's Git branch-prefix setting"
+    )]
     BranchMismatch {
         /// The branch the caller wanted.
         requested: String,
         /// The branch Orca created, if the receipt names one.
         actual: Option<String>,
+    },
+    /// The requested branch may exist, but its launch dispatch has ended.
+    #[error("launch dispatch ended for requested branch {requested}; start a new attempt")]
+    LaunchEnded {
+        /// The branch the caller wanted.
+        requested: String,
     },
     /// The launch has no confirmed branch after the bounded observation.
     #[error("launched branch is unconfirmed for requested {requested}")]
@@ -229,6 +237,7 @@ impl OrcaError {
             | Self::ScheduleDiffers { .. }
             | Self::ReservationBusy
             | Self::BranchMismatch { .. }
+            | Self::LaunchEnded { .. }
             | Self::BranchUnconfirmed { .. }
             | Self::BranchUnconfirmedRunning { .. }
             | Self::BranchTaken { .. }

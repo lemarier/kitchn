@@ -1262,6 +1262,7 @@ impl StackBoundary<'_> {
             EffectState::NotApplied { reason, .. } => Opened::NotApplied(*reason),
             EffectState::Intended
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. } => Opened::Uncertain,
         })

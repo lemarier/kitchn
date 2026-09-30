@@ -3,8 +3,8 @@
 use crate::{
     Error, TaskId,
     contracts::{
-        Clock, ContractError, EffectExecutor, EffectFailure, Fence, HouseGrants, IdempotencyKey,
-        Lookup, NotAppliedReason, Receipt, UncertainReason,
+        Clock, ContractError, Effect, EffectExecutor, EffectFailure, Fence, HouseGrants,
+        IdempotencyKey, Lookup, NotAppliedReason, Operation, Receipt, UncertainReason,
     },
     state::{
         EffectOutcome, EffectPlan, EffectRecord, EffectStart, HouseStore, StateError, TaskState,
@@ -88,8 +88,16 @@ fn look_up(executor: &dyn EffectExecutor, effect: &EffectRecord) -> EffectOutcom
     }
     match executor.lookup(effect.request()) {
         Ok(Lookup::Applied(receipt)) => EffectOutcome::Applied(receipt),
+        Ok(Lookup::Ended(receipt))
+            if matches!(
+                effect.request().effect(),
+                Effect::Worker(Operation::LaunchWorker { .. })
+            ) =>
+        {
+            EffectOutcome::Ended(receipt)
+        }
         Ok(Lookup::Absent) => EffectOutcome::NotApplied(NotAppliedReason::ConfirmedAbsent),
-        Ok(Lookup::Unknown) | Err(_) => {
+        Ok(Lookup::Ended(_) | Lookup::Unknown) | Err(_) => {
             EffectOutcome::Uncertain(UncertainReason::LookupInconclusive)
         }
     }
@@ -112,6 +120,8 @@ pub(crate) struct SettledLookup {
 pub(crate) enum Found {
     /// The backend returned this receipt for the key.
     Applied(Receipt),
+    /// The launch's worker stopped or failed.
+    Ended(Receipt),
     /// The backend proved the key was never applied.
     Absent,
 }
@@ -140,6 +150,15 @@ fn prove(executor: &dyn EffectExecutor, effect: &EffectRecord) -> Option<Settled
     }
     let found = match executor.lookup(effect.request()) {
         Ok(Lookup::Applied(receipt)) => Found::Applied(receipt),
+        Ok(Lookup::Ended(receipt))
+            if matches!(
+                effect.request().effect(),
+                Effect::Worker(Operation::LaunchWorker { .. })
+            ) =>
+        {
+            Found::Ended(receipt)
+        }
+        Ok(Lookup::Ended(_)) => return None,
         Ok(Lookup::Absent) => Found::Absent,
         Ok(Lookup::Unknown) | Err(_) => return None,
     };

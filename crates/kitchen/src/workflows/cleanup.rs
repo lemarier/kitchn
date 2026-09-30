@@ -1583,6 +1583,7 @@ impl Run<'_> {
             }
             EffectState::Intended
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. } => {
                 store.relinquish(&id, fence, self.clock.now())?;
@@ -2163,7 +2164,9 @@ fn created_workers(task: &TaskRecord) -> impl Iterator<Item = &ResourceRef> {
     task.effects()
         .iter()
         .filter_map(|effect| match effect.state() {
-            EffectState::Applied { receipt, .. } => Some(receipt.created()),
+            EffectState::Applied { receipt, .. } | EffectState::Ended { receipt, .. } => {
+                Some(receipt.created())
+            }
             EffectState::Intended
             | EffectState::Uncertain { .. }
             | EffectState::NotApplied { .. }

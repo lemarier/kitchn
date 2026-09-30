@@ -48,8 +48,8 @@ use crate::{
         DecisionOwner, Disposition, Effect, EffectExecutor, Evidence, EvidenceKind,
         EvidenceRevision, EvidenceVerdict, ExternalRef, FailureClass, Fence, HouseGrants, LeaseTtl,
         NotAppliedReason, Operation, Permission, PostingBudget, ResourceKind, ResourceRef,
-        RogerAsk, RogerEffect, Settlement, Text, Timestamp, Trigger, WorkerBackend, WorkerOutcome,
-        WorkerState, Workspace,
+        RogerAsk, RogerEffect, Settlement, Text, Timestamp, Trigger, UncertainReason,
+        WorkerBackend, WorkerOutcome, WorkerState, Workspace,
     },
     state::{
         AttemptRecord, AttemptState, ConsumerState, Consumption, EffectPlan, EffectRecord,
@@ -314,6 +314,16 @@ pub enum LaunchOutcome {
         /// What happens next.
         disposition: Disposition,
     },
+    /// This attempt created a dispatch that stopped or failed before acceptance.
+    Ended {
+        /// The ended worker.
+        worker: ResourceRef,
+        /// What happens next.
+        disposition: Disposition,
+    },
+    /// The worker was stopped because Orca's Git branch-prefix setting
+    /// disagreed with the configured `--branch-prefix`.
+    BranchPrefixMismatch,
     /// The outcome is unknown. Never launch again; reconcile first.
     Uncertain,
     /// Unresolved effects must be reconciled before a new attempt.
@@ -712,6 +722,26 @@ pub(crate) fn launch_rendered(
         Err(error) => return Err(error),
     };
     match record.state() {
+        EffectState::Ended { receipt, .. } => {
+            let Some(worker) = receipt
+                .created()
+                .iter()
+                .find(|resource| resource.kind == ResourceKind::Worker)
+            else {
+                return Ok(LaunchOutcome::Uncertain);
+            };
+            let disposition = ctx.store.finish_attempt(
+                task,
+                fence,
+                attempt,
+                AttemptOutcome::Failed(FailureClass::Retryable),
+                ctx.clock.now(),
+            )?;
+            Ok(LaunchOutcome::Ended {
+                worker: worker.clone(),
+                disposition,
+            })
+        }
         EffectState::Applied { receipt, .. } => {
             let Some(worker) = receipt
                 .created()
@@ -770,6 +800,10 @@ pub(crate) fn launch_rendered(
                 disposition,
             })
         }
+        EffectState::Uncertain {
+            reason: UncertainReason::BranchPrefixMismatchStopped,
+            ..
+        } => Ok(LaunchOutcome::BranchPrefixMismatch),
         EffectState::Intended
         | EffectState::Uncertain { .. }
         | EffectState::Unresolvable { .. }
@@ -820,6 +854,7 @@ fn stop_worker(
         EffectState::NotApplied { .. } => Stop::Refused,
         EffectState::Intended
         | EffectState::Uncertain { .. }
+        | EffectState::Ended { .. }
         | EffectState::Unresolvable { .. }
         | EffectState::Waived { .. } => Stop::Unresolved,
     })
@@ -1164,6 +1199,33 @@ fn supervise_step(
     if let TaskState::Settled { settlement, .. } = record.state() {
         return Ok(Supervision::Settled(*settlement));
     }
+    if let Some(running) = record
+        .attempts()
+        .last()
+        .filter(|attempt| attempt.fence() == fence && attempt.state() == AttemptState::Running)
+        && record.effects().iter().any(|effect| {
+            effect.request().attempt() == running.number()
+                && matches!(
+                    (effect.request().effect(), effect.state()),
+                    (
+                        Effect::Worker(Operation::LaunchWorker { .. }),
+                        EffectState::Ended { .. }
+                    )
+                )
+        })
+    {
+        ctx.store.finish_attempt(
+            task,
+            fence,
+            running.number(),
+            AttemptOutcome::Failed(FailureClass::Retryable),
+            ctx.clock.now(),
+        )?;
+        return Ok(match ctx.store.task(task)?.state() {
+            TaskState::Settled { settlement, .. } => Supervision::Settled(*settlement),
+            TaskState::Claimed { .. } | TaskState::Open => Supervision::AwaitingLaunch,
+        });
+    }
     // A finished or cancelled latest attempt already accounted for its
     // worker; only a new launch has something to supervise. An interrupted
     // attempt (relinquish, takeover) may still have a live worker: this
@@ -1419,6 +1481,7 @@ fn park(
                 EffectState::NotApplied { .. } => Supervision::Escalate(Escalation::ResumeRefused),
                 EffectState::Intended
                 | EffectState::Uncertain { .. }
+                | EffectState::Ended { .. }
                 | EffectState::Unresolvable { .. }
                 | EffectState::Waived { .. } => Supervision::Reconciling { unresolved: 1 },
             })
@@ -1460,6 +1523,7 @@ fn environment(
             Some(
                 EffectState::Intended
                 | EffectState::Uncertain { .. }
+                | EffectState::Ended { .. }
                 | EffectState::Unresolvable { .. }
                 | EffectState::Waived { .. },
             ) => Supervision::Reconciling { unresolved: 1 },
@@ -1506,6 +1570,7 @@ pub fn retry_validation(ctx: &Context<'_>, task: &TaskId, fence: Fence) -> Resul
         EffectState::NotApplied { .. } => Revalidation::NotApplied,
         EffectState::Intended
         | EffectState::Uncertain { .. }
+        | EffectState::Ended { .. }
         | EffectState::Unresolvable { .. }
         | EffectState::Waived { .. } => Revalidation::Uncertain,
     })
@@ -1627,6 +1692,7 @@ pub fn send_follow_up(
             EffectState::NotApplied { .. } => FollowUpRoute::Queued { id },
             EffectState::Intended
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. } => FollowUpRoute::Uncertain,
         });
@@ -1675,6 +1741,7 @@ pub fn send_follow_up(
         EffectState::NotApplied { .. } => FollowUpRoute::Queued { id },
         EffectState::Intended
         | EffectState::Uncertain { .. }
+        | EffectState::Ended { .. }
         | EffectState::Unresolvable { .. }
         | EffectState::Waived { .. } => FollowUpRoute::Uncertain,
     })
@@ -1738,6 +1805,7 @@ fn deliver_held(
             EffectState::Applied { .. } | EffectState::NotApplied { .. } => {}
             EffectState::Intended
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. } => {
                 return Ok(Some(Supervision::Reconciling { unresolved: 1 }));
@@ -1935,6 +2003,7 @@ fn record_reply(
             Some(RecordedAnswer::Person { .. }),
             EffectState::Intended
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::NotApplied { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. },
@@ -1989,6 +2058,7 @@ pub fn handle_question(
             }
             EffectState::Intended
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. } => QuestionRoute::Uncertain,
         });
@@ -2042,6 +2112,7 @@ pub fn handle_question(
                 }
                 EffectState::Intended
                 | EffectState::Uncertain { .. }
+                | EffectState::Ended { .. }
                 | EffectState::Unresolvable { .. }
                 | EffectState::Waived { .. } => QuestionRoute::Uncertain,
             })
@@ -2058,6 +2129,7 @@ pub fn handle_question(
             Some(
                 EffectState::Intended
                 | EffectState::Uncertain { .. }
+                | EffectState::Ended { .. }
                 | EffectState::Unresolvable { .. }
                 | EffectState::Waived { .. },
             ) => QuestionRoute::Uncertain,
@@ -2107,6 +2179,7 @@ pub fn handle_question(
                 }
                 EffectState::Intended
                 | EffectState::Uncertain { .. }
+                | EffectState::Ended { .. }
                 | EffectState::Unresolvable { .. }
                 | EffectState::Waived { .. } => QuestionRoute::Uncertain,
             })

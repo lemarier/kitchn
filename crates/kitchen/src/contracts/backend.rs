@@ -392,10 +392,14 @@ pub enum UncertainReason {
     ResponseLost,
     /// Kitchen stopped a launched worker after confirming a different branch.
     BranchMismatchStopped,
+    /// Orca's Git branch-prefix setting differs from Kitchen's configured prefix.
+    BranchPrefixMismatchStopped,
     /// Kitchen stopped a launched worker because its branch was never confirmed.
     BranchUnconfirmedStopped,
     /// Kitchen could not confirm the stop of a worker on an unsafe branch.
     BranchStopUnconfirmed,
+    /// The dispatch for this launch key has stopped or failed.
+    DispatchEnded,
     /// A reconciliation lookup could not establish the outcome.
     LookupInconclusive,
     /// The backend offers no lookup, so the outcome cannot be established.
@@ -413,8 +417,10 @@ impl UncertainReason {
             | Self::Transport
             | Self::ResponseLost
             | Self::BranchMismatchStopped
+            | Self::BranchPrefixMismatchStopped
             | Self::BranchUnconfirmedStopped
-            | Self::BranchStopUnconfirmed => false,
+            | Self::BranchStopUnconfirmed
+            | Self::DispatchEnded => false,
         }
     }
 }
@@ -435,6 +441,9 @@ pub enum EffectFailure {
 pub enum Lookup {
     /// The effect was applied.
     Applied(Receipt),
+    /// The launch created a dispatch, but that dispatch stopped or failed.
+    /// Its receipt retains ownership evidence; it must not be adopted.
+    Ended(Receipt),
     /// The provider can prove it never applied this key and that no earlier
     /// invocation can still apply it.
     Absent,

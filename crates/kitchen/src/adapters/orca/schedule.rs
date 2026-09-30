@@ -877,6 +877,7 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::WrongBranchRunning { .. } => {
             EffectFailure::Uncertain(UncertainReason::ResponseLost)
         }
+        OrcaError::LaunchEnded { .. } => EffectFailure::Uncertain(UncertainReason::DispatchEnded),
     }
 }
 

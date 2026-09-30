@@ -772,7 +772,7 @@ impl<'a> Runner<'a> {
             return Ok(());
         }
         match self.executor.lookup(request) {
-            Ok(Lookup::Applied(_)) => fail(check, "refused request was applied"),
+            Ok(Lookup::Applied(_) | Lookup::Ended(_)) => fail(check, "refused request was applied"),
             Ok(Lookup::Absent | Lookup::Unknown) => Ok(()),
             Err(_) => fail(check, "lookup failed after a refused request"),
         }
@@ -888,7 +888,9 @@ impl<'a> Runner<'a> {
                 self.record(check, CheckResult::Passed);
                 Ok(())
             }
-            Ok(Lookup::Applied(_)) => fail(check, "never-used key reported as applied"),
+            Ok(Lookup::Applied(_) | Lookup::Ended(_)) => {
+                fail(check, "never-used key reported as applied")
+            }
             Err(_) => fail(check, "declared lookup was unavailable"),
         }
     }
@@ -934,6 +936,7 @@ impl<'a> Runner<'a> {
                 Ok(())
             }
             Ok(Lookup::Applied(_)) => fail(check, "lookup returned a different receipt"),
+            Ok(Lookup::Ended(_)) => fail(check, "applied probe reported as ended"),
             Ok(Lookup::Absent) => fail(check, "applied probe reported as absent"),
             Ok(Lookup::Unknown) | Err(_) => fail(check, "applied probe could not be looked up"),
         }

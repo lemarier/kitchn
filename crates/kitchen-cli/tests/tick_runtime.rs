@@ -572,6 +572,12 @@ fn nondefault_pickup_settings_travel_through_a_printed_trigger() -> TestResult {
         "{}",
         text(&configured.stderr)
     );
+    assert!(
+        text(&configured.stdout)
+            .contains("--branch-prefix must equal the person's Orca Git branch-prefix setting"),
+        "{}",
+        text(&configured.stdout)
+    );
     let trigger = house.trigger(&[])?;
     assert_eq!(trigger.status.code(), Some(0), "{}", text(&trigger.stderr));
     let printed = text(&trigger.stdout);

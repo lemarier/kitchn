@@ -243,6 +243,10 @@ pub struct PassRun {
 
 /// Runs one bounded workflow pass. The tick calls it only while it holds the
 /// pass's lease; the pass takes its own workflow lease for its work.
+///
+/// A pass should finish within [`PASS_LEASE`]. One that panics, or runs
+/// longer, leaves its run open; the next tick after the lease expires records
+/// it as uncertain.
 pub trait PassRunner {
     /// Run `pass` once and report how it ended. Failures are outcomes, not
     /// errors, so the ledger always records them.

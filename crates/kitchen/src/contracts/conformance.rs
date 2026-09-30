@@ -505,26 +505,28 @@ fn worker_checks(
             "receipt names no worker on this backend",
         );
     };
-    // Exactly the requested branch: created once on this backend, and no
-    // other branch created or touched.
+    // One branch accepted by this backend: created once here, and no other
+    // branch created or touched.
     let requested = runner.branch()?;
     let mut branches = receipt
         .created()
         .iter()
         .chain(receipt.touched())
         .filter(|resource| resource.kind == ResourceKind::Branch);
-    let exact = matches!(
-        (branches.next(), branches.next()),
-        (Some(branch), None) if &branch.backend == own
-            && branch.handle.as_str() == requested.as_str()
-            && receipt.created().contains(branch)
-    );
-    if !exact {
+    let actual = match (branches.next(), branches.next()) {
+        (Some(branch), None) if &branch.backend == own && receipt.created().contains(branch) => {
+            BranchName::new(branch.handle.as_str()).ok()
+        }
+        _ => None,
+    };
+    let Some(actual) = actual
+        .filter(|actual| backend.accepts_launch_branch(&requested, actual, &Workspace::Isolated))
+    else {
         return fail(
             Check::LaunchReceipt,
-            "receipt does not name exactly the requested branch",
+            "receipt does not name an accepted branch",
         );
-    }
+    };
     runner.record(Check::LaunchReceipt, CheckResult::Passed);
     runner.selection_refused()?;
     runner.observable(backend, &worker)?;
@@ -534,7 +536,7 @@ fn worker_checks(
     let branch = ResourceRef {
         kind: ResourceKind::Branch,
         backend: own.clone(),
-        handle: ExternalRef::new(requested.as_str())
+        handle: ExternalRef::new(actual.as_str())
             .or_else(|_| fail(Check::Fixture, "branch is not a valid reference"))?,
     };
     runner.release_keeps_branch(backend, &worker, &branch)?;

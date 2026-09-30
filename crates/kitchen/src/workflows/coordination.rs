@@ -684,7 +684,7 @@ pub(crate) fn launch_rendered(
     let revision = record.evidence().revision();
     let effect = Effect::Worker(Operation::LaunchWorker {
         role,
-        workspace,
+        workspace: workspace.clone(),
         brief: text,
         branch: Some(branch.clone()),
         // The store refuses a launch that differs from the task's selection
@@ -721,14 +721,28 @@ pub(crate) fn launch_rendered(
                 // Accepted without a worker handle: nothing to supervise.
                 return Ok(LaunchOutcome::Uncertain);
             };
-            // Defense in depth: the backend must create exactly the
-            // requested branch, and a receipt naming another one stops the
-            // worker before it works.
-            let wrong_branch = receipt.created().iter().any(|resource| {
-                resource.kind == ResourceKind::Branch && resource.handle.as_str() != branch.as_str()
+            // The backend checks its own branch naming rule before returning
+            // an applied receipt. Require a valid reported branch here too;
+            // later push and gate decisions use this durable actual name.
+            let mut branches = receipt
+                .created()
+                .iter()
+                .filter(|resource| resource.kind == ResourceKind::Branch);
+            let actual = match (branches.next(), branches.next()) {
+                (Some(resource), None) if resource.backend == ctx.backend.descriptor().backend => {
+                    BranchName::new(resource.handle.as_str()).ok()
+                }
+                _ => None,
+            };
+            let wrong_branch = actual.as_ref().is_none_or(|actual| {
+                !ctx.backend
+                    .accepts_launch_branch(branch, actual, &workspace)
             });
             if wrong_branch {
                 return stop_misplaced(ctx, task, fence, attempt, worker);
+            }
+            if stacked && let Some(actual) = actual.as_ref() {
+                BranchFact::Stacked.record(ctx.store, task, fence, actual, ctx.clock.now())?;
             }
             Ok(LaunchOutcome::Accepted {
                 attempt,
@@ -848,7 +862,7 @@ pub struct WorkerView {
     pub attempt: AttemptNumber,
     /// When the launch was confirmed.
     pub launched_at: Timestamp,
-    /// The branch the launch named.
+    /// The branch the applied receipt confirmed.
     pub branch: Option<BranchName>,
 }
 
@@ -861,7 +875,7 @@ pub(crate) fn launched_workers(
         .iter()
         .filter_map(|effect| match (effect.request().effect(), effect.state()) {
             (
-                Effect::Worker(Operation::LaunchWorker { branch, .. }),
+                Effect::Worker(Operation::LaunchWorker { .. }),
                 EffectState::Applied { receipt, at },
             ) => receipt
                 .created()
@@ -871,7 +885,11 @@ pub(crate) fn launched_workers(
                     worker: worker.clone(),
                     attempt: effect.request().attempt(),
                     launched_at: *at,
-                    branch: branch.clone(),
+                    branch: receipt
+                        .created()
+                        .iter()
+                        .find(|resource| resource.kind == ResourceKind::Branch)
+                        .and_then(|resource| BranchName::new(resource.handle.as_str()).ok()),
                 }),
             _ => None,
         })

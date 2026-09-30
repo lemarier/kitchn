@@ -121,14 +121,28 @@ pub enum OrcaError {
     /// After a change, Orca reported a different state than requested.
     #[error("schedule state read back does not match the request")]
     StateMismatch,
-    /// The launched worker's branch is not the one requested. Orca prefixes
-    /// the name it is given; rename the branch before the first push.
+    /// The launched worker's confirmed branch violates Orca's naming rule
+    /// for the requested branch.
     #[error("launched branch {actual:?} is not the requested {requested}")]
     BranchMismatch {
         /// The branch the caller wanted.
         requested: String,
         /// The branch Orca created, if the receipt names one.
         actual: Option<String>,
+    },
+    /// The launch has no confirmed branch after the bounded observation.
+    #[error("launched branch is unconfirmed for requested {requested}")]
+    BranchUnconfirmed {
+        /// The branch the caller wanted.
+        requested: String,
+    },
+    /// The branch is unconfirmed and the worker may still be running.
+    #[error("worker {worker} still runs with an unconfirmed branch for requested {requested}")]
+    BranchUnconfirmedRunning {
+        /// The branch the caller wanted.
+        requested: String,
+        /// The Orca Dispatch that still needs a confirmed stop.
+        worker: String,
     },
     /// The launched worker's branch is not the one requested, and no stop
     /// took effect: the worker still runs on that branch and could push to
@@ -215,6 +229,8 @@ impl OrcaError {
             | Self::ScheduleDiffers { .. }
             | Self::ReservationBusy
             | Self::BranchMismatch { .. }
+            | Self::BranchUnconfirmed { .. }
+            | Self::BranchUnconfirmedRunning { .. }
             | Self::BranchTaken { .. }
             | Self::WrongBranchRunning { .. }
             | Self::InstallUncertain

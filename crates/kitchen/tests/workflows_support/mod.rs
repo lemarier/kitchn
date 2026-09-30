@@ -9,11 +9,11 @@ use std::time::Duration;
 use kitchen::{
     BackendId, ConsumerId, TaskId,
     contracts::{
-        BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, Claimant, Consent,
-        Effect, EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef,
-        HouseGrants, IssueNumber, Lookup, Operation, Permission, Provenance, Receipt, Repository,
-        ResourceKind, ResourceRef, RetryPolicy, TaskAuthority, Text, Timestamp, WorkerBackend,
-        WorkerState, fake::FakeBackend,
+        BackendDescriptor, BackendUnavailable, BranchName, Capability, CapabilitySet, Claimant,
+        Consent, Effect, EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision,
+        ExternalRef, HouseGrants, IssueNumber, Lookup, Operation, Permission, Provenance, Receipt,
+        Repository, ResourceKind, ResourceRef, RetryPolicy, TaskAuthority, Text, Timestamp,
+        WorkerBackend, WorkerState, fake::FakeBackend,
     },
     workflows::{
         coordination::{ConsentSource, Context, Standing, SupervisionPolicy},
@@ -256,6 +256,8 @@ pub fn under_consumer(
 pub struct ReportsBranch<'a> {
     pub inner: &'a FakeBackend,
     pub branch: &'a str,
+    /// A simulated backend rule for its own branch prefix.
+    pub accepted_prefix: Option<&'a str>,
     /// Refuse every stop request, as a backend that cannot reach the worker.
     pub refuse_stop: bool,
 }
@@ -287,6 +289,7 @@ impl EffectExecutor for ReportsBranch<'_> {
             EffectFailure::NotApplied(kitchen::contracts::NotAppliedReason::Rejected)
         })?;
         let mut created = receipt.created().to_vec();
+        created.retain(|resource| resource.kind != ResourceKind::Branch);
         created.push(ResourceRef {
             kind: ResourceKind::Branch,
             backend: self.inner.descriptor().backend.clone(),
@@ -306,6 +309,21 @@ impl EffectExecutor for ReportsBranch<'_> {
 }
 
 impl WorkerBackend for ReportsBranch<'_> {
+    fn accepts_launch_branch(
+        &self,
+        requested: &BranchName,
+        actual: &BranchName,
+        _workspace: &kitchen::contracts::Workspace,
+    ) -> bool {
+        requested == actual
+            || self.accepted_prefix.is_some_and(|prefix| {
+                requested
+                    .as_str()
+                    .rsplit_once('/')
+                    .is_some_and(|(_, name)| actual.as_str() == format!("{prefix}/{name}"))
+            })
+    }
+
     fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
         self.inner.observe_worker(worker)
     }

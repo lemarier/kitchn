@@ -319,6 +319,8 @@ pub struct SimState {
     pub start_state: &'static str,
     /// The prefix Orca puts before the name of a worktree it creates.
     pub branch_prefix: &'static str,
+    /// Number of branch-bearing reads before checkout becomes visible.
+    pub branch_reads_hidden: usize,
     /// The branch an existing worktree is on, when Orca reports one.
     pub existing_branch: Option<&'static str>,
     /// Worktrees Orca lists that no simulated worker created: id and branch.
@@ -377,6 +379,7 @@ impl Default for SimOrca {
                 retired: Vec::new(),
                 start_state: "ready",
                 branch_prefix: "lemarier/",
+                branch_reads_hidden: 0,
                 existing_branch: None,
                 worktrees: Vec::new(),
                 git_branches: Vec::new(),
@@ -727,6 +730,8 @@ impl SimState {
                 )
             }
             ["orchestration", "worker-show"] => {
+                let branch_visible = self.branch_reads_hidden == 0;
+                self.branch_reads_hidden = self.branch_reads_hidden.saturating_sub(1);
                 let dispatch = Self::flag(flags, "dispatch");
                 match self.workers.get(&dispatch) {
                     Some(worker) => ok(json!({
@@ -759,8 +764,8 @@ impl SimState {
                             "agentWait": if worker.waiting { json!({"source": "hook"}) } else { Value::Null },
                         },
                         "terminal": (worker.terminal_open
-                            && (worker.branch.is_some() || worker.preview.is_some()))
-                            .then(|| json!({"branch": worker.branch, "preview": worker.preview})),
+                            && ((branch_visible && worker.branch.is_some()) || worker.preview.is_some()))
+                            .then(|| json!({"branch": if branch_visible { worker.branch.as_ref() } else { None }, "preview": worker.preview})),
                         "terminalResource": {
                             "releaseState": worker.release_state,
                             "ownershipState": worker.ownership,
@@ -771,6 +776,8 @@ impl SimState {
                 }
             }
             ["worktree", "show"] => {
+                let branch_visible = self.branch_reads_hidden == 0;
+                self.branch_reads_hidden = self.branch_reads_hidden.saturating_sub(1);
                 let selector = Self::flag(flags, "worktree");
                 let id = selector.strip_prefix("id:").unwrap_or_default();
                 match self
@@ -779,7 +786,7 @@ impl SimState {
                     .find(|worker| worker.worktree.as_deref() == Some(id))
                 {
                     Some(worker) => ok(json!({
-                        "worktree": {"id": id, "branch": worker.branch},
+                        "worktree": {"id": id, "branch": if branch_visible { worker.branch.as_ref() } else { None }},
                     })),
                     None => refuse("worktree_not_found"),
                 }

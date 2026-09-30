@@ -921,7 +921,7 @@ impl WorkerBrief {
         let _ = writeln!(text, "Issue: {}", self.issue);
         let _ = writeln!(
             text,
-            "Branch: create exactly `{}`; do not add a prefix or rename it.",
+            "Branch: stay on the branch checked out in this worktree for requested work `{}`. Do not create or rename a branch. Use the checked-out branch for pushes and the pull request.",
             self.branch
         );
         match &self.base {

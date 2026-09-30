@@ -1890,10 +1890,7 @@ fn a_backend_reporting_another_branch_fails_the_contract() -> TestResult {
         .err()
         .ok_or("a launch on another branch passed")?;
     assert_eq!(failure.check, Check::LaunchReceipt);
-    assert_eq!(
-        failure.problem,
-        "receipt does not name exactly the requested branch"
-    );
+    assert_eq!(failure.problem, "receipt does not name an accepted branch");
     Ok(())
 }
 
@@ -2000,10 +1997,7 @@ fn a_backend_that_ignores_the_supplied_branch_fails_the_contract() -> TestResult
         .err()
         .ok_or("a launch on the default branch passed for a supplied one")?;
     assert_eq!(failure.check, Check::LaunchReceipt);
-    assert_eq!(
-        failure.problem,
-        "receipt does not name exactly the requested branch"
-    );
+    assert_eq!(failure.problem, "receipt does not name an accepted branch");
     Ok(())
 }
 

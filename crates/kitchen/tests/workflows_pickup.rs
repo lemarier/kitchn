@@ -612,7 +612,9 @@ fn a_brief_is_standalone_and_bound_to_its_task() -> TestResult {
     let spec = template()?.spec_for(&issue(5)?)?;
     let text = brief(5)?.render(&spec)?;
     let text = text.as_str();
-    assert!(text.contains("create exactly `lemarier/issue-5`"));
+    assert!(text.contains("stay on the branch checked out in this worktree"));
+    assert!(text.contains("requested work `lemarier/issue-5`"));
+    assert!(text.contains("Do not create or rename a branch"));
     assert!(text.contains(&provenance('a')?.kitchen.to_string()));
     assert!(text.contains(&common::commit('c')?.to_string()));
     assert!(text.contains("\"The firmware builds with the new driver.\""));

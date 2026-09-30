@@ -217,7 +217,7 @@ fn simulated_orca_passes_the_shared_contract_on_a_branch_under_its_own_prefix() 
 }
 
 #[test]
-fn a_supplied_branch_under_another_prefix_is_refused_before_anything_exists() -> TestResult {
+fn a_supplied_branch_label_uses_the_host_prefix() -> TestResult {
     for (host, supplied) in [
         ("lemarier/", "kitchen/kitchen-sim-run-1"),
         ("lemarier/", "lemarierx/kitchen-sim-run-1"),
@@ -233,21 +233,18 @@ fn a_supplied_branch_under_another_prefix_is_refused_before_anything_exists() ->
             },
             &sim,
         )?;
-        let failure = conformance::run_worker_on_branch(
+        let result = conformance::run_worker_on_branch(
             &backend,
             &conformance_fixture()?,
             &BranchName::new(supplied)?,
-        )
-        .err()
-        .ok_or("a launch on a branch the host cannot create passed")?;
-        assert_eq!(failure.check, Check::ProbeReceipt, "{host} {supplied}");
-        assert_eq!(failure.problem, "probe was refused", "{host} {supplied}");
+        );
+        assert!(result.is_ok(), "{host} {supplied}: {result:?}");
         assert!(
-            sim.calls_to(&["orchestration", "task-create"]).is_empty(),
+            !sim.calls_to(&["orchestration", "task-create"]).is_empty(),
             "{host} {supplied}"
         );
         assert!(
-            sim.calls_to(&["orchestration", "worker-start"]).is_empty(),
+            !sim.calls_to(&["orchestration", "worker-start"]).is_empty(),
             "{host} {supplied}"
         );
     }
@@ -269,19 +266,34 @@ fn a_host_whose_actual_prefix_differs_from_the_configured_one_fails_and_stops() 
     assert_eq!(failure.check, Check::ProbeReceipt);
     assert_eq!(failure.problem, "probe outcome was uncertain");
     assert_eq!(sim.calls_to(&["orchestration", "worker-stop"]).len(), 1);
+
+    // Even a textual match with the caller's logical label cannot override
+    // the host prefix that this backend was configured to verify.
+    let sim = SimOrca::default();
+    sim.state().branch_prefix = "kitchen/";
+    let backend = connect(&sim)?;
+    let launch = request(
+        launch_on("kitchen/issue-237", Workspace::Isolated)?,
+        "stale-prefix",
+    )?;
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchMismatchStopped
+        ))
+    );
+    assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
+    assert_eq!(stops(&sim), 1);
     Ok(())
 }
 
 #[test]
-fn the_shared_suite_is_refused_on_a_host_that_prefixes_otherwise() -> TestResult {
-    // Orca's CLI cannot create `kitchen/<tag>` on a host that prefixes
-    // `lemarier/`, so the exact-branch launch is refused before anything
-    // exists rather than run on another branch.
+fn the_shared_suite_accepts_the_host_prefix() -> TestResult {
+    // Orca uses the final requested component under its configured prefix.
     let sim = SimOrca::default();
     let backend = connect(&sim)?;
-    assert!(conformance::run_worker(&backend, &conformance_fixture()?).is_err());
-    assert!(sim.calls_to(&["orchestration", "task-create"]).is_empty());
-    assert!(sim.calls_to(&["orchestration", "worker-start"]).is_empty());
+    assert_shared_suite_passed(&conformance::run_worker(&backend, &conformance_fixture()?)?);
+    assert!(!sim.calls_to(&["orchestration", "worker-start"]).is_empty());
     Ok(())
 }
 
@@ -2406,8 +2418,67 @@ fn a_requested_branch_is_passed_as_the_name_that_yields_it() -> TestResult {
             launch_on("hotfix-2", Workspace::Isolated)?,
             "bare-prefixed"
         )?),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchMismatchStopped
+        ))
     );
+    Ok(())
+}
+
+#[test]
+fn a_prefixed_branch_is_reported_after_checkout_and_kept_in_the_receipt() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().branch_reads_hidden = 6;
+    let backend = connect(&sim)?;
+    let launch = request(
+        launch_on("kitchen/issue-237", Workspace::Isolated)?,
+        "delayed-prefix",
+    )?;
+    let receipt = backend.execute(&launch)?;
+    assert_eq!(
+        sim.calls_to(&["orchestration", "worker-start"])
+            .first()
+            .and_then(|call| flag(call, "name")),
+        Some("issue-237")
+    );
+    verify_branch(&receipt, "lemarier/issue-237")?;
+    assert_eq!(stops(&sim), 0);
+    assert_eq!(
+        backend.verify_launch_branch(launch.key(), &branch("kitchen/other")?),
+        Err(OrcaError::WrongBranchRunning {
+            requested: "kitchen/other".to_owned(),
+            actual: Some("lemarier/issue-237".to_owned()),
+            worker: launched(&receipt)?.handle.to_string(),
+        })
+    );
+    assert_eq!(backend.resolve(&launch)?, Lookup::Applied(receipt));
+    Ok(())
+}
+
+#[test]
+fn a_branch_that_never_appears_is_stopped_as_unconfirmed() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().branch_reads_hidden = usize::MAX;
+    let backend = connect(&sim)?;
+    let launch = request(
+        launch_on("kitchen/issue-237", Workspace::Isolated)?,
+        "never-reported",
+    )?;
+    assert_eq!(
+        backend.execute(&launch),
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchUnconfirmedStopped
+        ))
+    );
+    assert_eq!(stops(&sim), 1);
+    assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
+    assert_eq!(
+        backend.verify_launch_branch(launch.key(), &branch("kitchen/issue-237")?),
+        Err(OrcaError::BranchUnconfirmed {
+            requested: "kitchen/issue-237".to_owned(),
+        })
+    );
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
     Ok(())
 }
 
@@ -2423,7 +2494,9 @@ fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
     )?;
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost)),
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchMismatchStopped
+        )),
         "a worker on the wrong branch is not an accepted launch"
     );
     assert_eq!(stops(&sim), 1, "the worker is stopped before it can push");
@@ -2447,7 +2520,9 @@ fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
     // again; lookup does not call the launch applied.
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchMismatchStopped
+        ))
     );
     assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
     assert_eq!(sim.calls_to(&["orchestration", "task-create"]).len(), 1);
@@ -2456,9 +2531,8 @@ fn a_launch_on_another_branch_is_stopped_and_held() -> TestResult {
     // A key that never dispatched a launch cannot be confirmed either.
     assert_eq!(
         backend.verify_launch_branch(&key("never-launched")?, &branch("lemarier/issue-6")?),
-        Err(OrcaError::BranchMismatch {
+        Err(OrcaError::BranchUnconfirmed {
             requested: "lemarier/issue-6".to_owned(),
-            actual: None,
         })
     );
     Ok(())
@@ -2482,7 +2556,9 @@ fn a_stop_that_fails_is_retried_then_reported_as_a_running_mismatch() -> TestRes
     }
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchStopUnconfirmed
+        ))
     );
     assert_eq!(
         stops(&sim),
@@ -2515,7 +2591,9 @@ fn a_stop_that_fails_is_retried_then_reported_as_a_running_mismatch() -> TestRes
     assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchMismatchStopped
+        ))
     );
     assert_eq!(stops(&sim), 4);
     assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
@@ -2545,7 +2623,9 @@ fn a_stop_that_fails_once_is_retried_within_the_launch() -> TestResult {
     )?;
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchMismatchStopped
+        ))
     );
     assert_eq!(stops(&sim), 2);
     assert_eq!(
@@ -2682,7 +2762,9 @@ fn a_collision_is_stopped_released_and_reported_with_its_owner() -> TestResult {
     )?;
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchMismatchStopped
+        ))
     );
     assert_eq!(stops(&sim), 1);
     let releases = sim.calls_to(&["orchestration", "worker-release"]);
@@ -2726,7 +2808,9 @@ fn a_collision_is_stopped_released_and_reported_with_its_owner() -> TestResult {
     assert_eq!(backend.resolve(&launch)?, Lookup::Unknown);
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchMismatchStopped
+        ))
     );
     assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
     assert_eq!(stops(&sim), 1);
@@ -2763,7 +2847,9 @@ fn a_collision_whose_worker_keeps_running_is_reported_unsettled() -> TestResult 
     )?;
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchStopUnconfirmed
+        ))
     );
     // A worker that was not stopped keeps its terminal.
     assert!(
@@ -2780,7 +2866,9 @@ fn a_collision_whose_worker_keeps_running_is_reported_unsettled() -> TestResult 
     sim.state().release_action = "retained";
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchMismatchStopped
+        ))
     );
     let collision = backend
         .launch_collision(launch.key(), &branch("lemarier/issue-6")?)?
@@ -2908,8 +2996,8 @@ fn a_mismatch_under_another_prefix_is_not_a_collision() -> TestResult {
 fn a_branch_no_name_yields_is_refused_before_anything_is_created() -> TestResult {
     let sim = SimOrca::default();
     let backend = connect(&sim)?;
-    // Another prefix, more than one name, and no name after the prefix.
-    for (index, requested) in ["kitchen/x", "lemarier/area/topic", "lemarier"]
+    // More than one name or a name Orca would rewrite is refused.
+    for (index, requested) in ["lemarier/area/topic", "lemarier/-x", "lemarier/a@b"]
         .into_iter()
         .enumerate()
     {
@@ -2942,7 +3030,9 @@ fn an_existing_workspace_is_verified_not_renamed() -> TestResult {
     sim.state().existing_branch = Some("lemarier/somebody-else");
     assert_eq!(
         backend.execute(&request(existing.clone(), "repair-wrong")?),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchMismatchStopped
+        ))
     );
     assert_eq!(stops(&sim), 1);
 
@@ -2950,7 +3040,9 @@ fn an_existing_workspace_is_verified_not_renamed() -> TestResult {
     sim.state().existing_branch = None;
     assert_eq!(
         backend.execute(&request(existing, "repair-unknown")?),
-        Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+        Err(EffectFailure::Uncertain(
+            UncertainReason::BranchUnconfirmedStopped
+        ))
     );
     assert_eq!(stops(&sim), 2);
     Ok(())

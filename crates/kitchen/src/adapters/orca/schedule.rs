@@ -843,6 +843,8 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::ScheduleNotFound
         | OrcaError::DuplicateSchedules { .. }
         | OrcaError::BranchMismatch { .. }
+        | OrcaError::BranchUnconfirmed { .. }
+        | OrcaError::BranchUnconfirmedRunning { .. }
         | OrcaError::TrialRequiresPaused
         | OrcaError::ScheduleRequirementsUnknown
         | OrcaError::ScheduleRequirementsMismatch

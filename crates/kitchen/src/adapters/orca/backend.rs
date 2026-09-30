@@ -26,13 +26,13 @@
 //! A launch holds a per-key reservation (see [`OrcaConfig::runtime_dir`])
 //! across listing, creating, and starting, so concurrent first submissions of
 //! one key create one Task, not two. A launch with a requested branch
-//! ([`Operation::LaunchWorker`]'s `branch`) passes the worktree name that
-//! yields it under [`OrcaConfig::branch_prefix`], verifies the branch Orca
-//! created, and stops the worker it just started when they differ. Before
+//! ([`Operation::LaunchWorker`]'s `branch`) passes its final component as the
+//! worktree name, waits for Orca to report the prefixed branch, and stops
+//! the worker when it reports a different branch or none within the bound. Before
 //! the first start it refuses a branch an Orca worktree already has checked
 //! out, and it reports a collision Orca still made as a [`BranchCollision`].
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, thread, time::Duration};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -92,6 +92,8 @@ const SETTLED_WORKER_STATES: [&str; 4] = ["stopped", "failed", "succeeded", "aba
 /// Stop attempts for a worker a launch started on the wrong branch, before
 /// the launch is left held with the worker reported as running.
 const WRONG_BRANCH_STOP_ATTEMPTS: usize = 3;
+const BRANCH_POLLS: usize = 16;
+const BRANCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Most worktrees of the repository the branch check reads; a longer listing
 /// cannot show a branch is free, and the launch is refused.
@@ -135,12 +137,10 @@ pub struct OrcaConfig {
     pub repo: ExternalRef,
     /// Base ref for isolated workspaces; Orca's repository default when unset.
     pub base_branch: Option<ExternalRef>,
-    /// The prefix Orca's Git branch-prefix setting puts before the branch of
-    /// every worktree it creates, as a branch name without the trailing `/`;
-    /// `None` when the setting is off. Orca's CLI cannot override it, so a
-    /// launch's requested branch must be this prefix and one more name (or a
-    /// single name when there is no prefix); any other branch is refused
-    /// before anything is created.
+    /// The prefix Orca's Git branch-prefix setting puts before the worktree
+    /// name, without the trailing `/`; `None` when the setting is off. The
+    /// receipt must report this prefix and the requested name's final
+    /// component for a new worktree.
     pub branch_prefix: Option<BranchName>,
     /// The agent family a launch without an agent selection starts with.
     pub agent: AgentFamily,
@@ -439,27 +439,36 @@ pub fn launch_marker(house: &HouseId, key: &IdempotencyKey) -> String {
 
 /// Check that a launch receipt names exactly the `requested` branch.
 ///
-/// Orca prefixes the worktree name it is given (on the verified host,
-/// `--name lemarier/x` became `lemarier/lemarier-x`), so the receipt records
-/// the branch Orca actually created. Call this before the worker's first
-/// push; on a mismatch, rename the branch or hand the task over.
+/// The receipt records the branch Orca actually created. An absent branch is
+/// unconfirmed, not evidence of a different branch.
 ///
 /// # Errors
-/// [`OrcaError::BranchMismatch`] naming both branches.
+/// [`OrcaError::BranchMismatch`] naming both branches, or
+/// [`OrcaError::BranchUnconfirmed`] when no branch was reported.
 pub fn verify_branch(receipt: &Receipt, requested: &str) -> Result<(), OrcaError> {
     let actual = receipt
         .created()
         .iter()
         .find(|resource| resource.kind == ResourceKind::Branch)
         .map(|branch| branch.handle.as_str());
-    if actual == Some(requested) {
-        Ok(())
-    } else {
-        Err(OrcaError::BranchMismatch {
+    match actual {
+        Some(actual) if actual == requested => Ok(()),
+        Some(actual) => Err(OrcaError::BranchMismatch {
             requested: requested.to_owned(),
-            actual: actual.map(str::to_owned),
-        })
+            actual: Some(actual.to_owned()),
+        }),
+        None => Err(OrcaError::BranchUnconfirmed {
+            requested: requested.to_owned(),
+        }),
     }
+}
+
+fn receipt_branch(receipt: &Receipt) -> Option<BranchName> {
+    receipt
+        .created()
+        .iter()
+        .find(|resource| resource.kind == ResourceKind::Branch)
+        .and_then(|resource| BranchName::new(resource.handle.as_str()).ok())
 }
 
 /// What Orca shows about a launch whose requested branch already existed,
@@ -594,6 +603,8 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::ScheduleNotFound
         | OrcaError::DuplicateSchedules { .. }
         | OrcaError::BranchMismatch { .. }
+        | OrcaError::BranchUnconfirmed { .. }
+        | OrcaError::BranchUnconfirmedRunning { .. }
         | OrcaError::WrongBranchRunning { .. }
         | OrcaError::TrialRequiresPaused
         | OrcaError::ScheduleRequirementsUnknown
@@ -645,6 +656,8 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::ScheduleNotFound
         | OrcaError::DuplicateSchedules { .. }
         | OrcaError::BranchMismatch { .. }
+        | OrcaError::BranchUnconfirmed { .. }
+        | OrcaError::BranchUnconfirmedRunning { .. }
         | OrcaError::WrongBranchRunning { .. }
         | OrcaError::TrialRequiresPaused
         | OrcaError::ScheduleRequirementsUnknown
@@ -1068,10 +1081,16 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }
         // The branch a new worktree is to be created on.
         let new_branch = match workspace {
-            Workspace::Isolated => branch,
+            Workspace::Isolated => branch
+                .map(|requested| {
+                    branch::created_branch(self.config.branch_prefix.as_ref(), requested)
+                })
+                .transpose()
+                .map_err(|error| call_failure(&error))?,
             Workspace::Existing(_) => None,
         };
-        let name = new_branch
+        let name = branch
+            .filter(|_| matches!(workspace, Workspace::Isolated))
             .map(|branch| branch::worktree_name(self.config.branch_prefix.as_ref(), branch))
             .transpose()
             .map_err(|error| call_failure(&error))?;
@@ -1081,30 +1100,51 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 key_digest(&self.config.house, key.as_str())
             ))
             .map_err(|error| call_failure(&error))?;
-        let receipt = self.launch_reserved(key, workspace, brief, name, new_branch, agent)?;
+        let mut receipt =
+            self.launch_reserved(key, workspace, brief, name, new_branch.as_ref(), agent)?;
         reservation.settle();
-        let Some(branch) = branch else {
+        let Some(requested) = branch else {
             return Ok(receipt);
         };
-        if verify_branch(&receipt, branch.as_str()).is_ok() {
-            return Ok(receipt);
-        }
-        // The worker may run on another branch and could push to it. Stop
-        // it, retrying a bounded number of times. The launch is held as
-        // uncertain either way, because a worker, its worktree, and its
-        // branch exist. A stop that never took effect leaves the launch
-        // unresolved: lookup reports it unknown, each resubmission within the
-        // store's budget stops again, and `verify_launch_branch` reports
-        // [`OrcaError::WrongBranchRunning`] until the worker is stopped.
-        if let Some(worker) = receipt
+        let worker = receipt
             .created()
             .iter()
             .find(|resource| resource.kind == ResourceKind::Worker)
-            && (0..WRONG_BRANCH_STOP_ATTEMPTS).any(|_| self.cancel(worker).is_ok())
-        {
+            .cloned();
+        for poll in 0..BRANCH_POLLS {
+            if let Some(actual) = receipt_branch(&receipt) {
+                if self.accepts_launch_branch(requested, &actual, workspace) {
+                    return Ok(receipt);
+                }
+                break;
+            }
+            if poll + 1 < BRANCH_POLLS {
+                thread::sleep(BRANCH_POLL_INTERVAL);
+                if let Some(dispatch) = worker.as_ref().and_then(|worker| self.dispatch_of(worker))
+                    && let Ok(Some(shown)) = self.show(dispatch)
+                    && let Some(updated) =
+                        self.launch_receipt(receipt.reference().as_str(), dispatch, &shown)
+                {
+                    receipt = updated;
+                }
+            }
+        }
+        let reason = if receipt_branch(&receipt).is_some() {
+            UncertainReason::BranchMismatchStopped
+        } else {
+            UncertainReason::BranchUnconfirmedStopped
+        };
+        let stopped = worker.as_ref().is_some_and(|worker| {
+            (0..WRONG_BRANCH_STOP_ATTEMPTS).any(|_| self.cancel(worker).is_ok())
+        });
+        if stopped && let Some(worker) = worker.as_ref() {
             self.release_stopped(worker);
         }
-        Err(response_lost())
+        Err(EffectFailure::Uncertain(if stopped {
+            reason
+        } else {
+            UncertainReason::BranchStopUnconfirmed
+        }))
     }
 
     /// Close the terminal of a worker stopped for running on the wrong
@@ -1392,12 +1432,10 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// uncertain.
     ///
     /// # Errors
-    /// [`OrcaError::WrongBranchRunning`] when the launched worker is on
-    /// another branch and Orca's record does not show it settled: it could
-    /// still push, and needs a stop or a person. [`OrcaError::BranchMismatch`]
-    /// naming both branches otherwise. `actual` is `None` when Orca records no
-    /// branch or the key has no dispatched launch: the request cannot be
-    /// confirmed either way. Other errors when Orca cannot be read.
+    /// [`OrcaError::WrongBranchRunning`] when a confirmed wrong branch's
+    /// worker remains active; [`OrcaError::BranchUnconfirmedRunning`] when an
+    /// active worker has no reported branch. The settled forms are
+    /// [`OrcaError::BranchMismatch`] and [`OrcaError::BranchUnconfirmed`].
     pub fn verify_launch_branch(
         &self,
         key: &IdempotencyKey,
@@ -1405,9 +1443,31 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     ) -> Result<(), OrcaError> {
         match self.task_launch(key)? {
             TaskLaunch::Dispatched(receipt) => {
-                let Err(mismatch) = verify_branch(&receipt, requested.as_str()) else {
+                let actual = receipt_branch(&receipt);
+                let recorded = self.recorded_branch(key)?;
+                if actual
+                    .as_ref()
+                    .is_some_and(|actual| match recorded.as_deref() {
+                        Some(recorded) => {
+                            branch::created_branch(self.config.branch_prefix.as_ref(), requested)
+                                .is_ok_and(|expected| {
+                                    recorded == expected.as_str() && actual == &expected
+                                })
+                        }
+                        None => actual == requested,
+                    })
+                {
                     return Ok(());
-                };
+                }
+                let mismatch = actual.as_ref().map_or_else(
+                    || OrcaError::BranchUnconfirmed {
+                        requested: requested.to_string(),
+                    },
+                    |actual| OrcaError::BranchMismatch {
+                        requested: requested.to_string(),
+                        actual: Some(actual.to_string()),
+                    },
+                );
                 let Some(dispatch) = receipt
                     .created()
                     .iter()
@@ -1420,19 +1480,26 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 if self.show(dispatch)?.is_some_and(|shown| is_settled(&shown)) {
                     return Err(mismatch);
                 }
-                let OrcaError::BranchMismatch { requested, actual } = mismatch else {
-                    return Err(mismatch);
-                };
-                Err(OrcaError::WrongBranchRunning {
-                    requested,
-                    actual,
-                    worker: dispatch.to_owned(),
-                })
+                match mismatch {
+                    OrcaError::BranchMismatch { requested, actual } => {
+                        Err(OrcaError::WrongBranchRunning {
+                            requested,
+                            actual,
+                            worker: dispatch.to_owned(),
+                        })
+                    }
+                    OrcaError::BranchUnconfirmed { requested } => {
+                        Err(OrcaError::BranchUnconfirmedRunning {
+                            requested,
+                            worker: dispatch.to_owned(),
+                        })
+                    }
+                    other => Err(other),
+                }
             }
             TaskLaunch::None | TaskLaunch::Undispatched(_) | TaskLaunch::Unclear => {
-                Err(OrcaError::BranchMismatch {
+                Err(OrcaError::BranchUnconfirmed {
                     requested: requested.to_string(),
-                    actual: None,
                 })
             }
         }
@@ -1440,8 +1507,8 @@ impl<R: OrcaRunner> OrcaBackend<R> {
 
     /// The collision a launch with a requested branch ran into, if it did.
     ///
-    /// Returns `Some` when the key's launch recorded `requested` as its
-    /// branch, was dispatched, and Orca created that branch with a numeric
+    /// Returns `Some` when the key's launch recorded the branch derived from
+    /// `requested`, was dispatched, and Orca created it with a numeric
     /// suffix because it already existed, with the evidence that this launch
     /// owns the stray worker, worktree, and branch. Returns `None` for no
     /// dispatched launch, the requested branch itself, a launch that recorded
@@ -1460,7 +1527,8 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         };
         // A numeric suffix alone is not ownership: the launch must have
         // recorded this very branch as its request.
-        if self.recorded_branch(key)?.as_deref() != Some(requested.as_str()) {
+        let expected = branch::created_branch(self.config.branch_prefix.as_ref(), requested)?;
+        if self.recorded_branch(key)?.as_deref() != Some(expected.as_str()) {
             return Ok(None);
         }
         let created = receipt.created();
@@ -1474,7 +1542,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         ) else {
             return Ok(None);
         };
-        if !branch::is_collision(requested.as_str(), stray.handle.as_str()) {
+        if !branch::is_collision(expected.as_str(), stray.handle.as_str()) {
             return Ok(None);
         }
         let shown = match self.dispatch_of(worker) {
@@ -1520,12 +1588,16 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             }
         };
         match operation {
-            Operation::LaunchWorker { branch, .. } => {
+            Operation::LaunchWorker {
+                branch, workspace, ..
+            } => {
                 let found = self.lookup_launch(request.key())?;
                 // A launch on the wrong branch was held, not accepted.
                 Ok(match (&found, branch) {
                     (Lookup::Applied(receipt), Some(branch))
-                        if verify_branch(receipt, branch.as_str()).is_err() =>
+                        if !receipt_branch(receipt).as_ref().is_some_and(|actual| {
+                            self.accepts_launch_branch(branch, actual, workspace)
+                        }) =>
                     {
                         Lookup::Unknown
                     }
@@ -1631,6 +1703,21 @@ impl<R: OrcaRunner> EffectExecutor for OrcaBackend<R> {
 }
 
 impl<R: OrcaRunner> WorkerBackend for OrcaBackend<R> {
+    fn accepts_launch_branch(
+        &self,
+        requested: &BranchName,
+        actual: &BranchName,
+        workspace: &Workspace,
+    ) -> bool {
+        match workspace {
+            Workspace::Isolated => {
+                branch::created_branch(self.config.branch_prefix.as_ref(), requested)
+                    .is_ok_and(|created| &created == actual)
+            }
+            Workspace::Existing(_) => actual == requested,
+        }
+    }
+
     fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
         let Some(dispatch) = self.dispatch_of(worker) else {
             return Ok(WorkerState::Missing);

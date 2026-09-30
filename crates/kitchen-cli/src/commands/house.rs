@@ -25,6 +25,10 @@ pub struct HouseArgs {
 }
 #[derive(Subcommand)]
 enum HouseCommand {
+    /// Preview and explicitly grant standing house authority.
+    Grant(super::house_grant::GrantArgs),
+    /// Preview and revoke standing house authority.
+    Revoke(super::house_grant::GrantArgs),
     /// Register a house without granting new authority. Without --config,
     /// asks only for what cannot be inferred and pins the default guidance.
     Init {
@@ -117,6 +121,8 @@ enum HouseCommand {
 
 pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
     match args.command {
+        HouseCommand::Grant(args) => super::house_grant::run(args, false),
+        HouseCommand::Revoke(args) => super::house_grant::run(args, true),
         HouseCommand::Init {
             registry,
             config: None,

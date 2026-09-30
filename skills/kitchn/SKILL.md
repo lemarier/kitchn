@@ -161,6 +161,25 @@ doctor` reporting every capability scheduled pickup needs as observed. This
 build has no schedule command: say so and create nothing. Scheduled runs act
 on house grants, never on this session's approvals.
 
+Before enabling a scheduled workflow, inspect `kitchn house doctor` findings
+for that repository. A repository-scoped worker grant can cover its worker
+effects. When changing standing authority, preview `kitchn house grant` or
+`kitchn house revoke` for the selected repository and get the person's
+approval before applying. A selected repository scopes all granted permissions,
+including worker messages, cancellation, and resource release. Grant with
+`--house-wide` only when the person approves authority across repositories;
+repository-bound actions remain scoped to the selected repository. Repository
+revoke keeps matching house-scoped grants and limits and names them in the
+preview. `--house-wide` revokes
+matching authority across all repositories; use it only after the person
+approves that broader preview.
+
+Do not use `house grant --workflow gate` or `--permission merge`: the command
+refuses both. The owner must configure a repository-scoped merge grant, its
+matching policy limit, and merge readiness in the house config. The scheduled
+gate verifies an independent review attestation at the exact pull request head,
+calls `issue_authority`, and resolves its merge grant for that subject.
+
 ## Never
 
 - Act on a house you guessed, or without the pinned instructions.

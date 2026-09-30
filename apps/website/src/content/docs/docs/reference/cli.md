@@ -139,6 +139,41 @@ Exits 0 when configuration is complete and 1 when findings remain. Readiness
 gaps become findings only for work types whose `mergeReadiness` level is not met.
 With `--store`, doctor reads the house store and reports any table at 80% of its
 limit or more, before new work is refused.
+For scheduled worker effects, doctor checks grants against the bound
+repository and backend. A matching repository-scoped grant satisfies the
+check; a house-scoped grant also covers that repository.
+
+## `kitchn house grant` and `kitchn house revoke`
+
+Preview or change standing grants and their policy limits. A workflow selects
+its permissions; `--permission` selects one. Use `--repository` to select a
+served repository when working outside its checkout. A grant for a selected
+repository scopes every permission, including worker messaging, cancellation,
+and resource release, to that repository in both sets.
+
+```sh
+kitchn house grant --registry <dir> --house <id> --repository <owner/name> --workflow pickup --preview
+kitchn house grant --registry <dir> --house <id> --repository <owner/name> --permission message-worker --house-wide --preview
+kitchn house revoke --registry <dir> --house <id> --repository <owner/name> --permission message-worker --preview
+kitchn house revoke --registry <dir> --house <id> --repository <owner/name> --permission message-worker --house-wide --preview
+```
+
+`--preview` writes nothing; `--yes` applies without a prompt. Granting with
+`--house-wide` creates house-scoped entries for permissions that support them;
+repository-bound forge actions and worker launch remain scoped to the selected
+repository. A repository revoke removes matching repository-scoped entries for
+that repository. Its
+preview names any matching house-scoped entries it retains. `--house-wide`
+explicitly revokes matching entries across the house, including grants for
+other repositories. Review its preview before applying it.
+
+`house grant --workflow gate` and `house grant --permission merge` refuse to
+write a merge grant. To enable the scheduled gate, the owner must configure a
+repository-scoped `merge` grant and matching `policyLimits` entry in the house
+config, with the forge backend and credential, then set the desired
+`mergeReadiness` policy. The gate checks the independent review attestation and
+the pull request's exact head, calls `issue_authority`, and resolves that grant
+for the exact pull request subject. A guided grant has no subject or attestation.
 
 ## `kitchn init` and `kitchn adopt`
 

@@ -1165,6 +1165,7 @@ fn doctor_reports_idle_schedules_as_recommendations_and_unenforceable_budgets() 
         unobserved
             .findings
             .iter()
+            .filter(|finding| finding.code != DoctorCode::Authority)
             .map(|finding| finding.code)
             .collect::<Vec<_>>(),
         [DoctorCode::ScheduleBudget]
@@ -1186,7 +1187,12 @@ fn doctor_reports_idle_schedules_as_recommendations_and_unenforceable_budgets() 
         vec![usage("gardener", ObservedScheduleState::Active, idle_runs)?],
     ));
     let idle = doctor(&registry, &repository, Some(&doctor_evidence))?;
-    assert!(idle.healthy(), "a recommendation is not a setup gap");
+    assert!(
+        idle.findings
+            .iter()
+            .all(|finding| finding.code == DoctorCode::Authority),
+        "a recommendation adds no schedule gap"
+    );
     let [recommendation] = idle.recommendations.as_slice() else {
         return Err("one recommendation".into());
     };
@@ -1217,7 +1223,12 @@ fn doctor_reports_idle_schedules_as_recommendations_and_unenforceable_budgets() 
         vec![usage("pickup", ObservedScheduleState::Active, unknown)?],
     ));
     let report = doctor(&registry, &repository, Some(&doctor_evidence))?;
-    let [finding] = report.findings.as_slice() else {
+    let schedule_findings: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.code != DoctorCode::Authority)
+        .collect();
+    let [finding] = schedule_findings.as_slice() else {
         return Err("one finding".into());
     };
     assert_eq!(finding.code, DoctorCode::ScheduleBudget);
@@ -1251,7 +1262,12 @@ fn doctor_reports_an_exhaustion_whose_owner_was_never_told() -> TestResult {
         )?],
     ));
     let quiet = doctor(&registry, &repository, Some(&doctor_evidence))?;
-    assert!(quiet.healthy());
+    assert!(
+        quiet
+            .findings
+            .iter()
+            .all(|finding| finding.code == DoctorCode::Authority)
+    );
 
     let window = policy()?
         .window_hours
@@ -1332,10 +1348,20 @@ fn doctor_reports_a_run_budget_it_cannot_verify() -> TestResult {
 #[test]
 fn doctor_reports_schedules_without_a_policy() -> TestResult {
     let (_temp, registry, repository, mut doctor_evidence) = registry_with(None)?;
-    assert!(doctor(&registry, &repository, Some(&doctor_evidence))?.healthy());
+    assert!(
+        doctor(&registry, &repository, Some(&doctor_evidence))?
+            .findings
+            .iter()
+            .all(|finding| finding.code == DoctorCode::Authority)
+    );
     // An observation with no schedules needs no policy.
     doctor_evidence.schedules = Some(evidence(house()?, DAY_MS, Vec::new()));
-    assert!(doctor(&registry, &repository, Some(&doctor_evidence))?.healthy());
+    assert!(
+        doctor(&registry, &repository, Some(&doctor_evidence))?
+            .findings
+            .iter()
+            .all(|finding| finding.code == DoctorCode::Authority)
+    );
     doctor_evidence.schedules = Some(evidence(
         house()?,
         DAY_MS,
@@ -1346,6 +1372,7 @@ fn doctor_reports_schedules_without_a_policy() -> TestResult {
         report
             .findings
             .iter()
+            .filter(|finding| finding.code != DoctorCode::Authority)
             .map(|finding| finding.code)
             .collect::<Vec<_>>(),
         [DoctorCode::ScheduleBudget]

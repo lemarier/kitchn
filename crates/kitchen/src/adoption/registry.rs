@@ -157,6 +157,37 @@ impl HouseRegistry {
         }
         Ok(config)
     }
+    /// Replace only the authority sets after an exact preview. A concurrent
+    /// configuration change is refused rather than overwritten.
+    pub fn configure_grants(
+        &self,
+        expected: &HouseConfig,
+        next: &HouseConfig,
+    ) -> Result<(), HouseError> {
+        if expected.house != next.house {
+            return Err(HouseError::HouseSelection);
+        }
+        let mut comparable = next.clone();
+        comparable.grants = expected.grants.clone();
+        comparable.policy_limits = expected.policy_limits.clone();
+        if comparable != *expected {
+            return Err(HouseError::PolicyRelaxation);
+        }
+        next.validate()?;
+        let _lock = self.lock()?;
+        if self.load(&expected.house)? != *expected {
+            return Err(HouseError::Conflict);
+        }
+        if expected != next {
+            atomic_config(
+                &self.config_path(&next.house),
+                expected,
+                next,
+                super::installer::Visibility::Private,
+            )?;
+        }
+        Ok(())
+    }
     /// Enumerate bounded house configurations for explicit guided selection.
     pub fn houses(&self) -> Result<HouseListing, HouseError> {
         ensure_external(&self.root)?;

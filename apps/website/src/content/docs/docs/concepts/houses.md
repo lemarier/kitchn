@@ -23,7 +23,7 @@ write it for you from a few answers or register one you wrote and reviewed.
 | `postingDestinations` | Where kitchn may post. Posting grants must name one of these. |
 | `requiredReviewers` | Reviewers every change needs. |
 | `requiredChecks` | Checks every change needs. |
-| `grants` | Standing, repository-scoped grants with explicit backend and credential identifiers. |
+| `grants` | Standing grants with repository or house scope and explicit backend and credential identifiers. |
 | `policyLimits` | Limits kept separate from grants. |
 | `backend` | The [worker backend](#the-worker-backend) commands build for this house. |
 | `mergeReadiness` | Optional. The readiness level (`checked`, `reliable` or `covered`) each work type must reach before the merge gate may merge in a repository with a merge grant. Readiness never grants merge authority. Below the level, a merge needs an owner's Roger approval for that exact pull request, head and base; Kitchen persists the Ask, with the work type, levels and reason, before it is sent. Unobserved readiness counts as `unready`. |

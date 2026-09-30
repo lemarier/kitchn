@@ -106,7 +106,7 @@ fn scope(args: &[OsString]) -> Scope {
     let command = args.get(1).and_then(|arg| arg.to_str()).unwrap_or_default();
     let subcommand = args.get(2).and_then(|arg| arg.to_str()).unwrap_or_default();
     match (command, subcommand) {
-        ("house", "init" | "setup" | "import" | "doctor") => Scope::Registry,
+        ("house", "init" | "setup" | "import" | "doctor" | "grant" | "revoke") => Scope::Registry,
         ("house", "sync" | "update") => Scope::Both,
         ("init" | "adopt" | "work" | "pr" | "issue" | "hand-back", _) => Scope::Registry,
         ("decompose", "apply") => Scope::Both,

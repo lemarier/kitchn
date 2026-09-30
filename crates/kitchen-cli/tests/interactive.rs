@@ -499,6 +499,8 @@ fn the_skill_uses_only_flags_the_cli_accepts() -> TestResult {
         vec!["hand-back", "--help"],
         vec!["house", "setup", "--help"],
         vec!["house", "doctor", "--help"],
+        vec!["house", "grant", "--help"],
+        vec!["house", "revoke", "--help"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_kitchn"))
             .args(&args)

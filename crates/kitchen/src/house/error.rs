@@ -99,6 +99,11 @@ pub enum HouseError {
     /// A configured merge grant cannot become authority without a readiness check.
     #[error("merge grants are issued through the readiness check, not plain authority")]
     MergeNeedsReadiness,
+    /// Guided grants cannot prepare a merge without the gate's subject and evidence.
+    #[error(
+        "merge cannot be granted by this command; configure a repository-scoped merge grant and matching policy limit in the house config; an independent reviewer then records the approved review with `kitchn gate attest`, and the scheduled gate verifies it and authorizes each pull request at its exact head"
+    )]
+    MergeGrantNeedsGate,
     /// Bounded filesystem I/O failed.
     #[error("house storage operation failed ({0:?})")]
     Io(std::io::ErrorKind),
@@ -123,7 +128,8 @@ impl HouseError {
             | Self::BelowReadiness { .. }
             | Self::ReadinessDecision
             | Self::ReadinessNotApproved
-            | Self::MergeNeedsReadiness => ErrorClass::Refused,
+            | Self::MergeNeedsReadiness
+            | Self::MergeGrantNeedsGate => ErrorClass::Refused,
             Self::Conflict | Self::Conflicts(_) | Self::LegacyChanged | Self::Busy => {
                 ErrorClass::Conflict
             }

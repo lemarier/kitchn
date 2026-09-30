@@ -356,6 +356,7 @@ fn doctor_unknown_is_not_success_and_scoped_evidence_can_complete_it() -> TestRe
         DoctorCode::Instructions,
         DoctorCode::Labels,
         DoctorCode::Capability,
+        DoctorCode::Authority,
         DoctorCode::Access,
     ] {
         assert!(
@@ -389,7 +390,14 @@ fn doctor_unknown_is_not_success_and_scoped_evidence_can_complete_it() -> TestRe
         undelivered_budget_reports: Vec::new(),
         store_capacity: None,
     };
-    assert!(doctor(&registry, &repository, Some(&evidence))?.healthy());
+    let scoped = doctor(&registry, &repository, Some(&evidence))?;
+    assert!(!scoped.healthy());
+    assert!(
+        scoped
+            .findings
+            .iter()
+            .all(|finding| finding.code == DoctorCode::Authority)
+    );
     evidence.house = config("crabnebula")?.house;
     assert!(matches!(
         doctor(&registry, &repository, Some(&evidence)),
@@ -632,7 +640,13 @@ fn label_metadata_drift_is_informational_in_preview_and_doctor() -> TestResult {
         store_capacity: None,
     };
     let report = doctor(&registry, &repository, Some(&evidence))?;
-    assert!(report.healthy());
+    assert!(!report.healthy());
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(|finding| finding.code == DoctorCode::Authority)
+    );
     assert!(report.human_readable().contains("drift"));
     assert_eq!(evidence.labels, Some(labels));
     Ok(())
@@ -791,19 +805,30 @@ fn doctor_reports_a_configured_stack_tool_that_is_missing() -> TestResult {
     };
     let report = doctor(&registry, &repository, Some(&evidence))?;
     assert!(!report.healthy());
-    assert_eq!(
+    assert!(
         report
             .findings
             .iter()
-            .map(|finding| finding.code)
-            .collect::<Vec<_>>(),
-        vec![DoctorCode::StackTool]
+            .any(|finding| finding.code == DoctorCode::StackTool)
+    );
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == DoctorCode::Authority)
     );
     assert!(report.human_readable().contains("gh stack"));
     evidence.stack_tool = Some(StackToolStatus::Installed {
         version: "0.1.0".into(),
     });
-    assert!(doctor(&registry, &repository, Some(&evidence))?.healthy());
+    let report = doctor(&registry, &repository, Some(&evidence))?;
+    assert!(!report.healthy());
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(|finding| finding.code == DoctorCode::Authority)
+    );
     Ok(())
 }
 

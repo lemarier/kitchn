@@ -1056,6 +1056,7 @@ fn apply_in_slot(
             }
             EffectState::Intended
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. } => {
                 release(store, &id, &lease, clock)?;
@@ -1279,6 +1280,7 @@ fn read_back(task: &TaskRecord, name: &EffectName) -> ReadBack {
             EffectState::NotApplied { .. } => {}
             EffectState::Intended
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. } => state = ReadBack::Unknown,
         }

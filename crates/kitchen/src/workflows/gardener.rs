@@ -933,6 +933,7 @@ const fn is_applied(record: &EffectRecord) -> bool {
         EffectState::Applied { .. } => true,
         EffectState::Intended
         | EffectState::Uncertain { .. }
+        | EffectState::Ended { .. }
         | EffectState::NotApplied { .. }
         | EffectState::Unresolvable { .. }
         | EffectState::Waived { .. } => false,

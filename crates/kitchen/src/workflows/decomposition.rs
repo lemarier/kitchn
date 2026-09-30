@@ -1289,6 +1289,7 @@ pub fn apply<T: GitHubMutationTransport>(
             }
             EffectState::Intended
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::Unresolvable { .. }
             | EffectState::Waived { .. } => {
                 store.relinquish(&id, fence, writer.clock.now())?;
@@ -1469,6 +1470,7 @@ pub fn acknowledge(
                 EffectState::NotApplied { .. } => &mut absent,
                 EffectState::Intended
                 | EffectState::Uncertain { .. }
+                | EffectState::Ended { .. }
                 | EffectState::Unresolvable { .. }
                 | EffectState::Waived { .. } => continue,
             };

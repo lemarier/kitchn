@@ -843,6 +843,8 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::ScheduleNotFound
         | OrcaError::DuplicateSchedules { .. }
         | OrcaError::BranchMismatch { .. }
+        | OrcaError::BranchUnconfirmed { .. }
+        | OrcaError::BranchUnconfirmedRunning { .. }
         | OrcaError::TrialRequiresPaused
         | OrcaError::ScheduleRequirementsUnknown
         | OrcaError::ScheduleRequirementsMismatch
@@ -875,6 +877,7 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::WrongBranchRunning { .. } => {
             EffectFailure::Uncertain(UncertainReason::ResponseLost)
         }
+        OrcaError::LaunchEnded { .. } => EffectFailure::Uncertain(UncertainReason::DispatchEnded),
     }
 }
 

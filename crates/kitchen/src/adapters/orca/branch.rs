@@ -1,36 +1,36 @@
 //! The worktree name that makes Orca create a requested branch.
 //!
-//! Orca names the branch of a worktree it creates from `--name`: it puts the
-//! host's branch prefix setting in front and turns `/` in the name into `-`.
-//! On the verified host, `--name lemarier/x` became `lemarier/lemarier-x` and
-//! `--name x` became `lemarier/x`. Its CLI has no way to override this or to
-//! rename the branch afterwards, so a requested branch is only obtainable as
-//! the configured prefix followed by one name (or as a single name when the
-//! host adds no prefix). Anything else is refused before a Task or worktree
-//! exists, and what Orca actually created is still verified after the launch.
+//! Orca names the branch of a new worktree from `--name`: it puts the host's
+//! branch prefix in front and rewrites `/` in the name. Kitchen passes only a
+//! plain final component, then verifies the full branch Orca reports.
 
 use crate::{adapters::orca::OrcaError, contracts::BranchName};
 
-/// The `--name` that makes Orca create exactly `branch` on a host whose
-/// branch prefix setting is `prefix`, or off when `None`.
+/// The `--name` for a requested branch. The caller's prefix is a logical
+/// label; Orca replaces it with the configured host prefix.
 ///
 /// The name uses only letters, digits, `.`, `_`, and `-`, and starts with a
 /// letter or digit, so Orca does not rewrite it.
 ///
 /// # Errors
-/// [`OrcaError::BranchUnobtainable`] when `branch` is not `prefix/name` (or a
-/// single `name` without a prefix) for a name of that form.
+/// [`OrcaError::BranchUnobtainable`] when the request cannot be represented by
+/// one plain worktree name.
 pub(crate) fn worktree_name(
     prefix: Option<&BranchName>,
     branch: &BranchName,
 ) -> Result<String, OrcaError> {
-    let name = match prefix {
-        Some(prefix) => branch
-            .as_str()
-            .strip_prefix(prefix.as_str())
-            .and_then(|rest| rest.strip_prefix('/')),
-        None => Some(branch.as_str()),
-    };
+    let name = prefix
+        .and_then(|prefix| {
+            branch
+                .as_str()
+                .strip_prefix(prefix.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+        })
+        .or_else(|| match branch.as_str().split_once('/') {
+            Some((_, name)) if !name.contains('/') => Some(name),
+            None => Some(branch.as_str()),
+            Some(_) => None,
+        });
     match name {
         Some(name)
             if name
@@ -47,6 +47,16 @@ pub(crate) fn worktree_name(
             requested: branch.as_str().to_owned(),
         }),
     }
+}
+
+/// The full branch a new Orca worktree should create for `requested`.
+pub(crate) fn created_branch(
+    prefix: Option<&BranchName>,
+    requested: &BranchName,
+) -> Result<BranchName, OrcaError> {
+    let name = worktree_name(prefix, requested)?;
+    let full = prefix.map_or(name.clone(), |prefix| format!("{prefix}/{name}"));
+    BranchName::new(&full).map_err(OrcaError::from)
 }
 
 /// Whether `actual` is the branch Orca creates in place of `requested` when
@@ -106,30 +116,24 @@ mod tests {
     }
 
     #[test]
-    fn without_a_prefix_only_a_single_name_is_obtainable() -> Result<(), Box<dyn std::error::Error>>
+    fn a_requested_label_is_replaced_by_the_host_prefix() -> Result<(), Box<dyn std::error::Error>>
     {
         assert_eq!(worktree_name(None, &branch("hotfix")?)?, "hotfix");
+        assert_eq!(worktree_name(None, &branch("kitchen/x")?)?, "x");
+        assert_eq!(created_branch(None, &branch("kitchen/x")?)?, branch("x")?);
         assert_eq!(
-            worktree_name(None, &branch("lemarier/x")?),
-            Err(OrcaError::BranchUnobtainable {
-                requested: "lemarier/x".to_owned()
-            }),
-            "Orca would turn the slash into a dash"
+            created_branch(Some(&branch("lemarier")?), &branch("kitchen/x")?)?,
+            branch("lemarier/x")?
         );
         Ok(())
     }
 
     #[test]
-    fn branches_outside_the_prefix_or_of_another_shape_are_refused()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn branches_with_unrepresentable_names_are_refused() -> Result<(), Box<dyn std::error::Error>> {
         let prefix = branch("lemarier")?;
         for requested in [
-            "kitchen/x",           // another prefix
-            "lemarier",            // no name after the prefix
-            "lemarier-x",          // shares the text, not the component
             "lemarier/area/topic", // more than one name
-            "lemarierx/y",
-            "lemarier/-x", // does not start with a letter or digit
+            "lemarier/-x",         // does not start with a letter or digit
         ] {
             let requested = branch(requested)?;
             assert_eq!(

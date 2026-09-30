@@ -285,7 +285,7 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
                         .iter()
                         .find(|detail| detail.number == pick.issue.number)
                         .and_then(|detail| detail.body.as_deref());
-                    let brief = self.brief(pick.issue.clone(), pick.base, body)?;
+                    let brief = self.brief(pick.issue.clone(), pick.base, body, 1)?;
                     actions.push(launch(&ctx, pick.task, claim.fence(), &brief)?);
                 }
                 outcome => actions.push(PickupAction::NotClaimed {
@@ -308,7 +308,16 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
                 continue;
             }
             let detail = known(self.forge.issue_detail(house, repository, issue.number))?;
-            let brief = self.brief(issue, Base::DefaultBranch, detail.body.as_deref())?;
+            let next_attempt = record
+                .attempts()
+                .last()
+                .map_or(1, |attempt| attempt.number().get() + 1);
+            let brief = self.brief(
+                issue,
+                Base::DefaultBranch,
+                detail.body.as_deref(),
+                next_attempt,
+            )?;
             // The task moves to this pass's claim before the launch, so the
             // claim it had cannot also act on it.
             super::record(self.store, self.tick, &task, self.clock)?;
@@ -386,13 +395,25 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
         })
     }
 
-    fn brief(&self, issue: IssueRef, base: Base, body: Option<&str>) -> Result<WorkerBrief> {
+    fn brief(
+        &self,
+        issue: IssueRef,
+        base: Base,
+        body: Option<&str>,
+        attempt: u32,
+    ) -> Result<WorkerBrief> {
         let settings = self.settings;
+        let suffix = if attempt == 1 {
+            String::new()
+        } else {
+            format!("-attempt-{attempt}")
+        };
         Ok(WorkerBrief {
             branch: work_branch(&format!(
-                "{}/issue-{}",
+                "{}/issue-{}{}",
                 settings.branch_prefix,
-                issue.number.get()
+                issue.number.get(),
+                suffix
             ))?,
             issue,
             base,

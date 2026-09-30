@@ -1133,6 +1133,7 @@ fn a_replacement_launches_only_after_the_adopted_worker_is_shown_stopped() -> Te
 fn launch_on(
     world: &World,
     reported: &str,
+    accepted_prefix: Option<&str>,
     refuse_stop: bool,
     task: &TaskId,
     fence: Fence,
@@ -1140,6 +1141,7 @@ fn launch_on(
     let backend = workflows_support::ReportsBranch {
         inner: &world.backend,
         branch: reported,
+        accepted_prefix,
         refuse_stop,
     };
     let ctx = kitchen::workflows::coordination::Context {
@@ -1156,12 +1158,25 @@ fn launch_on(
 }
 
 #[test]
+fn a_backend_accepted_prefix_is_the_durable_task_branch() -> TestResult {
+    use kitchen::workflows::coordination::task_branch;
+
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    let outcome = launch_on(&world, "orca/issue-1", Some("orca"), false, &task, fence)?;
+    assert!(matches!(outcome, LaunchOutcome::Accepted { .. }));
+    let record = world.fixture.store.task(&task)?;
+    assert_eq!(task_branch(&record), Some(branch("orca/issue-1")?));
+    Ok(())
+}
+
+#[test]
 fn a_worker_placed_on_another_branch_is_stopped_before_it_works() -> TestResult {
     use kitchen::contracts::WorkerBackend;
     let world = World::new()?;
     let (task, fence) = claim(&world, "coordinator", 1, 3)?;
     // Orca prefixes the requested name.
-    let outcome = launch_on(&world, "orca/lemarier/issue-1", false, &task, fence)?;
+    let outcome = launch_on(&world, "orca/lemarier/issue-1", None, false, &task, fence)?;
     let LaunchOutcome::BranchMismatch {
         worker,
         disposition,
@@ -1192,7 +1207,7 @@ fn a_refused_stop_of_a_misplaced_worker_keeps_the_attempt_open() -> TestResult {
     use kitchen::state::AttemptState;
     let world = World::new()?;
     let (task, fence) = claim(&world, "coordinator", 1, 3)?;
-    let outcome = launch_on(&world, "orca/lemarier/issue-1", true, &task, fence)?;
+    let outcome = launch_on(&world, "orca/lemarier/issue-1", None, true, &task, fence)?;
     let LaunchOutcome::StopRefused { worker } = outcome else {
         return Err(format!("unexpected outcome {outcome:?}").into());
     };
@@ -1212,7 +1227,7 @@ fn a_refused_stop_of_a_misplaced_worker_keeps_the_attempt_open() -> TestResult {
     // A repeat reports the same refusal and asks nothing new of the backend.
     let calls = world.backend.execute_calls();
     assert_eq!(
-        launch_on(&world, "orca/lemarier/issue-1", true, &task, fence)?,
+        launch_on(&world, "orca/lemarier/issue-1", None, true, &task, fence)?,
         LaunchOutcome::StopRefused { worker }
     );
     assert_eq!(world.backend.execute_calls(), calls);
@@ -1220,11 +1235,11 @@ fn a_refused_stop_of_a_misplaced_worker_keeps_the_attempt_open() -> TestResult {
 }
 
 #[test]
-fn a_launch_is_accepted_when_the_backend_reports_the_exact_branch_or_none() -> TestResult {
+fn a_launch_is_accepted_when_the_backend_reports_the_exact_branch() -> TestResult {
     let world = World::new()?;
     let (task, fence) = claim(&world, "coordinator", 1, 3)?;
     assert!(matches!(
-        launch_on(&world, "lemarier/issue-1", false, &task, fence)?,
+        launch_on(&world, "lemarier/issue-1", None, false, &task, fence)?,
         LaunchOutcome::Accepted { .. }
     ));
     // The launch request names the exact branch, so the backend creates it

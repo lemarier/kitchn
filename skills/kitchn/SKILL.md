@@ -147,6 +147,12 @@ or another session can adopt it:
 
 `kitchn hand-back <task> --holder <you>`
 
+When inspecting cleanup after a stopped launch, include resources from every
+attempt. A reconciled `Ended` receipt proves creation and task ownership even
+when the dispatch did not finish. Recheck the backend owner, worker settlement,
+and worktree preservation for both the stopped launch and its retry before
+consenting to a release.
+
 ## 4. Scheduling
 
 A request such as "schedule pickup every 15 minutes" needs a preview

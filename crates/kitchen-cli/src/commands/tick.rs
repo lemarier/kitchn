@@ -373,10 +373,12 @@ fn configure(
         RuntimeOutcome::Replaced => "updated",
         RuntimeOutcome::Unchanged => "unchanged",
     };
-    Ok((
-        format!("{outcome} the runtime configuration of house {house}"),
-        true,
-    ))
+    let mut message = format!("{outcome} the runtime configuration of house {house}");
+    if runtime.orca.is_some() && runtime.pickup.is_some() {
+        message
+            .push_str("; --branch-prefix must equal the person's Orca Git branch-prefix setting");
+    }
+    Ok((message, true))
 }
 
 fn run_tick(

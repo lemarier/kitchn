@@ -390,6 +390,16 @@ pub enum UncertainReason {
     Transport,
     /// The provider may have acted but its response was lost or malformed.
     ResponseLost,
+    /// Kitchen stopped a launched worker after confirming a different branch.
+    BranchMismatchStopped,
+    /// Orca's Git branch-prefix setting differs from Kitchen's configured prefix.
+    BranchPrefixMismatchStopped,
+    /// Kitchen stopped a launched worker because its branch was never confirmed.
+    BranchUnconfirmedStopped,
+    /// Kitchen could not confirm the stop of a worker on an unsafe branch.
+    BranchStopUnconfirmed,
+    /// The dispatch for this launch key has stopped or failed.
+    DispatchEnded,
     /// A reconciliation lookup could not establish the outcome.
     LookupInconclusive,
     /// The backend offers no lookup, so the outcome cannot be established.
@@ -403,7 +413,14 @@ impl UncertainReason {
     pub const fn is_from_lookup(self) -> bool {
         match self {
             Self::LookupInconclusive | Self::LookupUnsupported => true,
-            Self::Timeout | Self::Transport | Self::ResponseLost => false,
+            Self::Timeout
+            | Self::Transport
+            | Self::ResponseLost
+            | Self::BranchMismatchStopped
+            | Self::BranchPrefixMismatchStopped
+            | Self::BranchUnconfirmedStopped
+            | Self::BranchStopUnconfirmed
+            | Self::DispatchEnded => false,
         }
     }
 }
@@ -424,6 +441,9 @@ pub enum EffectFailure {
 pub enum Lookup {
     /// The effect was applied.
     Applied(Receipt),
+    /// The launch created a dispatch, but that dispatch stopped or failed.
+    /// Its receipt retains ownership evidence; it must not be adopted.
+    Ended(Receipt),
     /// The provider can prove it never applied this key and that no earlier
     /// invocation can still apply it.
     Absent,
@@ -575,6 +595,17 @@ static NO_VERIFICATION_ENVIRONMENTS: VerificationEnvironments = VerificationEnvi
 /// `inventory` returns at most [`MAX_INVENTORY_RESOURCES`] observations,
 /// reporting [`Liveness::Unverifiable`] rather than guessing.
 pub trait WorkerBackend: EffectExecutor {
+    /// Whether a launch receipt's branch is the branch this backend can
+    /// create for the requested name. The default requires an exact match.
+    fn accepts_launch_branch(
+        &self,
+        requested: &BranchName,
+        actual: &BranchName,
+        _workspace: &Workspace,
+    ) -> bool {
+        requested == actual
+    }
+
     /// Observe a worker's state without changing it.
     ///
     /// # Errors

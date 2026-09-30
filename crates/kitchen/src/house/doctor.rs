@@ -1,7 +1,7 @@
 use super::{
-    Assessed, HouseError, LabelPreview, LabelStatus, ReadinessEvidence, RepositoryConfig,
-    RepositoryLabel, RepositoryReadiness, StackTool, Workflow, assess, missing_capabilities,
-    preview_labels, workflow_requirements,
+    Assessed, BackendKind, HouseError, LabelPreview, LabelStatus, ReadinessEvidence,
+    RepositoryConfig, RepositoryLabel, RepositoryReadiness, StackTool, Workflow, assess,
+    missing_capabilities, preview_labels, workflow_requirements,
 };
 use crate::{
     HouseId,
@@ -122,6 +122,8 @@ pub enum DoctorCode {
     Capability,
     /// A configured model is not offered by the installed agent, or was not checked.
     AgentModel,
+    /// Orca's branch-prefix setting must match the pickup setting.
+    BranchPrefix,
     /// A scheduled workflow's resolved selection names a model or effort the
     /// schedule backend cannot enforce.
     ScheduleAgent,
@@ -387,12 +389,23 @@ pub fn doctor(
     {
         findings.push(finding);
     }
-    let recommendations = diagnose_schedules(
+    let mut recommendations = diagnose_schedules(
         house.schedules.as_ref(),
         &house.house,
         evidence.and_then(|evidence| evidence.schedules.as_ref()),
         &mut findings,
     )?;
+    if house
+        .backend
+        .as_ref()
+        .is_some_and(|backend| backend.kind.kind() == Some(BackendKind::Orca))
+    {
+        recommendations.push(DoctorFinding {
+            code: DoctorCode::BranchPrefix,
+            message: "Orca launch branch prefix cannot be read through the current Orca CLI.".into(),
+            next_step: "Set kitchn tick configure --branch-prefix to the person's Orca Git branch-prefix setting, then verify a launch branch. The default 'kitchen' is not evidence of Orca's setting.".into(),
+        });
+    }
     let readiness = assess(
         &house,
         repository,

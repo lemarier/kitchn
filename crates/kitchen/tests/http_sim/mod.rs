@@ -338,6 +338,7 @@ fn route(call: &Recorded, backend: &FakeBackend, state: &Mutex<State>) -> (u16, 
                 Ok(Lookup::Applied(receipt)) => {
                     ok(json!({ "status": "applied", "receipt": receipt }))
                 }
+                Ok(Lookup::Ended(_)) => (503, String::new()),
                 Ok(Lookup::Absent) => ok(json!({ "status": "absent" })),
                 Ok(Lookup::Unknown) => ok(json!({ "status": "unknown" })),
                 Err(_) => (503, String::new()),

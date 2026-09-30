@@ -15,10 +15,10 @@ use common::{ManualClock, TestResult, WORKER_PERMISSIONS, backend_id, commit, cr
 use kitchen::{
     CredentialId, HolderId, WorkflowId,
     contracts::{
-        BranchName, Capability, CapabilitySet, CheckoutFact, CheckoutReport, Clock, Evidence,
-        EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef, Grant, LeaseTtl, MailMessage,
-        MessageKind, PostingBudget, Repository, ResourceRef, ReviewVerdict, Settlement, Text,
-        WorkerOutcome, WorkerState, fake::FakeBackend,
+        BranchName, Capability, CapabilitySet, CheckoutFact, CheckoutReport, Clock, Effect,
+        Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef, Grant, LeaseTtl,
+        MailMessage, MessageKind, Operation, PostingBudget, Repository, ResourceRef, ReviewVerdict,
+        Settlement, Text, WorkerOutcome, WorkerState, fake::FakeBackend,
     },
     house::HouseConfig,
     integrations::github::{
@@ -791,6 +791,46 @@ fn pickup_launches_a_task_whose_attempt_started_without_a_launch() -> TestResult
     // The launch is recorded now: the next pass leaves it to supervision.
     assert!(matches!(kitchen.pickup(false)?, Outcome::Idle));
     assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn pickup_retry_uses_a_fresh_branch_for_the_next_attempt() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    let first = acted(kitchen.pickup(false)?)?;
+    assert!(
+        matches!(first.as_slice(), [PickupAction::Launched { attempt, .. }] if attempt.get() == 1)
+    );
+    let task = kitchen.task(7)?;
+    let worker = current_worker(&kitchen.store().task(&task)?)
+        .ok_or("no pickup worker")?
+        .worker;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Failed));
+    let mut failed = report(&worker, "failed-pickup")?;
+    failed.outcome = Some(WorkerOutcome::Failed);
+    kitchen.backend.post(vec![failed])?;
+    acted(kitchen.coordinate()?)?;
+    let second = acted(kitchen.pickup(false)?)?;
+    assert!(
+        matches!(second.as_slice(), [PickupAction::Launched { attempt, .. }] if attempt.get() == 2)
+    );
+    let branches: Vec<_> = kitchen
+        .store()
+        .task(&task)?
+        .effects()
+        .iter()
+        .filter_map(|effect| match effect.request().effect() {
+            Effect::Worker(Operation::LaunchWorker { branch, .. }) => {
+                branch.as_ref().map(BranchName::as_str)
+            }
+            _ => None,
+        })
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(branches, ["kitchen/issue-7", "kitchen/issue-7-attempt-2"]);
     Ok(())
 }
 

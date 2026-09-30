@@ -1,11 +1,12 @@
 //! House isolation, immutable pins, setup diagnoses and recovery using synthetic fixtures.
 use kitchen::{
+    BackendId, CredentialId,
     adoption::{HouseRegistry, InstructionBundle, checkout_remotes, resolve_instructions},
     contracts::{Capability, CapabilitySet, CommitId},
     house::{
-        AccessStatus, DoctorCode, DoctorEvidence, HouseConfig, HouseError, LabelStatus,
-        RepositoryConfig, RepositoryLabel, Workflow, doctor, preview_labels, resolve_house,
-        workflow_requirements,
+        AccessStatus, BackendBinding, BackendKind, DoctorCode, DoctorEvidence, HouseConfig,
+        HouseError, LabelStatus, RepositoryConfig, RepositoryLabel, Workflow, doctor,
+        preview_labels, resolve_house, workflow_requirements,
     },
 };
 use std::{collections::BTreeSet, fs, path::Path, process::Command};
@@ -313,6 +314,35 @@ fn labels_preview_missing_conflicting_present_and_disabled() -> TestResult {
     );
     Ok(())
 }
+#[test]
+fn orca_doctor_names_the_branch_prefix_setting_without_guessing_it() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let registry = HouseRegistry::new(temp.path().canonicalize()?.join("registry"))?;
+    let mut house = config("origin89")?;
+    house.backend = Some(BackendBinding {
+        kind: BackendKind::Orca.into(),
+        backend: BackendId::new("orca-local")?,
+        credential: CredentialId::new("orca-host-session")?,
+        endpoint: None,
+    });
+    let repository = repo(&house)?;
+    registry.initialize(&house)?;
+    let report = doctor(&registry, &repository, None)?;
+    let prefix = report
+        .recommendations
+        .iter()
+        .find(|finding| finding.code == DoctorCode::BranchPrefix)
+        .ok_or("Orca prefix guidance missing")?;
+    assert!(prefix.next_step.contains("--branch-prefix"));
+    assert!(prefix.next_step.contains("Orca Git branch-prefix setting"));
+    assert!(
+        report
+            .human_readable()
+            .contains("Orca Git branch-prefix setting")
+    );
+    Ok(())
+}
+
 #[test]
 fn doctor_unknown_is_not_success_and_scoped_evidence_can_complete_it() -> TestResult {
     let temp = tempfile::tempdir()?;

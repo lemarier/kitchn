@@ -1630,6 +1630,7 @@ fn settled_outcome(task: &TaskRecord, name: &EffectName) -> Option<bool> {
             | EffectState::Intended
             | EffectState::Waived { .. }
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::Unresolvable { .. } => false,
         })
         .then_some(false)
@@ -1648,6 +1649,7 @@ fn applied(task: &TaskRecord, name: &EffectName) -> bool {
             EffectState::Intended
             | EffectState::Waived { .. }
             | EffectState::Uncertain { .. }
+            | EffectState::Ended { .. }
             | EffectState::NotApplied { .. }
             | EffectState::Unresolvable { .. } => false,
         })

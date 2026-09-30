@@ -46,17 +46,13 @@
 //!   each run with Kitchen's own [`crate::scheduling::ReadinessSignal`]s and
 //!   a deadline, so a swallowed launch is reported as
 //!   [`crate::scheduling::RunVerdict::LaunchFailed`].
-//! - Branches. Orca puts its branch-prefix setting in front of the worktree
-//!   name it is given, and its CLI can neither override that nor rename the
-//!   branch. A launch with a requested branch (`LaunchWorker`'s `branch`)
-//!   therefore needs that branch to be [`OrcaConfig::branch_prefix`] plus one
-//!   name, which the adapter passes as the worktree name; any other branch is
-//!   refused before anything is created. The branch Orca reports is then
-//!   verified. Orca offers no way to start a worker only after checking its
-//!   branch, so on a mismatch the adapter stops the worker it just started
-//!   and holds the launch as uncertain; [`OrcaBackend::verify_launch_branch`]
-//!   reports both branches. Receipts always name the branch Orca created, and
-//!   [`verify_branch`] checks any receipt.
+//! - Branches. Orca puts its configured prefix in front of a worktree name.
+//!   The adapter passes the requested branch's plain final component, waits
+//!   briefly for Orca to report the branch, and verifies the configured
+//!   prefix and name. A confirmed wrong branch or an unconfirmed branch after
+//!   the wait causes a stop and a distinct failure reason. Receipts name the
+//!   actual branch for later push and gate decisions. [`verify_branch`] checks
+//!   a receipt for an exact branch when that is needed.
 //! - Branch collisions. When the requested branch already exists, Orca
 //!   creates it with a numeric suffix (`<branch>-2`) instead. Before the
 //!   first start the adapter lists the repository's Orca worktrees and

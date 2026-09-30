@@ -433,7 +433,7 @@ fn find_key<'a>(tasks: &'a [TaskRecord], key: &IdempotencyKey) -> Option<&'a Eff
 fn gate_state(state: &EffectState) -> GateEffectState {
     match state {
         EffectState::Intended => GateEffectState::Intended,
-        EffectState::Uncertain { .. } => GateEffectState::Uncertain,
+        EffectState::Uncertain { .. } | EffectState::Ended { .. } => GateEffectState::Uncertain,
         EffectState::Applied { receipt, .. } => match receipt.retarget() {
             Some(retarget) => GateEffectState::AppliedElsewhere(retarget.clone()),
             None => GateEffectState::Applied,

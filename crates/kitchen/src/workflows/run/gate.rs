@@ -698,6 +698,7 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
                 EffectState::NotApplied { .. } => Merge::Not(NotMerged::Refused),
                 EffectState::Intended
                 | EffectState::Uncertain { .. }
+                | EffectState::Ended { .. }
                 | EffectState::Unresolvable { .. }
                 | EffectState::Waived { .. } => Merge::Not(NotMerged::Uncertain),
             },
@@ -806,6 +807,10 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             };
             let outcome = match found {
                 Ok(Lookup::Applied(receipt)) => EffectOutcome::Applied(receipt),
+                Ok(Lookup::Ended(_)) => {
+                    unproven = true;
+                    continue;
+                }
                 Ok(Lookup::Absent) => EffectOutcome::NotApplied(NotAppliedReason::ConfirmedAbsent),
                 Ok(Lookup::Unknown) | Err(_) => {
                     unproven = true;

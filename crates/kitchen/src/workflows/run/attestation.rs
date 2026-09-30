@@ -6,17 +6,20 @@
 //!
 //! An attestation rests on a forge review ([`ForgeReview`]): its id and the
 //! login the reviewer claims. Only [`record_gate_attestation`] writes one. It
-//! refuses a claimant who wrote the branch, and a claimed reviewer who is
-//! the pull request's author. A recorded attestation is never rewritten: a
-//! different one for the same subject is refused, and a moved head or base
-//! needs a new attestation.
+//! reads the pull request from the house's forge, so its head branch and
+//! author are the forge's and never a caller's word, and refuses a claimant
+//! who wrote that branch and a claimed reviewer who is the author. A
+//! recorded attestation is never rewritten: a different one for the same
+//! subject is refused, and a moved head or base needs a new attestation.
 //!
 //! The record authenticates nothing by itself: anyone who can open the
 //! store can claim any login. The scheduled gate reads it back with
-//! [`gate_attestation`] and merges only after the house's forge shows that
-//! review approved, on exactly the head, by the claimed login, and that
-//! login is neither the author the forge reports nor the forge login of any
-//! commit's author or committer ([`commit_logins`]).
+//! [`gate_attestation`], which also returns who recorded it, and merges
+//! only when the recorder wrote no part of the branch the gate found, the
+//! house's forge shows that review approved, on exactly the head, by the
+//! claimed login, and that login is neither the author the forge reports
+//! nor the forge login of any commit's author or committer
+//! ([`commit_logins`]).
 //!
 //! Who wrote the branch is read from the forge, not from the house records:
 //! those name a writer by its holder or worker handle, which is not a forge
@@ -45,7 +48,9 @@ use crate::{
         BranchName, Claimant, CommitId, ContractError, EvidenceSubject, IssueNumber, Repository,
         Timestamp, Trigger, ValueKind,
     },
-    integrations::github::{PullRequestCommit, Review, ReviewState},
+    integrations::github::{
+        GitHubClient, GitHubReadTransport, PullRequestCommit, Review, ReviewState,
+    },
     state::{
         HouseStore, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, OwnershipEvent, StateError,
         TaskRecord, WorkItem,
@@ -53,6 +58,7 @@ use crate::{
     workflows::{
         coordination::{launched_workers, person_took_over, task_branch},
         gate::{RiskClass, SemanticReview},
+        known,
     },
 };
 
@@ -105,23 +111,34 @@ pub struct GateAttestation {
     pub risk_classes: Vec<RiskClass>,
 }
 
-/// Record `attestation` for its exact subject. `author` is the pull
-/// request's author and `branch` its head branch, as the forge reports
-/// them. `recorded_by` must not be a branch writer, and the claimed
-/// reviewer must not be `author`. Recording the same attestation again is a
-/// no-op.
+/// An attestation read back from the house store, with who recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedAttestation {
+    /// What was attested.
+    pub attestation: GateAttestation,
+    /// The holder that recorded it. The gate refuses one that wrote the
+    /// branch.
+    pub recorded_by: HolderId,
+}
+
+/// Record `attestation` for its exact subject. The pull request's head
+/// branch and author are read from `forge`, the house's forge: a caller
+/// cannot name another branch to leave its own writer tasks out.
+/// `recorded_by` must not be a writer of that branch, and the claimed
+/// reviewer must not be the author. Recording the same attestation again is
+/// a no-op.
 ///
 /// # Errors
-/// [`ContractError::CrossHouse`] for another house,
-/// [`RunError::AttestationByWriter`] when `recorded_by` wrote the branch,
-/// [`RunError::AttestationNotIndependent`] for a reviewer who is `author`
-/// or an empty login, [`RunError::AttestationRecorded`] when a
+/// [`ContractError::CrossHouse`] for another house, a failed or incomplete
+/// read of the pull request, [`RunError::AttestationByWriter`] when
+/// `recorded_by` wrote the branch, [`RunError::AttestationNotIndependent`]
+/// for a reviewer who is the author, an empty login, or a pull request whose
+/// author the forge does not name, [`RunError::AttestationRecorded`] when a
 /// different attestation exists for the subject, and store errors.
-pub fn record_gate_attestation(
+pub fn record_gate_attestation<T: GitHubReadTransport>(
     store: &HouseStore,
+    forge: &GitHubClient<T>,
     attestation: &GateAttestation,
-    author: &str,
-    branch: &BranchName,
     recorded_by: &Claimant,
     now: Timestamp,
 ) -> Result<()> {
@@ -132,16 +149,22 @@ pub fn record_gate_attestation(
         }
         .into());
     }
+    let pull_request = known(forge.pull_request(
+        store.house(),
+        &attestation.repository,
+        attestation.pull_request,
+    ))?;
     let writers = BranchWriters::of(
         &store.tasks()?,
         &attestation.repository,
         attestation.pull_request,
-        branch,
+        &BranchName::new(&pull_request.head.name)?,
     );
     if writers.includes(recorded_by.holder.as_str()) {
         return Err(RunError::AttestationByWriter.into());
     }
-    if !independent(&attestation.forge_review.reviewer, Some(author), &[]) {
+    let author = pull_request.user.as_ref().map(|user| user.login.as_str());
+    if !independent(&attestation.forge_review.reviewer, author, &[]) {
         return Err(RunError::AttestationNotIndependent.into());
     }
     let key = key(
@@ -161,7 +184,7 @@ pub fn record_gate_attestation(
 }
 
 /// The attestation recorded for exactly this pull request, head, and base,
-/// if any.
+/// if any, and the holder that recorded it.
 ///
 /// # Errors
 /// [`StateError::MarkerPayloadInvalid`] for a payload that describes
@@ -172,7 +195,7 @@ pub fn gate_attestation(
     pull_request: IssueNumber,
     head: &CommitId,
     base: &CommitId,
-) -> Result<Option<GateAttestation>> {
+) -> Result<Option<RecordedAttestation>> {
     let Some(marker) = store.marker(&key(repository, pull_request, head, base)?)? else {
         return Ok(None);
     };
@@ -185,7 +208,10 @@ pub fn gate_attestation(
     {
         return Err(StateError::MarkerPayloadInvalid.into());
     }
-    Ok(Some(attestation))
+    Ok(Some(RecordedAttestation {
+        attestation,
+        recorded_by: marker.recorded_by().holder.clone(),
+    }))
 }
 
 /// Whether the forge's `reviews` hold the review `claimed` names, by the

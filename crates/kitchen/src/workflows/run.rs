@@ -64,7 +64,7 @@ mod repair;
 mod tick;
 
 pub use attestation::{
-    ForgeReview, GATE_ATTESTATION_WORKFLOW, GateAttestation, gate_attestation,
+    ForgeReview, GATE_ATTESTATION_WORKFLOW, GateAttestation, RecordedAttestation, gate_attestation,
     record_gate_attestation,
 };
 pub use coordinate::{CoordinateAction, CoordinatePass, Unroutable};
@@ -192,7 +192,7 @@ pub enum RunError {
     #[error("this pass needs its settings")]
     NoPassSettings,
     /// A gate attestation names the pull request's author as its reviewer,
-    /// or no reviewer.
+    /// or no reviewer, or the forge names no author.
     #[error(
         "the attesting reviewer is the pull request's author; an attestation must be independent"
     )]

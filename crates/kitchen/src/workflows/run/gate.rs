@@ -18,7 +18,15 @@
 //!
 //! Only a pull request whose verdict, evaluated without history, is a
 //! merge is recorded. It gets a gate task, claimed under this pass's lease,
-//! whose evidence subject is the verdict's head and base. The verdict and
+//! whose evidence subject is the verdict's head and base. The task's id
+//! carries a digest of its specification (the pinned revisions and the
+//! delegated grants) and a generation, so a house whose revisions or grants
+//! changed gets a new task, and so does a pull request whose task under the
+//! current specification settled or has little ownership history left. The
+//! pull request's other gate tasks are reconciled and settled first, and
+//! nothing is recorded or merged until they are. A pass that does not merge
+//! leaves the task's attempt interrupted, and the next pass continues that
+//! attempt instead of spending another. The verdict and
 //! its merge intent are persisted through [`HouseGateStore`], the provider's
 //! head and the base branch tip are read again ([`GateRun::next_merge`]),
 //! and only then is that exact intent submitted; a moved head or base
@@ -34,6 +42,7 @@ use super::{
     kitchen_pull_requests, repair_of, take_for_pass,
 };
 use crate::workflows::known;
+use crate::workflows::pickup::stable_hash;
 use crate::workflows::tick::PassRun;
 use crate::{
     BackendId, TaskId,
@@ -48,7 +57,10 @@ use crate::{
         GitHubClient, GitHubExecutor, GitHubMutationTransport, IntegrationError, Observation,
         ReadLimits,
     },
-    state::{EffectOutcome, EffectState, HouseStore, StateError, TaskRecord, TaskState, reconcile},
+    state::{
+        EffectOutcome, EffectState, HouseStore, MAX_OWNERSHIP_HISTORY, StateError, TaskRecord,
+        TaskState, reconcile,
+    },
     workflows::{
         gate::{
             Admission, FixGrant, ForgeGatePolicy, Gap, GateEvidence, GateGrants, GateHistory,
@@ -112,6 +124,9 @@ pub enum ReportReason {
     /// forge login of a commit's author or committer, or the forge does not
     /// name the pull request's author.
     NotIndependent,
+    /// The attestation was recorded by a holder or worker that wrote the
+    /// branch.
+    AttestedByWriter,
     /// The forge does not show the attestation's review: none with its id,
     /// or not by the claimed login, not approved, or not on this head.
     ReviewUnverified,
@@ -124,12 +139,12 @@ pub enum ReportReason {
     /// The verdict is not a merge. Fix requests and hand-overs stay with a
     /// person.
     NotMerge,
-    /// The gate task is held by another holder or a pass still running, it
-    /// settled, or it exists with another specification (such as older
-    /// pinned revisions).
+    /// The gate task, or an earlier gate task of the pull request that must
+    /// settle first, is held by another holder or a pass still running, or
+    /// cannot change hands again; or every generation of the task is spent.
     TaskHeld,
-    /// The gate task's claim expired without a release; rerun with a
-    /// takeover.
+    /// The claim on the gate task, or on an earlier gate task of the pull
+    /// request, expired without a release; rerun with a takeover.
     TaskUncertain,
 }
 
@@ -152,8 +167,8 @@ pub enum NotMerged {
     /// The forge accepted the merge but does not read it back as merged at
     /// the head yet.
     Unconfirmed,
-    /// An earlier effect of the gate task is unresolved; it is reconciled,
-    /// never repeated.
+    /// An earlier effect of the gate task, or of an earlier gate task of
+    /// the pull request, is unresolved; it is reconciled, never repeated.
     Reconciling,
     /// The gate task's attempts are spent.
     Exhausted,
@@ -303,9 +318,22 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             .user
             .as_ref()
             .map(|user| user.login.as_str());
+        let recorded_writers =
+            attestation::BranchWriters::of(tasks, self.repository, number, &found.branch);
+        // Whoever recorded the attestation chose its acceptance, hardware
+        // and risk facts, which no forge read confirms. A writer of this
+        // branch is refused here whatever branch the record-time check saw.
+        if recorded_writers.includes(attested.recorded_by.as_str()) {
+            return Ok(report(
+                &evidence,
+                GateGrants::default(),
+                ReportReason::AttestedByWriter,
+            ));
+        }
+        let attested = attested.attestation;
         // A holder or worker handle is not a forge login, and no record
         // ties a person's session to one.
-        if attestation::BranchWriters::of(tasks, self.repository, number, &found.branch).person() {
+        if recorded_writers.person() {
             return Ok(report(
                 &evidence,
                 GateGrants::default(),
@@ -403,13 +431,30 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
                 ));
             }
         }
-        let task = derived_task_id("gate", self.repository, number)?;
+        let Some(spec) = self.gate_task(tasks, number)? else {
+            return Ok(action(
+                predicted,
+                GateResult::ReportOnly(ReportReason::TaskHeld),
+            ));
+        };
+        let task = spec.id.clone();
+        // Another gate task of the pull request, under an earlier
+        // specification or generation, may hold an unresolved merge. It is
+        // reconciled and settled before this one takes its place.
+        for stale in tasks.iter().filter(|record| {
+            gate_of(record, self.repository) == Some(number)
+                && record.spec().id != task
+                && !matches!(record.state(), TaskState::Settled { .. })
+        }) {
+            if let Some(standing) = self.retire(stale, claimant, &merge)? {
+                return Ok(action(predicted, standing));
+            }
+        }
         super::record(self.store, self.tick, &task, self.clock)?;
-        match self
-            .store
-            .create_task(self.gate_spec(&task)?, claimant, self.clock.now())
-        {
+        match self.store.create_task(spec, claimant, self.clock.now()) {
             Ok(_) => {}
+            // The id carries the specification's digest, so only a digest
+            // collision gets here.
             Err(crate::Error::State(StateError::TaskConflict(_))) => {
                 return Ok(action(
                     predicted,
@@ -426,17 +471,8 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             self.clock.now(),
         )? {
             Ok(fence) => fence,
-            Err(Refusal::Held) => {
-                return Ok(action(
-                    predicted,
-                    GateResult::ReportOnly(ReportReason::TaskHeld),
-                ));
-            }
-            Err(Refusal::Uncertain) => {
-                return Ok(action(
-                    predicted,
-                    GateResult::ReportOnly(ReportReason::TaskUncertain),
-                ));
+            Err(refusal) => {
+                return Ok(action(predicted, GateResult::ReportOnly(refused(refusal))));
             }
         };
         let merged = self.merge(
@@ -482,22 +518,23 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
     ) -> Result<(Verdict, Merge)> {
         let (task, fence) = (owned.task, owned.fence);
         let now = self.clock.now();
-        let executor = GitHubExecutor::new(
-            self.forge_backend.clone(),
-            self.forge.scope().clone(),
-            self.forge.transport().clone(),
-            ReadLimits::default(),
-        )
-        .with_merge_grant(merge.clone());
+        let executor = self.executor(merge);
         let reconciled = reconcile(self.store, &executor, task, fence, self.clock)?;
         if !reconciled.unresolved.is_empty() || !reconciled.foreign.is_empty() {
             return Ok((Verdict::Merge, Merge::Not(NotMerged::Reconciling)));
         }
-        let attempt = match self.store.start_attempt(task, fence, now)? {
-            AttemptStart::Started(attempt) | AttemptStart::AlreadyRunning(attempt) => attempt,
-            AttemptStart::Exhausted => {
-                return Ok((Verdict::Merge, Merge::Not(NotMerged::Exhausted)));
-            }
+        // Every pass that does not merge relinquishes the task, which
+        // interrupts its attempt. That attempt is continued: a new one per
+        // pass would spend the task's attempts on passes that submitted
+        // nothing.
+        let attempt = match self.store.continue_attempt(task, fence, now)? {
+            Some(attempt) => attempt,
+            None => match self.store.start_attempt(task, fence, now)? {
+                AttemptStart::Started(attempt) | AttemptStart::AlreadyRunning(attempt) => attempt,
+                AttemptStart::Exhausted => {
+                    return Ok((Verdict::Merge, Merge::Not(NotMerged::Exhausted)));
+                }
+            },
         };
         // The verdict's effect is admitted only while the task's evidence is
         // at exactly this head and base. It is recorded once per subject, so
@@ -665,12 +702,97 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
         Ok(())
     }
 
-    /// The gate task of one pull request: the house's standing grants
-    /// delegated whole, and no worker.
-    fn gate_spec(&self, task: &TaskId) -> Result<TaskSpec> {
+    /// The forge executor merges run on, holding `merge`.
+    fn executor(&self, merge: &MergeGrant) -> GitHubExecutor<T> {
+        GitHubExecutor::new(
+            self.forge_backend.clone(),
+            self.forge.scope().clone(),
+            self.forge.transport().clone(),
+            ReadLimits::default(),
+        )
+        .with_merge_grant(merge.clone())
+    }
+
+    /// Reconcile and settle `stale`, an earlier gate task of the pull
+    /// request. `Some` says why it still stands; no task replaces it until
+    /// it settled.
+    fn retire(
+        &self,
+        stale: &TaskRecord,
+        claimant: &Claimant,
+        merge: &MergeGrant,
+    ) -> Result<Option<GateResult>> {
+        // Taking it would fail on its full ownership history and stop the
+        // pass; a person settles it.
+        if !room(stale, PASS_EVENTS) {
+            return Ok(Some(GateResult::ReportOnly(ReportReason::TaskHeld)));
+        }
+        let stale = &stale.spec().id;
+        super::record(self.store, self.tick, stale, self.clock)?;
+        let fence = match take_for_pass(
+            self.store,
+            stale,
+            claimant,
+            self.take_over,
+            self.clock.now(),
+        )? {
+            Ok(fence) => fence,
+            Err(refusal) => return Ok(Some(GateResult::ReportOnly(refused(refusal)))),
+        };
+        let settled = reconcile(self.store, &self.executor(merge), stale, fence, self.clock)
+            .and_then(|reconciled| {
+                if !reconciled.unresolved.is_empty() || !reconciled.foreign.is_empty() {
+                    return Ok(false);
+                }
+                match self.store.settle_cancelled(stale, fence, self.clock.now()) {
+                    Ok(()) => Ok(true),
+                    Err(crate::Error::State(StateError::UnresolvedEffects { .. })) => Ok(false),
+                    Err(error) => Err(error),
+                }
+            });
+        // A task that still stands goes back for the next pass.
+        if !matches!(settled, Ok(true)) {
+            self.store.relinquish(stale, fence, self.clock.now())?;
+        }
+        Ok(if settled? {
+            None
+        } else {
+            Some(GateResult::NotMerged(NotMerged::Reconciling))
+        })
+    }
+
+    /// The specification of the gate task this pass uses for pull request
+    /// `number`: the first generation whose task does not exist yet, or is
+    /// unsettled with room in its ownership history for this pass and for
+    /// settling it later. A task that settled, such as the one of an
+    /// earlier specification the house returned to, is never reused.
+    /// `None` when every generation is spent.
+    fn gate_task(&self, tasks: &[TaskRecord], number: IssueNumber) -> Result<Option<TaskSpec>> {
+        for generation in 0..=u8::MAX {
+            let spec = self.gate_spec(number, generation)?;
+            let usable = tasks
+                .iter()
+                .find(|record| record.spec().id == spec.id)
+                .is_none_or(|existing| {
+                    !matches!(existing.state(), TaskState::Settled { .. })
+                        && room(existing, 2 * PASS_EVENTS)
+                });
+            if usable {
+                return Ok(Some(spec));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Generation `generation` of the gate task of one pull request: the
+    /// house's standing grants delegated whole, and no worker. Its id
+    /// carries a digest of the rest of the specification and the
+    /// generation, so a changed specification is another task and never
+    /// conflicts with the one an earlier pass created.
+    fn gate_spec(&self, number: IssueNumber, generation: u8) -> Result<TaskSpec> {
         let grants = super::standing_grants(self.house)?;
-        Ok(TaskSpec {
-            id: task.clone(),
+        let mut spec = TaskSpec {
+            id: derived_task_id(GATE_TASK, self.repository, number)?,
             role: Role::Expediter,
             repository: Some(self.repository.clone()),
             authority: TaskAuthority::delegate(&grants, self.house.grants.iter().cloned())?,
@@ -680,7 +802,56 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             requires: CapabilityRequirements::new(),
             agent: None,
             work_type: None,
-        })
+        };
+        // A specification always encodes; a failure is refused like any
+        // other task the gate could not build.
+        let mut encoded = serde_json::to_vec(&spec).map_err(|_| RunError::GateRefused)?;
+        encoded.push(generation);
+        spec.id = derived_task_id(
+            &format!("{GATE_TASK}{:016x}", stable_hash(&encoded)),
+            self.repository,
+            number,
+        )?;
+        Ok(spec)
+    }
+}
+
+/// The kind every gate task id starts with.
+const GATE_TASK: &str = "gate";
+
+/// Ownership events one pass may add to a gate task: a claim, or a
+/// relinquish and a claim when it moves the task off an ended pass, and the
+/// relinquish or release that ends its hold.
+const PASS_EVENTS: usize = 3;
+
+/// Whether `record`'s ownership history has room for `events` more. Every
+/// pass that holds a gate task adds to it, and a full history refuses the
+/// next claim.
+fn room(record: &TaskRecord, events: usize) -> bool {
+    record.ownership().len().saturating_add(events) <= MAX_OWNERSHIP_HISTORY
+}
+
+/// The pull request a gate task of `repository` was created for, under any
+/// specification and generation, confirmed by deriving the task id again;
+/// `None` for another kind of task.
+fn gate_of(record: &TaskRecord, repository: &Repository) -> Option<IssueNumber> {
+    let spec = record.spec();
+    if spec.role != Role::Expediter || spec.repository.as_ref() != Some(repository) {
+        return None;
+    }
+    let (kind, rest) = spec.id.as_str().split_once('-')?;
+    let (_, number) = rest.rsplit_once('-')?;
+    let number = IssueNumber::new(number.parse().ok()?).ok()?;
+    (kind.starts_with(GATE_TASK)
+        && derived_task_id(kind, repository, number).ok().as_ref() == Some(&spec.id))
+    .then_some(number)
+}
+
+/// Why a pass that could not take a gate task only reports.
+const fn refused(refusal: Refusal) -> ReportReason {
+    match refusal {
+        Refusal::Held => ReportReason::TaskHeld,
+        Refusal::Uncertain => ReportReason::TaskUncertain,
     }
 }
 

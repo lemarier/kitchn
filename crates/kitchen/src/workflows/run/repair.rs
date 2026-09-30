@@ -13,6 +13,12 @@
 //! Otherwise the pull request is handed over as
 //! [`HandOver::WorktreeUnknown`].
 //!
+//! A round whose attempt ended without settling gets its next attempt here,
+//! through the same decision as a new round: the policy must still decide a
+//! repair for its pull request. Once the round launched a writer, that
+//! writer is the branch's latest, and it did not settle with such a report,
+//! so the pull request is handed over.
+//!
 //! A pass launches at most one writer per repository, and none while
 //! another branch writer of the repository may be working, since file
 //! overlap is not observed: a pickup task, a repair round, or a person's
@@ -228,10 +234,17 @@ struct Rounds<'r> {
     current: Option<&'r TaskRecord>,
 }
 
-impl Rounds<'_> {
+impl<'r> Rounds<'r> {
     /// Rounds already spent.
     fn used(&self) -> u8 {
         u8::try_from(self.settled.len()).unwrap_or(u8::MAX)
+    }
+
+    /// The unsettled round when a scheduled pass created it and it waits
+    /// for a launch: its first, or its next after an attempt that ended.
+    fn waiting(&self, repository: &Repository) -> Option<&'r TaskRecord> {
+        self.current
+            .filter(|current| scheduled_repair(current, repository) && awaiting_launch(current))
     }
 }
 
@@ -305,7 +318,6 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
         let mut actions = Vec::new();
         let mut candidates = Vec::with_capacity(found.len());
         let mut assessed = Vec::with_capacity(found.len());
-        let mut retry = None;
         for pull_request in &found {
             renew()?;
             super::record(self.store, self.tick, &pull_request.task, self.clock)?;
@@ -318,58 +330,16 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
                 continue;
             }
             let rounds = self.rounds(&tasks, pull_request.pull_request.number);
-            if let Some(current) = rounds.current
-                && scheduled_repair(current, self.repository)
-                && awaiting_launch(current)
-            {
-                // A round whose attempt ended without settling gets its next
-                // attempt here, like a pickup retry.
-                retry.get_or_insert((pull_request, rounds.used(), current));
-                continue;
-            }
             candidates.push(self.candidate(pull_request, &record, &rounds));
-            assessed.push(pull_request);
+            // A round waiting for its next attempt is the round a repair
+            // decision launches, like a pickup retry.
+            assessed.push((pull_request, rounds.waiting(self.repository)));
         }
         let mut launched = false;
-        if let Some((pull_request, used, current)) = retry {
-            renew()?;
-            let task = current.spec().id.clone();
-            let number = pull_request.pull_request.number;
-            if writer_open(&tasks, self.repository) {
-                actions.push(RepairAction::Waiting {
-                    pull_request: number,
-                    task,
-                    wait: Wait::WriterOpen,
-                });
-            } else {
-                let round = used.saturating_add(1);
-                // Read before taking the round, so a failed read leaves it
-                // as it was.
-                let findings = self.findings(&pull_request.pull_request)?;
-                super::record(self.store, self.tick, &task, self.clock)?;
-                match self.own_round(&task, &claimant)? {
-                    Ok(fence) => {
-                        let launch = Launch {
-                            task,
-                            round,
-                            fence,
-                            findings: &findings,
-                        };
-                        actions.push(self.launch(&ctx, pull_request, launch)?);
-                        launched = true;
-                    }
-                    Err(wait) => actions.push(RepairAction::Waiting {
-                        pull_request: number,
-                        task,
-                        wait,
-                    }),
-                }
-            }
-        }
         for (number, decision) in plan(&policy, &candidates, in_flight) {
-            let Some(pull_request) = assessed
+            let Some((pull_request, waiting)) = assessed
                 .iter()
-                .find(|found| found.pull_request.number == number)
+                .find(|(found, _)| found.pull_request.number == number)
             else {
                 continue;
             };
@@ -399,9 +369,15 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
                 continue;
             }
             renew()?;
+            // Read before taking the round, so a failed read leaves it as
+            // it was.
             let findings = self.findings(&pull_request.pull_request)?;
             super::record(self.store, self.tick, &task, self.clock)?;
-            match self.claim_round(template, &task, &claimant)? {
+            let owned = match waiting {
+                Some(_) => self.own_round(&task, &claimant)?,
+                None => self.claim_round(template, &task, &claimant)?,
+            };
+            match owned {
                 Ok(fence) => {
                     let launch = Launch {
                         task,
@@ -448,7 +424,9 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
     }
 
     /// The repair facts of one pull request. Its writers are the pickup
-    /// task and every repair round; an unsettled round is the writer.
+    /// task and every repair round. An unsettled round is the writer, unless
+    /// it waits for a launch: then the backend's view of every worker
+    /// launched so far decides, the waiting round's own included.
     fn candidate(
         &self,
         found: &KitchenPullRequest,
@@ -456,14 +434,21 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
         rounds: &Rounds<'_>,
     ) -> RepairCandidate {
         let view = PullRequestView::from_github(&found.pull_request);
+        let waiting = rounds.waiting(self.repository);
         let writer = match rounds.current {
-            Some(current) => Writer::Task(current.spec().id.clone()),
-            None => std::iter::once(pickup)
+            Some(current) if waiting.is_none() => Writer::Task(current.spec().id.clone()),
+            Some(_) | None => std::iter::once(pickup)
                 .chain(rounds.settled.iter().copied())
+                .chain(waiting)
                 .map(|record| self.writer(record))
                 .fold(Writer::None, strongest),
         };
-        let last = rounds.settled.last().copied().unwrap_or(pickup);
+        // The branch's latest writer: a waiting round once it launched one,
+        // else the newest settled round, else the pickup task.
+        let last = waiting
+            .filter(|round| current_worker(round).is_some())
+            .or_else(|| rounds.settled.last().copied())
+            .unwrap_or(pickup);
         RepairCandidate {
             repository: self.repository.clone(),
             branch: found.branch.clone(),
@@ -625,7 +610,8 @@ fn strongest(held: Writer, next: Writer) -> Writer {
 /// pull request's head now, and states the checkout clean and pushed: the
 /// repair writer then uses a new checkout without losing anything. A report
 /// that is silent about its checkout, or states it dirty or ahead of the
-/// remote, leaves the work unknown.
+/// remote, leaves the work unknown. So does a round whose writer's attempt
+/// ended without settling the round.
 fn worktree(last: &TaskRecord, writer: &Writer, head: &CommitId) -> WorktreeView {
     let settled = matches!(
         last.state(),

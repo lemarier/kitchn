@@ -46,6 +46,8 @@ enum Command {
     Pickup(commands::pickup::PickupArgs),
     /// Bind a house to the forge account it writes as, or show its binding.
     Forge(commands::forge::ForgeArgs),
+    /// Record an independent review for the scheduled merge gate.
+    Gate(commands::gate::GateArgs),
     /// Report how full the house store is and preview or apply its retention.
     Store(commands::store::StoreArgs),
     /// Report how full the trust ledger is and preview or apply its archival.
@@ -99,6 +101,7 @@ fn main() -> ExitCode {
         },
         Some(Command::Pickup(args)) => commands::pickup::run(args).map(|output| (output, true)),
         Some(Command::Forge(args)) => commands::forge::run(args),
+        Some(Command::Gate(args)) => commands::gate::run(args),
         Some(Command::Store(args)) => commands::store::run(args),
         Some(Command::Trust(args)) => commands::trust::run(args),
         Some(Command::Audit(args)) => commands::audit::run(args),

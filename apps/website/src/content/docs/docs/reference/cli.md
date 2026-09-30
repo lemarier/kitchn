@@ -619,8 +619,7 @@ before anything runs.
   under a new one. A merge that was sent and whose outcome the forge cannot
   prove blocks every later merge of that pull request, under any gate task
   and whatever risk decision was recorded for it, until a lookup shows it
-  merged or shows it can no longer merge. Kitchen has no command that
-  records attestations yet, so in practice the gate still only reports.
+  merged or shows it can no longer merge.
 
 Each pass takes its own lease first, so a second concurrent start does nothing
 and exits `3`. A pass that fails hands its lease to the next start. A pass that
@@ -631,6 +630,29 @@ process can no longer act on it; a replaced `pickup` can no longer claim or
 launch. The same flag lets `coordinate` take over scheduled task claims that
 expired because no pass renewed them for two hours. A pass with nothing to do prints `idle`, exits `0`, and launches or
 messages no worker.
+
+## `kitchn gate attest`
+
+An independent reviewer posts an approved forge review on the exact pull request head. The review body must contain one fenced `kitchen-attestation` block. The base SHA must match the live base branch tip; the PR object's base SHA can lag it. Kitchen takes the reviewer login and all claims from that review, checks the PR author, every branch commit author and committer, and the house's launched worker handles, then records the attestation. The scheduled gate reads the same review and claims again before considering a merge.
+
+````md
+```kitchen-attestation
+head=<40-character commit SHA>
+base=<40-character live base tip SHA>
+semantic=clean
+read_only=true
+acceptance=complete
+hardware=complete
+risk=none
+```
+````
+
+`semantic` is `clean`, `findings`, `partial`, or `unavailable`. `read_only` is `true` or `false`. `acceptance` and `hardware` are `complete` or `incomplete`. `risk` is `none` or a comma-separated list of distinct classes: `equipment-safety`, `authorization-secrets`, `durable-data`, `public-contract-release`, `workflow-rules`, `dependencies`, `weakened-validation`, and `large-diff`. The block must contain each key once, with no extra keys. Risk classes still require a separate human approval; this command does not grant one.
+
+```sh
+kitchn gate attest --registry <dir> --house <id> [--store <dir>] [--repository <owner/name>] \
+  --pull-request <number> --review-id <forge-review-id>
+```
 
 ## `kitchn pickup`
 

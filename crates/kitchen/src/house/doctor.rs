@@ -1,12 +1,13 @@
 use super::{
     Assessed, BackendKind, HouseError, LabelPreview, LabelStatus, ReadinessEvidence,
     RepositoryConfig, RepositoryLabel, RepositoryReadiness, StackTool, Workflow, assess,
+    forge_binding,
     missing_capabilities, preview_labels, workflow_requirements,
 };
 use crate::{
     HouseId,
     adoption::{HouseRegistry, ResolvedInstructions, resolve_instructions},
-    contracts::{Capability, CapabilitySet, Repository},
+    contracts::{Capability, CapabilitySet, Grant, Permission, Repository},
     scheduling::{BudgetError, ScheduleEvidence, SchedulePolicy, TokenUsage, UndeliveredReport},
     selection::OfferedModels,
     state::{StoreCapacity, TableUsage},
@@ -120,6 +121,8 @@ pub enum DoctorCode {
     Labels,
     /// Scheduler/backend capability is absent or partial.
     Capability,
+    /// An enabled workflow lacks a named standing grant.
+    Authority,
     /// A configured model is not offered by the installed agent, or was not checked.
     AgentModel,
     /// Orca's branch-prefix setting must match the pickup setting.
@@ -156,6 +159,24 @@ impl DoctorFinding {
             ),
             next_step: "Import it with kitchn house import if the registry lacks this binding, then delete the file yourself; Kitchen does not delete repository files.".into(),
         }
+    }
+}
+
+/// Standing permissions managed by a named grant preset and checked by doctor.
+/// Workflows without a preset still require their own explicit authority.
+#[must_use]
+pub fn workflow_grant_permissions(workflow: Workflow) -> Option<&'static [Permission]> {
+    match workflow {
+        Workflow::Pickup => Some(&[
+            Permission::LaunchWorker,
+            Permission::MessageWorker,
+            Permission::CancelWorker,
+            Permission::ReleaseResource,
+            Permission::PushBranch,
+            Permission::OpenPullRequest,
+        ]),
+        Workflow::Gate => Some(&[Permission::Merge]),
+        Workflow::Triage | Workflow::Gardener | Workflow::Dishwasher | Workflow::Inspector => None,
     }
 }
 /// Read-only setup report. Healthy means configuration evidence is complete,
@@ -331,6 +352,49 @@ pub fn doctor(
     let missing_capabilities = missing_capabilities(&repository.workflows, &capabilities);
     for (workflow, missing) in &missing_capabilities {
         findings.push(DoctorFinding { code: DoctorCode::Capability, message: format!("Scheduled {} requires: {}.", workflow.as_str(), missing.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")), next_step: "Configure a backend that positively supports each named capability and rerun doctor with its scoped observation; keep scheduling disabled until then. Interactive single-agent work remains separate.".into() });
+    }
+    for workflow in &repository.workflows {
+        let Some(permissions) = workflow_grant_permissions(*workflow) else {
+            continue;
+        };
+        for permission in permissions {
+            let forge = matches!(
+                permission,
+                Permission::PushBranch | Permission::OpenPullRequest | Permission::Merge
+            );
+            let binding = if forge {
+                forge_binding(registry, &house.house)
+                    .ok()
+                    .map(|b| (b.backend, b.credential))
+            } else {
+                house
+                    .backend
+                    .as_ref()
+                    .map(|b| (b.backend.clone(), b.credential.clone()))
+            };
+            let missing = binding.as_ref().is_none_or(|(backend, credential)| {
+                let grant = if matches!(
+                    permission,
+                    Permission::LaunchWorker
+                        | Permission::PushBranch
+                        | Permission::OpenPullRequest
+                        | Permission::Merge
+                ) {
+                    Grant::repository(
+                        *permission,
+                        repository.repository.clone(),
+                        backend.clone(),
+                        credential.clone(),
+                    )
+                } else {
+                    Grant::house(*permission, backend.clone(), credential.clone())
+                };
+                !house.grants.iter().any(|held| held.covers(&grant))
+            });
+            if missing {
+                findings.push(DoctorFinding { code: DoctorCode::Authority, message: format!("Scheduled {workflow} lacks {permission} for {}{}.", repository.repository, if binding.is_some() { "" } else { " (backend or forge binding missing)" }), next_step: format!("Bind the required backend or forge if absent, then run kitchn house grant --registry '{}' --house {} --repository {} --permission {} and approve its preview.", registry.root().display(), house.house, repository.repository, permission) });
+            }
+        }
     }
     if let Some(agents) = &house.agents {
         let offered = evidence.and_then(|evidence| evidence.agent_models.as_deref());

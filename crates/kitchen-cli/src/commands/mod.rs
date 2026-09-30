@@ -8,6 +8,7 @@ pub mod forge;
 pub mod gardener;
 pub mod gate;
 pub mod house;
+pub mod house_grant;
 pub mod house_init;
 pub mod interactive;
 pub mod mailbox;

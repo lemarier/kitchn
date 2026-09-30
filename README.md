@@ -137,7 +137,12 @@ action, in that session. A yes never carries over to the next action.
 
 `kitchn` is the engine behind the skill. Your agent runs it and reads its
 JSON; you rarely type anything beyond `house init`. The commands are precise
-and verbose on purpose, because agents and schedules call them, not people.
+for external effects. In a clean checkout at a pull request's live head, an
+expediter can run `kitchn gate attest --review-id <id>`; Kitchen infers the
+sole open pull request for that branch, or at that commit when no branch
+matches. `kitchn gate review` also infers
+`--head` from the clean checkout's `HEAD`. Explicit flags override these
+defaults.
 
 If you want to look under the hood, `kitchn --help` lists every command and
 the [CLI reference](https://getkitchn.com/docs/reference/cli/) documents

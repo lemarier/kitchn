@@ -4,9 +4,86 @@
 use std::{ffi::OsString, path::PathBuf};
 
 use kitchen::{
-    adoption::{HouseRegistry, origin_repository},
+    adoption::{HouseRegistry, checkout_branch, clean_checkout_head, origin_repository},
+    contracts::{CommitId, IssueNumber},
     house::HouseError,
+    integrations::github::{
+        GhCli, GitHubClient, HeadLocation, IntegrationError, IssueState, Observation,
+    },
 };
+
+use super::run::Opened;
+
+/// Resolve gate identifiers against the house-scoped forge. A missing PR is
+/// selected from the checkout branch when uniquely matched, or from the
+/// selected commit if no branch match exists.
+pub(super) fn gate_subject(
+    opened: &Opened,
+    forge: &GitHubClient<GhCli>,
+    pull_request: Option<IssueNumber>,
+    head: Option<CommitId>,
+) -> Result<(IssueNumber, CommitId), kitchen::Error> {
+    let inferred_head = head.is_none();
+    let (checkout_head, checkout_branch) = if inferred_head {
+        let cwd = std::env::current_dir().map_err(HouseError::from)?;
+        if origin_repository(&cwd)? != opened.repository {
+            return Err(IntegrationError::ScopeMismatch.into());
+        }
+        (Some(clean_checkout_head(&cwd)?), checkout_branch(&cwd)?)
+    } else {
+        (None, None)
+    };
+    let selected_head = head
+        .or(checkout_head.clone())
+        .ok_or(HouseError::MissingFlag { flag: "--head" })?;
+    let pull_request = match pull_request {
+        Some(number) => number,
+        None => {
+            let prs = known(forge.open_pull_requests(&opened.config.house, &opened.repository))?;
+            let branch_matches: Vec<_> = prs
+                .iter()
+                .filter(|pr| {
+                    pr.state == IssueState::Open
+                        && checkout_branch.as_deref() == Some(pr.head.name.as_str())
+                        && pr.head_location(&opened.repository) == HeadLocation::SameRepository
+                })
+                .collect();
+            let matches: Vec<_> = if branch_matches.is_empty() {
+                prs.iter()
+                    .filter(|pr| pr.state == IssueState::Open && pr.head.sha == selected_head)
+                    .collect()
+            } else {
+                branch_matches
+            };
+            if matches.len() != 1 {
+                if matches.is_empty() && checkout_branch.is_none() {
+                    return Err(HouseError::UnmatchedCheckoutHead.into());
+                }
+                return Err(HouseError::MissingFlag {
+                    flag: "--pull-request",
+                }
+                .into());
+            }
+            matches[0].number
+        }
+    };
+    if let Some(checkout_head) = checkout_head {
+        let live =
+            known(forge.pull_request(&opened.config.house, &opened.repository, pull_request))?;
+        if live.state != IssueState::Open || live.head.sha != checkout_head {
+            return Err(HouseError::StaleCheckoutHead.into());
+        }
+    }
+    Ok((pull_request, selected_head))
+}
+
+fn known<T>(observation: Observation<T>) -> Result<T, kitchen::Error> {
+    match observation {
+        Observation::Known(value) => Ok(value),
+        Observation::Unknown => Err(IntegrationError::Unknown.into()),
+        Observation::Unavailable(error) => Err(error.into()),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {

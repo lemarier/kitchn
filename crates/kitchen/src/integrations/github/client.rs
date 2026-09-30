@@ -422,6 +422,22 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             false,
         )
     }
+    /// List all open pull requests, refusing incomplete pagination.
+    pub fn open_pull_requests(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+    ) -> Observation<Vec<OpenPullRequest>> {
+        self.pages_with_permission(
+            house,
+            repo,
+            "pulls?state=open",
+            None,
+            false,
+            Some(super::AppPermission::PullRequests),
+        )
+    }
+
     /// Read the exact current head and mergeability.
     pub fn pull_request(
         &self,

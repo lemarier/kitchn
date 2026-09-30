@@ -415,7 +415,27 @@ fn gate_attest_accepts_only_pr_and_review_ids() -> TestResult {
 #[test]
 fn gate_attest_reads_the_forge_review_and_records_its_author() -> TestResult {
     let house = House::new()?;
-    let sha = KITCHEN;
+    fs::write(house.checkout.join("reviewed.txt"), "reviewed")?;
+    git(&house.checkout, &["add", "reviewed.txt"])?;
+    git(
+        &house.checkout,
+        &[
+            "-c",
+            "user.name=Author",
+            "-c",
+            "user.email=author@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Reviewed",
+        ],
+    )?;
+    let sha_output = run(Command::new("git")
+        .arg("-C")
+        .arg(&house.checkout)
+        .args(["rev-parse", "HEAD"]))?;
+    let sha = text(&sha_output.stdout);
+    let sha = sha.trim();
     let body = format!(
         "```kitchen-attestation\nhead={sha}\nbase={sha}\nsemantic=clean\nread_only=true\nacceptance=complete\nhardware=complete\nrisk=none\n```"
     );
@@ -430,6 +450,14 @@ fn gate_attest_reads_the_forge_review_and_records_its_author() -> TestResult {
             "base": {"sha": sha, "ref": "main", "repo": {"full_name": "acme/app"}},
             "mergeable": true, "mergeable_state": "clean", "user": {"login": "author"}
         }))?,
+    )?;
+    fs::write(
+        fixtures.join("pulls"),
+        serde_json::to_vec(&serde_json::json!([{
+            "number": 12, "state": "open",
+            "head": {"sha": sha, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
+            "base": {"ref": "main"}, "user": {"login": "author"}
+        }]))?,
     )?;
     fs::write(
         fixtures.join("branch"),
@@ -451,7 +479,8 @@ fn gate_attest_reads_the_forge_review_and_records_its_author() -> TestResult {
         }]))?,
     )?;
     let script = format!(
-        "#!/bin/sh\ncase \" $* \" in\n  *\" config get user \"*) echo octo-cat;;\n  *\" user \"*) cat '{}/user';;\n  *\"pulls/12/reviews\"*) cat '{}/reviews';;\n  *\"pulls/12/commits\"*) cat '{}/commits';;\n  *\"branches/main\"*) cat '{}/branch';;\n  *\"pulls/12\"*) cat '{}/pr';;\n  *) exit 1;;\nesac\n",
+        "#!/bin/sh\ncase \" $* \" in\n  *\" config get user \"*) echo octo-cat;;\n  *\" user \"*) cat '{}/user';;\n  *\"pulls/12/reviews\"*) cat '{}/reviews';;\n  *\"pulls/12/commits\"*) cat '{}/commits';;\n  *\"branches/main\"*) cat '{}/branch';;\n  *\"pulls?state=open\"*) cat '{}/pulls';;\n  *\"pulls/12\"*) cat '{}/pr';;\n  *) exit 1;;\nesac\n",
+        fixtures.display(),
         fixtures.display(),
         fixtures.display(),
         fixtures.display(),
@@ -469,8 +498,6 @@ fn gate_attest_reads_the_forge_review_and_records_its_author() -> TestResult {
         &registry,
         "--house",
         "acme",
-        "--pull-request",
-        "12",
         "--review-id",
         "11",
     ])?;
@@ -485,6 +512,192 @@ fn gate_attest_reads_the_forge_review_and_records_its_author() -> TestResult {
     .ok_or("missing attestation")?;
     assert_eq!(stored.attestation.forge_review.reviewer, "reviewer");
     assert_eq!(stored.recorded_by.as_str(), "reviewer");
+    fs::write(house.checkout.join("untracked"), "unreviewed")?;
+    let explicit = house.kitchen(&[
+        "gate",
+        "attest",
+        "--registry",
+        &registry,
+        "--house",
+        "acme",
+        "--pull-request",
+        "12",
+        "--review-id",
+        "11",
+    ])?;
+    assert_eq!(explicit.status.code(), Some(1));
+    assert!(text(&explicit.stderr).contains("already recorded"));
+    Ok(())
+}
+
+#[test]
+fn gate_inference_refuses_dirty_stale_missing_and_ambiguous_heads() -> TestResult {
+    let house = House::new()?;
+    git(
+        &house.checkout,
+        &["checkout", "--quiet", "-b", "review-branch"],
+    )?;
+    fs::write(house.checkout.join("reviewed.txt"), "reviewed")?;
+    git(&house.checkout, &["add", "reviewed.txt"])?;
+    git(
+        &house.checkout,
+        &[
+            "-c",
+            "user.name=Author",
+            "-c",
+            "user.email=author@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Reviewed",
+        ],
+    )?;
+    let sha_output = run(Command::new("git")
+        .arg("-C")
+        .arg(&house.checkout)
+        .args(["rev-parse", "HEAD"]))?;
+    let sha = text(&sha_output.stdout);
+    let sha = sha.trim();
+    let fixture = house.home.join("pulls.json");
+    let pr = |number, head: &str| {
+        serde_json::json!({
+            "number": number, "state": "open",
+            "head": {"sha": head, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
+            "base": {"ref": "main"}, "user": {"login": "author"}
+        })
+    };
+    let gh = Path::new(&house.path.split(':').next().ok_or("bin")?).join("gh");
+    fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" config get user \"*) echo octo-cat;;\n  *\" user \"*) echo '{{\"login\":\"octo-cat\"}}';;\n  *\"pulls?state=open\"*) cat '{}';;\n  *\"pulls/12\"*) cat '{}';;\n  *) exit 1;;\nesac\n",
+            fixture.display(),
+            house.home.join("pr.json").display()
+        ),
+    )?;
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))?;
+    let registry = house.registry().display().to_string();
+    let command = || {
+        house.kitchen(&[
+            "gate",
+            "attest",
+            "--registry",
+            &registry,
+            "--house",
+            "acme",
+            "--review-id",
+            "11",
+        ])
+    };
+
+    fs::write(house.checkout.join("untracked"), "dirty")?;
+    let dirty = command()?;
+    assert_eq!(dirty.status.code(), Some(1));
+    assert!(text(&dirty.stderr).contains("dirty checkout"));
+    fs::remove_file(house.checkout.join("untracked"))?;
+
+    fs::write(&fixture, "[]")?;
+    let missing = command()?;
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(text(&missing.stderr).contains("--pull-request"));
+
+    fs::write(
+        &fixture,
+        serde_json::to_vec(&serde_json::json!([pr(12, sha), pr(13, sha)]))?,
+    )?;
+    let ambiguous = command()?;
+    assert_eq!(ambiguous.status.code(), Some(2));
+    assert!(text(&ambiguous.stderr).contains("--pull-request"));
+
+    fs::write(
+        &fixture,
+        serde_json::to_vec(&serde_json::json!([pr(12, KITCHEN)]))?,
+    )?;
+    fs::write(
+        house.home.join("pr.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "number": 12, "state": "open", "draft": false, "merged": false,
+            "head": {"sha": KITCHEN, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
+            "base": {"sha": sha, "ref": "main"}, "mergeable": true
+        }))?,
+    )?;
+    let stale = command()?;
+    assert_eq!(stale.status.code(), Some(1));
+    assert!(text(&stale.stderr).contains("live forge head"));
+    Ok(())
+}
+
+#[test]
+fn gate_inference_reports_detached_checkout_with_moved_pr_head() -> TestResult {
+    let house = House::new()?;
+    fs::write(house.checkout.join("reviewed.txt"), "reviewed")?;
+    git(&house.checkout, &["add", "reviewed.txt"])?;
+    git(
+        &house.checkout,
+        &[
+            "-c",
+            "user.name=Author",
+            "-c",
+            "user.email=author@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Reviewed",
+        ],
+    )?;
+    git(&house.checkout, &["checkout", "--quiet", "--detach"])?;
+
+    let moved_head = "a".repeat(40);
+    let pr = serde_json::json!({
+        "number": 12, "state": "open",
+        "head": {"sha": moved_head, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
+        "base": {"ref": "main"}, "user": {"login": "author"}
+    });
+    let list = house.home.join("pulls.json");
+    let detail = house.home.join("pr.json");
+    fs::write(&list, serde_json::to_vec(&serde_json::json!([pr]))?)?;
+    let mut detailed = pr;
+    detailed["draft"] = serde_json::json!(false);
+    detailed["merged"] = serde_json::json!(false);
+    detailed["mergeable"] = serde_json::json!(true);
+    detailed["base"]["sha"] = serde_json::json!(KITCHEN);
+    fs::write(&detail, serde_json::to_vec(&detailed)?)?;
+    let gh = Path::new(&house.path.split(':').next().ok_or("bin")?).join("gh");
+    fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" config get user \"*) echo octo-cat;;\n  *\" user \"*) echo '{{\"login\":\"octo-cat\"}}';;\n  *\"pulls?state=open\"*) cat '{}';;\n  *\"pulls/12\"*) cat '{}';;\n  *) exit 1;;\nesac\n",
+            list.display(),
+            detail.display()
+        ),
+    )?;
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))?;
+
+    let registry = house.registry().display().to_string();
+    for arguments in [
+        vec!["gate", "attest", "--review-id", "11"],
+        vec![
+            "gate",
+            "review",
+            "--verdict",
+            "approve",
+            "--body-file",
+            "unused.txt",
+        ],
+    ] {
+        let mut command = arguments;
+        command.extend(["--registry", &registry, "--house", "acme"]);
+        let result = house.kitchen(&command)?;
+        assert_eq!(result.status.code(), Some(1));
+        let error = text(&result.stderr);
+        assert!(
+            error.contains("matches no open pull request head"),
+            "{error}"
+        );
+        assert!(error.contains("may be stale"), "{error}");
+        assert!(error.contains("--pull-request"), "{error}");
+        assert!(error.contains("--head"), "{error}");
+    }
     Ok(())
 }
 

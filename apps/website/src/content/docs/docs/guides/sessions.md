@@ -68,6 +68,8 @@ your decision. `follow-up` and `repair` claim the writer round, so scheduled
 repair skips the pull request until you hand it back. The house's fix-round
 budget applies. You can ask for fewer rounds in a session, never more.
 
+When the expediter has reviewed a clean checkout at the live PR head, the short attestation command is `kitchn gate attest --review-id <forge-review-id>`. Kitchen finds the sole open PR at that commit; a dirty checkout, moved head, or ambiguous match is refused.
+
 ## Issue drafts
 
 A preview shows every issue, comment, label and dependency it would write, with

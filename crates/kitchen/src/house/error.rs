@@ -15,6 +15,17 @@ pub enum HouseError {
         /// The CLI option needed to continue.
         flag: &'static str,
     },
+    /// A checkout with uncommitted files cannot establish what was reviewed.
+    #[error("cannot infer --head from a dirty checkout; commit or clean the worktree")]
+    DirtyCheckout,
+    /// The checked out commit no longer matches the forge pull request.
+    #[error("checkout --head is not the pull request's live forge head")]
+    StaleCheckoutHead,
+    /// A detached checkout does not identify any open pull request head.
+    #[error(
+        "this checkout matches no open pull request head and may be stale; pass --pull-request (and --head) explicitly"
+    )]
+    UnmatchedCheckoutHead,
     /// Origin fetch and push URLs identify different repositories.
     #[error("cannot infer --house: origin fetch and push disagree on --repository")]
     CheckoutRepositoryMismatch,
@@ -123,6 +134,9 @@ impl HouseError {
             | Self::RedirectedPath
             | Self::PinMismatch
             | Self::RepositoryUnidentified
+            | Self::DirtyCheckout
+            | Self::StaleCheckoutHead
+            | Self::UnmatchedCheckoutHead
             | Self::AmbiguousHouse { .. }
             | Self::RemotesDisagree { .. }
             | Self::BelowReadiness { .. }

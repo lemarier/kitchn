@@ -43,10 +43,12 @@ struct ReviewArgs {
     store: Option<PathBuf>,
     #[arg(long)]
     repository: Option<Repository>,
+    /// Open PR (default: the sole open PR for this checkout's branch or HEAD).
     #[arg(long)]
-    pull_request: u64,
+    pull_request: Option<NonZeroU64>,
+    /// Exact commit (default: HEAD of a clean checkout, verified against the live PR).
     #[arg(long)]
-    head: CommitId,
+    head: Option<CommitId>,
     #[arg(long, value_parser = ["approve", "request-changes"])]
     verdict: String,
     #[arg(long)]
@@ -74,8 +76,9 @@ struct AttestArgs {
     store: Option<PathBuf>,
     #[arg(long)]
     repository: Option<Repository>,
+    /// Open PR (default: the sole open PR for this checkout's branch or HEAD).
     #[arg(long)]
-    pull_request: u64,
+    pull_request: Option<NonZeroU64>,
     /// The forge review ID containing the attestation block.
     #[arg(long)]
     review_id: NonZeroU64,
@@ -89,11 +92,14 @@ pub fn run(args: GateArgs) -> Result<(String, bool), kitchen::Error> {
 }
 
 fn attest(args: AttestArgs) -> Result<(String, bool), kitchen::Error> {
-    let pull_request = IssueNumber::new(args.pull_request)?;
     let opened = Opened::open_parts(args.registry, &args.house, args.store, args.repository)?;
     let forge = opened
         .forge()?
         .with_read_access(TokenScope::for_review(opened.repository.clone()))?;
+    let pull_request = match args.pull_request {
+        Some(number) => IssueNumber::new(number.get())?,
+        None => super::defaults::gate_subject(&opened, &forge, None, None)?.0,
+    };
     let attestation = attest_gate_review(
         &opened.store,
         &forge,
@@ -122,6 +128,14 @@ fn review(args: ReviewArgs) -> Result<(String, bool), kitchen::Error> {
     let forge = opened
         .forge()?
         .with_read_access(TokenScope::for_review(opened.repository.clone()))?;
+    let (pull_request, head) = super::defaults::gate_subject(
+        &opened,
+        &forge,
+        args.pull_request
+            .map(|number| IssueNumber::new(number.get()))
+            .transpose()?,
+        args.head,
+    )?;
     let executor = GitHubExecutor::new(
         binding.backend.clone(),
         binding.scope(&opened.config)?,
@@ -166,8 +180,8 @@ fn review(args: ReviewArgs) -> Result<(String, bool), kitchen::Error> {
         .map_err(|_| kitchen::workflows::run::RunError::ReviewBodyInvalid)?;
     let input = GateReviewInput {
         repository: opened.repository.clone(),
-        pull_request: IssueNumber::new(args.pull_request)?,
-        head: args.head,
+        pull_request,
+        head,
         verdict,
         findings,
         semantic,

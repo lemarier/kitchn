@@ -149,6 +149,73 @@ the [CLI reference](https://getkitchn.com/docs/reference/cli/) documents
 their flags and exit codes. `house init` also creates the house state store
 where claims live, and commands find it through the registry.
 
+## Unattended merges
+
+The scheduled gate merges a pull request from a scheduled Kitchen task
+without you only when all of this holds at its exact head and base:
+
+- The house has a standing merge grant for the repository, and its readiness
+  policy allows unattended merges there.
+- Checks passed, review threads are resolved, nothing requests changes, and
+  the forge reports the pull request mergeable.
+- An independent reviewer approved that head on the forge, and a gate
+  attestation for that review is recorded. It says the review was `clean`
+  and `read_only`, acceptance and hardware are `complete`, and the risk is
+  `none`. Any risk class needs a human approval that an attestation does not
+  carry.
+
+Otherwise the gate only reports the pull request. A new head or base needs a
+new attestation.
+
+**Who may attest.** The reviewer must not have written the branch. Kitchen
+refuses an attestation by:
+
+- the pull request's author,
+- the forge login of any author or committer of a commit on the branch,
+- a worker that a launch on the branch created, or a holder of one of the
+  branch's writer tasks.
+
+If the forge links a commit to no account, or a person wrote the branch in
+their own session or took over a worker's terminal, Kitchen cannot tell the
+writers apart from the reviewer, and the pull request is only reported.
+
+**The attestation block.** The approving review's body holds exactly one
+`kitchen-attestation` block with these seven fields, one `key=value` per line:
+
+| Field | Value |
+| --- | --- |
+| `head` | The exact head commit reviewed. |
+| `base` | The base branch tip the diff was compared against. |
+| `semantic` | `clean`, `findings`, `partial`, or `unavailable`. |
+| `read_only` | `true` if the review read committed content without running the pull request's code with credentials, else `false`. |
+| `acceptance` | `complete` or `incomplete`: the linked issue's acceptance evidence. |
+| `hardware` | `complete` or `incomplete`; `complete` when no hardware work is needed. |
+| `risk` | `none`, or a comma-separated list of `equipment-safety`, `authorization-secrets`, `durable-data`, `public-contract-release`, `workflow-rules`, `dependencies`, `weakened-validation`, `large-diff`. |
+
+```kitchen-attestation
+head=9523e3b1c4f07a2d8e6b5f3a1c0d9e8f7a6b5c4d
+base=e635128a7f3c2b1d0e9f8a7b6c5d4e3f2a1b0c9d
+semantic=clean
+read_only=true
+acceptance=complete
+hardware=complete
+risk=none
+```
+
+`kitchn gate review --verdict approve --body-file findings.md --semantic clean
+--acceptance complete --hardware complete --risk none --attest` writes this
+block, posts the review, and records the attestation. For an approving review
+that already carries the block, record it from a clean checkout of the pull
+request's branch, or name the pull request with `--pull-request`:
+
+```sh
+kitchn gate attest --review-id <id>
+```
+
+Kitchen checks that the review is approved at the live head, that the block's
+`head` and `base` match the pull request, and that the reviewer is
+independent. The gate checks all of it again before it merges.
+
 ## Repository layout
 
 | Path | Contents |

@@ -579,6 +579,7 @@ mod tests {
     use crate::{
         contracts::{CommitId, ContractError},
         integrations::github::PullRequestCommit,
+        workflows::gate::SemanticReview,
     };
 
     fn commit(
@@ -629,6 +630,26 @@ mod tests {
             parse_review_block(Some(&valid.replace('\n', "\r\n")))?,
             claims
         );
+        Ok(())
+    }
+
+    #[test]
+    fn readme_example_block_parses() -> Result<(), Box<dyn std::error::Error>> {
+        // The README holds exactly one block, so parsing the whole file
+        // checks the example a reviewer copies.
+        let readme = include_str!("../../../../../README.md");
+        let claims = parse_review_block(Some(readme))?;
+        assert_eq!(
+            claims.head,
+            CommitId::new("9523e3b1c4f07a2d8e6b5f3a1c0d9e8f7a6b5c4d")?
+        );
+        assert_eq!(
+            claims.base,
+            CommitId::new("e635128a7f3c2b1d0e9f8a7b6c5d4e3f2a1b0c9d")?
+        );
+        assert_eq!(claims.semantic, SemanticReview::Clean);
+        assert!(claims.read_only && claims.acceptance && claims.hardware);
+        assert!(claims.risk.is_empty());
         Ok(())
     }
 

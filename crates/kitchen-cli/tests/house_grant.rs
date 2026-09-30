@@ -10,7 +10,6 @@ use kitchen::{
 };
 use std::{
     collections::BTreeSet,
-    fs,
     path::Path,
     process::{Command, Output, Stdio},
 };
@@ -165,28 +164,14 @@ fn invalid_permission_and_missing_binding_never_write() -> TestResult {
     assert_eq!(unbound.status.code(), Some(2));
     assert_eq!(registry.load(&before.house)?, before);
     let gate = run(&registry, &["grant", "--workflow", "gate", "--yes"])?;
-    assert!(
-        gate.status.success(),
-        "{}",
-        String::from_utf8_lossy(&gate.stderr)
-    );
-    let merged = registry.load(&before.house)?;
-    assert!(
-        merged
-            .grants
-            .iter()
-            .any(|grant| grant.permission == Permission::Merge)
-    );
-    fs::remove_file(registry.private_path(&before.house)?.join("forge.json"))?;
-    let revoke = run(&registry, &["revoke", "--workflow", "gate", "--yes"])?;
-    assert!(
-        revoke.status.success(),
-        "{}",
-        String::from_utf8_lossy(&revoke.stderr)
-    );
+    assert_eq!(gate.status.code(), Some(1));
+    assert!(String::from_utf8(gate.stderr)?.contains("exact head"));
+    let merge = run(&registry, &["grant", "--permission", "merge", "--yes"])?;
+    assert_eq!(merge.status.code(), Some(1));
+    assert!(String::from_utf8(merge.stderr)?.contains("exact head"));
     let after = registry.load(&before.house)?;
-    assert!(after.grants.is_empty());
-    assert!(after.policy_limits.is_empty());
+    assert_eq!(after, before);
+    after.authority()?;
     let other: HouseConfig = serde_json::from_str(include_str!(
         "../../kitchen/tests/fixtures/house/origin89.json"
     ))?;

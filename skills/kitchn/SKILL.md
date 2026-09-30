@@ -174,6 +174,12 @@ preview. `--house-wide` revokes
 matching authority across all repositories; use it only after the person
 approves that broader preview.
 
+Do not use `house grant --workflow gate` or `--permission merge`: the command
+refuses both. The owner must configure a repository-scoped merge grant, its
+matching policy limit, and merge readiness in the house config. The scheduled
+gate verifies an independent review attestation at the exact pull request head,
+calls `issue_authority`, and resolves its merge grant for that subject.
+
 ## Never
 
 - Act on a house you guessed, or without the pinned instructions.

@@ -21,7 +21,7 @@ pub struct GrantArgs {
         conflicts_with = "permission"
     )]
     workflow: Option<Workflow>,
-    /// One permission (for example launch-worker or merge).
+    /// One standing permission (for example launch-worker).
     #[arg(long)]
     permission: Option<Permission>,
     /// External registry directory (default: ~/.kitchn).
@@ -261,6 +261,9 @@ fn one_grant(
     // authority also needs named targets the command does not accept.
     if permission.is_target_scoped() || permission == AskHuman {
         return Err(HouseError::InvalidInput.into());
+    }
+    if permission == Merge {
+        return Err(HouseError::MergeGrantNeedsGate.into());
     }
     let forge = matches!(
         permission,

@@ -1,8 +1,7 @@
 use super::{
     Assessed, BackendKind, HouseError, LabelPreview, LabelStatus, ReadinessEvidence,
     RepositoryConfig, RepositoryLabel, RepositoryReadiness, StackTool, Workflow, assess,
-    forge_binding,
-    missing_capabilities, preview_labels, workflow_requirements,
+    forge_binding, missing_capabilities, preview_labels, workflow_requirements,
 };
 use crate::{
     HouseId,

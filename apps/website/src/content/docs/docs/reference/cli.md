@@ -167,6 +167,14 @@ preview names any matching house-scoped entries it retains. `--house-wide`
 explicitly revokes matching entries across the house, including grants for
 other repositories. Review its preview before applying it.
 
+`house grant --workflow gate` and `house grant --permission merge` refuse to
+write a merge grant. To enable the scheduled gate, the owner must configure a
+repository-scoped `merge` grant and matching `policyLimits` entry in the house
+config, with the forge backend and credential, then set the desired
+`mergeReadiness` policy. The gate checks the independent review attestation and
+the pull request's exact head, calls `issue_authority`, and resolves that grant
+for the exact pull request subject. A guided grant has no subject or attestation.
+
 ## `kitchn init` and `kitchn adopt`
 
 Preview, then create or add files from a house template.

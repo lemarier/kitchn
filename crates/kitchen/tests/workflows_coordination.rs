@@ -1259,6 +1259,27 @@ fn a_launch_is_accepted_when_the_backend_reports_the_exact_branch() -> TestResul
             ..
         }) if named == &requested
     )));
+    let launch = record
+        .effects()
+        .iter()
+        .find_map(|effect| match effect.request().effect() {
+            kitchen::contracts::Effect::Worker(kitchen::contracts::Operation::LaunchWorker {
+                brief,
+                ..
+            }) => Some(brief.as_str()),
+            _ => None,
+        })
+        .ok_or("launch brief missing")?;
+    assert!(launch.contains("Push: run '/"), "{launch}");
+    assert!(
+        launch.contains(&format!(
+            "push --store '{}' --house {} --task {}",
+            world.fixture.store.dir().display(),
+            world.fixture.store.house(),
+            task
+        )),
+        "{launch}"
+    );
     Ok(())
 }
 

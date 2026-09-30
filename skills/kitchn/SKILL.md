@@ -155,6 +155,21 @@ when the dispatch did not finish. Recheck the backend owner, worker settlement,
 and worktree preservation for both the stopped launch and its retry before
 consenting to a release.
 
+### Worker delivery
+
+When a Kitchen launch brief names a `Push:` command, run that exact command
+from the launched worktree after committing and completing the required checks.
+It checks the task's branch, worktree, grants, and live remote state, then pushes
+with a repository-scoped GitHub App installation token and opens a pull request.
+The house must use `kitchn forge bind --app-id ... --installation ...`;
+a personal-token binding is refused before its credential is read. Do not call
+Git's credential helpers or copy the forge token into a shell command. Add
+`--acceptance-done` only after the evidence report contains `Acceptance: done`
+and every acceptance item was checked. Otherwise the PR body says `Part of`
+the issue. If the command reports a refused or uncertain outcome, stop and
+give that result to the coordinator; do not use a direct `git push` to bypass
+the check. Later commits use the same command and task branch.
+
 ## 4. Scheduling
 
 A request such as "schedule pickup every 15 minutes" needs a preview

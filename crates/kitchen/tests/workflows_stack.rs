@@ -2832,7 +2832,7 @@ exec {GIT} \"$@\"
         assert_eq!(
             fs::read_to_string(&log)?,
             format!(
-                "global\tfile:{}\tkitchen-helper\ncommand\nglobal\nlocal\n",
+                "global\tfile:{}\tkitchen-helper\ncommand\tcommand line:\t\ncommand\tcommand line:\tkitchen-helper\ncommand\nglobal\nlocal\n",
                 text(config.path())?
             ),
             "only Kitchen's file, the checkout's own, and Kitchen's pins"

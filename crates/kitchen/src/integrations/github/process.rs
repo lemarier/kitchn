@@ -41,6 +41,23 @@ mod isolation_tests {
     use super::*;
 
     #[test]
+    fn personal_token_cannot_be_loaded_or_sent_to_a_child_for_push()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reference = CredentialRef::new(
+            crate::HouseId::new("house")?,
+            crate::CredentialId::new("github")?,
+            crate::contracts::ExternalRef::new("person")?,
+        );
+        let credential = CredentialFile::new(reference.clone(), PathBuf::from("/no-such-token"))?;
+        let gh = GhCli::new(PathBuf::from("/no-such-gh"), credential)?;
+        assert_eq!(
+            gh.push_token(&reference, &Repository::new("owner/repo")?),
+            Err(IntegrationError::AppRequiredForPush)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn child_receives_only_selected_environment_and_private_directory()
     -> Result<(), Box<dyn std::error::Error>> {
         let output = run(
@@ -187,6 +204,22 @@ enum Auth {
 }
 
 impl GhCli {
+    /// A repository-scoped token for one checked Git push child. The caller
+    /// must check task authority before asking for it and keep it off argv.
+    pub(crate) fn push_token(
+        &self,
+        reference: &CredentialRef,
+        repository: &Repository,
+    ) -> Result<String, IntegrationError> {
+        if matches!(self.auth, Auth::Token(_)) {
+            return Err(IntegrationError::AppRequiredForPush);
+        }
+        self.verified_token(
+            reference,
+            Some(&TokenScope::for_push(repository)),
+            Duration::from_secs(20),
+        )
+    }
     /// Select the binary and private credential binding without invoking them.
     ///
     /// # Errors

@@ -12,16 +12,20 @@ use common::{TestResult, commit, ttl};
 use kitchen::{
     BackendId, ErrorClass, TaskId,
     contracts::{
-        BranchName, CommitId, ContractError, Fence, Grant, HouseGrants, IssueNumber, Permission,
-        Repository, TaskAuthority,
+        BackendDescriptor, BackendUnavailable, BranchName, Capability, CapabilitySet, CommitId,
+        ContractError, EffectExecutor, EffectFailure, EffectRequest, ExternalRef, Fence,
+        GitHubEffect, GitHubMutation, Grant, HouseGrants, IssueNumber, Lookup, Permission,
+        PostingBudget, Receipt, Repository, ResourceKind, TaskAuthority, Text,
     },
     state::StateError,
     workflows::{
-        coordination::{LaunchOutcome, launch_worker},
+        coordination::{LaunchOutcome, Standing, launch_worker},
+        interactive::ForgeWriter,
         pickup::{Base, ClaimOutcome, TaskTemplate, WorkerBrief, claim_issue, issue_task_id},
         push::{
-            GitConfigKey, LayersPermit, PullRequests, PushBoundary, PushIntent, PushOutcome,
-            PushPermit, PushRefusal, RefUpdater, RemoteBranches, UpdateFailure,
+            GitConfigKey, LayersPermit, OpenOutcome, OpenRequest, PullRequests, PushBoundary,
+            PushIntent, PushOutcome, PushPermit, PushRefusal, RefUpdater, RemoteBranches,
+            UpdateFailure, last_pushed_head, open_task_pull_request, owns_worktree,
         },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
     },
@@ -107,6 +111,283 @@ fn pushing_on(grants: &HouseGrants, requested: Vec<Grant>, base: Base) -> TestRe
     };
     launch(&setup, &WorkerBrief { base, ..brief(5)? })?;
     Ok(setup)
+}
+
+#[test]
+fn a_worker_can_use_only_its_current_launch_worktree() -> TestResult {
+    let grants = push_grant_list()?;
+    let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
+    let record = setup.world.fixture.store.task(&setup.task)?;
+    let owned = record
+        .effects()
+        .iter()
+        .find_map(|effect| match effect.state() {
+            kitchen::state::EffectState::Applied { receipt, .. } => receipt
+                .created()
+                .iter()
+                .find(|resource| resource.kind == ResourceKind::Worktree)
+                .map(|resource| resource.handle.clone()),
+            _ => None,
+        })
+        .ok_or("no launched worktree")?;
+    assert!(owns_worktree(&record, &owned));
+    assert!(!owns_worktree(
+        &record,
+        &ExternalRef::new("another-worktree")?
+    ));
+    Ok(())
+}
+
+struct OpeningForge {
+    descriptor: BackendDescriptor,
+    calls: Cell<u32>,
+}
+
+impl OpeningForge {
+    fn new() -> TestResult<Self> {
+        Ok(Self {
+            descriptor: BackendDescriptor {
+                backend: github()?,
+                house: common::house()?,
+                worker_selection: None,
+                capabilities: CapabilitySet::supporting([
+                    Capability::ForgeMutation,
+                    Capability::EffectLookup,
+                ]),
+            },
+            calls: Cell::new(0),
+        })
+    }
+}
+
+impl EffectExecutor for OpeningForge {
+    fn descriptor(&self) -> &BackendDescriptor {
+        &self.descriptor
+    }
+
+    fn execute(&self, _: &EffectRequest) -> Result<Receipt, EffectFailure> {
+        self.calls.set(self.calls.get() + 1);
+        Receipt::new(
+            ExternalRef::new("https://github.com/origin89hq/firmware/pull/7").map_err(|_| {
+                EffectFailure::NotApplied(kitchen::contracts::NotAppliedReason::Rejected)
+            })?,
+            Vec::new(),
+            Vec::new(),
+        )
+        .map_err(|_| EffectFailure::NotApplied(kitchen::contracts::NotAppliedReason::Rejected))
+    }
+
+    fn lookup(&self, _: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
+        Ok(Lookup::Unknown)
+    }
+}
+
+impl ForgeWriter for OpeningForge {
+    fn github_effect(&self, mutation: GitHubMutation) -> kitchen::Result<GitHubEffect> {
+        Ok(GitHubEffect {
+            requester: ExternalRef::new("kitchen-bot")?,
+            mutation,
+            posting_budget: PostingBudget::new(10)?,
+        })
+    }
+}
+
+#[test]
+fn a_worker_opens_one_pr_and_retry_reuses_the_durable_effect() -> TestResult {
+    let mut grants = push_grant_list()?;
+    grants.push(Grant::house(
+        Permission::OpenPullRequest,
+        github()?,
+        common::credential()?,
+    ));
+    let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
+    let forge = OpeningForge::new()?;
+    let head = commit('d')?;
+    let base = branch("main")?;
+    let title = Text::new("feat: add driver")?;
+    let body = Text::new("Closes #5")?;
+    let reads = Reads::new(open(7)?, Observed::Known(Some(head.clone())));
+    let open = || {
+        open_task_pull_request(
+            &setup.world.fixture.store,
+            &setup.world.grants,
+            &setup.github,
+            &setup.world.clock,
+            &forge,
+            &Standing,
+            OpenRequest {
+                task: setup.task.clone(),
+                fence: setup.fence,
+                head: head.clone(),
+                base: base.clone(),
+                title: title.clone(),
+                body: body.clone(),
+                reads: &reads,
+            },
+        )
+    };
+    assert_eq!(open()?, OpenOutcome::Opened(number(7)?));
+    assert_eq!(open()?, OpenOutcome::Opened(number(7)?));
+    assert_eq!(forge.calls.get(), 1);
+    assert_eq!(
+        setup.world.fixture.store.task(&setup.task)?.pull_request(),
+        Some(number(7)?)
+    );
+    Ok(())
+}
+
+#[test]
+fn an_applied_open_survives_failed_readback_and_a_new_head() -> TestResult {
+    let mut grants = push_grant_list()?;
+    grants.push(Grant::house(
+        Permission::OpenPullRequest,
+        github()?,
+        common::credential()?,
+    ));
+    let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
+    let forge = OpeningForge::new()?;
+    let first_reads = Reads::new(Observed::Unknown, Observed::Known(Some(commit('d')?)));
+    let base = branch("main")?;
+    let title = Text::new("feat: driver")?;
+    let body = Text::new("Closes #5")?;
+    let request = |head, reads| OpenRequest {
+        task: setup.task.clone(),
+        fence: setup.fence,
+        head,
+        base: base.clone(),
+        title: title.clone(),
+        body: body.clone(),
+        reads,
+    };
+    assert_eq!(
+        open_task_pull_request(
+            &setup.world.fixture.store,
+            &setup.world.grants,
+            &setup.github,
+            &setup.world.clock,
+            &forge,
+            &Standing,
+            request(commit('d')?, &first_reads),
+        )?,
+        OpenOutcome::Uncertain,
+    );
+    let mut updated = view(7, PullRequestState::Open, "lemarier/issue-5")?;
+    updated.head = commit('e')?;
+    let second_reads = Reads::new(
+        Observed::Known(Some(updated)),
+        Observed::Known(Some(commit('e')?)),
+    );
+    assert_eq!(
+        open_task_pull_request(
+            &setup.world.fixture.store,
+            &setup.world.grants,
+            &setup.github,
+            &setup.world.clock,
+            &forge,
+            &Standing,
+            request(commit('e')?, &second_reads),
+        )?,
+        OpenOutcome::Opened(number(7)?),
+    );
+    assert_eq!(forge.calls.get(), 1);
+    assert_eq!(
+        setup.world.fixture.store.task(&setup.task)?.pull_request(),
+        Some(number(7)?)
+    );
+    Ok(())
+}
+
+#[test]
+fn an_applied_open_receipt_cannot_link_a_now_closed_pr() -> TestResult {
+    let mut grants = push_grant_list()?;
+    grants.push(Grant::house(
+        Permission::OpenPullRequest,
+        github()?,
+        common::credential()?,
+    ));
+    let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
+    let forge = OpeningForge::new()?;
+    let closed = Reads::new(
+        Observed::Known(Some(view(7, PullRequestState::Closed, "lemarier/issue-5")?)),
+        Observed::Known(None),
+    );
+    let request = || -> TestResult<OpenRequest<'_>> {
+        Ok(OpenRequest {
+            task: setup.task.clone(),
+            fence: setup.fence,
+            head: commit('d')?,
+            base: branch("main")?,
+            title: Text::new("feat: driver")?,
+            body: Text::new("Closes #5")?,
+            reads: &closed,
+        })
+    };
+    assert_eq!(
+        open_task_pull_request(
+            &setup.world.fixture.store,
+            &setup.world.grants,
+            &setup.github,
+            &setup.world.clock,
+            &forge,
+            &Standing,
+            request()?
+        )?,
+        OpenOutcome::Uncertain
+    );
+    assert_eq!(forge.calls.get(), 1);
+    assert_eq!(
+        setup.world.fixture.store.task(&setup.task)?.pull_request(),
+        None
+    );
+    // A retry reuses the applied receipt but must read live state again.
+    assert_eq!(
+        open_task_pull_request(
+            &setup.world.fixture.store,
+            &setup.world.grants,
+            &setup.github,
+            &setup.world.clock,
+            &forge,
+            &Standing,
+            request()?
+        )?,
+        OpenOutcome::Uncertain
+    );
+    assert_eq!(closed.pull_request_reads.get(), 2);
+    assert_eq!(forge.calls.get(), 1);
+    Ok(())
+}
+
+#[test]
+fn opening_a_worker_pr_requires_the_separate_open_grant() -> TestResult {
+    let grants = push_grant_list()?;
+    let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
+    let forge = OpeningForge::new()?;
+    let reads = Reads::new(open(7)?, Observed::Known(Some(commit('d')?)));
+    let result = open_task_pull_request(
+        &setup.world.fixture.store,
+        &setup.world.grants,
+        &setup.github,
+        &setup.world.clock,
+        &forge,
+        &Standing,
+        OpenRequest {
+            task: setup.task.clone(),
+            fence: setup.fence,
+            head: commit('d')?,
+            base: branch("main")?,
+            title: Text::new("feat: driver")?,
+            body: Text::new("Part of #5")?,
+            reads: &reads,
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(kitchen::Error::Contract(ContractError::PermissionDenied {
+            permission: Permission::OpenPullRequest
+        }))
+    ));
+    assert_eq!(forge.calls.get(), 0);
+    Ok(())
 }
 
 fn pushing() -> TestResult<Pushing> {
@@ -695,7 +976,7 @@ mod github_reads {
             CredentialRef, GitHubClient, GitHubReadTransport, HouseScope, IntegrationError,
             ReadLimits, ReadRequest,
         },
-        workflows::push::GitHubPullRequests,
+        workflows::push::{GitHubPullRequests, GitHubRemoteBranches, GitRemote, RemoteBranches},
     };
     use serde_json::json;
 
@@ -788,6 +1069,53 @@ mod github_reads {
                 1
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn private_branch_reads_distinguish_present_missing_and_unavailable() -> TestResult {
+        let house = HouseId::new("origin89")?;
+        let requester = ExternalRef::new("origin89-bot")?;
+        let repository = workflows_support::repo()?;
+        let scope = HouseScope::new(
+            house.clone(),
+            [repository.clone()],
+            requester.clone(),
+            CredentialRef::new(house.clone(), CredentialId::new("github-read")?, requester),
+            PostingBudget::new(0)?,
+            [Permission::PostComment],
+        )?;
+        let responses = VecDeque::from([
+            Ok(serde_json::to_vec(
+                &json!({"name":"lemarier/issue-5", "commit":{"sha":commit('d')?.as_str()}}),
+            )?),
+            Err(IntegrationError::NotFound),
+            Ok(serde_json::to_vec(&json!({"default_branch":"main"}))?),
+            Err(IntegrationError::Timeout),
+        ]);
+        let client = GitHubClient::new(
+            scope,
+            Transport(RefCell::new(responses)),
+            ReadLimits::new(Duration::from_secs(5), 1, 64 * 1024)?,
+        );
+        let directory = tempfile::tempdir()?;
+        let git = GitRemote::new(
+            std::env::current_exe()?,
+            directory.path().join("worker"),
+            "origin",
+            workflows_support::isolated_config(directory.path(), &[])?,
+            Duration::from_secs(5),
+        )?;
+        let source = GitHubRemoteBranches {
+            git: &git,
+            client: &client,
+            house: &house,
+            repository: &repository,
+        };
+        let branch = BranchName::new("lemarier/issue-5")?;
+        assert_eq!(source.head(&branch), Observed::Known(Some(commit('d')?)));
+        assert_eq!(source.head(&branch), Observed::Known(None));
+        assert_eq!(source.head(&branch), Observed::Unknown);
         Ok(())
     }
 }
@@ -924,6 +1252,77 @@ mod git_remote {
             Duration::from_secs(30),
         )?
         .with_url_bases(&[&url_base(repos)?])?)
+    }
+
+    #[test]
+    fn checkout_http_settings_do_not_reach_remote_head_read() -> TestResult {
+        let repos = fresh_repos()?;
+        git(
+            &repos.worker,
+            &["config", "http.proxy", "http://untrusted.invalid:8080"],
+        )?;
+        git(
+            &repos.worker,
+            &["config", "http.extraHeader", "Authorization: attacker"],
+        )?;
+        let trace = repos.dir.path().join("read-trace");
+        let wrapper = repos.dir.path().join("git-wrapper");
+        let trace_path = text(&trace)?.replace('\'', "'\\''");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = ls-remote ]; then\n pwd > '{trace_path}'\n git config --get http.proxy >> '{trace_path}' || true\n git config --get-all http.extraHeader >> '{trace_path}' || true\nfi\nexec {GIT} \"$@\"\n"
+            ),
+        )?;
+        let mut permissions = fs::metadata(&wrapper)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&wrapper, permissions)?;
+        let remote = GitRemote::new(
+            wrapper,
+            repos.worker.clone(),
+            "origin",
+            workflows_support::isolated_config(repos.dir.path(), &[])?,
+            Duration::from_secs(30),
+        )?
+        .with_url_bases(&[&url_base(&repos)?])?;
+        assert_eq!(remote.head(&branch(BRANCH)?), Observed::Known(None));
+        let observed = fs::read_to_string(trace)?;
+        assert!(!observed.contains("untrusted.invalid"), "{observed}");
+        assert!(!observed.contains("attacker"), "{observed}");
+        assert!(!observed.contains(text(&repos.worker)?), "{observed}");
+        Ok(())
+    }
+
+    #[test]
+    fn url_scoped_http_settings_refuse_a_push() -> TestResult {
+        let repos = fresh_repos()?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        git(
+            &repos.worker,
+            &[
+                "config",
+                "http.https://github.com/.extraHeader",
+                "Authorization: attacker",
+            ],
+        )?;
+        let remote = remote_for(&repos)?;
+        let outcome = push_with(
+            &pushing()?,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert!(
+            matches!(
+                outcome,
+                PushOutcome::Refused(PushRefusal::CheckoutRedirect(_))
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(remote_head(&repos, BRANCH)?, None);
+        Ok(())
     }
 
     /// Reads the remote head, then lets something happen before answering:
@@ -1857,8 +2256,8 @@ mod git_remote {
         Ok(())
     }
 
-    /// Without its own push repository Kitchen sends nothing, and says the
-    /// outcome is unknown rather than stale or pushed.
+    /// Without its own push repository Kitchen cannot verify the remote
+    /// head, so it refuses before sending anything.
     #[test]
     fn git_sends_nothing_when_its_push_repository_cannot_be_made() -> TestResult {
         let repos = fresh_repos()?;
@@ -1885,7 +2284,7 @@ mod git_remote {
             &first_intent()?,
             &mine,
         )?;
-        assert_eq!(outcome, PushOutcome::Uncertain);
+        assert_eq!(outcome, PushOutcome::Refused(PushRefusal::Unknown));
         assert_eq!(remote_head(&repos, BRANCH)?, None);
         Ok(())
     }
@@ -2321,18 +2720,38 @@ fn a_checked_pull_request_and_a_published_branch_bind_later_pushes() -> TestResu
         )?,
         PushOutcome::Pushed { replaced: None }
     );
+    assert_eq!(
+        last_pushed_head(
+            &setup.world.fixture.store,
+            &setup.task,
+            &branch("lemarier/issue-5")?
+        )?,
+        Some(first.clone())
+    );
     // An update names the pull request, which is checked and recorded.
     let reads = Reads::new(open(5)?, Observed::Known(Some(first.clone())));
     assert_eq!(
         boundary(&setup, &reads, &updater).push(
             &setup.task,
             setup.fence,
-            &update_intent(Some(first.clone()))?,
+            &update_intent(last_pushed_head(
+                &setup.world.fixture.store,
+                &setup.task,
+                &branch("lemarier/issue-5")?
+            )?)?,
             &second,
         )?,
         PushOutcome::Pushed {
             replaced: Some(first.clone())
         }
+    );
+    assert_eq!(
+        last_pushed_head(
+            &setup.world.fixture.store,
+            &setup.task,
+            &branch("lemarier/issue-5")?
+        )?,
+        Some(second.clone())
     );
     // The pull request merged and the forge kept the branch. An intent that
     // omits the pull request cannot skip the merged check.

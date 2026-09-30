@@ -175,6 +175,16 @@ pub struct TokenScope {
 }
 
 impl TokenScope {
+    /// Repository contents write access for a checked Git branch push.
+    #[must_use]
+    pub fn for_push(repository: &Repository) -> Self {
+        Self {
+            repository: repository.clone(),
+            permissions: [(AppPermission::Contents, Access::Write)]
+                .into_iter()
+                .collect(),
+        }
+    }
     /// Read access for a repository. Check runs, commit statuses, and branch
     /// protection need separate permissions requested only for those reads.
     #[must_use]

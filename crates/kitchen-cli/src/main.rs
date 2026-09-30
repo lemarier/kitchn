@@ -44,6 +44,8 @@ enum Command {
     Budget(Box<commands::budget::BudgetArgs>),
     /// Offline issue pickup diagnostics.
     Pickup(commands::pickup::PickupArgs),
+    /// Push the current task branch with the house forge credential and deliver its PR.
+    Push(commands::push::PushArgs),
     /// Bind a house to the forge account it writes as, or show its binding.
     Forge(commands::forge::ForgeArgs),
     /// Record an independent review for the scheduled merge gate.
@@ -119,6 +121,7 @@ fn main() -> ExitCode {
             commands::budget::Outcome::Output(result) => result,
         },
         Some(Command::Pickup(args)) => commands::pickup::run(args).map(|output| (output, true)),
+        Some(Command::Push(args)) => commands::push::run(args),
         Some(Command::Forge(args)) => commands::forge::run(args),
         Some(Command::Gate(args)) => commands::gate::run(args),
         Some(Command::Store(args)) => commands::store::run(args),

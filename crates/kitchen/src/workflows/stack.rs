@@ -1031,7 +1031,7 @@ impl StackBoundary<'_> {
         let Observed::Known(Some(local)) = self.local.local_head(&binding.branch) else {
             return Ok(refused(PushRefusal::Unknown));
         };
-        let permit = match self.plan_push(&view, &binding, replaces, local) {
+        let permit = match self.plan_push(&view, &binding, replaces, local.clone()) {
             Ok(permit) => permit,
             Err(refusal) => return Ok(StackOutcome::Refused(refusal)),
         };
@@ -1052,7 +1052,9 @@ impl StackBoundary<'_> {
             }
             Err(UpdateFailure::Uncertain) => return Ok(StackOutcome::Ran(StackResult::Uncertain)),
         }
-        record_landed(self.store, self.clock, task, fence, &binding, intent)?;
+        record_landed(
+            self.store, self.clock, task, fence, &binding, intent, &local,
+        )?;
         let Some(link) = link else {
             return Ok(StackOutcome::Ran(StackResult::Done));
         };

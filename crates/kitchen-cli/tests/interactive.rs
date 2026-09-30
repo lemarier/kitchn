@@ -497,6 +497,8 @@ fn the_skill_uses_only_flags_the_cli_accepts() -> TestResult {
         vec!["issue", "apply", "--help"],
         vec!["issue", "acknowledge", "--help"],
         vec!["hand-back", "--help"],
+        vec!["push", "--help"],
+        vec!["forge", "bind", "--help"],
         vec!["house", "setup", "--help"],
         vec!["house", "doctor", "--help"],
         vec!["house", "grant", "--help"],

@@ -1834,6 +1834,27 @@ fn a_launch_that_never_became_ready_is_a_failed_launch() -> TestResult {
         backend.observe_worker(&worker("ctx_quiet")?)?,
         WorkerState::Starting
     );
+    // Waiting on a reply is positive liveness only while the process is live:
+    // an unverifiable or exited waiting worker could not answer or push.
+    for liveness in ["unverifiable", "exited"] {
+        sim.set_worker(
+            "ctx_waiting",
+            SimWorker::new("ready", "in_progress", liveness, true),
+        );
+        assert_eq!(
+            backend.observe_worker(&worker("ctx_waiting")?)?,
+            WorkerState::Starting,
+            "{liveness} waiting worker"
+        );
+    }
+    sim.set_worker(
+        "ctx_waiting",
+        SimWorker::new("ready", "in_progress", "live", true),
+    );
+    assert_eq!(
+        backend.observe_worker(&worker("ctx_waiting")?)?,
+        WorkerState::AwaitingReply
+    );
     Ok(())
 }
 

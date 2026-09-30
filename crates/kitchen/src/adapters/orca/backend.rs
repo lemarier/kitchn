@@ -530,7 +530,9 @@ pub(crate) fn worker_state(
         ("succeeded", _) => WorkerState::Settled(WorkerOutcome::Succeeded),
         ("failed", _) | ("in_progress", "failed") => WorkerState::Settled(WorkerOutcome::Failed),
         ("in_progress", "starting") => WorkerState::Starting,
-        ("in_progress", "ready") if waiting => WorkerState::AwaitingReply,
+        // A waiting worker counts as awaiting a reply only while its process
+        // is shown live; otherwise it has no positive liveness evidence.
+        ("in_progress", "ready") if waiting && liveness == "live" => WorkerState::AwaitingReply,
         ("in_progress", "ready") if liveness == "live" => WorkerState::Ready,
         // Accepted, but the agent is not yet shown to be running.
         ("in_progress", "ready") => WorkerState::Starting,
@@ -2077,8 +2079,16 @@ mod tests {
             WorkerState::Starting
         );
         assert_eq!(
-            worker_state("ready", "in_progress", "unverifiable", true),
+            worker_state("ready", "in_progress", "live", true),
             WorkerState::AwaitingReply
+        );
+        assert_eq!(
+            worker_state("ready", "in_progress", "unverifiable", true),
+            WorkerState::Starting
+        );
+        assert_eq!(
+            worker_state("ready", "in_progress", "exited", true),
+            WorkerState::Starting
         );
         assert_eq!(
             worker_state("starting", "in_progress", "live", false),

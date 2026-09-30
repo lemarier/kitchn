@@ -452,10 +452,12 @@ const MAX_SETTLED_LOOKUPS: usize = 16;
 /// `repository`, found through each issue's linked pull requests by the
 /// task's branch. At most [`MAX_SETTLED_LOOKUPS`] tasks are looked up, newest
 /// first; a lookup that fails stops the pass rather than reading as none.
+/// `renew` runs before each lookup and stops the pass when it fails.
 fn kitchen_pull_requests<T: GitHubReadTransport>(
     store: &HouseStore,
     forge: &GitHubClient<T>,
     repository: &Repository,
+    renew: &dyn Fn() -> Result<()>,
 ) -> Result<Vec<KitchenPullRequest>> {
     let mut settled: Vec<(Timestamp, TaskRecord, IssueRef)> = store
         .tasks()?
@@ -477,6 +479,7 @@ fn kitchen_pull_requests<T: GitHubReadTransport>(
         let Some(branch) = task_branch(&record) else {
             continue;
         };
+        renew()?;
         let linked =
             super::known(forge.linked_pull_requests(store.house(), repository, issue.number))?;
         if let Some(linked) = linked.into_iter().find(|linked| {

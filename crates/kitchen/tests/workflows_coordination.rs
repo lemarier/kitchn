@@ -15,13 +15,13 @@ use kitchen::{
         PostingBudget, ResourceRef, Settlement, Text, WorkerOutcome, WorkerState, Workspace,
         fake::{ExecuteFault, FakeBackend},
     },
-    state::{ConsumerEvent, OwnershipEvent, RecoveryItem, TaskState},
+    state::{ConsumerEvent, ConsumerState, OwnershipEvent, RecoveryItem, TaskState},
     workflows::{
         coordination::{
             AnswerSource, Completion, CoordinatorStart, Escalation, HumanDecision, LaunchOutcome,
             QuestionEscalation, QuestionRoute, Response, RogerChannel, Supervision,
             SupervisionInput, WorkerQuestion, handle_question, launch_worker,
-            relinquish_coordinator, start_coordinator, supervise,
+            relinquish_coordinator, start_coordinator, start_coordinator_recording, supervise,
         },
         pickup::{ClaimOutcome, claim_issue, issue_task_id},
     },
@@ -505,6 +505,84 @@ fn duplicate_ticks_are_refused_by_the_consumer_lease() -> TestResult {
         )?,
         CoordinatorStart::Busy
     );
+    Ok(())
+}
+
+#[test]
+fn a_coordinator_records_each_relinquished_task_before_claiming_it() -> TestResult {
+    let world = World::new()?;
+    let store = &world.fixture.store;
+    let old = common::scheduled("coordinator-a")?;
+    let CoordinatorStart::Fresh(lease) = start_coordinator(
+        store,
+        world.backend.descriptor(),
+        &consumer()?,
+        &old,
+        ttl(600)?,
+        world.now(),
+    )?
+    else {
+        return Err("first coordinator did not start".into());
+    };
+    let claimant = old.clone().under(consumer()?, lease.fence());
+    let ClaimOutcome::Claimed(_) = claim_issue(
+        store,
+        &template()?,
+        &issue(1)?,
+        &claimant,
+        ttl(300)?,
+        world.now(),
+    )?
+    else {
+        return Err("claim failed".into());
+    };
+    let task = issue_task_id(&issue(1)?)?;
+    relinquish_coordinator(store, &consumer()?, lease.fence(), world.now())?;
+
+    // A recorder that fails stops the start before it takes the scope or
+    // claims anything.
+    let new = common::scheduled("coordinator-b")?;
+    let refused = start_coordinator_recording(
+        store,
+        world.backend.descriptor(),
+        &consumer()?,
+        &new,
+        ttl(600)?,
+        world.now(),
+        |_| Err(kitchen::workflows::run::RunError::NoBackend.into()),
+    );
+    assert!(matches!(
+        refused,
+        Err(kitchen::Error::Run(
+            kitchen::workflows::run::RunError::NoBackend
+        ))
+    ));
+    assert!(matches!(store.task(&task)?.state(), TaskState::Open));
+    assert!(matches!(
+        store.consumer(&consumer()?)?.ok_or("consumer missing")?.state(),
+        ConsumerState::Relinquished { lease, .. } if lease.holder() == &old.holder
+    ));
+
+    // The next start records the task while it is still open, then adopts it.
+    let mut seen = Vec::new();
+    let CoordinatorStart::Adopted { tasks, skipped, .. } = start_coordinator_recording(
+        store,
+        world.backend.descriptor(),
+        &consumer()?,
+        &new,
+        ttl(600)?,
+        world.now(),
+        |recorded| {
+            seen.push((recorded.clone(), store.task(recorded)?.state().clone()));
+            Ok(())
+        },
+    )?
+    else {
+        return Err("relinquished scope was not adopted".into());
+    };
+    assert_eq!(seen, [(task.clone(), TaskState::Open)]);
+    assert!(skipped.is_empty());
+    assert!(matches!(tasks.as_slice(), [(adopted, _)] if *adopted == task));
     Ok(())
 }
 

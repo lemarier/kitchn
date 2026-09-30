@@ -2164,3 +2164,231 @@ fn a_tick_coordination_pass_records_the_tasks_it_continues() -> TestResult {
     ));
     Ok(())
 }
+
+/// A clock whose process dies at the first reading after coordination
+/// claimed `task` under its pass lease.
+struct DiesAfterAdoption<'a> {
+    clock: &'a ManualClock,
+    store: &'a HouseStore,
+    task: kitchen::TaskId,
+}
+
+impl Clock for DiesAfterAdoption<'_> {
+    fn now(&self) -> kitchen::contracts::Timestamp {
+        let adopted = self.store.task(&self.task).is_ok_and(|record| {
+            matches!(
+                record.state(),
+                TaskState::Claimed { lease }
+                    if lease.consumer().is_some_and(|bound| bound.consumer.as_str() == "run-coordinate")
+            )
+        });
+        if adopted {
+            std::panic::resume_unwind(Box::new("the tick process died"));
+        }
+        self.clock.now()
+    }
+}
+
+#[test]
+fn a_tick_coordination_pass_records_a_handed_over_task_before_claiming_it() -> TestResult {
+    let mut kitchen = Kitchen::new()?;
+    kitchen.schedule(&[TickPass::Coordinate])?;
+    kitchen.ready_seven();
+    acted(kitchen.pickup(false)?)?;
+    let worker = kitchen.worker(7)?;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen.backend.post(vec![report(&worker, "done-7")?])?;
+    // A coordination pass fails and relinquishes its lease; its task is
+    // handed over open, relinquished by the scheduled runner.
+    assert!(kitchen.coordinate().is_err());
+    let task = kitchen.task(7)?;
+    kitchen
+        .store()
+        .relinquish(&task, kitchen.claim_fence(7)?, kitchen.clock.now())?;
+
+    // The tick's coordination pass adopts the task, and its process dies
+    // before anything else happens.
+    let dying = DiesAfterAdoption {
+        clock: &kitchen.clock,
+        store: kitchen.store(),
+        task: task.clone(),
+    };
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        kitchen.tick_on(Some(&kitchen.backend), &dying, "tick-crashed")
+    }));
+    assert!(crashed.is_err());
+    assert!(matches!(
+        kitchen.store().task(&task)?.ownership().last(),
+        Some(kitchen::state::OwnershipEvent::Adopted { .. })
+    ));
+    let runs = kitchen.store().runs()?;
+    assert!(
+        matches!(runs.as_slice(), [run] if run.state == RunState::Running && run.tasks == [task.clone()]),
+        "{runs:?}"
+    );
+
+    // Once its tick lease lapses the run is uncertain and still names the
+    // task it adopted.
+    kitchen.clock.advance(tick::PASS_LEASE.as_secs() + 1);
+    assert!(matches!(
+        decided(kitchen.tick("tick-b")?)?,
+        TickDecision::Blocked { .. }
+    ));
+    let runs = kitchen.store().runs()?;
+    assert!(
+        matches!(runs.as_slice(), [run] if matches!(run.state, RunState::Uncertain { .. }) && run.tasks == [task.clone()]),
+        "{runs:?}"
+    );
+    Ok(())
+}
+
+/// A clock on which each stretch of forge reads between two readings takes
+/// `stride` seconds, as slow forge calls would.
+struct SlowForge<'a> {
+    clock: &'a ManualClock,
+    forge: &'a Forge,
+    seen: std::cell::Cell<usize>,
+    stride: u64,
+}
+
+impl Clock for SlowForge<'_> {
+    fn now(&self) -> kitchen::contracts::Timestamp {
+        let reads = self.forge.reads();
+        if reads > self.seen.replace(reads) {
+            self.clock.advance(self.stride);
+        }
+        self.clock.now()
+    }
+}
+
+impl Kitchen {
+    /// Launch, report, and settle issue `number`, with pull request
+    /// `100 + number` open on its branch.
+    fn settle_with_pull_request(&self, number: u64) -> TestResult {
+        open_issues(self.forge(), vec![issue_json(number, &["ready"])]);
+        ready_issue(self.forge(), number, ACCEPTANCE);
+        acted(self.pickup(false)?)?;
+        let worker = self.worker(number)?;
+        self.backend
+            .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+        self.backend
+            .post(vec![report(&worker, &format!("done-{number}"))?])?;
+        self.forge().set(
+            &format!("repos/{REPO}/branches/kitchen/issue-{number}"),
+            json!({"name": format!("kitchen/issue-{number}"), "commit": {"sha": commit('d')?.as_str()}}),
+        );
+        acted(self.coordinate()?)?;
+        let task = self.task(number)?;
+        if !matches!(self.store().task(&task)?.state(), TaskState::Settled { .. }) {
+            return Err(format!("task {number} did not settle").into());
+        }
+        open_issues(self.forge(), Vec::new());
+        pull_request(self.forge(), number, 100 + number, true)?;
+        self.forge()
+            .set(&format!("repos/{REPO}/issues/{number}/timeline"), json!([]));
+        Ok(())
+    }
+}
+
+#[test]
+fn tick_repair_and_gate_passes_renew_while_slow_forge_reads_outlast_their_leases() -> TestResult {
+    let mut kitchen = Kitchen::new()?;
+    let issues = [7, 8, 9, 10, 11];
+    for number in issues {
+        kitchen.settle_with_pull_request(number)?;
+    }
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/main"),
+        json!({"name": "main", "commit": {"sha": commit('e')?.as_str()}}),
+    );
+    kitchen.schedule(&[TickPass::Repair, TickPass::Gate])?;
+    // Each forge lookup or evaluation takes 14 minutes: under the 15-minute
+    // pass lease, but five of them outlast the tick run's first hour.
+    let stride = PASS_LEASE.as_secs() - 60;
+    let slow = SlowForge {
+        clock: &kitchen.clock,
+        forge: kitchen.forge(),
+        seen: std::cell::Cell::new(kitchen.forge().reads()),
+        stride,
+    };
+    let ticks = kitchen.tick_on(Some(&kitchen.backend), &slow, "tick-a")?;
+    assert!(
+        ticks
+            .iter()
+            .all(|tick| ran(PassOutcome::Done)(&tick.decision)),
+        "{ticks:?}"
+    );
+    let mut tasks = Vec::with_capacity(issues.len());
+    for number in issues {
+        tasks.push(kitchen.task(number)?);
+    }
+    for pass in [TickPass::Repair, TickPass::Gate] {
+        let runs = kitchen.store().runs()?;
+        let run = runs
+            .iter()
+            .find(|run| run.pass == pass)
+            .ok_or("no run for the pass")?;
+        let RunState::Ended { ended_at, .. } = run.state else {
+            return Err(format!("{pass:?} did not end: {run:?}").into());
+        };
+        // The pass outlasted both the tick run's and its own first lease.
+        assert!(
+            ended_at > run.started_at.saturating_add(tick::PASS_LEASE),
+            "{run:?}"
+        );
+        let expected = match pass {
+            TickPass::Repair => issues.len(),
+            TickPass::Gate => kitchen::workflows::run::MAX_GATE_PULL_REQUESTS,
+            TickPass::Pickup | TickPass::Coordinate => 0,
+        };
+        assert_eq!(run.tasks.len(), expected, "{run:?}");
+        assert!(run.tasks.iter().all(|task| tasks.contains(task)));
+    }
+    assert_eq!(kitchen.consumer(Pass::Repair)?, Some(ConsumerState::Idle));
+    assert_eq!(kitchen.consumer(Pass::Gate)?, Some(ConsumerState::Idle));
+    Ok(())
+}
+
+#[test]
+fn a_repair_pass_stops_when_a_forge_read_outlasts_its_lease() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    for number in [7, 8] {
+        kitchen.settle_with_pull_request(number)?;
+    }
+    // One lookup takes longer than the pass lease: the renewal before the
+    // next item is refused and the pass assesses nothing.
+    let slow = SlowForge {
+        clock: &kitchen.clock,
+        forge: kitchen.forge(),
+        seen: std::cell::Cell::new(kitchen.forge().reads()),
+        stride: PASS_LEASE.as_secs() + 60,
+    };
+    let stopped = RepairPass {
+        store: kitchen.store(),
+        house: &kitchen.config,
+        backend: &kitchen.backend,
+        forge: &kitchen.forge,
+        clock: &slow,
+        repository: &kitchen.settings.repository,
+        take_over: false,
+        tick: None,
+    }
+    .run();
+    assert!(
+        matches!(
+            stopped,
+            Err(kitchen::Error::State(StateError::LeaseExpired { .. }))
+        ),
+        "{stopped:?}"
+    );
+    // The failed pass relinquished its lease, so the next start adopts it
+    // and assesses both pull requests.
+    assert!(matches!(
+        kitchen.consumer(Pass::Repair)?,
+        Some(ConsumerState::Relinquished { .. })
+    ));
+    assert_eq!(acted(kitchen.repair()?)?.len(), 2);
+    Ok(())
+}

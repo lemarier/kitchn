@@ -23,7 +23,7 @@ use crate::{
         coordination::{
             Completion, Context, CoordinatorStart, MailboxRoute, Standing, Supervision,
             SupervisionInput, SupervisionPolicy, current_worker, launched_workers,
-            start_coordinator, supervise, task_branch,
+            start_coordinator_recording, supervise, task_branch,
         },
         known,
         tick::PassRun,
@@ -276,13 +276,17 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         let claimant = run_claimant()?;
         let now = self.clock.now();
         let ttl = LeaseTtl::new(super::PASS_LEASE)?;
-        let (lease, took_over) = match start_coordinator(
+        // A relinquished task is recorded on the tick run before this pass
+        // adopts it, so a pass that stops right after the claim still names
+        // it.
+        let (lease, took_over) = match start_coordinator_recording(
             self.store,
             self.backend.descriptor(),
             &consumer,
             &claimant,
             ttl,
             now,
+            |task| super::record(self.store, self.tick, task, self.clock),
         )? {
             CoordinatorStart::Fresh(lease) | CoordinatorStart::Adopted { lease, .. } => {
                 (lease, false)
@@ -400,9 +404,10 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
     /// whose pickup pass is still current is left to it. After this pass
     /// `took_over` an expired lease, every live claim is moved, so the
     /// replaced process holds only stale fences. A claim bound to this pass,
-    /// at `consumer` and `pass_fence`, was adopted by [`start_coordinator`]
-    /// and is this pass's own. Each task this pass continues is recorded on
-    /// its tick run first; the adoption itself only moved the claim.
+    /// at `consumer` and `pass_fence`, was adopted by
+    /// [`start_coordinator_recording`], which recorded it on the tick run
+    /// before the claim, and is this pass's own. Each other task this pass
+    /// continues is recorded on its tick run before it is moved or claimed.
     fn own(
         &self,
         consumer: &ConsumerId,
@@ -424,7 +429,6 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                 if bound
                     .is_some_and(|bound| &bound.consumer == consumer && bound.fence == pass_fence)
                 {
-                    super::record(self.store, self.tick, &task, self.clock)?;
                     actions.push(CoordinateAction::Adopted { task: task.clone() });
                     owned.push(Owned::new(task, lease.fence()));
                     continue;

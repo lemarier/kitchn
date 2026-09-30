@@ -41,7 +41,7 @@
 use std::time::Duration;
 
 use crate::{
-    ConsumerId, EffectName, ErrorClass, TaskId,
+    ConsumerId, EffectName, ErrorClass, HolderId, TaskId,
     contracts::{
         AskKind, AskRisk, AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor,
         BranchName, Capability, Claimant, Clock, Consent, ContractError, DecisionBinding,
@@ -2174,6 +2174,26 @@ pub fn start_coordinator(
     ttl: LeaseTtl,
     now: Timestamp,
 ) -> Result<CoordinatorStart> {
+    start_coordinator_recording(store, backend, consumer, claimant, ttl, now, |_| Ok(()))
+}
+
+/// [`start_coordinator`], calling `before_claim` with each task the
+/// previous coordinator relinquished before this one takes the scope's
+/// lease, so a caller can record every task it may claim durably first.
+/// When `before_claim` fails, nothing was taken or claimed. A start that then
+/// finds the scope busy or uncertain claims none of the tasks it reported.
+///
+/// # Errors
+/// The errors of [`start_coordinator`] and of `before_claim`.
+pub fn start_coordinator_recording(
+    store: &HouseStore,
+    backend: &BackendDescriptor,
+    consumer: &ConsumerId,
+    claimant: &Claimant,
+    ttl: LeaseTtl,
+    now: Timestamp,
+    mut before_claim: impl FnMut(&TaskId) -> Result<()>,
+) -> Result<CoordinatorStart> {
     if &backend.house != store.house() {
         return Err(ContractError::CrossHouse {
             expected: store.house().clone(),
@@ -2193,6 +2213,13 @@ pub fn start_coordinator(
             ConsumerState::Relinquished { lease, .. } => Some(lease.holder().clone()),
             ConsumerState::Idle | ConsumerState::Held { .. } => None,
         });
+    let relinquished = match &previous {
+        Some(previous) => relinquished_by(store, previous)?,
+        None => Vec::new(),
+    };
+    for task in &relinquished {
+        before_claim(task)?;
+    }
     let lease = match store.acquire_consumer(consumer, claimant, ttl, now) {
         Ok(lease) => lease,
         Err(crate::Error::State(StateError::ClaimHeld { .. })) => {
@@ -2203,28 +2230,13 @@ pub fn start_coordinator(
         }
         Err(error) => return Err(error),
     };
-    let Some(previous) = previous else {
+    if previous.is_none() {
         return Ok(CoordinatorStart::Fresh(lease));
-    };
+    }
     let under = claimant.clone().under(consumer.clone(), lease.fence());
     let mut tasks = Vec::new();
     let mut skipped = Vec::new();
-    for record in store.tasks()? {
-        let events = record.ownership();
-        let relinquished_by_previous = match events {
-            [
-                ..,
-                OwnershipEvent::Claimed { holder, fence, .. }
-                | OwnershipEvent::Adopted { holder, fence, .. }
-                | OwnershipEvent::TakenOver { holder, fence, .. },
-                OwnershipEvent::Relinquished { fence: gave_up, .. },
-            ] => holder == &previous && fence == gave_up,
-            _ => false,
-        };
-        if !relinquished_by_previous || !matches!(record.state(), TaskState::Open) {
-            continue;
-        }
-        let id = record.spec().id.clone();
+    for id in relinquished {
         match store.claim(&id, &under, ttl, now) {
             Ok(task_lease) => tasks.push((id, task_lease)),
             Err(crate::Error::State(
@@ -2238,6 +2250,29 @@ pub fn start_coordinator(
         tasks,
         skipped,
     })
+}
+
+/// The open tasks whose last ownership event is `previous` relinquishing
+/// its own claim.
+fn relinquished_by(store: &HouseStore, previous: &HolderId) -> Result<Vec<TaskId>> {
+    Ok(store
+        .tasks()?
+        .into_iter()
+        .filter(|record| {
+            matches!(record.state(), TaskState::Open)
+                && match record.ownership() {
+                    [
+                        ..,
+                        OwnershipEvent::Claimed { holder, fence, .. }
+                        | OwnershipEvent::Adopted { holder, fence, .. }
+                        | OwnershipEvent::TakenOver { holder, fence, .. },
+                        OwnershipEvent::Relinquished { fence: gave_up, .. },
+                    ] => holder == previous && fence == gave_up,
+                    _ => false,
+                }
+        })
+        .map(|record| record.spec().id.clone())
+        .collect())
 }
 
 /// Hand a coordinator's scope over with work in flight: relinquish every

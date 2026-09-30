@@ -473,7 +473,7 @@ impl<'a> StaleMarkers<'a> {
         let subject = stale_subject()?;
         self.store
             .markers(&self.workflow)
-            .map_err(|_| WorkflowError::PrecheckFailed)?
+            .map_err(WorkflowError::precheck_store)?
             .iter()
             .filter(|marker| marker.key().subject == subject)
             .filter_map(|marker| match &marker.key().item {
@@ -512,7 +512,7 @@ impl<'a> StaleMarkers<'a> {
         let Some(marker) = self
             .store
             .marker(&key)
-            .map_err(|_| WorkflowError::PrecheckFailed)?
+            .map_err(WorkflowError::precheck_store)?
         else {
             return Ok(false);
         };
@@ -528,7 +528,7 @@ impl<'a> StaleMarkers<'a> {
         let key = self.key(repository, issue)?;
         self.store
             .marker(&key)
-            .map_err(|_| WorkflowError::PrecheckFailed)?
+            .map_err(WorkflowError::precheck_store)?
             .map(|marker| StaleHandled::handled_revision(marker.fact()))
             .transpose()
             .map(Option::flatten)

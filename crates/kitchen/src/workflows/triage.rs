@@ -41,7 +41,7 @@ pub fn poll_spec_answer<T: RogerReadTransport>(
         IntegrationError::ScopeMismatch | IntegrationError::StaleDecision => {
             WorkflowError::DecisionMismatch
         }
-        _ => WorkflowError::PrecheckFailed,
+        other => WorkflowError::precheck(other),
     })
 }
 
@@ -363,7 +363,7 @@ impl MarkerView for IssueMarkers<'_> {
         let markers = self
             .store
             .markers(&self.workflow)
-            .map_err(|_| WorkflowError::PrecheckFailed)?;
+            .map_err(WorkflowError::precheck_store)?;
         markers
             .iter()
             .filter(|marker| marker.key().item == item)
@@ -389,7 +389,7 @@ impl MarkerView for IssueMarkers<'_> {
         let markers = self
             .store
             .markers(&self.workflow)
-            .map_err(|_| WorkflowError::PrecheckFailed)?;
+            .map_err(WorkflowError::precheck_store)?;
         let mut posted = false;
         let mut legacy = false;
         let mut identified = false;
@@ -479,11 +479,9 @@ pub fn record_resolution(
     // A version 1 marker at this revision is replaced by the identified one.
     // The swap compares against the fact just read, so a concurrent change
     // is refused rather than overwritten.
-    let existing = store
-        .marker(&key)
-        .map_err(|_| WorkflowError::PrecheckFailed)?;
+    let existing = store.marker(&key).map_err(WorkflowError::precheck_store)?;
     if let Some(existing) =
-        existing.filter(|marker| is_legacy_resolution(marker.fact()) == Ok(true))
+        existing.filter(|marker| matches!(is_legacy_resolution(marker.fact()), Ok(true)))
     {
         return store
             .supersede_marker(&key, existing.fact(), fact, recorded_by, now)
@@ -507,7 +505,7 @@ fn record(
 fn marker_error(error: crate::Error) -> WorkflowError {
     match error {
         crate::Error::State(StateError::MarkerConflict) => WorkflowError::DecisionMismatch,
-        _ => WorkflowError::PrecheckFailed,
+        other => WorkflowError::precheck_store(other),
     }
 }
 

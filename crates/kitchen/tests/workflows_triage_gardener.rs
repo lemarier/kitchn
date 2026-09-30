@@ -164,12 +164,12 @@ fn triage_collects_complete_forge_sources_and_rejects_partial_reads()
     let client = github_client(pages[..3].to_vec())?;
     assert!(matches!(
         triage::collect_issue(&client, &house, &repo, issue(10)),
-        Err(WorkflowError::PrecheckFailed)
+        Err(WorkflowError::PrecheckFailed { .. })
     ));
     let client = github_client(pages)?;
     assert!(matches!(
         triage::collect_issue(&client, &HouseId::new("foreign")?, &repo, issue(10)),
-        Err(WorkflowError::PrecheckFailed)
+        Err(WorkflowError::PrecheckFailed { .. })
     ));
     Ok(())
 }
@@ -595,10 +595,11 @@ fn unreadable_marker_store_fails_instead_of_asking_again() -> common::TestResult
     let mut input = triage_input();
     input.factual_resolution = None;
     input.pending_product_questions = 1;
-    assert_eq!(
-        triage::plan_with_markers(&input, &markers),
-        Err(WorkflowError::PrecheckFailed)
-    );
+    let Err(failure) = triage::plan_with_markers(&input, &markers) else {
+        return Err("corrupt marker store was accepted".into());
+    };
+    assert!(matches!(failure, WorkflowError::PrecheckFailed { .. }));
+    assert!(failure.to_string().contains("persisted state is invalid"));
     // Work that needs no pass never reads the store.
     input.human_only = true;
     assert_eq!(triage::plan_with_markers(&input, &markers), Ok(vec![]));
@@ -919,10 +920,10 @@ fn unreadable_or_foreign_resolution_markers_fail_closed() -> common::TestResult 
         Err(WorkflowError::IncompleteEvidence)
     );
     fs::write(fixture.state_path(), b"{not json")?;
-    assert_eq!(
+    assert!(matches!(
         triage::plan_with_markers(&input, &markers),
-        Err(WorkflowError::PrecheckFailed)
-    );
+        Err(WorkflowError::PrecheckFailed { .. })
+    ));
     Ok(())
 }
 
@@ -1120,7 +1121,7 @@ fn precheck_results_decode_to_schedule_outcomes() {
     );
     assert_eq!(precheck_outcome(Ok(Precheck::Idle)), PrecheckOutcome::Idle);
     for error in [
-        WorkflowError::PrecheckFailed,
+        WorkflowError::precheck(IntegrationError::Unavailable),
         WorkflowError::IncompleteEvidence,
     ] {
         assert_eq!(precheck_outcome(Err(error)), PrecheckOutcome::Error);
@@ -1136,8 +1137,8 @@ fn gardener_has_independent_idle_error_and_actionable_precheck() {
     };
     assert_eq!(gardener::precheck(Ok(quiet)), Ok(Precheck::Idle));
     assert_eq!(
-        gardener::precheck(Err(WorkflowError::PrecheckFailed)),
-        Err(WorkflowError::PrecheckFailed)
+        gardener::precheck(Err(WorkflowError::precheck(IntegrationError::Unavailable))),
+        Err(WorkflowError::precheck(IntegrationError::Unavailable))
     );
     assert_eq!(
         gardener::precheck(Ok(gardener::Signal {
@@ -1293,10 +1294,10 @@ fn gardener_precheck_reads_changed_and_open_inventory() -> common::TestResult {
     assert_eq!(unknown, Err(WorkflowError::IncompleteEvidence));
 
     let (unavailable, _) = signal(vec![json!([])])?;
-    assert_eq!(
+    assert!(matches!(
         gardener::precheck(unavailable),
-        Err(WorkflowError::PrecheckFailed)
-    );
+        Err(WorkflowError::PrecheckFailed { .. })
+    ));
     assert_eq!(
         gardener::Window::new(stale_before, since),
         Err(WorkflowError::IncompleteEvidence)
@@ -1531,10 +1532,13 @@ fn an_unreadable_marker_store_never_reads_as_a_handled_idle_day() -> common::Tes
         Ok(Precheck::Idle)
     );
     fs::write(fixture.state_path(), b"{not json")?;
-    assert_eq!(
-        gardener_precheck(Some(&markers), daily_window(0)?, json!([]), json!([stale]))?,
-        Err(WorkflowError::PrecheckFailed)
-    );
+    let Err(failure) =
+        gardener_precheck(Some(&markers), daily_window(0)?, json!([]), json!([stale]))?
+    else {
+        return Err("corrupt marker store was accepted".into());
+    };
+    assert!(matches!(failure, WorkflowError::PrecheckFailed { .. }));
+    assert!(failure.to_string().contains("persisted state is invalid"));
     Ok(())
 }
 

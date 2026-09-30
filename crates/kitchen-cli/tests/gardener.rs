@@ -233,7 +233,23 @@ fn precheck_failures_never_exit_as_idle() -> TestResult {
     assert_eq!(outcome(&failed), PrecheckOutcome::Error);
     assert_eq!(failed.status.code(), Some(3));
     assert!(failed.stdout.is_empty());
-    assert!(!String::from_utf8(failed.stderr)?.contains("sanitized-fixture-token"));
+    let stderr = String::from_utf8(failed.stderr)?;
+    assert_eq!(stderr, "error: incomplete workflow evidence\n");
+    assert!(!stderr.contains("sanitized-fixture-token"));
+
+    let gh = fake_gh(root.path(), "[]", "[]")?;
+    let mut argv = scheduled_argv(root.path(), gh.clone())?;
+    let requester = argv
+        .iter()
+        .position(|arg| arg == "--requester")
+        .ok_or("missing requester")?;
+    *argv.get_mut(requester + 1).ok_or("missing value")? = "another-bot".into();
+    let wrong_scope = run(&argv)?;
+    assert_eq!(wrong_scope.status.code(), Some(3));
+    assert!(
+        String::from_utf8(wrong_scope.stderr)?
+            .contains("workflow precheck failed: integration scope mismatch")
+    );
 
     // An unknown lifecycle is incomplete evidence.
     let locked = issue(4, "locked", "2999-01-01T00:00:00Z", &[]);

@@ -169,7 +169,7 @@ fn precheck(args: PrecheckArgs) -> Result<Precheck, Failure> {
         .store
         .map(|store| HouseStore::open(store, args.house.clone(), StoreOptions::default()))
         .transpose()
-        .map_err(|_| Failure::Read(WorkflowError::PrecheckFailed))?;
+        .map_err(|source| Failure::Read(WorkflowError::precheck_store(source)))?;
     let handled = store
         .as_ref()
         .map(gardener::StaleMarkers::new)

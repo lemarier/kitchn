@@ -32,7 +32,7 @@ pub mod triage;
 use crate::{
     ConsumerId,
     contracts::Capability,
-    integrations::github::Observation,
+    integrations::github::{IntegrationError, Observation},
     scheduling::{PrecheckOutcome, WorkflowName},
 };
 
@@ -117,13 +117,13 @@ fn valid_label(label: &str) -> bool {
 fn known<T>(observation: Observation<T>) -> Result<T, WorkflowError> {
     match observation {
         Observation::Known(value) => Ok(value),
-        Observation::Unavailable(_) => Err(WorkflowError::PrecheckFailed),
+        Observation::Unavailable(source) => Err(WorkflowError::precheck(source)),
         Observation::Unknown => Err(WorkflowError::IncompleteEvidence),
     }
 }
 
 /// Workflow input or evidence failure. Private issue content is never included.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum WorkflowError {
     /// The input is incomplete or inconsistent.
     #[error("incomplete workflow evidence")]
@@ -135,20 +135,71 @@ pub enum WorkflowError {
     #[error("decision scope mismatch")]
     DecisionMismatch,
     /// A precheck read failed.
-    #[error("workflow precheck failed")]
-    PrecheckFailed,
+    #[error("workflow precheck failed: {source}")]
+    PrecheckFailed {
+        /// The sanitized integration or store failure.
+        #[source]
+        source: PrecheckCause,
+    },
 }
 
+/// A precheck's failed read. Both source types omit private issue content and credentials.
+#[derive(Debug, thiserror::Error)]
+pub enum PrecheckCause {
+    /// A house-scoped forge or decision read failed.
+    #[error(transparent)]
+    Integration(#[from] IntegrationError),
+    /// A durable marker read failed.
+    #[error(transparent)]
+    Store(#[from] Box<crate::Error>),
+}
+
+impl PartialEq for WorkflowError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::IncompleteEvidence, Self::IncompleteEvidence)
+            | (Self::UnknownDecisionOwner, Self::UnknownDecisionOwner)
+            | (Self::DecisionMismatch, Self::DecisionMismatch) => true,
+            (Self::PrecheckFailed { source: left }, Self::PrecheckFailed { source: right }) => {
+                match (left, right) {
+                    (PrecheckCause::Integration(left), PrecheckCause::Integration(right)) => {
+                        left == right
+                    }
+                    (PrecheckCause::Store(left), PrecheckCause::Store(right)) => {
+                        left.class() == right.class() && left.to_string() == right.to_string()
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for WorkflowError {}
+
 impl WorkflowError {
+    /// Preserve an integration read failure for a precheck caller.
+    pub fn precheck(source: impl Into<PrecheckCause>) -> Self {
+        Self::PrecheckFailed {
+            source: source.into(),
+        }
+    }
+
+    /// Preserve a sanitized house-store read failure for a precheck caller.
+    pub fn precheck_store(source: crate::Error) -> Self {
+        Self::precheck(Box::new(source))
+    }
+
     /// Broad handling class for callers.
     #[must_use]
-    pub const fn class(self) -> crate::ErrorClass {
+    pub const fn class(&self) -> crate::ErrorClass {
         match self {
             Self::IncompleteEvidence | Self::UnknownDecisionOwner => {
                 crate::ErrorClass::InvalidInput
             }
             Self::DecisionMismatch => crate::ErrorClass::Refused,
-            Self::PrecheckFailed => crate::ErrorClass::Execution,
+            Self::PrecheckFailed { .. } => crate::ErrorClass::Execution,
         }
     }
 }
@@ -165,7 +216,7 @@ pub enum Precheck {
 /// The schedule outcome of a precheck result. Any error is
 /// [`PrecheckOutcome::Error`], never idle.
 #[must_use]
-pub const fn precheck_outcome(result: Result<Precheck, WorkflowError>) -> PrecheckOutcome {
+pub fn precheck_outcome(result: Result<Precheck, WorkflowError>) -> PrecheckOutcome {
     match result {
         Ok(Precheck::Actionable) => PrecheckOutcome::Actionable,
         Ok(Precheck::Idle) => PrecheckOutcome::Idle,
@@ -182,4 +233,44 @@ pub enum ClaimState {
     ClaimedByOther,
     /// The store could not establish ownership.
     Unknown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PrecheckCause, WorkflowError, known};
+    use crate::integrations::github::{IntegrationError, Observation};
+
+    #[test]
+    fn failed_reads_keep_every_integration_cause() -> Result<(), Box<dyn std::error::Error>> {
+        for cause in [
+            IntegrationError::InvalidInput,
+            IntegrationError::ScopeMismatch,
+            IntegrationError::PermissionDenied,
+            IntegrationError::BudgetExhausted,
+            IntegrationError::Timeout,
+            IntegrationError::Unavailable,
+            IntegrationError::NotFound,
+            IntegrationError::LimitExceeded,
+            IntegrationError::Unknown,
+            IntegrationError::StaleDecision,
+        ] {
+            let Err(WorkflowError::PrecheckFailed {
+                source: PrecheckCause::Integration(actual),
+            }) = known::<()>(Observation::Unavailable(cause))
+            else {
+                return Err("read failure did not retain its cause".into());
+            };
+            assert_eq!(actual, cause);
+            assert_eq!(
+                WorkflowError::precheck(actual).to_string(),
+                format!("workflow precheck failed: {cause}")
+            );
+        }
+        assert!(matches!(
+            known::<()>(Observation::Unknown),
+            Err(WorkflowError::IncompleteEvidence)
+        ));
+        assert!(known(Observation::Known(())).is_ok());
+        Ok(())
+    }
 }

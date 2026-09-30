@@ -733,6 +733,35 @@ fn house_scope() -> TestResult<HouseScope> {
     )?)
 }
 
+fn comment_request(executor: &GitHubExecutor<GhCli>) -> TestResult<EffectRequest> {
+    Ok(EffectRequest::new(
+        HouseId::new("acme")?,
+        BackendId::new("github")?,
+        CredentialId::new("github")?,
+        TaskId::new("task-1")?,
+        AttemptNumber::FIRST,
+        IdempotencyKey::from_ref(ExternalRef::new("comment-1")?),
+        executor.effect(comment_on("acme/app")?)?.into(),
+    ))
+}
+
+fn minted_permissions(fixture: &Fixture) -> TestResult<Vec<Value>> {
+    fixture
+        .remote()?
+        .mints()
+        .iter()
+        .map(|mint| {
+            let body = mint.body.as_ref().ok_or("missing mint body")?;
+            if body.get("repositories") != Some(&json!(["app"])) {
+                return Err("token is not repository scoped".into());
+            }
+            body.get("permissions")
+                .cloned()
+                .ok_or_else(|| "missing mint permissions".into())
+        })
+        .collect()
+}
+
 fn fake_gh_reads(directory: &Path, head: &CommitId) -> TestResult<PathBuf> {
     let gh = directory.join("gh-reads");
     fs::write(
@@ -900,6 +929,58 @@ fn app_read_outside_installation_is_refused_before_gh() -> TestResult {
 }
 
 #[test]
+fn comment_lookup_mints_only_a_repository_read_token() -> TestResult {
+    let fixture = Fixture::new(true)?;
+    let executor = GitHubExecutor::new(
+        BackendId::new("github")?,
+        house_scope()?,
+        GhCli::app(fake_gh(&fixture.root)?, fixture.tokens()?)?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        executor.lookup(&comment_request(&executor)?)?,
+        Lookup::Unknown
+    );
+    assert_eq!(
+        minted_permissions(&fixture)?,
+        [json!({"contents":"read","issues":"read","pull_requests":"read"})]
+    );
+    assert_eq!(
+        gh_calls(&fixture.root)?,
+        [("ghs_fake_1".into(), "GET".into())]
+    );
+    Ok(())
+}
+
+#[test]
+fn comment_execution_reads_with_read_scope_and_submits_with_write_scope() -> TestResult {
+    let fixture = Fixture::new(true)?;
+    let executor = GitHubExecutor::new(
+        BackendId::new("github")?,
+        house_scope()?,
+        GhCli::app(fake_gh(&fixture.root)?, fixture.tokens()?)?,
+        ReadLimits::default(),
+    );
+    assert!(executor.execute(&comment_request(&executor)?).is_ok());
+    assert_eq!(
+        minted_permissions(&fixture)?,
+        [
+            json!({"contents":"read","issues":"read","pull_requests":"read"}),
+            json!({"issues":"write"}),
+        ]
+    );
+    assert_eq!(
+        gh_calls(&fixture.root)?,
+        [
+            ("ghs_fake_1".into(), "GET".into()),
+            ("ghs_fake_2".into(), "POST".into()),
+            ("ghs_fake_1".into(), "GET".into()),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn a_refresh_between_a_lost_response_and_its_reconciliation_posts_once() -> TestResult {
     let fixture = Fixture::new(true)?;
     let gh = fake_gh(&fixture.root)?;
@@ -944,12 +1025,19 @@ fn a_refresh_between_a_lost_response_and_its_reconciliation_posts_once() -> Test
         calls,
         [
             ("ghs_fake_1".to_owned(), "GET".to_owned()),
-            ("ghs_fake_1".to_owned(), "POST".to_owned()),
-            ("ghs_fake_2".to_owned(), "GET".to_owned()),
-            ("ghs_fake_2".to_owned(), "GET".to_owned()),
+            ("ghs_fake_2".to_owned(), "POST".to_owned()),
+            ("ghs_fake_3".to_owned(), "GET".to_owned()),
+            ("ghs_fake_3".to_owned(), "GET".to_owned()),
         ]
     );
-    assert_eq!(fixture.remote()?.mints().len(), 2);
+    assert_eq!(
+        minted_permissions(&fixture)?,
+        [
+            json!({"contents":"read","issues":"read","pull_requests":"read"}),
+            json!({"issues":"write"}),
+            json!({"contents":"read","issues":"read","pull_requests":"read"}),
+        ]
+    );
     Ok(())
 }
 

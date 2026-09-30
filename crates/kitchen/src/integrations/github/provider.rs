@@ -1,4 +1,5 @@
 //! Provider-side mutation and reconciliation. Durable ownership lives in core.
+use super::client::encode_branch_path;
 use super::{
     CloseReason, CredentialRef, GhCli, GitHubAction, GitHubMutation, GitHubReadTransport,
     HouseScope, IntegrationError, Label, LabelSetup, ReadLimits, ReadRequest, ReviewVerdict,
@@ -746,7 +747,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                 }
                 let tip = self.read(format!(
                     "{root}/branches/{}",
-                    encode_segment(expected_base.as_str())
+                    encode_branch_path(expected_base)
                 ))?;
                 if tip.pointer("/commit/sha").and_then(Value::as_str)
                     != Some(expected_base_commit.as_str())

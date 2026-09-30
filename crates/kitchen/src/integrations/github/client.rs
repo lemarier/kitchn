@@ -838,7 +838,7 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
 /// Percent-encode a branch name for a REST path. `/` separates the name's
 /// components and stays literal; `#`, `%`, `&`, and other reserved bytes
 /// would otherwise end or change the path.
-fn encode_branch_path(branch: &BranchName) -> String {
+pub(super) fn encode_branch_path(branch: &BranchName) -> String {
     use std::fmt::Write as _;
     let mut encoded = String::with_capacity(branch.as_str().len());
     for byte in branch.as_str().bytes() {

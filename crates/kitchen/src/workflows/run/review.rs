@@ -244,11 +244,10 @@ pub fn post_gate_review<T: GitHubMutationTransport + Clone>(
         Err(error) => return Err(error),
     };
     let task = store.task(&id)?;
-    if let Some(persisted) = task.effects().first() {
+    let expected: Effect = effect.clone().into();
+    for persisted in task.effects() {
         let request = persisted.request();
-        let expected: Effect = effect.clone().into();
-        if task.effects().len() != 1
-            || request.house() != store.house()
+        if request.house() != store.house()
             || request.backend() != &executor.descriptor().backend
             || request.credential() != executor.scope().credential().name()
             || request.task() != &id
@@ -256,11 +255,17 @@ pub fn post_gate_review<T: GitHubMutationTransport + Clone>(
         {
             return Err(StateError::TaskConflict(id).into());
         }
-    } else if conflicting_spec {
+    }
+    if task.effects().is_empty() && conflicting_spec {
         return Err(StateError::TaskConflict(id).into());
     }
     let applied = |task: &crate::state::TaskRecord| -> Result<Option<NonZeroU64>> {
-        match task.effects().first().map(|effect| effect.state()) {
+        match task
+            .effects()
+            .iter()
+            .map(|effect| effect.state())
+            .find(|state| matches!(state, EffectState::Applied { .. }))
+        {
             Some(EffectState::Applied { receipt, .. }) => Ok(Some(
                 NonZeroU64::new(
                     receipt

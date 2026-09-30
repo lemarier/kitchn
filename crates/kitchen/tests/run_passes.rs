@@ -5097,6 +5097,57 @@ fn uncertain_review_post_is_found_by_marker_without_a_second_post() -> TestResul
 }
 
 #[test]
+fn refused_review_attempt_can_retry_and_settle_from_later_effect() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    let reviews_path = format!("repos/{REPO}/pulls/12/reviews");
+    kitchen.forge().set(&reviews_path, json!([]));
+    // The first effect cannot inspect existing reviews, so it is not applied.
+    kitchen.forge().queue(&reviews_path, vec![json!({})]);
+    let (forge, executor) = review_fixture(&mut kitchen, "safety-reviewer")?;
+    let mut input = review_input(ReviewVerdict::Approve)?;
+    input.attest = false;
+    let post = || {
+        post_gate_review(
+            kitchen.store(),
+            &kitchen.config,
+            &forge,
+            &executor,
+            &kitchen.settings.instructions.provenance,
+            &kitchen.clock,
+            &input,
+        )
+    };
+    assert!(matches!(
+        post(),
+        Err(kitchen::Error::Run(RunError::ReviewPostRefused))
+    ));
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    let review = post()?;
+    assert_eq!(review.id.get(), 19);
+    assert!(!review.attested);
+    assert_eq!(kitchen.forge().writes.borrow().len(), 1);
+    let task = kitchen
+        .store()
+        .tasks()?
+        .into_iter()
+        .find(|task| task.spec().id.as_str().starts_with("gate-review-"))
+        .ok_or("review task")?;
+    assert!(matches!(
+        task.effects()[0].state(),
+        EffectState::NotApplied { .. }
+    ));
+    assert!(matches!(
+        task.effects()[1].state(),
+        EffectState::Applied { .. }
+    ));
+    assert!(matches!(task.state(), TaskState::Settled { .. }));
+    assert_eq!(post()?.id.get(), 19);
+    assert_eq!(kitchen.forge().writes.borrow().len(), 1);
+    Ok(())
+}
+
+#[test]
 fn review_by_pull_request_author_creates_no_intent_or_post() -> TestResult {
     let mut kitchen = settled_with_pull_request(true)?;
     green_pull_request(&kitchen)?;
@@ -5274,6 +5325,50 @@ fn base_moving_between_review_checks_is_refused_without_posting() -> TestResult 
         Err(kitchen::Error::Run(RunError::AttestationStaleBase))
     ));
     assert!(kitchen.forge().writes.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn review_base_tip_preserves_branch_slashes_and_encodes_reserved_bytes() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    set_pull_request(&kitchen, "/base/ref", json!("release/v1#final"))?;
+    let base_path = format!("repos/{REPO}/branches/release/v1%23final");
+    kitchen.forge().set(
+        &base_path,
+        json!({"name":"release/v1#final", "commit":{"sha":commit('e')?.as_str()}}),
+    );
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    let (forge, executor) = review_fixture(&mut kitchen, "safety-reviewer")?;
+    let mut input = review_input(ReviewVerdict::RequestChanges)?;
+    input.semantic = None;
+    input.acceptance = None;
+    input.hardware = None;
+    input.risk = None;
+    input.attest = false;
+    let review = post_gate_review(
+        kitchen.store(),
+        &kitchen.config,
+        &forge,
+        &executor,
+        &kitchen.settings.instructions.provenance,
+        &kitchen.clock,
+        &input,
+    )?;
+    assert_eq!(review.id.get(), 19);
+    assert_eq!(
+        kitchen
+            .forge()
+            .reads
+            .borrow()
+            .iter()
+            .filter(|path| *path == &base_path)
+            .count(),
+        2,
+    );
+    assert_eq!(kitchen.forge().writes.borrow().len(), 1);
     Ok(())
 }
 

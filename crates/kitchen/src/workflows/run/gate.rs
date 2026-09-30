@@ -338,9 +338,8 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             .map(|user| user.login.as_str());
         let recorded_writers =
             attestation::BranchWriters::of(tasks, self.repository, number, &found.branch);
-        // Whoever recorded the attestation chose its acceptance, hardware
-        // and risk facts, which no forge read confirms. A writer of this
-        // branch is refused here whatever branch the record-time check saw.
+        // A writer of this branch is refused here whatever branch the
+        // record-time check saw. Review claims are compared below.
         if recorded_writers.includes(attested.recorded_by.as_str()) {
             return Ok(report(
                 &evidence,
@@ -348,9 +347,12 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
                 ReportReason::AttestedByWriter,
             ));
         }
+        let same_principal = attested
+            .recorded_by
+            .as_str()
+            .eq_ignore_ascii_case(&attested.attestation.forge_review.reviewer);
         let attested = attested.attestation;
-        // A holder or worker handle is not a forge login, and no record
-        // ties a person's session to one.
+        // A person's branch session has no reliable forge login binding.
         if recorded_writers.person() {
             return Ok(report(
                 &evidence,
@@ -396,7 +398,17 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             self.forge
                 .reviews(self.store.house(), self.repository, number),
         )?;
-        if !attestation::review_verified(&reviews, &attested.forge_review, &evidence.head) {
+        if !reviews.iter().any(|review| {
+            attestation::review_verified(
+                std::slice::from_ref(review),
+                &attested.forge_review,
+                &evidence.head,
+            ) && attestation::claims_match(review, &attested)
+        })
+            // Markers written by the public low-level API must name the
+            // review author as their recorded principal too.
+            || !same_principal
+        {
             return Ok(report(
                 &evidence,
                 GateGrants::default(),

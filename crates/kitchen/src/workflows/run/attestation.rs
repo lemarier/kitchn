@@ -5,20 +5,17 @@
 //! its exact head and base.
 //!
 //! An attestation rests on a forge review ([`ForgeReview`]): its id and the
-//! login the reviewer claims. Only [`record_gate_attestation`] writes one. It
-//! reads the pull request from the house's forge, so its head branch and
-//! author are the forge's and never a caller's word, and refuses a claimant
-//! who wrote that branch and a claimed reviewer who is the author. A
+//! review author's login. [`attest_gate_review`] reads the review and its
+//! structured claims from the house's forge, then records them. It refuses
+//! a reviewer who wrote the branch or authored the pull request. A
 //! recorded attestation is never rewritten: a different one for the same
 //! subject is refused, and a moved head or base needs a new attestation.
 //!
-//! The record authenticates nothing by itself: anyone who can open the
-//! store can claim any login. The scheduled gate reads it back with
-//! [`gate_attestation`], which also returns who recorded it, and merges
-//! only when the recorder wrote no part of the branch the gate found, the
-//! house's forge shows that review approved, on exactly the head, by the
-//! claimed login, and that login is neither the author the forge reports
-//! nor the forge login of any commit's author or committer
+//! The record authenticates nothing by itself. The scheduled gate reads it
+//! back with [`gate_attestation`] and merges only when the recorded principal
+//! is the forge review's author, the review remains approved at the exact
+//! head with the same claims, and the reviewer is neither a branch writer,
+//! the pull request author, nor any commit author or committer
 //! ([`commit_logins`]).
 //!
 //! Who wrote the branch is read from the forge, not from the house records:
@@ -74,8 +71,7 @@ const SCHEMA: &str = "gate.attestation";
 pub struct ForgeReview {
     /// The forge's id for the pull request review.
     pub id: NonZeroU64,
-    /// The reviewer's forge login. The gate merges only when the forge
-    /// shows this login as the review's author.
+    /// The review author's forge login.
     pub reviewer: String,
 }
 
@@ -115,8 +111,8 @@ pub struct GateAttestation {
 pub struct RecordedAttestation {
     /// What was attested.
     pub attestation: GateAttestation,
-    /// The holder that recorded it. The gate refuses one that wrote the
-    /// branch.
+    /// The forge review author's login, recorded as a holder. The gate
+    /// verifies it again against the review and branch writers.
     pub recorded_by: HolderId,
 }
 
@@ -196,63 +192,173 @@ pub fn record_gate_attestation<T: GitHubReadTransport>(
 pub fn attest_gate_review<T: GitHubReadTransport>(
     store: &HouseStore,
     forge: &GitHubClient<T>,
-    attestation: &GateAttestation,
-    recorded_by: &Claimant,
+    repository: &Repository,
+    pull_number: IssueNumber,
+    review_id: NonZeroU64,
     now: Timestamp,
-) -> Result<()> {
-    if &attestation.house != store.house() {
-        return Err(ContractError::CrossHouse {
-            expected: store.house().clone(),
-            found: attestation.house.clone(),
-        }
-        .into());
-    }
-    let pull_request = known(forge.pull_request(
-        store.house(),
-        &attestation.repository,
-        attestation.pull_request,
-    ))?;
+) -> Result<GateAttestation> {
+    let pull_request = known(forge.pull_request(store.house(), repository, pull_number))?;
     if pull_request.state != IssueState::Open || pull_request.merged {
         return Err(RunError::AttestationClosed.into());
     }
-    if pull_request.head.sha != attestation.head {
+    let head = pull_request.head.sha.clone();
+    let base_branch = BranchName::new(&pull_request.base.name)?;
+    let base = known(forge.branch_tip(store.house(), repository, &base_branch))?;
+    let reviews = known(forge.reviews(store.house(), repository, pull_number))?;
+    let review = reviews
+        .iter()
+        .find(|review| review.id == review_id.get())
+        .ok_or(RunError::AttestationReviewUnverified)?;
+    if review.state != ReviewState::Approved || review.commit_id != head {
+        return Err(RunError::AttestationReviewUnverified.into());
+    }
+    let claims = parse_review_block(review.body.as_deref())?;
+    if claims.head != head {
         return Err(RunError::AttestationStaleHead.into());
     }
-    if pull_request.base.sha != attestation.base {
+    if claims.base != base {
         return Err(RunError::AttestationStaleBase.into());
     }
+    let reviewer = review.user.login.as_str();
     let writers = BranchWriters::of(
         &store.tasks()?,
-        &attestation.repository,
-        attestation.pull_request,
+        repository,
+        pull_number,
         &BranchName::new(&pull_request.head.name)?,
     );
-    if writers.includes(recorded_by.holder.as_str()) {
+    if writers.includes(reviewer) {
         return Err(RunError::AttestationByWriter.into());
     }
-    let commits = known(forge.pull_request_commits(
-        store.house(),
-        &attestation.repository,
-        attestation.pull_request,
-        &attestation.head,
-    ))?;
+    let commits = known(forge.pull_request_commits(store.house(), repository, pull_number, &head))?;
     let commit_writers = commit_logins(&commits).ok_or(RunError::AttestationWritersUnknown)?;
     if !independent(
-        &attestation.forge_review.reviewer,
+        reviewer,
         pull_request.user.as_ref().map(|user| user.login.as_str()),
         &commit_writers,
     ) {
         return Err(RunError::AttestationNotIndependent.into());
     }
-    let reviews = known(forge.reviews(
-        store.house(),
-        &attestation.repository,
-        attestation.pull_request,
-    ))?;
-    if !review_verified(&reviews, &attestation.forge_review, &attestation.head) {
-        return Err(RunError::AttestationReviewUnverified.into());
+    let attestation = GateAttestation {
+        house: store.house().clone(),
+        repository: repository.clone(),
+        pull_request: pull_number,
+        head,
+        base,
+        forge_review: ForgeReview {
+            id: review_id,
+            reviewer: reviewer.to_owned(),
+        },
+        review: claims.semantic,
+        read_only: claims.read_only,
+        acceptance_met: claims.acceptance,
+        hardware_complete: claims.hardware,
+        risk_classes: claims.risk,
+    };
+    let recorded_by = Claimant::interactive(HolderId::new(reviewer)?);
+    record_gate_attestation(store, forge, &attestation, &recorded_by, now)?;
+    Ok(attestation)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ReviewClaims {
+    head: CommitId,
+    base: CommitId,
+    semantic: SemanticReview,
+    read_only: bool,
+    acceptance: bool,
+    hardware: bool,
+    risk: Vec<RiskClass>,
+}
+
+/// Parse the single, complete `kitchen-attestation` fenced block in a forge review.
+pub(super) fn parse_review_block(body: Option<&str>) -> Result<ReviewClaims> {
+    let body = body.ok_or(RunError::AttestationBlockInvalid)?;
+    let normalized = body.replace("\r\n", "\n");
+    let body = normalized.as_str();
+    let mut blocks = body.split("```kitchen-attestation\n");
+    let _prefix = blocks.next();
+    let block = blocks.next().ok_or(RunError::AttestationBlockInvalid)?;
+    if blocks.next().is_some() {
+        return Err(RunError::AttestationBlockInvalid.into());
     }
-    record_gate_attestation(store, forge, attestation, recorded_by, now)
+    let (content, suffix) = block
+        .split_once("\n```")
+        .ok_or(RunError::AttestationBlockInvalid)?;
+    if suffix.starts_with('`') {
+        return Err(RunError::AttestationBlockInvalid.into());
+    }
+    let mut fields = std::collections::BTreeMap::new();
+    for line in content.lines() {
+        let (key, value) = line
+            .split_once('=')
+            .ok_or(RunError::AttestationBlockInvalid)?;
+        if value.is_empty() || fields.insert(key, value).is_some() {
+            return Err(RunError::AttestationBlockInvalid.into());
+        }
+    }
+    if fields.len() != 7 {
+        return Err(RunError::AttestationBlockInvalid.into());
+    }
+    let field = |key| {
+        fields
+            .get(key)
+            .copied()
+            .ok_or(RunError::AttestationBlockInvalid)
+    };
+    let head = CommitId::new(field("head")?).map_err(|_| RunError::AttestationBlockInvalid)?;
+    let base = CommitId::new(field("base")?).map_err(|_| RunError::AttestationBlockInvalid)?;
+    let semantic = serde_json::from_value::<SemanticReview>(serde_json::Value::String(
+        field("semantic")?.to_owned(),
+    ))
+    .map_err(|_| RunError::AttestationBlockInvalid)?;
+    let read_only = match field("read_only")? {
+        "true" => true,
+        "false" => false,
+        _ => return Err(RunError::AttestationBlockInvalid.into()),
+    };
+    let complete = |key| match field(key)? {
+        "complete" => Ok(true),
+        "incomplete" => Ok(false),
+        _ => Err(RunError::AttestationBlockInvalid),
+    };
+    let acceptance = complete("acceptance")?;
+    let hardware = complete("hardware")?;
+    let risk = if field("risk")? == "none" {
+        Vec::new()
+    } else {
+        let mut classes = Vec::new();
+        for value in field("risk")?.split(',') {
+            let class =
+                serde_json::from_value::<RiskClass>(serde_json::Value::String(value.to_owned()))
+                    .map_err(|_| RunError::AttestationBlockInvalid)?;
+            if classes.contains(&class) {
+                return Err(RunError::AttestationBlockInvalid.into());
+            }
+            classes.push(class);
+        }
+        classes
+    };
+    Ok(ReviewClaims {
+        head,
+        base,
+        semantic,
+        read_only,
+        acceptance,
+        hardware,
+        risk,
+    })
+}
+
+pub(super) fn claims_match(review: &Review, attestation: &GateAttestation) -> bool {
+    parse_review_block(review.body.as_deref()).is_ok_and(|claims| {
+        claims.head == attestation.head
+            && claims.base == attestation.base
+            && claims.semantic == attestation.review
+            && claims.read_only == attestation.read_only
+            && claims.acceptance == attestation.acceptance_met
+            && claims.hardware == attestation.hardware_complete
+            && claims.risk == attestation.risk_classes
+    })
 }
 
 /// The attestation recorded for exactly this pull request, head, and base,
@@ -440,7 +546,7 @@ fn key(
 
 #[cfg(test)]
 mod tests {
-    use super::{BranchWriters, commit_logins, independent};
+    use super::{BranchWriters, commit_logins, independent, parse_review_block};
     use crate::{
         contracts::{CommitId, ContractError},
         integrations::github::PullRequestCommit,
@@ -463,6 +569,38 @@ mod tests {
         assert!(!independent("Reviewer", Some("reviewer"), &[]));
         assert!(!independent("Reviewer", None, &[]));
         assert!(!independent("", Some("kitchen-bot"), &[]));
+    }
+
+    #[test]
+    fn review_block_requires_one_complete_typed_subject() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let head = "a".repeat(40);
+        let base = "b".repeat(40);
+        let valid = format!(
+            "Review text\n```kitchen-attestation\nhead={head}\nbase={base}\nsemantic=clean\nread_only=true\nacceptance=complete\nhardware=incomplete\nrisk=workflow-rules,dependencies\n```\n"
+        );
+        let claims = parse_review_block(Some(&valid))?;
+        assert_eq!(claims.head, CommitId::new(&head)?);
+        assert_eq!(claims.base, CommitId::new(&base)?);
+        assert_eq!(claims.risk.len(), 2);
+        assert!(!claims.hardware);
+        assert!(parse_review_block(None).is_err());
+        assert!(parse_review_block(Some("ordinary review text")).is_err());
+        assert!(
+            parse_review_block(Some(&valid.replace("semantic=clean", "semantic=great"))).is_err()
+        );
+        assert!(
+            parse_review_block(Some(
+                &valid.replace("risk=workflow-rules,dependencies", "risk=none,dependencies")
+            ))
+            .is_err()
+        );
+        assert!(parse_review_block(Some(&valid.replace("base=", "head="))).is_err());
+        assert_eq!(
+            parse_review_block(Some(&valid.replace('\n', "\r\n")))?,
+            claims
+        );
+        Ok(())
     }
 
     #[test]

@@ -633,26 +633,26 @@ messages no worker.
 
 ## `kitchn gate attest`
 
-A person or reviewer worker records a review after inspecting the committed
-base-to-head diff. The command reads the house's bound forge and store, checks
-that the pull request is open at those exact commits, that the forge shows the
-named approval at the head, and that the reviewer is neither the pull request
-author nor any commit author or committer. It also refuses a recorder named in
-the house's branch writer records and an attestation already recorded for that
-head and base. The scheduled gate checks these facts again before a merge.
+An independent reviewer posts an approved forge review on the exact pull request head. The review body must contain one fenced `kitchen-attestation` block. The base SHA must match the live base branch tip; the PR object's base SHA can lag it. Kitchen takes the reviewer login and all claims from that review, checks the PR author, every branch commit author and committer, and the house's launched worker handles, then records the attestation. The scheduled gate reads the same review and claims again before considering a merge.
+
+````md
+```kitchen-attestation
+head=<40-character commit SHA>
+base=<40-character live base tip SHA>
+semantic=clean
+read_only=true
+acceptance=complete
+hardware=complete
+risk=none
+```
+````
+
+`semantic` is `clean`, `findings`, `partial`, or `unavailable`. `read_only` is `true` or `false`. `acceptance` and `hardware` are `complete` or `incomplete`. `risk` is `none` or a comma-separated list of distinct classes: `equipment-safety`, `authorization-secrets`, `durable-data`, `public-contract-release`, `workflow-rules`, `dependencies`, `weakened-validation`, and `large-diff`. The block must contain each key once, with no extra keys. Risk classes still require a separate human approval; this command does not grant one.
 
 ```sh
 kitchn gate attest --registry <dir> --house <id> [--store <dir>] [--repository <owner/name>] \
-  --pull-request <number> --head <sha> --base <sha> --reviewer <forge-login> \
-  --recorder <holder-or-worker-handle> --review-id <forge-review-id> \
-  --result clean|findings|partial|unavailable --read-only true|false \
-  --acceptance complete|incomplete --hardware complete|incomplete \
-  --risk none|equipment-safety|authorization-secrets|durable-data|public-contract-release|workflow-rules|dependencies|weakened-validation|large-diff
+  --pull-request <number> --review-id <forge-review-id>
 ```
-
-Repeat `--risk` for multiple classes; `none` must appear alone. The recorder
-must supply its actual holder or worker handle. The command records evidence;
-it does not approve risk classes or grant merge authority.
 
 ## `kitchn pickup`
 

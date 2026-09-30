@@ -197,9 +197,9 @@ pub enum RunError {
         "the attesting reviewer is the pull request's author; an attestation must be independent"
     )]
     AttestationNotIndependent,
-    /// A gate attestation's recorder wrote the branch: it created or held
-    /// one of its writer tasks, or a launch on the branch created it.
-    #[error("the recorder wrote the branch; a branch writer cannot record an attestation")]
+    /// The forge reviewer wrote the branch: it created or held one of its
+    /// writer tasks, or a launch on the branch created it.
+    #[error("the reviewer wrote the branch; a branch writer cannot attest")]
     AttestationByWriter,
     /// An attestation is already recorded for this exact subject; the
     /// reviewer command refuses even an identical repeat.
@@ -217,12 +217,12 @@ pub enum RunError {
     /// The forge does not show the claimed approval at the reviewed head.
     #[error("the forge does not show this approved review at the reviewed head")]
     AttestationReviewUnverified,
+    /// The forge review has no valid, complete Kitchen attestation block.
+    #[error("the forge review has no valid kitchen-attestation block")]
+    AttestationBlockInvalid,
     /// The forge cannot identify every branch commit author and committer.
     #[error("the forge cannot identify every branch commit author and committer")]
     AttestationWritersUnknown,
-    /// Risk classes must be complete and unambiguous.
-    #[error("risk classification must be `none` or one or more distinct classes")]
-    AttestationRiskInvalid,
     /// The merge gate's durable store refused an effect it could not
     /// authorize or build: no merge grant for the subject, a task whose
     /// evidence is not at the verdict's head and base, or a verdict lacking
@@ -245,7 +245,6 @@ impl RunError {
             | Self::RepositoryAmbiguous
             | Self::BackendArguments(_)
             | Self::RuntimeMismatch(_) => ErrorClass::InvalidInput,
-            Self::AttestationRiskInvalid => ErrorClass::InvalidInput,
             Self::NoBackend | Self::NoPickupSettings | Self::NoPassSettings => ErrorClass::Refused,
             Self::Mailbox(MailboxError::Fenced) => ErrorClass::Conflict,
             Self::Mailbox(MailboxError::Unavailable(_)) | Self::GateRecords => {
@@ -254,6 +253,7 @@ impl RunError {
             Self::AttestationNotIndependent
             | Self::AttestationByWriter
             | Self::AttestationReviewUnverified
+            | Self::AttestationBlockInvalid
             | Self::AttestationWritersUnknown
             | Self::GateRefused => ErrorClass::Refused,
             Self::AttestationRecorded

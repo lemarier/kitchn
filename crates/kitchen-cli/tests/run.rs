@@ -248,7 +248,7 @@ fn an_unknown_pass_is_invalid_input() -> TestResult {
 }
 
 #[test]
-fn gate_attest_requires_every_review_field_and_unambiguous_risk() -> TestResult {
+fn gate_attest_accepts_only_pr_and_review_ids() -> TestResult {
     let house = House::new()?;
     let registry = house.registry().display().to_string();
     let missing = house.kitchen(&[
@@ -262,7 +262,29 @@ fn gate_attest_requires_every_review_field_and_unambiguous_risk() -> TestResult 
         "12",
     ])?;
     assert_eq!(missing.status.code(), Some(2));
-    assert!(text(&missing.stderr).contains("--head"));
+    assert!(text(&missing.stderr).contains("--review-id"));
+
+    let asserted = house.kitchen(&[
+        "gate",
+        "attest",
+        "--registry",
+        &registry,
+        "--house",
+        "acme",
+        "--pull-request",
+        "12",
+        "--review-id",
+        "11",
+        "--recorder",
+        "someone",
+    ])?;
+    assert_eq!(
+        asserted.status.code(),
+        Some(2),
+        "{}",
+        text(&asserted.stderr)
+    );
+    assert!(text(&asserted.stderr).contains("unexpected argument"));
 
     let invalid = house.kitchen(&[
         "gate",
@@ -272,31 +294,86 @@ fn gate_attest_requires_every_review_field_and_unambiguous_risk() -> TestResult 
         "--house",
         "acme",
         "--pull-request",
-        "12",
-        "--head",
-        KITCHEN,
-        "--base",
-        KITCHEN,
-        "--reviewer",
-        "reviewer",
-        "--recorder",
-        "reviewer",
+        "0",
         "--review-id",
         "11",
-        "--result",
-        "clean",
-        "--read-only",
-        "true",
-        "--acceptance",
-        "complete",
-        "--hardware",
-        "complete",
-        "--risk",
-        "none",
-        "--risk",
-        "large-diff",
     ])?;
-    assert_eq!(invalid.status.code(), Some(2), "{}", text(&invalid.stderr));
-    assert!(text(&invalid.stderr).contains("risk classification"));
+    assert_eq!(invalid.status.code(), Some(2));
+    Ok(())
+}
+
+#[test]
+fn gate_attest_reads_the_forge_review_and_records_its_author() -> TestResult {
+    let house = House::new()?;
+    let sha = KITCHEN;
+    let body = format!(
+        "```kitchen-attestation\nhead={sha}\nbase={sha}\nsemantic=clean\nread_only=true\nacceptance=complete\nhardware=complete\nrisk=none\n```"
+    );
+    let fixtures = house.home.join("forge-fixtures");
+    fs::create_dir_all(&fixtures)?;
+    fs::write(fixtures.join("user"), r#"{"login":"octo-cat"}"#)?;
+    fs::write(
+        fixtures.join("pr"),
+        serde_json::to_vec(&serde_json::json!({
+            "number": 12, "state": "open", "draft": false, "merged": false,
+            "head": {"sha": sha, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
+            "base": {"sha": sha, "ref": "main", "repo": {"full_name": "acme/app"}},
+            "mergeable": true, "mergeable_state": "clean", "user": {"login": "author"}
+        }))?,
+    )?;
+    fs::write(
+        fixtures.join("branch"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "main", "commit": {"sha": sha}
+        }))?,
+    )?;
+    fs::write(
+        fixtures.join("reviews"),
+        serde_json::to_vec(&serde_json::json!([{
+            "id": 11, "user": {"login": "reviewer"}, "commit_id": sha,
+            "state": "APPROVED", "body": body
+        }]))?,
+    )?;
+    fs::write(
+        fixtures.join("commits"),
+        serde_json::to_vec(&serde_json::json!([{
+            "sha": sha, "author": {"login": "author"}, "committer": {"login": "author"}
+        }]))?,
+    )?;
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in\n  *\" config get user \"*) echo octo-cat;;\n  *\" user \"*) cat '{}/user';;\n  *\"pulls/12/reviews\"*) cat '{}/reviews';;\n  *\"pulls/12/commits\"*) cat '{}/commits';;\n  *\"branches/main\"*) cat '{}/branch';;\n  *\"pulls/12\"*) cat '{}/pr';;\n  *) exit 1;;\nesac\n",
+        fixtures.display(),
+        fixtures.display(),
+        fixtures.display(),
+        fixtures.display(),
+        fixtures.display()
+    );
+    let gh = Path::new(&house.path.split(':').next().ok_or("bin")?).join("gh");
+    fs::write(&gh, script)?;
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))?;
+    let registry = house.registry().display().to_string();
+    let output = house.kitchen(&[
+        "gate",
+        "attest",
+        "--registry",
+        &registry,
+        "--house",
+        "acme",
+        "--pull-request",
+        "12",
+        "--review-id",
+        "11",
+    ])?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    let stored = kitchen::workflows::run::gate_attestation(
+        &house.store()?,
+        &Repository::new("acme/app")?,
+        kitchen::contracts::IssueNumber::new(12)?,
+        &CommitId::new(sha)?,
+        &CommitId::new(sha)?,
+    )?
+    .ok_or("missing attestation")?;
+    assert_eq!(stored.attestation.forge_review.reviewer, "reviewer");
+    assert_eq!(stored.recorded_by.as_str(), "reviewer");
     Ok(())
 }

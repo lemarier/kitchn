@@ -2226,7 +2226,8 @@ fn green_on(kitchen: &Kitchen, at: char, base: char) -> TestResult {
     forge.set(
         &format!("repos/{REPO}/pulls/12/reviews"),
         json!([{"id": 11, "user": {"login": "safety-reviewer"}, "commit_id": head,
-            "state": "APPROVED", "submitted_at": "1970-01-01T00:00:00Z"}]),
+            "state": "APPROVED", "body": review_block(at, base)?,
+            "submitted_at": "1970-01-01T00:00:00Z"}]),
     );
     forge.set(
         "graphql:threads#12",
@@ -2248,6 +2249,14 @@ fn green_on(kitchen: &Kitchen, at: char, base: char) -> TestResult {
 
 /// A pull request commit as the forge lists it: `author` and `committer`
 /// are the logins it links, or `None` where it links no account.
+fn review_block(head: char, base: char) -> TestResult<String> {
+    Ok(format!(
+        "```kitchen-attestation\nhead={}\nbase={}\nsemantic=clean\nread_only=true\nacceptance=complete\nhardware=complete\nrisk=none\n```",
+        commit(head)?,
+        commit(base)?
+    ))
+}
+
 fn commit_json(sha: char, author: Option<&str>, committer: Option<&str>) -> TestResult<Value> {
     let account = |login: Option<&str>| login.map_or(Value::Null, |login| json!({"login": login}));
     Ok(
@@ -2321,10 +2330,25 @@ fn record_as(
 
 /// Record an independent reviewer's attestation of pull request 12 at `head`.
 fn attest(kitchen: &Kitchen, head: char) -> TestResult {
+    let recorded = attest_gate_review(
+        kitchen.store(),
+        &kitchen.forge,
+        &repo()?,
+        pr(12)?,
+        std::num::NonZeroU64::new(11).ok_or("review id")?,
+        kitchen.clock.now(),
+    )?;
+    assert_eq!(recorded.head, commit(head)?);
+    Ok(())
+}
+
+/// Seed a valid review marker while testing later gate reads that are
+/// intentionally unavailable or over their bound.
+fn seed_attestation(kitchen: &Kitchen) -> TestResult {
     record_as(
         kitchen,
-        &attestation(head, "safety-reviewer", 11)?,
-        &common::scheduled("reviewer")?,
+        &attestation('d', "safety-reviewer", 11)?,
+        &common::scheduled("safety-reviewer")?,
     )?;
     Ok(())
 }
@@ -2400,8 +2424,9 @@ fn gate_merges_an_attested_pull_request_at_its_exact_head() -> TestResult {
     attest_gate_review(
         kitchen.store(),
         &kitchen.forge,
-        &attestation('d', "safety-reviewer", 11)?,
-        &common::scheduled("reviewer")?,
+        &repo()?,
+        pr(12)?,
+        std::num::NonZeroU64::new(11).ok_or("review id")?,
         kitchen.clock.now(),
     )?;
     let action = one_verdict(kitchen.gate()?)?;
@@ -2433,62 +2458,111 @@ fn gate_merges_an_attested_pull_request_at_its_exact_head() -> TestResult {
 }
 
 #[test]
+fn gate_refuses_review_claims_changed_after_attestation() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    kitchen.config = with_merge_grant(house_config()?)?;
+    green_pull_request(&kitchen)?;
+    attest(&kitchen, 'd')?;
+    kitchen.forge().set(
+        &format!("repos/{REPO}/pulls/12/reviews"),
+        json!([{"id":11,"user":{"login":"safety-reviewer"},
+            "commit_id":commit('d')?.as_str(),"state":"APPROVED",
+            "body":review_block('d','e')?.replace("semantic=clean", "semantic=findings")}]),
+    );
+    assert_reported(
+        &kitchen,
+        ReportReason::ReviewUnverified,
+        "edited review claims",
+    )
+}
+
+#[test]
+fn gate_refuses_a_recorded_principal_other_than_the_review_author() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    kitchen.config = with_merge_grant(house_config()?)?;
+    green_pull_request(&kitchen)?;
+    record_as(
+        &kitchen,
+        &attestation('d', "safety-reviewer", 11)?,
+        &common::scheduled("unrelated-handle")?,
+    )?;
+    assert_reported(
+        &kitchen,
+        ReportReason::ReviewUnverified,
+        "different recorder",
+    )
+}
+
+#[test]
 fn reviewer_entrypoint_refuses_moved_self_reviewed_and_duplicate_subjects() -> TestResult {
     let kitchen = settled_with_pull_request(true)?;
     green_pull_request(&kitchen)?;
-    let recorder = common::scheduled("reviewer")?;
-    let record = |value: &GateAttestation| {
+    let repository = repo()?;
+    let pull_number = pr(12)?;
+    let review_id = std::num::NonZeroU64::new(11).ok_or("review id")?;
+    let record = || {
         attest_gate_review(
             kitchen.store(),
             &kitchen.forge,
-            value,
-            &recorder,
+            &repository,
+            pull_number,
+            review_id,
             kitchen.clock.now(),
         )
     };
+    kitchen.forge().set(
+        &format!("repos/{REPO}/pulls/12/reviews"),
+        json!([{"id":11,"user":{"login":"safety-reviewer"},"commit_id":commit('d')?.as_str(),
+            "state":"COMMENTED","body":review_block('d','e')?}]),
+    );
     assert!(matches!(
-        record(&attestation('f', "safety-reviewer", 11)?),
+        record(),
+        Err(kitchen::Error::Run(RunError::AttestationReviewUnverified))
+    ));
+    kitchen.forge().set(
+        &format!("repos/{REPO}/pulls/12/reviews"),
+        json!([{"id":11,"user":{"login":"safety-reviewer"},"commit_id":commit('d')?.as_str(),
+            "state":"APPROVED","body":review_block('f','e')?}]),
+    );
+    assert!(matches!(
+        record(),
         Err(kitchen::Error::Run(RunError::AttestationStaleHead))
     ));
-    assert!(matches!(
-        record(&attestation_on('d', 'f', "safety-reviewer", 11)?),
-        Err(kitchen::Error::Run(RunError::AttestationStaleBase))
-    ));
-    assert!(matches!(
-        record(&attestation('d', "kitchen-bot", 11)?),
-        Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
-    ));
+    approved_by(&kitchen, "safety-reviewer")?;
     commits(
         &kitchen,
         json!([commit_json(
             'd',
-            Some("safety-reviewer"),
-            Some("kitchen-bot")
+            Some("kitchen-bot"),
+            Some("safety-reviewer")
         )?]),
     );
     assert!(matches!(
-        record(&attestation('d', "safety-reviewer", 11)?),
+        record(),
         Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
     ));
     commits(
         &kitchen,
         json!([commit_json('d', Some("kitchen-bot"), Some("kitchen-bot"))?]),
     );
-    let worker = kitchen.worker(7)?;
+    let base = commit('f')?;
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/main"),
+        json!({"name":"main","commit":{"sha":base.as_str()}}),
+    );
     assert!(matches!(
-        attest_gate_review(
-            kitchen.store(),
-            &kitchen.forge,
-            &attestation('d', "safety-reviewer", 11)?,
-            &common::scheduled(worker.handle.as_str())?,
-            kitchen.clock.now(),
-        ),
-        Err(kitchen::Error::Run(RunError::AttestationByWriter))
+        record(),
+        Err(kitchen::Error::Run(RunError::AttestationStaleBase))
     ));
-    let valid = attestation('d', "safety-reviewer", 11)?;
-    record(&valid)?;
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/main"),
+        json!({"name":"main","commit":{"sha":commit('e')?.as_str()}}),
+    );
+    // The PR object's base SHA may lag the live ref used by the gate.
+    set_pull_request(&kitchen, "/base/sha", json!(commit('c')?.as_str()))?;
+    record()?;
     assert!(matches!(
-        record(&valid),
+        record(),
         Err(kitchen::Error::Run(RunError::AttestationRecorded))
     ));
     Ok(())
@@ -2606,7 +2680,7 @@ fn gate_only_reports_a_commit_the_forge_links_to_no_account() -> TestResult {
         kitchen.config = with_merge_grant(house_config()?)?;
         green_pull_request(&kitchen)?;
         commits(&kitchen, list);
-        attest(&kitchen, 'd')?;
+        seed_attestation(&kitchen)?;
         assert_reported(&kitchen, ReportReason::WriterIdentityUnknown, case)?;
     }
     Ok(())
@@ -2632,7 +2706,7 @@ fn gate_reads_commits_up_to_the_bound_and_only_reports_beyond_it() -> TestResult
         COMMITS,
         vec![json!(commit_page(MAX_PULL_REQUEST_COMMITS)?), json!([])],
     );
-    attest(&kitchen, 'd')?;
+    seed_attestation(&kitchen)?;
     let action = one_verdict(kitchen.gate()?)?;
     assert_eq!(action.result, GateResult::Merged, "{action:?}");
 
@@ -2648,7 +2722,7 @@ fn gate_reads_commits_up_to_the_bound_and_only_reports_beyond_it() -> TestResult
             json!(commit_page(1)?),
         ],
     );
-    attest(&kitchen, 'd')?;
+    seed_attestation(&kitchen)?;
     assert_reported(&kitchen, ReportReason::CommitsOverBound, "one over")
 }
 
@@ -2676,7 +2750,7 @@ fn gate_stops_when_the_commits_cannot_be_read_or_lack_the_head() -> TestResult {
                 kitchen.forge().responses.borrow_mut().remove(COMMITS);
             }
         }
-        attest(&kitchen, 'd')?;
+        seed_attestation(&kitchen)?;
         assert!(kitchen.gate().is_err(), "{case}");
         assert!(merges(&kitchen).is_empty(), "{case}");
         assert_eq!(verdict_markers(&kitchen)?, 0, "{case}");
@@ -3223,11 +3297,7 @@ fn gate_reports_an_earlier_task_whose_ownership_history_is_full() -> TestResult 
 fn green_and_attested_on(kitchen: &Kitchen, head: char, base: char) -> TestResult {
     set_pull_request(kitchen, "/head/sha", json!(commit(head)?.as_str()))?;
     green_on(kitchen, head, base)?;
-    record_as(
-        kitchen,
-        &attestation_on(head, base, "safety-reviewer", 11)?,
-        &common::scheduled("reviewer")?,
-    )?;
+    attest(kitchen, head)?;
     Ok(())
 }
 
@@ -3652,7 +3722,8 @@ fn approved_by(kitchen: &Kitchen, login: &str) -> TestResult {
     kitchen.forge().set(
         &format!("repos/{REPO}/pulls/12/reviews"),
         json!([{"id": 11, "user": {"login": login}, "commit_id": commit('d')?.as_str(),
-            "state": "APPROVED", "submitted_at": "1970-01-01T00:00:00Z"}]),
+            "state": "APPROVED", "body": review_block('d', 'e')?,
+            "submitted_at": "1970-01-01T00:00:00Z"}]),
     );
     Ok(())
 }

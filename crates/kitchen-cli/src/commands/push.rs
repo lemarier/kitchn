@@ -19,9 +19,9 @@ use kitchen::{
         coordination::{Standing, current_worker, task_branch},
         pickup::{IssueRef, issue_task_id},
         push::{
-            GitHubPullRequests, GitRemote, IsolatedGitConfig, OpenOutcome, OpenRequest,
-            PullRequests, PushBoundary, PushIntent, PushOutcome, PushSetting,
-            open_task_pull_request, owns_worktree, task_published,
+            GitHubPullRequests, GitHubRemoteBranches, GitRemote, IsolatedGitConfig, OpenOutcome,
+            OpenRequest, PullRequests, PushBoundary, PushIntent, PushOutcome,
+            open_task_pull_request, owns_worktree,
         },
         repair::Observed,
         stack::{LayerText, PullRequestText},
@@ -46,11 +46,6 @@ pub struct PushArgs {
     /// State that the evidence report covers all acceptance items.
     #[arg(long)]
     acceptance_done: bool,
-    /// Internal Git credential-helper invocation.
-    #[arg(long, hide = true)]
-    credential_helper: bool,
-    #[arg(hide = true)]
-    helper_operation: Option<String>,
 }
 
 struct Selected {
@@ -137,9 +132,6 @@ impl PushArgs {
 
 pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
     let selected = args.select()?;
-    if args.credential_helper {
-        return credential(&args, &selected);
-    }
     let cwd = std::env::current_dir().map_err(|_| kitchen::house::HouseError::HouseSelection)?;
     let runtime = runtime_config(&selected.registry, &args.house)?
         .and_then(|runtime| runtime.orca)
@@ -186,21 +178,13 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
     let branch = task_branch(&selected.record)
         .ok_or(kitchen::integrations::github::IntegrationError::PermissionDenied)?;
     let git = executable("git").ok_or(kitchen::house::HouseError::InvalidInput)?;
-    let self_exe = std::env::current_exe().map_err(|_| kitchen::house::HouseError::InvalidInput)?;
-    let helper = format!(
-        "!{} push --store {} --house {} --task {} --credential-helper",
-        shell_quote(&self_exe.to_string_lossy()),
-        shell_quote(&args.store.to_string_lossy()),
-        shell_quote(&args.house.to_string()),
-        shell_quote(&args.task.to_string())
-    );
     let config = IsolatedGitConfig::create(
         &git,
         selected
             .registry
             .private_path(&args.house)?
             .join(format!("push-{}.gitconfig", args.task)),
-        &[PushSetting::CredentialHelper { url: None, helper }],
+        &[],
         DEADLINE,
     )?;
     let remote = GitRemote::new(
@@ -221,12 +205,16 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
         return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
     }
     let binding = forge_binding(&selected.registry, &args.house)?;
-    let client = GitHubClient::new(
-        binding.scope(&selected.house)?,
-        connect_gh(checked_forge_credential(&selected.registry, &binding)?)?,
-        ReadLimits::default(),
-    );
+    let gh = connect_gh(checked_forge_credential(&selected.registry, &binding)?)?;
+    let remote = remote.with_push_credential(gh.clone(), binding.credential_ref());
+    let client = GitHubClient::new(binding.scope(&selected.house)?, gh, ReadLimits::default());
     let reads = GitHubPullRequests {
+        client: &client,
+        house: &args.house,
+        repository: &selected.repository,
+    };
+    let remote_reads = GitHubRemoteBranches {
+        git: &remote,
         client: &client,
         house: &args.house,
         repository: &selected.repository,
@@ -239,7 +227,7 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
         stack_tool: selected.house.stack_tool,
         clock: &SystemClock,
         pull_requests: &reads,
-        remote: &remote,
+        remote: &remote_reads,
         updater: &remote,
     }
     .push(
@@ -247,9 +235,11 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
         selected.fence,
         &PushIntent {
             pull_request: selected.record.pull_request(),
-            expected_remote: task_published(&selected.record)
-                .then(|| remote.tracking_head(&branch))
-                .flatten(),
+            expected_remote: kitchen::workflows::push::last_pushed_head(
+                &selected.store,
+                &args.task,
+                &branch,
+            )?,
         },
         &head,
     )?;
@@ -266,6 +256,20 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
         _ => return Ok(("push outcome unsupported".into(), false)),
     }
     if let Some(number) = selected.record.pull_request() {
+        let live = reads.pull_request(number);
+        if !matches!(
+            live,
+            Observed::Known(Some(ref view))
+                if view.state == kitchen::workflows::repair::PullRequestState::Open
+                    && view.number == number
+                    && view.head_branch == branch.as_str()
+                    && view.head == head
+        ) {
+            return Ok((
+                "pull request state changed; delivery unconfirmed".into(),
+                false,
+            ));
+        }
         return Ok((
             format!(
                 "branch {branch} at {head}; pull request #{} already linked",
@@ -320,6 +324,7 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
             base,
             title,
             body,
+            reads: &reads,
         },
     )?;
     Ok(match opened {
@@ -333,30 +338,6 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
             false,
         ),
     })
-}
-
-fn credential(args: &PushArgs, selected: &Selected) -> Result<(String, bool), kitchen::Error> {
-    if args.helper_operation.as_deref() != Some("get") {
-        return Err(kitchen::integrations::github::IntegrationError::InvalidInput.into());
-    }
-    let mut input = String::new();
-    std::io::stdin()
-        .take(4097)
-        .read_to_string(&mut input)
-        .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
-    if input.len() > 4096
-        || !input.lines().any(|line| line == "protocol=https")
-        || !input.lines().any(|line| line == "host=github.com")
-    {
-        return Err(kitchen::integrations::github::IntegrationError::PermissionDenied.into());
-    }
-    let binding = forge_binding(&selected.registry, &args.house)?;
-    let token = connect_gh(checked_forge_credential(&selected.registry, &binding)?)?
-        .push_token(&binding.credential_ref(), &selected.repository)?;
-    Ok((
-        format!("protocol=https\nhost=github.com\nusername=x-access-token\npassword={token}"),
-        true,
-    ))
 }
 
 fn acceptance_reported(selected: &Selected, worktree: &Path) -> Result<(), kitchen::Error> {
@@ -426,8 +407,4 @@ fn executable(name: &str) -> Option<PathBuf> {
         .filter(|path| path.is_absolute())
         .map(|path| path.join(name))
         .find(|path| path.is_file())
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }

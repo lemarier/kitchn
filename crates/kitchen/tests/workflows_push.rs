@@ -25,7 +25,7 @@ use kitchen::{
         push::{
             GitConfigKey, LayersPermit, OpenOutcome, OpenRequest, PullRequests, PushBoundary,
             PushIntent, PushOutcome, PushPermit, PushRefusal, RefUpdater, RemoteBranches,
-            UpdateFailure, open_task_pull_request, owns_worktree,
+            UpdateFailure, last_pushed_head, open_task_pull_request, owns_worktree,
         },
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
     },
@@ -206,6 +206,7 @@ fn a_worker_opens_one_pr_and_retry_reuses_the_durable_effect() -> TestResult {
     let base = branch("main")?;
     let title = Text::new("feat: add driver")?;
     let body = Text::new("Closes #5")?;
+    let reads = Reads::new(open(7)?, Observed::Known(Some(head.clone())));
     let open = || {
         open_task_pull_request(
             &setup.world.fixture.store,
@@ -221,6 +222,7 @@ fn a_worker_opens_one_pr_and_retry_reuses_the_durable_effect() -> TestResult {
                 base: base.clone(),
                 title: title.clone(),
                 body: body.clone(),
+                reads: &reads,
             },
         )
     };
@@ -235,10 +237,71 @@ fn a_worker_opens_one_pr_and_retry_reuses_the_durable_effect() -> TestResult {
 }
 
 #[test]
+fn an_applied_open_receipt_cannot_link_a_now_closed_pr() -> TestResult {
+    let mut grants = push_grant_list()?;
+    grants.push(Grant::house(
+        Permission::OpenPullRequest,
+        github()?,
+        common::credential()?,
+    ));
+    let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
+    let forge = OpeningForge::new()?;
+    let closed = Reads::new(
+        Observed::Known(Some(view(7, PullRequestState::Closed, "lemarier/issue-5")?)),
+        Observed::Known(None),
+    );
+    let request = || -> TestResult<OpenRequest<'_>> {
+        Ok(OpenRequest {
+            task: setup.task.clone(),
+            fence: setup.fence,
+            head: commit('d')?,
+            base: branch("main")?,
+            title: Text::new("feat: driver")?,
+            body: Text::new("Closes #5")?,
+            reads: &closed,
+        })
+    };
+    assert_eq!(
+        open_task_pull_request(
+            &setup.world.fixture.store,
+            &setup.world.grants,
+            &setup.github,
+            &setup.world.clock,
+            &forge,
+            &Standing,
+            request()?
+        )?,
+        OpenOutcome::Uncertain
+    );
+    assert_eq!(forge.calls.get(), 1);
+    assert_eq!(
+        setup.world.fixture.store.task(&setup.task)?.pull_request(),
+        None
+    );
+    // A retry reuses the applied receipt but must read live state again.
+    assert_eq!(
+        open_task_pull_request(
+            &setup.world.fixture.store,
+            &setup.world.grants,
+            &setup.github,
+            &setup.world.clock,
+            &forge,
+            &Standing,
+            request()?
+        )?,
+        OpenOutcome::Uncertain
+    );
+    assert_eq!(closed.pull_request_reads.get(), 2);
+    assert_eq!(forge.calls.get(), 1);
+    Ok(())
+}
+
+#[test]
 fn opening_a_worker_pr_requires_the_separate_open_grant() -> TestResult {
     let grants = push_grant_list()?;
     let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
     let forge = OpeningForge::new()?;
+    let reads = Reads::new(open(7)?, Observed::Known(Some(commit('d')?)));
     let result = open_task_pull_request(
         &setup.world.fixture.store,
         &setup.world.grants,
@@ -253,6 +316,7 @@ fn opening_a_worker_pr_requires_the_separate_open_grant() -> TestResult {
             base: branch("main")?,
             title: Text::new("feat: driver")?,
             body: Text::new("Part of #5")?,
+            reads: &reads,
         },
     );
     assert!(matches!(
@@ -851,7 +915,7 @@ mod github_reads {
             CredentialRef, GitHubClient, GitHubReadTransport, HouseScope, IntegrationError,
             ReadLimits, ReadRequest,
         },
-        workflows::push::GitHubPullRequests,
+        workflows::push::{GitHubPullRequests, GitHubRemoteBranches, GitRemote, RemoteBranches},
     };
     use serde_json::json;
 
@@ -944,6 +1008,53 @@ mod github_reads {
                 1
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn private_branch_reads_distinguish_present_missing_and_unavailable() -> TestResult {
+        let house = HouseId::new("origin89")?;
+        let requester = ExternalRef::new("origin89-bot")?;
+        let repository = workflows_support::repo()?;
+        let scope = HouseScope::new(
+            house.clone(),
+            [repository.clone()],
+            requester.clone(),
+            CredentialRef::new(house.clone(), CredentialId::new("github-read")?, requester),
+            PostingBudget::new(0)?,
+            [Permission::PostComment],
+        )?;
+        let responses = VecDeque::from([
+            Ok(serde_json::to_vec(
+                &json!({"name":"lemarier/issue-5", "commit":{"sha":commit('d')?.as_str()}}),
+            )?),
+            Err(IntegrationError::NotFound),
+            Ok(serde_json::to_vec(&json!({"default_branch":"main"}))?),
+            Err(IntegrationError::Timeout),
+        ]);
+        let client = GitHubClient::new(
+            scope,
+            Transport(RefCell::new(responses)),
+            ReadLimits::new(Duration::from_secs(5), 1, 64 * 1024)?,
+        );
+        let directory = tempfile::tempdir()?;
+        let git = GitRemote::new(
+            std::env::current_exe()?,
+            directory.path().join("worker"),
+            "origin",
+            workflows_support::isolated_config(directory.path(), &[])?,
+            Duration::from_secs(5),
+        )?;
+        let source = GitHubRemoteBranches {
+            git: &git,
+            client: &client,
+            house: &house,
+            repository: &repository,
+        };
+        let branch = BranchName::new("lemarier/issue-5")?;
+        assert_eq!(source.head(&branch), Observed::Known(Some(commit('d')?)));
+        assert_eq!(source.head(&branch), Observed::Known(None));
+        assert_eq!(source.head(&branch), Observed::Unknown);
         Ok(())
     }
 }
@@ -2477,18 +2588,38 @@ fn a_checked_pull_request_and_a_published_branch_bind_later_pushes() -> TestResu
         )?,
         PushOutcome::Pushed { replaced: None }
     );
+    assert_eq!(
+        last_pushed_head(
+            &setup.world.fixture.store,
+            &setup.task,
+            &branch("lemarier/issue-5")?
+        )?,
+        Some(first.clone())
+    );
     // An update names the pull request, which is checked and recorded.
     let reads = Reads::new(open(5)?, Observed::Known(Some(first.clone())));
     assert_eq!(
         boundary(&setup, &reads, &updater).push(
             &setup.task,
             setup.fence,
-            &update_intent(Some(first.clone()))?,
+            &update_intent(last_pushed_head(
+                &setup.world.fixture.store,
+                &setup.task,
+                &branch("lemarier/issue-5")?
+            )?)?,
             &second,
         )?,
         PushOutcome::Pushed {
             replaced: Some(first.clone())
         }
+    );
+    assert_eq!(
+        last_pushed_head(
+            &setup.world.fixture.store,
+            &setup.task,
+            &branch("lemarier/issue-5")?
+        )?,
+        Some(second.clone())
     );
     // The pull request merged and the forge kept the branch. An intent that
     // omits the pull request cannot skip the merged check.

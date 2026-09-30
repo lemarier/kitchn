@@ -16,7 +16,7 @@ use crate::{
         Operation, ResourceRef, Timestamp, WorkerOutcome,
     },
     house::HouseConfig,
-    integrations::github::{GitHubClient, GitHubReadTransport},
+    integrations::github::{GitHubClient, GitHubReadTransport, IntegrationError, Observation},
     state::{
         HouseMailbox, HouseStore, OwnershipEvent, StateError, TaskRecord, TaskState, reconcile,
     },
@@ -564,6 +564,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                             super::issue_of(&record, repository).is_some()
                         })
                         && record.pull_request().is_none()
+                        && self.branch_has_commits(&record)?
                     {
                         handled = false;
                         actions.push(CoordinateAction::AwaitingDelivery {
@@ -695,10 +696,14 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         else {
             return Ok(None);
         };
-        let head = known(
-            self.forge
-                .branch_tip(self.store.house(), repository, &branch),
-        )?;
+        let head = match self
+            .forge
+            .branch_tip(self.store.house(), repository, &branch)
+        {
+            Observation::Known(head) => head,
+            Observation::Unavailable(IntegrationError::NotFound) => return Ok(None),
+            other => known(other)?,
+        };
         Ok(Some(Completion {
             observed_branch: branch.as_str().to_owned(),
             requested: branch,
@@ -711,6 +716,52 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             },
             addressed: Vec::new(),
         }))
+    }
+
+    /// A branch needs delivery only when the forge proves it has commits
+    /// ahead of its launch base branch. A later ordinary advance of that
+    /// base cannot make an unchanged worker branch appear ahead.
+    fn branch_has_commits(&self, record: &TaskRecord) -> Result<bool> {
+        let (Some(branch), Some(repository)) = (task_branch(record), &record.spec().repository)
+        else {
+            return Ok(false);
+        };
+        let house = self.store.house();
+        let base = if super::super::coordination::BranchFact::Stacked.holds(record, &branch) {
+            let attempt = current_worker(record)
+                .ok_or(crate::integrations::github::IntegrationError::Unknown)?
+                .attempt;
+            let branch = record.effects().iter().rev().find_map(|effect| {
+                if effect.request().attempt() != attempt {
+                    return None;
+                }
+                let Effect::Worker(Operation::LaunchWorker { brief, .. }) =
+                    effect.request().effect()
+                else {
+                    return None;
+                };
+                brief.as_str().lines().find_map(|line| {
+                    line.strip_prefix("Base: stack layer ")
+                        .and_then(|line| line.split_once(" on `"))
+                        .and_then(|(_, rest)| rest.split_once('`'))
+                        .and_then(|(branch, _)| crate::contracts::BranchName::new(branch).ok())
+                })
+            });
+            branch.ok_or(crate::integrations::github::IntegrationError::Unknown)?
+        } else {
+            let info = known(self.forge.repository(house, repository))?;
+            crate::contracts::BranchName::new(&info.default_branch)?
+        };
+        let base_head = known(self.forge.branch_tip(house, repository, &base))?;
+        let head = match self.forge.branch_tip(house, repository, &branch) {
+            Observation::Known(head) => head,
+            Observation::Unavailable(IntegrationError::NotFound) => return Ok(false),
+            other => known(other)?,
+        };
+        if head == base_head {
+            return Ok(false);
+        }
+        Ok(known(self.forge.compare(house, repository, &base_head, &head))?.ahead_by > 0)
     }
 }
 

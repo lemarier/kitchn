@@ -187,9 +187,9 @@ enum Auth {
 }
 
 impl GhCli {
-    /// A repository-scoped token for Git's credential helper. The caller
+    /// A repository-scoped token for one checked Git push child. The caller
     /// must check task authority before asking for it and keep it off argv.
-    pub fn push_token(
+    pub(crate) fn push_token(
         &self,
         reference: &CredentialRef,
         repository: &Repository,

@@ -23,11 +23,13 @@
 //! credentials can still push directly is a limit of credential isolation
 //! (#6, #13), not of this module.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 use std::{
     fmt::Write as _,
     fs::File,
     io::{Read, Seek, SeekFrom},
+    num::NonZeroU32,
     path::PathBuf,
     process::{Command, Stdio},
     thread,
@@ -35,15 +37,20 @@ use std::{
 };
 
 use crate::{
-    BackendId, EffectName, HouseId, TaskId,
+    BackendId, EffectName, HouseId, TaskId, WorkflowId,
     contracts::{
         BranchName, Clock, CommitId, Effect, ExternalRef, Fence, GitHubAction, GitHubMutation,
         GrantScope, HouseGrants, IssueNumber, Operation, Permission, Repository, ResourceKind,
         Text,
     },
     house::StackTool,
-    integrations::github::{GitHubClient, GitHubReadTransport, Observation},
-    state::{EffectPlan, EffectState, HouseStore, StateError, TaskRecord, TaskState, run_effect},
+    integrations::github::{
+        CredentialRef, GhCli, GitHubClient, GitHubReadTransport, IntegrationError, Observation,
+    },
+    state::{
+        EffectPlan, EffectState, HouseStore, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject,
+        StateError, TaskRecord, TaskState, WorkItem, run_effect,
+    },
     workflows::{
         coordination::{
             BranchFact, ConsentSource, CoordinationError, current_worker, held_branches,
@@ -66,11 +73,59 @@ pub enum OpenOutcome {
     Uncertain,
 }
 
-/// Whether this task already published its latest launched branch through
-/// the checked boundary. An unpublished task must not replace a remote ref.
-#[must_use]
-pub fn task_published(record: &TaskRecord) -> bool {
-    task_branch(record).is_some_and(|branch| BranchFact::Published.holds(record, &branch))
+fn pushed_key(task: &TaskId, branch: &BranchName) -> Result<MarkerKey> {
+    let digest = Sha256::digest(branch.as_str().as_bytes());
+    let mut name = String::from("branch-");
+    for byte in digest.iter().take(16) {
+        let _ = write!(name, "{byte:02x}");
+    }
+    Ok(MarkerKey {
+        workflow: WorkflowId::new("worker-push")?,
+        item: WorkItem::Task { task: task.clone() },
+        subject: MarkerSubject::Observation(ExternalRef::new(&name)?),
+    })
+}
+
+fn pushed_schema() -> Result<MarkerSchema> {
+    Ok(MarkerSchema::new("worker-push-head", NonZeroU32::MIN)?)
+}
+
+/// The last branch head this task's checked push accepted, independent of
+/// the checkout's remote-tracking refs.
+pub fn last_pushed_head(
+    store: &HouseStore,
+    task: &TaskId,
+    branch: &BranchName,
+) -> Result<Option<CommitId>> {
+    store
+        .marker(&pushed_key(task, branch)?)?
+        .map(|marker| {
+            marker
+                .fact()
+                .decode(&pushed_schema()?)
+                .map_err(crate::Error::from)
+        })
+        .transpose()
+}
+
+fn record_pushed_head(
+    store: &HouseStore,
+    task: &TaskId,
+    fence: Fence,
+    branch: &BranchName,
+    head: &CommitId,
+    clock: &dyn Clock,
+) -> Result<()> {
+    let key = pushed_key(task, branch)?;
+    let fact = MarkerFact::workflow(pushed_schema()?, head)?;
+    if let Some(previous) = store.marker(&key)? {
+        if previous.fact() != &fact {
+            store.supersede_task_marker(&key, previous.fact(), fact, task, fence, clock.now())?;
+        }
+    } else {
+        store.record_task_marker_unless(key, fact, task, fence, clock.now(), |_| Ok(None::<()>))?;
+    }
+    Ok(())
 }
 
 /// Whether the current attempt's applied launch receipt created this exact
@@ -96,7 +151,7 @@ pub fn owns_worktree(record: &TaskRecord, worktree: &ExternalRef) -> bool {
 /// Open the task branch's pull request through the persisted effect path.
 /// The branch, live claim, and both grants are checked before the intent is
 /// recorded. A retry uses the same effect name at the same head.
-pub struct OpenRequest {
+pub struct OpenRequest<'a> {
     /// Task receiving the pull request.
     pub task: TaskId,
     /// Current claim fence.
@@ -109,6 +164,8 @@ pub struct OpenRequest {
     pub title: Text,
     /// Pull request body.
     pub body: Text,
+    /// Live pull request reads used to confirm the opened receipt.
+    pub reads: &'a dyn PullRequests,
 }
 
 /// Submit and link a worker pull request with persisted intent.
@@ -119,7 +176,7 @@ pub fn open_task_pull_request(
     clock: &dyn Clock,
     forge: &dyn ForgeWriter,
     consent: &dyn ConsentSource,
-    request: OpenRequest,
+    request: OpenRequest<'_>,
 ) -> Result<OpenOutcome> {
     let OpenRequest {
         task,
@@ -128,6 +185,7 @@ pub fn open_task_pull_request(
         base,
         title,
         body,
+        reads,
     } = request;
     let (record, binding) = bind(
         store,
@@ -153,8 +211,8 @@ pub fn open_task_pull_request(
         .github_effect(GitHubMutation {
             repository: binding.repository.clone(),
             action: GitHubAction::OpenPullRequest {
-                head: binding.branch,
-                expected_head: head,
+                head: binding.branch.clone(),
+                expected_head: head.clone(),
                 base,
                 title,
                 body,
@@ -196,7 +254,17 @@ pub fn open_task_pull_request(
         | EffectState::Waived { .. } => OpenOutcome::Uncertain,
     };
     if let OpenOutcome::Opened(number) = outcome {
-        store.link_pull_request(&task, fence, number)?;
+        match reads.pull_request(number) {
+            Observed::Known(Some(view))
+                if view.state == PullRequestState::Open
+                    && view.number == number
+                    && view.head_branch == binding.branch.as_str()
+                    && view.head == head =>
+            {
+                store.link_pull_request(&task, fence, number)?;
+            }
+            _ => return Ok(OpenOutcome::Uncertain),
+        }
     }
     Ok(outcome)
 }
@@ -636,6 +704,7 @@ pub(crate) fn record_landed(
     fence: Fence,
     binding: &Binding,
     intent: &PushIntent,
+    head: &CommitId,
 ) -> Result<()> {
     let now = clock.now();
     if !binding.published {
@@ -644,6 +713,7 @@ pub(crate) fn record_landed(
     if intent.pull_request.is_some() && !binding.pull_request_bound {
         BranchFact::PullRequestBound.record(store, task, fence, &binding.branch, now)?;
     }
+    record_pushed_head(store, task, fence, &binding.branch, head, clock)?;
     Ok(())
 }
 
@@ -759,7 +829,9 @@ impl PushBoundary<'_> {
         let permit = match decide(&binding, intent, &observed, Some(commit)) {
             Ok(Decision::Update(permit)) => permit,
             Ok(Decision::Current) => {
-                record_landed(self.store, self.clock, task, fence, &binding, intent)?;
+                record_landed(
+                    self.store, self.clock, task, fence, &binding, intent, commit,
+                )?;
                 return Ok(PushOutcome::AlreadyCurrent);
             }
             Err(refusal) => return Ok(PushOutcome::Refused(refusal)),
@@ -767,7 +839,9 @@ impl PushBoundary<'_> {
         Ok(
             match self.updater.update(&permit, &binding.branch, commit) {
                 Ok(()) => {
-                    record_landed(self.store, self.clock, task, fence, &binding, intent)?;
+                    record_landed(
+                        self.store, self.clock, task, fence, &binding, intent, commit,
+                    )?;
                     PushOutcome::Pushed {
                         replaced: permit.replaces,
                     }
@@ -812,6 +886,39 @@ impl<T: GitHubReadTransport> PullRequests for GitHubPullRequests<'_, T> {
     }
 }
 
+/// Remote branch reads through the house-scoped forge client while Git checks
+/// the checkout's remote URL and performs the leased update. Private branches
+/// therefore need no Git credential before the push child starts.
+pub struct GitHubRemoteBranches<'a, T: GitHubReadTransport> {
+    /// Git remote URL and rewrite checks.
+    pub git: &'a GitRemote,
+    /// House-scoped forge reader.
+    pub client: &'a GitHubClient<T>,
+    /// Owning house.
+    pub house: &'a HouseId,
+    /// Granted repository.
+    pub repository: &'a Repository,
+}
+
+impl<T: GitHubReadTransport> RemoteBranches for GitHubRemoteBranches<'_, T> {
+    fn reads_from(&self, repository: &Repository) -> Observed<bool> {
+        self.git.reads_from(repository)
+    }
+
+    fn head(&self, branch: &BranchName) -> Observed<Option<CommitId>> {
+        match self.client.branch_tip(self.house, self.repository, branch) {
+            Observation::Known(head) => Observed::Known(Some(head)),
+            Observation::Unavailable(IntegrationError::NotFound) => {
+                match self.client.repository(self.house, self.repository) {
+                    Observation::Known(_) => Observed::Known(None),
+                    Observation::Unavailable(_) | Observation::Unknown => Observed::Unknown,
+                }
+            }
+            Observation::Unavailable(_) | Observation::Unknown => Observed::Unknown,
+        }
+    }
+}
+
 /// Longest Git output read, in bytes.
 const MAX_GIT_OUTPUT: u64 = 64 * 1024;
 
@@ -847,8 +954,9 @@ const GIT_POLL: Duration = Duration::from_millis(10);
 /// Kitchen's configuration that borrows the checkout's objects, so the push
 /// never reads the checkout's configuration. A rewrite or remote URL a
 /// worker writes to its checkout after the last check cannot redirect it,
-/// and the checkout's credential helpers do not run for it: give Kitchen's
-/// own [`PushSetting::CredentialHelper`] instead.
+/// and the checkout's credential helpers do not run for it. GitHub pushes
+/// use [`GitRemote::with_push_credential`] to supply an HTTPS header to that
+/// child only.
 #[derive(Debug, Clone)]
 pub struct GitRemote {
     git: PathBuf,
@@ -858,6 +966,7 @@ pub struct GitRemote {
     deadline: Duration,
     url_bases: Vec<String>,
     transport_url: Option<String>,
+    push_credential: Option<(GhCli, CredentialRef)>,
 }
 
 /// The URL prefixes of GitHub repositories, followed by `owner/name`.
@@ -889,16 +998,6 @@ impl GitRemote {
         ))
     }
 
-    /// The checkout's last recorded remote head. A missing tracking ref is
-    /// the only acceptable expectation for a first push.
-    #[must_use]
-    pub fn tracking_head(&self, branch: &BranchName) -> Option<CommitId> {
-        let reference = format!("refs/remotes/{}/{}", self.remote, branch);
-        let (Some(0), head) = self.run(&["rev-parse", "--verify", "--quiet", &reference])? else {
-            return None;
-        };
-        CommitId::new(String::from_utf8(head).ok()?.trim()).ok()
-    }
     /// Longest remote name accepted, in bytes.
     pub const MAX_REMOTE_BYTES: usize = 64;
 
@@ -943,6 +1042,7 @@ impl GitRemote {
                 .map(|base| (*base).to_owned())
                 .collect(),
             transport_url: None,
+            push_credential: None,
         })
     }
 
@@ -951,6 +1051,16 @@ impl GitRemote {
     #[must_use]
     pub fn with_github_https_transport(mut self, repository: &Repository) -> Self {
         self.transport_url = Some(format!("https://github.com/{repository}.git"));
+        self
+    }
+
+    /// Mint a repository-scoped token only after the checked push reaches its
+    /// Git child. Requires [`Self::with_github_https_transport`]; without an
+    /// HTTPS transport, the push fails closed. Neither read calls nor the
+    /// caller receive the token.
+    #[must_use]
+    pub fn with_push_credential(mut self, gh: GhCli, reference: CredentialRef) -> Self {
+        self.push_credential = Some((gh, reference));
         self
     }
 
@@ -1517,7 +1627,40 @@ impl GitRemote {
                 .map(|update| format!("{}:refs/heads/{}", update.commit, update.branch)),
         );
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        match self.run_in(snapshot.path(), &args) {
+        let result = if let Some((gh, reference)) = &self.push_credential {
+            let Some(url) = self.transport_url.as_deref() else {
+                return Err(UpdateFailure::Uncertain);
+            };
+            let token = gh
+                .push_token(reference, repository)
+                .map_err(|_| UpdateFailure::Uncertain)?;
+            let mut env = git_environment(&self.config, &self.remote);
+            let count = env
+                .iter()
+                .find(|(key, _)| key == "GIT_CONFIG_COUNT")
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .ok_or(UpdateFailure::Uncertain)?;
+            let header = STANDARD.encode(format!("x-access-token:{token}"));
+            env.push((
+                format!("GIT_CONFIG_KEY_{count}"),
+                format!("http.{url}.extraheader"),
+            ));
+            env.push((
+                format!("GIT_CONFIG_VALUE_{count}"),
+                format!("Authorization: Basic {header}"),
+            ));
+            if let Some((_, value)) = env.iter_mut().find(|(key, _)| key == "GIT_CONFIG_COUNT") {
+                *value = (count + 1).to_string();
+            }
+            let env: Vec<(&str, &str)> = env
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            run_bounded(&self.git, snapshot.path(), &args, &env, self.deadline)
+        } else {
+            self.run_in(snapshot.path(), &args)
+        };
+        match result {
             Some((Some(0), _)) => Ok(()),
             // Git reports a refused ref, such as a failed lease, as a line
             // starting with `!` under `--porcelain`: nothing changed, since

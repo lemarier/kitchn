@@ -1084,6 +1084,7 @@ fn coordinate_settles_a_reported_task_and_acknowledges_the_report() -> TestResul
 fn coordinate_holds_a_successful_report_until_a_pr_is_linked() -> TestResult {
     let kitchen = Kitchen::new()?;
     kitchen.launch_and_finish_unlinked()?;
+    delivery_comparison(&kitchen, 1)?;
     let task = kitchen.task(7)?;
     let actions = acted(kitchen.coordinate()?)?;
     assert!(actions.iter().any(|action| matches!(action,
@@ -1100,6 +1101,75 @@ fn coordinate_holds_a_successful_report_until_a_pr_is_linked() -> TestResult {
         task,
         outcome: Supervision::Settled(Settlement::Succeeded),
     }));
+    Ok(())
+}
+
+fn delivery_comparison(kitchen: &Kitchen, ahead_by: u64) -> TestResult {
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}"), json!({"default_branch": "main"}));
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/main"),
+        json!({"name": "main", "commit": {"sha": commit('c')?.as_str()}}),
+    );
+    kitchen.forge().set(
+        &format!(
+            "repos/{REPO}/compare/{}...{}",
+            commit('c')?.as_str(),
+            commit('d')?.as_str()
+        ),
+        json!({"behind_by": 0, "ahead_by": ahead_by}),
+    );
+    Ok(())
+}
+
+#[test]
+fn coordinate_does_not_hold_an_unlinked_branch_without_new_commits() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.launch_and_finish_unlinked()?;
+    delivery_comparison(&kitchen, 0)?;
+    let task = kitchen.task(7)?;
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, CoordinateAction::AwaitingDelivery { .. }))
+    );
+    assert!(actions.contains(&CoordinateAction::Supervised {
+        task: task.clone(),
+        outcome: Supervision::Settled(Settlement::Succeeded),
+    }));
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Settled { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn coordinate_does_not_hold_a_branch_at_its_base_commit() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.launch_and_finish_unlinked()?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}"), json!({"default_branch": "main"}));
+    for branch in ["main", "kitchen/issue-7"] {
+        kitchen.forge().set(
+            &format!("repos/{REPO}/branches/{branch}"),
+            json!({"name": branch, "commit": {"sha": commit('c')?.as_str()}}),
+        );
+    }
+    let task = kitchen.task(7)?;
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, CoordinateAction::AwaitingDelivery { .. }))
+    );
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Settled { .. }
+    ));
     Ok(())
 }
 

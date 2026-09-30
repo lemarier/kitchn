@@ -148,6 +148,12 @@ Shared parents follow these rules:
 
 ## Bounded execution conventions
 
+Worker delivery uses `kitchn push` from its launched worktree. The command gives
+the forge credential only to its checked Git push child, keeps the accepted
+remote head in the house store for later pushes, and confirms a PR is still
+open at the submitted head before linking it. See `skills/kitchn/SKILL.md` for
+the worker procedure.
+
 Before adding I/O, define a finite deadline, input/output byte limits, and the
 owner of the operation. A retry policy must specify maximum attempts and elapsed
 time, retryable errors, and what proves a previous effect did not occur. An

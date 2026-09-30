@@ -537,7 +537,7 @@ kitchn run pickup     <house> <backend> [--ready-label ready] [--needs-spec-labe
                       [--human-label human-only] [--capacity 1] [--branch-prefix kitchen]
                       [--report-path kitchen-report.md]
 kitchn run coordinate <house> <backend>
-kitchn run repair     <house> <backend>
+kitchn run repair     <house> <backend> [--branch-prefix kitchen] [--report-path kitchen-report.md]
 kitchn run gate       <house>
 ```
 
@@ -568,9 +568,20 @@ before anything runs.
   owns first. Unreadable rows and messages no task can take are acknowledged,
   and each is printed.
 - `repair` assesses the open pull requests of settled scheduled tasks and
-  prints each decision. It launches no repair writer.
+  prints each decision. For a conflict it launches one repair writer in a new
+  checkout of the pushed branch, with a brief quoting the change requests on
+  the current head, while the house's fix-round budget lasts. It launches none
+  while another scheduled writer of the repository is unsettled, and at most
+  one per pass. When the branch's last writer did not settle successfully with
+  a report of the current head, the pull request is handed over instead. The
+  `coordinate` pass supervises repair writers like pickup workers.
 - `gate` evaluates up to three of those pull requests at their exact heads and
-  prints each verdict. It records nothing and never merges.
+  prints each verdict. It merges one only when an independent reviewer's
+  attestation is recorded for exactly its head and base and the house's merge
+  grant covers it. The merge is a squash matched to that head, submitted only
+  after the head and base branch are read again. Without an attestation, or
+  with any other verdict, it records nothing. Kitchen has no command that
+  records attestations yet, so in practice the gate still only reports.
 
 Each pass takes its own lease first, so a second concurrent start does nothing
 and exits `3`. A pass that fails hands its lease to the next start. A pass that

@@ -152,7 +152,8 @@ pub struct ExpectedReviewer {
     pub outcome: ReviewerOutcome,
 }
 /// Gate's own review. Partial or failed automated coverage is a gap.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SemanticReview {
     /// The review found no actionable issue.
     Clean,
@@ -164,7 +165,8 @@ pub enum SemanticReview {
     Unavailable,
 }
 /// Risk classes requiring human write-access approval at this revision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RiskClass {
     /// Equipment control, firmware, or safety logic.
     EquipmentSafety,

@@ -514,8 +514,9 @@ before anything runs.
 - `pickup` claims ready issues of the repository (label, stated acceptance
   criteria, no open blocked-by link, not assigned or reserved), launches their
   workers, and launches the next attempt of a scheduled task whose attempt
-  ended. While another scheduled task of the repository is unsettled, a new
-  issue waits: file overlap is not observed.
+  ended. File overlap is not observed, so a pass launches at most one writer
+  per repository whatever `--capacity` says, and a new issue waits while
+  another scheduled task of the repository is unsettled.
 - `coordinate` continues every scheduled task, reads worker deliveries from
   the backend when it declares them and from the house mailbox otherwise, and
   supervises each task once. A worker's successful report settles its task
@@ -529,9 +530,11 @@ before anything runs.
 Each pass takes its own lease first, so a second concurrent start does nothing
 and exits `3`. A pass that fails hands its lease to the next start. A pass that
 died leaves an expired lease: the next start exits `4` until run with
-`--take-over`, which records the takeover. The same flag lets `coordinate` take
-over scheduled task claims that expired because no pass renewed them for two
-hours. A pass with nothing to do prints `idle`, exits `0`, and launches or
+`--take-over`, which records the takeover. After a `coordinate` takeover, every
+scheduled task moves to a new claim before anything else runs, so the replaced
+process can no longer act on it; a replaced `pickup` can no longer claim or
+launch. The same flag lets `coordinate` take over scheduled task claims that
+expired because no pass renewed them for two hours. A pass with nothing to do prints `idle`, exits `0`, and launches or
 messages no worker.
 
 ## `kitchn pickup`

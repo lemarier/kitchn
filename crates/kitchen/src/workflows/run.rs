@@ -10,13 +10,21 @@
 //! ([`Outcome::OwnerUncertain`]) and only a start that asks for a takeover
 //! proceeds, recording it.
 //!
-//! Task claims are not scoped to a pass's consumer lease. Pickup claims each
-//! issue task under the scheduled runner holder ([`RUN_HOLDER`]) for
-//! [`TASK_LEASE`], and each coordination pass continues that claim and renews
-//! it while it supervises. The consumer lease keeps a single pass of each
-//! kind running; the task lease keeps an unattended task visible as owned
-//! between passes. A task whose lease expired because no pass ran is
-//! uncertain, and only a takeover continues it.
+//! A task has one acting pass at a time, and that pass's fence is the only
+//! one the store accepts for it. Pickup claims and launches under its own
+//! consumer lease ([`Claimant::under`]): once that lease is released or
+//! superseded, the store refuses the claim's effects and renewals. The
+//! coordination pass then moves the task to its own claim, under the
+//! scheduled runner holder ([`RUN_HOLDER`]) for [`TASK_LEASE`], and renews
+//! it while it supervises across passes. A coordination claim is not bound
+//! to one pass's lease, because binding it would move every task on every
+//! pass and fill its ownership history. Instead, a coordination pass that
+//! took over an expired lease moves every task it continues to a new fence
+//! before acting, so the process it replaced holds only stale fences. Each
+//! move is a recorded relinquish and adoption; unresolved effects stay with
+//! the task and supervision reconciles them before anything else. A task
+//! whose claim expired because no pass ran is uncertain, and only a
+//! takeover continues it.
 //!
 //! A pass reads before it spends: when nothing is actionable it returns
 //! [`Outcome::Idle`] without launching or messaging any worker.
@@ -26,12 +34,12 @@ use std::{fmt, str::FromStr, time::Duration};
 use crate::{
     ConsumerId, ErrorClass, HolderId, TaskId,
     contracts::{
-        Claimant, Clock, ExecutorKind, Fence, IssueNumber, LeaseTtl, MailboxError, Provenance,
-        Repository, RetryPolicy, Role, TaskAuthority, Timestamp,
+        Claimant, Clock, ConsumerFence, ExecutorKind, Fence, IssueNumber, LeaseTtl, MailboxError,
+        Provenance, Repository, RetryPolicy, Role, TaskAuthority, Timestamp,
     },
     house::HouseConfig,
     integrations::github::{GitHubClient, GitHubReadTransport, HeadLocation, IssueState},
-    state::{HouseStore, Lease, StateError, TaskRecord, TaskState},
+    state::{ConsumerState, HouseStore, Lease, StateError, TaskRecord, TaskState},
     workflows::{
         coordination::{MailboxRoute, task_branch},
         pickup::{IssueRef, TaskTemplate, issue_task_id, stable_hash},
@@ -340,16 +348,57 @@ fn issue_of(record: &TaskRecord, repository: &Repository) -> Option<IssueRef> {
         .map(|_| issue)
 }
 
-/// Whether the scheduled runner holds `record` under a live claim, and at
-/// which fence.
-fn held_by_run(record: &TaskRecord, now: Timestamp) -> Option<Fence> {
+/// The scheduled runner's live claim on `record`, if it holds one.
+fn held_by_run(record: &TaskRecord, now: Timestamp) -> Option<&Lease> {
     match record.state() {
         TaskState::Claimed { lease }
             if lease.holder().as_str() == RUN_HOLDER && lease.is_live(now) =>
         {
-            Some(lease.fence())
+            Some(lease)
         }
         TaskState::Claimed { .. } | TaskState::Open | TaskState::Settled { .. } => None,
+    }
+}
+
+/// Whether the pass lease `bound` names is still held, current, and live:
+/// that pass may still act on the tasks it claimed.
+fn pass_current(store: &HouseStore, bound: &ConsumerFence, now: Timestamp) -> Result<bool> {
+    Ok(store
+        .consumer(&bound.consumer)?
+        .is_some_and(|record| match record.state() {
+            ConsumerState::Held { lease } => lease.fence() == bound.fence && lease.is_live(now),
+            ConsumerState::Idle | ConsumerState::Relinquished { .. } => false,
+        }))
+}
+
+/// Move `task`, claimed at `fence`, to a new claim for `claimant`: the
+/// relinquish makes `fence` stale for every later change and effect, and the
+/// claim records an adoption. Unresolved effects stay for the new owner to
+/// reconcile. `None` when the task changed hands first; nothing was moved.
+fn transfer(
+    store: &HouseStore,
+    task: &TaskId,
+    fence: Fence,
+    claimant: &Claimant,
+    now: Timestamp,
+) -> Result<Option<Fence>> {
+    match store.relinquish(task, fence, now) {
+        Ok(()) => {}
+        Err(crate::Error::State(
+            StateError::StaleFence { .. } | StateError::TaskSettled { .. },
+        )) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    }
+    match store.claim(task, claimant, LeaseTtl::new(TASK_LEASE)?, now) {
+        Ok(lease) => Ok(Some(lease.fence())),
+        Err(crate::Error::State(
+            StateError::ClaimHeld { .. }
+            | StateError::LeaseExpired { .. }
+            | StateError::TaskSettled { .. },
+        )) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 

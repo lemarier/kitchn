@@ -4,12 +4,12 @@
 
 use std::fmt;
 
-use super::{Outcome, Pass, RunError, TASK_LEASE, held_by_run, issue_of, run_claimant};
+use super::{Outcome, Pass, RunError, TASK_LEASE, held_by_run, issue_of, run_claimant, transfer};
 use crate::{
     ConsumerId, TaskId,
     contracts::{
-        AttemptNumber, BranchName, Clock, ContractError, Fence, LeaseTtl, Repository, Text,
-        WorkerBackend, Workspace,
+        AttemptNumber, BranchName, Clock, ContractError, Effect, Fence, LeaseTtl, Operation,
+        Repository, Text, WorkerBackend, Workspace,
     },
     house::HouseConfig,
     integrations::github::{GitHubClient, GitHubReadTransport, Issue, IssueDetail, IssueState},
@@ -52,7 +52,9 @@ pub struct PickupSettings {
     pub repository: Repository,
     /// Label names.
     pub labels: PickupLabels,
-    /// Most unsettled scheduled pickup tasks in the repository.
+    /// Most unsettled scheduled pickup tasks in the repository. Without
+    /// observed file overlap a pass still launches at most one writer, so a
+    /// capacity above one does not add concurrent writers.
     pub capacity: u32,
     /// Workers create `<prefix>/issue-<number>`.
     pub branch_prefix: BranchName,
@@ -120,6 +122,12 @@ pub enum PickupAction {
         /// The task.
         task: TaskId,
     },
+    /// A scheduled task changed hands before this pass could take it for
+    /// its next attempt; it was left alone.
+    Moved {
+        /// The task.
+        task: TaskId,
+    },
 }
 
 impl fmt::Display for PickupAction {
@@ -149,6 +157,7 @@ impl fmt::Display for PickupAction {
                 formatter,
                 "stacked task needs a person for its next attempt: task {task}"
             ),
+            Self::Moved { task } => write!(formatter, "task {task} changed hands; left alone"),
         }
     }
 }
@@ -203,14 +212,27 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
                     .issues_filtered(house, repository, Some(IssueState::Open), None),
             )?;
         let tasks = self.store.tasks()?;
-        let retries: Vec<(&TaskRecord, IssueRef, Fence)> = tasks
-            .iter()
-            .filter_map(|record| {
-                let issue = issue_of(record, repository)?;
-                let fence = held_by_run(record, now)?;
-                awaiting_launch(record).then_some((record, issue, fence))
-            })
-            .collect();
+        // One writer per repository: file overlap is not observed, so a pass
+        // launches at most one writer, and none while another scheduled
+        // task of the repository has an open attempt. Selection already
+        // leaves new issues while any scheduled task is unsettled.
+        let writer_open = tasks.iter().any(|record| {
+            issue_of(record, repository).is_some()
+                && !matches!(record.state(), TaskState::Settled { .. })
+                && !awaiting_launch(record)
+        });
+        let retries: Vec<(&TaskRecord, IssueRef, Fence)> = if writer_open {
+            Vec::new()
+        } else {
+            tasks
+                .iter()
+                .filter_map(|record| {
+                    let issue = issue_of(record, repository)?;
+                    let fence = held_by_run(record, now)?.fence();
+                    awaiting_launch(record).then_some((record, issue, fence))
+                })
+                .collect()
+        };
         let mut ready: Vec<&Issue> = issues
             .iter()
             .filter(|issue| has_label(issue, &settings.labels.ready))
@@ -239,27 +261,31 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
             clock: self.clock,
             consent: &Standing,
         };
-        let claimant = run_claimant()?;
+        // Claims and launches are bound to this pass's lease: once it is
+        // superseded, the store refuses them, even from a process already
+        // past its last renewal.
+        let claimant = run_claimant()?.under(consumer.clone(), lease);
         let ttl = LeaseTtl::new(TASK_LEASE)?;
-        let mut actions = Vec::with_capacity(selection.picks.len() + retries.len());
-        for pick in selection.picks {
+        let mut actions = Vec::new();
+        // Selection picks only while no scheduled task is unsettled, so the
+        // first pick is the one writer.
+        if let Some(pick) = selection.picks.into_iter().next() {
             super::renew(self.store, consumer, lease, self.clock)?;
-            let fence = match claim_issue(self.store, template, &pick.issue, &claimant, ttl, now)? {
-                ClaimOutcome::Claimed(lease) | ClaimOutcome::Adopted(lease) => lease.fence(),
-                outcome => {
-                    actions.push(PickupAction::NotClaimed {
-                        issue: pick.issue,
-                        outcome,
-                    });
-                    continue;
+            match claim_issue(self.store, template, &pick.issue, &claimant, ttl, now)? {
+                ClaimOutcome::Claimed(claim) | ClaimOutcome::Adopted(claim) => {
+                    let body = details
+                        .iter()
+                        .find(|detail| detail.number == pick.issue.number)
+                        .and_then(|detail| detail.body.as_deref());
+                    let brief = self.brief(pick.issue.clone(), pick.base, body)?;
+                    actions.push(launch(&ctx, pick.task, claim.fence(), &brief)?);
                 }
-            };
-            let body = details
-                .iter()
-                .find(|detail| detail.number == pick.issue.number)
-                .and_then(|detail| detail.body.as_deref());
-            let brief = self.brief(pick.issue.clone(), pick.base, body)?;
-            actions.push(launch(&ctx, pick.task, fence, &brief)?);
+                outcome => actions.push(PickupAction::NotClaimed {
+                    issue: pick.issue,
+                    outcome,
+                }),
+            }
+            return Ok(actions);
         }
         for (record, issue, fence) in retries {
             super::renew(self.store, consumer, lease, self.clock)?;
@@ -275,15 +301,21 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
             }
             let detail = known(self.forge.issue_detail(house, repository, issue.number))?;
             let brief = self.brief(issue, Base::DefaultBranch, detail.body.as_deref())?;
+            // The task moves to this pass's claim before the launch, so the
+            // claim it had cannot also act on it.
+            let Some(fence) = transfer(self.store, &task, fence, &claimant, now)? else {
+                actions.push(PickupAction::Moved { task });
+                continue;
+            };
             actions.push(launch(&ctx, task, fence, &brief)?);
+            break;
         }
         Ok(actions)
     }
 
     /// The pickup facts of one ready issue. File overlap is not observed:
     /// while another scheduled task of the repository is unsettled, overlap
-    /// is unknown and the issue waits, so pickup keeps one writer per
-    /// repository.
+    /// is unknown and the issue waits.
     fn candidate(
         &self,
         issue: &Issue,
@@ -392,16 +424,30 @@ fn launch(
     )
 }
 
-/// Whether the task has no open attempt: never launched, or its latest
-/// attempt finished and it did not settle.
+/// Whether the task needs a launch: never launched, its latest attempt
+/// finished and it did not settle, or its latest attempt is open with no
+/// launch recorded (a pass stopped between starting the attempt and
+/// submitting the launch). A recorded launch, even one whose outcome is
+/// unknown, is left to supervision.
 fn awaiting_launch(record: &TaskRecord) -> bool {
-    !matches!(record.state(), TaskState::Settled { .. })
-        && record.attempts().last().is_none_or(|attempt| {
-            !matches!(
-                attempt.state(),
-                AttemptState::Running | AttemptState::Interrupted { .. }
-            )
-        })
+    if matches!(record.state(), TaskState::Settled { .. }) {
+        return false;
+    }
+    let Some(attempt) = record.attempts().last() else {
+        return true;
+    };
+    match attempt.state() {
+        AttemptState::Running | AttemptState::Interrupted { .. } => {
+            !record.effects().iter().any(|effect| {
+                effect.request().attempt() == attempt.number()
+                    && matches!(
+                        effect.request().effect(),
+                        Effect::Worker(Operation::LaunchWorker { .. })
+                    )
+            })
+        }
+        AttemptState::Finished { .. } | AttemptState::Cancelled { .. } => true,
+    }
 }
 
 fn has_label(issue: &Issue, name: &str) -> bool {

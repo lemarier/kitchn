@@ -20,7 +20,8 @@ use kitchen::{
         ReadRequest,
     },
     state::{
-        ConsumerState, HouseStore, MailSender, PostKind, ReportedOutcome, TaskState, WorkerPost,
+        ConsumerState, HouseStore, MailSender, PostKind, ReportedOutcome, StateError, TaskState,
+        WorkerPost,
     },
     workflows::{
         coordination::{Supervision, current_worker},
@@ -361,6 +362,38 @@ impl Kitchen {
         Ok(current_worker(&record).ok_or("no worker")?.worker)
     }
 
+    /// The fence of task `number`'s current claim.
+    fn claim_fence(&self, number: u64) -> TestResult<kitchen::contracts::Fence> {
+        match self.store().task(&self.task(number)?)?.state() {
+            TaskState::Claimed { lease } => Ok(lease.fence()),
+            TaskState::Open | TaskState::Settled { .. } => Err("not claimed".into()),
+        }
+    }
+
+    /// Begin a message effect to task `number`'s worker at `fence`, as a
+    /// process holding that fence would before submitting it.
+    fn message_worker_at(
+        &self,
+        number: u64,
+        fence: kitchen::contracts::Fence,
+    ) -> TestResult<kitchen::Result<kitchen::state::EffectStart>> {
+        let plan = common::plan(
+            &self.task(number)?,
+            fence,
+            "nudge",
+            kitchen::contracts::Operation::MessageWorker {
+                worker: self.worker(number)?,
+                body: Text::new("Status?")?,
+            },
+        )?;
+        Ok(self.store().begin_effect(
+            plan,
+            &self.config.authority()?,
+            &self.backend,
+            self.clock.now(),
+        ))
+    }
+
     /// The consumer state of `pass`.
     fn consumer(&self, pass: Pass) -> TestResult<Option<ConsumerState>> {
         Ok(self
@@ -427,6 +460,190 @@ fn pickup_claims_a_ready_issue_launches_once_and_is_idle_after() -> TestResult {
     ));
     // The lease is released, and the next pass finds the issue claimed.
     assert_eq!(kitchen.consumer(Pass::Pickup)?, Some(ConsumerState::Idle));
+    assert!(matches!(kitchen.pickup(false)?, Outcome::Idle));
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn pickup_launches_one_writer_per_repository_even_with_capacity_for_two() -> TestResult {
+    let mut kitchen = Kitchen::new()?;
+    kitchen.settings.capacity = 2;
+    open_issues(
+        kitchen.forge(),
+        vec![issue_json(7, &["ready"]), issue_json(8, &["ready"])],
+    );
+    ready_issue(kitchen.forge(), 7, ACCEPTANCE);
+    ready_issue(kitchen.forge(), 8, ACCEPTANCE);
+    // Nothing tells whether 7 and 8 touch the same files: one writer only.
+    let actions = acted(kitchen.pickup(false)?)?;
+    assert!(matches!(
+        actions.as_slice(),
+        [PickupAction::Launched { task, .. }] if *task == kitchen.task(7)?
+    ));
+    assert_eq!(kitchen.store().tasks()?.len(), 1);
+    // While 7 is unsettled, 8 waits.
+    assert!(matches!(kitchen.pickup(false)?, Outcome::Idle));
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    // Once 7 settled, the next pass takes 8.
+    let worker = kitchen.worker(7)?;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen.backend.post(vec![report(&worker, "done-7")?])?;
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/kitchen/issue-7"),
+        json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
+    );
+    acted(kitchen.coordinate()?)?;
+    let actions = acted(kitchen.pickup(false)?)?;
+    assert!(matches!(
+        actions.as_slice(),
+        [PickupAction::Launched { task, .. }] if *task == kitchen.task(8)?
+    ));
+    Ok(())
+}
+
+#[test]
+fn pickup_relaunches_one_of_two_waiting_tasks_per_pass() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    open_issues(
+        kitchen.forge(),
+        vec![issue_json(7, &["ready"]), issue_json(8, &["ready"])],
+    );
+    ready_issue(kitchen.forge(), 7, ACCEPTANCE);
+    ready_issue(kitchen.forge(), 8, ACCEPTANCE);
+    // Two tasks were claimed without a launch, as an earlier runner could.
+    let template = kitchen::workflows::run::task_template(
+        &kitchen.config,
+        kitchen::workflows::coordination::MailboxRoute::Backend,
+        kitchen.settings.instructions.provenance.clone(),
+    )?;
+    for number in [7, 8] {
+        kitchen::workflows::pickup::claim_issue(
+            kitchen.store(),
+            &template,
+            &IssueRef {
+                repository: repo()?,
+                number: kitchen::contracts::IssueNumber::new(number)?,
+            },
+            &run_claimant()?,
+            kitchen::contracts::LeaseTtl::new(TASK_LEASE)?,
+            kitchen.clock.now(),
+        )?;
+    }
+    let actions = acted(kitchen.pickup(false)?)?;
+    assert!(matches!(
+        actions.as_slice(),
+        [PickupAction::Launched { .. }]
+    ));
+    // The other waits while the first has an open attempt.
+    assert!(matches!(kitchen.pickup(false)?, Outcome::Idle));
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn an_old_pickup_resuming_after_a_takeover_can_neither_claim_nor_launch() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    // The old pass took its lease and claimed issue 7 under it, then
+    // stalled before launching.
+    let consumer = Pass::Pickup.consumer(&repo()?)?;
+    let old_pass = kitchen.store().acquire_consumer(
+        &consumer,
+        &run_claimant()?,
+        kitchen::contracts::LeaseTtl::new(PASS_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    let old = run_claimant()?.under(consumer.clone(), old_pass.fence());
+    let template = kitchen::workflows::run::task_template(
+        &kitchen.config,
+        kitchen::workflows::coordination::MailboxRoute::Backend,
+        kitchen.settings.instructions.provenance.clone(),
+    )?;
+    let issue = |number| -> TestResult<IssueRef> {
+        Ok(IssueRef {
+            repository: repo()?,
+            number: kitchen::contracts::IssueNumber::new(number)?,
+        })
+    };
+    let ttl = kitchen::contracts::LeaseTtl::new(TASK_LEASE)?;
+    kitchen::workflows::pickup::claim_issue(
+        kitchen.store(),
+        &template,
+        &issue(7)?,
+        &old,
+        ttl,
+        kitchen.clock.now(),
+    )?;
+    let old_fence = kitchen.claim_fence(7)?;
+    kitchen.clock.advance(PASS_LEASE.as_secs() + 1);
+    // The task claim is still live; a takeover moves it and launches once.
+    let actions = acted(kitchen.pickup(true)?)?;
+    assert!(matches!(
+        actions.as_slice(),
+        [PickupAction::Launched { attempt, .. }] if attempt.get() == 1
+    ));
+    assert_ne!(kitchen.claim_fence(7)?, old_fence);
+    // The old process resumes: it can claim nothing new and submit nothing
+    // for the task it held.
+    let effects = kitchen.backend.effects_performed();
+    let claim = kitchen::workflows::pickup::claim_issue(
+        kitchen.store(),
+        &template,
+        &issue(8)?,
+        &old,
+        ttl,
+        kitchen.clock.now(),
+    );
+    assert!(matches!(
+        claim,
+        Err(kitchen::Error::State(StateError::StaleFence { .. }))
+    ));
+    assert!(matches!(
+        kitchen.message_worker_at(7, old_fence)?,
+        Err(kitchen::Error::State(StateError::StaleFence { .. }))
+    ));
+    assert_eq!(kitchen.backend.effects_performed(), effects);
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn pickup_launches_a_task_whose_attempt_started_without_a_launch() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    // An earlier pass claimed issue 7 and started its attempt, then stopped
+    // before submitting the launch.
+    let template = kitchen::workflows::run::task_template(
+        &kitchen.config,
+        kitchen::workflows::coordination::MailboxRoute::Backend,
+        kitchen.settings.instructions.provenance.clone(),
+    )?;
+    kitchen::workflows::pickup::claim_issue(
+        kitchen.store(),
+        &template,
+        &IssueRef {
+            repository: repo()?,
+            number: kitchen::contracts::IssueNumber::new(7)?,
+        },
+        &run_claimant()?,
+        kitchen::contracts::LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    kitchen.store().start_attempt(
+        &kitchen.task(7)?,
+        kitchen.claim_fence(7)?,
+        kitchen.clock.now(),
+    )?;
+    let actions = acted(kitchen.pickup(false)?)?;
+    assert!(matches!(
+        actions.as_slice(),
+        [PickupAction::Launched { .. }]
+    ));
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    // The launch is recorded now: the next pass leaves it to supervision.
     assert!(matches!(kitchen.pickup(false)?, Outcome::Idle));
     assert_eq!(kitchen.backend.launched_agents().len(), 1);
     Ok(())
@@ -743,6 +960,134 @@ fn coordinate_duplicate_start_is_refused_and_an_expired_owner_needs_a_takeover()
         kitchen.coordinate_on(&kitchen.backend, true)?,
         Outcome::Acted(_)
     ));
+    Ok(())
+}
+
+#[test]
+fn coordinate_moves_a_launched_task_off_the_pickup_pass_once() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    acted(kitchen.pickup(false)?)?;
+    let task = kitchen.task(7)?;
+    let launched_at = kitchen.claim_fence(7)?;
+    // The pickup pass ended, so its claim can no longer act.
+    assert!(matches!(
+        kitchen.message_worker_at(7, launched_at)?,
+        Err(kitchen::Error::State(StateError::StaleFence { .. }))
+    ));
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.contains(&CoordinateAction::Moved { task: task.clone() }));
+    assert!(actions.contains(&CoordinateAction::Supervised {
+        task: task.clone(),
+        outcome: Supervision::Running(WorkerState::Starting),
+    }));
+    // Later passes keep the same claim.
+    let owned_at = kitchen.claim_fence(7)?;
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(!actions.contains(&CoordinateAction::Moved { task }));
+    assert_eq!(kitchen.claim_fence(7)?, owned_at);
+    Ok(())
+}
+
+#[test]
+fn coordinate_leaves_a_task_to_a_pickup_pass_still_running() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    // A pickup pass holds its lease and has claimed issue 7 under it.
+    let consumer = Pass::Pickup.consumer(&repo()?)?;
+    let pass = kitchen.store().acquire_consumer(
+        &consumer,
+        &run_claimant()?,
+        kitchen::contracts::LeaseTtl::new(PASS_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    let template = kitchen::workflows::run::task_template(
+        &kitchen.config,
+        kitchen::workflows::coordination::MailboxRoute::Backend,
+        kitchen.settings.instructions.provenance.clone(),
+    )?;
+    kitchen::workflows::pickup::claim_issue(
+        kitchen.store(),
+        &template,
+        &IssueRef {
+            repository: repo()?,
+            number: kitchen::contracts::IssueNumber::new(7)?,
+        },
+        &run_claimant()?.under(consumer, pass.fence()),
+        kitchen::contracts::LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    let claimed_at = kitchen.claim_fence(7)?;
+    assert!(matches!(kitchen.coordinate()?, Outcome::Idle));
+    assert_eq!(kitchen.claim_fence(7)?, claimed_at);
+    Ok(())
+}
+
+#[test]
+fn an_old_coordinator_resuming_after_a_takeover_is_refused() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    acted(kitchen.pickup(false)?)?;
+    acted(kitchen.coordinate()?)?;
+    kitchen
+        .backend
+        .set_worker_state(&kitchen.worker(7)?, WorkerState::Ready);
+    // The old coordination pass holds its lease and the task's claim, then
+    // stalls past its lease while the task claim stays live.
+    let old_fence = kitchen.claim_fence(7)?;
+    let consumer = Pass::Coordinate.consumer(&repo()?)?;
+    let old_pass = kitchen.store().acquire_consumer(
+        &consumer,
+        &run_claimant()?,
+        kitchen::contracts::LeaseTtl::new(PASS_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    kitchen.clock.advance(PASS_LEASE.as_secs() + 1);
+    let actions = acted(kitchen.coordinate_on(&kitchen.backend, true)?)?;
+    let task = kitchen.task(7)?;
+    assert!(actions.contains(&CoordinateAction::Moved { task: task.clone() }));
+    assert!(actions.contains(&CoordinateAction::Supervised {
+        task,
+        outcome: Supervision::Running(WorkerState::Ready),
+    }));
+    let new_fence = kitchen.claim_fence(7)?;
+    assert_ne!(new_fence, old_fence);
+    // The old process resumes: its lease, claim, and effects are refused.
+    let effects = kitchen.backend.effects_performed();
+    assert!(
+        kitchen
+            .store()
+            .renew_consumer(
+                &consumer,
+                old_pass.fence(),
+                kitchen::contracts::LeaseTtl::new(PASS_LEASE)?,
+                kitchen.clock.now(),
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        kitchen.store().renew(
+            &kitchen.task(7)?,
+            old_fence,
+            kitchen::contracts::LeaseTtl::new(TASK_LEASE)?,
+            kitchen.clock.now(),
+        ),
+        Err(kitchen::Error::State(StateError::StaleFence { .. }))
+    ));
+    assert!(matches!(
+        kitchen.message_worker_at(7, old_fence)?,
+        Err(kitchen::Error::State(StateError::StaleFence { .. }))
+    ));
+    assert_eq!(kitchen.backend.effects_performed(), effects);
+    // The new claim continues the same attempt and still acts.
+    assert!(
+        kitchen
+            .store()
+            .continue_attempt(&kitchen.task(7)?, new_fence, kitchen.clock.now())?
+            .is_some_and(|attempt| attempt.get() == 1)
+    );
+    let fresh = kitchen.message_worker_at(7, new_fence)?;
+    assert!(fresh.is_ok(), "{fresh:?}");
     Ok(())
 }
 

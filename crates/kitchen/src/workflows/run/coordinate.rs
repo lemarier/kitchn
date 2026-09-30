@@ -4,7 +4,9 @@
 
 use std::{collections::BTreeMap, fmt, time::Duration};
 
-use super::{Outcome, RunError, TASK_LEASE, held_by_run, issue_of, run_claimant};
+use super::{
+    Outcome, RunError, TASK_LEASE, held_by_run, issue_of, pass_current, run_claimant, transfer,
+};
 use crate::{
     ConsumerId, TaskId,
     contracts::{
@@ -70,6 +72,19 @@ pub enum CoordinateAction {
         /// The task.
         task: TaskId,
     },
+    /// A scheduled task was moved to this pass's claim: from a pickup pass
+    /// that ended, or, after this pass took over an expired lease, from the
+    /// pass it replaced. The earlier claim's fence is stale.
+    Moved {
+        /// The task.
+        task: TaskId,
+    },
+    /// The task changed hands before this pass could move it, or during the
+    /// pass; this pass does not act on it.
+    Lost {
+        /// The task.
+        task: TaskId,
+    },
     /// An expired scheduled task claim was taken over.
     TakenOver {
         /// The task.
@@ -125,6 +140,8 @@ impl fmt::Display for CoordinateAction {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Adopted { task } => write!(formatter, "adopted task {task}"),
+            Self::Moved { task } => write!(formatter, "moved task {task} to this pass"),
+            Self::Lost { task } => write!(formatter, "task {task} changed hands during the pass"),
             Self::TakenOver { task } => write!(formatter, "took over task {task}"),
             Self::Uncertain { task, expired_at } => write!(
                 formatter,
@@ -182,7 +199,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         let claimant = run_claimant()?;
         let now = self.clock.now();
         let ttl = LeaseTtl::new(super::PASS_LEASE)?;
-        let lease = match start_coordinator(
+        let (lease, took_over) = match start_coordinator(
             self.store,
             self.backend.descriptor(),
             &consumer,
@@ -190,11 +207,15 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             ttl,
             now,
         )? {
-            CoordinatorStart::Fresh(lease) | CoordinatorStart::Adopted { lease, .. } => lease,
+            CoordinatorStart::Fresh(lease) | CoordinatorStart::Adopted { lease, .. } => {
+                (lease, false)
+            }
             CoordinatorStart::Busy => return Ok(Outcome::Busy),
-            CoordinatorStart::Uncertain { .. } if self.take_over => self
-                .store
-                .take_over_consumer(&consumer, &claimant, ttl, now)?,
+            CoordinatorStart::Uncertain { .. } if self.take_over => (
+                self.store
+                    .take_over_consumer(&consumer, &claimant, ttl, now)?,
+                true,
+            ),
             CoordinatorStart::Uncertain { expired_at } => {
                 return Ok(Outcome::OwnerUncertain { expired_at });
             }
@@ -205,14 +226,19 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             &consumer,
             fence,
             self.clock,
-            self.pass(&consumer, fence),
+            self.pass(&consumer, fence, took_over),
         )
     }
 
-    fn pass(&self, consumer: &ConsumerId, fence: Fence) -> Result<Vec<CoordinateAction>> {
+    fn pass(
+        &self,
+        consumer: &ConsumerId,
+        fence: Fence,
+        took_over: bool,
+    ) -> Result<Vec<CoordinateAction>> {
         // The mailbox is read even without owned tasks, so a late message
         // from a settled task's worker cannot hold it up.
-        let (mut actions, owned) = self.own()?;
+        let (mut actions, owned) = self.own(took_over)?;
         let descriptor = self.backend.descriptor();
         let route = MailboxRoute::select(descriptor);
         let house_mailbox;
@@ -266,14 +292,20 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         for owned in &owned {
             if !supervised.contains_key(&owned.task) {
                 super::renew(self.store, consumer, fence, self.clock)?;
-                let outcome = supervise(
+                match still_owned(supervise(
                     &ctx,
                     &owned.task,
                     owned.fence,
                     &policy,
                     &SupervisionInput::default(),
-                )?;
-                supervised.insert(owned.task.clone(), outcome);
+                ))? {
+                    Some(outcome) => {
+                        supervised.insert(owned.task.clone(), outcome);
+                    }
+                    None => actions.push(CoordinateAction::Lost {
+                        task: owned.task.clone(),
+                    }),
+                }
             }
         }
         actions.extend(
@@ -286,7 +318,11 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
 
     /// Continue every scheduled pickup task: the runner's live claims,
     /// relinquished tasks (adopted), and with `take_over`, its expired ones.
-    fn own(&self) -> Result<(Vec<CoordinateAction>, Vec<Owned>)> {
+    /// A claim bound to a pickup pass that ended is moved to this pass; one
+    /// whose pickup pass is still current is left to it. After this pass
+    /// `took_over` an expired lease, every live claim is moved, so the
+    /// replaced process holds only stale fences.
+    fn own(&self, took_over: bool) -> Result<(Vec<CoordinateAction>, Vec<Owned>)> {
         let claimant = run_claimant()?;
         let ttl = LeaseTtl::new(TASK_LEASE)?;
         let now = self.clock.now();
@@ -302,8 +338,26 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             if !scheduled {
                 continue;
             }
-            if let Some(fence) = held_by_run(&record, now) {
-                owned.push(Owned { task, fence });
+            if let Some(lease) = held_by_run(&record, now) {
+                let bound = lease.consumer();
+                if let Some(bound) = bound
+                    && pass_current(self.store, bound, now)?
+                {
+                    continue;
+                }
+                if bound.is_none() && !took_over {
+                    owned.push(Owned {
+                        task,
+                        fence: lease.fence(),
+                    });
+                } else if let Some(fence) =
+                    transfer(self.store, &task, lease.fence(), &claimant, now)?
+                {
+                    actions.push(CoordinateAction::Moved { task: task.clone() });
+                    owned.push(Owned { task, fence });
+                } else {
+                    actions.push(CoordinateAction::Lost { task });
+                }
                 continue;
             }
             match record.state() {
@@ -390,7 +444,7 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                         Some(WorkerOutcome::Succeeded) => self.completion(&record, message)?,
                         Some(WorkerOutcome::Failed | WorkerOutcome::Cancelled) | None => None,
                     };
-                    let outcome = supervise(
+                    let Some(outcome) = still_owned(supervise(
                         ctx,
                         &owned.task,
                         owned.fence,
@@ -399,7 +453,14 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                             completion: completion.as_ref(),
                             ..SupervisionInput::default()
                         },
-                    )?;
+                    ))?
+                    else {
+                        handled = false;
+                        actions.push(CoordinateAction::Lost {
+                            task: owned.task.clone(),
+                        });
+                        continue;
+                    };
                     handled &= ends_attempt(&outcome);
                     supervised.insert(owned.task.clone(), outcome);
                 }
@@ -456,6 +517,16 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             },
             addressed: Vec::new(),
         }))
+    }
+}
+
+/// A supervision step's outcome, or `None` when the task's fence went stale
+/// because another pass moved the task during this one.
+fn still_owned(step: Result<Supervision>) -> Result<Option<Supervision>> {
+    match step {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(crate::Error::State(StateError::StaleFence { .. })) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 

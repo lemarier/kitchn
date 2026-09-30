@@ -144,7 +144,8 @@ struct PickupArgs {
     /// The label that reserves an issue for a person.
     #[arg(long, default_value = "human-only")]
     human_label: String,
-    /// Most unsettled scheduled pickup tasks in the repository.
+    /// Most unsettled scheduled pickup tasks in the repository. A pass still
+    /// launches at most one writer, since file overlap is not observed.
     #[arg(long, default_value_t = 1)]
     capacity: u32,
     /// Workers create `<prefix>/issue-<number>`.

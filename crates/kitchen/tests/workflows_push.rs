@@ -19,7 +19,9 @@ use kitchen::{
     },
     state::StateError,
     workflows::{
-        coordination::{LaunchOutcome, Standing, launch_worker},
+        coordination::{
+            LaunchOutcome, Standing, Supervision, SupervisionInput, launch_worker, supervise,
+        },
         interactive::ForgeWriter,
         pickup::{Base, ClaimOutcome, TaskTemplate, WorkerBrief, claim_issue, issue_task_id},
         push::{
@@ -31,7 +33,7 @@ use kitchen::{
         repair::{Mergeability, Observed, PullRequestState, PullRequestView},
     },
 };
-use workflows_support::{World, branch, brief, issue, template, under_consumer};
+use workflows_support::{World, branch, brief, issue, supervision, template, under_consumer};
 
 fn number(value: u64) -> TestResult<IssueNumber> {
     Ok(IssueNumber::new(value)?)
@@ -185,6 +187,63 @@ fn delivery_requires_a_running_attempt_and_positive_live_worker_observation() ->
         delivery_worker_live(&interrupted, &setup.world.backend),
         Err(kitchen::integrations::github::IntegrationError::AttemptNotRunning)
     );
+    Ok(())
+}
+
+#[test]
+fn transferred_worker_pushes_only_after_coordination_observes_it_live() -> TestResult {
+    let mut setup = pushing()?;
+    let record = setup.world.fixture.store.task(&setup.task)?;
+    let worker =
+        kitchen::workflows::coordination::current_worker(&record).ok_or("no launched worker")?;
+    setup
+        .world
+        .fixture
+        .store
+        .relinquish(&setup.task, setup.fence, setup.world.now())?;
+    let claimant = common::scheduled("replacement")?;
+    setup.fence = setup
+        .world
+        .fixture
+        .store
+        .claim(&setup.task, &claimant, ttl(300)?, setup.world.now())?
+        .fence();
+    let head = commit('d')?;
+    let intent = update_intent(Some(head.clone()))?;
+    let next = commit('e')?;
+    let reads = Reads::new(open(5)?, Observed::Known(Some(head.clone())));
+    let updater = Recorder::answering(Ok(()));
+    let push = || boundary(&setup, &reads, &updater).push(&setup.task, setup.fence, &intent, &next);
+    assert!(matches!(
+        push(),
+        Err(kitchen::Error::Integration(
+            kitchen::integrations::github::IntegrationError::AttemptNotRunning
+        ))
+    ));
+    assert!(updater.calls.borrow().is_empty());
+    setup
+        .world
+        .backend
+        .set_worker_state(&worker.worker, WorkerState::Ready);
+    assert_eq!(
+        supervise(
+            &setup.world.ctx(),
+            &setup.task,
+            setup.fence,
+            &supervision()?,
+            &SupervisionInput::default(),
+        )?,
+        Supervision::Running(WorkerState::Ready)
+    );
+    assert_eq!(
+        delivery_worker_live(
+            &setup.world.fixture.store.task(&setup.task)?,
+            &setup.world.backend
+        ),
+        Ok(())
+    );
+    assert!(matches!(push()?, PushOutcome::Pushed { .. }));
+    assert_eq!(updater.calls.borrow().len(), 1);
     Ok(())
 }
 

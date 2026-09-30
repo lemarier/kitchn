@@ -712,6 +712,14 @@ pub(crate) fn bind(
     if held_branches(&record).contains(&branch) {
         return Ok((record, Err(PushRefusal::BranchHeld)));
     }
+    let worker = current_worker(&record).ok_or(IntegrationError::AttemptNotRunning)?;
+    let attempt = record
+        .attempts()
+        .last()
+        .ok_or(IntegrationError::AttemptNotRunning)?;
+    if attempt.number() != worker.attempt || attempt.state() != AttemptState::Running {
+        return Err(IntegrationError::AttemptNotRunning.into());
+    }
     let binding = Binding {
         stacked: BranchFact::Stacked.holds(&record, &branch),
         published: BranchFact::Published.holds(&record, &branch),

@@ -27,7 +27,8 @@ a readable origin remote whose repository matches the binding; a mismatched
 push URL, an unbound checkout, or an ambiguous selection is refused. Pass
 `--house` explicitly outside a bound checkout. Explicit flags take precedence.
 
-An omitted `--store` uses `<registry>/private/<house>/store`. The store stays
+For commands that consume the store, an omitted `--store` uses
+`<registry>/private/<house>/store`. The store stays
 house scoped even when several repositories bind to one house. It must already
 exist; pass `--store` for a different initialized store. `tick`, `run`, and
 `gate` use the house's only repository when there is one. In a house with
@@ -97,7 +98,7 @@ Adopt a repository by recording its binding in the registry. Writes nothing into
 the repository.
 
 ```sh
-kitchn house setup --house <id> --workflows <list|none> [--repository <owner/name>]
+kitchn house setup --house <id> [--workflows <list|none>] [--repository <owner/name>]
 ```
 
 | Option | Description |
@@ -144,7 +145,7 @@ limit or more, before new work is refused.
 Preview, then create or add files from a house template.
 
 ```sh
-kitchn init <dir> --house <id> --repository <owner/name> --template <name> [options]
+kitchn init <dir> [--house <id>] [--repository <owner/name>] --template <name> [options]
 kitchn adopt <dir> --template <name> [options]
 ```
 

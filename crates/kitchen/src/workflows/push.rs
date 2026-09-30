@@ -197,6 +197,40 @@ pub fn open_task_pull_request(
         &[Permission::PushBranch, Permission::OpenPullRequest],
     )?;
     let binding = binding.map_err(|_| CoordinationError::BranchMismatch)?;
+    if let Some(reference) = record.effects().iter().rev().find_map(|effect| {
+        if let EffectState::Applied { receipt, .. } = effect.state()
+            && let Effect::GitHub(github) = effect.request().effect()
+            && let GitHubAction::OpenPullRequest { head, .. } = &github.mutation.action
+            && github.mutation.repository == binding.repository
+            && *head == binding.branch
+        {
+            Some(receipt.reference())
+        } else {
+            None
+        }
+    }) {
+        let prefix = format!("https://github.com/{}/pull/", binding.repository);
+        let Some(number) = reference
+            .as_str()
+            .strip_prefix(&prefix)
+            .and_then(|value| value.parse::<u64>().ok())
+            .and_then(|value| IssueNumber::new(value).ok())
+        else {
+            return Ok(OpenOutcome::Uncertain);
+        };
+        return Ok(match reads.pull_request(number) {
+            Observed::Known(Some(view))
+                if view.state == PullRequestState::Open
+                    && view.number == number
+                    && view.head_branch == binding.branch.as_str()
+                    && view.head == head =>
+            {
+                store.link_pull_request(&task, fence, number)?;
+                OpenOutcome::Opened(number)
+            }
+            _ => OpenOutcome::Uncertain,
+        });
+    }
     let mut digest = Sha256::new();
     for part in [binding.branch.as_str(), head.as_str()] {
         digest.update(part.len().to_be_bytes());
@@ -1192,7 +1226,7 @@ impl GitRemote {
                 // A rewrite is named first: it redirects even a verified URL.
                 let offending = entries
                     .iter()
-                    .find(|(key, _)| key.starts_with("url."))
+                    .find(|(key, _)| key.starts_with("url.") || key.starts_with("http."))
                     .or_else(|| {
                         entries
                             .iter()
@@ -1207,7 +1241,7 @@ impl GitRemote {
 
 /// Keys that decide where Git sends a push: URL rewrites and remote URLs.
 /// Git matches this against keys with the section and variable in lowercase.
-const REDIRECT_KEYS: &str = r"^(url\..*\.(insteadof|pushinsteadof)|remote\..*\.(url|pushurl))$";
+const REDIRECT_KEYS: &str = r"^(url\..*\.(insteadof|pushinsteadof)|remote\..*\.(url|pushurl)|http\..*\.(proxy|extraheader|sslverify|sslcainfo|sslcapath|sslbackend|followredirects))$";
 
 /// A Git configuration key read from a checkout, such as
 /// `url.https://example.com/.insteadof`, with its section and variable in
@@ -1423,6 +1457,9 @@ pub(crate) fn pinned_git_config(remote: &str) -> Vec<(String, String)> {
         ("push.recurseSubmodules".to_owned(), "no".to_owned()),
         ("push.followTags".to_owned(), "false".to_owned()),
         ("submodule.recurse".to_owned(), "false".to_owned()),
+        ("http.proxy".to_owned(), String::new()),
+        ("http.extraHeader".to_owned(), String::new()),
+        ("http.sslVerify".to_owned(), "true".to_owned()),
     ]
     .into()
 }
@@ -1523,8 +1560,25 @@ impl RemoteBranches for GitRemote {
 
     fn head(&self, branch: &BranchName) -> Observed<Option<CommitId>> {
         let reference = format!("refs/heads/{branch}");
-        let destination = self.transport_url.as_deref().unwrap_or(&self.remote);
-        let Some((Some(0), stdout)) = self.run(&["ls-remote", destination, &reference]) else {
+        let urls = if self.transport_url.is_none() {
+            self.urls(false)
+        } else {
+            None
+        };
+        let destination = self.transport_url.as_deref().or_else(|| {
+            urls.as_ref()
+                .and_then(|urls| urls.first())
+                .map(String::as_str)
+        });
+        let Some(destination) = destination else {
+            return Observed::Unknown;
+        };
+        let Some(snapshot) = self.push_snapshot() else {
+            return Observed::Unknown;
+        };
+        let Some((Some(0), stdout)) =
+            self.run_in(snapshot.path(), &["ls-remote", destination, &reference])
+        else {
             return Observed::Unknown;
         };
         let Ok(stdout) = String::from_utf8(stdout) else {

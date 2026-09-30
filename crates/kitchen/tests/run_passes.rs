@@ -1093,6 +1093,8 @@ fn coordinate_holds_a_successful_report_until_a_pr_is_linked() -> TestResult {
         kitchen.store().task(&task)?.state(),
         TaskState::Claimed { .. }
     ));
+    use kitchen::contracts::CoordinatorMailbox;
+    assert_eq!(kitchen.backend.next_delivery(), Ok(None));
     kitchen
         .store()
         .link_pull_request(&task, kitchen.claim_fence(7)?, pr(12)?)?;
@@ -1101,6 +1103,69 @@ fn coordinate_holds_a_successful_report_until_a_pr_is_linked() -> TestResult {
         task,
         outcome: Supervision::Settled(Settlement::Succeeded),
     }));
+    Ok(())
+}
+
+#[test]
+fn a_delivery_hold_acknowledges_the_batch_and_escalates_once() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.launch_and_finish_unlinked()?;
+    delivery_comparison(&kitchen, 1)?;
+    acted(kitchen.coordinate()?)?;
+    // Another launched task can ask a question while the first awaits delivery.
+    let template = kitchen::workflows::run::task_template(
+        &kitchen.config,
+        kitchen::workflows::coordination::MailboxRoute::Backend,
+        kitchen.settings.instructions.provenance.clone(),
+    )?;
+    let claimed = kitchen::workflows::pickup::claim_issue(
+        kitchen.store(),
+        &template,
+        &IssueRef {
+            repository: repo()?,
+            number: pr(8)?,
+        },
+        &run_claimant()?,
+        LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    assert!(matches!(
+        claimed,
+        kitchen::workflows::pickup::ClaimOutcome::Claimed(_)
+    ));
+    let (_, launched) = old_process_calls(&kitchen, 8, kitchen.claim_fence(8)?)?;
+    assert!(matches!(
+        launched?,
+        kitchen::workflows::coordination::LaunchOutcome::Accepted { .. }
+    ));
+    let question = ExternalRef::new("question-8")?;
+    kitchen.backend.post(vec![MailMessage {
+        id: question.clone(),
+        kind: MessageKind::Question,
+        worker: Some(kitchen.worker(8)?),
+        outcome: None,
+        subject: None,
+        body: Some(Text::new("Which bus?")?),
+        checkout: CheckoutReport::default(),
+    }])?;
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.contains(&CoordinateAction::Question {
+        task: kitchen.task(8)?,
+        message: question
+    }));
+    kitchen.clock.advance(60 * 60 + 1);
+    acted(kitchen.coordinate_on(&kitchen.backend, true)?)?;
+    let questions = kitchen.store().open_questions(8)?;
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].task, kitchen.task(7)?);
+    assert!(
+        questions[0]
+            .body
+            .as_str()
+            .contains("no pull request is linked")
+    );
+    acted(kitchen.coordinate()?)?;
+    assert_eq!(kitchen.store().open_questions(8)?.len(), 1);
     Ok(())
 }
 

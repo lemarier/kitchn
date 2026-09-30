@@ -2,23 +2,30 @@
 //! worker deliveries on the backend's mailbox route, and supervise each task
 //! once.
 
-use std::{cell::Cell, collections::BTreeMap, fmt, time::Duration};
+use std::{
+    cell::Cell, collections::BTreeMap, fmt, fmt::Write as _, num::NonZeroU32, time::Duration,
+};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{
     Outcome, RunError, TASK_LEASE, held_by_run, pass_current, run_claimant, scheduled_writer,
     transfer,
 };
 use crate::{
-    ConsumerId, TaskId,
+    ConsumerId, TaskId, WorkflowId,
     contracts::{
-        Capability, Clock, CoordinatorMailbox, Delivery, Effect, Evidence, EvidenceKind,
-        EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, LeaseTtl, MailMessage, MessageKind,
-        Operation, ResourceRef, Timestamp, WorkerOutcome,
+        AttemptNumber, Capability, CheckoutReport, Clock, CoordinatorMailbox, Delivery, Effect,
+        Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, LeaseTtl,
+        MailMessage, MessageKind, Operation, ResourceRef, Text, Timestamp, WorkerOutcome,
     },
     house::HouseConfig,
     integrations::github::{GitHubClient, GitHubReadTransport, IntegrationError, Observation},
     state::{
-        HouseMailbox, HouseStore, OwnershipEvent, StateError, TaskRecord, TaskState, reconcile,
+        HouseMailbox, HouseStore, MailSender, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject,
+        OwnershipEvent, PostKind, StateError, TaskRecord, TaskState, WorkItem, WorkerPost,
+        reconcile,
     },
     workflows::{
         coordination::{
@@ -44,6 +51,30 @@ const QUESTION_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
 /// How long a worker may sit idle at its prompt before it counts as stalled.
 const IDLE_DEADLINE: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HeldDelivery {
+    message: ExternalRef,
+    attempt: AttemptNumber,
+    checkout: CheckoutReport,
+    escalated: bool,
+}
+
+fn hold_workflow() -> Result<WorkflowId> {
+    Ok(WorkflowId::new("delivery-hold")?)
+}
+
+fn hold_schema() -> Result<MarkerSchema> {
+    Ok(MarkerSchema::new("delivery-hold", NonZeroU32::MIN)?)
+}
+
+fn hold_key(task: &TaskId, message: &ExternalRef) -> Result<MarkerKey> {
+    Ok(MarkerKey {
+        workflow: hold_workflow()?,
+        item: WorkItem::Task { task: task.clone() },
+        subject: MarkerSubject::Observation(message.clone()),
+    })
+}
 
 /// The coordination consumer: one per house.
 pub(super) fn consumer() -> Result<ConsumerId> {
@@ -388,6 +419,10 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         for owned in &owned {
             if !supervised.contains_key(&owned.task) {
                 super::renew(self.store, consumer, fence, self.tick, self.clock)?;
+                if let Some(outcome) = self.resume_delivery(&ctx, &policy, owned)? {
+                    supervised.insert(owned.task.clone(), outcome);
+                    continue;
+                }
                 match still_owned(supervise(
                     &ctx,
                     &owned.task,
@@ -566,11 +601,31 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                         && record.pull_request().is_none()
                         && self.branch_has_commits(&record)?
                     {
-                        handled = false;
+                        let key = hold_key(&owned.task, &message.id)?;
+                        let fact = MarkerFact::workflow(
+                            hold_schema()?,
+                            &HeldDelivery {
+                                message: message.id.clone(),
+                                attempt: current_worker(&record)
+                                    .ok_or(IntegrationError::Unknown)?
+                                    .attempt,
+                                checkout: message.checkout,
+                                escalated: false,
+                            },
+                        )?;
+                        self.store.record_task_marker_unless(
+                            key,
+                            fact,
+                            &owned.task,
+                            owned.fence,
+                            self.clock.now(),
+                            |_| Ok(None::<()>),
+                        )?;
                         actions.push(CoordinateAction::AwaitingDelivery {
                             task: owned.task.clone(),
                             message: message.id.clone(),
                         });
+                        supervised.insert(owned.task.clone(), Supervision::AwaitingLaunch);
                         continue;
                     }
                     let completion = match message.outcome {
@@ -601,6 +656,92 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             }
         }
         Ok(handled.then_some(dropped))
+    }
+
+    /// Resume a report saved before acknowledging its mailbox batch.
+    fn resume_delivery(
+        &self,
+        ctx: &Context<'_>,
+        policy: &SupervisionPolicy,
+        owned: &Owned,
+    ) -> Result<Option<Supervision>> {
+        let record = self.store.task(&owned.task)?;
+        let marker = self
+            .store
+            .markers(&hold_workflow()?)?
+            .into_iter()
+            .rev()
+            .find(|marker| {
+                marker.key().item
+                    == WorkItem::Task {
+                        task: owned.task.clone(),
+                    }
+            });
+        let Some(marker) = marker else {
+            return Ok(None);
+        };
+        let mut held: HeldDelivery = marker.fact().decode(&hold_schema()?)?;
+        if current_worker(&record).is_none_or(|worker| worker.attempt != held.attempt) {
+            return Ok(None);
+        }
+        if record.pull_request().is_some() {
+            let message = MailMessage {
+                id: held.message,
+                kind: MessageKind::WorkerDone,
+                worker: None,
+                outcome: Some(WorkerOutcome::Succeeded),
+                subject: None,
+                body: None,
+                checkout: held.checkout,
+            };
+            let completion = self.completion(&record, &message)?;
+            return still_owned(supervise(
+                ctx,
+                &owned.task,
+                owned.fence,
+                policy,
+                &SupervisionInput {
+                    completion: completion.as_ref(),
+                    ..SupervisionInput::default()
+                },
+            ));
+        }
+        if !held.escalated
+            && self.clock.now().saturating_since(marker.recorded_at()) >= IDLE_DEADLINE
+        {
+            let digest = Sha256::digest(held.message.as_str().as_bytes());
+            let mut subject_text = String::from("Delivery overdue: ");
+            for byte in digest.iter().take(16) {
+                let _ = write!(subject_text, "{byte:02x}");
+            }
+            let subject = Text::new(&subject_text)?;
+            let exists = self.store.open_questions(512)?.iter().any(|question| {
+                question.task == owned.task && question.subject.as_ref() == Some(&subject)
+            });
+            if !exists {
+                self.store
+                    .continue_attempt(&owned.task, owned.fence, self.clock.now())?;
+                self.store.post_mail(
+                    &MailSender { task: owned.task.clone(), fence: owned.fence },
+                    WorkerPost {
+                        kind: PostKind::Question,
+                        subject: Some(subject),
+                        body: Text::new("Worker report is held because the pushed branch has commits but no pull request is linked. Check delivery or decide how to finish the task.")?,
+                    },
+                    self.clock.now(),
+                )?;
+            }
+            held.escalated = true;
+            self.store.supersede_task_marker(
+                marker.key(),
+                marker.fact(),
+                MarkerFact::workflow(hold_schema()?, &held)?,
+                &owned.task,
+                owned.fence,
+                self.clock.now(),
+            )?;
+        }
+        Ok(Some(Supervision::AwaitingLaunch))
     }
 
     /// Where `message` belongs: the owned task whose current worker sent

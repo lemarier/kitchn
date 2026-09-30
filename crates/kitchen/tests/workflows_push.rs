@@ -237,6 +237,67 @@ fn a_worker_opens_one_pr_and_retry_reuses_the_durable_effect() -> TestResult {
 }
 
 #[test]
+fn an_applied_open_survives_failed_readback_and_a_new_head() -> TestResult {
+    let mut grants = push_grant_list()?;
+    grants.push(Grant::house(
+        Permission::OpenPullRequest,
+        github()?,
+        common::credential()?,
+    ));
+    let setup = pushing_with(&house_grants_of(&grants)?, grants)?;
+    let forge = OpeningForge::new()?;
+    let first_reads = Reads::new(Observed::Unknown, Observed::Known(Some(commit('d')?)));
+    let base = branch("main")?;
+    let title = Text::new("feat: driver")?;
+    let body = Text::new("Closes #5")?;
+    let request = |head, reads| OpenRequest {
+        task: setup.task.clone(),
+        fence: setup.fence,
+        head,
+        base: base.clone(),
+        title: title.clone(),
+        body: body.clone(),
+        reads,
+    };
+    assert_eq!(
+        open_task_pull_request(
+            &setup.world.fixture.store,
+            &setup.world.grants,
+            &setup.github,
+            &setup.world.clock,
+            &forge,
+            &Standing,
+            request(commit('d')?, &first_reads),
+        )?,
+        OpenOutcome::Uncertain,
+    );
+    let mut updated = view(7, PullRequestState::Open, "lemarier/issue-5")?;
+    updated.head = commit('e')?;
+    let second_reads = Reads::new(
+        Observed::Known(Some(updated)),
+        Observed::Known(Some(commit('e')?)),
+    );
+    assert_eq!(
+        open_task_pull_request(
+            &setup.world.fixture.store,
+            &setup.world.grants,
+            &setup.github,
+            &setup.world.clock,
+            &forge,
+            &Standing,
+            request(commit('e')?, &second_reads),
+        )?,
+        OpenOutcome::Opened(number(7)?),
+    );
+    assert_eq!(forge.calls.get(), 1);
+    assert_eq!(
+        setup.world.fixture.store.task(&setup.task)?.pull_request(),
+        Some(number(7)?)
+    );
+    Ok(())
+}
+
+#[test]
 fn an_applied_open_receipt_cannot_link_a_now_closed_pr() -> TestResult {
     let mut grants = push_grant_list()?;
     grants.push(Grant::house(
@@ -1193,6 +1254,77 @@ mod git_remote {
         .with_url_bases(&[&url_base(repos)?])?)
     }
 
+    #[test]
+    fn checkout_http_settings_do_not_reach_remote_head_read() -> TestResult {
+        let repos = fresh_repos()?;
+        git(
+            &repos.worker,
+            &["config", "http.proxy", "http://untrusted.invalid:8080"],
+        )?;
+        git(
+            &repos.worker,
+            &["config", "http.extraHeader", "Authorization: attacker"],
+        )?;
+        let trace = repos.dir.path().join("read-trace");
+        let wrapper = repos.dir.path().join("git-wrapper");
+        let trace_path = text(&trace)?.replace('\'', "'\\''");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = ls-remote ]; then\n pwd > '{trace_path}'\n git config --get http.proxy >> '{trace_path}' || true\n git config --get-all http.extraHeader >> '{trace_path}' || true\nfi\nexec {GIT} \"$@\"\n"
+            ),
+        )?;
+        let mut permissions = fs::metadata(&wrapper)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&wrapper, permissions)?;
+        let remote = GitRemote::new(
+            wrapper,
+            repos.worker.clone(),
+            "origin",
+            workflows_support::isolated_config(repos.dir.path(), &[])?,
+            Duration::from_secs(30),
+        )?
+        .with_url_bases(&[&url_base(&repos)?])?;
+        assert_eq!(remote.head(&branch(BRANCH)?), Observed::Known(None));
+        let observed = fs::read_to_string(trace)?;
+        assert!(!observed.contains("untrusted.invalid"), "{observed}");
+        assert!(!observed.contains("attacker"), "{observed}");
+        assert!(!observed.contains(text(&repos.worker)?), "{observed}");
+        Ok(())
+    }
+
+    #[test]
+    fn url_scoped_http_settings_refuse_a_push() -> TestResult {
+        let repos = fresh_repos()?;
+        let mine = commit_in(&repos.worker, "mine")?;
+        git(
+            &repos.worker,
+            &[
+                "config",
+                "http.https://github.com/.extraHeader",
+                "Authorization: attacker",
+            ],
+        )?;
+        let remote = remote_for(&repos)?;
+        let outcome = push_with(
+            &pushing()?,
+            Observed::Unknown,
+            &remote,
+            &remote,
+            &first_intent()?,
+            &mine,
+        )?;
+        assert!(
+            matches!(
+                outcome,
+                PushOutcome::Refused(PushRefusal::CheckoutRedirect(_))
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(remote_head(&repos, BRANCH)?, None);
+        Ok(())
+    }
+
     /// Reads the remote head, then lets something happen before answering:
     /// the window between the check and the update.
     struct ChangesAfterRead<'a> {
@@ -2124,8 +2256,8 @@ mod git_remote {
         Ok(())
     }
 
-    /// Without its own push repository Kitchen sends nothing, and says the
-    /// outcome is unknown rather than stale or pushed.
+    /// Without its own push repository Kitchen cannot verify the remote
+    /// head, so it refuses before sending anything.
     #[test]
     fn git_sends_nothing_when_its_push_repository_cannot_be_made() -> TestResult {
         let repos = fresh_repos()?;
@@ -2152,7 +2284,7 @@ mod git_remote {
             &first_intent()?,
             &mine,
         )?;
-        assert_eq!(outcome, PushOutcome::Uncertain);
+        assert_eq!(outcome, PushOutcome::Refused(PushRefusal::Unknown));
         assert_eq!(remote_head(&repos, BRANCH)?, None);
         Ok(())
     }

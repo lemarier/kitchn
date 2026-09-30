@@ -5,9 +5,11 @@
 //! The forge supplies most of the evidence. The rest, the independent
 //! review, acceptance, hardware, and risk facts, comes from the
 //! attestation recorded for exactly the pull request's head and base
-//! ([`super::gate_attestation`]); without one, or with one whose reviewer
-//! wrote the branch, the pull request is only reported. A merge also needs
-//! the house's readiness-checked [`MergeGrant`] for that exact subject.
+//! ([`super::gate_attestation`]). The attestation counts only when the
+//! house's forge shows the review it names approved on that head by the
+//! claimed login, and that login did not write the branch; otherwise the
+//! pull request is only reported. A merge also needs the house's
+//! readiness-checked [`MergeGrant`] for that exact subject.
 //!
 //! Only a pull request whose verdict, evaluated without history, is a
 //! merge is recorded. It gets a gate task, claimed under this pass's lease,
@@ -26,14 +28,15 @@ use super::{
     KitchenPullRequest, Outcome, Pass, Refusal, RunError, attestation, gate_attestation,
     kitchen_pull_requests, repair_of, take_for_pass,
 };
+use crate::workflows::known;
 use crate::workflows::tick::PassRun;
 use crate::{
     BackendId, TaskId,
     contracts::{
         AttemptStart, CapabilityRequirements, Claimant, Clock, CommitId, EffectExecutor,
-        EffectFailure, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, Fence,
-        IdempotencyKey, IssueNumber, NotAppliedReason, Provenance, Repository, RetryPolicy, Role,
-        TaskAuthority, TaskSpec,
+        EffectFailure, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef,
+        Fence, IdempotencyKey, IssueNumber, NotAppliedReason, Provenance, Repository, RetryPolicy,
+        Role, TaskAuthority, TaskSpec,
     },
     house::{HouseConfig, HouseError, MergeSubject},
     integrations::github::{
@@ -92,6 +95,9 @@ pub enum ReportReason {
     /// The attestation's reviewer wrote the branch, or the forge does not
     /// name the pull request's author.
     NotIndependent,
+    /// The forge does not show the attestation's review: none with its id,
+    /// or not by the claimed login, not approved, or not on this head.
+    ReviewUnverified,
     /// The house has no standing merge grant for the repository on the
     /// forge.
     NoMergeGrant,
@@ -280,15 +286,34 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             .user
             .as_ref()
             .map(|user| user.login.as_str());
-        let writers = attestation::branch_writers(tasks, &found.branch);
-        if !attestation::independent(&attested.reviewer, author, &writers) {
+        let writers = attestation::BranchWriters::of(tasks, self.repository, number, &found.branch);
+        if !attestation::independent(
+            &attested.forge_review.reviewer,
+            author,
+            self.authors,
+            &writers,
+        ) {
             return Ok(report(
                 &evidence,
                 GateGrants::default(),
                 ReportReason::NotIndependent,
             ));
         }
-        attest(&mut evidence, &attested);
+        // The record proves nothing by itself: the forge must show the
+        // review it names, by that login, approved at this exact head.
+        let reviews = known(
+            self.forge
+                .reviews(self.store.house(), self.repository, number),
+        )?;
+        if !attestation::review_verified(&reviews, &attested.forge_review, &evidence.head) {
+            return Ok(report(
+                &evidence,
+                GateGrants::default(),
+                ReportReason::ReviewUnverified,
+            ));
+        }
+        let source = review_source(&attested.forge_review)?;
+        attest(&mut evidence, &attested, source.clone());
         let subject = MergeSubject {
             repository: self.repository.clone(),
             number,
@@ -379,7 +404,7 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             &evidence,
             grants,
             &merge,
-            &attested.source,
+            &source,
         );
         // The task goes back unless it settled, so the next pass adopts it
         // and reconciles anything left unresolved.
@@ -408,7 +433,7 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
         evidence: &GateEvidence,
         grants: GateGrants,
         merge: &MergeGrant,
-        source: &crate::contracts::ExternalRef,
+        source: &ExternalRef,
     ) -> Result<(Verdict, Merge)> {
         let (task, fence) = (owned.task, owned.fence);
         let now = self.clock.now();
@@ -630,9 +655,9 @@ enum Merge {
 
 /// The attested facts, applied to forge evidence of the same subject. The
 /// reviewer's independence was checked by the caller.
-fn attest(evidence: &mut GateEvidence, attested: &super::GateAttestation) {
+fn attest(evidence: &mut GateEvidence, attested: &super::GateAttestation, source: ExternalRef) {
     evidence.semantic_review = attested.review.clone();
-    evidence.semantic_source = Some(attested.source.clone());
+    evidence.semantic_source = Some(source);
     evidence.semantic_head = Some(attested.head.clone());
     evidence.semantic_base = Some(attested.base.clone());
     evidence.semantic_read_only = attested.read_only;
@@ -641,6 +666,15 @@ fn attest(evidence: &mut GateEvidence, attested: &super::GateAttestation) {
     evidence.hardware_complete = Some(attested.hardware_complete);
     evidence.risk_classes = Some(attested.risk_classes.clone());
     evidence.supporting_subject = Some((attested.head.clone(), attested.base.clone()));
+}
+
+/// Where the attestation's forge review is read: the pull request review
+/// with its id.
+fn review_source(review: &super::ForgeReview) -> Result<ExternalRef> {
+    Ok(ExternalRef::new(&format!(
+        "pull-request-review-{}",
+        review.id
+    ))?)
 }
 
 /// A gate store failure as the pass's error.

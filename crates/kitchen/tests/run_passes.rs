@@ -35,9 +35,9 @@ use kitchen::{
         pickup::{IssueRef, PinnedInstructions, issue_task_id},
         repair::{HandOver, RepairDecision, Skip},
         run::{
-            CoordinateAction, CoordinatePass, GateAction, GateAttestation, GatePass, GateResult,
-            NotMerged, Outcome, PASS_LEASE, Pass, PickupAction, PickupLabels, PickupPass,
-            PickupSettings, RepairAction, RepairPass, RepairSettings, ReportReason, Reviewer,
+            CoordinateAction, CoordinatePass, ForgeReview, GateAction, GateAttestation, GatePass,
+            GateResult, NotMerged, Outcome, PASS_LEASE, Pass, PickupAction, PickupLabels,
+            PickupPass, PickupSettings, RepairAction, RepairPass, RepairSettings, ReportReason,
             RunError, TASK_LEASE, TickPasses, Unroutable, Wait, pass_repository,
             record_gate_attestation, run_claimant,
         },
@@ -2106,16 +2106,19 @@ fn with_merge_grant(mut config: HouseConfig) -> TestResult<HouseConfig> {
     Ok(config)
 }
 
-/// An attestation of pull request 12 at `head` on base `e` by `reviewer`.
-fn attestation(head: char, reviewer: Reviewer) -> TestResult<GateAttestation> {
+/// An attestation of pull request 12 at `head` on base `e`, resting on
+/// forge review `id` by `reviewer`.
+fn attestation(head: char, reviewer: &str, id: u64) -> TestResult<GateAttestation> {
     Ok(GateAttestation {
         house: house()?,
         repository: repo()?,
         pull_request: pr(12)?,
         head: commit(head)?,
         base: commit('e')?,
-        reviewer,
-        source: ExternalRef::new("https://github.com/origin89hq/firmware/pull/12#review-1")?,
+        forge_review: ForgeReview {
+            id: std::num::NonZeroU64::new(id).ok_or("review id")?,
+            reviewer: reviewer.to_owned(),
+        },
         review: kitchen::workflows::gate::SemanticReview::Clean,
         read_only: true,
         acceptance_met: true,
@@ -2124,17 +2127,11 @@ fn attestation(head: char, reviewer: Reviewer) -> TestResult<GateAttestation> {
     })
 }
 
-fn person(login: &str) -> Reviewer {
-    Reviewer::Person {
-        login: login.to_owned(),
-    }
-}
-
 /// Record an independent reviewer's attestation of pull request 12 at `head`.
 fn attest(kitchen: &Kitchen, head: char) -> TestResult {
     record_gate_attestation(
         kitchen.store(),
-        &attestation(head, person("safety-reviewer"))?,
+        &attestation(head, "safety-reviewer", 11)?,
         "kitchen-bot",
         &BranchName::new("kitchen/issue-7")?,
         &common::scheduled("reviewer")?,
@@ -2297,21 +2294,23 @@ fn gate_attestations_must_be_independent_and_are_never_rewritten() -> TestResult
             kitchen.clock.now(),
         )
     };
-    // The branch's own worker and the pull request's author are refused.
-    let writer = Reviewer::Worker {
-        worker: kitchen.worker(7)?,
-    };
+    // The branch's own worker and the pull request's author are refused
+    // as reviewers.
+    let worker = kitchen.worker(7)?;
     assert!(matches!(
-        record(&attestation('d', writer)?, "kitchen-bot"),
+        record(
+            &attestation('d', worker.handle.as_str(), 11)?,
+            "kitchen-bot"
+        ),
         Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
     ));
     assert!(matches!(
-        record(&attestation('d', person("Kitchen-Bot"))?, "kitchen-bot"),
+        record(&attestation('d', "Kitchen-Bot", 11)?, "kitchen-bot"),
         Err(kitchen::Error::Run(RunError::AttestationNotIndependent))
     ));
     // A reviewer who claimed another author is caught when the gate reads
     // the forge's author back.
-    record(&attestation('d', person("kitchen-bot"))?, "someone-else")?;
+    record(&attestation('d', "kitchen-bot", 11)?, "someone-else")?;
     let action = one_verdict(kitchen.gate()?)?;
     assert_eq!(
         action.result,
@@ -2319,18 +2318,122 @@ fn gate_attestations_must_be_independent_and_are_never_rewritten() -> TestResult
     );
     assert!(merges(&kitchen).is_empty());
     // The same attestation again is a no-op; a different one is refused.
-    record(&attestation('d', person("kitchen-bot"))?, "someone-else")?;
+    record(&attestation('d', "kitchen-bot", 11)?, "someone-else")?;
     assert!(matches!(
-        record(&attestation('d', person("safety-reviewer"))?, "kitchen-bot"),
+        record(&attestation('d', "safety-reviewer", 11)?, "kitchen-bot"),
         Err(kitchen::Error::Run(RunError::AttestationRecorded))
     ));
     // Another house's attestation is refused before anything is read.
-    let mut foreign = attestation('f', person("safety-reviewer"))?;
+    let mut foreign = attestation('f', "safety-reviewer", 11)?;
     foreign.house = common::other_house()?;
     assert!(matches!(
         record(&foreign, "kitchen-bot"),
         Err(kitchen::Error::Contract(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn a_branch_writer_cannot_record_an_attestation_for_another_reviewer() -> TestResult {
+    let kitchen = settled_with_pull_request(true)?;
+    green_pull_request(&kitchen)?;
+    // A person repairs the pull request through `kitchn pr`.
+    let (_, _) = person_holds_round(&kitchen, 12)?;
+    let branch = BranchName::new("kitchen/issue-7")?;
+    let worker = kitchen.worker(7)?;
+    // The branch's worker, the runner that held its task, and the person
+    // holding its round each claim the real reviewer's approval.
+    for recorder in [
+        common::scheduled(worker.handle.as_str())?,
+        run_claimant()?,
+        person_session()?,
+    ] {
+        let recorded = record_gate_attestation(
+            kitchen.store(),
+            &attestation('d', "safety-reviewer", 11)?,
+            "kitchen-bot",
+            &branch,
+            &recorder,
+            kitchen.clock.now(),
+        );
+        assert!(
+            matches!(
+                recorded,
+                Err(kitchen::Error::Run(RunError::AttestationByWriter))
+            ),
+            "{recorder:?}: {recorded:?}"
+        );
+    }
+    assert!(
+        kitchen::workflows::run::gate_attestation(
+            kitchen.store(),
+            &repo()?,
+            pr(12)?,
+            &commit('d')?,
+            &commit('e')?,
+        )?
+        .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn gate_merges_nothing_on_an_attestation_the_forge_does_not_show() -> TestResult {
+    let head = commit('d')?;
+    let review = |id: u64, login: &str, at: &kitchen::contracts::CommitId, state: &str| {
+        json!([{"id": id, "user": {"login": login}, "commit_id": at.as_str(),
+            "state": state, "submitted_at": "1970-01-01T00:00:00Z"}])
+    };
+    for (claimed, id, forge) in [
+        // Someone outside the records claims the reviewer's approval with a
+        // review the forge does not have.
+        (
+            "safety-reviewer",
+            99,
+            review(11, "safety-reviewer", &head, "APPROVED"),
+        ),
+        // The review exists, but another login wrote it.
+        (
+            "safety-reviewer",
+            11,
+            review(11, "kitchen-helper", &head, "APPROVED"),
+        ),
+        // The approval is on an earlier head.
+        (
+            "safety-reviewer",
+            11,
+            review(11, "safety-reviewer", &commit('c')?, "APPROVED"),
+        ),
+        // The review only commented.
+        (
+            "safety-reviewer",
+            11,
+            review(11, "safety-reviewer", &head, "COMMENTED"),
+        ),
+    ] {
+        let mut kitchen = settled_with_pull_request(true)?;
+        kitchen.config = with_merge_grant(house_config()?)?;
+        green_pull_request(&kitchen)?;
+        kitchen
+            .forge()
+            .set(&format!("repos/{REPO}/pulls/12/reviews"), forge.clone());
+        record_gate_attestation(
+            kitchen.store(),
+            &attestation('d', claimed, id)?,
+            "kitchen-bot",
+            &BranchName::new("kitchen/issue-7")?,
+            &common::scheduled("reviewer")?,
+            kitchen.clock.now(),
+        )?;
+        let action = one_verdict(kitchen.gate()?)?;
+        assert_eq!(
+            action.result,
+            GateResult::ReportOnly(ReportReason::ReviewUnverified),
+            "{forge}"
+        );
+        assert!(merges(&kitchen).is_empty(), "{forge}");
+        assert_eq!(verdict_markers(&kitchen)?, 0, "{forge}");
+    }
     Ok(())
 }
 

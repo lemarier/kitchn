@@ -64,7 +64,8 @@ mod repair;
 mod tick;
 
 pub use attestation::{
-    GATE_ATTESTATION_WORKFLOW, GateAttestation, Reviewer, gate_attestation, record_gate_attestation,
+    ForgeReview, GATE_ATTESTATION_WORKFLOW, GateAttestation, gate_attestation,
+    record_gate_attestation,
 };
 pub use coordinate::{CoordinateAction, CoordinatePass, Unroutable};
 pub use gate::{GateAction, GatePass, GateResult, MAX_GATE_PULL_REQUESTS, NotMerged, ReportReason};
@@ -194,6 +195,10 @@ pub enum RunError {
     /// request's author or a worker a launch of the branch created.
     #[error("the attesting reviewer wrote the branch; an attestation must be independent")]
     AttestationNotIndependent,
+    /// A gate attestation's recorder wrote the branch: it created or held
+    /// one of its writer tasks, or a launch on the branch created it.
+    #[error("the recorder wrote the branch; a branch writer cannot record an attestation")]
+    AttestationByWriter,
     /// A different attestation is already recorded for this exact subject;
     /// attestations are never rewritten.
     #[error("a different attestation is already recorded for this head and base")]
@@ -225,7 +230,9 @@ impl RunError {
             Self::Mailbox(MailboxError::Unavailable(_)) | Self::GateRecords => {
                 ErrorClass::Execution
             }
-            Self::AttestationNotIndependent | Self::GateRefused => ErrorClass::Refused,
+            Self::AttestationNotIndependent | Self::AttestationByWriter | Self::GateRefused => {
+                ErrorClass::Refused
+            }
             Self::AttestationRecorded => ErrorClass::Conflict,
         }
     }

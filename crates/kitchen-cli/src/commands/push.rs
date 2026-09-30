@@ -12,8 +12,8 @@ use kitchen::{
     adapters::orca::{Invocation, OrcaRunner, SystemRunner},
     adoption::HouseRegistry,
     contracts::{Clock, ExternalRef, GrantScope, Permission, SystemClock, Text},
-    house::{checked_forge_credential, forge_binding, runtime_config},
-    integrations::github::{GitHubClient, GitHubExecutor, ReadLimits},
+    house::{CredentialKind, checked_forge_credential, forge_binding, runtime_config},
+    integrations::github::{GitHubClient, GitHubExecutor, IntegrationError, ReadLimits},
     state::{AttemptState, HouseStore, StoreOptions, TaskState},
     workflows::{
         coordination::{Standing, current_worker, task_branch},
@@ -110,6 +110,7 @@ impl PushArgs {
             .ok_or(kitchen::integrations::github::IntegrationError::InvalidInput)?;
         let grants = house.authority()?;
         let binding = forge_binding(&registry, &self.house)?;
+        require_app_binding(binding.credential_kind)?;
         for permission in [Permission::PushBranch, Permission::OpenPullRequest] {
             record.spec().authority.authorize(
                 &grants,
@@ -127,6 +128,13 @@ impl PushArgs {
             fence,
             repository,
         })
+    }
+}
+
+fn require_app_binding(kind: CredentialKind) -> Result<(), IntegrationError> {
+    match kind {
+        CredentialKind::GitHubApp(_) => Ok(()),
+        CredentialKind::Token => Err(IntegrationError::AppRequiredForPush),
     }
 }
 
@@ -407,4 +415,26 @@ fn executable(name: &str) -> Option<PathBuf> {
         .filter(|path| path.is_absolute())
         .map(|path| path.join(name))
         .find(|path| path.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kitchen::integrations::github::{AppId, GitHubApp, InstallationId};
+
+    #[test]
+    fn worker_push_requires_an_app_binding() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            require_app_binding(CredentialKind::Token),
+            Err(IntegrationError::AppRequiredForPush)
+        );
+        assert_eq!(
+            require_app_binding(CredentialKind::GitHubApp(GitHubApp {
+                app_id: AppId::new(1)?,
+                installation: InstallationId::new(2)?,
+            })),
+            Ok(())
+        );
+        Ok(())
+    }
 }

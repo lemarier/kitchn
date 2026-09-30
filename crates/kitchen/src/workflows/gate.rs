@@ -2108,6 +2108,7 @@ pub fn collect_forge_evidence<T: crate::integrations::github::GitHubReadTranspor
             Observation::Unavailable(
                 error @ (IntegrationError::ScopeMismatch
                 | IntegrationError::PermissionDenied
+                | IntegrationError::AppRequiredForPush
                 | IntegrationError::BudgetExhausted
                 | IntegrationError::StaleDecision),
             ) => return Err(error),

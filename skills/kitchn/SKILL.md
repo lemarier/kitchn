@@ -158,8 +158,10 @@ consenting to a release.
 When a Kitchen launch brief names a `Push:` command, run that exact command
 from the launched worktree after committing and completing the required checks.
 It checks the task's branch, worktree, grants, and live remote state, then pushes
-with the house forge credential and opens a pull request. Do not call Git's
-credential helpers or copy the forge token into a shell command. Add
+with a repository-scoped GitHub App installation token and opens a pull request.
+The house must use `kitchn forge bind --app-id ... --installation ...`;
+a personal-token binding is refused before its credential is read. Do not call
+Git's credential helpers or copy the forge token into a shell command. Add
 `--acceptance-done` only after the evidence report contains `Acceptance: done`
 and every acceptance item was checked. Otherwise the PR body says `Part of`
 the issue. If the command reports a refused or uncertain outcome, stop and

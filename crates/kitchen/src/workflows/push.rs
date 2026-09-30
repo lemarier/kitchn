@@ -250,6 +250,7 @@ pub fn open_task_pull_request(
         EffectState::NotApplied { .. } => OpenOutcome::NotApplied,
         EffectState::Intended
         | EffectState::Uncertain { .. }
+        | EffectState::Ended { .. }
         | EffectState::Unresolvable { .. }
         | EffectState::Waived { .. } => OpenOutcome::Uncertain,
     };

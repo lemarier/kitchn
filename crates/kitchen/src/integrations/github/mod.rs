@@ -86,6 +86,11 @@ pub enum IntegrationError {
     /// The house does not permit this effect.
     #[error("integration effect is not permitted")]
     PermissionDenied,
+    /// Worker pushes need an installation token scoped to one repository.
+    #[error(
+        "worker push requires a GitHub App forge binding; use `kitchn forge bind --app-id ... --installation ...`"
+    )]
+    AppRequiredForPush,
     /// All permitted submissions for this durable task have been spent.
     #[error("posting budget exhausted")]
     BudgetExhausted,
@@ -115,9 +120,10 @@ impl IntegrationError {
     pub const fn class(self) -> ErrorClass {
         match self {
             Self::InvalidInput => ErrorClass::InvalidInput,
-            Self::ScopeMismatch | Self::PermissionDenied | Self::BudgetExhausted => {
-                ErrorClass::Refused
-            }
+            Self::ScopeMismatch
+            | Self::PermissionDenied
+            | Self::AppRequiredForPush
+            | Self::BudgetExhausted => ErrorClass::Refused,
             Self::StaleDecision => ErrorClass::Conflict,
             Self::Timeout
             | Self::Unavailable

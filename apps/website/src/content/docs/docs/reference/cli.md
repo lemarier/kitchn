@@ -215,6 +215,25 @@ limits for forge writes must name the credential. `show` exits 1 when the token
 file is not ready: missing, not a regular file, reached through a link, owned
 by another user, or accessible to group or others.
 
+## `kitchn push`
+
+Push the launched worker's task branch and deliver its pull request from that
+worktree. Use the exact `Push:` command in the launch brief after committing and
+running the required checks.
+
+```sh
+kitchn push --store <house-store> --house <id> --task <id> [--acceptance-done]
+```
+
+Worker push requires a GitHub App forge binding. Bind the house with
+`kitchn forge bind --app-id ... --installation ...` and the app's bot requester;
+the app installation must cover the task repository. Kitchen requests an
+installation token limited to that repository and contents write. A house
+bound to a personal token is refused before that credential is read or passed
+to a child process. `--acceptance-done` requires the worker's evidence report
+to contain `Acceptance: done`; otherwise the pull request body says `Part of`
+the issue. A refused or uncertain push must be reconciled before retrying.
+
 ## `kitchn work`, `kitchn pr` and `kitchn hand-back`
 
 The entrypoints behind the [`/kitchn` skill](/docs/guides/sessions/). Each

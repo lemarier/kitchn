@@ -633,3 +633,57 @@ fn nondefault_pickup_settings_travel_through_a_printed_trigger() -> TestResult {
     assert_eq!(house.orca_calls(), calls);
     Ok(())
 }
+
+#[test]
+fn run_repair_reads_the_stored_branch_prefix_and_report_path() -> TestResult {
+    let house = House::new()?;
+    let mut flags = house.orca_flags();
+    flags.extend(["--branch-prefix", "bot", "--report-path", "reports/out.md"].map(str::to_owned));
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    assert_eq!(house.configure(&flags)?.status.code(), Some(0));
+    // A flag naming another value than the stored one is refused before any
+    // backend call, the built-in defaults included.
+    let calls = house.orca_calls();
+    for (flag, value) in [
+        ("--branch-prefix", "kitchen"),
+        ("--report-path", "kitchen-report.md"),
+    ] {
+        let refused = run_pass(&house, "repair", &[flag, value])?;
+        let combined = format!("{}{}", text(&refused.stdout), text(&refused.stderr));
+        assert_eq!(refused.status.code(), Some(2), "{flag}: {combined}");
+        assert!(combined.contains(flag), "{flag}: {combined}");
+        assert!(combined.contains("disagrees"), "{flag}: {combined}");
+        assert_eq!(house.orca_calls(), calls, "{flag}: contacted a backend");
+    }
+    // Without the flags, or with the stored values, the pass runs.
+    for extra in [
+        &[][..],
+        &["--branch-prefix", "bot", "--report-path", "reports/out.md"],
+    ] {
+        let ran = run_pass(&house, "repair", extra)?;
+        assert_eq!(
+            ran.status.code(),
+            Some(0),
+            "{extra:?}: {}{}",
+            text(&ran.stdout),
+            text(&ran.stderr)
+        );
+        assert_eq!(text(&ran.stdout).trim(), "idle", "{extra:?}");
+    }
+
+    // A house with nothing stored takes the flags, and refuses a report
+    // path outside the workspace as `configure` does.
+    let fresh = House::new()?;
+    let orca = fresh.orca_flags();
+    let mut given: Vec<&str> = orca.iter().map(String::as_str).collect();
+    given.extend(["--branch-prefix", "bot", "--report-path", "reports/out.md"]);
+    let ran = run_pass(&fresh, "repair", &given)?;
+    assert_eq!(ran.status.code(), Some(0), "{}", text(&ran.stderr));
+    let calls = fresh.orca_calls();
+    let mut outside: Vec<&str> = orca.iter().map(String::as_str).collect();
+    outside.extend(["--report-path", "../out.md"]);
+    let refused = run_pass(&fresh, "repair", &outside)?;
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
+    assert_eq!(fresh.orca_calls(), calls);
+    Ok(())
+}

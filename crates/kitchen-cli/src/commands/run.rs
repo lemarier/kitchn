@@ -246,15 +246,20 @@ pub(super) fn agree<'a, T: PartialEq>(
     }
 }
 
+/// What a repair writer shares with pickup workers. Unset flags use the
+/// house's stored pickup settings, or the defaults when none are stored; a
+/// flag that disagrees with the stored settings is refused, as for pickup.
 #[derive(Args)]
 struct RepairArgs {
     /// Scheduled branches are named `<prefix>/issue-<number>`; the worker
-    /// backend names a repair writer's workspace without it.
-    #[arg(long, default_value = "kitchen")]
-    branch_prefix: String,
-    /// Where each repair writer writes its evidence report in its workspace.
-    #[arg(long, default_value = "kitchen-report.md")]
-    report_path: String,
+    /// backend names a repair writer's workspace without it (default:
+    /// kitchen).
+    #[arg(long)]
+    branch_prefix: Option<String>,
+    /// Where each repair writer writes its evidence report in its workspace
+    /// (default: kitchen-report.md).
+    #[arg(long)]
+    report_path: Option<String>,
 }
 
 /// The house, its store, and the repository one pass serves.
@@ -488,15 +493,25 @@ pub fn run(args: RunArgs) -> ExitCode {
             backend,
             repair,
         } => Opened::open(&house).and_then(|opened| {
+            // The branch prefix and report path are pickup's, as the tick
+            // reads them.
+            let pickup = pickup_config(
+                &opened,
+                &PickupArgs {
+                    branch_prefix: repair.branch_prefix,
+                    report_path: repair.report_path,
+                    ..PickupArgs::default()
+                },
+            )?;
             let settings = RepairSettings {
                 instructions: instructions(&opened)?,
-                report_path: Text::new(&repair.report_path)?,
+                report_path: Text::new(&pickup.report_path)?,
             };
             // A repair writer is supervised like a pickup worker.
             let backend = opened.backend(
                 &backend,
                 Pass::Repair.as_str(),
-                Some(BranchName::new(&repair.branch_prefix)?),
+                Some(BranchName::new(&pickup.branch_prefix)?),
                 MailboxRoute::House.worker_requirements(),
             )?;
             let forge = opened.forge()?;

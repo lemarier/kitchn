@@ -525,6 +525,10 @@ fn gate_attest_reads_the_forge_review_and_records_its_author() -> TestResult {
 #[test]
 fn gate_inference_refuses_dirty_stale_missing_and_ambiguous_heads() -> TestResult {
     let house = House::new()?;
+    git(
+        &house.checkout,
+        &["checkout", "--quiet", "-b", "review-branch"],
+    )?;
     fs::write(house.checkout.join("reviewed.txt"), "reviewed")?;
     git(&house.checkout, &["add", "reviewed.txt"])?;
     git(
@@ -550,7 +554,7 @@ fn gate_inference_refuses_dirty_stale_missing_and_ambiguous_heads() -> TestResul
     let pr = |number, head: &str| {
         serde_json::json!({
             "number": number, "state": "open", "draft": false, "merged": false,
-            "head": {"sha": head, "ref": "review-branch"},
+            "head": {"sha": head, "ref": "review-branch", "repo": {"full_name": "acme/app"}},
             "base": {"sha": sha, "ref": "main"}, "mergeable": true
         })
     };
@@ -599,7 +603,7 @@ fn gate_inference_refuses_dirty_stale_missing_and_ambiguous_heads() -> TestResul
 
     fs::write(
         &fixture,
-        serde_json::to_vec(&serde_json::json!([pr(12, sha)]))?,
+        serde_json::to_vec(&serde_json::json!([pr(12, KITCHEN)]))?,
     )?;
     fs::write(
         house.home.join("pr.json"),

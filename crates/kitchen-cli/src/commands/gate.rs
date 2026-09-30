@@ -43,7 +43,7 @@ struct ReviewArgs {
     store: Option<PathBuf>,
     #[arg(long)]
     repository: Option<Repository>,
-    /// Open PR (default: the sole open PR at this checkout's HEAD).
+    /// Open PR (default: the sole open PR for this checkout's branch or HEAD).
     #[arg(long)]
     pull_request: Option<NonZeroU64>,
     /// Exact commit (default: HEAD of a clean checkout, verified against the live PR).
@@ -76,7 +76,7 @@ struct AttestArgs {
     store: Option<PathBuf>,
     #[arg(long)]
     repository: Option<Repository>,
-    /// Open PR (default: the sole open PR at this checkout's HEAD).
+    /// Open PR (default: the sole open PR for this checkout's branch or HEAD).
     #[arg(long)]
     pull_request: Option<NonZeroU64>,
     /// The forge review ID containing the attestation block.

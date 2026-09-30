@@ -139,7 +139,8 @@ action, in that session. A yes never carries over to the next action.
 JSON; you rarely type anything beyond `house init`. The commands are precise
 for external effects. In a clean checkout at a pull request's live head, an
 expediter can run `kitchn gate attest --review-id <id>`; Kitchen infers the
-sole open pull request at that commit. `kitchn gate review` also infers
+sole open pull request for that branch, or at that commit when no branch
+matches. `kitchn gate review` also infers
 `--head` from the clean checkout's `HEAD`. Explicit flags override these
 defaults.
 

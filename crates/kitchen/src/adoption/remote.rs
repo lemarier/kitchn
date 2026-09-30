@@ -222,6 +222,17 @@ pub fn clean_checkout_head(start: &Path) -> Result<crate::contracts::CommitId, H
         .map_err(|_| HouseError::Git(GitReadError::Malformed))
 }
 
+/// The current checkout's local branch name, or `None` for detached HEAD.
+///
+/// # Errors
+/// Git reads retain the path and execution bounds used by other checkout reads.
+pub fn checkout_branch(start: &Path) -> Result<Option<String>, HouseError> {
+    Ok(
+        optional_git(start, &["symbolic-ref", "--quiet", "--short", "HEAD"])?
+            .map(|branch| branch.trim_end_matches('\n').to_owned()),
+    )
+}
+
 /// Normalize a GitHub remote URL to lowercase `owner/name`.
 ///
 /// Accepts `https://`, `http://`, `ssh://`, `git://`, `git+ssh://` and

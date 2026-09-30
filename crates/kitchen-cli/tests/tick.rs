@@ -1,5 +1,5 @@
 //! The `kitchn tick` process contract against a temporary registry and house
-//! store. The scheduled passes are not wired in yet (#225), so every pass
+//! store, including `kitchn tick settle` for a run a crash left uncertain. The scheduled passes are not wired in yet (#225), so every pass
 //! that runs reports that it is not available; no workflow pass, backend,
 //! or live trigger runs, so none of this is live evidence.
 
@@ -16,7 +16,7 @@ use kitchen::{
     house::HouseConfig,
     scheduling::IntervalMinutes,
     state::{HouseStore, RunStart, RunState, StoreOptions},
-    workflows::tick::{PASS_LEASE, Pass, PassFailure, PassOutcome, Repeat},
+    workflows::tick::{PASS_LEASE, Pass, PassFailure, PassOutcome},
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -93,10 +93,9 @@ fn crashed_pickup(kitchen: &Kitchen, task: Option<&str>) -> TestResult {
             .as_unix_millis()
             .saturating_sub(2 * 60 * 60 * 1000),
     );
-    let RunStart::Started { run, fence, .. } = store.start_run(
+    let RunStart::Started { run, fence } = store.start_run(
         Pass::Pickup,
         IntervalMinutes::new(15)?,
-        Repeat::AfterReconcile,
         &HolderId::new("tick-crashed")?,
         LeaseTtl::new(PASS_LEASE)?,
         started,
@@ -110,40 +109,46 @@ fn crashed_pickup(kitchen: &Kitchen, task: Option<&str>) -> TestResult {
     Ok(())
 }
 
-#[test]
-fn a_crashed_run_that_did_nothing_is_reconciled_before_the_pass_runs() -> TestResult {
-    let kitchen = Kitchen::new(&[("origin89", pickup_every(15))])?;
-    crashed_pickup(&kitchen, None)?;
-
-    let output = kitchen.tick("origin89", &[])?;
-    assert_eq!(
-        stdout(&output).trim(),
-        "pickup: run 1: failed: pass not available in this build \
-         (run 0 recorded as uncertain) (run 0 reconciled)"
-    );
-    let runs = kitchen.store("origin89")?.runs()?;
-    assert!(matches!(
-        runs.first().map(|run| &run.state),
-        Some(RunState::Recovered { .. })
-    ));
-    assert_eq!(runs.len(), 2);
-    Ok(())
+impl Kitchen {
+    fn settle(&self, extra: &[&str]) -> TestResult<Output> {
+        let registry = self.registry();
+        let mut args = vec![
+            "tick",
+            "settle",
+            "--registry",
+            &registry,
+            "--house",
+            "origin89",
+        ];
+        args.extend_from_slice(extra);
+        self.kitchn(&args)
+    }
 }
 
+const SETTLE: [&str; 8] = [
+    "--pass",
+    "pickup",
+    "--run",
+    "0",
+    "--reason",
+    "checked the forge: nothing was opened",
+    "--holder",
+    "david",
+];
+
 #[test]
-fn a_crashed_run_that_recorded_a_task_keeps_the_pass_waiting() -> TestResult {
+fn a_crashed_run_blocks_the_pass_until_a_person_settles_it() -> TestResult {
     let kitchen = Kitchen::new(&[("origin89", pickup_every(15))])?;
     crashed_pickup(&kitchen, Some("pickup-task"))?;
 
-    for _ in 0..2 {
+    for recorded in [", recorded now", ""] {
         let output = kitchen.tick("origin89", &[])?;
         assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-        assert!(
-            stdout(&output).starts_with(
-                "pickup: waiting: run 0 is uncertain and not reconciled (0 unresolved effects)"
-            ),
-            "{}",
-            stdout(&output)
+        assert_eq!(
+            stdout(&output).trim(),
+            format!(
+                "pickup: blocked: run 0 is uncertain{recorded} (0 unresolved effects on the tasks it recorded; it may have done more). Check what it did, then run `kitchn tick settle --pass pickup --run 0`."
+            )
         );
     }
     let runs = kitchen.store("origin89")?.runs()?;
@@ -152,6 +157,69 @@ fn a_crashed_run_that_recorded_a_task_keeps_the_pass_waiting() -> TestResult {
         runs.first().map(|run| &run.state),
         Some(RunState::Uncertain { .. })
     ));
+
+    let settled = kitchen.settle(&SETTLE)?;
+    assert_eq!(settled.status.code(), Some(0), "{}", stderr(&settled));
+    assert_eq!(
+        stdout(&settled).trim(),
+        "pickup: settled run 0 for david: checked the forge: nothing was opened (0 unresolved effects recorded)\nThe pass runs again when due."
+    );
+    let registry = kitchen.registry();
+    let listed = kitchen.kitchn(&[
+        "tick",
+        "runs",
+        "--registry",
+        &registry,
+        "--house",
+        "origin89",
+    ])?;
+    assert!(
+        stdout(&listed).contains("uncertain, settled by david at ",)
+            && stdout(&listed)
+                .contains("(0 unresolved effects): checked the forge: nothing was opened"),
+        "{}",
+        stdout(&listed)
+    );
+
+    // Settling again changes nothing.
+    let again = kitchen.settle(&SETTLE)?;
+    assert_eq!(again.status.code(), Some(0), "{}", stderr(&again));
+    assert!(stdout(&again).starts_with("pickup: run 0 was already settled by david at "));
+
+    let output = kitchen.tick("origin89", &[])?;
+    assert_eq!(
+        stdout(&output).trim(),
+        "pickup: run 1: failed: pass not available in this build"
+    );
+    Ok(())
+}
+
+#[test]
+fn settle_refuses_a_run_that_is_not_uncertain_and_invalid_input() -> TestResult {
+    let kitchen = Kitchen::new(&[("origin89", pickup_every(15))])?;
+    crashed_pickup(&kitchen, None)?;
+
+    // Still running as far as the ledger knows: nothing to settle.
+    let running = kitchen.settle(&SETTLE)?;
+    assert_eq!(running.status.code(), Some(1));
+    assert!(stderr(&running).contains("the run is not uncertain"));
+
+    let mut unknown = SETTLE;
+    unknown[3] = "7";
+    let missing = kitchen.settle(&unknown)?;
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("no such run"));
+
+    for (index, value) in [(1, "nightly"), (3, "run-0")] {
+        let mut invalid = SETTLE;
+        invalid[index] = value;
+        assert_eq!(kitchen.settle(&invalid)?.status.code(), Some(2));
+    }
+    let without_reason = kitchen.settle(&SETTLE[..4])?;
+    assert_eq!(without_reason.status.code(), Some(2));
+
+    let runs = kitchen.store("origin89")?.runs()?;
+    assert_eq!(runs.first().map(|run| &run.state), Some(&RunState::Running));
     Ok(())
 }
 

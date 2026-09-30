@@ -15,23 +15,24 @@
 //!   interval ago. Failed and uncertain runs count as runs.
 //! - A run whose lease expired before it recorded an end is uncertain, not
 //!   failed: the next tick takes the lease over and records the run as
-//!   [`crate::state::RunState::Uncertain`]. The run is superseded: its late
-//!   end, renewal, or task record is refused ([`TickError::Superseded`]).
-//! - An uncertain run blocks its pass until it is reconciled, unless the
-//!   runner declares the pass [`Repeat::Idempotent`]. The tick asks the
-//!   runner to reconcile it ([`PassRunner::reconcile`]) under the pass
-//!   lease; the store records it as recovered only when the runner
-//!   establishes the outcome and no task the run recorded
-//!   ([`HouseStore::record_run_task`]) has an unresolved effect. Otherwise
-//!   the pass waits and the tick reports [`TickDecision::NeedsAttention`].
+//!   [`crate::state::RunState::Uncertain`]. A run is superseded once its
+//!   lease lapses or [`MAX_PASS_RUNTIME`] passes: its late end, renewal, or
+//!   task record is refused ([`TickError::Superseded`]) and changes nothing.
+//! - An uncertain run blocks its pass ([`TickDecision::Blocked`]) until a
+//!   person settles it with [`HouseStore::settle_run`], which records who,
+//!   when, and why. No tick or trigger settles a run: a pass may act without
+//!   recording a task first, so the unresolved effects of the tasks it
+//!   recorded ([`HouseStore::record_run_task`]) are reported, never taken as
+//!   proof that it did nothing.
 //! - A pass that may outlast [`PASS_LEASE`] renews its run
-//!   ([`HouseStore::renew_run`]), for at most [`MAX_PASS_RUNTIME`].
+//!   ([`HouseStore::renew_run`]); the lease never extends past
+//!   [`MAX_PASS_RUNTIME`] after the run started.
 //! - A backend's own run history is evidence linked from a run
 //!   ([`PassReport::backend_runs`]), never a second ledger.
 //! - [`trigger_plist`] and [`trigger_cron`] only render text for a person
 //!   to install. Nothing here installs or changes a live schedule.
 
-use std::{collections::BTreeMap, fmt, path::Path, time::Duration};
+use std::{collections::BTreeMap, fmt, path::Path, str::FromStr, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +41,7 @@ use crate::{
     contracts::{Clock, ExternalRef, Fence, LeaseTtl, Timestamp},
     house::HouseConfig,
     scheduling::{IntervalMinutes, SchedulePolicy},
-    state::{HouseStore, RunId, RunRecord, RunSettle, RunStart, TokenCounts},
+    state::{HouseStore, RunId, RunStart, TokenCounts},
 };
 
 /// How long a pass holds its tick lease without renewing it. A pass that
@@ -48,7 +49,8 @@ use crate::{
 /// tick, which records the run as uncertain.
 pub const PASS_LEASE: Duration = Duration::from_secs(60 * 60);
 
-/// How long after its start a run may still renew its lease or record tasks.
+/// How long after its start a run may hold its pass lease, renew it, record
+/// tasks, or record its end.
 pub const MAX_PASS_RUNTIME: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Backend run references one run links at most.
@@ -67,6 +69,9 @@ pub enum TickError {
     /// The house schedules no tick passes.
     #[error("the house schedules no tick passes")]
     NoPasses,
+    /// No pass has that name.
+    #[error("no such pass")]
+    UnknownPass,
     /// No run with that id is in the ledger.
     #[error("no such run in the ledger")]
     UnknownRun,
@@ -76,16 +81,16 @@ pub enum TickError {
     /// The run already recorded a different end.
     #[error("the run already recorded a different end")]
     AlreadyFinished,
-    /// A later tick recorded the run as uncertain, or its pass lease lapsed;
-    /// it may no longer act or record an end.
-    #[error("a later tick superseded the run")]
+    /// The run's pass lease lapsed, its runtime ran out, or a later tick
+    /// recorded it as uncertain; it may no longer act or record an end.
+    #[error("the run was superseded")]
     Superseded,
-    /// Only an uncertain run can be reconciled.
+    /// Only an uncertain run can be settled.
     #[error("the run is not uncertain")]
     NotUncertain,
-    /// The run started more than [`MAX_PASS_RUNTIME`] ago.
-    #[error("the run exceeded its maximum runtime")]
-    RunTooLong,
+    /// Only a person present can settle an uncertain run.
+    #[error("only a person can settle an uncertain run")]
+    SettleNeedsPerson,
     /// A run records at most this many tasks.
     #[error("a run records at most {max} tasks")]
     TooManyTasks {
@@ -113,13 +118,14 @@ impl TickError {
         match self {
             Self::TooMuchEvidence { .. }
             | Self::TooManyTasks { .. }
+            | Self::UnknownPass
             | Self::TriggerPath
             | Self::TriggerInterval => ErrorClass::InvalidInput,
             Self::CrossHouse
             | Self::NoPasses
             | Self::UnknownRun
             | Self::NotRunOwner
-            | Self::RunTooLong => ErrorClass::Refused,
+            | Self::SettleNeedsPerson => ErrorClass::Refused,
             Self::AlreadyFinished | Self::Superseded | Self::NotUncertain => ErrorClass::Conflict,
         }
     }
@@ -168,6 +174,17 @@ impl Pass {
 impl fmt::Display for Pass {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Pass {
+    type Err = TickError;
+
+    fn from_str(text: &str) -> Result<Self, TickError> {
+        Self::ALL
+            .into_iter()
+            .find(|pass| pass.as_str() == text)
+            .ok_or(TickError::UnknownPass)
     }
 }
 
@@ -275,60 +292,17 @@ pub struct PassRun {
     pub fence: Fence,
 }
 
-/// Whether a pass may run again while an earlier run of it is uncertain.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Repeat {
-    /// An uncertain run blocks the pass until it is reconciled.
-    #[default]
-    AfterReconcile,
-    /// Repeating the pass cannot repeat an external effect, so an uncertain
-    /// run blocks nothing. Declare it only with that proof.
-    Idempotent,
-}
-
-/// What a runner established about an uncertain run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Recovery {
-    /// How the run ended. The store still refuses it while a task the run
-    /// recorded has an unresolved effect.
-    Ended(PassReport),
-    /// The outcome is not established; the pass keeps waiting.
-    Unknown,
-}
-
-/// An uncertain run to reconcile, under the pass lease the tick holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PassRecovery {
-    /// The house.
-    pub house: HouseId,
-    /// The uncertain run, including the tasks it recorded.
-    pub record: RunRecord,
-    /// The tick's current pass lease fence.
-    pub fence: Fence,
-}
-
 /// Runs one bounded workflow pass. The tick calls it only while it holds the
 /// pass's lease; the pass takes its own workflow lease for its work.
 ///
 /// Before touching a task, a pass records it with
-/// [`HouseStore::record_run_task`]; after a crash, reconciliation checks
-/// those tasks' effects. A pass that may outlast [`PASS_LEASE`] renews its
-/// run with [`HouseStore::renew_run`] and stops when that is refused.
+/// [`HouseStore::record_run_task`], so a blocked run can report those
+/// tasks' effects. A pass that may outlast [`PASS_LEASE`] renews its run
+/// with [`HouseStore::renew_run`] and stops when that is refused.
 pub trait PassRunner {
     /// Run `pass` once and report how it ended. Failures are outcomes, not
     /// errors, so the ledger always records them.
     fn run(&mut self, pass: Pass, run: &PassRun) -> PassReport;
-
-    /// Reconcile an uncertain run of `pass`: resolve the effects of the
-    /// tasks it recorded through the store's durable intent (take over each
-    /// task's claim and call [`crate::state::reconcile`]) and establish how
-    /// the run ended. Never repeat the run's work here.
-    fn reconcile(&mut self, pass: Pass, uncertain: &PassRecovery) -> Recovery;
-
-    /// Whether `pass` may run again while an earlier run is uncertain.
-    fn repeat(&self, _pass: Pass) -> Repeat {
-        Repeat::AfterReconcile
-    }
 }
 
 /// What the tick decided for one pass.
@@ -346,16 +320,16 @@ pub enum TickDecision {
         /// When it is due next.
         next_due: Timestamp,
     },
-    /// An uncertain run is not reconciled, so the pass did not run. A
-    /// person or a later tick has to settle the run's effects first.
-    NeedsAttention {
+    /// An uncertain run blocks the pass until a person settles it.
+    Blocked {
         /// The uncertain run.
         run: RunId,
-        /// Unresolved effects of the tasks it recorded.
+        /// Unresolved effects of the tasks it recorded. Zero does not mean
+        /// the run did nothing.
         unresolved_effects: usize,
     },
-    /// The pass ran past its lease and a later tick recorded the run as
-    /// uncertain, so its end was refused. The run waits for reconciliation.
+    /// The pass outlasted its lease or runtime, so its end was refused. The
+    /// next tick records the run as uncertain.
     Superseded {
         /// The superseded run.
         run: RunId,
@@ -376,10 +350,8 @@ pub struct PassTick {
     pub pass: Pass,
     /// What happened.
     pub decision: TickDecision,
-    /// An earlier run this tick recorded as uncertain.
-    pub uncertain: Option<RunId>,
-    /// Uncertain runs this tick reconciled, oldest first.
-    pub recovered: Vec<RunId>,
+    /// Whether this tick recorded the blocking run as uncertain.
+    pub newly_uncertain: bool,
 }
 
 /// The tick's result.
@@ -390,7 +362,7 @@ pub struct TickReport {
 }
 
 impl TickReport {
-    /// Whether no pass that ran failed and none waits on reconciliation.
+    /// Whether no pass that ran failed, was superseded, or is blocked.
     #[must_use]
     pub fn healthy(&self) -> bool {
         !self.passes.iter().any(|pass| {
@@ -399,7 +371,7 @@ impl TickReport {
                 TickDecision::Ran {
                     outcome: PassOutcome::Failed { .. },
                     ..
-                } | TickDecision::NeedsAttention { .. }
+                } | TickDecision::Blocked { .. }
                     | TickDecision::Superseded { .. }
             )
         })
@@ -443,7 +415,7 @@ pub fn tick(
     Ok(report)
 }
 
-/// One pass: reconcile its uncertain runs, then run it when due.
+/// One pass: run it when due and not blocked.
 #[expect(
     clippy::too_many_arguments,
     reason = "the tick's inputs, passed through once"
@@ -458,82 +430,41 @@ fn tick_pass(
     runner: &mut dyn PassRunner,
     clock: &dyn Clock,
 ) -> crate::Result<PassTick> {
-    let repeat = runner.repeat(pass);
-    let mut first_uncertain = None;
-    let mut recovered = Vec::new();
-    // Each round recovers one uncertain run or stops, and the ledger holds
-    // a bounded number of them, so this ends.
-    let decision = loop {
-        let start = store.start_run(
-            pass,
-            schedule.every_minutes,
-            repeat,
-            holder,
-            ttl,
-            clock.now(),
-        )?;
-        match start {
-            RunStart::Busy { holder, expires_at } => {
-                break TickDecision::Busy { holder, expires_at };
-            }
-            RunStart::NotDue {
-                next_due,
-                uncertain,
-            } => {
-                first_uncertain = first_uncertain.or(uncertain);
-                break TickDecision::NotDue { next_due };
-            }
-            RunStart::Reconcile {
-                record,
-                fence,
-                uncertain,
-            } => {
-                first_uncertain = first_uncertain.or(uncertain);
-                let run = record.id;
-                let context = PassRecovery {
-                    house: config.house.clone(),
-                    record,
-                    fence,
-                };
-                let recovery = runner.reconcile(pass, &context);
-                match store.settle_run(run, fence, recovery, clock.now())? {
-                    RunSettle::Recovered => recovered.push(run),
-                    RunSettle::Blocked { unresolved_effects } => {
-                        break TickDecision::NeedsAttention {
-                            run,
-                            unresolved_effects,
-                        };
-                    }
-                }
-            }
-            RunStart::Started {
+    let start = store.start_run(pass, schedule.every_minutes, holder, ttl, clock.now())?;
+    let (decision, newly_uncertain) = match start {
+        RunStart::Busy { holder, expires_at } => (TickDecision::Busy { holder, expires_at }, false),
+        RunStart::NotDue { next_due } => (TickDecision::NotDue { next_due }, false),
+        RunStart::Blocked {
+            run,
+            unresolved_effects,
+            newly_uncertain,
+        } => (
+            TickDecision::Blocked {
+                run,
+                unresolved_effects,
+            },
+            newly_uncertain,
+        ),
+        RunStart::Started { run, fence } => {
+            let context = PassRun {
+                house: config.house.clone(),
                 run,
                 fence,
-                uncertain,
-            } => {
-                first_uncertain = first_uncertain.or(uncertain);
-                let context = PassRun {
-                    house: config.house.clone(),
-                    run,
-                    fence,
-                };
-                let ended = runner.run(pass, &context);
-                let outcome = ended.outcome;
-                match store.finish_run(run, fence, ended, clock.now()) {
-                    Ok(()) => break TickDecision::Ran { run, outcome },
-                    Err(crate::Error::Tick(TickError::Superseded)) => {
-                        break TickDecision::Superseded { run };
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            };
+            let ended = runner.run(pass, &context);
+            let outcome = ended.outcome;
+            let decision = match store.finish_run(run, fence, ended, clock.now()) {
+                Ok(()) => TickDecision::Ran { run, outcome },
+                Err(crate::Error::Tick(TickError::Superseded)) => TickDecision::Superseded { run },
+                Err(error) => return Err(error),
+            };
+            (decision, false)
         }
     };
     Ok(PassTick {
         pass,
         decision,
-        uncertain: first_uncertain,
-        recovered,
+        newly_uncertain,
     })
 }
 

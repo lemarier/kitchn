@@ -2,8 +2,8 @@
 //!
 //! Without a subcommand it runs every due pass the house configures and
 //! records each run in the house store's run ledger. `runs` lists the ledger;
-//! `trigger` prints a launchd plist or crontab line that runs the tick and
-//! installs nothing. Due decisions, leases, and the ledger stay in
+//! `settle` records that a person settled an uncertain run; `trigger` prints
+//! a launchd plist or crontab line that runs the tick and installs nothing. Due decisions, leases, and the ledger stay in
 //! [`kitchen::workflows::tick`].
 
 use std::{fmt::Write as _, path::PathBuf};
@@ -12,12 +12,12 @@ use clap::{Args, Subcommand, ValueEnum};
 use kitchen::{
     HolderId, HouseId,
     adoption::HouseRegistry,
-    contracts::{Clock, SystemClock},
+    contracts::{Claimant, Clock, SystemClock, Text},
     house::HouseError,
-    state::{HouseStore, RunState, StoreOptions},
+    state::{HouseStore, RunId, RunSettle, RunState, StoreOptions},
     workflows::tick::{
-        self, Pass, PassFailure, PassOutcome, PassRecovery, PassReport, PassRun, PassRunner,
-        Recovery, TickDecision, TriggerMinutes, TriggerTarget, trigger_cron, trigger_plist,
+        self, Pass, PassFailure, PassOutcome, PassReport, PassRun, PassRunner, TickDecision,
+        TriggerMinutes, TriggerTarget, trigger_cron, trigger_plist,
     },
 };
 
@@ -36,6 +36,25 @@ enum TickCommand {
     Runs {
         #[command(flatten)]
         house: HouseScope,
+    },
+    /// Let a pass run again after an uncertain run blocked it. Check what
+    /// the run did first: it may have acted without recording a task.
+    /// Records who settled it, when, and why. A scheduled run cannot do it.
+    Settle {
+        #[command(flatten)]
+        house: HouseScope,
+        /// The blocked pass.
+        #[arg(long)]
+        pass: Pass,
+        /// The uncertain run's number, as `kitchn tick` reported it.
+        #[arg(long)]
+        run: RunId,
+        /// Why the pass may run again, such as what you checked.
+        #[arg(long)]
+        reason: String,
+        /// Your session, recorded as who settled the run.
+        #[arg(long)]
+        holder: HolderId,
     },
     /// Print a launchd plist or crontab line that runs the tick. Installs
     /// nothing.
@@ -94,21 +113,21 @@ impl PassRunner for PendingPasses {
     fn run(&mut self, _pass: Pass, _run: &PassRun) -> PassReport {
         Self::report()
     }
-
-    /// This build runs no pass work and records no tasks, so an interrupted
-    /// run of it did nothing either.
-    fn reconcile(&mut self, _pass: Pass, uncertain: &PassRecovery) -> Recovery {
-        if uncertain.record.tasks.is_empty() {
-            Recovery::Ended(Self::report())
-        } else {
-            Recovery::Unknown
-        }
-    }
 }
 
 pub fn run(args: TickArgs) -> Result<(String, bool), kitchen::Error> {
     match (args.command, args.house) {
         (Some(TickCommand::Runs { house }), _) => runs(house),
+        (
+            Some(TickCommand::Settle {
+                house,
+                pass,
+                run,
+                reason,
+                holder,
+            }),
+            _,
+        ) => settle(house, pass, run, &Text::new(&reason)?, holder),
         (
             Some(TickCommand::Trigger {
                 format,
@@ -161,17 +180,23 @@ fn run_tick(scope: HouseScope) -> Result<(String, bool), kitchen::Error> {
                 pass.pass,
                 next_due.as_unix_millis()
             ),
-            TickDecision::NeedsAttention {
+            TickDecision::Blocked {
                 run,
                 unresolved_effects,
             } => write!(
                 text,
-                "{}: waiting: {run} is uncertain and not reconciled ({unresolved_effects} unresolved effects)",
-                pass.pass
+                "{pass}: blocked: {run} is uncertain{newly} ({unresolved_effects} unresolved effects on the tasks it recorded; it may have done more). Check what it did, then run `kitchn tick settle --pass {pass} --run {number}`.",
+                pass = pass.pass,
+                newly = if pass.newly_uncertain {
+                    ", recorded now"
+                } else {
+                    ""
+                },
+                number = run.get(),
             ),
             TickDecision::Superseded { run } => write!(
                 text,
-                "{}: {run} outlasted its lease; its end was refused",
+                "{}: {run} outlasted its lease or runtime; its end was refused",
                 pass.pass
             ),
             TickDecision::Busy { holder, expires_at } => write!(
@@ -182,14 +207,54 @@ fn run_tick(scope: HouseScope) -> Result<(String, bool), kitchen::Error> {
                 expires_at.as_unix_millis()
             ),
         };
-        if let Some(run) = pass.uncertain {
-            let _ = write!(text, " ({run} recorded as uncertain)");
-        }
-        for run in &pass.recovered {
-            let _ = write!(text, " ({run} reconciled)");
-        }
     }
     Ok((text, report.healthy()))
+}
+
+fn settle(
+    scope: HouseScope,
+    pass: Pass,
+    run: RunId,
+    reason: &Text,
+    holder: HolderId,
+) -> Result<(String, bool), kitchen::Error> {
+    let (store, _, _) = scope.open()?;
+    let settled = store.settle_run(
+        pass,
+        run,
+        &Claimant::interactive(holder),
+        reason,
+        SystemClock.now(),
+    )?;
+    let (record, already) = match &settled {
+        RunSettle::Settled(record) => (record, false),
+        RunSettle::AlreadySettled(record) => (record, true),
+    };
+    let RunState::Settled {
+        by,
+        settled_at,
+        reason,
+        unresolved_effects,
+        ..
+    } = &record.state
+    else {
+        return Err(HouseError::InvalidInput.into());
+    };
+    let text = if already {
+        format!(
+            "{pass}: {run} was already settled by {} at {}: {}\nNothing changed.",
+            by.as_str(),
+            settled_at.as_unix_millis(),
+            reason.as_str()
+        )
+    } else {
+        format!(
+            "{pass}: settled {run} for {}: {} ({unresolved_effects} unresolved effects recorded)\nThe pass runs again when due.",
+            by.as_str(),
+            reason.as_str()
+        )
+    };
+    Ok((text, true))
 }
 
 fn runs(scope: HouseScope) -> Result<(String, bool), kitchen::Error> {
@@ -224,22 +289,23 @@ fn runs(scope: HouseScope) -> Result<(String, bool), kitchen::Error> {
                 ended_at.as_unix_millis(),
                 backend_runs.len()
             ),
-            RunState::Uncertain { reconciled_at } => write!(
+            RunState::Uncertain { recorded_at } => write!(
                 text,
-                "uncertain, recorded at {}",
-                reconciled_at.as_unix_millis()
+                "uncertain, recorded at {}; blocks the pass until settled",
+                recorded_at.as_unix_millis()
             ),
-            RunState::Recovered {
-                recovered_at,
-                outcome,
-                backend_runs,
+            RunState::Settled {
+                by,
+                settled_at,
+                reason,
+                unresolved_effects,
                 ..
             } => write!(
                 text,
-                "{}, reconciled at {} ({} backend runs linked)",
-                outcome_text(*outcome),
-                recovered_at.as_unix_millis(),
-                backend_runs.len()
+                "uncertain, settled by {} at {} ({unresolved_effects} unresolved effects): {}",
+                by.as_str(),
+                settled_at.as_unix_millis(),
+                reason.as_str()
             ),
         };
     }

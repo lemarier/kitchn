@@ -54,7 +54,7 @@ use crate::{
         snapshot::{SnapshotStore, StoreLayout, StoreOptions},
         usage::{AttemptUsageEntry, UsageReport},
     },
-    workflows::tick::{Pass, PassReport, Recovery, Repeat},
+    workflows::tick::{Pass, PassReport},
 };
 
 #[cfg(doc)]
@@ -1075,11 +1075,10 @@ impl HouseStore {
 
     /// Start a tick pass when it is due: record a run whose pass lease
     /// expired as uncertain, then take the lease and record a running entry,
-    /// in one transaction. Unless `repeat` is [`Repeat::Idempotent`], an
-    /// uncertain run of the pass comes back as [`RunStart::Reconcile`] with
-    /// the lease held, and no new run starts. A live lease is
-    /// [`RunStart::Busy`] and changes nothing, so a duplicate trigger is
-    /// harmless.
+    /// in one transaction. An uncertain run of the pass comes back as
+    /// [`RunStart::Blocked`], holding no lease, until a person settles it
+    /// with [`Self::settle_run`]. A live lease is [`RunStart::Busy`] and
+    /// changes nothing, so a duplicate trigger is harmless.
     ///
     /// # Errors
     /// Consumer capacity and storage errors.
@@ -1087,41 +1086,46 @@ impl HouseStore {
         &self,
         pass: Pass,
         every: IntervalMinutes,
-        repeat: Repeat,
         holder: &HolderId,
         ttl: LeaseTtl,
         now: Timestamp,
     ) -> Result<RunStart> {
-        self.transact(|state| state.start_run(pass, every, repeat, holder, ttl, now))
+        self.transact(|state| state.start_run(pass, every, holder, ttl, now))
     }
 
-    /// Settle an uncertain run under the pass lease `fence` that
-    /// [`RunStart::Reconcile`] handed out, then release the lease. The run
-    /// is recorded as [`crate::state::RunState::Recovered`] only when
-    /// `recovery` establishes its outcome and no task the run touched has an
-    /// unresolved effect; otherwise it stays uncertain and keeps blocking.
+    /// Record that a person settled an uncertain run of `pass`: who, when,
+    /// and why, with the unresolved effects of the tasks the run recorded.
+    /// The pass may then run again when due. Settling a settled run returns
+    /// the first record unchanged.
+    ///
+    /// Check what the run did first: it may have acted without recording a
+    /// task, so no unresolved effect does not mean it did nothing.
     ///
     /// # Errors
-    /// [`TickError::Superseded`] when `fence` no longer holds the pass lease,
-    /// [`TickError::UnknownRun`], [`TickError::NotUncertain`],
-    /// [`TickError::AlreadyFinished`], [`TickError::TooMuchEvidence`], and
-    /// storage errors.
+    /// [`TickError::SettleNeedsPerson`] unless `claimant` is interactive,
+    /// [`StateError::CapacityExceeded`] for a reason longer than
+    /// [`crate::state::MAX_ACKNOWLEDGEMENT_REASON_BYTES`],
+    /// [`TickError::UnknownRun`] for no such run of `pass`,
+    /// [`TickError::NotUncertain`] for a running or ended run, and storage
+    /// errors.
     pub fn settle_run(
         &self,
+        pass: Pass,
         run: RunId,
-        fence: Fence,
-        recovery: Recovery,
+        claimant: &Claimant,
+        reason: &Text,
         now: Timestamp,
     ) -> Result<RunSettle> {
-        self.transact(|state| state.settle_run(run, fence, recovery, now))
+        self.transact(|state| state.settle_run(pass, run, claimant, reason, now))
     }
 
     /// Extend a live run's pass lease by `ttl`, so a slow pass is not taken
-    /// over. Renewal stops [`MAX_PASS_RUNTIME`] after the run started.
+    /// over. The lease never extends past [`MAX_PASS_RUNTIME`] after the run
+    /// started; returns the new expiry.
     ///
     /// # Errors
-    /// [`TickError::Superseded`] once another tick recorded the run as
-    /// uncertain or its lease lapsed, [`TickError::RunTooLong`],
+    /// [`TickError::Superseded`] once the run's lease lapsed, its runtime
+    /// ran out, or another tick recorded it as uncertain;
     /// [`TickError::NotRunOwner`], [`TickError::AlreadyFinished`],
     /// [`TickError::UnknownRun`], and storage errors.
     pub fn renew_run(
@@ -1135,8 +1139,8 @@ impl HouseStore {
     }
 
     /// Record that a live run is about to touch `task`, before it creates
-    /// intent or effects for it. Reconciling the run after a crash checks
-    /// these tasks' effects. Repeating is a no-op.
+    /// intent or effects for it. A blocked run reports these tasks'
+    /// unresolved effects. Repeating is a no-op.
     ///
     /// # Errors
     /// The errors of [`Self::renew_run`], and [`TickError::TooManyTasks`].
@@ -1150,15 +1154,15 @@ impl HouseStore {
         self.transact(|state| state.record_run_task(run, fence, task, now))
     }
 
-    /// Record how a run ended and release its pass lease if it still holds
-    /// it. Repeating the same end is a no-op.
+    /// Record how a live run ended and release its pass lease. Repeating
+    /// the same end is a no-op.
     ///
     /// # Errors
-    /// [`TickError::Superseded`] once another tick recorded the run as
-    /// uncertain (the ledger keeps the reconciled outcome),
-    /// [`TickError::UnknownRun`], [`TickError::NotRunOwner`] for another
-    /// fence, [`TickError::AlreadyFinished`] for a different earlier end,
-    /// and [`TickError::TooMuchEvidence`].
+    /// [`TickError::Superseded`] once the run's lease lapsed, its runtime
+    /// ran out, or another tick recorded it as uncertain; nothing changes
+    /// then. [`TickError::UnknownRun`], [`TickError::NotRunOwner`] for
+    /// another fence, [`TickError::AlreadyFinished`] for a different earlier
+    /// end, and [`TickError::TooMuchEvidence`].
     pub fn finish_run(
         &self,
         run: RunId,

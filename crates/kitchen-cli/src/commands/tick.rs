@@ -5,18 +5,26 @@
 //! each run in the house store's run ledger. The forge and worker backend
 //! are resolved only for a pass that is due. `runs` lists the ledger;
 //! `settle` records that a person settled an uncertain run; `trigger` prints
-//! a launchd plist or crontab line that runs the tick and installs nothing.
+//! a launchd plist or crontab line that runs the tick and installs nothing;
+//! `configure` stores the house's backend and pickup settings.
 //! Due decisions, leases, and the ledger stay in
 //! [`kitchen::workflows::tick`]; the passes in [`kitchen::workflows::run`].
 
-use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+    path::{Path, PathBuf},
+};
 
 use clap::{Args, Subcommand, ValueEnum};
 use kitchen::{
     HolderId, HouseId,
     adoption::HouseRegistry,
     contracts::{Capability, Claimant, Clock, Repository, SystemClock, Text},
-    house::{HouseError, forge_binding},
+    house::{
+        HouseError, OrcaHost, RUNTIME_SCHEMA, RuntimeConfig, RuntimeOutcome, forge_binding,
+        runtime_config, store_runtime,
+    },
     state::{HouseStore, RunId, RunSettle, RunState, StoreOptions},
     workflows::{
         coordination::MailboxRoute,
@@ -74,7 +82,9 @@ enum TickCommand {
         holder: HolderId,
     },
     /// Print a launchd plist or crontab line that runs the tick. Installs
-    /// nothing.
+    /// nothing and stores nothing: the line names only the registry and the
+    /// house, and every tick reads its backend and pickup settings from the
+    /// runtime configuration `tick configure` stores.
     Trigger {
         #[arg(value_enum)]
         format: TriggerFormat,
@@ -90,6 +100,29 @@ enum TickCommand {
         /// Minutes between ticks, 1 to 59. Each pass still runs only when due.
         #[arg(long, default_value_t = 5)]
         every_minutes: u8,
+    },
+    /// Store the house's backend, repository, and pickup settings, owner-only,
+    /// in its private runtime configuration in the registry. Every tick and
+    /// `kitchn run` reads them there. This is the only command that changes
+    /// what is stored: a tick or run flag that disagrees with it is refused.
+    /// Flags given here overlay what is already stored; nothing is stored
+    /// unless the whole configuration validates.
+    Configure {
+        /// Absolute path of the house registry.
+        #[arg(long)]
+        registry: PathBuf,
+        /// The house the settings belong to.
+        #[arg(long)]
+        house: HouseId,
+        /// The repository a multi-repository house's passes serve, as
+        /// `owner/name`.
+        #[arg(long)]
+        repository: Option<Repository>,
+        #[command(flatten)]
+        backend: BackendArgs,
+        /// Scheduled pickup settings.
+        #[command(flatten)]
+        pickup: Box<PickupArgs>,
     },
 }
 
@@ -214,9 +247,104 @@ pub fn run(args: TickArgs) -> Result<(String, bool), kitchen::Error> {
             };
             Ok((text.trim_end().to_owned(), true))
         }
+        (
+            Some(TickCommand::Configure {
+                registry,
+                house,
+                repository,
+                backend,
+                pickup,
+            }),
+            _,
+        ) => configure(&registry, &house, repository, &backend, &pickup),
         (None, Some(house)) => run_tick(house, args.repository, &args.backend, &args.pickup),
         (None, None) => Err(HouseError::InvalidInput.into()),
     }
+}
+
+/// Store the backend, repository, and pickup flags, overlaid on what the
+/// house already stores. Nothing is written when none was given or the
+/// whole configuration does not validate.
+fn configure(
+    registry: &Path,
+    house: &HouseId,
+    repository: Option<Repository>,
+    flags: &BackendArgs,
+    pickup: &PickupArgs,
+) -> Result<(String, bool), kitchen::Error> {
+    let orca_given = [
+        flags.orca.is_some(),
+        flags.runtime_dir.is_some(),
+        flags.orca_run.is_some(),
+        flags.orca_coordinator.is_some(),
+        flags.orca_repo.is_some(),
+    ];
+    if repository.is_none() && flags.curl.is_none() && !pickup.any() && !orca_given.contains(&true)
+    {
+        return Err(HouseError::InvalidInput.into());
+    }
+    let registry = HouseRegistry::new(registry)?;
+    let mut runtime = runtime_config(&registry, house)?.unwrap_or(RuntimeConfig {
+        schema: RUNTIME_SCHEMA,
+        house: house.clone(),
+        orca: None,
+        curl: None,
+        repository: None,
+        pickup: None,
+    });
+    if orca_given.contains(&true) {
+        let stored = runtime.orca.take();
+        let orca = (
+            flags
+                .orca
+                .clone()
+                .or(stored.as_ref().map(|orca| orca.executable.clone())),
+            flags
+                .runtime_dir
+                .clone()
+                .or(stored.as_ref().map(|orca| orca.runtime_dir.clone())),
+            flags
+                .orca_run
+                .clone()
+                .or(stored.as_ref().map(|orca| orca.run.clone())),
+            flags
+                .orca_coordinator
+                .clone()
+                .or(stored.as_ref().map(|orca| orca.coordinator.clone())),
+            flags
+                .orca_repo
+                .clone()
+                .or(stored.as_ref().map(|orca| orca.repo.clone())),
+        );
+        let (Some(executable), Some(runtime_dir), Some(run), Some(coordinator), Some(repo)) = orca
+        else {
+            return Err(kitchen::workflows::run::RunError::BackendArguments(
+                "all of --orca, --runtime-dir, --orca-run, --orca-coordinator, and --orca-repo",
+            )
+            .into());
+        };
+        runtime.orca = Some(OrcaHost {
+            executable,
+            runtime_dir,
+            run,
+            coordinator,
+            repo,
+        });
+    }
+    runtime.curl = flags.curl.clone().or(runtime.curl);
+    runtime.repository = repository.or(runtime.repository);
+    if pickup.any() {
+        runtime.pickup = Some(pickup.overlay(runtime.pickup.take().unwrap_or_default()));
+    }
+    let outcome = match store_runtime(&registry, &runtime)? {
+        RuntimeOutcome::Created => "stored",
+        RuntimeOutcome::Replaced => "updated",
+        RuntimeOutcome::Unchanged => "unchanged",
+    };
+    Ok((
+        format!("{outcome} the runtime configuration of house {house}"),
+        true,
+    ))
 }
 
 fn run_tick(

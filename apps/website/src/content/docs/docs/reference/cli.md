@@ -454,6 +454,8 @@ kitchn tick --registry <dir> --house <id> [--store <dir>] [--repository <owner/n
 kitchn tick runs --registry <dir> --house <id> [--store <dir>]
 kitchn tick settle --registry <dir> --house <id> [--store <dir>] --pass <pass> --run <n> --reason <text> --holder <you>
 kitchn tick trigger launchd|cron --kitchn <abs path> --registry <abs dir> --house <id> [--every-minutes 1-59]
+kitchn tick configure --registry <abs dir> --house <id> [--repository <owner/name>]
+            [<backend>] [<pickup settings>]
 ```
 
 Each configured pass runs when it never ran or its last run started at least
@@ -495,9 +497,33 @@ worker's backend reference is linked as run evidence.
 `runs` lists the ledger and reads only. `trigger` prints a launchd plist or a
 crontab line that runs the tick every `--every-minutes` (default 5; for cron it
 must divide 60, since cron restarts its minute step each hour); it installs
-nothing and changes no live schedule. The printed command names only the registry and the
-house, so a house whose passes need worker backend options must add them to it
-by hand for now.
+nothing, stores nothing, and changes no live schedule. The printed command names
+only the registry and the house.
+
+The host facts a worker backend needs on every tick live in the house's
+private runtime configuration, `private/<house>/runtime.json` in the registry:
+the Orca executable, runtime directory, Run, coordinator, and repository
+selector, the `curl` path for an HTTP backend, and the repository a
+multi-repository house's passes serve. Give `configure` the `<backend>` flags, `--repository`, and the pickup settings
+(`--ready-label`, `--needs-spec-label`, `--human-label`, `--capacity` from 1 to
+64, `--branch-prefix`, `--report-path`, which must stay inside the workspace)
+and it stores them there, replacing a valid file and overlaying flags you leave
+out on what is stored, then prints whether it stored, updated, or left the file
+unchanged. It refuses a call that gives no flag. It validates every argument
+before it writes, and it writes through a uniquely named owner-only temporary
+that it renames over the file, so a call that fails validation or storage leaves
+the file as it was, and a temporary file from another writer is never removed. To
+recover from an invalid file, remove it and run `configure` again. `configure` is the only
+command that changes the file; `trigger` never writes it and takes none of these
+flags. The tick and `kitchn run` read the file. A flag on their command
+line that names a different value than the stored one is refused before any
+backend is contacted, naming the flag; a flag that repeats the stored value, or
+a setting the file does not hold, is accepted. The file holds paths, labels, and
+identifiers only, never a credential (unknown fields are refused), and is
+created owner-only. A file that others can access, a link, a damaged file, one
+for another house, or one with a relative path is refused with an error, and no
+backend is contacted. A pass without the
+facts it needs is recorded as failed and the error names the flags.
 
 ## `kitchn run`
 

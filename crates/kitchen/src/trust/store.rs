@@ -763,7 +763,8 @@ pub(crate) fn store_error(error: crate::Error) -> TrustError {
         | crate::Error::Audit(_)
         | crate::Error::Mail(_)
         | crate::Error::Tick(_)
-        | crate::Error::Run(_) => TrustError::Refused,
+        | crate::Error::Run(_)
+        | crate::Error::Runtime(_) => TrustError::Refused,
     }
 }
 fn audit_identity(audit: &GrantAudit) -> (&crate::contracts::ExternalRef, &HouseId) {

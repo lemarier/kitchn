@@ -9,14 +9,21 @@
 //! Due decisions, leases, and the ledger stay in
 //! [`kitchen::workflows::tick`]; the passes in [`kitchen::workflows::run`].
 
-use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+    path::{Path, PathBuf},
+};
 
 use clap::{Args, Subcommand, ValueEnum};
 use kitchen::{
     HolderId, HouseId,
     adoption::HouseRegistry,
     contracts::{Capability, Claimant, Clock, Repository, SystemClock, Text},
-    house::{HouseError, forge_binding},
+    house::{
+        HouseError, OrcaHost, RUNTIME_SCHEMA, RuntimeConfig, forge_binding, runtime_config,
+        store_runtime,
+    },
     state::{HouseStore, RunId, RunSettle, RunState, StoreOptions},
     workflows::{
         coordination::MailboxRoute,
@@ -74,7 +81,9 @@ enum TickCommand {
         holder: HolderId,
     },
     /// Print a launchd plist or crontab line that runs the tick. Installs
-    /// nothing.
+    /// nothing. Backend flags given here are stored, owner-only, in the
+    /// house's private runtime configuration in the registry, and every tick
+    /// reads them there; the printed line carries no backend flags.
     Trigger {
         #[arg(value_enum)]
         format: TriggerFormat,
@@ -90,6 +99,12 @@ enum TickCommand {
         /// Minutes between ticks, 1 to 59. Each pass still runs only when due.
         #[arg(long, default_value_t = 5)]
         every_minutes: u8,
+        /// The repository a multi-repository house's passes serve, as
+        /// `owner/name`. Stored with the backend flags.
+        #[arg(long)]
+        repository: Option<Repository>,
+        #[command(flatten)]
+        backend: BackendArgs,
     },
 }
 
@@ -199,9 +214,12 @@ pub fn run(args: TickArgs) -> Result<(String, bool), kitchen::Error> {
                 registry,
                 house,
                 every_minutes,
+                repository,
+                backend,
             }),
             _,
         ) => {
+            store_runtime_flags(&registry, &house, repository, &backend)?;
             let target = TriggerTarget::new(
                 &kitchn,
                 &registry,
@@ -217,6 +235,77 @@ pub fn run(args: TickArgs) -> Result<(String, bool), kitchen::Error> {
         (None, Some(house)) => run_tick(house, args.repository, &args.backend, &args.pickup),
         (None, None) => Err(HouseError::InvalidInput.into()),
     }
+}
+
+/// Store the backend and repository flags, overlaid on what the house
+/// already stores, when any was given. Nothing is written otherwise.
+fn store_runtime_flags(
+    registry: &Path,
+    house: &HouseId,
+    repository: Option<Repository>,
+    flags: &BackendArgs,
+) -> Result<(), kitchen::Error> {
+    let orca_given = [
+        flags.orca.is_some(),
+        flags.runtime_dir.is_some(),
+        flags.orca_run.is_some(),
+        flags.orca_coordinator.is_some(),
+        flags.orca_repo.is_some(),
+    ];
+    if repository.is_none() && flags.curl.is_none() && !orca_given.contains(&true) {
+        return Ok(());
+    }
+    let registry = HouseRegistry::new(registry)?;
+    let mut runtime = runtime_config(&registry, house)?.unwrap_or(RuntimeConfig {
+        schema: RUNTIME_SCHEMA,
+        house: house.clone(),
+        orca: None,
+        curl: None,
+        repository: None,
+    });
+    if orca_given.contains(&true) {
+        let stored = runtime.orca.take();
+        let orca = (
+            flags
+                .orca
+                .clone()
+                .or(stored.as_ref().map(|orca| orca.executable.clone())),
+            flags
+                .runtime_dir
+                .clone()
+                .or(stored.as_ref().map(|orca| orca.runtime_dir.clone())),
+            flags
+                .orca_run
+                .clone()
+                .or(stored.as_ref().map(|orca| orca.run.clone())),
+            flags
+                .orca_coordinator
+                .clone()
+                .or(stored.as_ref().map(|orca| orca.coordinator.clone())),
+            flags
+                .orca_repo
+                .clone()
+                .or(stored.as_ref().map(|orca| orca.repo.clone())),
+        );
+        let (Some(executable), Some(runtime_dir), Some(run), Some(coordinator), Some(repo)) = orca
+        else {
+            return Err(kitchen::workflows::run::RunError::BackendArguments(
+                "all of --orca, --runtime-dir, --orca-run, --orca-coordinator, and --orca-repo",
+            )
+            .into());
+        };
+        runtime.orca = Some(OrcaHost {
+            executable,
+            runtime_dir,
+            run,
+            coordinator,
+            repo,
+        });
+    }
+    runtime.curl = flags.curl.clone().or(runtime.curl);
+    runtime.repository = repository.or(runtime.repository);
+    store_runtime(&registry, &runtime)?;
+    Ok(())
 }
 
 fn run_tick(

@@ -33,6 +33,7 @@ use kitchen::{
     },
     house::{
         BackendKind, CredentialKind, ForgeCredential, HouseConfig, credential_path, forge_binding,
+        runtime_config,
     },
     integrations::github::{CredentialFile, GhCli, GitHubClient, ReadLimits},
     scheduling::AgentFamily,
@@ -110,27 +111,27 @@ struct HouseArgs {
 }
 
 /// Where the house's bound worker backend runs on this host.
-#[derive(Args)]
+#[derive(Args, Default)]
 pub(super) struct BackendArgs {
     /// Absolute path of the Orca executable, for a house bound to Orca.
     #[arg(long)]
-    orca: Option<PathBuf>,
+    pub(super) orca: Option<PathBuf>,
     /// House-scoped Orca runtime storage shared by every caller.
     #[arg(long)]
-    runtime_dir: Option<PathBuf>,
+    pub(super) runtime_dir: Option<PathBuf>,
     /// The Orca Run that owns the house's workers and mailbox.
     #[arg(long)]
-    orca_run: Option<ExternalRef>,
+    pub(super) orca_run: Option<ExternalRef>,
     /// The Orca coordinator terminal handle calls are attributed to.
     #[arg(long)]
-    orca_coordinator: Option<ExternalRef>,
+    pub(super) orca_coordinator: Option<ExternalRef>,
     /// The Orca repository selector for worker workspaces, such as
     /// `id:<repo-id>`.
     #[arg(long)]
-    orca_repo: Option<ExternalRef>,
+    pub(super) orca_repo: Option<ExternalRef>,
     /// Absolute path of `curl`, for a house bound to an HTTP backend.
     #[arg(long)]
-    curl: Option<PathBuf>,
+    pub(super) curl: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -187,6 +188,14 @@ impl Opened {
         let registry = HouseRegistry::new(root)?;
         let config = registry.load(house)?;
         let store = HouseStore::open(store, house.clone(), StoreOptions::default())?;
+        // A house with several repositories may store which one its passes
+        // serve; the stored file is read only when that decides.
+        let repository = match repository {
+            None if config.repositories.len() > 1 => {
+                runtime_config(&registry, house)?.and_then(|stored| stored.repository)
+            }
+            named => named,
+        };
         let repository = pass_repository(&config, repository)?;
         Ok(Self {
             registry,
@@ -224,21 +233,32 @@ impl Opened {
     ) -> Result<Box<dyn CoordinatorMailbox>, kitchen::Error> {
         let (_, kind) = backend_binding(&self.config)?;
         let missing = |needs| kitchen::Error::from(RunError::BackendArguments(needs));
+        // Flags win; the house's stored runtime configuration fills the rest.
+        let stored = runtime_config(&self.registry, &self.config.house)?;
         match kind {
             BackendKind::Orca => {
+                let stored = stored.and_then(|stored| stored.orca);
                 let (Some(orca), Some(runtime_dir), Some(run), Some(coordinator), Some(repo)) = (
-                    &args.orca,
-                    &args.runtime_dir,
-                    &args.orca_run,
-                    &args.orca_coordinator,
-                    &args.orca_repo,
+                    args.orca
+                        .as_ref()
+                        .or(stored.as_ref().map(|orca| &orca.executable)),
+                    args.runtime_dir
+                        .as_ref()
+                        .or(stored.as_ref().map(|orca| &orca.runtime_dir)),
+                    args.orca_run
+                        .as_ref()
+                        .or(stored.as_ref().map(|orca| &orca.run)),
+                    args.orca_coordinator
+                        .as_ref()
+                        .or(stored.as_ref().map(|orca| &orca.coordinator)),
+                    args.orca_repo
+                        .as_ref()
+                        .or(stored.as_ref().map(|orca| &orca.repo)),
                 ) else {
-                    return Err(missing(
-                        "--orca, --runtime-dir, --orca-run, --orca-coordinator, and --orca-repo",
-                    ));
+                    return Err(missing(ORCA_ARGUMENTS));
                 };
-                if !orca.is_absolute() {
-                    return Err(missing("an absolute --orca path"));
+                if !orca.is_absolute() || !runtime_dir.is_absolute() {
+                    return Err(missing("absolute --orca and --runtime-dir paths"));
                 }
                 Ok(Box::new(resolve_backend(
                     &self.config,
@@ -259,8 +279,13 @@ impl Opened {
                 )?))
             }
             BackendKind::Http => {
-                let Some(curl) = args.curl.as_ref().filter(|curl| curl.is_absolute()) else {
-                    return Err(missing("an absolute --curl path"));
+                let Some(curl) = args
+                    .curl
+                    .as_ref()
+                    .or(stored.as_ref().and_then(|stored| stored.curl.as_ref()))
+                    .filter(|curl| curl.is_absolute())
+                else {
+                    return Err(missing(HTTP_ARGUMENTS));
                 };
                 Ok(Box::new(resolve_http_backend(
                     &self.registry,
@@ -278,6 +303,12 @@ impl Opened {
         }
     }
 }
+
+/// What an Orca house's passes need, from flags or the stored runtime
+/// configuration.
+const ORCA_ARGUMENTS: &str = "--orca, --runtime-dir, --orca-run, --orca-coordinator, and --orca-repo (or store them with `kitchn tick trigger`)";
+/// What an HTTP house's passes need.
+const HTTP_ARGUMENTS: &str = "an absolute --curl path (or store it with `kitchn tick trigger`)";
 
 /// Per-call deadline for an HTTP worker backend.
 const HTTP_CALL_TIMEOUT: Duration = Duration::from_secs(20);

@@ -110,6 +110,9 @@ pub enum Error {
     /// A scheduled runner pass refused its input or mailbox.
     #[error(transparent)]
     Run(#[from] crate::workflows::run::RunError),
+    /// A house's runtime configuration was refused.
+    #[error(transparent)]
+    Runtime(#[from] crate::house::RuntimeError),
 }
 
 impl Error {
@@ -145,6 +148,7 @@ impl Error {
             Self::Mail(error) => error.class(),
             Self::Tick(error) => error.class(),
             Self::Run(error) => error.class(),
+            Self::Runtime(error) => error.class(),
         }
     }
 }

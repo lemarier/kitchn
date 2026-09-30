@@ -39,6 +39,8 @@ own selection flows; `init` and `adopt` still need `--house` for an unbound
 target. Scheduled triggers carry explicit registry and house flags because
 they can run outside a checkout.
 
+For `gate review`, an omitted `--head` is the clean checkout's `HEAD`, checked against the live pull request head. For `gate review` and `gate attest`, an omitted `--pull-request` is the sole open pull request in the selected house repository at that commit. The checkout repository must match the selected repository; dirty, stale, missing, ambiguous, or incomplete forge evidence is refused. Explicit identifiers override inference. `gate attest` with an explicit PR number reads that PR without requiring a checkout.
+
 ## `kitchn house init`
 
 Register a house, pin its guidance, and create its state store. Grants no
@@ -685,12 +687,10 @@ messages no worker.
 Post findings through the selected house's forge binding at an exact pull request head. The house must grant `review-pull-request` for the repository and forge credential. The command reads the live base tip, adds a `kitchen-attestation` block, persists the write intent, and reads back the posted review id. An uncertain submission is reconciled by its marker on retry and is never blindly posted again. `--attest` verifies and records an approved review for the scheduled gate; a binding whose login authored the pull request is refused by attestation.
 
 ```sh
-kitchn gate review --pull-request <number> --head <40-character-sha> \
-  --verdict approve --body-file <findings.md> \
+kitchn gate review --verdict approve --body-file <findings.md> \
   --semantic clean --acceptance complete --hardware complete --risk none [--attest]
 
-kitchn gate review --pull-request <number> \
-  --head <40-character-sha> --verdict request-changes --body-file <findings.md>
+kitchn gate review --verdict request-changes --body-file <findings.md>
 ```
 
 Approval requires all four claim flags. `request-changes` refuses claim flags and `--attest`. The review uses the house's forge identity and its PullRequests write permission; posting a review alone never grants merge authority. A moved head or base refuses submission. The body file must not contain its own attestation block.
@@ -714,7 +714,7 @@ risk=none
 `semantic` is `clean`, `findings`, `partial`, or `unavailable`. `read_only` is `true` or `false`. `acceptance` and `hardware` are `complete` or `incomplete`. `risk` is `none` or a comma-separated list of distinct classes: `equipment-safety`, `authorization-secrets`, `durable-data`, `public-contract-release`, `workflow-rules`, `dependencies`, `weakened-validation`, and `large-diff`. The block must contain each key once, with no extra keys. Risk classes still require a separate human approval; this command does not grant one.
 
 ```sh
-kitchn gate attest --pull-request <number> --review-id <forge-review-id>
+kitchn gate attest --review-id <forge-review-id>
 ```
 
 ## `kitchn pickup`

@@ -4,9 +4,69 @@
 use std::{ffi::OsString, path::PathBuf};
 
 use kitchen::{
-    adoption::{HouseRegistry, origin_repository},
+    adoption::{HouseRegistry, clean_checkout_head, origin_repository},
+    contracts::{CommitId, IssueNumber},
     house::HouseError,
+    integrations::github::{GhCli, GitHubClient, IntegrationError, IssueState, Observation},
 };
+
+use super::run::Opened;
+
+/// Resolve gate identifiers against the house-scoped forge. A missing PR is
+/// selected only from a complete list of open PRs at the selected commit.
+pub(super) fn gate_subject(
+    opened: &Opened,
+    forge: &GitHubClient<GhCli>,
+    pull_request: Option<IssueNumber>,
+    head: Option<CommitId>,
+) -> Result<(IssueNumber, CommitId), kitchen::Error> {
+    let inferred_head = head.is_none();
+    let checkout_head = if inferred_head {
+        let cwd = std::env::current_dir().map_err(HouseError::from)?;
+        if origin_repository(&cwd)? != opened.repository {
+            return Err(IntegrationError::ScopeMismatch.into());
+        }
+        Some(clean_checkout_head(&cwd)?)
+    } else {
+        None
+    };
+    let selected_head = head
+        .or(checkout_head.clone())
+        .ok_or(HouseError::MissingFlag { flag: "--head" })?;
+    let pull_request = match pull_request {
+        Some(number) => number,
+        None => {
+            let prs = known(forge.open_pull_requests(&opened.config.house, &opened.repository))?;
+            let matches: Vec<_> = prs
+                .into_iter()
+                .filter(|pr| pr.state == IssueState::Open && pr.head.sha == selected_head)
+                .collect();
+            if matches.len() != 1 {
+                return Err(HouseError::MissingFlag {
+                    flag: "--pull-request",
+                }
+                .into());
+            }
+            matches[0].number
+        }
+    };
+    if let Some(checkout_head) = checkout_head {
+        let live =
+            known(forge.pull_request(&opened.config.house, &opened.repository, pull_request))?;
+        if live.state != IssueState::Open || live.head.sha != checkout_head {
+            return Err(HouseError::StaleCheckoutHead.into());
+        }
+    }
+    Ok((pull_request, selected_head))
+}
+
+fn known<T>(observation: Observation<T>) -> Result<T, kitchen::Error> {
+    match observation {
+        Observation::Known(value) => Ok(value),
+        Observation::Unknown => Err(IntegrationError::Unknown.into()),
+        Observation::Unavailable(error) => Err(error.into()),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {

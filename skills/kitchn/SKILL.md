@@ -17,6 +17,8 @@ repository binding, and the house store. Use the short forms below. If the
 checkout is unbound or selection is ambiguous, stop and resolve it with the
 person. Kitchen writes nothing into the repository's working tree.
 
+For an expediter in a clean PR checkout, use `kitchn gate review --verdict approve --body-file <findings.md> --semantic clean --acceptance complete --hardware complete --risk none` or `kitchn gate attest --review-id <id>`. Kitchen verifies the checked out commit against the live forge head and finds the sole open PR at that commit. The claim flags describe the review and remain explicit. Pass `--head` or `--pull-request` when checkout inference is unavailable.
+
 ## 1. Start every session
 
 1. Read the pinned revision: `git rev-parse HEAD` → `<rev>`.

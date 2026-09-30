@@ -205,6 +205,23 @@ pub fn checkout_root(start: &Path) -> Result<PathBuf, HouseError> {
     Ok(root)
 }
 
+/// Return the checked out commit only when tracked and untracked files are clean.
+///
+/// # Errors
+/// A dirty checkout is refused; Git reads are bounded by the shared runner.
+pub fn clean_checkout_head(start: &Path) -> Result<crate::contracts::CommitId, HouseError> {
+    let status = git(
+        start,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if !status.is_empty() {
+        return Err(HouseError::DirtyCheckout);
+    }
+    let head = git(start, &["rev-parse", "--verify", "HEAD"])?;
+    crate::contracts::CommitId::new(head.trim())
+        .map_err(|_| HouseError::Git(GitReadError::Malformed))
+}
+
 /// Normalize a GitHub remote URL to lowercase `owner/name`.
 ///
 /// Accepts `https://`, `http://`, `ssh://`, `git://`, `git+ssh://` and

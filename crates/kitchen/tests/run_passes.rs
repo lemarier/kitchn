@@ -957,7 +957,9 @@ fn coordinate_acknowledges_a_late_message_from_a_settled_task() -> TestResult {
     acted(kitchen.coordinate()?)?;
     // The worker repeats its report after the task settled; it must not
     // hold up the mailbox.
-    kitchen.backend.post(vec![report(&worker, "done-7-again")?])?;
+    kitchen
+        .backend
+        .post(vec![report(&worker, "done-7-again")?])?;
     let actions = acted(kitchen.coordinate_on(&kitchen.backend, false)?)?;
     assert_eq!(
         actions,

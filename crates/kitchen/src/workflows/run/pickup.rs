@@ -412,7 +412,8 @@ fn has_label(issue: &Issue, name: &str) -> bool {
 }
 
 /// The list items under the issue's first heading or line that starts with
-/// "Acceptance", verbatim, at most [`MAX_ACCEPTANCE`]. Checkbox markers are
+/// "Acceptance", verbatim, at most [`MAX_ACCEPTANCE`]; blank lines between
+/// items are allowed. Checkbox markers are
 /// kept as written. Empty when the issue states none.
 fn acceptance(body: Option<&str>) -> Vec<Text> {
     let Some(body) = body else {
@@ -430,7 +431,8 @@ fn acceptance(body: Option<&str>) -> Vec<Text> {
     lines
         .map(str::trim)
         .skip_while(|line| line.is_empty())
-        .take_while(|line| line.starts_with("- ") || line.starts_with("* "))
+        .take_while(|line| line.is_empty() || line.starts_with("- ") || line.starts_with("* "))
+        .filter(|line| !line.is_empty())
         .filter_map(|line| Text::new(line.get(2..).unwrap_or_default().trim()).ok())
         .take(MAX_ACCEPTANCE)
         .collect()
@@ -449,7 +451,7 @@ mod tests {
 
     #[test]
     fn acceptance_reads_the_list_under_its_heading() {
-        let body = "Intro.\n\n## Acceptance criteria\n\n- [ ] The driver builds.\n* Tests pass.\n\nMore prose.\n- not acceptance";
+        let body = "Intro.\n\n## Acceptance criteria\n\n- [ ] The driver builds.\n\n* Tests pass.\n\nMore prose.\n- not acceptance";
         assert_eq!(items(body), ["[ ] The driver builds.", "Tests pass."]);
     }
 

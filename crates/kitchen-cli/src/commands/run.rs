@@ -195,10 +195,14 @@ impl Opened {
         Ok(GitHubClient::new(scope, transport, ReadLimits::default()))
     }
 
-    /// The house's bound worker backend, which must support `required`.
+    /// The house's bound worker backend for `pass`, which must support
+    /// `required`. Orca names each worker's workspace after its branch
+    /// without `branch_prefix`.
     fn backend(
         &self,
         args: &BackendArgs,
+        pass: Pass,
+        branch_prefix: Option<BranchName>,
         required: &[Capability],
     ) -> Result<Box<dyn CoordinatorMailbox>, kitchen::Error> {
         let (_, kind) = backend_binding(&self.config)?;
@@ -226,7 +230,7 @@ impl Opened {
                         coordinator: coordinator.clone(),
                         repo: repo.clone(),
                         base_branch: None,
-                        branch_prefix: None,
+                        branch_prefix,
                         agent: AgentFamily::Claude,
                         call_timeout: DEFAULT_CALL_TIMEOUT,
                         launch_timeout: DEFAULT_LAUNCH_TIMEOUT,
@@ -246,7 +250,7 @@ impl Opened {
                     &self.config,
                     HttpSession {
                         run: ExternalRef::new(&format!("kitchen-{}", self.config.house))?,
-                        coordinator: ExternalRef::new(Pass::Coordinate.as_str())?,
+                        coordinator: ExternalRef::new(pass.as_str())?,
                         curl: curl.clone(),
                         call_timeout: HTTP_CALL_TIMEOUT,
                     },
@@ -271,8 +275,13 @@ pub fn run(args: RunArgs) -> ExitCode {
         } => Opened::open(&house).and_then(|opened| {
             // The route is decided by the backend's own descriptor inside
             // the pass; only supervision is required to connect.
-            let backend = opened.backend(&backend, MailboxRoute::House.worker_requirements())?;
             let settings = settings(&opened, pickup)?;
+            let backend = opened.backend(
+                &backend,
+                Pass::Pickup,
+                Some(settings.branch_prefix.clone()),
+                MailboxRoute::House.worker_requirements(),
+            )?;
             let forge = opened.forge()?;
             render(
                 PickupPass {
@@ -288,7 +297,12 @@ pub fn run(args: RunArgs) -> ExitCode {
             )
         }),
         RunCommand::Coordinate { house, backend } => Opened::open(&house).and_then(|opened| {
-            let backend = opened.backend(&backend, MailboxRoute::House.worker_requirements())?;
+            let backend = opened.backend(
+                &backend,
+                Pass::Coordinate,
+                None,
+                MailboxRoute::House.worker_requirements(),
+            )?;
             let forge = opened.forge()?;
             render(
                 CoordinatePass {
@@ -303,7 +317,12 @@ pub fn run(args: RunArgs) -> ExitCode {
             )
         }),
         RunCommand::Repair { house, backend } => Opened::open(&house).and_then(|opened| {
-            let backend = opened.backend(&backend, &[Capability::WorkerStatusAndOutcome])?;
+            let backend = opened.backend(
+                &backend,
+                Pass::Repair,
+                None,
+                &[Capability::WorkerStatusAndOutcome],
+            )?;
             let forge = opened.forge()?;
             render(
                 RepairPass {

@@ -68,6 +68,10 @@ earned, never assumed.
 Each [role card](roles/) lists what the station owes as evidence and the line it
 can't cross.
 
+The dishwasher recognizes a reconciled stopped launch as creation evidence.
+After a retry, it checks the worker and worktree from each attempt for backend
+ownership, settlement, and preserved work before an approved release.
+
 ## What stays true
 
 - **Nothing happens because you installed it.** Installing kitchn, choosing a

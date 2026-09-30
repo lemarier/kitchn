@@ -960,12 +960,12 @@ impl TaskRecord {
         submitted
     }
 
-    /// Whether the task was given `resource` or an applied effect of this
+    /// Whether the task was given `resource` or an applied or ended effect of this
     /// task created it. Touching a resource does not transfer it.
     fn owns_resource(&self, resource: &ResourceRef) -> bool {
         self.spec.resources.contains(resource)
             || self.effects.iter().any(|effect| {
-                matches!(&effect.state, EffectState::Applied { receipt, .. }
+                matches!(&effect.state, EffectState::Applied { receipt, .. } | EffectState::Ended { receipt, .. }
                     if receipt.created().contains(resource))
             })
     }

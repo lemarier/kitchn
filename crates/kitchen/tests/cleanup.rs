@@ -23,15 +23,15 @@ use kitchen::{
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, BackendUnavailable,
         BranchName, Capability, CapabilitySet, Claimant, Clock, CommitId, Consent, Effect,
-        EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, Fence, Grant,
-        HouseGrants, Liveness, Lookup, NotAppliedReason, Operation, Permission, Provenance,
-        Receipt, ResourceKind, ResourceObservation, ResourceRef, WorkerBackend, WorkerOutcome,
-        WorkerState,
+        EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision, ExternalRef, FailureClass,
+        Fence, Grant, HouseGrants, Liveness, Lookup, NotAppliedReason, Operation, Permission,
+        Provenance, Receipt, ResourceKind, ResourceObservation, ResourceRef, WorkerBackend,
+        WorkerOutcome, WorkerState,
         fake::{ExecuteFault, FakeBackend},
     },
     state::{
         EffectOutcome, EffectStart, EffectState, HouseStore, MarkerFact, MarkerKey, MarkerSchema,
-        MarkerSubject, RiskAction, RiskDecision, WorkItem, run_effect,
+        MarkerSubject, RiskAction, RiskDecision, WorkItem, reconcile, run_effect,
     },
     workflows::cleanup::{
         ApplyOptions, ApplyReport, ApprovalOutcome, ApprovalResult, BuildOutcome, BuildReport,
@@ -206,6 +206,8 @@ struct Inventory {
     /// Resources the inventory leaves out although the backend still knows
     /// them, such as a worker whose listing was truncated.
     hidden: RefCell<Vec<ResourceRef>>,
+    /// Model Orca finding a stopped dispatch after its launch response was lost.
+    ended_launches: Cell<bool>,
 }
 
 impl Inventory {
@@ -219,6 +221,7 @@ impl Inventory {
             outage: Cell::new(false),
             created_override: RefCell::new(None),
             hidden: RefCell::new(Vec::new()),
+            ended_launches: Cell::new(false),
         }
     }
 
@@ -274,7 +277,17 @@ impl EffectExecutor for Inventory {
     }
 
     fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {
-        self.fake.lookup(request)
+        let found = self.fake.lookup(request)?;
+        if self.ended_launches.get()
+            && matches!(
+                request.effect(),
+                Effect::Worker(Operation::LaunchWorker { .. })
+            )
+            && let Lookup::Applied(ref receipt) = found
+        {
+            return Ok(Lookup::Ended(receipt.clone()));
+        }
+        Ok(found)
     }
 }
 
@@ -604,6 +617,131 @@ fn a_settled_clean_pushed_task_is_eligible_with_its_evidence() -> TestResult {
     assert_eq!(worktree["worktree"]["type"], "read");
     assert_eq!(worktree["worktree"]["state"]["unpushedCommits"], false);
     assert_eq!(worktree["decision"]["type"], "release");
+    Ok(())
+}
+
+#[test]
+fn stopped_reconciled_launch_and_retry_keep_cleanup_ownership() -> TestResult {
+    let mut harness = Harness::new()?;
+    let task = TaskId::new("task-1")?;
+    let store = &harness.fixture.store;
+    store.create_task(spec("task-1")?, &scheduled("pickup")?, harness.clock.now())?;
+    let fence = store
+        .claim(&task, &scheduled("pickup")?, ttl(600)?, harness.clock.now())?
+        .fence();
+    harness.backend.ended_launches.set(true);
+    let mut resources = Vec::new();
+
+    for number in 1..=2 {
+        let AttemptStart::Started(attempt) =
+            store.start_attempt(&task, fence, harness.clock.now())?
+        else {
+            return Err("retry did not start".into());
+        };
+        assert_eq!(attempt.get(), number);
+        harness
+            .backend
+            .fake
+            .inject(ExecuteFault::ApplyThenLoseResponse);
+        let launch = run_effect(
+            store,
+            &harness.backend,
+            &grants()?,
+            plan(&task, fence, "launch", launch()?)?,
+            &harness.clock,
+        )?;
+        assert!(matches!(launch.state(), EffectState::Uncertain { .. }));
+        let Lookup::Applied(receipt) = harness.backend.fake.lookup(launch.request())? else {
+            return Err("dispatch was not created".into());
+        };
+        let resolved = reconcile(store, &harness.backend, &task, fence, &harness.clock)?;
+        assert_eq!(resolved.resolved.len(), 1);
+        assert!(resolved.unresolved.is_empty());
+        assert!(matches!(
+            resolved.resolved[0].state(),
+            EffectState::Ended { .. }
+        ));
+        let worker = receipt
+            .created()
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::Worker)
+            .ok_or("missing worker")?
+            .clone();
+        let worktree = receipt
+            .created()
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::Worktree)
+            .ok_or("missing worktree")?
+            .clone();
+        harness
+            .backend
+            .fake
+            .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Failed));
+        let path = harness.repo.pushed_worktree(&format!("task-1-{number}"))?;
+        harness.backend.add(
+            worktree.clone(),
+            Some(ExternalRef::new(launch.request().key().as_str())?),
+            Liveness::Exited,
+        );
+        harness.paths.insert(worktree.clone(), path);
+
+        // An ended receipt also grants this task ownership of its worker for
+        // later targeted effects; the store must not reject it as foreign.
+        let EffectStart::Execute(cancel) = store.begin_effect(
+            plan(
+                &task,
+                fence,
+                &format!("cancel-{number}"),
+                Operation::CancelWorker {
+                    worker: worker.clone(),
+                },
+            )?,
+            &grants()?,
+            &harness.backend,
+            harness.clock.now(),
+        )?
+        else {
+            return Err("ended worker was not owned".into());
+        };
+        store.record_effect_outcome(
+            &task,
+            fence,
+            cancel.seq(),
+            EffectOutcome::NotApplied(NotAppliedReason::ConfirmedAbsent),
+            harness.clock.now(),
+        )?;
+        store.finish_attempt(
+            &task,
+            fence,
+            attempt,
+            AttemptOutcome::Failed(if number == 1 {
+                FailureClass::Retryable
+            } else {
+                FailureClass::Permanent
+            }),
+            harness.clock.now(),
+        )?;
+        resources.push((worker, worktree));
+    }
+
+    let preview = harness.inspect()?;
+    assert_eq!(preview.precheck(), Precheck::Actionable);
+    for (worker, worktree) in &resources {
+        for resource in [worker, worktree] {
+            let entry = preview.entry(resource).ok_or("created resource missing")?;
+            assert!(matches!(&entry.ownership, Ownership::Task(owner) if owner.task == task));
+            assert_eq!(entry.decision, Decision::Release);
+        }
+    }
+    assert_eq!(harness.approve_all()?.len(), 4);
+    let report = harness.apply()?;
+    for (worker, worktree) in &resources {
+        assert_eq!(outcome(&report, worker)?, ReleaseOutcome::Released);
+        assert_eq!(outcome(&report, worktree)?, ReleaseOutcome::Released);
+    }
+    let repeated = harness.apply()?;
+    assert_eq!(repeated.preview.precheck(), Precheck::Idle);
+    assert!(repeated.results.is_empty());
     Ok(())
 }
 

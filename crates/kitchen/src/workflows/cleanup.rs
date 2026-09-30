@@ -5,7 +5,7 @@
 //! only start an inspection. A resource is eligible for release only with
 //! positive evidence that its ownership ended and nothing would be lost:
 //!
-//! - exactly one Kitchen task created it through an applied effect, and the
+//! - exactly one Kitchen task created it through an applied or ended effect, and the
 //!   backend's owner record names that same effect. A backend that records no
 //!   owner leaves the resource unconfirmed and it is retained; that is fixed
 //!   policy, not a house option, because Kitchen's own record alone is not
@@ -2159,7 +2159,7 @@ const fn reclaimable(kind: ResourceKind) -> bool {
     }
 }
 
-/// The workers that applied effects of `task` created.
+/// The workers that applied or ended effects of `task` created.
 fn created_workers(task: &TaskRecord) -> impl Iterator<Item = &ResourceRef> {
     task.effects()
         .iter()
@@ -2177,13 +2177,13 @@ fn created_workers(task: &TaskRecord) -> impl Iterator<Item = &ResourceRef> {
         .filter(|resource| resource.kind == ResourceKind::Worker)
 }
 
-/// Ownership of `resource` according to the store's applied effects.
+/// Ownership of `resource` according to the store's creation receipts.
 fn ownership(tasks: &[TaskRecord], resource: &ResourceRef) -> Ownership {
     let creators: Vec<(&TaskRecord, &EffectRecord)> = tasks
         .iter()
         .flat_map(|task| task.effects().iter().map(move |effect| (task, effect)))
         .filter(|(_, effect)| {
-            matches!(effect.state(), EffectState::Applied { receipt, .. }
+            matches!(effect.state(), EffectState::Applied { receipt, .. } | EffectState::Ended { receipt, .. }
                 if receipt.created().contains(resource))
         })
         .collect();

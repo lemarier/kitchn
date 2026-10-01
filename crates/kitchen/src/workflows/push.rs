@@ -72,6 +72,10 @@ pub fn checkout_at_head(
     if reported != CheckoutReport::default() {
         return reported;
     }
+    let Some(attempt) = record.attempts().last() else {
+        return reported;
+    };
+    let source = format!("checked-push-{}", attempt.number().get());
     record
         .evidence()
         .items()
@@ -80,7 +84,7 @@ pub fn checkout_at_head(
         .find_map(|evidence| {
             if evidence.verdict != EvidenceVerdict::Pass
                 || &evidence.subject.head != head
-                || !evidence.source.as_str().starts_with("checked-push-")
+                || evidence.source.as_str() != source
             {
                 return None;
             }
@@ -99,6 +103,22 @@ pub fn checkout_clean_except_report(
     report_path: &Path,
 ) -> std::result::Result<bool, crate::git::GitReadError> {
     Ok(checkout_changes_except_report(worktree, report_path)?.is_empty())
+}
+
+/// A Kitchen launch writes this marker only into its worker's worktree config.
+/// An unreadable config is treated as worker context by the owner command.
+#[must_use]
+pub fn launched_writer_worktree(path: &Path) -> bool {
+    let Some((Some(code), _)) = run_bounded(
+        Path::new("git"),
+        path,
+        &["config", "--worktree", "--get", "kitchen.launchBase"],
+        &[],
+        Duration::from_secs(10),
+    ) else {
+        return true;
+    };
+    code != 1
 }
 
 /// Files still changed after excluding the house report path.
@@ -146,6 +166,31 @@ pub fn checkout_changes_except_report(
             let from = entries.next().ok_or(crate::git::GitReadError::Malformed)?;
             changed.push(format!("{from} -> {path}"));
             continue;
+        }
+        if Path::new(path) != report_path {
+            changed.push(path.to_owned());
+        }
+    }
+    // Status collapses an ignored directory to one entry even with
+    // --untracked-files=all. ls-files enumerates its actual files so a
+    // directory holding only the configured report remains exempt.
+    let ignored = crate::git::run(
+        worktree,
+        [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+        &limits,
+    )?;
+    if !ignored.is_empty() && !ignored.ends_with('\0') {
+        return Err(crate::git::GitReadError::Malformed);
+    }
+    for path in ignored.split_terminator('\0') {
+        if path.is_empty() {
+            return Err(crate::git::GitReadError::Malformed);
         }
         if Path::new(path) != report_path {
             changed.push(path.to_owned());

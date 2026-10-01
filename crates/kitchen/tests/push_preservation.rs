@@ -72,3 +72,68 @@ fn invalid_checkout_is_not_reported_clean() -> TestResult {
     assert!(checkout_clean_except_report(dir.path(), Path::new("report.md")).is_err());
     Ok(())
 }
+
+#[test]
+fn every_git_exclude_source_still_counts_untracked_work() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git(root, &["init", "-q"])?;
+    fs::write(
+        root.join(".gitignore"),
+        "ignored-by-tree\nreports/issue.md\n",
+    )?;
+    fs::write(root.join(".git/info/exclude"), "ignored-by-repo\n")?;
+    let global = root.join("global-excludes");
+    fs::write(&global, "ignored-by-global\n")?;
+    git(
+        root,
+        &[
+            "config",
+            "core.excludesFile",
+            global.to_str().ok_or("path")?,
+        ],
+    )?;
+    fs::write(root.join("ignored-by-tree"), "work")?;
+    fs::write(root.join("ignored-by-repo"), "work")?;
+    fs::write(root.join("ignored-by-global"), "work")?;
+    fs::create_dir(root.join("reports"))?;
+    fs::write(root.join("reports/issue.md"), "report")?;
+    let changes = checkout_changes_except_report(root, Path::new("reports/issue.md"))?;
+    for name in ["ignored-by-tree", "ignored-by-repo", "ignored-by-global"] {
+        assert!(changes.iter().any(|change| change == name), "{changes:?}");
+    }
+    assert!(!changes.iter().any(|change| change == "reports/issue.md"));
+    assert!(!checkout_clean_except_report(
+        root,
+        Path::new("reports/issue.md")
+    )?);
+    Ok(())
+}
+
+#[test]
+fn ignored_report_directory_is_clean_only_when_it_contains_the_report() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git(root, &["init", "-q"])?;
+    fs::write(root.join(".gitignore"), "reports/\n")?;
+    git(root, &["add", ".gitignore"])?;
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "ignore reports",
+        ],
+    )?;
+    fs::create_dir(root.join("reports"))?;
+    fs::write(root.join("reports/issue.md"), "report")?;
+    let report = Path::new("reports/issue.md");
+    assert!(checkout_clean_except_report(root, report)?);
+    fs::write(root.join("reports/other.md"), "work")?;
+    assert!(!checkout_clean_except_report(root, report)?);
+    Ok(())
+}

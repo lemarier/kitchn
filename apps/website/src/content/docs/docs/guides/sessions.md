@@ -73,7 +73,11 @@ checkout is clean and matches the pushed head. The configured evidence report
 file does not count as a dirty file. The worker finishes with the absolute
 mailbox report command in its brief. If the earlier writer left no usable
 checkout statement, the owner can preview the bound worktree and live PR head
-with `kitchn preserve`, then confirm that exact head when the preview is clean.
+with `kitchn preserve --worktree <launched-worktree>` from a separate
+coordinator checkout, then confirm that exact head when the preview is clean.
+The owner must type the head prefix on a TTY. On a host where workers share
+the OS user and credentials, this checkpoint is not person authentication;
+worker isolation such as OpenShell is needed for full enforcement.
 
 When the expediter has reviewed a clean checkout at the live PR head, the short attestation command is `kitchn gate attest --review-id <forge-review-id>`. Kitchen finds the sole open PR at that commit; a dirty checkout, moved head, or ambiguous match is refused.
 

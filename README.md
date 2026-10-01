@@ -75,7 +75,11 @@ worktree and refuses a push with a foreign author or committer.
 The checked `kitchn push` records whether that checkout is clean and at the
 pushed head, ignoring only Kitchen's configured report file. A settled PR
 writer without that evidence can be confirmed at an exact live head with
-`kitchn preserve` after its owner reviews the checkout and unpushed range.
+`kitchn preserve --worktree <launched-worktree>` from a separate coordinator
+checkout after its owner reviews the checkout and unpushed range. Confirmation
+requires an interactive TTY and the displayed head prefix. Workers sharing the
+OS user and credentials can still impersonate an owner; full enforcement needs
+worker isolation such as OpenShell, which is deferred.
 Before the first writer launch in a repository, its owner runs
 `kitchn house setup --registry <registry> --house <house> --workflows <list|none> --enable-worktree-config`
 from the checkout. Add `--preview` to see the repository and exact

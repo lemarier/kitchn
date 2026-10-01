@@ -902,6 +902,7 @@ fn pickup_retry_uses_a_fresh_branch_for_the_next_attempt() -> TestResult {
         matches!(first.as_slice(), [PickupAction::Launched { attempt, .. }] if attempt.get() == 1)
     );
     let task = kitchen.task(7)?;
+    let first_brief = launch_brief(&kitchen, &task)?;
     let worker = current_worker(&kitchen.store().task(&task)?)
         .ok_or("no pickup worker")?
         .worker;
@@ -930,6 +931,35 @@ fn pickup_retry_uses_a_fresh_branch_for_the_next_attempt() -> TestResult {
         .map(str::to_owned)
         .collect();
     assert_eq!(branches, ["kitchen/issue-7", "kitchen/issue-7-attempt-2"]);
+    let second_brief = launch_brief(&kitchen, &task)?;
+    assert_ne!(second_brief, first_brief);
+    assert!(
+        second_brief.contains("kitchen/issue-7-attempt-2"),
+        "{second_brief}"
+    );
+    kitchen.store().record_evidence(
+        &task,
+        kitchen.claim_fence(7)?,
+        Evidence {
+            kind: EvidenceKind::WorkerReport(CLEAN_AND_PUSHED),
+            verdict: EvidenceVerdict::Pass,
+            subject: EvidenceSubject {
+                head: commit('d')?,
+                base: None,
+            },
+            source: ExternalRef::new("checked-push-1")?,
+            observed_at: kitchen.clock.now(),
+        },
+        kitchen.clock.now(),
+    )?;
+    assert_eq!(
+        kitchen::workflows::push::checkout_at_head(
+            &kitchen.store().task(&task)?,
+            &commit('d')?,
+            CheckoutReport::default(),
+        ),
+        CheckoutReport::default(),
+    );
     Ok(())
 }
 

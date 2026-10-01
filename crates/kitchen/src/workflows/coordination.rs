@@ -687,27 +687,6 @@ pub(crate) fn launch_rendered(
     // A resumed launch reuses its persisted brief. The earlier worker saw
     // that exact text and its original mailbox fence; a takeover must not
     // turn a replay into a different logical effect.
-    let text = record
-        .attempts()
-        .last()
-        .filter(|attempt| {
-            matches!(
-                attempt.state(),
-                AttemptState::Running | AttemptState::Interrupted { .. }
-            )
-        })
-        .and_then(|attempt| {
-            record.effects().iter().rev().find_map(|effect| {
-                if effect.request().attempt() != attempt.number() {
-                    return None;
-                }
-                match effect.request().effect() {
-                    Effect::Worker(Operation::LaunchWorker { brief, .. }) => Some(brief.clone()),
-                    _ => None,
-                }
-            })
-        })
-        .unwrap_or(proposed);
     // A selection the executor cannot launch is a configuration problem no
     // retry fixes: refuse it before an attempt is spent on it.
     if let Some(resolved) = &record.spec().agent {
@@ -723,6 +702,22 @@ pub(crate) fn launch_rendered(
         }
         Err(error) => return Err(error),
     };
+    // Reuse a brief only for a replay of this same attempt. A retry needs
+    // its new mailbox fence and the follow-ups selected for this launch.
+    let text = record
+        .effects()
+        .iter()
+        .rev()
+        .find_map(|effect| {
+            if effect.request().attempt() != attempt {
+                return None;
+            }
+            match effect.request().effect() {
+                Effect::Worker(Operation::LaunchWorker { brief, .. }) => Some(brief.clone()),
+                _ => None,
+            }
+        })
+        .unwrap_or(proposed);
     if stacked {
         // The push boundary reads the layer from this record, never from
         // the writer.

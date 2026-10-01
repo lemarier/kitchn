@@ -276,16 +276,20 @@ confirms its work is preserved. The first call previews dirty files and the
 unpushed range; repeat with `--confirm-preserved` only after reviewing it.
 
 ```sh
-kitchn preserve <task> --pull-request <n> --head <sha> --holder <you> --registry <dir>
-kitchn preserve <task> --pull-request <n> --head <sha> --holder <you> --registry <dir> --confirm-preserved
+kitchn preserve <task> --pull-request <n> --head <sha> --holder <you> --registry <dir> --worktree <launched-worktree>
+kitchn preserve <task> --pull-request <n> --head <sha> --holder <you> --registry <dir> --worktree <launched-worktree> --confirm-preserved
 ```
 
-Run the command from the original launched worktree. Kitchen matches Orca's
-current worktree ID and path to the task's launch record. The checkout must
+Run the command from a separate coordinator checkout. Kitchen matches Orca's
+recorded worktree ID and path to the task's launch record. The checkout must
 belong to the registry's bound house and repository, match the task's branch
 and exact live PR head, and have no changes other than the configured report path.
 A different head, dirty file, missing forge observation, or unsettled task is
 refused. The recorded decision applies only to that head.
+Confirmation refuses a worker environment or launched worktree and requires an
+interactive TTY where the owner types the displayed head prefix. This checkpoint
+cannot authenticate a person when workers share the same OS user and credentials.
+Full enforcement requires worker isolation such as OpenShell, deferred here.
 
 ## `kitchn work`, `kitchn pr` and `kitchn hand-back`
 

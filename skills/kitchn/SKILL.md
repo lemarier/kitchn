@@ -201,10 +201,16 @@ After a successful push, read the printed clean/pushed facts and run the
 brief's absolute `kitchn mailbox report` command with those values as the
 last checkout action. Kitchen ignores only the configured report path when
 checking cleanliness. If a settled worker left no checkout statement, the
-owner can inspect its bound worktree with `kitchn preserve <task>
---pull-request <n> --head <sha> --holder <you> --registry <dir>` and repeat
-with `--confirm-preserved` after the preview shows a clean checkout at the
-live PR head.
+owner can inspect its bound worktree from a separate coordinator checkout with
+`kitchn preserve <task> --pull-request <n> --head <sha> --holder <you>
+--registry <dir> --worktree <launched-worktree>` and repeat with
+`--confirm-preserved` after the preview shows a clean checkout at the live PR
+head. Confirmation requires a TTY and the owner must type the displayed head
+prefix. It refuses inside a Kitchen-launched worktree or worker environment.
+On a host where workers share the OS user and credentials, this is an
+interactive owner checkpoint, not person authentication: a worker could still
+impersonate the owner. Full enforcement requires worker isolation such as
+OpenShell; that integration is deferred.
 
 ## 4. Scheduling
 

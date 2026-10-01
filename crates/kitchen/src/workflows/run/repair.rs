@@ -48,8 +48,9 @@ use crate::{
     },
     selection::WorkType,
     state::{
-        EffectState, HouseStore, MailSender, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject,
-        PostKind, StateError, TaskRecord, TaskState, WorkItem, WorkerPost,
+        ConsumerEvent, EffectState, HouseStore, MailSender, MarkerFact, MarkerKey, MarkerSchema,
+        MarkerSubject, OwnershipEvent, PostKind, StateError, TaskRecord, TaskState, WorkItem,
+        WorkerPost,
     },
     workflows::{
         coordination::{
@@ -1146,20 +1147,25 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
                 )
             })
             && let Some(lease) = super::held_by_run(&record, self.clock.now())
-            && lease.consumer().is_some_and(|bound| {
-                Pass::Coordinate
-                    .consumer(self.repository)
-                    .is_ok_and(|id| id == bound.consumer)
-            })
         {
-            return Ok(super::transfer(
-                self.store,
-                task,
-                lease.fence(),
-                claimant,
-                self.clock.now(),
-            )?
-            .ok_or(Wait::RoundHeld));
+            if self.coordination_claim(&record, lease)? {
+                return Ok(super::transfer(
+                    self.store,
+                    task,
+                    lease.fence(),
+                    claimant,
+                    self.clock.now(),
+                )?
+                .ok_or(Wait::RoundHeld));
+            }
+            if lease.consumer().is_none()
+                && matches!(
+                    record.ownership().last(),
+                    Some(OwnershipEvent::TakenOver { .. } | OwnershipEvent::Adopted { .. })
+                )
+            {
+                return Ok(Err(Wait::RoundHeld));
+            }
         }
         Ok(
             take_for_pass(self.store, task, claimant, self.take_over, self.clock.now())?.map_err(
@@ -1169,6 +1175,80 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
                 },
             ),
         )
+    }
+
+    /// Older coordinator takeovers wrote an unbound task lease. The matching
+    /// ownership event and the consumer's audit trail must place the runner
+    /// under the coordination lease when that task fence was issued.
+    fn coordination_claim(&self, record: &TaskRecord, lease: &crate::state::Lease) -> Result<bool> {
+        let consumer = Pass::Coordinate.consumer(self.repository)?;
+        if let Some(bound) = lease.consumer() {
+            return Ok(bound.consumer == consumer
+                && !super::pass_current(self.store, bound, self.clock.now())?);
+        }
+        let Some(
+            OwnershipEvent::TakenOver {
+                holder,
+                trigger,
+                fence,
+                at,
+                ..
+            }
+            | OwnershipEvent::Adopted {
+                holder,
+                trigger,
+                fence,
+                at,
+                ..
+            },
+        ) = record.ownership().last()
+        else {
+            return Ok(false);
+        };
+        if *fence != lease.fence()
+            || holder != lease.holder()
+            || trigger != lease.trigger()
+            || *at != lease.acquired_at()
+        {
+            return Ok(false);
+        }
+        let Some(coordinate) = self.store.consumer(&consumer)? else {
+            return Ok(false);
+        };
+        if coordinate
+            .lease()
+            .is_some_and(|lease| lease.is_live(self.clock.now()))
+        {
+            return Ok(false);
+        }
+        let mut held = false;
+        for event in coordinate.history() {
+            match event {
+                ConsumerEvent::Acquired {
+                    holder: owner,
+                    at: since,
+                    ..
+                }
+                | ConsumerEvent::Adopted {
+                    holder: owner,
+                    at: since,
+                    ..
+                }
+                | ConsumerEvent::TakenOver {
+                    holder: owner,
+                    at: since,
+                    ..
+                } if *since <= *at => held = owner == holder,
+                ConsumerEvent::Relinquished { at: until, .. }
+                | ConsumerEvent::Released { at: until, .. }
+                    if *until < *at =>
+                {
+                    held = false
+                }
+                _ => {}
+            }
+        }
+        Ok(held)
     }
 
     /// The change requests on the pull request's current head, quoted in

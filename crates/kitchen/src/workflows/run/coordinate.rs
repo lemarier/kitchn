@@ -589,6 +589,7 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
         took_over: bool,
     ) -> Result<(Vec<CoordinateAction>, Vec<Owned>)> {
         let claimant = run_claimant()?;
+        let bound_claimant = claimant.clone().under(consumer.clone(), pass_fence);
         let ttl = LeaseTtl::new(TASK_LEASE)?;
         let now = self.clock.now();
         let mut actions = Vec::new();
@@ -598,6 +599,16 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
             if !scheduled(&record) {
                 continue;
             }
+            let owner = if record
+                .spec()
+                .repository
+                .as_ref()
+                .is_some_and(|repository| super::scheduled_repair(&record, repository))
+            {
+                &bound_claimant
+            } else {
+                &claimant
+            };
             if let Some(lease) = held_by_run(&record, now) {
                 let bound = lease.consumer();
                 if bound
@@ -615,8 +626,7 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
                 super::record(self.store, self.tick, &task, self.clock)?;
                 if bound.is_none() && !took_over {
                     owned.push(Owned::new(task, lease.fence()));
-                } else if let Some(fence) =
-                    transfer(self.store, &task, lease.fence(), &claimant, now)?
+                } else if let Some(fence) = transfer(self.store, &task, lease.fence(), owner, now)?
                 {
                     actions.push(CoordinateAction::Moved { task: task.clone() });
                     owned.push(Owned::new(task, fence));
@@ -629,7 +639,7 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
                 TaskState::Claimed { lease } if lease.holder().as_str() == super::RUN_HOLDER => {
                     if self.take_over {
                         super::record(self.store, self.tick, &task, self.clock)?;
-                        let lease = self.store.take_over(&task, &claimant, ttl, now)?;
+                        let lease = self.store.take_over(&task, owner, ttl, now)?;
                         actions.push(CoordinateAction::TakenOver { task: task.clone() });
                         owned.push(Owned::new(task, lease.fence()));
                     } else {
@@ -646,7 +656,7 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
                     ) =>
                 {
                     super::record(self.store, self.tick, &task, self.clock)?;
-                    match self.store.claim(&task, &claimant, ttl, now) {
+                    match self.store.claim(&task, owner, ttl, now) {
                         Ok(lease) => {
                             actions.push(CoordinateAction::Adopted { task: task.clone() });
                             owned.push(Owned::new(task, lease.fence()));

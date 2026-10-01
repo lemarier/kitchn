@@ -2320,7 +2320,7 @@ fn follow_up_refuses_a_moved_pull_request_head_before_effects() -> TestResult {
 }
 
 #[test]
-fn follow_up_refuses_a_new_reviewer_comment_after_launch() -> TestResult {
+fn follow_up_skips_a_new_reviewer_comment_after_launch() -> TestResult {
     let mut kitchen = settled_with_pull_request(true)?;
     grant_follow_up(&mut kitchen)?;
     follow_up_thread(&kitchen)?;
@@ -2343,11 +2343,53 @@ fn follow_up_refuses_a_new_reviewer_comment_after_launch() -> TestResult {
         .to_string(),
     )?);
     kitchen.backend.post(vec![message])?;
-    assert!(matches!(
-        kitchen.coordinate(),
-        Err(kitchen::Error::Run(RunError::DispositionInvalid))
-    ));
+    acted(kitchen.coordinate()?)?;
     assert!(kitchen.forge().writes.borrow().is_empty());
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Settled { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn follow_up_skips_an_edited_reviewer_comment_after_launch() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    grant_follow_up(&mut kitchen)?;
+    follow_up_thread(&kitchen)?;
+    acted(kitchen.follow_up()?)?;
+    let task = round_task(1)?;
+    checked_follow_up_push(&kitchen, &task, &commit('d')?)?;
+    let worker = current_worker(&kitchen.store().task(&task)?)
+        .ok_or("no follow-up worker")?
+        .worker;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    {
+        let forge = kitchen.forge();
+        let mut responses = forge.responses.borrow_mut();
+        let thread = &mut responses
+            .get_mut("graphql:threads#12")
+            .ok_or("missing threads")?["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+            [0];
+        thread["comments"]["nodes"][0]["body"] = json!("The boundary also needs a timeout.");
+        thread["line"] = json!(11);
+    }
+    let mut message = report(&worker, "edited-thread")?;
+    message.body = Some(Text::new(
+        &json!({"sourceHead":commit('d')?.as_str(),
+        "dispositions":[{"thread":"PRRT_fixture","verdict":"fixed","reply":"Fixed."}]})
+        .to_string(),
+    )?);
+    kitchen.backend.post(vec![message])?;
+    acted(kitchen.coordinate()?)?;
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Settled { .. }
+    ));
+    assert!(matches!(kitchen.follow_up()?, Outcome::Acted(_)));
     Ok(())
 }
 
@@ -2477,6 +2519,7 @@ fn follow_up_exhausted_budget_asks_the_house_owner_once() -> TestResult {
     ));
     let questions = kitchen.store().open_questions(512)?;
     assert_eq!(questions.len(), 1);
+    kitchen.clock.advance(TASK_LEASE.as_secs() + 1);
     let second = acted(kitchen.follow_up()?)?;
     assert!(matches!(
         second.as_slice(),

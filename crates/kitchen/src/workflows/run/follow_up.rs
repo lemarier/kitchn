@@ -75,6 +75,7 @@ pub(crate) struct ReviewTarget {
 pub(crate) struct ThreadTarget {
     pub id: ExternalRef,
     pub latest_reviewer_comment: ExternalRef,
+    pub content_digest: u64,
 }
 
 pub(crate) fn target(thread: &FollowUpThread, requester: &str) -> Result<ThreadTarget> {
@@ -93,7 +94,43 @@ pub(crate) fn target(thread: &FollowUpThread, requester: &str) -> Result<ThreadT
     Ok(ThreadTarget {
         id: ExternalRef::new(&thread.id)?,
         latest_reviewer_comment: ExternalRef::new(&latest.id)?,
+        content_digest: super::super::pickup::stable_hash(
+            &serde_json::to_vec(&(
+                &latest.body,
+                &thread.path,
+                thread.line,
+                thread.original_line,
+            ))
+            .map_err(|_| RunError::DispositionInvalid)?,
+        ),
     })
+}
+
+pub(crate) fn record_changed(
+    store: &HouseStore,
+    task: &TaskId,
+    fence: Fence,
+    thread: &ExternalRef,
+    now: Timestamp,
+) -> Result<()> {
+    store.record_task_marker_unless(
+        changed_key(task, thread)?,
+        MarkerFact::workflow(schema()?, &"changed-since-launch")?,
+        task,
+        fence,
+        now,
+        |_| Ok(None::<()>),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn changed(store: &HouseStore, task: &TaskId, thread: &ExternalRef) -> Result<bool> {
+    Ok(store.marker(&changed_key(task, thread)?)?.is_some())
+}
+
+fn changed_key(task: &TaskId, thread: &ExternalRef) -> Result<MarkerKey> {
+    let digest = super::super::pickup::stable_hash(thread.as_str().as_bytes());
+    key(task, ExternalRef::new(&format!("changed-{digest:016x}"))?)
 }
 
 fn workflow() -> Result<WorkflowId> {

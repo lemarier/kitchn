@@ -11,7 +11,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     Outcome, RunError, TASK_LEASE,
-    follow_up::{FollowUpVerdict, record_report, snapshot, target},
+    follow_up::{
+        FollowUpVerdict, ThreadTarget, changed, record_changed, record_report, snapshot, target,
+    },
     held_by_run, pass_current, run_claimant, scheduled_writer, transfer,
 };
 use crate::{
@@ -19,8 +21,8 @@ use crate::{
     contracts::{
         AttemptNumber, AttemptOutcome, Capability, CheckoutReport, Clock, CoordinatorMailbox,
         Delivery, Effect, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef,
-        Fence, GitHubAction, GitHubMutation, LeaseTtl, MailMessage, MessageKind, Operation,
-        ResourceRef, Text, Timestamp, WorkerOutcome, WorkerState,
+        Fence, GitHubAction, GitHubMutation, IssueNumber, LeaseTtl, MailMessage, MessageKind,
+        Operation, Repository, ResourceRef, Text, Timestamp, WorkerOutcome, WorkerState,
     },
     house::HouseConfig,
     integrations::github::{
@@ -1072,32 +1074,13 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
         }) {
             return Err(RunError::DispositionInvalid.into());
         }
-        let live = known(self.forge.follow_up_threads(
-            self.store.house(),
-            repository,
-            saved.pull_request,
-        ))?;
-        if report.dispositions.iter().any(|item| {
-            let digest = super::super::pickup::stable_hash(item.thread.as_str().as_bytes());
-            let resolved_here = current_record.effects().iter().any(|effect| {
-                effect.name().as_str() == format!("thread-{digest:016x}-resolve")
-                    && matches!(effect.state(), EffectState::Applied { .. })
-            });
-            let expected_target = saved.threads.iter().find(|saved| saved.id == item.thread);
-            !live.iter().any(|thread| {
-                thread.id == item.thread.as_str()
-                    && target(thread, self.forge.scope().requester().as_str())
-                        .ok()
-                        .as_ref()
-                        == expected_target
-                    && (!thread.is_resolved
-                        || (item.verdict == FollowUpVerdict::Fixed && resolved_here))
-            })
-        }) {
-            return Err(RunError::DispositionInvalid.into());
-        }
         let grants = super::standing_grants(self.house)?;
         for item in report.dispositions {
+            let expected = saved
+                .threads
+                .iter()
+                .find(|thread| thread.id == item.thread)
+                .ok_or(RunError::DispositionInvalid)?;
             let explanation = item.reply.clone();
             let reply = GitHubMutation {
                 repository: repository.clone(),
@@ -1109,6 +1092,20 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
                 },
             };
             let digest = super::super::pickup::stable_hash(item.thread.as_str().as_bytes());
+            let resolved_here = current_record.effects().iter().any(|effect| {
+                effect.name().as_str() == format!("thread-{digest:016x}-resolve")
+                    && matches!(effect.state(), EffectState::Applied { .. })
+            });
+            if !self.thread_current(
+                repository,
+                saved.pull_request,
+                expected,
+                resolved_here,
+                owned,
+            )? {
+                continue;
+            }
+            let mut changed = false;
             for (suffix, mutation) in std::iter::once(("reply", reply)).chain(
                 (item.verdict == FollowUpVerdict::Fixed).then(|| {
                     (
@@ -1124,6 +1121,16 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
                     )
                 }),
             ) {
+                if !self.thread_current(
+                    repository,
+                    saved.pull_request,
+                    expected,
+                    resolved_here,
+                    owned,
+                )? {
+                    changed = true;
+                    break;
+                }
                 let effect = executor.effect(mutation)?.into();
                 let result = run_effect(
                     self.store,
@@ -1144,6 +1151,9 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
                     return Err(RunError::FollowUpEffectUncertain.into());
                 }
             }
+            if changed {
+                continue;
+            }
             if item.verdict == FollowUpVerdict::Declined {
                 self.store.post_mail_unique(
                     &MailSender {
@@ -1162,6 +1172,39 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
             }
         }
         Ok(())
+    }
+
+    fn thread_current(
+        &self,
+        repository: &Repository,
+        number: IssueNumber,
+        expected: &ThreadTarget,
+        resolved_here: bool,
+        owned: &Owned,
+    ) -> Result<bool> {
+        if changed(self.store, &owned.task, &expected.id)? {
+            return Ok(false);
+        }
+        let live = known(
+            self.forge
+                .follow_up_threads(self.store.house(), repository, number),
+        )?;
+        let current = live.iter().any(|thread| {
+            thread.id == expected.id.as_str()
+                && target(thread, self.forge.scope().requester().as_str())
+                    .is_ok_and(|now| now == *expected)
+                && (!thread.is_resolved || resolved_here)
+        });
+        if !current {
+            record_changed(
+                self.store,
+                &owned.task,
+                owned.fence,
+                &expected.id,
+                self.clock.now(),
+            )?;
+        }
+        Ok(current)
     }
 
     /// A branch needs delivery only when the forge proves it has commits

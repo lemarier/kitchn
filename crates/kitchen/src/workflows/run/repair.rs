@@ -38,16 +38,19 @@ use crate::workflows::tick::PassRun;
 use crate::{
     ConsumerId, TaskId,
     contracts::{
-        AttemptNumber, AttemptStart, BranchName, Claimant, Clock, CommitId, ContractError,
-        EvidenceKind, EvidenceVerdict, Fence, IssueNumber, Repository, ResourceRef, Role,
-        Settlement, TaskSpec, Text, WorkerBackend, Workspace,
+        AttemptNumber, AttemptOutcome, AttemptStart, BranchName, Claimant, Clock, CommitId,
+        ContractError, EvidenceKind, EvidenceVerdict, Fence, IssueNumber, Repository, ResourceRef,
+        Role, Settlement, TaskSpec, Text, WorkerBackend, Workspace,
     },
     house::HouseConfig,
     integrations::github::{
         FollowUpThread, GitHubClient, GitHubReadTransport, PullRequest, ReviewState,
     },
     selection::WorkType,
-    state::{HouseStore, MailSender, PostKind, StateError, TaskRecord, TaskState, WorkerPost},
+    state::{
+        HouseStore, MailSender, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, PostKind,
+        StateError, TaskRecord, TaskState, WorkItem, WorkerPost,
+    },
     workflows::{
         coordination::{
             BranchFact, Context, CoordinationError, LaunchOutcome, MailboxRoute, Standing,
@@ -461,7 +464,12 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
                 continue;
             }
             if rounds.used() >= self.house.follow_up_budget().fix_rounds() {
-                self.escalate_budget(template, &claimant, pr.pull_request.number)?;
+                self.escalate_budget(
+                    template,
+                    &claimant,
+                    pr.pull_request.number,
+                    &pr.pull_request.head.sha,
+                )?;
                 actions.push(FollowUpAction::Exhausted {
                     pull_request: pr.pull_request.number,
                 });
@@ -610,12 +618,27 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
         template: &TaskTemplate,
         claimant: &Claimant,
         number: IssueNumber,
+        head: &CommitId,
     ) -> Result<()> {
+        let budget = self.house.follow_up_budget().fix_rounds();
+        let identity = serde_json::to_vec(&(self.repository, number, head, budget))
+            .map_err(|_| RunError::DispositionInvalid)?;
+        let digest = super::super::pickup::stable_hash(&identity);
         let task = TaskId::new(&format!(
-            "follow-up-budget-{:016x}-{}",
+            "follow-up-budget-{:016x}-{}-{digest:016x}",
             super::super::pickup::stable_hash(self.repository.as_str().as_bytes()),
             number.get()
         ))?;
+        let marker = MarkerKey {
+            workflow: crate::WorkflowId::new("review-follow-up-budget")?,
+            item: WorkItem::Task { task: task.clone() },
+            subject: MarkerSubject::Observation(crate::contracts::ExternalRef::new(&format!(
+                "{digest:016x}"
+            ))?),
+        };
+        if self.store.marker(&marker)?.is_some() {
+            return Ok(());
+        }
         let spec = TaskSpec {
             id: task.clone(),
             role: Role::Expediter,
@@ -648,23 +671,42 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
             Err(Refusal::Held) => return Ok(()),
             Err(Refusal::Uncertain) => return Err(RunError::FollowUpEffectUncertain.into()),
         };
-        if self
-            .store
-            .continue_attempt(&task, fence, self.clock.now())?
-            .is_none()
+        let attempt = if let Some(attempt) =
+            self.store
+                .continue_attempt(&task, fence, self.clock.now())?
         {
+            attempt
+        } else {
             match self.store.start_attempt(&task, fence, self.clock.now())? {
-                AttemptStart::Started(_) | AttemptStart::AlreadyRunning(_) => {}
+                AttemptStart::Started(attempt) | AttemptStart::AlreadyRunning(attempt) => attempt,
                 AttemptStart::Exhausted => return Err(RunError::FollowUpEffectUncertain.into()),
             }
-        }
+        };
         self.store.post_mail_unique(
-            &MailSender { task, fence },
+            &MailSender { task: task.clone(), fence },
             WorkerPost {
                 kind: PostKind::Question,
                 subject: Some(Text::new(&format!("Follow-up budget exhausted for PR #{}", number.get()))?),
                 body: Text::new("The house's review follow-up fix-round budget is exhausted. Inspect the remaining open review threads and decide how to proceed.")?,
             },
+            self.clock.now(),
+        )?;
+        self.store.record_task_marker_unless(
+            marker,
+            MarkerFact::workflow(
+                MarkerSchema::new("review-follow-up-budget", std::num::NonZeroU32::MIN)?,
+                &true,
+            )?,
+            &task,
+            fence,
+            self.clock.now(),
+            |_| Ok(None::<()>),
+        )?;
+        self.store.finish_attempt(
+            &task,
+            fence,
+            attempt,
+            AttemptOutcome::Succeeded,
             self.clock.now(),
         )?;
         Ok(())

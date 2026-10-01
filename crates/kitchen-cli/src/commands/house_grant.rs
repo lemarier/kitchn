@@ -265,20 +265,7 @@ fn one_grant(
     if permission == Merge {
         return Err(HouseError::MergeGrantNeedsGate.into());
     }
-    let forge = matches!(
-        permission,
-        PostComment
-            | EditLabels
-            | CreateIssue
-            | CloseIssue
-            | EditIssueRelationships
-            | PushBranch
-            | OpenPullRequest
-            | ReviewPullRequest
-            | RequestReview
-            | Merge
-            | Publish
-    );
+    let forge = permission.is_forge();
     let (destination, credential) = if forge {
         let binding = forge_binding(registry, &house.house)?;
         (binding.backend, binding.credential)
@@ -286,21 +273,7 @@ fn one_grant(
         let binding = house.backend.as_ref().ok_or(HouseError::InvalidInput)?;
         (binding.backend.clone(), binding.credential.clone())
     };
-    let repository_scoped = matches!(
-        permission,
-        LaunchWorker
-            | PostComment
-            | EditLabels
-            | CreateIssue
-            | CloseIssue
-            | EditIssueRelationships
-            | PushBranch
-            | OpenPullRequest
-            | ReviewPullRequest
-            | RequestReview
-            | Merge
-            | Publish
-    );
+    let repository_scoped = permission == LaunchWorker || permission.is_forge();
     Ok(if !house_wide || repository_scoped {
         Grant::repository(permission, repository.clone(), destination, credential)
     } else {

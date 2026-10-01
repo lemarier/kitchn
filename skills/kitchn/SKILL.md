@@ -116,6 +116,15 @@ thread needs `resolve-review-thread`. Verify the exact PR head and the thread
 against current code before proposing either effect. A missing or partial forge
 read is not permission to retry an uncertain write.
 
+For unattended Kitchen PRs, `kitchn run follow-up` (or a configured
+`kitchn tick` follow-up pass) claims a bounded writer round after it reads
+unresolved threads or change requests. A follow-up worker uses `kitchn push`
+and gives its configured mailbox a JSON report body (the house mailbox uses
+`kitchn mailbox report --body`): the launch `sourceHead`
+and one `{ "thread", "verdict": "fixed"|"declined", "reply" }` item for
+each thread. Kitchen records those dispositions and posts the replies;
+fixed threads are resolved, while declined threads go to the house mailbox.
+
 ### `issue new` and `issue refine <n>`
 
 Draft with the person: outcome, ownership, acceptance criteria, and

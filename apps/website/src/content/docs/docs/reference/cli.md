@@ -546,6 +546,13 @@ with nothing unpushed. A report without them records the checkout as unknown,
 and scheduled repair then hands the pull request over instead of repairing
 it from a new checkout.
 
+A successful scheduled follow-up report uses `--body` with JSON shaped as
+`{"sourceHead":"<head at launch>","dispositions":[{"thread":"<thread id>","verdict":"fixed","reply":"<reason>"}]}`.
+Use one item for each thread named in the brief; use `declined` when a finding
+was not fixed. A change-request review without a thread has no disposition
+item. The report's source head comes from the brief, while `--clean yes
+--pushed yes` attests to the final checkout after `kitchn push`.
+
 The mailbox holds at most 512 messages, 64 per task, and 32 waiting per task;
 a full mailbox refuses the post instead of dropping it. Bodies and answers are
 at most 8 KiB. `kitchn store retain` removes handled messages once their
@@ -565,8 +572,8 @@ kitchn tick trigger launchd|cron --kitchn <abs path> --registry <abs dir> --hous
 kitchn tick configure <backend or pickup setting> [--repository <owner/name>]
 ```
 
-A repair pass takes its branch prefix and report path from the pickup
-options, and repair and the gate read the house's pinned instructions as
+A repair or follow-up pass takes its branch prefix and report path from the pickup
+options, and repair, follow-up, and the gate read the house's pinned instructions as
 `kitchn run` does.
 
 Each configured pass runs when it never ran or its last run started at least
@@ -640,20 +647,21 @@ facts it needs is recorded as failed and the error names the flags.
 
 One bounded scheduled pass, for a trigger such as an Orca schedule, launchd, or
 cron. `kitchn tick` runs the same passes when they are due. `gate` needs only
-the house; `pickup`, `coordinate`, and `repair` also need the worker backend
+the house; `pickup`, `coordinate`, `repair`, and `follow-up` also need the worker backend
 options below. Everything else defaults from the house.
 
 ```sh
 kitchn run pickup
 kitchn run coordinate
 kitchn run repair
+kitchn run follow-up
 kitchn run gate
 ```
 
 These forms use the inferred registry, house, and store, with optional
 `--repository <owner/name>` and `--take-over`. The repository defaults to the
 house's only one (or its stored runtime choice for these passes). Pickup,
-coordinate, and repair use the stored backend and pickup settings when
+coordinate, repair, and follow-up use the stored backend and pickup settings when
 configured; otherwise pass the needed flags explicitly.
 The forge is the house's forge binding, with `gh` (and `curl` for a GitHub App)
 from `PATH`. `<backend>` holds the host facts of the house's bound worker
@@ -700,6 +708,22 @@ before anything runs.
   pickup's: `repair` reads the stored pickup settings and refuses a flag that
   names another value. The `coordinate` pass supervises repair writers like
   pickup workers.
+- `follow-up` reads unresolved review threads and change-request reviews on
+  open PRs delivered by settled scheduled tasks. It rechecks the head and
+  review data before claiming a fix round, shares `followUp.fixRounds` with
+  repair, and launches at most one writer in an isolated checkout of the
+  pushed branch. A competing repository writer or unproved preservation stops
+  the launch. The brief quotes thread IDs, paths, lines, and reviewer text as
+  untrusted data. The worker verifies findings, pushes with `kitchn push`
+  under the house writer identity, and reports one `fixed` or `declined`
+  disposition with a reply for each thread. `coordinate` records all
+  dispositions before settling the round, then uses persisted forge effects
+  to reply and resolve only fixed threads. Declined threads remain open and
+  enter the house mailbox. An exhausted budget asks the house owner there.
+  A moved head, changed reviewer comment, incomplete disposition set, or
+  uncertain forge write blocks settlement; restarting coordination
+  reconciles the recorded effect before continuing. `--branch-prefix` and
+  `--report-path` use pickup's stored settings, as for repair.
 - `gate` evaluates up to three of those pull requests at their exact heads and
   prints each verdict. It merges one only when an independent reviewer's
   attestation is recorded for exactly its head and base, whoever recorded it

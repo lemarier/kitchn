@@ -141,13 +141,21 @@ pub enum Pass {
     Coordinate,
     /// Pull request repair.
     Repair,
+    /// Review-thread follow-up.
+    FollowUp,
     /// The exact-head merge gate.
     Gate,
 }
 
 impl Pass {
     /// Every pass.
-    pub const ALL: [Self; 4] = [Self::Pickup, Self::Coordinate, Self::Repair, Self::Gate];
+    pub const ALL: [Self; 5] = [
+        Self::Pickup,
+        Self::Coordinate,
+        Self::Repair,
+        Self::FollowUp,
+        Self::Gate,
+    ];
 
     /// The stable lowercase name.
     #[must_use]
@@ -156,6 +164,7 @@ impl Pass {
             Self::Pickup => "pickup",
             Self::Coordinate => "coordinate",
             Self::Repair => "repair",
+            Self::FollowUp => "follow-up",
             Self::Gate => "gate",
         }
     }
@@ -166,6 +175,7 @@ impl Pass {
             Self::Pickup => "tick-pickup",
             Self::Coordinate => "tick-coordinate",
             Self::Repair => "tick-repair",
+            Self::FollowUp => "tick-follow-up",
             Self::Gate => "tick-gate",
         })
     }

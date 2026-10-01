@@ -309,7 +309,7 @@ fn a_pass_needing_workers_names_the_missing_backend_arguments() -> TestResult {
     // Guided init binds the house to Orca, whose host facts the trigger
     // passes; without them nothing is contacted.
     let house = House::new()?;
-    for pass in ["pickup", "coordinate", "repair"] {
+    for pass in ["pickup", "coordinate", "repair", "follow-up"] {
         let output = house.pass(pass, &[])?;
         assert_eq!(
             output.status.code(),

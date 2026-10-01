@@ -10,14 +10,14 @@
 //! ([`PassFailure::OwnerUncertain`]).
 
 use super::{
-    CoordinatePass, GatePass, Outcome, PickupAction, PickupPass, PickupSettings, RepairAction,
-    RepairPass, RepairSettings, RunError,
+    CoordinatePass, FollowUpAction, GatePass, Outcome, PickupAction, PickupPass, PickupSettings,
+    RepairAction, RepairPass, RepairSettings, RunError,
 };
 use crate::{
     BackendId, ErrorClass,
     contracts::{Clock, CoordinatorMailbox, ExternalRef, Provenance, Repository},
     house::HouseConfig,
-    integrations::github::{GitHubClient, GitHubMutationTransport},
+    integrations::github::{GitHubClient, GitHubExecutor, GitHubMutationTransport},
     state::HouseStore,
     workflows::tick::{
         MAX_RUN_EVIDENCE, Pass, PassFailure, PassOutcome, PassReport, PassRun, PassRunner,
@@ -38,6 +38,8 @@ pub struct TickPasses<'a, T> {
     pub backend: Option<&'a dyn CoordinatorMailbox>,
     /// The house's forge reads.
     pub forge: &'a GitHubClient<T>,
+    /// Forge effect executor for replies and resolutions.
+    pub forge_executor: Option<&'a GitHubExecutor<T>>,
     /// Time source.
     pub clock: &'a dyn Clock,
     /// The repository pickup, repair, and the gate serve.
@@ -91,6 +93,7 @@ impl<T: GitHubMutationTransport + Clone> TickPasses<'_, T> {
                     house: self.house,
                     backend: backend()?,
                     forge: self.forge,
+                    forge_executor: self.forge_executor,
                     clock: self.clock,
                     take_over: false,
                     tick,
@@ -112,6 +115,21 @@ impl<T: GitHubMutationTransport + Clone> TickPasses<'_, T> {
                 }
                 .run()?,
                 repair_worker,
+            ),
+            Pass::FollowUp => report(
+                RepairPass {
+                    store: self.store,
+                    house: self.house,
+                    backend: backend()?,
+                    forge: self.forge,
+                    clock: self.clock,
+                    repository,
+                    settings: self.repair.ok_or(RunError::NoPassSettings)?,
+                    take_over: false,
+                    tick,
+                }
+                .run_follow_up()?,
+                follow_up_worker,
             ),
             Pass::Gate => report(
                 GatePass {
@@ -191,5 +209,15 @@ fn repair_worker(action: &RepairAction) -> Option<ExternalRef> {
         | RepairAction::Stacked { .. }
         | RepairAction::NotLaunched { .. }
         | RepairAction::Waiting { .. } => None,
+    }
+}
+
+fn follow_up_worker(action: &FollowUpAction) -> Option<ExternalRef> {
+    match action {
+        FollowUpAction::Launched { worker, .. } => Some(worker.handle.clone()),
+        FollowUpAction::Waiting { .. }
+        | FollowUpAction::Exhausted { .. }
+        | FollowUpAction::PreservationUnknown { .. }
+        | FollowUpAction::NotLaunched { .. } => None,
     }
 }

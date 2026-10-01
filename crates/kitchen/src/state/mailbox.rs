@@ -98,6 +98,9 @@ pub enum MailError {
     /// The question already has a different answer.
     #[error("the question already has a different answer")]
     AlreadyAnswered,
+    /// An idempotent coordinator question already has a different body.
+    #[error("the question subject already has a different body")]
+    ConflictingQuestion,
     /// A person's answer is recorded on the task's owner, and the task has
     /// none now, such as during a handover.
     #[error("the task has no owner to record a person's reply")]
@@ -122,7 +125,7 @@ impl MailError {
             Self::NoOpenAttempt | Self::NotSender | Self::NoOwner | Self::Full | Self::Fenced => {
                 ErrorClass::Refused
             }
-            Self::AlreadyAnswered => ErrorClass::Conflict,
+            Self::AlreadyAnswered | Self::ConflictingQuestion => ErrorClass::Conflict,
         }
     }
 }
@@ -439,6 +442,33 @@ impl Mailbox {
             answer: None,
         });
         Ok(id)
+    }
+
+    /// Post a coordinator escalation once per task, attempt, and subject.
+    /// A replay with different text under the same subject is refused.
+    pub(crate) fn post_unique(
+        &mut self,
+        task: &TaskRecord,
+        sender: &MailSender,
+        post: WorkerPost,
+        now: Timestamp,
+    ) -> crate::Result<ExternalRef> {
+        let (attempt, _) = seat(task, sender.fence)?;
+        if post.kind != PostKind::Question || post.subject.is_none() {
+            return Err(MailError::NotAQuestion.into());
+        }
+        if let Some(existing) = self.messages.iter().find(|mail| {
+            mail.task == sender.task
+                && mail.attempt == attempt
+                && mail.kind == post.kind
+                && mail.subject == post.subject
+        }) {
+            if existing.body != post.body {
+                return Err(MailError::ConflictingQuestion.into());
+            }
+            return Ok(existing.id()?);
+        }
+        self.post(task, sender, post, now)
     }
 
     /// The answer to `question`, for the worker that asked it.

@@ -98,6 +98,8 @@ struct Forge {
     lose_writes: Rc<Cell<bool>>,
     /// The next review applies but its response is lost.
     lose_review_reply: Rc<Cell<bool>>,
+    /// A thread reply applies, then its response is lost once.
+    lose_thread_reply: Rc<Cell<bool>>,
 }
 
 impl Forge {
@@ -110,6 +112,7 @@ impl Forge {
             writes: Rc::new(RefCell::new(Vec::new())),
             lose_writes: Rc::new(Cell::new(false)),
             lose_review_reply: Rc::new(Cell::new(false)),
+            lose_thread_reply: Rc::new(Cell::new(false)),
         }
     }
 
@@ -146,10 +149,17 @@ impl Forge {
                 "merge-state"
             } else if text.contains("reviewThreads") {
                 "threads"
+            } else if text.contains("node(id:") {
+                "node"
             } else {
                 "other"
             };
-            return format!("graphql:{kind}#{number}");
+            let subject = if kind == "node" {
+                query.pointer("/variables/id").cloned().unwrap_or_default()
+            } else {
+                number
+            };
+            return format!("graphql:{kind}#{subject}");
         }
         let endpoint = request.endpoint();
         match endpoint.find("per_page=") {
@@ -214,6 +224,52 @@ impl GitHubMutationTransport for Forge {
                 kitchen::contracts::UncertainReason::ResponseLost,
             ));
         }
+        if endpoint == "graphql" {
+            let query = request.body()["query"].as_str().unwrap_or_default();
+            let input = &request.body()["variables"]["input"];
+            let (thread, resolve) = if query.contains("addPullRequestReviewThreadReply") {
+                (input["pullRequestReviewThreadId"].as_str(), false)
+            } else if query.contains("resolveReviewThread") {
+                (input["threadId"].as_str(), true)
+            } else {
+                (None, false)
+            };
+            let thread = thread.ok_or(EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
+            let node_key = format!("graphql:node#{}", json!(thread));
+            let mut responses = self.responses.borrow_mut();
+            let node = responses
+                .get_mut(&node_key)
+                .and_then(|value| value.pointer_mut("/data/node"))
+                .ok_or(EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
+            if resolve {
+                node["isResolved"] = json!(true);
+                node["resolvedBy"] = json!({"login":"kitchen-bot"});
+                if let Some(list) = responses.get_mut("graphql:threads#12").and_then(|value| {
+                    value.pointer_mut("/data/repository/pullRequest/reviewThreads/nodes/0")
+                }) {
+                    list["isResolved"] = json!(true);
+                }
+            } else {
+                node["comments"]["nodes"].as_array_mut()
+                    .ok_or(EffectFailure::NotApplied(NotAppliedReason::Rejected))?
+                    .push(json!({"id":"PRRC_reply","body":input["body"],"url":"https://github.com/origin89hq/firmware/pull/12#discussion_r2","author":{"login":"kitchen-bot"}}));
+                if self.lose_thread_reply.replace(false) {
+                    return Err(EffectFailure::Uncertain(
+                        kitchen::contracts::UncertainReason::ResponseLost,
+                    ));
+                }
+            }
+            if resolve {
+                return serde_json::to_vec(&json!({"data":{"resolveReviewThread":{
+                    "clientMutationId":input["clientMutationId"],
+                    "thread":{"id":thread,"isResolved":true}
+                }}}))
+                .map_err(|_| {
+                    EffectFailure::Uncertain(kitchen::contracts::UncertainReason::ResponseLost)
+                });
+            }
+            return Ok(b"{}".to_vec());
+        }
         if endpoint.ends_with("/reviews") {
             let mut responses = self.responses.borrow_mut();
             let entries = responses
@@ -257,7 +313,11 @@ fn client(forge: Forge) -> TestResult<GitHubClient<Forge>> {
         requester.clone(),
         CredentialRef::new(house()?, CredentialId::new("forge")?, requester),
         PostingBudget::new(3)?,
-        [kitchen::contracts::Permission::Merge],
+        [
+            kitchen::contracts::Permission::Merge,
+            kitchen::contracts::Permission::PostComment,
+            kitchen::contracts::Permission::ResolveReviewThread,
+        ],
     )?;
     Ok(GitHubClient::new(scope, forge, ReadLimits::default()))
 }
@@ -422,11 +482,18 @@ impl Kitchen {
         backend: &FakeBackend,
         take_over: bool,
     ) -> kitchen::Result<Outcome<CoordinateAction>> {
+        let executor = GitHubExecutor::new(
+            kitchen::BackendId::new("github")?,
+            self.forge.scope().clone(),
+            self.forge.transport().clone(),
+            ReadLimits::default(),
+        );
         CoordinatePass {
             store: self.store(),
             house: &self.config,
             backend,
             forge: &self.forge,
+            forge_executor: Some(&executor),
             clock: &self.clock,
             take_over,
             tick: None,
@@ -440,6 +507,24 @@ impl Kitchen {
 
     fn repair(&self) -> kitchen::Result<Outcome<RepairAction>> {
         self.repair_with(false)
+    }
+
+    fn follow_up(&self) -> kitchen::Result<Outcome<kitchen::workflows::run::FollowUpAction>> {
+        RepairPass {
+            store: self.store(),
+            house: &self.config,
+            backend: &self.backend,
+            forge: &self.forge,
+            clock: &self.clock,
+            repository: &self.settings.repository,
+            settings: &RepairSettings {
+                instructions: self.settings.instructions.clone(),
+                report_path: self.settings.report_path.clone(),
+            },
+            take_over: false,
+            tick: None,
+        }
+        .run_follow_up()
     }
 
     fn repair_with(&self, take_over: bool) -> kitchen::Result<Outcome<RepairAction>> {
@@ -1063,8 +1148,9 @@ fn coordinate_is_idle_without_scheduled_tasks() -> TestResult {
 
 /// A checked push marker has the same durable shape the push boundary writes.
 fn checked_push_marker(kitchen: &Kitchen, head: &kitchen::contracts::CommitId) -> TestResult {
-    push_marker(
+    push_marker_for(
         kitchen,
+        &kitchen.task(7)?,
         MarkerFact::workflow(
             MarkerSchema::new("worker-push-head", NonZeroU32::MIN)?,
             head,
@@ -1073,7 +1159,25 @@ fn checked_push_marker(kitchen: &Kitchen, head: &kitchen::contracts::CommitId) -
 }
 
 fn push_marker(kitchen: &Kitchen, fact: MarkerFact) -> TestResult {
-    let task = kitchen.task(7)?;
+    push_marker_for(kitchen, &kitchen.task(7)?, fact)
+}
+
+fn checked_follow_up_push(
+    kitchen: &Kitchen,
+    task: &kitchen::TaskId,
+    head: &kitchen::contracts::CommitId,
+) -> TestResult {
+    push_marker_for(
+        kitchen,
+        task,
+        MarkerFact::workflow(
+            MarkerSchema::new("worker-push-head", NonZeroU32::MIN)?,
+            head,
+        )?,
+    )
+}
+
+fn push_marker_for(kitchen: &Kitchen, task: &kitchen::TaskId, fact: MarkerFact) -> TestResult {
     let mut name = String::from("branch-");
     for byte in Sha256::digest(b"kitchen/issue-7").iter().take(16) {
         write!(name, "{byte:02x}")?;
@@ -1999,6 +2103,494 @@ fn settled_with_pull_request(mergeable: bool) -> TestResult<Kitchen> {
         .forge()
         .set(&format!("repos/{REPO}/issues/7/timeline"), json!([]));
     Ok(kitchen)
+}
+
+/// Sanitized `reviewThreads` and `node(id)` shapes from the read-only
+/// `gh api graphql` check on lemarier/kitchn PR #275 for layer 1.
+fn follow_up_thread(kitchen: &Kitchen) -> TestResult {
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    kitchen.forge().set("graphql:threads#12", json!({"data":{"repository":{"pullRequest":{"reviewThreads":{
+        "nodes":[{"id":"PRRT_fixture","isResolved":false,"isOutdated":false,"path":"src/lib.rs","line":10,"originalLine":10,
+            "comments":{"nodes":[{"id":"PRRC_original","body":"Check the boundary.","author":{"login":"coderabbitai"}}],
+                "pageInfo":{"hasNextPage":false,"endCursor":"cursor"}}}],
+        "pageInfo":{"hasNextPage":false,"endCursor":"cursor"}
+    }}}}}));
+    kitchen.forge().set("graphql:node#\"PRRT_fixture\"", json!({"data":{"node":{
+        "id":"PRRT_fixture","isResolved":false,"resolvedBy":null,
+        "pullRequest":{"number":12,"headRefOid":commit('d')?.as_str(),"repository":{"nameWithOwner":REPO}},
+        "comments":{"nodes":[{"id":"PRRC_original","body":"Check the boundary.","url":"https://github.com/origin89hq/firmware/pull/12#discussion_r1","author":{"login":"coderabbitai"}}],
+            "pageInfo":{"hasNextPage":false,"endCursor":"cursor"}}
+    }}}));
+    Ok(())
+}
+
+fn grant_follow_up(kitchen: &mut Kitchen) -> TestResult {
+    for permission in [
+        kitchen::contracts::Permission::PostComment,
+        kitchen::contracts::Permission::ResolveReviewThread,
+    ] {
+        let grant = Grant::repository(
+            permission,
+            repo()?,
+            kitchen::BackendId::new("github")?,
+            CredentialId::new("forge")?,
+        );
+        kitchen.config.policy_limits.insert(grant.clone());
+        kitchen.config.grants.insert(grant);
+    }
+    Ok(())
+}
+
+#[test]
+fn follow_up_bot_thread_launches_and_posts_fixed_resolution() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    kitchen.config = with_merge_grant(kitchen.config.clone())?;
+    grant_follow_up(&mut kitchen)?;
+    green_pull_request(&kitchen)?;
+    seed_attestation(&kitchen)?;
+    follow_up_thread(&kitchen)?;
+    let actions = acted(kitchen.follow_up()?)?;
+    assert!(matches!(
+        actions.as_slice(),
+        [kitchen::workflows::run::FollowUpAction::Launched { round: 1, .. }]
+    ));
+    let task = round_task(1)?;
+    checked_follow_up_push(&kitchen, &task, &commit('f')?)?;
+    let worker = current_worker(&kitchen.store().task(&task)?)
+        .ok_or("no follow-up worker")?
+        .worker;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/kitchen/issue-7"),
+        json!({"name":"kitchen/issue-7","commit":{"sha":commit('f')?.as_str()}}),
+    );
+    set_pull_request(&kitchen, "/head/sha", json!(commit('f')?.as_str()))?;
+    kitchen
+        .forge()
+        .responses
+        .borrow_mut()
+        .get_mut("graphql:node#\"PRRT_fixture\"")
+        .ok_or("missing thread node")?["data"]["node"]["pullRequest"]["headRefOid"] =
+        json!(commit('f')?.as_str());
+    let mut message = report(&worker, "done-follow-up")?;
+    message.body = Some(Text::new(&json!({"sourceHead":commit('d')?.as_str(),
+        "dispositions":[{"thread":"PRRT_fixture","verdict":"fixed","reply":"Fixed with a boundary regression test."}]}).to_string())?);
+    kitchen.backend.post(vec![message])?;
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.iter().any(|action| matches!(action, CoordinateAction::Supervised { task: found, outcome: Supervision::Settled(Settlement::Succeeded) } if found == &task)), "{actions:?}");
+    assert_eq!(
+        kitchen
+            .forge()
+            .writes
+            .borrow()
+            .iter()
+            .filter(|(endpoint, _)| endpoint == "graphql")
+            .count(),
+        2
+    );
+    assert_eq!(
+        kitchen.forge().responses.borrow()["graphql:node#\"PRRT_fixture\""]["data"]["node"]["isResolved"],
+        json!(true)
+    );
+    green_at(&kitchen, 'f')?;
+    assert_eq!(
+        one_verdict(kitchen.gate()?)?.result,
+        GateResult::ReportOnly(ReportReason::Unattested)
+    );
+    Ok(())
+}
+
+#[test]
+fn follow_up_declined_thread_stays_open_and_reaches_house_mailbox() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    grant_follow_up(&mut kitchen)?;
+    follow_up_thread(&kitchen)?;
+    acted(kitchen.follow_up()?)?;
+    let task = round_task(1)?;
+    checked_follow_up_push(&kitchen, &task, &commit('d')?)?;
+    let worker = current_worker(&kitchen.store().task(&task)?)
+        .ok_or("no follow-up worker")?
+        .worker;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    let mut message = report(&worker, "done-declined")?;
+    message.body = Some(Text::new(&json!({"sourceHead":commit('d')?.as_str(),
+        "dispositions":[{"thread":"PRRT_fixture","verdict":"declined","reply":"The existing range check covers this case."}]}).to_string())?);
+    kitchen.backend.post(vec![message])?;
+    acted(kitchen.coordinate()?)?;
+    assert_eq!(
+        kitchen
+            .forge()
+            .writes
+            .borrow()
+            .iter()
+            .filter(|(endpoint, _)| endpoint == "graphql")
+            .count(),
+        1
+    );
+    assert_eq!(
+        kitchen.forge().responses.borrow()["graphql:node#\"PRRT_fixture\""]["data"]["node"]["isResolved"],
+        json!(false)
+    );
+    assert!(
+        kitchen
+            .store()
+            .open_questions(512)?
+            .iter()
+            .any(|question| question.task == task)
+    );
+    Ok(())
+}
+
+#[test]
+fn follow_up_refuses_missing_duplicate_unknown_and_stale_dispositions() -> TestResult {
+    for body in [
+        json!({"sourceHead":commit('d')?.as_str(),"dispositions":[]}),
+        json!({"sourceHead":commit('d')?.as_str(),"dispositions":[
+            {"thread":"PRRT_fixture","verdict":"fixed","reply":"Fixed."},
+            {"thread":"PRRT_fixture","verdict":"fixed","reply":"Fixed."}]}),
+        json!({"sourceHead":commit('d')?.as_str(),"dispositions":[
+            {"thread":"PRRT_unknown","verdict":"fixed","reply":"Fixed."}]}),
+        json!({"sourceHead":commit('a')?.as_str(),"dispositions":[
+            {"thread":"PRRT_fixture","verdict":"fixed","reply":"Fixed."}]}),
+    ] {
+        let mut kitchen = settled_with_pull_request(true)?;
+        grant_follow_up(&mut kitchen)?;
+        follow_up_thread(&kitchen)?;
+        acted(kitchen.follow_up()?)?;
+        let task = round_task(1)?;
+        let worker = current_worker(&kitchen.store().task(&task)?)
+            .ok_or("no follow-up worker")?
+            .worker;
+        kitchen
+            .backend
+            .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+        let mut message = report(&worker, "invalid-follow-up")?;
+        message.body = Some(Text::new(&body.to_string())?);
+        kitchen.backend.post(vec![message])?;
+        assert!(
+            matches!(
+                kitchen.coordinate(),
+                Err(kitchen::Error::Run(RunError::DispositionInvalid))
+            ),
+            "{body}"
+        );
+        assert!(kitchen.forge().writes.borrow().is_empty());
+        assert!(!matches!(
+            kitchen.store().task(&task)?.state(),
+            TaskState::Settled { .. }
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn follow_up_refuses_a_moved_pull_request_head_before_effects() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    grant_follow_up(&mut kitchen)?;
+    follow_up_thread(&kitchen)?;
+    acted(kitchen.follow_up()?)?;
+    let task = round_task(1)?;
+    checked_follow_up_push(&kitchen, &task, &commit('d')?)?;
+    let worker = current_worker(&kitchen.store().task(&task)?)
+        .ok_or("no follow-up worker")?
+        .worker;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    set_pull_request(&kitchen, "/head/sha", json!(commit('f')?.as_str()))?;
+    let mut message = report(&worker, "moved-follow-up")?;
+    message.body = Some(Text::new(
+        &json!({"sourceHead":commit('d')?.as_str(),
+        "dispositions":[{"thread":"PRRT_fixture","verdict":"fixed","reply":"Fixed."}]})
+        .to_string(),
+    )?);
+    kitchen.backend.post(vec![message])?;
+    assert!(matches!(
+        kitchen.coordinate(),
+        Err(kitchen::Error::Run(RunError::AttestationStaleHead))
+    ));
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn follow_up_skips_a_new_reviewer_comment_after_launch() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    grant_follow_up(&mut kitchen)?;
+    follow_up_thread(&kitchen)?;
+    acted(kitchen.follow_up()?)?;
+    let task = round_task(1)?;
+    checked_follow_up_push(&kitchen, &task, &commit('d')?)?;
+    let worker = current_worker(&kitchen.store().task(&task)?)
+        .ok_or("no follow-up worker")?
+        .worker;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen.forge().responses.borrow_mut().get_mut("graphql:threads#12").ok_or("missing threads")?["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["comments"]["nodes"]
+        .as_array_mut().ok_or("missing comments")?
+        .push(json!({"id":"PRRC_new","body":"The boundary is still wrong.","author":{"login":"coderabbitai"}}));
+    let mut message = report(&worker, "stale-thread")?;
+    message.body = Some(Text::new(
+        &json!({"sourceHead":commit('d')?.as_str(),
+        "dispositions":[{"thread":"PRRT_fixture","verdict":"fixed","reply":"Fixed."}]})
+        .to_string(),
+    )?);
+    kitchen.backend.post(vec![message])?;
+    acted(kitchen.coordinate()?)?;
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Settled { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn follow_up_skips_an_edited_reviewer_comment_after_launch() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    grant_follow_up(&mut kitchen)?;
+    follow_up_thread(&kitchen)?;
+    acted(kitchen.follow_up()?)?;
+    let task = round_task(1)?;
+    checked_follow_up_push(&kitchen, &task, &commit('d')?)?;
+    let worker = current_worker(&kitchen.store().task(&task)?)
+        .ok_or("no follow-up worker")?
+        .worker;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    {
+        let forge = kitchen.forge();
+        let mut responses = forge.responses.borrow_mut();
+        let thread = &mut responses
+            .get_mut("graphql:threads#12")
+            .ok_or("missing threads")?["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+            [0];
+        thread["comments"]["nodes"][0]["body"] = json!("The boundary also needs a timeout.");
+        thread["line"] = json!(11);
+    }
+    let mut message = report(&worker, "edited-thread")?;
+    message.body = Some(Text::new(
+        &json!({"sourceHead":commit('d')?.as_str(),
+        "dispositions":[{"thread":"PRRT_fixture","verdict":"fixed","reply":"Fixed."}]})
+        .to_string(),
+    )?);
+    kitchen.backend.post(vec![message])?;
+    acted(kitchen.coordinate()?)?;
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Settled { .. }
+    ));
+    assert!(matches!(kitchen.follow_up()?, Outcome::Acted(_)));
+    Ok(())
+}
+
+#[test]
+fn follow_up_requires_the_rounds_checked_push_before_replying() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    grant_follow_up(&mut kitchen)?;
+    follow_up_thread(&kitchen)?;
+    acted(kitchen.follow_up()?)?;
+    let task = round_task(1)?;
+    let worker = current_worker(&kitchen.store().task(&task)?)
+        .ok_or("no follow-up worker")?
+        .worker;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    let mut message = report(&worker, "unverified-push")?;
+    message.body = Some(Text::new(
+        &json!({"sourceHead":commit('d')?.as_str(),
+        "dispositions":[{"thread":"PRRT_fixture","verdict":"fixed","reply":"Fixed."}]})
+        .to_string(),
+    )?);
+    kitchen.backend.post(vec![message])?;
+    assert!(matches!(
+        kitchen.coordinate(),
+        Err(kitchen::Error::Run(RunError::FollowUpPushMissing))
+    ));
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn follow_up_waits_for_worker_settlement_before_external_effects() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    grant_follow_up(&mut kitchen)?;
+    follow_up_thread(&kitchen)?;
+    acted(kitchen.follow_up()?)?;
+    let task = round_task(1)?;
+    checked_follow_up_push(&kitchen, &task, &commit('f')?)?;
+    let worker = current_worker(&kitchen.store().task(&task)?)
+        .ok_or("no follow-up worker")?
+        .worker;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Ready);
+    let mut message = report(&worker, "worker-still-active")?;
+    message.body = Some(Text::new(
+        &json!({"sourceHead":commit('d')?.as_str(),
+            "dispositions":[{"thread":"PRRT_fixture","verdict":"fixed","reply":"Fixed."}]})
+        .to_string(),
+    )?);
+    kitchen.backend.post(vec![message])?;
+    assert!(matches!(
+        kitchen.coordinate(),
+        Err(kitchen::Error::Run(RunError::FollowUpPushMissing))
+    ));
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn follow_up_change_request_without_thread_uses_an_empty_disposition_set() -> TestResult {
+    let kitchen = settled_with_pull_request(true)?;
+    follow_up_thread(&kitchen)?;
+    kitchen.forge().set(
+        "graphql:threads#12",
+        json!({"data":{"repository":{"pullRequest":{"reviewThreads":{
+            "nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}
+        }}}}}),
+    );
+    kitchen.forge().set(&format!("repos/{REPO}/pulls/12/reviews"), json!([{
+        "id":41,"user":{"login":"coderabbitai"},"commit_id":commit('d')?.as_str(),
+        "state":"CHANGES_REQUESTED","body":"Add a boundary test.","submitted_at":"1970-01-01T00:00:00Z"
+    }]));
+    let actions = acted(kitchen.follow_up()?)?;
+    assert!(matches!(
+        actions.as_slice(),
+        [kitchen::workflows::run::FollowUpAction::Launched { .. }]
+    ));
+    let task = round_task(1)?;
+    checked_follow_up_push(&kitchen, &task, &commit('d')?)?;
+    let worker = current_worker(&kitchen.store().task(&task)?)
+        .ok_or("no follow-up worker")?
+        .worker;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    let mut message = report(&worker, "review-only")?;
+    message.body = Some(Text::new(
+        &json!({"sourceHead":commit('d')?.as_str(),"dispositions":[]}).to_string(),
+    )?);
+    kitchen.backend.post(vec![message])?;
+    acted(kitchen.coordinate()?)?;
+    assert!(matches!(kitchen.follow_up()?, Outcome::Idle));
+    assert!(kitchen.forge().writes.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn follow_up_waits_for_another_repository_writer() -> TestResult {
+    let kitchen = settled_with_pull_request(true)?;
+    follow_up_thread(&kitchen)?;
+    open_issues(kitchen.forge(), vec![issue_json(8, &["ready"])]);
+    ready_issue(kitchen.forge(), 8, ACCEPTANCE);
+    acted(kitchen.pickup(false)?)?;
+    let actions = acted(kitchen.follow_up()?)?;
+    assert!(matches!(
+        actions.as_slice(),
+        [kitchen::workflows::run::FollowUpAction::Waiting {
+            reason: Wait::WriterOpen,
+            ..
+        }]
+    ));
+    assert_eq!(kitchen.backend.launched_agents().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn follow_up_exhausted_budget_asks_the_house_owner_once() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    kitchen.config = house_config_with(Some(0))?;
+    follow_up_thread(&kitchen)?;
+    let first = acted(kitchen.follow_up()?)?;
+    assert!(matches!(
+        first.as_slice(),
+        [kitchen::workflows::run::FollowUpAction::Exhausted { .. }]
+    ));
+    let questions = kitchen.store().open_questions(512)?;
+    assert_eq!(questions.len(), 1);
+    kitchen.clock.advance(TASK_LEASE.as_secs() + 1);
+    let second = acted(kitchen.follow_up()?)?;
+    assert!(matches!(
+        second.as_slice(),
+        [kitchen::workflows::run::FollowUpAction::Exhausted { .. }]
+    ));
+    assert_eq!(kitchen.store().open_questions(512)?.len(), 1);
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn follow_up_reconciles_a_lost_reply_after_coordinator_restart() -> TestResult {
+    let mut kitchen = settled_with_pull_request(true)?;
+    grant_follow_up(&mut kitchen)?;
+    follow_up_thread(&kitchen)?;
+    acted(kitchen.follow_up()?)?;
+    let task = round_task(1)?;
+    checked_follow_up_push(&kitchen, &task, &commit('f')?)?;
+    let worker = current_worker(&kitchen.store().task(&task)?)
+        .ok_or("no follow-up worker")?
+        .worker;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/kitchen/issue-7"),
+        json!({"name":"kitchen/issue-7","commit":{"sha":commit('f')?.as_str()}}),
+    );
+    set_pull_request(&kitchen, "/head/sha", json!(commit('f')?.as_str()))?;
+    kitchen
+        .forge()
+        .responses
+        .borrow_mut()
+        .get_mut("graphql:node#\"PRRT_fixture\"")
+        .ok_or("missing thread node")?["data"]["node"]["pullRequest"]["headRefOid"] =
+        json!(commit('f')?.as_str());
+    kitchen.forge().lose_thread_reply.set(true);
+    let mut message = report(&worker, "lost-follow-up")?;
+    message.body = Some(Text::new(&json!({"sourceHead":commit('d')?.as_str(),
+        "dispositions":[{"thread":"PRRT_fixture","verdict":"fixed","reply":"Fixed with a regression test."}]}).to_string())?);
+    kitchen.backend.post(vec![message])?;
+    assert!(matches!(
+        kitchen.coordinate(),
+        Err(kitchen::Error::Run(RunError::FollowUpEffectUncertain))
+    ));
+    assert!(!matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Settled { .. }
+    ));
+    let resumed = acted(kitchen.coordinate()?)?;
+    assert!(resumed.iter().any(|action| matches!(action, CoordinateAction::Supervised { task: found, outcome: Supervision::Settled(Settlement::Succeeded) } if found == &task)));
+    let writes = kitchen.forge().writes.borrow();
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|(_, body)| body["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("addPullRequestReviewThreadReply")))
+            .count(),
+        1
+    );
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|(_, body)| body["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("resolveReviewThread")))
+            .count(),
+        1
+    );
+    Ok(())
 }
 
 fn pr(number: u64) -> TestResult<kitchen::contracts::IssueNumber> {
@@ -4924,6 +5516,7 @@ impl Kitchen {
             house: &self.config,
             backend,
             forge: &self.forge,
+            forge_executor: None,
             clock,
             repository: &self.settings.repository,
             pickup: Some(&self.settings),
@@ -5385,7 +5978,7 @@ fn tick_repair_and_gate_passes_renew_while_slow_forge_reads_outlast_their_leases
         let expected = match pass {
             TickPass::Repair => issues.len(),
             TickPass::Gate => kitchen::workflows::run::MAX_GATE_PULL_REQUESTS,
-            TickPass::Pickup | TickPass::Coordinate => 0,
+            TickPass::Pickup | TickPass::Coordinate | TickPass::FollowUp => 0,
         };
         assert_eq!(run.tasks.len(), expected, "{run:?}");
         assert!(run.tasks.iter().all(|task| tasks.contains(task)));

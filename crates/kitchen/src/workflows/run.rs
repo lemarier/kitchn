@@ -58,6 +58,7 @@ use crate::{
 
 mod attestation;
 mod coordinate;
+mod follow_up;
 mod gate;
 mod pickup;
 mod repair;
@@ -69,9 +70,10 @@ pub use attestation::{
     attest_gate_review, gate_attestation, record_gate_attestation,
 };
 pub use coordinate::{CoordinateAction, CoordinatePass, Unroutable};
+pub use follow_up::{FollowUpDisposition, FollowUpVerdict};
 pub use gate::{GateAction, GatePass, GateResult, MAX_GATE_PULL_REQUESTS, NotMerged, ReportReason};
 pub use pickup::{MAX_READY_INSPECTED, PickupAction, PickupLabels, PickupPass, PickupSettings};
-pub use repair::{RepairAction, RepairPass, RepairSettings, Wait};
+pub use repair::{FollowUpAction, RepairAction, RepairPass, RepairSettings, Wait};
 pub use review::{GateReview, GateReviewInput, post_gate_review};
 pub use tick::{TickPasses, failed_report};
 
@@ -103,13 +105,21 @@ pub enum Pass {
     Coordinate,
     /// Assess Kitchen pull requests for conflict repair ([`RepairPass`]).
     Repair,
+    /// Act on review threads on delivered Kitchen pull requests.
+    FollowUp,
     /// Evaluate Kitchen pull requests at their exact heads ([`GatePass`]).
     Gate,
 }
 
 impl Pass {
     /// Every pass.
-    pub const ALL: [Self; 4] = [Self::Pickup, Self::Coordinate, Self::Repair, Self::Gate];
+    pub const ALL: [Self; 5] = [
+        Self::Pickup,
+        Self::Coordinate,
+        Self::Repair,
+        Self::FollowUp,
+        Self::Gate,
+    ];
 
     /// The command and consumer name.
     #[must_use]
@@ -118,6 +128,7 @@ impl Pass {
             Self::Pickup => "pickup",
             Self::Coordinate => "coordinate",
             Self::Repair => "repair",
+            Self::FollowUp => "follow-up",
             Self::Gate => "gate",
         }
     }
@@ -131,11 +142,13 @@ impl Pass {
     pub fn consumer(self, repository: &Repository) -> Result<ConsumerId> {
         Ok(match self {
             Self::Coordinate => coordinate::consumer()?,
-            Self::Pickup | Self::Repair | Self::Gate => ConsumerId::new(&format!(
-                "run-{}-{:016x}",
-                self.as_str(),
-                stable_hash(repository.as_str().as_bytes())
-            ))?,
+            Self::Pickup | Self::Repair | Self::FollowUp | Self::Gate => {
+                ConsumerId::new(&format!(
+                    "run-{}-{:016x}",
+                    self.as_str(),
+                    stable_hash(repository.as_str().as_bytes())
+                ))?
+            }
         })
     }
 }
@@ -162,8 +175,17 @@ impl FromStr for Pass {
 #[non_exhaustive]
 pub enum RunError {
     /// No pass has this name.
-    #[error("unknown pass; expected pickup, coordinate, repair, or gate")]
+    #[error("unknown pass; expected pickup, coordinate, repair, follow-up, or gate")]
     UnknownPass,
+    /// A follow-up worker's report is missing, stale, duplicated, or malformed.
+    #[error("invalid follow-up thread dispositions")]
+    DispositionInvalid,
+    /// The round has no checked push at the reported head.
+    #[error("the follow-up round has no checked push at the reported head")]
+    FollowUpPushMissing,
+    /// A thread effect or budget escalation lacks a proven outcome.
+    #[error("the follow-up effect outcome is not proved; reconcile or hand over")]
+    FollowUpEffectUncertain,
     /// The repository is not one of the house's repositories.
     #[error("the repository is not one of the house's repositories")]
     RepositoryOutsideHouse,
@@ -261,7 +283,9 @@ impl RunError {
             | Self::RepositoryAmbiguous
             | Self::BackendArguments(_)
             | Self::RuntimeMismatch(_) => ErrorClass::InvalidInput,
-            Self::ReviewClaimsWithoutApproval | Self::ReviewBodyInvalid => ErrorClass::InvalidInput,
+            Self::ReviewClaimsWithoutApproval
+            | Self::ReviewBodyInvalid
+            | Self::DispositionInvalid => ErrorClass::InvalidInput,
             Self::NoBackend | Self::NoPickupSettings | Self::NoPassSettings => ErrorClass::Refused,
             Self::Mailbox(MailboxError::Fenced | MailboxError::CoordinatorStale) => {
                 ErrorClass::Conflict
@@ -276,6 +300,8 @@ impl RunError {
             | Self::AttestationWritersUnknown
             | Self::ReviewUncertain
             | Self::ReviewPostRefused
+            | Self::FollowUpPushMissing
+            | Self::FollowUpEffectUncertain
             | Self::GateRefused => ErrorClass::Refused,
             Self::AttestationRecorded
             | Self::AttestationClosed

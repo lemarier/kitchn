@@ -2313,6 +2313,105 @@ fn follow_up_not_applied_releases_round_for_immediate_retry() -> TestResult {
 }
 
 #[test]
+fn follow_up_adopts_awaiting_launch_after_coordinate_takeover() -> TestResult {
+    let kitchen = settled_with_pull_request(true)?;
+    follow_up_thread(&kitchen)?;
+    kitchen
+        .backend
+        .inject(kitchen::contracts::fake::ExecuteFault::Reject);
+    acted(kitchen.follow_up()?)?;
+    let task = round_task(1)?;
+    let stale = kitchen
+        .store()
+        .claim(
+            &task,
+            &run_claimant()?,
+            LeaseTtl::new(TASK_LEASE)?,
+            kitchen.clock.now(),
+        )?
+        .fence();
+    kitchen.clock.advance(TASK_LEASE.as_secs() + 1);
+    let waiting = acted(kitchen.follow_up()?)?;
+    assert!(
+        waiting.iter().any(|action| action
+            .to_string()
+            .contains("kitchn run coordinate --take-over")),
+        "{waiting:?}"
+    );
+    acted(kitchen.coordinate_on(&kitchen.backend, true)?)?;
+    let before = kitchen.store().task(&task)?.state().clone();
+    assert!(matches!(before, TaskState::Claimed { .. }));
+    let actions = acted(kitchen.follow_up()?)?;
+    assert!(
+        matches!(actions.as_slice(), [kitchen::workflows::run::FollowUpAction::Launched { attempt, .. }] if attempt.get() == 2),
+        "{actions:?}"
+    );
+    assert!(matches!(
+        kitchen
+            .store()
+            .start_attempt(&task, stale, kitchen.clock.now()),
+        Err(kitchen::Error::State(StateError::StaleFence { .. }))
+    ));
+    assert_eq!(kitchen.backend.launched_agents().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn pickup_names_coordinate_for_an_expired_task_claim() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    kitchen
+        .backend
+        .inject(kitchen::contracts::fake::ExecuteFault::Reject);
+    acted(kitchen.pickup(false)?)?;
+    let task = kitchen.task(7)?;
+    kitchen.clock.advance(TASK_LEASE.as_secs() + 1);
+    let actions = acted(kitchen.pickup(true)?)?;
+    assert!(actions.iter().any(|action| matches!(action, PickupAction::TaskClaimUncertain { task: found } if found == &task)));
+    assert!(
+        actions[0]
+            .to_string()
+            .contains("kitchn run coordinate --take-over")
+    );
+    assert_eq!(kitchen.backend.launched_agents().len(), 0);
+    Ok(())
+}
+
+#[test]
+fn follow_up_does_not_adopt_running_or_unresolved_launches() -> TestResult {
+    let running = settled_with_pull_request(true)?;
+    follow_up_thread(&running)?;
+    acted(running.follow_up()?)?;
+    acted(running.coordinate()?)?;
+    let held = acted(running.follow_up()?)?;
+    assert!(
+        !held.iter().any(|action| matches!(
+            action,
+            kitchen::workflows::run::FollowUpAction::Launched { .. }
+        )),
+        "{held:?}"
+    );
+    assert_eq!(running.backend.launched_agents().len(), 2);
+
+    let uncertain = settled_with_pull_request(true)?;
+    follow_up_thread(&uncertain)?;
+    uncertain
+        .backend
+        .inject(kitchen::contracts::fake::ExecuteFault::TimeoutWithoutApplying);
+    acted(uncertain.follow_up()?)?;
+    let held = acted(uncertain.follow_up()?)?;
+    assert!(
+        !held.iter().any(|action| matches!(
+            action,
+            kitchen::workflows::run::FollowUpAction::Launched { .. }
+        )),
+        "{held:?}"
+    );
+    assert_eq!(uncertain.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+#[test]
 fn follow_up_declined_thread_stays_open_and_reaches_house_mailbox() -> TestResult {
     let mut kitchen = settled_with_pull_request(true)?;
     grant_follow_up(&mut kitchen)?;
@@ -2969,6 +3068,62 @@ fn a_repair_round_whose_launch_was_refused_is_launched_by_the_next_pass() -> Tes
         "{retried:?}"
     );
     assert_eq!(kitchen.backend.launched_agents().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn repair_adopts_awaiting_launch_after_coordinate_takeover() -> TestResult {
+    let kitchen = settled_with_pull_request(false)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    kitchen
+        .backend
+        .inject(kitchen::contracts::fake::ExecuteFault::Reject);
+    acted(kitchen.repair()?)?;
+    let task = round_task(1)?;
+    kitchen.store().claim(
+        &task,
+        &run_claimant()?,
+        LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    kitchen.clock.advance(TASK_LEASE.as_secs() + 1);
+    let waiting = acted(kitchen.repair()?)?;
+    assert!(
+        waiting.iter().any(|action| action
+            .to_string()
+            .contains("kitchn run coordinate --take-over")),
+        "{waiting:?}"
+    );
+    acted(kitchen.coordinate_on(&kitchen.backend, true)?)?;
+    let actions = acted(kitchen.repair()?)?;
+    assert!(
+        matches!(actions.as_slice(), [RepairAction::Launched { attempt, .. }] if attempt.get() == 2),
+        "{actions:?}"
+    );
+    assert_eq!(kitchen.backend.launched_agents().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn repair_does_not_adopt_an_unresolved_launch() -> TestResult {
+    let kitchen = settled_with_pull_request(false)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    kitchen
+        .backend
+        .inject(kitchen::contracts::fake::ExecuteFault::TimeoutWithoutApplying);
+    acted(kitchen.repair()?)?;
+    let actions = acted(kitchen.repair()?)?;
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, RepairAction::Launched { .. })),
+        "{actions:?}"
+    );
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
     Ok(())
 }
 

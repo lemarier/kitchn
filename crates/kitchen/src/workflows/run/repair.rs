@@ -129,6 +129,19 @@ pub enum Wait {
     RoundUncertain,
 }
 
+impl fmt::Display for Wait {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")?;
+        if matches!(self, Self::RoundHeld | Self::RoundUncertain) {
+            write!(
+                formatter,
+                "; if this pass's --take-over cannot take the task claim, inspect its prior launch, then run kitchn run coordinate --take-over"
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// What a repair pass decided about one pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepairAction {
@@ -263,7 +276,7 @@ impl fmt::Display for FollowUpAction {
                 reason,
             } => write!(
                 formatter,
-                "pull request #{}: follow-up task {task} waits: {reason:?}",
+                "pull request #{}: follow-up task {task} waits: {reason}",
                 pull_request.get()
             ),
             Self::Exhausted { pull_request } => write!(
@@ -349,7 +362,7 @@ impl fmt::Display for RepairAction {
                 wait,
             } => write!(
                 formatter,
-                "pull request #{}: repair task {task} waits: {wait:?}",
+                "pull request #{}: repair task {task} waits: {wait}",
                 pull_request.get()
             ),
         }
@@ -1118,6 +1131,36 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
         task: &TaskId,
         claimant: &Claimant,
     ) -> Result<std::result::Result<Fence, Wait>> {
+        let record = self.store.task(task)?;
+        // Coordination owns an idle round after recovering its claim. A
+        // scheduled writer may take it only when no launch is running or
+        // unresolved; transfer fences out the coordinator before launching.
+        if scheduled_repair(&record, self.repository)
+            && awaiting_launch(&record)
+            && !record.unresolved_effects().any(|effect| {
+                matches!(
+                    effect.request().effect(),
+                    crate::contracts::Effect::Worker(
+                        crate::contracts::Operation::LaunchWorker { .. }
+                    )
+                )
+            })
+            && let Some(lease) = super::held_by_run(&record, self.clock.now())
+            && lease.consumer().is_some_and(|bound| {
+                Pass::Coordinate
+                    .consumer(self.repository)
+                    .is_ok_and(|id| id == bound.consumer)
+            })
+        {
+            return Ok(super::transfer(
+                self.store,
+                task,
+                lease.fence(),
+                claimant,
+                self.clock.now(),
+            )?
+            .ok_or(Wait::RoundHeld));
+        }
         Ok(
             take_for_pass(self.store, task, claimant, self.take_over, self.clock.now())?.map_err(
                 |refusal| match refusal {

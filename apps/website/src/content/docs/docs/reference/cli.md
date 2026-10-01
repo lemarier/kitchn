@@ -743,8 +743,10 @@ before anything runs.
   removed existing-branch worktree through Orca. A round whose writer's
   attempt ended without settling it gets its next attempt only through the
   same decision; once that writer ran, it is the branch's last writer, so the
-  pull request is handed over. `--branch-prefix` and `--report-path` are
-  pickup's: `repair` reads the stored pickup settings and refuses a flag that
+  pull request is handed over. If coordination holds a round waiting for its
+  next launch, repair adopts it under a new fence before starting the worker.
+  Running and unresolved launches stay with coordination. `--branch-prefix`
+  and `--report-path` are pickup's: `repair` reads the stored pickup settings and refuses a flag that
   names another value. The `coordinate` pass supervises repair writers like
   pickup workers.
 - `follow-up` reads unresolved review threads and change-request reviews on
@@ -763,7 +765,9 @@ before anything runs.
   A moved head, changed reviewer comment, incomplete disposition set, or
   uncertain forge write blocks settlement; restarting coordination
   reconciles the recorded effect before continuing. `--branch-prefix` and
-  `--report-path` use pickup's stored settings, as for repair.
+  `--report-path` use pickup's stored settings, as for repair. A round waiting
+  for another launch can move from coordination to follow-up under a new fence;
+  running and unresolved launches stay with coordination.
 - `gate` evaluates up to three of those pull requests at their exact heads and
   prints each verdict. It merges one only when an independent reviewer's
   attestation is recorded for exactly its head and base, whoever recorded it
@@ -800,6 +804,12 @@ process can no longer act on it; a replaced `pickup` can no longer claim or
 launch. The same flag lets `coordinate` take over scheduled task claims that
 expired because no pass renewed them for two hours. A pass with nothing to do prints `idle`, exits `0`, and launches or
 messages no worker.
+
+`--take-over` on pickup covers its pass lease. On repair and follow-up it can
+also take an eligible round's expired task claim. If a claim remains held or uncertain, the
+pass prints a wait with `kitchn run coordinate --take-over` as the recovery
+command. Inspect the earlier launch before using it; coordination reconciles
+uncertain launches before a writer pass can adopt the task.
 
 ## `kitchn gate review`
 

@@ -138,6 +138,11 @@ pub enum PickupAction {
         /// The task.
         task: TaskId,
     },
+    /// An expired task claim needs coordination before pickup can retry it.
+    TaskClaimUncertain {
+        /// The task.
+        task: TaskId,
+    },
 }
 
 impl fmt::Display for PickupAction {
@@ -167,6 +172,10 @@ impl fmt::Display for PickupAction {
             Self::StackedRetry { task } => write!(
                 formatter,
                 "stacked task needs a person for its next attempt: task {task}"
+            ),
+            Self::TaskClaimUncertain { task } => write!(
+                formatter,
+                "task {task} has an expired task claim; --take-over on pickup covers its pass lease, not this task: inspect the launch, then run kitchn run coordinate --take-over"
             ),
             Self::Moved { task } => write!(formatter, "task {task} changed hands; left alone"),
         }
@@ -223,6 +232,25 @@ impl<T: GitHubReadTransport> PickupPass<'_, T> {
                     .issues_filtered(house, repository, Some(IssueState::Open), None),
             )?;
         let tasks = self.store.tasks()?;
+        let uncertain: Vec<_> = tasks
+            .iter()
+            .filter_map(|record| {
+                issue_of(record, repository)?;
+                if awaiting_launch(record)
+                    && matches!(record.state(), TaskState::Claimed { lease }
+                    if lease.holder().as_str() == super::RUN_HOLDER && !lease.is_live(now))
+                {
+                    Some(PickupAction::TaskClaimUncertain {
+                        task: record.spec().id.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !uncertain.is_empty() {
+            return Ok(uncertain);
+        }
         // One writer per repository: file overlap is not observed, so a pass
         // launches at most one writer, and none while another branch writer
         // of the repository, scheduled or a person's, may be working.

@@ -123,7 +123,7 @@ pub fn run(args: PreserveArgs) -> Result<(String, bool), kitchen::Error> {
             }
         })
         .ok_or(IntegrationError::Unknown)?;
-    let current = SystemRunner::new(runtime.executable).run(&Invocation::new(
+    let current = SystemRunner::new(runtime.executable.clone()).run(&Invocation::new(
         vec![
             "worktree".into(),
             "show".into(),
@@ -209,11 +209,87 @@ pub fn run(args: PreserveArgs) -> Result<(String, bool), kitchen::Error> {
     io::stdout()
         .flush()
         .map_err(|_| IntegrationError::Unknown)?;
-    confirm_head(
-        prefix,
-        io::BufReader::new(io::stdin().lock().take(128)),
-        true,
+    let still_valid = confirm_and_recheck(
+        || {
+            confirm_head(
+                prefix,
+                io::BufReader::new(io::stdin().lock().take(128)),
+                true,
+            )
+        },
+        || {
+            let fresh_record = store.task(&args.task)?;
+            if !matches!(
+                fresh_record.state(),
+                TaskState::Settled {
+                    settlement: kitchen::contracts::Settlement::Succeeded,
+                    ..
+                }
+            ) || fresh_record.spec().repository.as_ref() != Some(&repository)
+                || fresh_record.pull_request() != Some(number)
+                || task_branch(&fresh_record).as_ref() != Some(&branch)
+                || current_worker(&fresh_record).map(|worker| worker.attempt)
+                    != Some(worker.attempt)
+                || report_path(&fresh_record)? != report_path(&record)?
+            {
+                return Ok(false);
+            }
+            let (fresh_branch, fresh_head) =
+                observed_branch_head(&target).map_err(|_| IntegrationError::Unknown)?;
+            if fresh_branch != branch || fresh_head != args.head {
+                return Ok(false);
+            }
+            let fresh_worktree =
+                SystemRunner::new(runtime.executable.clone()).run(&Invocation::new(
+                    vec![
+                        "worktree".into(),
+                        "show".into(),
+                        "--worktree".into(),
+                        format!("id:{worktree_id}"),
+                        "--json".into(),
+                    ],
+                    Duration::from_secs(30),
+                ))?;
+            if fresh_worktree.exit_code != Some(0) {
+                return Ok(false);
+            }
+            let fresh_worktree: serde_json::Value = serde_json::from_slice(&fresh_worktree.stdout)
+                .map_err(|_| IntegrationError::Unknown)?;
+            let found = &fresh_worktree["result"]["worktree"];
+            if fresh_worktree["ok"] != true
+                || found["id"].as_str() != Some(worktree_id.as_str())
+                || found["path"]
+                    .as_str()
+                    .and_then(|path| Path::new(path).canonicalize().ok())
+                    .as_deref()
+                    != Some(target.as_path())
+                || found["projectId"].as_str() != Some(&format!("github:{repository}"))
+                || found["branch"].as_str() != Some(&format!("refs/heads/{branch}"))
+                || found["head"].as_str() != Some(args.head.as_str())
+            {
+                return Ok(false);
+            }
+            if !checkout_changes_except_report(&target, &report_path(&fresh_record)?)
+                .map_err(|_| IntegrationError::Unknown)?
+                .is_empty()
+            {
+                return Ok(false);
+            }
+            let fresh_live = match client.pull_request(&house_id, &repository, number) {
+                Observation::Known(live) => live,
+                _ => return Err(IntegrationError::Unknown.into()),
+            };
+            Ok(fresh_live.state == IssueState::Open
+                && fresh_live.head_location(&repository) == HeadLocation::SameRepository
+                && fresh_live.head.name == branch.as_str()
+                && fresh_live.head.sha == args.head)
+        },
     )?;
+    if !still_valid {
+        output
+            .push_str("\npreservation refused: checkout or live head changed during confirmation");
+        return Ok((output, false));
+    }
     let source = format!("owner-preserved-{}", args.holder);
     store.record_owner_preservation(
         &args.task,
@@ -224,6 +300,14 @@ pub fn run(args: PreserveArgs) -> Result<(String, bool), kitchen::Error> {
     )?;
     output.push_str("\npreservation recorded for this head");
     Ok((output, true))
+}
+
+fn confirm_and_recheck(
+    confirm: impl FnOnce() -> Result<(), kitchen::Error>,
+    recheck: impl FnOnce() -> Result<bool, kitchen::Error>,
+) -> Result<bool, kitchen::Error> {
+    confirm()?;
+    recheck()
 }
 
 fn worker_context(path: &Path) -> bool {
@@ -264,6 +348,37 @@ mod tests {
         assert!(confirm_head(prefix, "aaaaaaaaaaaa\n".as_bytes(), true).is_ok());
         assert!(confirm_head(prefix, "aaaaaaaaaaaa\n".as_bytes(), false).is_err());
         assert!(confirm_head(prefix, "aaaaaaaaaaab\n".as_bytes(), true).is_err());
+    }
+
+    #[test]
+    fn changed_state_during_confirmation_refuses_recording()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["init", "-q"])
+                .status()?
+                .success()
+        );
+        assert!(checkout_changes_except_report(root, Path::new("report.md"))?.is_empty());
+        let accepted = confirm_and_recheck(
+            || {
+                confirm_head("aaaaaaaaaaaa", "aaaaaaaaaaaa\n".as_bytes(), true)?;
+                fs::write(root.join("late-work.txt"), "changed during prompt")
+                    .map_err(|_| IntegrationError::Unknown)?;
+                Ok(())
+            },
+            || {
+                Ok(checkout_changes_except_report(root, Path::new("report.md"))
+                    .map_err(|_| IntegrationError::Unknown)?
+                    .is_empty())
+            },
+        );
+        assert!(matches!(accepted, Ok(false)));
+        Ok(())
     }
 
     #[test]

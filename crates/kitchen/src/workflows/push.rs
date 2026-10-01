@@ -127,9 +127,41 @@ pub fn checkout_changes_except_report(
     report_path: &Path,
 ) -> std::result::Result<Vec<String>, crate::git::GitReadError> {
     let limits = crate::git::GitLimits::default();
+    let root = worktree
+        .canonicalize()
+        .map_err(|_| crate::git::GitReadError::InvalidPath)?;
+    if !root.is_dir() {
+        return Err(crate::git::GitReadError::InvalidPath);
+    }
+    let pinned = format!("core.worktree={}", root.display());
+    let actual = crate::git::run(
+        &root,
+        ["-c", pinned.as_str(), "rev-parse", "--show-toplevel"],
+        &limits,
+    )?;
+    if Path::new(actual.trim())
+        .canonicalize()
+        .map_err(|_| crate::git::GitReadError::NotCheckoutRoot)?
+        != root
+    {
+        return Err(crate::git::GitReadError::NotCheckoutRoot);
+    }
+    let report = root.join(report_path);
+    let exempt_report = report_path.is_relative()
+        && report_path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        && report
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_file())
+        && report
+            .canonicalize()
+            .is_ok_and(|path| path.starts_with(&root));
     let status = crate::git::run(
-        worktree,
+        &root,
         [
+            "-c",
+            pinned.as_str(),
             "-c",
             "status.relativePaths=false",
             "status",
@@ -167,7 +199,7 @@ pub fn checkout_changes_except_report(
             changed.push(format!("{from} -> {path}"));
             continue;
         }
-        if Path::new(path) != report_path {
+        if !exempt_report || Path::new(path) != report_path {
             changed.push(path.to_owned());
         }
     }
@@ -175,8 +207,10 @@ pub fn checkout_changes_except_report(
     // --untracked-files=all. ls-files enumerates its actual files so a
     // directory holding only the configured report remains exempt.
     let ignored = crate::git::run(
-        worktree,
+        &root,
         [
+            "-c",
+            pinned.as_str(),
             "ls-files",
             "--others",
             "--ignored",
@@ -192,11 +226,11 @@ pub fn checkout_changes_except_report(
         if path.is_empty() {
             return Err(crate::git::GitReadError::Malformed);
         }
-        if Path::new(path) != report_path {
+        if !exempt_report || Path::new(path) != report_path {
             changed.push(path.to_owned());
         }
     }
-    let hidden = crate::workflows::cleanup::count_hidden_tracked(worktree, &limits)?;
+    let hidden = crate::workflows::cleanup::count_hidden_tracked_pinned(&root, &pinned, &limits)?;
     if hidden > 0 {
         changed.push(format!("{hidden} tracked path(s) hidden from Git status"));
     }

@@ -137,3 +137,47 @@ fn ignored_report_directory_is_clean_only_when_it_contains_the_report() -> TestR
     assert!(!checkout_clean_except_report(root, report)?);
     Ok(())
 }
+
+#[test]
+fn worktree_config_cannot_redirect_cleanliness_to_another_checkout() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("launched");
+    let clean = dir.path().join("clean");
+    fs::create_dir(&root)?;
+    fs::create_dir(&clean)?;
+    git(&root, &["init", "-q"])?;
+    git(&clean, &["init", "-q"])?;
+    git(&root, &["config", "extensions.worktreeConfig", "true"])?;
+    fs::write(root.join("worker-work.txt"), "must count")?;
+    git(
+        &root,
+        &[
+            "config",
+            "--worktree",
+            "core.worktree",
+            clean.to_str().ok_or("path")?,
+        ],
+    )?;
+    let result = checkout_changes_except_report(&root, Path::new("report.md"));
+    assert!(result.is_err() || result?.iter().any(|path| path == "worker-work.txt"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn report_symlink_outside_checkout_is_work() -> TestResult {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("launched");
+    fs::create_dir(&root)?;
+    git(&root, &["init", "-q"])?;
+    let outside = dir.path().join("outside.md");
+    fs::write(&outside, "external")?;
+    symlink(&outside, root.join("report.md"))?;
+    assert_eq!(
+        checkout_changes_except_report(&root, Path::new("report.md"))?,
+        ["report.md"]
+    );
+    Ok(())
+}

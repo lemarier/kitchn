@@ -108,7 +108,7 @@
 mod build;
 mod disk;
 mod git;
-pub(crate) use git::count_hidden_tracked;
+pub(crate) use git::count_hidden_tracked_pinned;
 
 use std::{
     collections::{BTreeMap, BTreeSet},

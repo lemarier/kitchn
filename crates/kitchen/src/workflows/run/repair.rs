@@ -628,6 +628,7 @@ fn worktree(last: &TaskRecord, writer: &Writer, head: &CommitId) -> WorktreeView
         .find_map(|evidence| match evidence.kind {
             EvidenceKind::WorkerReport(checkout) => Some((evidence, checkout)),
             EvidenceKind::Check
+            | EvidenceKind::ForgeMerge(_)
             | EvidenceKind::Verification(_)
             | EvidenceKind::AuthorizedVerification(_) => None,
         });

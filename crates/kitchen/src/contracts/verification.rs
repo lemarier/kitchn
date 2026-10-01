@@ -660,8 +660,8 @@ impl VerificationReport {
     /// target, and credentials. Other verification evidence for a target is
     /// [`TargetStatus::Unauthenticated`]. Of the authenticated evidence, only
     /// the exact subject counts; a failure outweighs a pass, and a pass
-    /// outweighs an unavailable result. Check and worker-report evidence never
-    /// verifies a target.
+    /// outweighs an unavailable result. Check, worker-report, and forge-merge
+    /// evidence never verify a target.
     pub fn evaluate(
         required: &BTreeSet<VerificationTarget>,
         subject: &EvidenceSubject,
@@ -679,7 +679,9 @@ impl VerificationReport {
                                 (&access.target, authorized.contains(access))
                             }
                             EvidenceKind::Verification(observed) => (observed, false),
-                            EvidenceKind::Check | EvidenceKind::WorkerReport(_) => continue,
+                            EvidenceKind::Check
+                            | EvidenceKind::WorkerReport(_)
+                            | EvidenceKind::ForgeMerge(_) => continue,
                         };
                         if observed != target {
                             continue;

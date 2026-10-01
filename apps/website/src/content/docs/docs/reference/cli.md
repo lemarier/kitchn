@@ -141,6 +141,14 @@ Exits 0 when configuration is complete and 1 when findings remain. Readiness
 gaps become findings only for work types whose `mergeReadiness` level is not met.
 With `--store`, doctor reads the house store and reports any table at 80% of its
 limit or more, before new work is refused.
+When Orca runtime settings are stored, doctor makes a bounded, read-only mailbox
+probe. A stale coordinator handle is named in the findings. Create a live
+terminal with `orca terminal create --focus`, bind it with `orca orchestration
+run-use --id <run> --from <new-terminal>`, then update the stored handle with
+`kitchn tick configure --registry <registry> --house <house> --orca-coordinator <new-terminal>`.
+The probe does not acknowledge a delivery or move the Run. Scheduled passes
+also check the stored handle before acting and stop with the named recovery
+error when it is stale.
 For scheduled worker effects, doctor checks grants against the bound
 repository and backend. A matching repository-scoped grant satisfies the
 check; a house-scoped grant also covers that repository.
@@ -646,7 +654,11 @@ before anything runs.
 - `coordinate` continues every scheduled task, reads worker deliveries from
   the backend when it declares them and from the house mailbox otherwise, and
   supervises each task once. A worker's successful report settles its task
-  with the head its branch shows on the forge. Questions wait for a person
+  with the head its branch shows on the forge. A merged linked PR also settles
+  a task whose report was lost when its exact head matches the task's last
+  checked push, the forge names a merge commit, and the backend confirms the
+  worker settled successfully. The merge commit is recorded as evidence.
+  Questions wait for a person
   (`kitchn mailbox reply` on the house mailbox). A delivery stays unread only
   while a message in it waits for a scheduled task the pass does not own yet,
   for a scheduled task's launch whose outcome is not recorded yet, or for a

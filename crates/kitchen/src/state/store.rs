@@ -503,7 +503,10 @@ impl HouseStore {
     ) -> Result<EvidenceRevision> {
         match evidence.kind {
             EvidenceKind::AuthorizedVerification(_) => Err(VerificationError::NotRun.into()),
-            EvidenceKind::Check | EvidenceKind::WorkerReport(_) | EvidenceKind::Verification(_) => {
+            EvidenceKind::Check
+            | EvidenceKind::WorkerReport(_)
+            | EvidenceKind::Verification(_)
+            | EvidenceKind::ForgeMerge(_) => {
                 self.transact(|state| state.record_evidence(id, fence, evidence, now))
             }
         }

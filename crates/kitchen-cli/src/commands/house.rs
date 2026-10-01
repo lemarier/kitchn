@@ -1,14 +1,15 @@
 use clap::{Args, Subcommand};
 use kitchen::{
     HouseId,
+    adapters::orca::{DEFAULT_CALL_TIMEOUT, OrcaError, SystemRunner, probe_coordinator},
     adoption::{
         BindingDigest, HouseRegistry, InstructionBundle, LegacyImportStatus, RepositoryMatch,
         StoreOutcome, StoreSetup, decode, encode, legacy_binding,
     },
     contracts::Repository,
     house::{
-        DoctorEvidence, DoctorFinding, DoctorReport, HouseConfig, HouseError,
-        REPOSITORY_BINDING_SCHEMA, RepositoryConfig, Workflow, doctor,
+        DoctorCode, DoctorEvidence, DoctorFinding, DoctorReport, HouseConfig, HouseError,
+        REPOSITORY_BINDING_SCHEMA, RepositoryConfig, Workflow, doctor, runtime_config,
     },
     state::{HouseStore, StoreOptions},
 };
@@ -419,6 +420,32 @@ fn diagnose(
             .store_capacity = Some(capacity);
     }
     let mut report = doctor(registry, config, evidence.as_ref())?;
+    match runtime_config(registry, &config.house) {
+        Ok(Some(runtime)) => {
+            if let Some(orca) = runtime.orca {
+                let status = probe_coordinator(
+                    &SystemRunner::new(orca.executable),
+                    &orca.run,
+                    &orca.coordinator,
+                    DEFAULT_CALL_TIMEOUT,
+                );
+                if let Err(error) = status {
+                    let stale = matches!(&error, OrcaError::Refused { code, .. } if code == "terminal_handle_stale");
+                    report.findings.push(DoctorFinding {
+                        code: DoctorCode::Coordinator,
+                        message: if stale { "The stored Orca coordinator terminal handle is stale.".into() } else { format!("The stored Orca coordinator terminal could not be checked: {error}") },
+                        next_step: if stale { "Create a live terminal with `orca terminal create --focus`, bind it with `orca orchestration run-use --id <run> --from <new-terminal>`, then run `kitchn tick configure --registry <registry> --house <house> --orca-coordinator <new-terminal>` and rerun doctor.".into() } else { "Check the Orca runtime and stored Run, then rerun doctor. Do not infer that the mailbox is empty.".into() },
+                    });
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => report.findings.push(DoctorFinding {
+            code: DoctorCode::Coordinator,
+            message: format!("The house's stored runtime configuration could not be read: {error}"),
+            next_step: "Inspect and remove the invalid runtime configuration, then store it again with `kitchn tick configure` and rerun doctor. Do not infer that the mailbox is empty.".into(),
+        }),
+    }
     report
         .findings
         .extend(legacy.map(DoctorFinding::legacy_binding));

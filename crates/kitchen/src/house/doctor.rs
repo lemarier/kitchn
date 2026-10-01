@@ -116,6 +116,8 @@ pub enum DoctorCode {
     Instructions,
     /// Forge access was not positively observed.
     Access,
+    /// The stored Orca coordinator cannot read its Run mailbox.
+    Coordinator,
     /// Label observation/creation/manual conflict resolution needed.
     Labels,
     /// Scheduler/backend capability is absent or partial.

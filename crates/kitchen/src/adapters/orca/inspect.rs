@@ -135,8 +135,27 @@ fn message_kind(value: &str) -> MessageKind {
 fn mailbox_failure(error: &OrcaError) -> MailboxError {
     match error {
         OrcaError::Refused { code, .. } if code == "consumer_fenced" => MailboxError::Fenced,
+        OrcaError::Refused { code, .. } if code == "terminal_handle_stale" => {
+            MailboxError::CoordinatorStale
+        }
         other => MailboxError::Unavailable(backend::read_failure(other)),
     }
+}
+
+/// Read the stored coordinator's mailbox identity without acknowledging a
+/// delivery or adopting the Run. A stale handle needs a new terminal and an
+/// explicit binding; probing never moves the Run.
+pub fn probe_coordinator<R: OrcaRunner>(
+    runner: &R,
+    run: &ExternalRef,
+    coordinator: &ExternalRef,
+    deadline: Duration,
+) -> Result<(), OrcaError> {
+    let args = wire::Args::command(&["orchestration", "check"])
+        .value("terminal", coordinator.as_str())
+        .value("run", run.as_str())
+        .json();
+    wire::result(&runner.run(&crate::adapters::orca::Invocation::new(args, deadline))?).map(|_| ())
 }
 
 #[derive(Deserialize)]
@@ -413,7 +432,8 @@ impl<R: OrcaRunner> CoordinatorMailbox for OrcaBackend<R> {
             .json();
         match self.delivery(args).map_err(|error| mailbox_failure(&error)) {
             Err(MailboxError::Fenced) => self.next_delivery(),
-            result @ (Ok(_) | Err(MailboxError::Unavailable(_))) => result,
+            result @ (Ok(_)
+            | Err(MailboxError::Unavailable(_) | MailboxError::CoordinatorStale)) => result,
         }
     }
 
@@ -443,6 +463,60 @@ impl<R: OrcaRunner> CoordinatorMailbox for OrcaBackend<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Answer(&'static str);
+
+    impl OrcaRunner for Answer {
+        fn run(
+            &self,
+            invocation: &crate::adapters::orca::Invocation,
+        ) -> Result<crate::adapters::orca::RawOutput, OrcaError> {
+            assert_eq!(
+                invocation.args(),
+                [
+                    "orchestration",
+                    "check",
+                    "--terminal=old",
+                    "--run=run-1",
+                    "--json"
+                ]
+            );
+            Ok(crate::adapters::orca::RawOutput {
+                exit_code: Some(1),
+                stdout: self.0.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn stale_coordinator_has_a_named_mailbox_error_and_read_only_probe() -> Result<(), OrcaError> {
+        let stale = r#"{"ok":false,"error":{"code":"terminal_handle_stale","message":"The coordinator terminal has no stable pane identity"}}"#;
+        let result = probe_coordinator(
+            &Answer(stale),
+            &ExternalRef::new("run-1")?,
+            &ExternalRef::new("old")?,
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            matches!(&result, Err(OrcaError::Refused { code, .. }) if code == "terminal_handle_stale")
+        );
+        assert_eq!(
+            mailbox_failure(&result.err().ok_or(OrcaError::Malformed {
+                what: "stale probe"
+            })?),
+            MailboxError::CoordinatorStale
+        );
+        assert!(
+            probe_coordinator(
+                &Answer(r#"{"ok":true,"result":{}}"#),
+                &ExternalRef::new("run-1")?,
+                &ExternalRef::new("old")?,
+                std::time::Duration::from_secs(2)
+            )
+            .is_ok()
+        );
+        Ok(())
+    }
 
     #[test]
     fn untrusted_text_is_bounded() {

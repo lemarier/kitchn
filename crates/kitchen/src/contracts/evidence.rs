@@ -87,6 +87,9 @@ pub enum EvidenceKind {
     /// report recorded before reports carried their checkout reads as
     /// unknown.
     WorkerReport(CheckoutReport),
+    /// The forge confirmed that the task's checked push was merged. The
+    /// commit identifies the merge, while the subject identifies its head.
+    ForgeMerge(CommitId),
     /// A verification run that names its environment but not the access that
     /// ran it. It never satisfies a verification requirement; it remains so
     /// records written before [`Self::AuthorizedVerification`] stay readable.
@@ -117,6 +120,7 @@ enum LegacyEvidenceKind {
 enum CurrentEvidenceKind {
     Check,
     WorkerReport(CheckoutReport),
+    ForgeMerge(CommitId),
     Verification(VerificationTarget),
     AuthorizedVerification(VerificationAccess),
 }
@@ -130,6 +134,9 @@ impl From<EvidenceKindRecord> for EvidenceKind {
             EvidenceKindRecord::Current(CurrentEvidenceKind::Check) => Self::Check,
             EvidenceKindRecord::Current(CurrentEvidenceKind::WorkerReport(checkout)) => {
                 Self::WorkerReport(checkout)
+            }
+            EvidenceKindRecord::Current(CurrentEvidenceKind::ForgeMerge(commit)) => {
+                Self::ForgeMerge(commit)
             }
             EvidenceKindRecord::Current(CurrentEvidenceKind::Verification(target)) => {
                 Self::Verification(target)

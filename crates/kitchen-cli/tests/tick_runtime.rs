@@ -30,6 +30,8 @@ case "$1 $2" in
     printf '{"id":"fake","ok":true,"result":{"claude":{"accounts":[]},"codex":{"accounts":[]}}}' ;;
   "orchestration check")
     printf '{"id":"fake","ok":true,"result":{"messages":[]}}' ;;
+  "orchestration run-use")
+    printf '{"id":"fake","ok":true,"result":{}}' ;;
   *) exit 1 ;;
 esac
 "#;
@@ -318,6 +320,144 @@ fn stored_house() -> TestResult<(House, String)> {
     assert_eq!(house.configure(&flags)?.status.code(), Some(0));
     let printed = text(&house.trigger(&[])?.stdout);
     Ok((house, printed))
+}
+
+#[test]
+fn doctor_names_a_stale_stored_coordinator_without_changing_the_run() -> TestResult {
+    let (house, trigger) = stored_house()?;
+    let registry = house.registry().display().to_string();
+    let setup = house.kitchen(&[
+        "house",
+        "setup",
+        "--registry",
+        &registry,
+        "--house",
+        "acme",
+        "--repository",
+        "acme/app",
+        "--workflows",
+        "none",
+    ])?;
+    assert_eq!(setup.status.code(), Some(0), "{}", text(&setup.stderr));
+    script(
+        &house.bin.join("orca"),
+        r#"#!/bin/sh
+echo "$*" >> "$(dirname "$0")/calls"
+case "$1 $2" in
+  "orchestration check") printf '{"ok":false,"error":{"code":"terminal_handle_stale","message":"The coordinator terminal has no stable pane identity"}}' ;;
+  *) exit 1 ;;
+esac
+"#,
+    )?;
+    let before = fs::read(house.runtime_file())?;
+    let output = house.kitchen(&["house", "doctor", "--registry", &registry, "--json"])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let findings = report["findings"].as_array().ok_or("no findings")?;
+    assert!(findings.iter().any(|finding| {
+        finding["code"] == "coordinator"
+            && finding["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("stale"))
+            && finding["nextStep"]
+                .as_str()
+                .is_some_and(|step| step.contains("tick configure --registry"))
+    }));
+    assert_eq!(fs::read(house.runtime_file())?, before);
+    assert!(
+        house
+            .orca_calls()
+            .contains("orchestration check --terminal=term-1 --run=run-1 --json")
+    );
+    assert!(!house.orca_calls().contains("run-use"));
+    let tick = house.fire(&trigger)?;
+    assert_ne!(tick.status.code(), Some(0));
+    assert!(
+        format!("{}{}", text(&tick.stdout), text(&tick.stderr))
+            .contains("coordinator terminal is stale")
+    );
+    let gate = run_pass(&house, "gate", &[])?;
+    assert_ne!(gate.status.code(), Some(0));
+    assert!(
+        format!("{}{}", text(&gate.stdout), text(&gate.stderr))
+            .contains("coordinator terminal is stale")
+    );
+    fs::write(house.runtime_file(), b"not-json")?;
+    let damaged = house.kitchen(&["house", "doctor", "--registry", &registry, "--json"])?;
+    assert_eq!(damaged.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&damaged.stdout)?;
+    assert!(
+        report["findings"]
+            .as_array()
+            .ok_or("no findings")?
+            .iter()
+            .any(|finding| {
+                finding["code"] == "coordinator"
+                    && finding["message"].as_str().is_some_and(|message| {
+                        message.contains("runtime configuration could not be read")
+                    })
+            })
+    );
+    Ok(())
+}
+
+#[test]
+fn a_fenced_live_coordinator_can_adopt_with_or_without_take_over() -> TestResult {
+    for extra in [&[][..], &["--take-over"][..]] {
+        let (house, _) = stored_house()?;
+        script(
+            &house.bin.join("orca"),
+            r#"#!/bin/sh
+echo "$*" >> "$(dirname "$0")/calls"
+case "$1 $2" in
+  "status --json") printf '{"id":"fake","ok":true,"result":{"runtime":{"state":"ready","reachable":true,"appVersion":"1.4.212","capabilities":["orchestration.contract.v1","orchestration.worker-stop-verdict.v1"]}}}' ;;
+  "orchestration check")
+    if test -f "$(dirname "$0")/adopted"; then
+      printf '{"ok":true,"result":{"messages":[]}}'
+    else
+      printf '{"ok":false,"error":{"code":"consumer_fenced","message":"Another consumer holds the Run"}}'
+    fi ;;
+  "orchestration run-use") touch "$(dirname "$0")/adopted"; printf '{"ok":true,"result":{}}' ;;
+  *) exit 1 ;;
+esac
+"#,
+        )?;
+        let result = run_pass(&house, "coordinate", extra)?;
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "{}{}\n{}",
+            text(&result.stdout),
+            text(&result.stderr),
+            house.orca_calls()
+        );
+        let calls = house.orca_calls();
+        assert!(calls.contains("orchestration check --terminal=term-1 --run=run-1 --json"));
+        assert!(calls.contains("orchestration run-use"), "{calls}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_stale_coordinator_cannot_adopt_even_with_take_over() -> TestResult {
+    for extra in [&[][..], &["--take-over"][..]] {
+        let (house, _) = stored_house()?;
+        script(
+            &house.bin.join("orca"),
+            r#"#!/bin/sh
+echo "$*" >> "$(dirname "$0")/calls"
+case "$1 $2" in
+  "orchestration check") printf '{"ok":false,"error":{"code":"terminal_handle_stale","message":"No stable pane identity"}}' ;;
+  *) exit 1 ;;
+esac
+"#,
+        )?;
+        let result = run_pass(&house, "coordinate", extra)?;
+        assert_eq!(result.status.code(), Some(1));
+        assert!(text(&result.stderr).contains("coordinator terminal is stale"));
+        assert!(!house.orca_calls().contains("run-use"));
+    }
+    Ok(())
 }
 
 #[test]

@@ -8,7 +8,7 @@
 
 use std::{
     ffi::OsStr,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{ChildStdout, Command, ExitStatus, Stdio},
     sync::mpsc::{self, RecvTimeoutError},
@@ -122,12 +122,49 @@ pub(crate) fn run_raw<S: AsRef<OsStr>>(
     Ok((status, output))
 }
 
+/// Run a bounded Git query with a bounded stdin payload.
+pub(crate) fn run_raw_stdin<S: AsRef<OsStr>>(
+    dir: &Path,
+    args: impl IntoIterator<Item = S>,
+    input: Vec<u8>,
+    limits: &GitLimits,
+) -> Result<(ExitStatus, String), GitReadError> {
+    if input.len() > limits.max_output_bytes {
+        return Err(GitReadError::OutputTooLarge);
+    }
+    let max = limits.max_output_bytes;
+    let (status, output) = run_with_input(dir, args, limits, Some(input), move |stdout| {
+        let mut buffer = Vec::new();
+        stdout
+            .take(u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1))
+            .read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })?;
+    if output.len() > max {
+        return Err(GitReadError::OutputTooLarge);
+    }
+    Ok((
+        status,
+        String::from_utf8(output).map_err(|_| GitReadError::Malformed)?,
+    ))
+}
+
 /// Run one read-only `git` call in `dir` under its deadline, handing its
 /// standard output to `read` on a separate thread.
 pub(crate) fn run_with<S: AsRef<OsStr>, T: Send + 'static>(
     dir: &Path,
     args: impl IntoIterator<Item = S>,
     limits: &GitLimits,
+    read: impl FnOnce(ChildStdout) -> io::Result<T> + Send + 'static,
+) -> Result<(ExitStatus, T), GitReadError> {
+    run_with_input(dir, args, limits, None, read)
+}
+
+fn run_with_input<S: AsRef<OsStr>, T: Send + 'static>(
+    dir: &Path,
+    args: impl IntoIterator<Item = S>,
+    limits: &GitLimits,
+    input: Option<Vec<u8>>,
     read: impl FnOnce(ChildStdout) -> io::Result<T> + Send + 'static,
 ) -> Result<(ExitStatus, T), GitReadError> {
     let mut command = Command::new(&limits.program);
@@ -145,13 +182,31 @@ pub(crate) fn run_with<S: AsRef<OsStr>, T: Send + 'static>(
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     for name in REDIRECTING_ENV {
         command.env_remove(name);
     }
     let mut child = command.spawn().map_err(|_| GitReadError::Spawn)?;
+    let writer = if let Some(bytes) = input {
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GitReadError::Spawn);
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(stdin.write_all(&bytes));
+        });
+        Some(receiver)
+    } else {
+        None
+    };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
@@ -190,5 +245,11 @@ pub(crate) fn run_with<S: AsRef<OsStr>, T: Send + 'static>(
         // The detached reader ends when the last writer closes the pipe.
         Err(RecvTimeoutError::Timeout) => return Err(GitReadError::Timeout),
     };
+    if let Some(writer) = writer {
+        match writer.recv_timeout(limits.call_timeout.saturating_sub(started.elapsed())) {
+            Ok(Ok(())) => {}
+            _ => return Err(GitReadError::Failed),
+        }
+    }
     Ok((status, output))
 }

@@ -27,7 +27,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 use std::{
     fmt::Write as _,
-    fs::File,
+    fs::{self, File},
     io::{Read, Seek, SeekFrom},
     num::NonZeroU32,
     path::{Path, PathBuf},
@@ -96,8 +96,8 @@ pub fn checkout_at_head(
         .unwrap_or(reported)
 }
 
-/// Observe the checkout after delivery. Only the configured report file is
-/// Kitchen-owned; every other status entry is worker work to preserve.
+/// Observe the checkout after delivery. Only the configured regular report
+/// file and files ignored by committed rules are excluded from dirty work.
 pub fn checkout_clean_except_report(
     worktree: &Path,
     report_path: &Path,
@@ -199,34 +199,80 @@ pub fn checkout_changes_except_report(
             changed.push(format!("{from} -> {path}"));
             continue;
         }
+        // Untracked entries are evaluated against the committed patterns
+        // below, regardless of what the working tree's ignore files say.
+        if code == "?? " {
+            continue;
+        }
         if !exempt_report || Path::new(path) != report_path {
             changed.push(path.to_owned());
         }
     }
-    // Status collapses an ignored directory to one entry even with
-    // --untracked-files=all. ls-files enumerates its actual files so a
-    // directory holding only the configured report remains exempt.
-    let ignored = crate::git::run(
+    // List without exclude rules: status omits files hidden by any ignore
+    // source. Only patterns committed at HEAD may hide worker output.
+    let untracked = crate::git::run(
         &root,
         [
             "-c",
             pinned.as_str(),
             "ls-files",
             "--others",
-            "--ignored",
-            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
             "-z",
         ],
         &limits,
     )?;
-    if !ignored.is_empty() && !ignored.ends_with('\0') {
+    if !untracked.is_empty() && !untracked.ends_with('\0') {
         return Err(crate::git::GitReadError::Malformed);
     }
-    for path in ignored.split_terminator('\0') {
-        if path.is_empty() {
-            return Err(crate::git::GitReadError::Malformed);
+    let mut entries: Vec<String> = untracked
+        .split_terminator('\0')
+        .map(str::to_owned)
+        .collect();
+    let ignores = CommittedIgnores::new(&root, &pinned, &limits)?;
+    while !entries.is_empty() {
+        let ignored = ignores.check(&entries, &limits)?;
+        let mut next = Vec::new();
+        for path in entries {
+            if path.is_empty() {
+                return Err(crate::git::GitReadError::Malformed);
+            }
+            if path.ends_with('/') {
+                if !ignored.contains(&path) {
+                    read_untracked_directory(&root, &path, &mut next)?;
+                }
+            } else if (!exempt_report || Path::new(&path) != report_path)
+                && (Path::new(&path) == report_path
+                    || Path::new(&path).file_name() == Some(std::ffi::OsStr::new(".gitignore"))
+                    || !ignored.contains(&path))
+                && !changed.contains(&path)
+            {
+                changed.push(path);
+            }
         }
-        if !exempt_report || Path::new(path) != report_path {
+        entries = next;
+    }
+    // A committed directory rule hides ordinary files, but an untracked
+    // nested ignore file is worker work. Ask Git only for those names.
+    let nested_ignores = crate::git::run(
+        &root,
+        [
+            "-c",
+            pinned.as_str(),
+            "ls-files",
+            "--others",
+            "-z",
+            "--",
+            ":(glob)**/.gitignore",
+        ],
+        &limits,
+    )?;
+    if !nested_ignores.is_empty() && !nested_ignores.ends_with('\0') {
+        return Err(crate::git::GitReadError::Malformed);
+    }
+    for path in nested_ignores.split_terminator('\0') {
+        if !changed.iter().any(|entry| entry == path) {
             changed.push(path.to_owned());
         }
     }
@@ -235,6 +281,143 @@ pub fn checkout_changes_except_report(
         changed.push(format!("{hidden} tracked path(s) hidden from Git status"));
     }
     Ok(changed)
+}
+
+/// Evaluate untracked paths using only regular `.gitignore` blobs at HEAD.
+/// The scratch repository has no worker-controlled exclude files or index.
+struct CommittedIgnores {
+    scratch: tempfile::TempDir,
+    disabled_excludes: String,
+}
+
+impl CommittedIgnores {
+    fn new(
+        root: &Path,
+        pinned: &str,
+        limits: &crate::git::GitLimits,
+    ) -> std::result::Result<Self, crate::git::GitReadError> {
+        use crate::git::{GitReadError, run};
+
+        let head = run(
+            root,
+            ["-c", pinned, "rev-parse", "--verify", "HEAD^{commit}"],
+            limits,
+        )?;
+        let head = head.trim();
+        let tree = run(root, ["-c", pinned, "ls-tree", "-rz", head], limits)?;
+        if !tree.is_empty() && !tree.ends_with('\0') {
+            return Err(GitReadError::Malformed);
+        }
+        let scratch = tempfile::tempdir().map_err(|_| GitReadError::Failed)?;
+        run(
+            scratch.path(),
+            ["-c", "init.templateDir=", "init", "-q"],
+            limits,
+        )?;
+        fs::create_dir_all(scratch.path().join(".git/info")).map_err(|_| GitReadError::Failed)?;
+        fs::write(scratch.path().join(".git/info/exclude"), "")
+            .map_err(|_| GitReadError::Failed)?;
+        let empty_excludes = scratch.path().join("empty-excludes");
+        fs::write(&empty_excludes, "").map_err(|_| GitReadError::Failed)?;
+        let disabled_excludes = format!("core.excludesFile={}", empty_excludes.display());
+        for entry in tree.split_terminator('\0') {
+            let (meta, path) = entry.split_once('\t').ok_or(GitReadError::Malformed)?;
+            if !matches!(meta.split_once(' '), Some(("100644" | "100755", _)))
+                || Path::new(path).file_name() != Some(std::ffi::OsStr::new(".gitignore"))
+            {
+                continue;
+            }
+            let relative = Path::new(path);
+            if !relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(GitReadError::Malformed);
+            }
+            let blob = run(
+                root,
+                ["-c", pinned, "show", &format!("{head}:{path}")],
+                limits,
+            )?;
+            let target = scratch.path().join(relative);
+            fs::create_dir_all(target.parent().ok_or(GitReadError::Malformed)?)
+                .map_err(|_| GitReadError::Failed)?;
+            fs::write(target, blob).map_err(|_| GitReadError::Failed)?;
+        }
+        Ok(Self {
+            scratch,
+            disabled_excludes,
+        })
+    }
+
+    fn check(
+        &self,
+        paths: &[String],
+        limits: &crate::git::GitLimits,
+    ) -> std::result::Result<std::collections::HashSet<String>, crate::git::GitReadError> {
+        use crate::git::{GitReadError, run_raw_stdin};
+        let mut ignored = std::collections::HashSet::new();
+        for chunk in paths.chunks(256) {
+            let mut input = Vec::new();
+            for path in chunk {
+                // The prefix makes even pathspec-shaped names literal.
+                input.extend_from_slice(b"./");
+                input.extend_from_slice(path.as_bytes());
+                input.push(0);
+            }
+            let (status, output) = run_raw_stdin(
+                self.scratch.path(),
+                [
+                    "-c",
+                    self.disabled_excludes.as_str(),
+                    "check-ignore",
+                    "--no-index",
+                    "--stdin",
+                    "-z",
+                ],
+                input,
+                limits,
+            )?;
+            if !matches!(status.code(), Some(0 | 1))
+                || (!output.is_empty() && !output.ends_with('\0'))
+            {
+                return Err(GitReadError::Malformed);
+            }
+            for path in output.split_terminator('\0') {
+                let original = path.strip_prefix("./").ok_or(GitReadError::Malformed)?;
+                if !chunk.iter().any(|candidate| candidate == original) {
+                    return Err(GitReadError::Malformed);
+                }
+                ignored.insert(original.to_owned());
+            }
+        }
+        Ok(ignored)
+    }
+}
+
+fn read_untracked_directory(
+    root: &Path,
+    directory: &str,
+    next: &mut Vec<String>,
+) -> std::result::Result<(), crate::git::GitReadError> {
+    use crate::git::GitReadError;
+    for entry in fs::read_dir(root.join(directory)).map_err(|_| GitReadError::Failed)? {
+        let entry = entry.map_err(|_| GitReadError::Failed)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| GitReadError::Malformed)?;
+        let mut path = format!("{directory}{name}");
+        if entry
+            .file_type()
+            .map_err(|_| GitReadError::Failed)?
+            .is_dir()
+        {
+            path.push('/');
+        }
+        next.push(path);
+    }
+    Ok(())
 }
 
 /// The attached branch and commit observed without environment redirects.

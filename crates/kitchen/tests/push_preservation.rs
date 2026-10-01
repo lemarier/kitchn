@@ -10,6 +10,7 @@ fn git(path: &Path, args: &[&str]) -> TestResult {
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
+        .args(["-c", "commit.gpgsign=false"])
         .args(args)
         .output()?;
     if !output.status.success() {
@@ -74,13 +75,26 @@ fn invalid_checkout_is_not_reported_clean() -> TestResult {
 }
 
 #[test]
-fn every_git_exclude_source_still_counts_untracked_work() -> TestResult {
+fn only_committed_ignore_rules_hide_untracked_work() -> TestResult {
     let dir = tempfile::tempdir()?;
     let root = dir.path();
     git(root, &["init", "-q"])?;
     fs::write(
         root.join(".gitignore"),
         "ignored-by-tree\nreports/issue.md\n",
+    )?;
+    git(root, &["add", ".gitignore"])?;
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "ignore files",
+        ],
     )?;
     fs::write(root.join(".git/info/exclude"), "ignored-by-repo\n")?;
     let global = root.join("global-excludes");
@@ -99,9 +113,10 @@ fn every_git_exclude_source_still_counts_untracked_work() -> TestResult {
     fs::create_dir(root.join("reports"))?;
     fs::write(root.join("reports/issue.md"), "report")?;
     let changes = checkout_changes_except_report(root, Path::new("reports/issue.md"))?;
-    for name in ["ignored-by-tree", "ignored-by-repo", "ignored-by-global"] {
+    for name in ["ignored-by-repo", "ignored-by-global"] {
         assert!(changes.iter().any(|change| change == name), "{changes:?}");
     }
+    assert!(!changes.iter().any(|change| change == "ignored-by-tree"));
     assert!(!changes.iter().any(|change| change == "reports/issue.md"));
     assert!(!checkout_clean_except_report(
         root,
@@ -111,11 +126,238 @@ fn every_git_exclude_source_still_counts_untracked_work() -> TestResult {
 }
 
 #[test]
-fn ignored_report_directory_is_clean_only_when_it_contains_the_report() -> TestResult {
+fn repository_build_and_skill_caches_are_clean() -> TestResult {
     let dir = tempfile::tempdir()?;
     let root = dir.path();
     git(root, &["init", "-q"])?;
-    fs::write(root.join(".gitignore"), "reports/\n")?;
+    fs::write(root.join(".gitignore"), include_str!("../../../.gitignore"))?;
+    git(root, &["add", ".gitignore"])?;
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "ignore caches",
+        ],
+    )?;
+    for path in [
+        "target/debug/kitchen",
+        ".origin89/engineering/versions/snapshot/skills/origin89-working/SKILL.md",
+        ".agents/skills/origin89-working/SKILL.md",
+        ".claude/skills/origin89-testing/SKILL.md",
+    ] {
+        let file = root.join(path);
+        fs::create_dir_all(file.parent().ok_or("parent")?)?;
+        fs::write(file, "cache")?;
+    }
+    assert_eq!(
+        checkout_changes_except_report(root, Path::new("report.md"))?,
+        [] as [&str; 0]
+    );
+    Ok(())
+}
+
+#[test]
+fn large_committed_build_ignore_stays_bounded() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git(root, &["init", "-q"])?;
+    fs::write(root.join(".gitignore"), "/target/\n")?;
+    git(root, &["add", ".gitignore"])?;
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "ignore build",
+        ],
+    )?;
+    fs::create_dir(root.join("target"))?;
+    for index in 0..12_000 {
+        fs::write(
+            root.join(format!(
+                "target/build-output-{index:05}-{}.o",
+                "x".repeat(80)
+            )),
+            "object",
+        )?;
+    }
+    assert!(checkout_clean_except_report(root, Path::new("report.md"))?);
+    Ok(())
+}
+
+#[test]
+fn pathspec_shaped_directory_is_worker_work() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git(root, &["init", "-q"])?;
+    fs::write(root.join(".gitignore"), "/target/\n")?;
+    git(root, &["add", ".gitignore"])?;
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "ignore build",
+        ],
+    )?;
+    fs::create_dir(root.join(":(top)target"))?;
+    fs::write(root.join(":(top)target/work"), "work")?;
+    assert_eq!(
+        checkout_changes_except_report(root, Path::new("report.md"))?,
+        [":(top)target/work"]
+    );
+    Ok(())
+}
+
+#[test]
+fn ignored_directory_with_nested_untracked_ignore_is_dirty() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git(root, &["init", "-q"])?;
+    fs::write(root.join(".gitignore"), "/target/\n")?;
+    git(root, &["add", ".gitignore"])?;
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "ignore build",
+        ],
+    )?;
+    fs::create_dir_all(root.join("target/deep"))?;
+    fs::write(root.join("target/deep/.gitignore"), "*\n")?;
+    fs::write(root.join("target/deep/work"), "ignored")?;
+    assert_eq!(
+        checkout_changes_except_report(root, Path::new("report.md"))?,
+        ["target/deep/.gitignore"]
+    );
+    Ok(())
+}
+
+#[test]
+fn report_inside_ignored_directory_is_exempt() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git(root, &["init", "-q"])?;
+    fs::write(root.join(".gitignore"), "/target/\n")?;
+    git(root, &["add", ".gitignore"])?;
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "ignore build",
+        ],
+    )?;
+    fs::create_dir(root.join("target"))?;
+    fs::write(root.join("target/report.md"), "report")?;
+    assert!(checkout_clean_except_report(
+        root,
+        Path::new("target/report.md")
+    )?);
+    Ok(())
+}
+
+#[test]
+fn working_tree_ignore_rules_cannot_hide_siblings() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git(root, &["init", "-q"])?;
+    fs::write(root.join(".gitignore"), "target/\n")?;
+    git(root, &["add", ".gitignore"])?;
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "ignore build",
+        ],
+    )?;
+    fs::create_dir(root.join("nested"))?;
+    fs::write(root.join("nested/.gitignore"), "*\n")?;
+    fs::write(root.join("nested/work.txt"), "work")?;
+    let changes = checkout_changes_except_report(root, Path::new("report.md"))?;
+    assert!(
+        changes.contains(&"nested/.gitignore".to_owned()),
+        "{changes:?}"
+    );
+    assert!(
+        changes.contains(&"nested/work.txt".to_owned()),
+        "{changes:?}"
+    );
+    fs::write(root.join(".gitignore"), "*\n")?;
+    let changes = checkout_changes_except_report(root, Path::new("report.md"))?;
+    assert!(changes.contains(&".gitignore".to_owned()), "{changes:?}");
+    assert!(
+        changes.contains(&"nested/work.txt".to_owned()),
+        "{changes:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn committed_nested_ignore_and_negation_apply() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git(root, &["init", "-q"])?;
+    fs::create_dir(root.join("nested"))?;
+    fs::write(root.join("nested/.gitignore"), "*.log\n!important.log\n")?;
+    git(root, &["add", "nested/.gitignore"])?;
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "nested ignore",
+        ],
+    )?;
+    fs::write(root.join("nested/cache.log"), "cache")?;
+    fs::write(root.join("nested/café.log"), "cache")?;
+    fs::write(root.join("nested/line\nbreak.log"), "cache")?;
+    assert!(checkout_clean_except_report(root, Path::new("report.md"))?);
+    fs::write(root.join("nested/important.log"), "work")?;
+    assert_eq!(
+        checkout_changes_except_report(root, Path::new("report.md"))?,
+        ["nested/important.log"]
+    );
+    Ok(())
+}
+
+#[test]
+fn only_the_report_file_is_exempt_in_its_directory() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git(root, &["init", "-q"])?;
+    fs::write(root.join(".gitignore"), "reports/issue.md\n")?;
     git(root, &["add", ".gitignore"])?;
     git(
         root,
@@ -172,6 +414,20 @@ fn report_symlink_outside_checkout_is_work() -> TestResult {
     let root = dir.path().join("launched");
     fs::create_dir(&root)?;
     git(&root, &["init", "-q"])?;
+    fs::write(root.join(".gitignore"), "report.md\n")?;
+    git(&root, &["add", ".gitignore"])?;
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    )?;
     let outside = dir.path().join("outside.md");
     fs::write(&outside, "external")?;
     symlink(&outside, root.join("report.md"))?;

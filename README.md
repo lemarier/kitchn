@@ -73,7 +73,8 @@ opens the pull request. A separate GitHub identity, currently a person,
 reviews and attests it. Kitchen sets the writer identity in each launched
 worktree and refuses a push with a foreign author or committer.
 The checked `kitchn push` records whether that checkout is clean and at the
-pushed head, ignoring only Kitchen's configured report file. A settled PR
+pushed head. It honors ignore rules committed at that head and exempts Kitchen's
+configured report file; local exclude rules cannot hide work. A settled PR
 writer without that evidence can be confirmed at an exact live head with
 `kitchn preserve --worktree <launched-worktree>` from a separate coordinator
 checkout after its owner reviews the checkout and unpushed range. Confirmation

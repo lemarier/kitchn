@@ -35,7 +35,7 @@ use kitchen::{
         StateError, TaskState, WorkItem, WorkerPost,
     },
     workflows::{
-        coordination::{Supervision, current_worker},
+        coordination::{LaunchOutcome, Supervision, current_worker},
         gate::Verdict,
         pickup::{IssueRef, PinnedInstructions, issue_task_id},
         repair::{HandOver, RepairDecision, Skip},
@@ -2277,6 +2277,42 @@ fn follow_up_bot_thread_launches_and_posts_fixed_resolution() -> TestResult {
 }
 
 #[test]
+fn follow_up_not_applied_releases_round_for_immediate_retry() -> TestResult {
+    let kitchen = settled_with_pull_request(true)?;
+    follow_up_thread(&kitchen)?;
+    kitchen
+        .backend
+        .inject(kitchen::contracts::fake::ExecuteFault::Reject);
+    let first = acted(kitchen.follow_up()?)?;
+    assert!(
+        matches!(
+            first.as_slice(),
+            [kitchen::workflows::run::FollowUpAction::NotLaunched {
+                outcome: LaunchOutcome::NotApplied {
+                    disposition: kitchen::contracts::Disposition::RetryAvailable { .. },
+                    ..
+                },
+                ..
+            }]
+        ),
+        "{first:?}"
+    );
+    let task = round_task(1)?;
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Open
+    ));
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    let second = acted(kitchen.follow_up()?)?;
+    assert!(
+        matches!(second.as_slice(), [kitchen::workflows::run::FollowUpAction::Launched { round: 1, attempt, .. }] if attempt.get() == 2),
+        "{second:?}"
+    );
+    assert_eq!(kitchen.backend.launched_agents().len(), 2);
+    Ok(())
+}
+
+#[test]
 fn follow_up_declined_thread_stays_open_and_reaches_house_mailbox() -> TestResult {
     let mut kitchen = settled_with_pull_request(true)?;
     grant_follow_up(&mut kitchen)?;
@@ -2917,6 +2953,10 @@ fn a_repair_round_whose_launch_was_refused_is_launched_by_the_next_pass() -> Tes
         "{refused:?}"
     );
     assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    assert!(matches!(
+        kitchen.store().task(&round_task(1)?)?.state(),
+        TaskState::Open
+    ));
     // The pickup worker is still the branch's latest writer, and its report
     // stands: the next pass launches the round's second attempt.
     let retried = acted(kitchen.repair()?)?;

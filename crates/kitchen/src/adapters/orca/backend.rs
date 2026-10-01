@@ -52,7 +52,7 @@ use crate::{
     contracts::{
         BackendDescriptor, BackendUnavailable, BranchName, Clock, Effect, EffectExecutor,
         EffectFailure, EffectRequest, ExternalRef, IdempotencyKey, Lookup, MAX_INVENTORY_RESOURCES,
-        MAX_RECEIPT_RESOURCES, NotAppliedReason, Operation, Receipt, ResourceKind,
+        MAX_RECEIPT_RESOURCES, NotAppliedReason, Operation, PinnedCheckout, Receipt, ResourceKind,
         ResourceObservation, ResourceRef, SystemClock, Text, Timestamp, UncertainReason,
         WorkerBackend, WorkerOutcome, WorkerState, Workspace, WorktreeStatus,
     },
@@ -1200,6 +1200,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         workspace: &Workspace,
         brief: &Text,
         branch: Option<&BranchName>,
+        pinned: Option<&PinnedCheckout>,
         agent: Option<&AgentSelection>,
     ) -> Result<Receipt, EffectFailure> {
         if self.writer_identity_required && self.writer_identity.is_none() {
@@ -1237,6 +1238,18 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 key_digest(&self.config.house, key.as_str())
             ))
             .map_err(|error| call_failure(&error))?;
+        // Serialize all Kitchen launches into this preserved worktree, even
+        // when they have different effect keys. Hold it through worker-start.
+        let _worktree_reservation = match (workspace, pinned) {
+            (Workspace::Existing(resource), Some(_)) => Some(
+                self.reserve(format!(
+                    "worktree-{:032x}",
+                    key_digest(&self.config.house, resource.handle.as_str())
+                ))
+                .map_err(|error| call_failure(&error))?,
+            ),
+            _ => None,
+        };
         let mut receipt = self.launch_reserved(
             key,
             workspace,
@@ -1244,6 +1257,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             name,
             new_branch.as_ref(),
             branch,
+            pinned,
             agent,
         )?;
         reservation.settle();
@@ -1389,6 +1403,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         name: Option<String>,
         new_branch: Option<&BranchName>,
         requested_branch: Option<&BranchName>,
+        pinned: Option<&PinnedCheckout>,
         agent: Option<&AgentSelection>,
     ) -> Result<Receipt, EffectFailure> {
         let task = match self
@@ -1443,12 +1458,35 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         {
             let branch = requested_branch.ok_or_else(response_lost)?;
             self.prepare_existing_identity_worktree(key, resource, branch)?;
+            self.recheck_pinned(workspace, requested_branch, pinned)?;
             let receipt = self.start(key, &task, workspace, None, agent)?;
             return self
                 .complete_identity_receipt(key, receipt)
                 .ok_or_else(response_lost);
         }
+        self.recheck_pinned(workspace, requested_branch, pinned)?;
         self.start(key, &task, workspace, name.as_deref(), agent)
+    }
+
+    fn recheck_pinned(
+        &self,
+        workspace: &Workspace,
+        branch: Option<&BranchName>,
+        pinned: Option<&PinnedCheckout>,
+    ) -> Result<(), EffectFailure> {
+        let Some(pinned) = pinned else {
+            return Ok(());
+        };
+        let (Workspace::Existing(resource), Some(branch)) = (workspace, branch) else {
+            return Err(not_applied());
+        };
+        match self.inspect_worktree(resource, branch, &pinned.head, &pinned.report_path) {
+            Ok(WorktreeStatus::Ready) => Ok(()),
+            Ok(status) => Err(EffectFailure::NotApplied(
+                NotAppliedReason::WorktreeChanged(status),
+            )),
+            Err(_) => Err(response_lost()),
+        }
     }
 
     fn prepare_existing_identity_worktree(
@@ -1466,14 +1504,24 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             "worktree show",
         )
         .map_err(|_| response_lost())?;
-        let row = shown.worktree.ok_or_else(response_lost)?;
-        let path = row.path.as_ref().ok_or_else(response_lost)?;
+        let row = shown.worktree.ok_or({
+            EffectFailure::NotApplied(NotAppliedReason::WorktreeChanged(WorktreeStatus::Missing))
+        })?;
+        if row.branch.as_deref() != Some(format!("refs/heads/{branch}").as_str()) {
+            return Err(EffectFailure::NotApplied(
+                NotAppliedReason::WorktreeChanged(WorktreeStatus::WrongBranch),
+            ));
+        }
+        let path = row.path.as_ref().ok_or({
+            EffectFailure::NotApplied(NotAppliedReason::WorktreeChanged(WorktreeStatus::Missing))
+        })?;
         if row.id.as_deref() != Some(resource.handle.as_str())
-            || row.branch.as_deref() != Some(format!("refs/heads/{branch}").as_str())
             || row.is_main_worktree
             || !path.is_absolute()
         {
-            return Err(response_lost());
+            return Err(EffectFailure::NotApplied(
+                NotAppliedReason::WorktreeChanged(WorktreeStatus::Missing),
+            ));
         }
         let (name, email) = self.writer_identity.as_ref().ok_or_else(response_lost)?;
         let base = configure_writer_worktree(path, name, email, self.config.call_timeout)
@@ -2292,12 +2340,14 @@ impl<R: OrcaRunner> EffectExecutor for OrcaBackend<R> {
                 workspace,
                 brief,
                 branch,
+                pinned,
                 agent,
             } => self.launch(
                 request.key(),
                 workspace,
                 brief,
                 branch.as_ref(),
+                pinned.as_ref(),
                 agent.as_ref(),
             ),
             Operation::MessageWorker { worker, body } => self.message(worker, body),
@@ -2375,6 +2425,15 @@ impl<R: OrcaRunner> WorkerBackend for OrcaBackend<R> {
         let root = std::str::from_utf8(&root).map_err(|_| BackendUnavailable::Transport)?;
         if std::path::Path::new(root.trim()).canonicalize().ok() != path.canonicalize().ok() {
             return Ok(WorktreeStatus::Missing);
+        }
+        let expected_branch = format!("refs/heads/{branch}\n");
+        let Some((code, symbolic)) = git(&["symbolic-ref", "--quiet", "HEAD"]) else {
+            return Err(BackendUnavailable::Transport);
+        };
+        match code {
+            Some(0) if symbolic == expected_branch.as_bytes() => {}
+            Some(0 | 1) => return Ok(WorktreeStatus::WrongBranch),
+            _ => return Err(BackendUnavailable::Transport),
         }
         let Some((Some(0), actual)) = git(&["rev-parse", "--verify", "HEAD"]) else {
             return Err(BackendUnavailable::Transport);

@@ -637,8 +637,21 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
                 Workspace::Existing(workspace),
                 &pr.branch,
                 false,
+                Some(crate::contracts::PinnedCheckout {
+                    head: live.head.sha.clone(),
+                    report_path: self.settings.report_path.clone(),
+                }),
                 |spec, follow_ups| brief.render(spec, follow_ups),
             )?;
+            if matches!(
+                outcome,
+                LaunchOutcome::NotApplied {
+                    disposition: crate::contracts::Disposition::RetryAvailable { .. },
+                    ..
+                }
+            ) {
+                self.store.relinquish(&task, fence, self.clock.now())?;
+            }
             actions.push(match outcome {
                 LaunchOutcome::Accepted { attempt, worker } => FollowUpAction::Launched {
                     pull_request: live.number,
@@ -1164,30 +1177,42 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
             budget: self.house.follow_up_budget(),
         };
         let number = pull_request.number;
-        Ok(
-            match launch_rendered(
-                ctx,
-                &task,
-                fence,
-                Workspace::Existing(workspace),
-                &found.branch,
-                false,
-                |spec, follow_ups| brief.render(spec, follow_ups),
-            )? {
-                LaunchOutcome::Accepted { attempt, worker } => RepairAction::Launched {
-                    pull_request: number,
-                    task,
-                    round,
-                    attempt,
-                    worker,
-                },
-                outcome => RepairAction::NotLaunched {
-                    pull_request: number,
-                    task,
-                    outcome,
-                },
+        let outcome = launch_rendered(
+            ctx,
+            &task,
+            fence,
+            Workspace::Existing(workspace),
+            &found.branch,
+            false,
+            Some(crate::contracts::PinnedCheckout {
+                head: pull_request.head.sha.clone(),
+                report_path: self.settings.report_path.clone(),
+            }),
+            |spec, follow_ups| brief.render(spec, follow_ups),
+        )?;
+        if matches!(
+            outcome,
+            LaunchOutcome::NotApplied {
+                disposition: crate::contracts::Disposition::RetryAvailable { .. },
+                ..
+            }
+        ) {
+            self.store.relinquish(&task, fence, self.clock.now())?;
+        }
+        Ok(match outcome {
+            LaunchOutcome::Accepted { attempt, worker } => RepairAction::Launched {
+                pull_request: number,
+                task,
+                round,
+                attempt,
+                worker,
             },
-        )
+            outcome => RepairAction::NotLaunched {
+                pull_request: number,
+                task,
+                outcome,
+            },
+        })
     }
 }
 

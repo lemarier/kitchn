@@ -568,6 +568,7 @@ pub fn judgment_request(
         workspace: Workspace::Isolated,
         brief: Text::new(&brief).map_err(|_| WorkflowError::IncompleteEvidence)?,
         branch: None,
+        pinned: None,
         agent: evidence.agent.clone(),
     }))
 }

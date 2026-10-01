@@ -441,6 +441,9 @@ fn refusal(reason: NotAppliedReason) -> Value {
         | NotAppliedReason::WorktreeConfigDisabled => {
             json!({ "status": "not-applied", "reason": "rejected" })
         }
+        NotAppliedReason::WorktreeChanged(_) => {
+            json!({ "status": "not-applied", "reason": "rejected" })
+        }
     }
 }
 

@@ -1192,6 +1192,7 @@ fn app_binding(requester: &str) -> TestResult<ForgeBinding> {
         requester: ExternalRef::new(requester)?,
         credential: CredentialId::new("github")?,
         credential_kind: CredentialKind::GitHubApp(app()?),
+        bot_user_id: Some(336054063),
         posting_budget: PostingBudget::new(5)?,
     })
 }
@@ -1259,6 +1260,7 @@ fn a_token_binding_is_stored_without_a_kind() -> TestResult {
     let binding = ForgeBinding {
         requester: ExternalRef::new("acme-bot")?,
         credential_kind: CredentialKind::Token,
+        bot_user_id: None,
         ..app_binding(LOGIN)?
     };
     bind_forge(&registry, &binding)?;

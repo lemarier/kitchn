@@ -148,6 +148,10 @@ pub struct ForgeBinding {
     /// What the credential file holds; a token when absent.
     #[serde(default, skip_serializing_if = "CredentialKind::is_token")]
     pub credential_kind: CredentialKind,
+    /// GitHub's numeric bot user ID for an app requester. GitHub uses this
+    /// ID in the commit email; token bindings do not have a bot user ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_user_id: Option<u64>,
     /// Most logical writes one task may make.
     pub posting_budget: PostingBudget,
 }
@@ -162,8 +166,11 @@ impl ForgeBinding {
     /// [`HouseError::HouseSelection`] for another house.
     pub fn validate(&self, house: &HouseConfig) -> Result<(), HouseError> {
         let app_login = match self.credential_kind {
-            CredentialKind::Token => true,
-            CredentialKind::GitHubApp(_) => self.requester.as_str().ends_with("[bot]"),
+            CredentialKind::Token => self.bot_user_id.is_none(),
+            CredentialKind::GitHubApp(_) => {
+                self.requester.as_str().ends_with("[bot]")
+                    && self.bot_user_id.is_none_or(|id| id > 0)
+            }
         };
         if self.schema != FORGE_BINDING_SCHEMA
             || !self.forge.accepts_requester(&self.requester)
@@ -175,6 +182,18 @@ impl ForgeBinding {
             return Err(HouseError::HouseSelection);
         }
         Ok(())
+    }
+
+    /// The exact author and committer a worker must use for this binding.
+    /// App bindings use GitHub's documented bot noreply address.
+    #[must_use]
+    pub fn writer_identity(&self) -> Option<(String, String)> {
+        let id = self.bot_user_id?;
+        let login = self.requester.as_str();
+        Some((
+            login.to_owned(),
+            format!("{id}+{login}@users.noreply.github.com"),
+        ))
     }
 
     /// The credential reference core effects carry.
@@ -227,6 +246,8 @@ pub enum BindOutcome {
     Created,
     /// The identical binding was already stored.
     Unchanged,
+    /// A legacy app binding gained its verified bot user ID.
+    Updated,
 }
 
 /// Whether the credential file is ready to use. Checked without reading it.
@@ -397,6 +418,17 @@ pub fn bind_forge(
     };
     match forge_binding(registry, &binding.house) {
         Ok(existing) if existing == *binding => return Ok(BindOutcome::Unchanged),
+        Ok(existing)
+            if existing.bot_user_id.is_none()
+                && binding.bot_user_id.is_some()
+                && (ForgeBinding {
+                    bot_user_id: None,
+                    ..binding.clone()
+                }) == existing =>
+        {
+            registry.update_private_document(&binding.house, BINDING_FILE, &existing, binding)?;
+            return Ok(BindOutcome::Updated);
+        }
         Ok(_) => return Err(conflict()),
         Err(ForgeError::MissingBinding { .. }) => {}
         // A damaged file is kept, never overwritten.
@@ -841,6 +873,7 @@ mod tests {
             requester: ExternalRef::new("acme-bot")?,
             credential: CredentialId::new("github")?,
             credential_kind: CredentialKind::Token,
+            bot_user_id: None,
             posting_budget: PostingBudget::new(5)?,
         };
         bind_forge(&registry, &binding)?;

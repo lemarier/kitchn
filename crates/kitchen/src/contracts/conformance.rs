@@ -910,6 +910,7 @@ impl<'a> Runner<'a> {
             Ok(receipt) => receipt,
             Err(EffectFailure::NotApplied(_)) => return fail(check, "probe was refused"),
             Err(EffectFailure::Uncertain(_)) => return fail(check, "probe outcome was uncertain"),
+            Err(EffectFailure::Ended(_)) => return fail(check, "probe ended with owned resources"),
         };
         self.record(check, CheckResult::Passed);
         Ok(Some((request, receipt)))
@@ -1108,7 +1109,7 @@ impl<'a> Runner<'a> {
         )?;
         match backend.execute(&request) {
             // An uncertain cancel is allowed; the observation below decides.
-            Ok(_) | Err(EffectFailure::Uncertain(_)) => {}
+            Ok(_) | Err(EffectFailure::Uncertain(_)) | Err(EffectFailure::Ended(_)) => {}
             Err(EffectFailure::NotApplied(_)) => {
                 return fail(check, "cancel of a launched worker was refused");
             }
@@ -1180,6 +1181,9 @@ impl<'a> Runner<'a> {
             Err(EffectFailure::NotApplied(_)) => {}
             Err(EffectFailure::Uncertain(_)) => {
                 return fail(check, "release of a cancelled worker has no clear outcome");
+            }
+            Err(EffectFailure::Ended(_)) => {
+                return fail(check, "release returned a launch-only ended receipt");
             }
         }
         if listed_before && !self.lists(backend, branch)? {

@@ -268,7 +268,7 @@ impl FakeBackend {
                 let worker = self.handle(state, "worker")?;
                 let mut created = vec![self.resource(ResourceKind::Worker, worker.clone())];
                 if let Some(branch) = branch {
-                    let handle = ExternalRef::new(branch.as_str()).map_err(|_| rejected)?;
+                    let handle = ExternalRef::new(branch.as_str()).map_err(|_| rejected.clone())?;
                     created.push(self.resource(ResourceKind::Branch, handle));
                 }
                 let mut touched = Vec::new();

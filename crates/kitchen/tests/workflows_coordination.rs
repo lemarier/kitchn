@@ -1148,6 +1148,7 @@ fn launch_on(
         branch: reported,
         accepted_prefix,
         refuse_stop,
+        existing: None,
     };
     let ctx = kitchen::workflows::coordination::Context {
         backend: &backend,
@@ -1172,6 +1173,65 @@ fn a_backend_accepted_prefix_is_the_durable_task_branch() -> TestResult {
     assert!(matches!(outcome, LaunchOutcome::Accepted { .. }));
     let record = world.fixture.store.task(&task)?;
     assert_eq!(task_branch(&record), Some(branch("orca/issue-1")?));
+    Ok(())
+}
+
+#[test]
+fn existing_worktree_launch_keeps_branch_and_allows_delivery_without_ownership() -> TestResult {
+    use kitchen::contracts::ResourceKind;
+    use kitchen::workflows::{
+        coordination::task_branch,
+        push::{launch_worktree, owns_worktree},
+    };
+
+    let world = World::new()?;
+    let (task, fence) = claim(&world, "coordinator", 1, 3)?;
+    let worker = launched(&world, &task, fence, 1)?;
+    let first = world.fixture.store.task(&task)?;
+    let worktree = first
+        .effects()
+        .iter()
+        .find_map(|effect| match effect.state() {
+            kitchen::state::EffectState::Applied { receipt, .. } => receipt
+                .created()
+                .iter()
+                .find(|resource| resource.kind == ResourceKind::Worktree)
+                .cloned(),
+            _ => None,
+        })
+        .ok_or("missing first worktree")?;
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Failed));
+    assert!(matches!(
+        step(&world, &task, fence)?,
+        Supervision::Retry { .. }
+    ));
+    let backend = workflows_support::ReportsBranch {
+        inner: &world.backend,
+        branch: "lemarier/issue-1",
+        accepted_prefix: None,
+        refuse_stop: false,
+        existing: Some(&worktree),
+    };
+    let ctx = kitchen::workflows::coordination::Context {
+        backend: &backend,
+        ..world.ctx()
+    };
+    assert!(matches!(
+        launch_worker(
+            &ctx,
+            &task,
+            fence,
+            Workspace::Existing(worktree.clone()),
+            &brief(1)?
+        )?,
+        LaunchOutcome::Accepted { .. }
+    ));
+    let record = world.fixture.store.task(&task)?;
+    assert_eq!(task_branch(&record), Some(branch("lemarier/issue-1")?));
+    assert!(launch_worktree(&record, &worktree.handle));
+    assert!(!owns_worktree(&record, &worktree.handle));
     Ok(())
 }
 

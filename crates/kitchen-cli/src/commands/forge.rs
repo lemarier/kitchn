@@ -23,6 +23,8 @@ use std::{
 const GH_DEADLINE: Duration = Duration::from_secs(3);
 /// Most bytes read from `gh` for one login.
 const GH_OUTPUT_BYTES: u64 = 1024;
+/// Largest accepted public GitHub bot user response.
+const GH_BOT_ID_BYTES: u64 = 16 * 1024;
 /// Most `PATH` entries searched for `gh`.
 const MAX_PATH_ENTRIES: usize = 256;
 
@@ -90,6 +92,12 @@ pub fn run(args: ForgeArgs) -> Result<(String, bool), kitchen::Error> {
                 // Clap requires both or neither.
                 _ => CredentialKind::Token,
             };
+            let bot_user_id = match credential_kind {
+                CredentialKind::GitHubApp(_) => {
+                    Some(github_bot_id(std::env::var_os("PATH"), &requester)?)
+                }
+                CredentialKind::Token => None,
+            };
             let binding = ForgeBinding {
                 schema: FORGE_BINDING_SCHEMA,
                 house,
@@ -98,6 +106,7 @@ pub fn run(args: ForgeArgs) -> Result<(String, bool), kitchen::Error> {
                 requester,
                 credential,
                 credential_kind,
+                bot_user_id,
                 posting_budget: PostingBudget::new(posting_budget)?,
             };
             let outcome = bind_forge(&registry, &binding)?;
@@ -108,6 +117,7 @@ pub fn run(args: ForgeArgs) -> Result<(String, bool), kitchen::Error> {
                     match outcome {
                         BindOutcome::Created => "Bound",
                         BindOutcome::Unchanged => "Already bound",
+                        BindOutcome::Updated => "Updated",
                     },
                     binding.house,
                     binding.forge,
@@ -137,6 +147,85 @@ pub fn run(args: ForgeArgs) -> Result<(String, bool), kitchen::Error> {
             ))
         }
     }
+}
+
+/// Read the app's bot user ID from GitHub when the binding is created. A
+/// caller-supplied number would let an unrelated identity be recorded.
+fn github_bot_id(
+    path: Option<std::ffi::OsString>,
+    requester: &ExternalRef,
+) -> Result<u64, kitchen::Error> {
+    if !ForgeKind::GitHub.accepts_requester(requester) || !requester.as_str().ends_with("[bot]") {
+        return Err(kitchen::house::HouseError::InvalidInput.into());
+    }
+    let gh = gh_executable(path).ok_or(ForgeError::GhNotFound)?;
+    let endpoint = format!(
+        "users/{}",
+        requester.as_str().replace('[', "%5B").replace(']', "%5D")
+    );
+    let mut command = Command::new(gh);
+    command
+        .args(["api", "--hostname", "github.com", &endpoint])
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|_| ForgeError::GhNotFound)?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < GH_DEADLINE => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(kitchen::integrations::github::IntegrationError::Timeout.into());
+            }
+        }
+    };
+    if !status.success() {
+        return Err(kitchen::integrations::github::IntegrationError::Unavailable.into());
+    }
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or(kitchen::integrations::github::IntegrationError::Unknown)?
+        .take(GH_BOT_ID_BYTES + 1)
+        .read_to_end(&mut output)
+        .map_err(|_| kitchen::integrations::github::IntegrationError::Unavailable)?;
+    if output.len() as u64 > GH_BOT_ID_BYTES {
+        return Err(kitchen::integrations::github::IntegrationError::LimitExceeded.into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output)
+        .map_err(|_| kitchen::integrations::github::IntegrationError::Unknown)?;
+    if value["login"].as_str() != Some(requester.as_str()) || value["type"].as_str() != Some("Bot")
+    {
+        return Err(kitchen::integrations::github::IntegrationError::ScopeMismatch.into());
+    }
+    value["id"]
+        .as_u64()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| kitchen::integrations::github::IntegrationError::Unknown.into())
+}
+
+/// Read a worker's app binding, upgrading an older binding only after GitHub
+/// confirms the same bot login. Ordinary forge reads stay read-only.
+pub(super) fn writer_binding(
+    registry: &HouseRegistry,
+    house: &HouseId,
+) -> Result<ForgeBinding, kitchen::Error> {
+    let mut binding = forge_binding(registry, house)?;
+    if matches!(binding.credential_kind, CredentialKind::GitHubApp(_))
+        && binding.bot_user_id.is_none()
+    {
+        binding.bot_user_id = Some(github_bot_id(std::env::var_os("PATH"), &binding.requester)?);
+        bind_forge(registry, &binding)?;
+        binding = forge_binding(registry, house)?;
+    }
+    Ok(binding)
 }
 
 fn token(
@@ -313,6 +402,7 @@ impl Reread {
 pub fn not_applied(reason: NotAppliedReason) -> String {
     match reason {
         NotAppliedReason::Rejected => "rejected; check the token's account and access".to_owned(),
+        NotAppliedReason::WorktreeConfigDisabled => "worktree Git config is disabled; run kitchn house setup --enable-worktree-config for this repository".to_owned(),
         NotAppliedReason::RateLimited {
             retry_after: Some(delay),
         } => format!("rate limited; retry after {}s", delay.as_secs()),
@@ -384,6 +474,30 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn app_bot_id_comes_from_a_matching_github_user() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = std::ffi::OsString::from(temp.path());
+        let login = ExternalRef::new("kitchn-expediter[bot]")?;
+        fake_gh(
+            temp.path(),
+            "#!/bin/sh\n[ \"$1\" = api ] && [ \"$2\" = --hostname ] && [ \"$3\" = github.com ] || exit 1\nprintf '%s\\n' '{\"id\":336054063,\"login\":\"kitchn-expediter[bot]\",\"type\":\"Bot\"}'\n",
+        )?;
+        assert_eq!(github_bot_id(Some(path.clone()), &login)?, 336054063);
+        fake_gh(
+            temp.path(),
+            "#!/bin/sh\nprintf '%s\\n' '{\"id\":336054063,\"login\":\"other[bot]\",\"type\":\"Bot\"}'\n",
+        )?;
+        assert!(github_bot_id(Some(path.clone()), &login).is_err());
+        fake_gh(
+            temp.path(),
+            "#!/bin/sh\nprintf '%s\\n' '{\"id\":0,\"login\":\"kitchn-expediter[bot]\",\"type\":\"Bot\"}'\n",
+        )?;
+        assert!(github_bot_id(Some(path), &login).is_err());
+        assert!(github_bot_id(None, &ExternalRef::new("other[bot]/repos")?).is_err());
         Ok(())
     }
 

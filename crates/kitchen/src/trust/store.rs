@@ -742,6 +742,7 @@ pub(crate) fn store_error(error: crate::Error) -> TrustError {
         crate::Error::Identifier(_)
         | crate::Error::House(_)
         | crate::Error::Integration(_)
+        | crate::Error::PushWriter(_)
         | crate::Error::Scaffold(_)
         | crate::Error::Orca(_)
         | crate::Error::Cleanup(_)

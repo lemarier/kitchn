@@ -8,6 +8,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    path::PathBuf,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
@@ -38,6 +39,7 @@ pub struct SimWorker {
     pub waiting: bool,
     pub task: Option<String>,
     pub worktree: Option<String>,
+    pub created_worktree: bool,
     pub branch: Option<String>,
     pub release_state: &'static str,
     pub ownership: &'static str,
@@ -101,6 +103,7 @@ impl SimWorker {
             waiting,
             task: None,
             worktree: None,
+            created_worktree: false,
             branch: None,
             release_state: "not_requested",
             ownership: "owned",
@@ -325,6 +328,14 @@ pub struct SimState {
     pub existing_branch: Option<&'static str>,
     /// Worktrees Orca lists that no simulated worker created: id and branch.
     pub worktrees: Vec<(String, String)>,
+    /// A real disposable Git worktree path for identity setup tests.
+    pub identity_path: Option<PathBuf>,
+    /// Disposable main checkout that simulated worktree creation extends.
+    pub identity_repo: Option<PathBuf>,
+    /// The worktree `worktree create` returned for an identity launch.
+    pub identity_worktree: Option<(String, String, String, PathBuf)>,
+    /// Whether worker-start observed the configured worktree identity.
+    pub identity_seen_at_start: bool,
     /// Branches that exist in Git without an Orca worktree.
     pub git_branches: Vec<String>,
     /// Whether `worktree list` reports its listing truncated.
@@ -382,6 +393,10 @@ impl Default for SimOrca {
                 branch_reads_hidden: 0,
                 existing_branch: None,
                 worktrees: Vec::new(),
+                identity_path: None,
+                identity_repo: None,
+                identity_worktree: None,
+                identity_seen_at_start: false,
                 git_branches: Vec::new(),
                 listing_truncated: false,
                 unlisted_worktrees: 0,
@@ -615,6 +630,26 @@ impl SimState {
                 }
             }
             ["orchestration", "worker-start"] => {
+                if let Some((_, _, _, path)) = &self.identity_worktree {
+                    let name = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(path)
+                        .args(["config", "--worktree", "user.name"])
+                        .output()
+                        .ok();
+                    let email = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(path)
+                        .args(["config", "--worktree", "user.email"])
+                        .output()
+                        .ok();
+                    self.identity_seen_at_start = name.as_ref().is_some_and(|result| {
+                        result.status.success() && result.stdout == b"house[bot]\n"
+                    }) && email.as_ref().is_some_and(|result| {
+                        result.status.success()
+                            && result.stdout == b"123+house[bot]@users.noreply.github.com\n"
+                    });
+                }
                 let task_id = Self::flag(flags, "task");
                 let Some(index) = self.tasks.iter().position(|task| task.id == task_id) else {
                     return refuse("task_not_found");
@@ -623,7 +658,11 @@ impl SimState {
                     return refuse("task_not_startable");
                 }
                 let dispatch = self.next_id("ctx_");
-                let worktree = self.next_id("wt_");
+                let requested_worktree = Self::flag(flags, "worktree");
+                let worktree = requested_worktree
+                    .strip_prefix("id:")
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.next_id("wt_"));
                 self.effects += 1;
                 if let Some(task) = self.tasks.get_mut(index) {
                     task.status = "dispatched";
@@ -637,13 +676,20 @@ impl SimState {
                 };
                 worker.task = Some(task_id.clone());
                 worker.worktree = Some(worktree.clone());
+                worker.created_worktree = requested_worktree == "new-top-level";
                 // Orca prefixes the requested worktree name and reports the
                 // full ref; an existing worktree keeps the branch it has.
                 worker.branch = match flags.get("name") {
                     Some(name) => Some(self.free_branch(&format!("{}{name}", self.branch_prefix))),
                     None => self
-                        .existing_branch
-                        .map(|branch| format!("refs/heads/{branch}")),
+                        .identity_worktree
+                        .as_ref()
+                        .filter(|(id, _, _, _)| id == &worktree)
+                        .map(|(_, branch, _, _)| branch.clone())
+                        .or_else(|| {
+                            self.existing_branch
+                                .map(|branch| format!("refs/heads/{branch}"))
+                        }),
                 };
                 self.workers.insert(dispatch.clone(), worker);
                 self.mutation(json!({
@@ -747,7 +793,7 @@ impl SimState {
                             "state": worker.worker_state,
                             "stage": worker.stage_detail(),
                             "lastError": worker.last_error,
-                            "effects": worker.worktree.iter().map(|id| json!({
+                            "effects": worker.worktree.iter().filter(|_| worker.created_worktree).map(|id| json!({
                                 "kind": "worktree", "action": "created_top_level", "id": id,
                             })).collect::<Vec<_>>(),
                         },
@@ -788,25 +834,52 @@ impl SimState {
                     .find(|worker| worker.worktree.as_deref() == Some(id))
                 {
                     Some(worker) => ok(json!({
-                        "worktree": {"id": id, "branch": if branch_visible { worker.branch.as_ref() } else { None }},
+                        "worktree": {"id": id, "branch": if branch_visible { worker.branch.as_ref() } else { None },
+                            "path": self.identity_worktree.as_ref().filter(|(known, _, _, _)| known == id).map(|(_, _, _, path)| path),
+                            "isMainWorktree": false},
                     })),
-                    None => refuse("worktree_not_found"),
+                    None => match self
+                        .identity_worktree
+                        .as_ref()
+                        .filter(|(known, _, _, _)| known == id)
+                    {
+                        Some((_, branch, _, path)) => ok(
+                            json!({"worktree": {"id": id, "branch": branch, "path": path, "isMainWorktree": false}}),
+                        ),
+                        None => refuse("worktree_not_found"),
+                    },
                 }
             }
             ["worktree", "list"] => {
                 let rows: Vec<Value> = self
-                    .workers
-                    .values()
-                    .filter_map(|worker| {
-                        worker
-                            .worktree
-                            .as_ref()
-                            .map(|id| json!({"id": id, "branch": worker.branch}))
+                    .identity_repo
+                    .iter()
+                    .map(|path| {
+                        json!({"id": "main", "path": path, "isMainWorktree": true,
+                        "branch": "refs/heads/main"})
                     })
                     .chain(
-                        self.worktrees
-                            .iter()
-                            .map(|(id, branch)| json!({"id": id, "branch": branch})),
+                        self.workers
+                            .values()
+                            .filter_map(|worker| {
+                                worker
+                                    .worktree
+                                    .as_ref()
+                                    .map(|id| json!({"id": id, "branch": worker.branch}))
+                            })
+                            .chain(
+                                self.worktrees
+                                    .iter()
+                                    .map(|(id, branch)| json!({"id": id, "branch": branch})),
+                            )
+                            .chain(self.identity_worktree.iter().map(
+                                |(id, branch, comment, path)| {
+                                    json!({
+                                        "id": id, "branch": branch, "comment": comment,
+                                        "path": path, "isMainWorktree": false,
+                                    })
+                                },
+                            )),
                     )
                     .collect();
                 ok(json!({
@@ -815,6 +888,62 @@ impl SimState {
                     "totalCount": rows.len() + self.unlisted_worktrees,
                     "truncated": self.listing_truncated,
                 }))
+            }
+            ["worktree", "create"] => {
+                let Some(path) = self.identity_path.clone() else {
+                    return refuse("worktree_create_unavailable");
+                };
+                let name = Self::flag(flags, "name");
+                let comment = Self::flag(flags, "comment");
+                let id = self.next_id("wt_");
+                let branch = self.free_branch(&format!("{}{name}", self.branch_prefix));
+                if let Some(repo) = &self.identity_repo {
+                    let Some(plain_branch) = branch.strip_prefix("refs/heads/") else {
+                        return refuse("worktree_create_failed");
+                    };
+                    let status = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(repo)
+                        .args(["worktree", "add", "-q", "-b", plain_branch])
+                        .arg(&path)
+                        .status();
+                    if !status.is_ok_and(|status| status.success()) {
+                        return refuse("worktree_create_failed");
+                    }
+                }
+                self.identity_worktree = Some((id.clone(), branch.clone(), comment, path));
+                self.effects += 1;
+                ok(json!({"worktree": {"id": id, "branch": branch}}))
+            }
+            ["worktree", "rm"] => {
+                let selector = Self::flag(flags, "worktree");
+                let Some((id, branch, _, path)) = self.identity_worktree.as_ref() else {
+                    return refuse("worktree_not_found");
+                };
+                if selector != format!("id:{id}") {
+                    return refuse("worktree_not_found");
+                }
+                if let Some(repo) = &self.identity_repo {
+                    let removed = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(repo)
+                        .args(["worktree", "remove"])
+                        .arg(path)
+                        .status();
+                    if !removed.is_ok_and(|status| status.success()) {
+                        return refuse("worktree_remove_failed");
+                    }
+                    if let Some(branch) = branch.strip_prefix("refs/heads/") {
+                        let _ = std::process::Command::new("git")
+                            .arg("-C")
+                            .arg(repo)
+                            .args(["branch", "-D", branch])
+                            .status();
+                    }
+                }
+                self.identity_worktree = None;
+                self.effects += 1;
+                ok(json!({"state": "removed"}))
             }
             ["orchestration", "worker-read"] => {
                 let dispatch = Self::flag(flags, "dispatch");

@@ -401,7 +401,7 @@ impl Opened {
                     return Err(missing("absolute --orca and --runtime-dir paths"));
                 }
                 probe_orca_coordinator(orca, run, coordinator)?;
-                Ok(Box::new(resolve_backend(
+                let backend = resolve_backend(
                     &self.config,
                     OrcaSession {
                         run: run.clone(),
@@ -417,7 +417,14 @@ impl Opened {
                     },
                     SystemRunner::new(orca),
                     required,
-                )?))
+                )?;
+                let binding = super::forge::writer_binding(&self.registry, &self.config.house)?;
+                Ok(Box::new(match binding.writer_identity() {
+                    Some((writer_name, writer_email)) => {
+                        backend.with_writer_identity(writer_name, writer_email)
+                    }
+                    None => backend.require_writer_identity(),
+                }))
             }
             BackendKind::Http => {
                 let curl = agree(

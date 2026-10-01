@@ -554,7 +554,7 @@ impl kitchen::contracts::EffectExecutor for LabelRefusingForge {
                     && matches!(effect.mutation.action, GitHubAction::SetLabel { .. })) =>
             {
                 let reference = ExternalRef::new(&format!("forge-{}", request.key().as_str()))
-                    .map_err(|_| rejected)?;
+                    .map_err(|_| rejected.clone())?;
                 Receipt::new(reference, Vec::new(), Vec::new()).map_err(|_| rejected)
             }
             _ => Err(rejected),

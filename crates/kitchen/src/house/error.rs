@@ -83,6 +83,9 @@ pub enum HouseError {
     /// A bounded Git read failed; nothing was decided from it.
     #[error("git could not be read: {0}")]
     Git(crate::git::GitReadError),
+    /// The explicit repository setup could not enable per-worktree Git config.
+    #[error("cannot enable extensions.worktreeConfig in this repository")]
+    WorktreeConfigSetup,
     /// A merge grant was attempted below the house's required readiness.
     #[error(
         "repository readiness {} is below the required {}; an owner must approve this merge with a reason to proceed",
@@ -150,6 +153,7 @@ impl HouseError {
             Self::UnverifiedSnapshot
             | Self::PartialInstallation { .. }
             | Self::Git(_)
+            | Self::WorktreeConfigSetup
             | Self::DecisionRecord
             | Self::Io(_) => ErrorClass::Execution,
         }

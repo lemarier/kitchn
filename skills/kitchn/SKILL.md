@@ -51,6 +51,17 @@ kitchn house setup --house <house> --workflows <list|none>
 Add `--repository <owner/name>` when the checkout cannot identify the approved
 repository from its Git remotes.
 
+Before Kitchen can launch a writer in an Orca worktree, the repository owner
+must explicitly enable Git's per-worktree config once from that checkout.
+Preview `kitchn house setup --house <house> --workflows <list|none>
+--enable-worktree-config --preview`; it names the repository and the exact
+`extensions.worktreeConfig=true` shared Git config change. After the person
+approves that change, rerun without `--preview`. This step needs a checkout;
+`--repository` alone cannot identify the Git config to change. Launch refuses
+with `WorktreeConfigDisabled` and names this setup command while the setting
+is off. Each launch then writes identity only to its worktree's
+`config.worktree`.
+
 Show the person the doctor report it prints. Any other resolution error
 (no house claims the repository, several do, or remotes disagree) stops the
 session: report it and ask the person how to proceed. Never pick a house.
@@ -159,7 +170,10 @@ consenting to a release.
 
 When a Kitchen launch brief names a `Push:` command, run that exact command
 from the launched worktree after committing and completing the required checks.
-It checks the task's branch, worktree, grants, forge scope, and live remote state, then pushes
+Keep the Git author and committer identity Kitchen set for that worktree. The
+house writer authors every worker commit and opens the PR; a different GitHub
+identity reviews and attests it. The command checks each branch commit's author
+and committer, the task's branch, worktree, grants, forge scope, and live remote state, then pushes
 with a repository-scoped GitHub App installation token and opens a pull request.
 The house must use `kitchn forge bind --app-id ... --installation ...`;
 a personal-token binding is refused before its credential is read. Do not call

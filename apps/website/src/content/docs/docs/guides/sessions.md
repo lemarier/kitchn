@@ -70,6 +70,12 @@ budget applies. You can ask for fewer rounds in a session, never more.
 
 When the expediter has reviewed a clean checkout at the live PR head, the short attestation command is `kitchn gate attest --review-id <forge-review-id>`. Kitchen finds the sole open PR at that commit; a dirty checkout, moved head, or ambiguous match is refused.
 
+For supervised work, the house writer GitHub App authors the worker commits
+and opens the pull request. The expediter reviews and attests with a separate
+GitHub identity, currently a person. A separate review app can fill that role
+when a house configures one. The writer cannot approve its own PR; an
+attestation from its identity is refused.
+
 ## Issue drafts
 
 A preview shows every issue, comment, label and dependency it would write, with

@@ -328,6 +328,7 @@ fn route(call: &Recorded, backend: &FakeBackend, state: &Mutex<State>) -> (u16, 
                 Ok(receipt) => ok(json!({ "status": "applied", "receipt": receipt })),
                 Err(EffectFailure::NotApplied(reason)) => ok(refusal(reason)),
                 Err(EffectFailure::Uncertain(_)) => (502, String::new()),
+                Err(EffectFailure::Ended(_)) => (502, String::new()),
             }
         }
         ("POST", "/v1/effects/lookup") => {
@@ -434,7 +435,9 @@ fn refusal(reason: NotAppliedReason) -> Value {
             "reason": "rate-limited",
             "retryAfterSeconds": retry_after.map(|delay| delay.as_secs()),
         }),
-        NotAppliedReason::Rejected | NotAppliedReason::ConfirmedAbsent => {
+        NotAppliedReason::Rejected
+        | NotAppliedReason::ConfirmedAbsent
+        | NotAppliedReason::WorktreeConfigDisabled => {
             json!({ "status": "not-applied", "reason": "rejected" })
         }
     }

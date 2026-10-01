@@ -51,6 +51,7 @@ fn fixture_with_second_repository(
             requester: ExternalRef::new("owner")?,
             credential: CredentialId::new("github")?,
             credential_kind: CredentialKind::Token,
+            bot_user_id: None,
             posting_budget: PostingBudget::new(20)?,
         },
     )?;

@@ -260,6 +260,8 @@ pub struct ReportsBranch<'a> {
     pub accepted_prefix: Option<&'a str>,
     /// Refuse every stop request, as a backend that cannot reach the worker.
     pub refuse_stop: bool,
+    /// Model an existing worktree whose branch belongs in touched.
+    pub existing: Option<&'a ResourceRef>,
 }
 
 impl EffectExecutor for ReportsBranch<'_> {
@@ -290,17 +292,21 @@ impl EffectExecutor for ReportsBranch<'_> {
         })?;
         let mut created = receipt.created().to_vec();
         created.retain(|resource| resource.kind != ResourceKind::Branch);
-        created.push(ResourceRef {
+        let branch = ResourceRef {
             kind: ResourceKind::Branch,
             backend: self.inner.descriptor().backend.clone(),
             handle: branch,
-        });
-        Receipt::new(
-            receipt.reference().clone(),
-            created,
-            receipt.touched().to_vec(),
-        )
-        .map_err(|_| EffectFailure::NotApplied(kitchen::contracts::NotAppliedReason::Rejected))
+        };
+        let mut touched = receipt.touched().to_vec();
+        if let Some(worktree) = self.existing {
+            created.retain(|resource| resource.kind != ResourceKind::Worktree);
+            touched.push(worktree.clone());
+            touched.push(branch);
+        } else {
+            created.push(branch);
+        }
+        Receipt::new(receipt.reference().clone(), created, touched)
+            .map_err(|_| EffectFailure::NotApplied(kitchen::contracts::NotAppliedReason::Rejected))
     }
 
     fn lookup(&self, request: &EffectRequest) -> Result<Lookup, BackendUnavailable> {

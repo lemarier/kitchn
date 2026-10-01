@@ -8,6 +8,9 @@
 //! | `ReleaseResource` (workers only) | `worker-release --dispatch` |
 //! | `observe_worker` | `worker-show --dispatch` |
 //!
+//! Identity-bearing isolated launches create an Orca worktree and set its
+//! worktree-local Git identity before `worker-start --worktree id:<id>`.
+//!
 //! Orca's `--retry-request` accepts only request ids Orca issued, so a
 //! Kitchen idempotency key cannot be an Orca request id. Launches are keyed by
 //! an Orca Task instead: one Task per key, titled with [`launch_marker`]. A
@@ -173,6 +176,8 @@ pub struct OrcaBackend<R> {
     runner: R,
     schedule_policy: Option<SchedulePolicy>,
     now: fn() -> Timestamp,
+    writer_identity: Option<(String, String)>,
+    writer_identity_required: bool,
 }
 
 fn system_now() -> Timestamp {
@@ -225,10 +230,18 @@ struct WorktreeShow {
     worktree: Option<WorktreeRow>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct WorktreeRow {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
     branch: Option<String>,
+    #[serde(default)]
+    comment: Option<String>,
+    #[serde(default, rename = "isMainWorktree")]
+    is_main_worktree: bool,
 }
 
 /// `worktree list`. Completeness is required, not defaulted: a listing that
@@ -476,6 +489,7 @@ fn receipt_branch(receipt: &Receipt) -> Option<BranchName> {
     receipt
         .created()
         .iter()
+        .chain(receipt.touched())
         .find(|resource| resource.kind == ResourceKind::Branch)
         .and_then(|resource| BranchName::new(resource.handle.as_str()).ok())
 }
@@ -737,7 +751,25 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             runner,
             schedule_policy: None,
             now: system_now,
+            writer_identity: None,
+            writer_identity_required: false,
         })
+    }
+
+    /// Require this house writer for new isolated worktrees before a worker
+    /// starts. The identity is scoped to each created worktree.
+    #[must_use]
+    pub fn with_writer_identity(mut self, name: String, email: String) -> Self {
+        self.writer_identity = Some((name, email));
+        self.writer_identity_required = true;
+        self
+    }
+
+    /// Refuse a worker launch if the house has no verified writer identity.
+    #[must_use]
+    pub fn require_writer_identity(mut self) -> Self {
+        self.writer_identity_required = true;
+        self
     }
 
     /// Enforce the house's schedule limits: installs that break them are
@@ -843,21 +875,32 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                     .first()
                     .and_then(|id| self.worktree_branch_until(id, deadline))
             });
-        resources.extend(
-            branch
-                .as_deref()
-                // Orca reports the full ref, such as `refs/heads/lemarier/x`.
-                .map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch))
-                .and_then(external)
-                .map(|branch| self.resource(ResourceKind::Branch, branch)),
-        );
+        let branch_resources = branch
+            .as_deref()
+            // Orca reports the full ref, such as `refs/heads/lemarier/x`.
+            .map(|branch| branch.strip_prefix("refs/heads/").unwrap_or(branch))
+            .and_then(external)
+            .map(|branch| self.resource(ResourceKind::Branch, branch));
+        let created_worktree = shown
+            .worker
+            .effects
+            .iter()
+            .any(|effect| effect.kind == "worktree");
+        if created_worktree {
+            resources.extend(branch_resources.clone());
+        }
         resources.extend(
             worktrees
                 .into_iter()
                 .map(|handle| self.resource(ResourceKind::Worktree, handle)),
         );
         resources.truncate(MAX_RECEIPT_RESOURCES);
-        Receipt::new(external(task)?, resources, Vec::new()).ok()
+        let touched = if created_worktree {
+            Vec::new()
+        } else {
+            branch_resources.into_iter().collect()
+        };
+        Receipt::new(external(task)?, resources, touched).ok()
     }
 
     /// The branch Orca's worktree record names, or `None` when the worktree
@@ -988,16 +1031,16 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         let Some(shown) = self.show(&dispatch.id)? else {
             return Ok(TaskLaunch::Unclear);
         };
-        Ok(self.launch_receipt(&task.id, &dispatch.id, &shown).map_or(
-            TaskLaunch::Unclear,
-            |receipt| {
-                if dispatch_ended(&shown) {
-                    TaskLaunch::Ended(receipt)
-                } else {
-                    TaskLaunch::Dispatched(receipt)
-                }
-            },
-        ))
+        let receipt = self
+            .launch_receipt(&task.id, &dispatch.id, &shown)
+            .and_then(|receipt| self.complete_identity_receipt(key, receipt));
+        Ok(receipt.map_or(TaskLaunch::Unclear, |receipt| {
+            if dispatch_ended(&shown) {
+                TaskLaunch::Ended(receipt)
+            } else {
+                TaskLaunch::Dispatched(receipt)
+            }
+        }))
     }
 
     /// The branch the launch for `key` recorded as requested, when its Task
@@ -1157,6 +1200,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         branch: Option<&BranchName>,
         agent: Option<&AgentSelection>,
     ) -> Result<Receipt, EffectFailure> {
+        if self.writer_identity_required && self.writer_identity.is_none() {
+            return Err(not_applied());
+        }
         // A workspace, branch, or agent selection no launch can honor is
         // refused before anything exists: no reservation, no Task. A
         // selection Orca cannot provide is never replaced by another.
@@ -1189,8 +1235,15 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 key_digest(&self.config.house, key.as_str())
             ))
             .map_err(|error| call_failure(&error))?;
-        let mut receipt =
-            self.launch_reserved(key, workspace, brief, name, new_branch.as_ref(), agent)?;
+        let mut receipt = self.launch_reserved(
+            key,
+            workspace,
+            brief,
+            name,
+            new_branch.as_ref(),
+            branch,
+            agent,
+        )?;
         reservation.settle();
         let Some(requested) = branch else {
             return Ok(receipt);
@@ -1229,7 +1282,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                         &shown,
                         Some(deadline),
                     ) {
-                        receipt = updated;
+                        receipt = self
+                            .complete_identity_receipt(key, updated)
+                            .ok_or_else(response_lost)?;
                     }
                 }
             }
@@ -1257,6 +1312,54 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }))
     }
 
+    /// The repository owner enables this once during house setup. Launch is
+    /// read-only with respect to the shared Git config.
+    fn worktree_config_enabled(&self) -> Result<bool, EffectFailure> {
+        let args = wire::Args::command(&["worktree", "list"])
+            .value("repo", self.config.repo.as_str())
+            .value("limit", &MAX_REPO_WORKTREES.to_string())
+            .json();
+        let list: WorktreeList = wire::typed(
+            self.call(args, self.config.call_timeout)
+                .map_err(|_| response_lost())?,
+            "worktree list",
+        )
+        .map_err(|_| response_lost())?;
+        if list.truncated
+            || list.total_count != list.worktrees.len()
+            || !list.host_scope.omitted_host_ids.is_empty()
+        {
+            return Err(response_lost());
+        }
+        let mut mains = list.worktrees.iter().filter(|row| row.is_main_worktree);
+        let path = match (mains.next(), mains.next()) {
+            (Some(row), None) => row.path.as_deref().ok_or_else(response_lost)?,
+            _ => return Err(response_lost()),
+        };
+        let result = crate::workflows::push::run_bounded(
+            std::path::Path::new("git"),
+            path,
+            &[
+                "config",
+                "--local",
+                "--bool",
+                "--get",
+                "extensions.worktreeConfig",
+            ],
+            &[
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ],
+            self.config.call_timeout,
+        );
+        match result {
+            Some((Some(0), output)) if output == b"true\n" => Ok(true),
+            Some((Some(0), output)) if output == b"false\n" => Ok(false),
+            Some((Some(1), output)) if output.is_empty() => Ok(false),
+            _ => Err(response_lost()),
+        }
+    }
+
     /// Close the terminal of a worker stopped for running on the wrong
     /// branch. Orca archives its output and keeps its worktree and branch.
     /// The outcome is not needed here: [`OrcaBackend::launch_collision`]
@@ -1272,6 +1375,10 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "launch needs both requested and resolved branch names"
+    )]
     fn launch_reserved(
         &self,
         key: &IdempotencyKey,
@@ -1279,6 +1386,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         brief: &Text,
         name: Option<String>,
         new_branch: Option<&BranchName>,
+        requested_branch: Option<&BranchName>,
         agent: Option<&AgentSelection>,
     ) -> Result<Receipt, EffectFailure> {
         let task = match self
@@ -1293,17 +1401,295 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             TaskLaunch::Undispatched(task) => Some(task),
             TaskLaunch::None => None,
         };
-        // Only a first start is checked: once dispatched, the launch's own
-        // worktree holds the branch. Only reads happened so far, so any
-        // failure of the check is a refusal.
-        if let Some(branch) = new_branch {
+        if self.writer_identity.is_some() && !self.worktree_config_enabled()? {
+            return Err(EffectFailure::NotApplied(
+                NotAppliedReason::WorktreeConfigDisabled,
+            ));
+        }
+        // An identity-bearing launch creates and configures its worktree
+        // before starting the worker. A retry finds that worktree by the
+        // launch marker, so an interrupted setup cannot create a second one.
+        if self.writer_identity.is_none()
+            && let Some(branch) = new_branch
+        {
             self.check_branch_free(branch).map_err(|_| not_applied())?;
         }
         let task = match task {
             Some(task) => task,
             None => self.create_task(key, brief, new_branch)?,
         };
+        if self.writer_identity.is_some() && matches!(workspace, Workspace::Isolated) {
+            let branch = new_branch.ok_or_else(response_lost)?;
+            let name = name.ok_or_else(response_lost)?;
+            let worktree = self.prepare_identity_worktree(key, &task, &name, branch)?;
+            let id = external(worktree.id.as_deref().ok_or_else(response_lost)?)
+                .ok_or_else(response_lost)?;
+            let existing = Workspace::Existing(self.resource(ResourceKind::Worktree, id));
+            let receipt = self.start(key, &task, &existing, None, agent)?;
+            return self
+                .complete_identity_receipt(key, receipt)
+                .ok_or_else(response_lost);
+        }
+        if self.writer_identity.is_some()
+            && let Workspace::Existing(resource) = workspace
+        {
+            let branch = requested_branch.ok_or_else(response_lost)?;
+            self.prepare_existing_identity_worktree(key, resource, branch)?;
+            let receipt = self.start(key, &task, workspace, None, agent)?;
+            return self
+                .complete_identity_receipt(key, receipt)
+                .ok_or_else(response_lost);
+        }
         self.start(key, &task, workspace, name.as_deref(), agent)
+    }
+
+    fn prepare_existing_identity_worktree(
+        &self,
+        key: &IdempotencyKey,
+        resource: &ResourceRef,
+        branch: &BranchName,
+    ) -> Result<(), EffectFailure> {
+        let args = wire::Args::command(&["worktree", "show"])
+            .value("worktree", &format!("id:{}", resource.handle))
+            .json();
+        let shown: WorktreeShow = wire::typed(
+            self.call(args, self.config.call_timeout)
+                .map_err(|_| response_lost())?,
+            "worktree show",
+        )
+        .map_err(|_| response_lost())?;
+        let row = shown.worktree.ok_or_else(response_lost)?;
+        let path = row.path.as_ref().ok_or_else(response_lost)?;
+        if row.id.as_deref() != Some(resource.handle.as_str())
+            || row.branch.as_deref() != Some(format!("refs/heads/{branch}").as_str())
+            || row.is_main_worktree
+            || !path.is_absolute()
+        {
+            return Err(response_lost());
+        }
+        let (name, email) = self.writer_identity.as_ref().ok_or_else(response_lost)?;
+        let base = configure_writer_worktree(path, name, email, self.config.call_timeout)
+            .ok_or_else(response_lost)?;
+        crate::adapters::orca::record_writer_base(
+            &self.config.runtime_dir,
+            key,
+            &crate::adapters::orca::WriterBase {
+                house: self.config.house.clone(),
+                worktree: resource.handle.clone(),
+                branch: branch.clone(),
+                base,
+                created: false,
+            },
+        )
+        .map_err(|_| response_lost())
+    }
+
+    /// Find a worktree this launch marker owns. A partial or truncated list
+    /// proves nothing, and duplicate markers require operator inspection.
+    fn identity_worktree(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<Option<WorktreeRow>, EffectFailure> {
+        let args = wire::Args::command(&["worktree", "list"])
+            .value("repo", self.config.repo.as_str())
+            .value("limit", &MAX_REPO_WORKTREES.to_string())
+            .json();
+        let list: WorktreeList = wire::typed(
+            self.call(args, self.config.call_timeout)
+                .map_err(|_| response_lost())?,
+            "worktree list",
+        )
+        .map_err(|_| response_lost())?;
+        if list.truncated
+            || list.total_count > list.worktrees.len()
+            || list.worktrees.len() >= MAX_REPO_WORKTREES
+            || !list.host_scope.omitted_host_ids.is_empty()
+        {
+            return Err(response_lost());
+        }
+        let mut matches = list
+            .worktrees
+            .into_iter()
+            .filter(|row| row.comment.as_deref() == Some(self.task_title(key).as_str()));
+        match (matches.next(), matches.next()) {
+            (None, _) => Ok(None),
+            (Some(row), None) => Ok(Some(row)),
+            _ => Err(response_lost()),
+        }
+    }
+
+    fn prepare_identity_worktree(
+        &self,
+        key: &IdempotencyKey,
+        task: &str,
+        name: &str,
+        branch: &BranchName,
+    ) -> Result<WorktreeRow, EffectFailure> {
+        let mut row = self.identity_worktree(key)?;
+        let created_now = row.is_none();
+        if row.is_none() {
+            self.check_branch_free(branch).map_err(|_| not_applied())?;
+            let mut args = wire::Args::command(&["worktree", "create"])
+                .value("repo", self.config.repo.as_str())
+                .value("name", name)
+                .value("comment", &self.task_title(key))
+                .switch("no-parent");
+            if let Some(base) = &self.config.base_branch {
+                args = args.value("base-branch", base.as_str());
+            }
+            // A lost response is reconciled by the marker before another
+            // create. The branch is not handed to a worker until configured.
+            let _ = self
+                .call(args.json(), self.config.launch_timeout)
+                .map_err(|_| response_lost())?;
+            row = self.identity_worktree(key)?;
+        }
+        let row = row.ok_or_else(response_lost)?;
+        let expected = format!("refs/heads/{branch}");
+        if row.branch.as_deref() != Some(expected.as_str())
+            || row.is_main_worktree
+            || row.id.is_none()
+            || row.path.as_ref().is_none_or(|path| !path.is_absolute())
+        {
+            if created_now
+                && let Some(receipt) = self.remove_failed_identity_worktree(key, task, &row)
+            {
+                return Err(EffectFailure::Ended(receipt));
+            }
+            return Err(response_lost());
+        }
+        let (name, email) = self.writer_identity.as_ref().ok_or_else(response_lost)?;
+        let path = row.path.as_ref().ok_or_else(response_lost)?;
+        let base = match configure_writer_worktree(path, name, email, self.config.call_timeout) {
+            Some(base) => base,
+            None => {
+                if created_now
+                    && let Some(receipt) = self.remove_failed_identity_worktree(key, task, &row)
+                {
+                    return Err(EffectFailure::Ended(receipt));
+                }
+                return Err(response_lost());
+            }
+        };
+        let recorded = crate::adapters::orca::record_writer_base(
+            &self.config.runtime_dir,
+            key,
+            &crate::adapters::orca::WriterBase {
+                house: self.config.house.clone(),
+                worktree: external(row.id.as_deref().ok_or_else(response_lost)?)
+                    .ok_or_else(response_lost)?,
+                branch: branch.clone(),
+                base,
+                created: true,
+            },
+        );
+        if recorded.is_err() {
+            if created_now
+                && let Some(receipt) = self.remove_failed_identity_worktree(key, task, &row)
+            {
+                return Err(EffectFailure::Ended(receipt));
+            }
+            return Err(response_lost());
+        }
+        Ok(row)
+    }
+
+    fn undispatched_receipt(&self, task: &str, row: &WorktreeRow) -> Option<Receipt> {
+        let worktree = self.resource(ResourceKind::Worktree, external(row.id.as_deref()?)?);
+        let branch = self.resource(
+            ResourceKind::Branch,
+            external(row.branch.as_deref()?.strip_prefix("refs/heads/")?)?,
+        );
+        Receipt::new(external(task)?, vec![worktree, branch], Vec::new()).ok()
+    }
+
+    /// Remove only a worktree created by this invocation, after confirming
+    /// that its Task has no Dispatch and its marker still identifies it.
+    fn remove_failed_identity_worktree(
+        &self,
+        key: &IdempotencyKey,
+        task: &str,
+        row: &WorktreeRow,
+    ) -> Option<Receipt> {
+        let receipt = self.undispatched_receipt(task, row)?;
+        if !matches!(self.task_launch(key), Ok(TaskLaunch::Undispatched(_)))
+            || !self.identity_worktree(key).is_ok_and(|found| {
+                found
+                    .as_ref()
+                    .is_some_and(|found| found.id == row.id && found.branch == row.branch)
+            })
+        {
+            return Some(receipt);
+        }
+        let Some(id) = row.id.as_deref() else {
+            return Some(receipt);
+        };
+        let args = wire::Args::command(&["worktree", "rm"])
+            .value("worktree", &format!("id:{id}"))
+            .json();
+        let _ = self.call(args, self.config.call_timeout);
+        // A complete reread proves removal; otherwise retain the receipt.
+        if matches!(self.identity_worktree(key), Ok(None)) {
+            None
+        } else {
+            Some(receipt)
+        }
+    }
+
+    fn complete_identity_receipt(&self, key: &IdempotencyKey, receipt: Receipt) -> Option<Receipt> {
+        if self.writer_identity.is_none() {
+            return Some(receipt);
+        }
+        let recorded = match crate::adapters::orca::read_writer_base(&self.config.runtime_dir, key)
+        {
+            Ok(recorded) => recorded,
+            Err(crate::adapters::orca::WriterBaseError::NotFound) => return Some(receipt),
+            Err(_) => return None,
+        };
+        let mut created = receipt.created().to_vec();
+        if !recorded.created {
+            let mut touched = receipt.touched().to_vec();
+            created.retain(|resource| {
+                if matches!(resource.kind, ResourceKind::Branch | ResourceKind::Worktree) {
+                    if !touched.contains(resource) {
+                        touched.push(resource.clone());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            let branch = self.resource(ResourceKind::Branch, external(recorded.branch.as_str())?);
+            if !touched.contains(&branch) {
+                touched.push(branch);
+            }
+            let worktree = self.resource(ResourceKind::Worktree, recorded.worktree);
+            if !touched.contains(&worktree) {
+                touched.push(worktree);
+            }
+            return Receipt::new(receipt.reference().clone(), created, touched).ok();
+        }
+        let row = self.identity_worktree(key).ok()??;
+        let id = external(row.id.as_deref()?)?;
+        if id != recorded.worktree {
+            return None;
+        }
+        let branch = row.branch.as_deref()?.strip_prefix("refs/heads/")?;
+        if branch != recorded.branch.as_str() {
+            return None;
+        }
+        let branch = external(branch)?;
+        let worktree = self.resource(ResourceKind::Worktree, id);
+        if !created.contains(&worktree) {
+            created.push(worktree);
+        }
+        let branch = self.resource(ResourceKind::Branch, branch);
+        if !created.contains(&branch) {
+            created.push(branch);
+        }
+        let mut touched = receipt.touched().to_vec();
+        touched.retain(|resource| !created.contains(resource));
+        Receipt::new(receipt.reference().clone(), created, touched).ok()
     }
 
     /// Check that no Orca worktree of the repository has `branch` checked
@@ -1541,6 +1927,12 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         {
             TaskLaunch::Dispatched(receipt) => Ok(Lookup::Applied(receipt)),
             TaskLaunch::Ended(receipt) => Ok(Lookup::Ended(receipt)),
+            TaskLaunch::Undispatched(task) if self.writer_identity.is_some() => Ok(self
+                .identity_worktree(key)
+                .ok()
+                .flatten()
+                .and_then(|row| self.undispatched_receipt(&task, &row))
+                .map_or(Lookup::Unknown, Lookup::Ended)),
             TaskLaunch::None | TaskLaunch::Undispatched(_) | TaskLaunch::Unclear => {
                 Ok(Lookup::Unknown)
             }
@@ -1780,6 +2172,74 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     }
 }
 
+/// Set identity only in the linked worktree's config, after Git enables
+/// per-worktree configuration for the repository. An invalid or missing
+/// worktree fails before an agent can receive its task.
+fn configure_writer_worktree(
+    path: &std::path::Path,
+    name: &str,
+    email: &str,
+    deadline: Duration,
+) -> Option<crate::contracts::CommitId> {
+    if !path.is_absolute()
+        || deadline.is_zero()
+        || [name, email]
+            .iter()
+            .any(|value| value.is_empty() || value.chars().any(char::is_control))
+    {
+        return None;
+    }
+    let environment = [
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ];
+    let run = |args: &[&str]| {
+        matches!(
+            crate::workflows::push::run_bounded(
+                std::path::Path::new("git"),
+                path,
+                args,
+                &environment,
+                deadline,
+            ),
+            Some((Some(0), _))
+        )
+    };
+    let Some((Some(0), root)) = crate::workflows::push::run_bounded(
+        std::path::Path::new("git"),
+        path,
+        &["rev-parse", "--show-toplevel"],
+        &environment,
+        deadline,
+    ) else {
+        return None;
+    };
+    let reported = std::str::from_utf8(&root).ok().map(str::trim);
+    if reported.and_then(|root| std::path::Path::new(root).canonicalize().ok())
+        != path.canonicalize().ok()
+    {
+        return None;
+    }
+    let Some((Some(0), head)) = crate::workflows::push::run_bounded(
+        std::path::Path::new("git"),
+        path,
+        &["rev-parse", "--verify", "HEAD"],
+        &environment,
+        deadline,
+    ) else {
+        return None;
+    };
+    let Ok(head) = std::str::from_utf8(&head) else {
+        return None;
+    };
+    let head = head.trim();
+    let base = crate::contracts::CommitId::new(head).ok()?;
+    (run(&["config", "--worktree", "user.name", name])
+        && run(&["config", "--worktree", "user.email", email])
+        && run(&["config", "--worktree", "kitchen.launchBase", head]))
+    .then_some(base)
+}
+
 impl<R: OrcaRunner> EffectExecutor for OrcaBackend<R> {
     fn descriptor(&self) -> &BackendDescriptor {
         &self.descriptor
@@ -1912,6 +2372,90 @@ impl<R: OrcaRunner> WorkerBackend for OrcaBackend<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_identity_is_scoped_to_the_launched_worktree() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::process::Command;
+        let temp = tempfile::tempdir()?;
+        let main = temp.path().join("main");
+        let worker = temp.path().join("worker");
+        std::fs::create_dir(&main)?;
+        let git =
+            |path: &std::path::Path, args: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+                let output = Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .output()?;
+                if !output.status.success() {
+                    return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+                }
+                Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+            };
+        git(&main, &["init", "-q", "-b", "main"])?;
+        git(&main, &["config", "--local", "user.name", "Person"])?;
+        git(
+            &main,
+            &["config", "--local", "user.email", "person@example.com"],
+        )?;
+        git(
+            &main,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        )?;
+        git(
+            &main,
+            &["config", "--local", "extensions.worktreeConfig", "true"],
+        )?;
+        let shared_config = std::fs::read(main.join(".git/config"))?;
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "writer",
+                worker.to_str().ok_or("path")?,
+            ],
+        )?;
+        assert!(
+            configure_writer_worktree(
+                &worker,
+                "house[bot]",
+                "123+house[bot]@users.noreply.github.com",
+                Duration::from_secs(5)
+            )
+            .is_some()
+        );
+        assert_eq!(git(&worker, &["config", "user.name"])?, "house[bot]");
+        assert_eq!(
+            git(&worker, &["config", "user.email"])?,
+            "123+house[bot]@users.noreply.github.com"
+        );
+        assert_eq!(git(&main, &["config", "user.name"])?, "Person");
+        assert_eq!(git(&main, &["config", "user.email"])?, "person@example.com");
+        assert_eq!(std::fs::read(main.join(".git/config"))?, shared_config);
+        assert!(
+            configure_writer_worktree(
+                temp.path(),
+                "house[bot]",
+                "123+house[bot]@users.noreply.github.com",
+                Duration::from_secs(5)
+            )
+            .is_none()
+        );
+        Ok(())
+    }
 
     #[test]
     fn settlement_needs_a_report_or_an_explicit_stop() {

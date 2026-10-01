@@ -37,7 +37,7 @@ use std::{
 };
 
 use crate::{
-    BackendId, EffectName, HouseId, TaskId, WorkflowId,
+    BackendId, EffectName, ErrorClass, HouseId, TaskId, WorkflowId,
     contracts::{
         BranchName, Clock, CommitId, Effect, ExternalRef, Fence, GitHubAction, GitHubMutation,
         GrantScope, HouseGrants, IssueNumber, Operation, Permission, Repository, ResourceKind,
@@ -60,6 +60,41 @@ use crate::{
         repair::{Observed, PullRequestState, PullRequestView, observe_pull_request},
     },
 };
+
+/// A branch cannot be delivered unless every new commit has the bound house
+/// writer as both author and committer.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PushWriterError {
+    /// The app binding has no verified bot ID.
+    #[error(
+        "house forge binding has no verified bot user ID; rebind the app before worker delivery"
+    )]
+    MissingIdentity,
+    /// The branch history could not be established within the Git bounds.
+    #[error(
+        "cannot establish the branch commits against the default tip; inspect the checkout before retrying"
+    )]
+    UnknownHistory,
+    /// One or more commits were written by another identity.
+    #[error(
+        "commits {commits:?} do not have the house writer as both author and committer; amend each with `git commit --amend --reset-author` under the worktree identity, or rebase them"
+    )]
+    ForeignCommits {
+        /// Offending branch commits, ordered newest first.
+        commits: Vec<CommitId>,
+    },
+}
+
+impl PushWriterError {
+    /// Broad handling class.
+    #[must_use]
+    pub const fn class(&self) -> ErrorClass {
+        match self {
+            Self::MissingIdentity | Self::ForeignCommits { .. } => ErrorClass::Refused,
+            Self::UnknownHistory => ErrorClass::Execution,
+        }
+    }
+}
 
 /// The durable result of opening a task's pull request. An uncertain result
 /// must be reconciled before another submission.
@@ -132,6 +167,17 @@ fn record_pushed_head(
 /// worktree handle. A branch name or filesystem path alone does not prove it.
 #[must_use]
 pub fn owns_worktree(record: &TaskRecord, worktree: &ExternalRef) -> bool {
+    launch_worktree_in(record, worktree, false)
+}
+
+/// Whether the current launch bound this worktree, whether created by this
+/// attempt or already present. This authorizes delivery, not cleanup.
+#[must_use]
+pub fn launch_worktree(record: &TaskRecord, worktree: &ExternalRef) -> bool {
+    launch_worktree_in(record, worktree, true)
+}
+
+fn launch_worktree_in(record: &TaskRecord, worktree: &ExternalRef, include_touched: bool) -> bool {
     let Some(worker) = current_worker(record) else {
         return false;
     };
@@ -143,7 +189,9 @@ pub fn owns_worktree(record: &TaskRecord, worktree: &ExternalRef) -> bool {
             )
             && matches!(effect.state(), EffectState::Applied { receipt, .. } if
                 receipt.created().contains(&worker.worker)
-                    && receipt.created().iter().any(|resource|
+                    && receipt.created().iter().chain(
+                        include_touched.then_some(receipt.touched()).into_iter().flatten()
+                    ).any(|resource|
                         resource.kind == ResourceKind::Worktree && &resource.handle == worktree))
     })
 }
@@ -1066,6 +1114,156 @@ impl GitRemote {
         ))
     }
 
+    /// Verify commits reachable from the captured head but not from the
+    /// house-scoped forge's default-branch tip. An incomplete Git answer
+    /// refuses delivery.
+    pub fn verify_writer(
+        &self,
+        repository: &Repository,
+        default_branch: &BranchName,
+        head: &CommitId,
+        default_tip: &CommitId,
+        name: &str,
+        email: &str,
+    ) -> std::result::Result<(), PushWriterError> {
+        if !matches!(self.redirecting_entry(repository), Observed::Known(None)) {
+            return Err(PushWriterError::UnknownHistory);
+        }
+        let urls = self.urls(false).ok_or(PushWriterError::UnknownHistory)?;
+        if !urls.iter().all(|url| self.names(url, repository)) {
+            return Err(PushWriterError::UnknownHistory);
+        }
+        let destination = self
+            .transport_url
+            .as_deref()
+            .or_else(|| urls.first().map(String::as_str))
+            .ok_or(PushWriterError::UnknownHistory)?;
+        let snapshot = self
+            .push_snapshot()
+            .ok_or(PushWriterError::UnknownHistory)?;
+        let dir = snapshot.path();
+        // Materialize the captured head in the same bare object view used by
+        // push. Repacking from its private ref copies reachable objects out
+        // of the checkout's alternates without reading its grafts or config.
+        let head_ref = "refs/kitchen/head";
+        if !matches!(
+            self.run_in(dir, &["update-ref", head_ref, head.as_str()]),
+            Some((Some(0), _))
+        ) || !matches!(
+            self.run_in(dir, &["repack", "-a", "-d", "--quiet"]),
+            Some((Some(0), _))
+        ) || std::fs::remove_file(dir.join("objects/info/alternates")).is_err()
+            || dir.join("shallow").exists()
+        {
+            return Err(PushWriterError::UnknownHistory);
+        }
+        let fetched_ref = "refs/kitchen/default";
+        let source = format!("refs/heads/{default_branch}:{fetched_ref}");
+        let args = [
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            destination,
+            &source,
+        ];
+        let fetched = if let Some((gh, reference)) = &self.push_credential {
+            let url = self
+                .transport_url
+                .as_deref()
+                .ok_or(PushWriterError::UnknownHistory)?;
+            let token = gh
+                .push_token(reference, repository)
+                .map_err(|_| PushWriterError::UnknownHistory)?;
+            let mut env = git_environment(&self.config, &self.remote);
+            let count = env
+                .iter()
+                .find(|(key, _)| key == "GIT_CONFIG_COUNT")
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .ok_or(PushWriterError::UnknownHistory)?;
+            let header = STANDARD.encode(format!("x-access-token:{token}"));
+            env.push((
+                format!("GIT_CONFIG_KEY_{count}"),
+                format!("http.{url}.extraheader"),
+            ));
+            env.push((
+                format!("GIT_CONFIG_VALUE_{count}"),
+                format!("Authorization: Basic {header}"),
+            ));
+            if let Some((_, value)) = env.iter_mut().find(|(key, _)| key == "GIT_CONFIG_COUNT") {
+                *value = (count + 1).to_string();
+            }
+            let env: Vec<(&str, &str)> = env
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            run_bounded(&self.git, dir, &args, &env, self.deadline)
+        } else {
+            self.run_in(dir, &args)
+        };
+        if !matches!(fetched, Some((Some(0), _)))
+            || dir.join("shallow").exists()
+            || !matches!(
+                self.run_in(
+                    dir,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        default_tip.as_str(),
+                        fetched_ref
+                    ]
+                ),
+                Some((Some(0), _))
+            )
+        {
+            return Err(PushWriterError::UnknownHistory);
+        }
+        let (Some(0), output) = self
+            .run_in(
+                dir,
+                &[
+                    "log",
+                    "-z",
+                    "--format=%H%x00%an%x00%ae%x00%cn%x00%ce",
+                    head.as_str(),
+                    "--not",
+                    default_tip.as_str(),
+                ],
+            )
+            .ok_or(PushWriterError::UnknownHistory)?
+        else {
+            return Err(PushWriterError::UnknownHistory);
+        };
+        if output.is_empty() {
+            return Ok(());
+        }
+        if output.last() != Some(&0) {
+            return Err(PushWriterError::UnknownHistory);
+        }
+        let mut fields: Vec<&[u8]> = output.split(|byte| *byte == 0).collect();
+        fields.pop();
+        if !fields.len().is_multiple_of(5) {
+            return Err(PushWriterError::UnknownHistory);
+        }
+        let mut commits = Vec::new();
+        for record in fields.as_chunks::<5>().0 {
+            let sha =
+                std::str::from_utf8(record[0]).map_err(|_| PushWriterError::UnknownHistory)?;
+            let sha = CommitId::new(sha).map_err(|_| PushWriterError::UnknownHistory)?;
+            if record[1] != name.as_bytes()
+                || record[2] != email.as_bytes()
+                || record[3] != name.as_bytes()
+                || record[4] != email.as_bytes()
+            {
+                commits.push(sha);
+            }
+        }
+        if commits.is_empty() {
+            Ok(())
+        } else {
+            Err(PushWriterError::ForeignCommits { commits })
+        }
+    }
+
     /// Longest remote name accepted, in bytes.
     pub const MAX_REMOTE_BYTES: usize = 64;
 
@@ -1512,6 +1710,7 @@ pub(crate) fn git_environment(config: &IsolatedGitConfig, remote: &str) -> Vec<(
     let mut env = Vec::with_capacity(pins.len() * 2 + 5);
     env.extend([
         ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
+        ("GIT_NO_REPLACE_OBJECTS".to_owned(), "1".to_owned()),
         (
             "GIT_CONFIG_GLOBAL".to_owned(),
             config.path.to_string_lossy().into_owned(),

@@ -494,6 +494,24 @@ impl HouseRegistry {
         ensure_external(&path)?;
         Ok(path)
     }
+
+    /// Replace one existing private JSON document after comparing its exact
+    /// decoded value. A staged file and atomic rename preserve the old value
+    /// if writing fails or another process changes it first.
+    pub(crate) fn update_private_document<T: Serialize + DeserializeOwned + PartialEq>(
+        &self,
+        house: &HouseId,
+        file: &str,
+        expected: &T,
+        next: &T,
+    ) -> Result<(), HouseError> {
+        if file.is_empty() || file.contains('/') || file.contains('\\') || file.starts_with('.') {
+            return Err(HouseError::InvalidInput);
+        }
+        let path = self.private_path(house)?.join(file);
+        atomic_config(&path, expected, next, super::installer::Visibility::Private)
+    }
+
     /// Where the house's state store lives: `private/<house>/store`. Commands
     /// default `--store` to it. Does not create or open it.
     ///

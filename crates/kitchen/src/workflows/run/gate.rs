@@ -742,6 +742,9 @@ impl<T: GitHubMutationTransport + Clone> GatePass<'_, T> {
             Ok(receipt) => EffectOutcome::Applied(receipt),
             Err(EffectFailure::NotApplied(reason)) => EffectOutcome::NotApplied(reason),
             Err(EffectFailure::Uncertain(reason)) => EffectOutcome::Uncertain(reason),
+            Err(EffectFailure::Ended(_)) => {
+                EffectOutcome::Uncertain(crate::contracts::UncertainReason::ResponseLost)
+            }
         };
         Ok(self
             .store

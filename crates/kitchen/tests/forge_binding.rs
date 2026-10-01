@@ -15,8 +15,8 @@ use kitchen::{
         forge_binding, plan_house_init, register_house,
     },
     integrations::github::{
-        CredentialRef, GitHubExecutor, GitHubMutationTransport, GitHubReadTransport,
-        IntegrationError, MutationRequest, ReadRequest,
+        AppId, CredentialRef, GitHubApp, GitHubExecutor, GitHubMutationTransport,
+        GitHubReadTransport, InstallationId, IntegrationError, MutationRequest, ReadRequest,
     },
 };
 use std::{
@@ -74,8 +74,30 @@ fn binding(requester: &str) -> TestResult<ForgeBinding> {
         requester: ExternalRef::new(requester)?,
         credential: CredentialId::new("github")?,
         credential_kind: CredentialKind::Token,
+        bot_user_id: None,
         posting_budget: PostingBudget::new(5)?,
     })
+}
+
+#[test]
+fn app_writer_email_uses_the_verified_bot_user_id() -> TestResult {
+    let mut bound = binding("kitchn-expediter[bot]")?;
+    bound.credential_kind = CredentialKind::GitHubApp(GitHubApp {
+        app_id: AppId::new(1)?,
+        installation: InstallationId::new(2)?,
+    });
+    assert_eq!(bound.writer_identity(), None);
+    bound.validate(&house_config(BTreeSet::new())?)?;
+    bound.bot_user_id = Some(336054063);
+    bound.validate(&house_config(BTreeSet::new())?)?;
+    assert_eq!(
+        bound.writer_identity(),
+        Some((
+            "kitchn-expediter[bot]".to_owned(),
+            "336054063+kitchn-expediter[bot]@users.noreply.github.com".to_owned()
+        ))
+    );
+    Ok(())
 }
 
 /// A registry holding house `acme` with `config`.
@@ -126,6 +148,31 @@ fn a_binding_is_stored_privately_once_and_a_rerun_keeps_it() -> TestResult {
         credential_path(&registry, &bound)?,
         root.join("registry/private/acme/credentials/github")
     );
+    Ok(())
+}
+
+#[test]
+fn legacy_app_binding_gains_only_its_verified_bot_id() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let registry = registry(&root, &house_config(BTreeSet::new())?)?;
+    let mut legacy = binding("kitchn-expediter[bot]")?;
+    legacy.credential_kind = CredentialKind::GitHubApp(GitHubApp {
+        app_id: AppId::new(1)?,
+        installation: InstallationId::new(2)?,
+    });
+    assert_eq!(bind_forge(&registry, &legacy)?, BindOutcome::Created);
+    let mut upgraded = legacy.clone();
+    upgraded.bot_user_id = Some(336054063);
+    assert_eq!(bind_forge(&registry, &upgraded)?, BindOutcome::Updated);
+    assert_eq!(forge_binding(&registry, &legacy.house)?, upgraded);
+    assert_eq!(bind_forge(&registry, &upgraded)?, BindOutcome::Unchanged);
+    let mut changed = upgraded.clone();
+    changed.requester = ExternalRef::new("other[bot]")?;
+    assert!(matches!(
+        bind_forge(&registry, &changed),
+        Err(ForgeError::BindingConflict { .. })
+    ));
     Ok(())
 }
 

@@ -1265,7 +1265,7 @@ impl EffectExecutor for MemoryForge {
             _ => format!("forge-{}", state.applied.len()),
         };
         let receipt = Receipt::new(
-            ExternalRef::new(&reference).map_err(|_| rejected)?,
+            ExternalRef::new(&reference).map_err(|_| rejected.clone())?,
             Vec::new(),
             Vec::new(),
         )

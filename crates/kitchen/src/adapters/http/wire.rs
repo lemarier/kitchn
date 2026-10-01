@@ -181,7 +181,7 @@ pub(super) fn execute_outcome(
         }
         _ => return Err(lost),
     }
-    match serde_json::from_slice::<ExecuteBody>(body).map_err(|_| lost)? {
+    match serde_json::from_slice::<ExecuteBody>(body).map_err(|_| lost.clone())? {
         ExecuteBody::Applied { receipt } => {
             if names_only(&receipt, backend) {
                 Ok(receipt)

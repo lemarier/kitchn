@@ -617,6 +617,7 @@ impl<'a> Runner<'a> {
             workspace: Workspace::Isolated,
             brief: self.fixture.brief.clone(),
             branch: Some(self.branch()?),
+            pinned: None,
             agent: None,
         }))
     }
@@ -640,6 +641,7 @@ impl<'a> Runner<'a> {
             workspace: Workspace::Isolated,
             brief: self.fixture.brief.clone(),
             branch: Some(self.branch()?),
+            pinned: None,
             agent: Some(agent),
         });
         let request = self.own_request("selection-refused", effect)?;

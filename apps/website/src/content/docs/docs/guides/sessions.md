@@ -80,6 +80,11 @@ The owner must type the head prefix on a TTY. On a host where workers share
 the OS user and credentials, this checkpoint is not person authentication;
 worker isolation such as OpenShell is needed for full enforcement.
 
+Scheduled repair and review follow-up reuse that recorded worktree only while
+it still exists, is clean, and is checked out at the live PR head. A removed
+worktree needs an owner hand-over because Orca cannot recreate an existing
+remote branch checkout. A dirty or moved checkout also stops the round.
+
 When the expediter has reviewed a clean checkout at the live PR head, the short attestation command is `kitchn gate attest --review-id <forge-review-id>`. Kitchen finds the sole open PR at that commit; a dirty checkout, moved head, or ambiguous match is refused.
 
 For supervised work, the house writer GitHub App authors the worker commits

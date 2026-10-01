@@ -118,6 +118,7 @@ impl Kitchen {
             workspace: Workspace::Isolated,
             brief: Text::new("Take part in the deliberation.")?,
             branch: None,
+            pinned: None,
             agent: None,
         };
         let name = format!("launch-{role}");

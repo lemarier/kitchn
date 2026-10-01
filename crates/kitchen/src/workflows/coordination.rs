@@ -608,6 +608,7 @@ pub fn launch_worker(
         workspace,
         &brief.branch,
         matches!(brief.base, Base::Stack { .. }),
+        None,
         |spec, follow_ups| brief.render_with(spec, follow_ups),
     )
 }
@@ -621,6 +622,10 @@ pub fn launch_worker(
 ///
 /// # Errors
 /// As [`launch_worker`], and whatever `render` returns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "launch needs pinned checkout evidence alongside the existing brief inputs"
+)]
 pub(crate) fn launch_rendered(
     ctx: &Context<'_>,
     task: &TaskId,
@@ -628,6 +633,7 @@ pub(crate) fn launch_rendered(
     workspace: Workspace,
     branch: &BranchName,
     stacked: bool,
+    pinned: Option<crate::contracts::PinnedCheckout>,
     render: impl FnOnce(&crate::contracts::TaskSpec, &[QueuedFollowUp]) -> Result<Text>,
 ) -> Result<LaunchOutcome> {
     let record = ctx.store.task(task)?;
@@ -736,6 +742,7 @@ pub(crate) fn launch_rendered(
         workspace: workspace.clone(),
         brief: text,
         branch: Some(branch.clone()),
+        pinned,
         // The store refuses a launch that differs from the task's selection
         // or that the backend does not declare support for.
         agent: record
@@ -824,7 +831,9 @@ pub(crate) fn launch_rendered(
                 NotAppliedReason::Rejected
                 | NotAppliedReason::ConfirmedAbsent
                 | NotAppliedReason::RateLimited { .. } => FailureClass::Retryable,
+                NotAppliedReason::WorktreeChanged(_) => FailureClass::Retryable,
                 NotAppliedReason::Unsupported(_)
+                | NotAppliedReason::BranchInUse
                 | NotAppliedReason::WorktreeConfigDisabled
                 | NotAppliedReason::CrossHouse
                 | NotAppliedReason::ForeignBackend => FailureClass::Permanent,

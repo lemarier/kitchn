@@ -436,8 +436,12 @@ fn refusal(reason: NotAppliedReason) -> Value {
             "retryAfterSeconds": retry_after.map(|delay| delay.as_secs()),
         }),
         NotAppliedReason::Rejected
+        | NotAppliedReason::BranchInUse
         | NotAppliedReason::ConfirmedAbsent
         | NotAppliedReason::WorktreeConfigDisabled => {
+            json!({ "status": "not-applied", "reason": "rejected" })
+        }
+        NotAppliedReason::WorktreeChanged(_) => {
             json!({ "status": "not-applied", "reason": "rejected" })
         }
     }

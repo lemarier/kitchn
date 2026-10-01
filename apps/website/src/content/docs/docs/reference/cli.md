@@ -728,14 +728,19 @@ before anything runs.
   owns first. Unreadable rows and messages no task can take are acknowledged,
   and each is printed.
 - `repair` assesses the open pull requests of settled scheduled tasks and
-  prints each decision. For a conflict it launches one repair writer in a new
-  checkout of the pushed branch, with a brief quoting the change requests on
+  prints each decision. For a conflict it launches one repair writer in the
+  preserved checkout of the pushed branch, with a brief quoting the change requests on
   the current head, while the house's fix-round budget lasts. It launches none
   while another branch writer of the repository may be working, scheduled or
   a person's, and at most one per pass. When the branch's last writer did not
   settle successfully with a report of the current head that states its
   checkout clean and pushed (including a checked `kitchn push` observation),
-  the pull request is handed over instead. A round whose writer's
+  the pull request is handed over instead. Before reuse, the backend checks
+  that the recorded worktree still exists, holds the branch at the live PR
+  head, and has no tracked or untracked changes except the configured report
+  file and files ignored by committed rules. Missing, dirty, moved, or
+  unreadable worktrees yield a named hand-over; Kitchen cannot reconstruct a
+  removed existing-branch worktree through Orca. A round whose writer's
   attempt ended without settling it gets its next attempt only through the
   same decision; once that writer ran, it is the branch's last writer, so the
   pull request is handed over. `--branch-prefix` and `--report-path` are
@@ -745,8 +750,9 @@ before anything runs.
 - `follow-up` reads unresolved review threads and change-request reviews on
   open PRs delivered by settled scheduled tasks. It rechecks the head and
   review data before claiming a fix round, shares `followUp.fixRounds` with
-  repair, and launches at most one writer in an isolated checkout of the
-  pushed branch. A competing repository writer or unproved preservation stops
+  repair, and launches at most one writer in the preserved checkout of the
+  pushed branch. A competing repository writer, unproved preservation, or a
+  failed live checkout inspection stops
   the launch. The brief quotes thread IDs, paths, lines, and reviewer text as
   untrusted data. The worker verifies findings, pushes with `kitchn push`
   under the house writer identity, and reports one `fixed` or `declined`

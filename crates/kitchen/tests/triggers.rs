@@ -125,6 +125,7 @@ fn consent_for_a_different_effect_is_rejected() -> TestResult {
         workspace: Workspace::Isolated,
         brief: Text::new("A different brief.")?,
         branch: None,
+        pinned: None,
         agent: None,
     };
     let other_task = consent("c-task", &task_id("task-2")?, launch()?)?;

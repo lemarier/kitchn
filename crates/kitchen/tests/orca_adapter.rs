@@ -32,10 +32,10 @@ use kitchen::{
         AttemptNumber, BackendUnavailable, BranchName, Capability, CapabilityRequirements,
         CoordinatorMailbox, Effect, EffectExecutor, EffectFailure, EffectRequest, EvidenceRevision,
         ExternalRef, Grant, HouseGrants, IdempotencyKey, Liveness, Lookup, MailboxError,
-        MessageKind, NotAppliedReason, Operation, Permission, Provenance, Receipt, Repository,
-        ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleBackend, ScheduleEffect,
+        MessageKind, NotAppliedReason, Operation, Permission, PinnedCheckout, Provenance, Receipt,
+        Repository, ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleBackend, ScheduleEffect,
         TaskAuthority, TaskSpec, Text, Timestamp, UncertainReason, WorkerBackend, WorkerOutcome,
-        WorkerState, Workspace,
+        WorkerState, Workspace, WorktreeStatus,
         conformance::{self, Check, CheckResult, ConformanceFixture},
     },
     scheduling::{
@@ -104,6 +104,7 @@ fn launch_op(brief: &str) -> TestResult<Operation> {
         workspace: Workspace::Isolated,
         brief: Text::new(brief)?,
         branch: None,
+        pinned: None,
         agent: None,
     })
 }
@@ -453,6 +454,7 @@ fn identity_launch_configures_the_worktree_before_worker_start() -> TestResult {
         workspace: Workspace::Isolated,
         brief: Text::new("task")?,
         branch: Some(BranchName::new("lemarier/issue-1")?),
+        pinned: None,
         agent: None,
     };
     let launch_request = request(effect, "identity-launch")?;
@@ -516,6 +518,7 @@ fn identity_launch_configures_the_worktree_before_worker_start() -> TestResult {
             workspace: Workspace::Existing(worktree),
             brief: Text::new("follow-up")?,
             branch: Some(BranchName::new("lemarier/issue-1")?),
+            pinned: None,
             agent: None,
         },
         "identity-follow-up",
@@ -613,6 +616,7 @@ fn failed_identity_launch(removal_refused: bool, base_write_failure: bool) -> Te
             workspace: Workspace::Isolated,
             brief: Text::new("task")?,
             branch: Some(BranchName::new("lemarier/issue-1")?),
+            pinned: None,
             agent: None,
         },
         "identity-setup-failure",
@@ -2540,6 +2544,182 @@ fn worktree(handle: &str) -> TestResult<ResourceRef> {
 }
 
 #[test]
+fn preserved_worktree_inspection_checks_the_real_checkout() -> TestResult {
+    use std::process::Command;
+    let temp = tempfile::tempdir()?;
+    let main = temp.path().join("main");
+    let checkout = temp.path().join("preserved");
+    std::fs::create_dir(&main)?;
+    let git = |args: &[&str]| -> TestResult<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    };
+    git(&["init", "-q", "-b", "main"])?;
+    git(&[
+        "-c",
+        "user.name=Person",
+        "-c",
+        "user.email=person@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "base",
+    ])?;
+    git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "lemarier/issue-6",
+        checkout.to_str().ok_or("path")?,
+    ])?;
+    let head = kitchen::contracts::CommitId::new(&git(&["rev-parse", "HEAD"])?)?;
+    let sim = SimOrca::default();
+    sim.state().identity_worktree = Some((
+        "wt_preserved".to_owned(),
+        "refs/heads/lemarier/issue-6".to_owned(),
+        "kitchen-marker".to_owned(),
+        checkout.clone(),
+    ));
+    let backend = connect(&sim)?;
+    let resource = worktree("wt_preserved")?;
+    let branch = BranchName::new("lemarier/issue-6")?;
+    let report = Text::new("report.md")?;
+    std::fs::write(checkout.join("report.md"), "evidence")?;
+    assert_eq!(
+        backend.inspect_worktree(&resource, &branch, &head, &report)?,
+        WorktreeStatus::Ready
+    );
+    let launch = |key_text: &str| -> TestResult<EffectRequest> {
+        let mut operation = launch_on("lemarier/issue-6", Workspace::Existing(resource.clone()))?;
+        if let Operation::LaunchWorker { pinned, .. } = &mut operation {
+            *pinned = Some(PinnedCheckout {
+                head: head.clone(),
+                report_path: report.clone(),
+            });
+        }
+        request(operation, key_text)
+    };
+    git(&[
+        "-C",
+        checkout.to_str().ok_or("path")?,
+        "switch",
+        "-q",
+        "--detach",
+        "HEAD",
+    ])?;
+    assert_eq!(
+        backend.inspect_worktree(&resource, &branch, &head, &report)?,
+        WorktreeStatus::WrongBranch
+    );
+    git(&[
+        "-C",
+        checkout.to_str().ok_or("path")?,
+        "switch",
+        "-q",
+        "lemarier/issue-6",
+    ])?;
+    git(&[
+        "-C",
+        checkout.to_str().ok_or("path")?,
+        "switch",
+        "-q",
+        "-c",
+        "other",
+    ])?;
+    assert_eq!(
+        backend.inspect_worktree(&resource, &branch, &head, &report)?,
+        WorktreeStatus::WrongBranch
+    );
+    assert_eq!(
+        backend.execute(&launch("moved-branch")?),
+        Err(EffectFailure::NotApplied(
+            NotAppliedReason::WorktreeChanged(WorktreeStatus::WrongBranch)
+        ))
+    );
+    git(&[
+        "-C",
+        checkout.to_str().ok_or("path")?,
+        "switch",
+        "-q",
+        "lemarier/issue-6",
+    ])?;
+    assert_eq!(
+        backend.inspect_worktree(&resource, &branch, &head, &report)?,
+        WorktreeStatus::Ready
+    );
+    std::fs::write(checkout.join("changed.txt"), "after inspection")?;
+    assert_eq!(
+        backend.execute(&launch("changed-after-inspection")?),
+        Err(EffectFailure::NotApplied(
+            NotAppliedReason::WorktreeChanged(WorktreeStatus::Dirty)
+        ))
+    );
+    assert!(sim.calls_to(&["orchestration", "worker-start"]).is_empty());
+    std::fs::remove_file(checkout.join("changed.txt"))?;
+    git(&[
+        "-C",
+        checkout.to_str().ok_or("path")?,
+        "-c",
+        "user.name=Person",
+        "-c",
+        "user.email=person@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "moved",
+    ])?;
+    assert_eq!(
+        backend.execute(&launch("moved-head")?),
+        Err(EffectFailure::NotApplied(
+            NotAppliedReason::WorktreeChanged(WorktreeStatus::WrongHead)
+        ))
+    );
+    assert!(sim.calls_to(&["orchestration", "worker-start"]).is_empty());
+    git(&[
+        "-C",
+        checkout.to_str().ok_or("path")?,
+        "reset",
+        "--hard",
+        "-q",
+        head.as_str(),
+    ])?;
+    assert_eq!(
+        backend.inspect_worktree(&resource, &branch, &commit('a')?, &report)?,
+        WorktreeStatus::WrongHead
+    );
+    std::fs::write(checkout.join("untracked.txt"), "keep")?;
+    assert_eq!(
+        backend.inspect_worktree(&resource, &branch, &head, &report)?,
+        WorktreeStatus::Dirty
+    );
+    std::fs::remove_file(checkout.join("untracked.txt"))?;
+    sim.state().existing_branch = Some("lemarier/issue-6");
+    backend.execute(&launch("unchanged-checkout")?)?;
+    assert_eq!(sim.calls_to(&["orchestration", "worker-start"]).len(), 1);
+    sim.state().identity_worktree = None;
+    assert_eq!(
+        backend.inspect_worktree(&resource, &branch, &head, &report)?,
+        WorktreeStatus::Missing
+    );
+    Ok(())
+}
+
+#[test]
 fn presets_are_sent_and_compared_as_cron() -> TestResult {
     let sim = SimOrca::default();
     let backend = connect(&sim)?;
@@ -2736,6 +2916,7 @@ fn launch_on(requested: &str, workspace: Workspace) -> TestResult<Operation> {
         workspace,
         brief: Text::new("Implement it.")?,
         branch: Some(branch(requested)?),
+        pinned: None,
         agent: None,
     })
 }
@@ -3229,7 +3410,7 @@ fn a_branch_an_orca_worktree_holds_is_refused_before_anything_is_created() -> Te
     )?;
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+        Err(EffectFailure::NotApplied(NotAppliedReason::BranchInUse))
     );
     nothing_launched(&sim);
     let listings = sim.calls_to(&["worktree", "list"]);
@@ -3315,9 +3496,7 @@ fn a_listing_that_cannot_show_the_branch_free_refuses_the_launch() -> TestResult
     let backend = connect(&sim)?;
     assert_eq!(
         backend.check_branch_free(&branch("lemarier/issue-6")?),
-        Err(OrcaError::BranchTaken {
-            requested: "lemarier/issue-6".to_owned()
-        })
+        Err(OrcaError::BranchUnverified)
     );
     Ok(())
 }
@@ -3508,6 +3687,7 @@ fn a_collision_is_found_when_the_brief_is_long_and_multiline() -> TestResult {
             workspace: Workspace::Isolated,
             brief: Text::new(&long)?,
             branch: Some(branch("lemarier/issue-6")?),
+            pinned: None,
             agent: None,
         },
         "long-collision",

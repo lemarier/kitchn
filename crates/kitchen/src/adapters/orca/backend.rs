@@ -52,9 +52,9 @@ use crate::{
     contracts::{
         BackendDescriptor, BackendUnavailable, BranchName, Clock, Effect, EffectExecutor,
         EffectFailure, EffectRequest, ExternalRef, IdempotencyKey, Lookup, MAX_INVENTORY_RESOURCES,
-        MAX_RECEIPT_RESOURCES, NotAppliedReason, Operation, Receipt, ResourceKind,
+        MAX_RECEIPT_RESOURCES, NotAppliedReason, Operation, PinnedCheckout, Receipt, ResourceKind,
         ResourceObservation, ResourceRef, SystemClock, Text, Timestamp, UncertainReason,
-        WorkerBackend, WorkerOutcome, WorkerState, Workspace,
+        WorkerBackend, WorkerOutcome, WorkerState, Workspace, WorktreeStatus,
     },
     scheduling::{AgentFamily, SchedulePolicy},
     selection::{AgentSelection, EffortSupport, SelectionSupport},
@@ -626,6 +626,7 @@ fn call_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::BranchTaken { .. }
+        | OrcaError::BranchUnverified
         | OrcaError::ScheduleActive
         | OrcaError::ScheduleDiffers { .. }
         | OrcaError::ScheduleLimit(_)
@@ -709,6 +710,7 @@ pub(crate) fn read_failure(error: &OrcaError) -> BackendUnavailable {
         | OrcaError::ReservationBusy
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::BranchTaken { .. }
+        | OrcaError::BranchUnverified
         | OrcaError::InstallUncertain
         | OrcaError::StateMismatch
         | OrcaError::Schedule(_)
@@ -1198,6 +1200,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         workspace: &Workspace,
         brief: &Text,
         branch: Option<&BranchName>,
+        pinned: Option<&PinnedCheckout>,
         agent: Option<&AgentSelection>,
     ) -> Result<Receipt, EffectFailure> {
         if self.writer_identity_required && self.writer_identity.is_none() {
@@ -1235,6 +1238,18 @@ impl<R: OrcaRunner> OrcaBackend<R> {
                 key_digest(&self.config.house, key.as_str())
             ))
             .map_err(|error| call_failure(&error))?;
+        // Serialize all Kitchen launches into this preserved worktree, even
+        // when they have different effect keys. Hold it through worker-start.
+        let _worktree_reservation = match (workspace, pinned) {
+            (Workspace::Existing(resource), Some(_)) => Some(
+                self.reserve(format!(
+                    "worktree-{:032x}",
+                    key_digest(&self.config.house, resource.handle.as_str())
+                ))
+                .map_err(|error| call_failure(&error))?,
+            ),
+            _ => None,
+        };
         let mut receipt = self.launch_reserved(
             key,
             workspace,
@@ -1242,6 +1257,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             name,
             new_branch.as_ref(),
             branch,
+            pinned,
             agent,
         )?;
         reservation.settle();
@@ -1387,6 +1403,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         name: Option<String>,
         new_branch: Option<&BranchName>,
         requested_branch: Option<&BranchName>,
+        pinned: Option<&PinnedCheckout>,
         agent: Option<&AgentSelection>,
     ) -> Result<Receipt, EffectFailure> {
         let task = match self
@@ -1412,7 +1429,13 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         if self.writer_identity.is_none()
             && let Some(branch) = new_branch
         {
-            self.check_branch_free(branch).map_err(|_| not_applied())?;
+            self.check_branch_free(branch)
+                .map_err(|error| match error {
+                    OrcaError::BranchTaken { .. } => {
+                        EffectFailure::NotApplied(NotAppliedReason::BranchInUse)
+                    }
+                    _ => not_applied(),
+                })?;
         }
         let task = match task {
             Some(task) => task,
@@ -1435,12 +1458,35 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         {
             let branch = requested_branch.ok_or_else(response_lost)?;
             self.prepare_existing_identity_worktree(key, resource, branch)?;
+            self.recheck_pinned(workspace, requested_branch, pinned)?;
             let receipt = self.start(key, &task, workspace, None, agent)?;
             return self
                 .complete_identity_receipt(key, receipt)
                 .ok_or_else(response_lost);
         }
+        self.recheck_pinned(workspace, requested_branch, pinned)?;
         self.start(key, &task, workspace, name.as_deref(), agent)
+    }
+
+    fn recheck_pinned(
+        &self,
+        workspace: &Workspace,
+        branch: Option<&BranchName>,
+        pinned: Option<&PinnedCheckout>,
+    ) -> Result<(), EffectFailure> {
+        let Some(pinned) = pinned else {
+            return Ok(());
+        };
+        let (Workspace::Existing(resource), Some(branch)) = (workspace, branch) else {
+            return Err(not_applied());
+        };
+        match self.inspect_worktree(resource, branch, &pinned.head, &pinned.report_path) {
+            Ok(WorktreeStatus::Ready) => Ok(()),
+            Ok(status) => Err(EffectFailure::NotApplied(
+                NotAppliedReason::WorktreeChanged(status),
+            )),
+            Err(_) => Err(response_lost()),
+        }
     }
 
     fn prepare_existing_identity_worktree(
@@ -1458,14 +1504,24 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             "worktree show",
         )
         .map_err(|_| response_lost())?;
-        let row = shown.worktree.ok_or_else(response_lost)?;
-        let path = row.path.as_ref().ok_or_else(response_lost)?;
+        let row = shown.worktree.ok_or({
+            EffectFailure::NotApplied(NotAppliedReason::WorktreeChanged(WorktreeStatus::Missing))
+        })?;
+        if row.branch.as_deref() != Some(format!("refs/heads/{branch}").as_str()) {
+            return Err(EffectFailure::NotApplied(
+                NotAppliedReason::WorktreeChanged(WorktreeStatus::WrongBranch),
+            ));
+        }
+        let path = row.path.as_ref().ok_or({
+            EffectFailure::NotApplied(NotAppliedReason::WorktreeChanged(WorktreeStatus::Missing))
+        })?;
         if row.id.as_deref() != Some(resource.handle.as_str())
-            || row.branch.as_deref() != Some(format!("refs/heads/{branch}").as_str())
             || row.is_main_worktree
             || !path.is_absolute()
         {
-            return Err(response_lost());
+            return Err(EffectFailure::NotApplied(
+                NotAppliedReason::WorktreeChanged(WorktreeStatus::Missing),
+            ));
         }
         let (name, email) = self.writer_identity.as_ref().ok_or_else(response_lost)?;
         let base = configure_writer_worktree(path, name, email, self.config.call_timeout)
@@ -1528,7 +1584,13 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         let mut row = self.identity_worktree(key)?;
         let created_now = row.is_none();
         if row.is_none() {
-            self.check_branch_free(branch).map_err(|_| not_applied())?;
+            self.check_branch_free(branch)
+                .map_err(|error| match error {
+                    OrcaError::BranchTaken { .. } => {
+                        EffectFailure::NotApplied(NotAppliedReason::BranchInUse)
+                    }
+                    _ => not_applied(),
+                })?;
             let mut args = wire::Args::command(&["worktree", "create"])
                 .value("repo", self.config.repo.as_str())
                 .value("name", name)
@@ -1703,9 +1765,9 @@ impl<R: OrcaRunner> OrcaBackend<R> {
     /// [`OrcaBackend::launch_collision`] reports it.
     ///
     /// # Errors
-    /// [`OrcaError::BranchTaken`] when a worktree has the branch, or the
-    /// listing is truncated, counts more worktrees than it returns, holds
-    /// [`MAX_REPO_WORKTREES`] or more rows, or leaves out a host. Other errors when Orca cannot be read.
+    /// [`OrcaError::BranchTaken`] when a worktree has the branch;
+    /// [`OrcaError::BranchUnverified`] when the listing is incomplete.
+    /// Other errors when Orca cannot be read.
     pub fn check_branch_free(&self, branch: &BranchName) -> Result<(), OrcaError> {
         let args = wire::Args::command(&["worktree", "list"])
             .value("repo", self.config.repo.as_str())
@@ -1721,7 +1783,7 @@ impl<R: OrcaRunner> OrcaBackend<R> {
             || list.worktrees.len() >= MAX_REPO_WORKTREES
             || !list.host_scope.omitted_host_ids.is_empty()
         {
-            return Err(taken());
+            return Err(OrcaError::BranchUnverified);
         }
         if list.worktrees.iter().any(|worktree| {
             worktree
@@ -2278,12 +2340,14 @@ impl<R: OrcaRunner> EffectExecutor for OrcaBackend<R> {
                 workspace,
                 brief,
                 branch,
+                pinned,
                 agent,
             } => self.launch(
                 request.key(),
                 workspace,
                 brief,
                 branch.as_ref(),
+                pinned.as_ref(),
                 agent.as_ref(),
             ),
             Operation::MessageWorker { worker, body } => self.message(worker, body),
@@ -2308,6 +2372,87 @@ impl<R: OrcaRunner> EffectExecutor for OrcaBackend<R> {
 }
 
 impl<R: OrcaRunner> WorkerBackend for OrcaBackend<R> {
+    fn inspect_worktree(
+        &self,
+        worktree: &ResourceRef,
+        branch: &BranchName,
+        head: &crate::contracts::CommitId,
+        report_path: &Text,
+    ) -> Result<WorktreeStatus, BackendUnavailable> {
+        if worktree.backend != self.config.backend || worktree.kind != ResourceKind::Worktree {
+            return Ok(WorktreeStatus::Missing);
+        }
+        let args = wire::Args::command(&["worktree", "show"])
+            .value("worktree", &format!("id:{}", worktree.handle))
+            .json();
+        let answer = match self.call(args, self.config.call_timeout) {
+            Ok(answer) => answer,
+            Err(OrcaError::Refused { code, .. }) if code == "worktree_not_found" => {
+                return Ok(WorktreeStatus::Missing);
+            }
+            Err(error) => return Err(read_failure(&error)),
+        };
+        let shown: WorktreeShow =
+            wire::typed(answer, "worktree show").map_err(|_| BackendUnavailable::Transport)?;
+        let Some(row) = shown.worktree else {
+            return Ok(WorktreeStatus::Missing);
+        };
+        if row.id.as_deref() != Some(worktree.handle.as_str()) || row.is_main_worktree {
+            return Ok(WorktreeStatus::Missing);
+        }
+        if row.branch.as_deref() != Some(format!("refs/heads/{branch}").as_str()) {
+            return Ok(WorktreeStatus::WrongBranch);
+        }
+        let Some(path) = row.path.filter(|path| path.is_absolute()) else {
+            return Ok(WorktreeStatus::Missing);
+        };
+        let env = [
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ];
+        let git = |args: &[&str]| {
+            crate::workflows::push::run_bounded(
+                std::path::Path::new("git"),
+                &path,
+                args,
+                &env,
+                self.config.call_timeout,
+            )
+        };
+        let Some((Some(0), root)) = git(&["rev-parse", "--show-toplevel"]) else {
+            return Ok(WorktreeStatus::Missing);
+        };
+        let root = std::str::from_utf8(&root).map_err(|_| BackendUnavailable::Transport)?;
+        if std::path::Path::new(root.trim()).canonicalize().ok() != path.canonicalize().ok() {
+            return Ok(WorktreeStatus::Missing);
+        }
+        let expected_branch = format!("refs/heads/{branch}\n");
+        let Some((code, symbolic)) = git(&["symbolic-ref", "--quiet", "HEAD"]) else {
+            return Err(BackendUnavailable::Transport);
+        };
+        match code {
+            Some(0) if symbolic == expected_branch.as_bytes() => {}
+            Some(0 | 1) => return Ok(WorktreeStatus::WrongBranch),
+            _ => return Err(BackendUnavailable::Transport),
+        }
+        let Some((Some(0), actual)) = git(&["rev-parse", "--verify", "HEAD"]) else {
+            return Err(BackendUnavailable::Transport);
+        };
+        if actual.as_slice() != format!("{}\n", head.as_str()).as_bytes() {
+            return Ok(WorktreeStatus::WrongHead);
+        }
+        let clean = crate::workflows::push::checkout_clean_except_report(
+            &path,
+            std::path::Path::new(report_path.as_str()),
+        )
+        .map_err(|_| BackendUnavailable::Transport)?;
+        Ok(if clean {
+            WorktreeStatus::Ready
+        } else {
+            WorktreeStatus::Dirty
+        })
+    }
+
     fn accepts_launch_branch(
         &self,
         requested: &BranchName,

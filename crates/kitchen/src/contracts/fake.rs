@@ -18,12 +18,12 @@ use std::{
 use crate::{
     BackendId, HouseId,
     contracts::{
-        BackendDescriptor, BackendUnavailable, Capability, CapabilitySet, ContractError,
-        CoordinatorMailbox, Delivery, Effect, EffectExecutor, EffectFailure, EffectRequest,
-        ExternalRef, IdempotencyKey, Liveness, Lookup, MAX_INVENTORY_RESOURCES, MailMessage,
-        MailboxError, NotAppliedReason, Operation, Receipt, ResourceKind, ResourceObservation,
-        ResourceRef, ScheduleEffect, UncertainReason, WorkerBackend, WorkerOutcome, WorkerState,
-        Workspace,
+        BackendDescriptor, BackendUnavailable, BranchName, Capability, CapabilitySet, CommitId,
+        ContractError, CoordinatorMailbox, Delivery, Effect, EffectExecutor, EffectFailure,
+        EffectRequest, ExternalRef, IdempotencyKey, Liveness, Lookup, MAX_INVENTORY_RESOURCES,
+        MailMessage, MailboxError, NotAppliedReason, Operation, Receipt, ResourceKind,
+        ResourceObservation, ResourceRef, ScheduleEffect, UncertainReason, WorkerBackend,
+        WorkerOutcome, WorkerState, Workspace, WorktreeStatus,
     },
     scheduling::AgentFamily,
     selection::{AgentSelection, EffortSupport, SelectionSupport},
@@ -44,6 +44,7 @@ pub enum ExecuteFault {
 struct FakeState {
     applied: BTreeMap<IdempotencyKey, Receipt>,
     workers: BTreeMap<ExternalRef, WorkerState>,
+    worktrees: BTreeMap<ExternalRef, (BranchName, CommitId, bool)>,
     owners: BTreeMap<ExternalRef, ExternalRef>,
     execute_faults: VecDeque<ExecuteFault>,
     lookup_outages: usize,
@@ -68,6 +69,23 @@ pub struct FakeBackend {
 }
 
 impl FakeBackend {
+    /// Set the simulated checkout facts for a worktree. Removing the entry
+    /// simulates a worktree that was removed after the prior writer settled.
+    pub fn set_worktree_checkout(
+        &self,
+        worktree: &ResourceRef,
+        checkout: Option<(BranchName, CommitId, bool)>,
+    ) {
+        let mut state = self.lock();
+        match checkout {
+            Some(checkout) => {
+                state.worktrees.insert(worktree.handle.clone(), checkout);
+            }
+            None => {
+                state.worktrees.remove(&worktree.handle);
+            }
+        }
+    }
     /// A fake with exactly `capabilities`.
     #[must_use]
     pub fn new(backend: BackendId, house: HouseId, capabilities: CapabilitySet) -> Self {
@@ -403,6 +421,24 @@ impl EffectExecutor for FakeBackend {
 }
 
 impl WorkerBackend for FakeBackend {
+    fn inspect_worktree(
+        &self,
+        worktree: &ResourceRef,
+        branch: &BranchName,
+        head: &CommitId,
+        _report_path: &crate::contracts::Text,
+    ) -> Result<WorktreeStatus, BackendUnavailable> {
+        if worktree.kind != ResourceKind::Worktree || worktree.backend != self.descriptor.backend {
+            return Ok(WorktreeStatus::Missing);
+        }
+        Ok(match self.lock().worktrees.get(&worktree.handle) {
+            None => WorktreeStatus::Missing,
+            Some((actual, _, _)) if actual != branch => WorktreeStatus::WrongBranch,
+            Some((_, actual, _)) if actual != head => WorktreeStatus::WrongHead,
+            Some((_, _, false)) => WorktreeStatus::Dirty,
+            Some((_, _, true)) => WorktreeStatus::Ready,
+        })
+    }
     fn observe_worker(&self, worker: &ResourceRef) -> Result<WorkerState, BackendUnavailable> {
         if !self
             .descriptor

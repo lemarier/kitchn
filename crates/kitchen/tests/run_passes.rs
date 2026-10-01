@@ -19,8 +19,9 @@ use kitchen::{
     contracts::{
         BranchName, Capability, CapabilitySet, CheckoutFact, CheckoutReport, Clock, Effect,
         Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef, Grant, LeaseTtl,
-        MailMessage, MessageKind, Operation, PostingBudget, Repository, ResourceRef, ReviewVerdict,
-        Settlement, Text, WorkerOutcome, WorkerState, fake::FakeBackend,
+        MailMessage, MessageKind, Operation, PostingBudget, Repository, ResourceKind, ResourceRef,
+        ReviewVerdict, Settlement, Text, WorkerOutcome, WorkerState, WorktreeStatus,
+        fake::FakeBackend,
     },
     house::HouseConfig,
     integrations::github::{
@@ -34,7 +35,7 @@ use kitchen::{
         StateError, TaskState, WorkItem, WorkerPost,
     },
     workflows::{
-        coordination::{Supervision, current_worker},
+        coordination::{LaunchOutcome, Supervision, current_worker},
         gate::Verdict,
         pickup::{IssueRef, PinnedInstructions, issue_task_id},
         repair::{HandOver, RepairDecision, Skip},
@@ -438,6 +439,30 @@ struct Kitchen {
 }
 
 impl Kitchen {
+    fn preserved_worktree(&self) -> TestResult<ResourceRef> {
+        self.store()
+            .task(&self.task(7)?)?
+            .effects()
+            .iter()
+            .find_map(|effect| match effect.state() {
+                EffectState::Applied { receipt, .. } => receipt
+                    .created()
+                    .iter()
+                    .find(|resource| resource.kind == ResourceKind::Worktree)
+                    .cloned(),
+                _ => None,
+            })
+            .ok_or_else(|| "no pickup worktree".into())
+    }
+
+    fn set_preserved_worktree(&self, clean: bool) -> TestResult {
+        let worktree = self.preserved_worktree()?;
+        self.backend.set_worktree_checkout(
+            &worktree,
+            Some((BranchName::new("kitchen/issue-7")?, commit('d')?, clean)),
+        );
+        Ok(())
+    }
     fn new() -> TestResult<Self> {
         Self::with_backend(FakeBackend::fully_capable(backend_id()?, house()?))
     }
@@ -1205,6 +1230,21 @@ fn checked_follow_up_push(
             head,
         )?,
     )
+}
+
+fn assert_reused_worktree(kitchen: &Kitchen, round: u8) -> TestResult {
+    let resource = kitchen.preserved_worktree()?;
+    let record = kitchen.store().task(&round_task(round)?)?;
+    assert!(record.spec().resources.contains(&resource));
+    assert!(
+        record
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect.state(),
+        EffectState::Applied { receipt, .. } if receipt.touched().contains(&resource)
+            && !receipt.created().contains(&resource)))
+    );
+    Ok(())
 }
 
 fn push_marker_for(kitchen: &Kitchen, task: &kitchen::TaskId, fact: MarkerFact) -> TestResult {
@@ -2128,6 +2168,7 @@ fn settled_with_pull_request(mergeable: bool) -> TestResult<Kitchen> {
     let kitchen = Kitchen::new()?;
     kitchen.launch_and_finish()?;
     acted(kitchen.coordinate()?)?;
+    kitchen.set_preserved_worktree(true)?;
     pull_request(kitchen.forge(), 7, 12, mergeable)?;
     kitchen
         .forge()
@@ -2186,6 +2227,7 @@ fn follow_up_bot_thread_launches_and_posts_fixed_resolution() -> TestResult {
         actions.as_slice(),
         [kitchen::workflows::run::FollowUpAction::Launched { round: 1, .. }]
     ));
+    assert_reused_worktree(&kitchen, 1)?;
     let task = round_task(1)?;
     checked_follow_up_push(&kitchen, &task, &commit('f')?)?;
     let worker = current_worker(&kitchen.store().task(&task)?)
@@ -2231,6 +2273,42 @@ fn follow_up_bot_thread_launches_and_posts_fixed_resolution() -> TestResult {
         one_verdict(kitchen.gate()?)?.result,
         GateResult::ReportOnly(ReportReason::Unattested)
     );
+    Ok(())
+}
+
+#[test]
+fn follow_up_not_applied_releases_round_for_immediate_retry() -> TestResult {
+    let kitchen = settled_with_pull_request(true)?;
+    follow_up_thread(&kitchen)?;
+    kitchen
+        .backend
+        .inject(kitchen::contracts::fake::ExecuteFault::Reject);
+    let first = acted(kitchen.follow_up()?)?;
+    assert!(
+        matches!(
+            first.as_slice(),
+            [kitchen::workflows::run::FollowUpAction::NotLaunched {
+                outcome: LaunchOutcome::NotApplied {
+                    disposition: kitchen::contracts::Disposition::RetryAvailable { .. },
+                    ..
+                },
+                ..
+            }]
+        ),
+        "{first:?}"
+    );
+    let task = round_task(1)?;
+    assert!(matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Open
+    ));
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    let second = acted(kitchen.follow_up()?)?;
+    assert!(
+        matches!(second.as_slice(), [kitchen::workflows::run::FollowUpAction::Launched { round: 1, attempt, .. }] if attempt.get() == 2),
+        "{second:?}"
+    );
+    assert_eq!(kitchen.backend.launched_agents().len(), 2);
     Ok(())
 }
 
@@ -2663,6 +2741,7 @@ fn repair_launches_one_writer_for_a_conflict_within_the_budget() -> TestResult {
             "submitted_at": "1970-01-01T00:00:00Z"}]),
     );
     let actions = acted(kitchen.repair()?)?;
+    assert_reused_worktree(&kitchen, 1)?;
     let task = round_task(1)?;
     assert!(
         matches!(
@@ -2874,6 +2953,10 @@ fn a_repair_round_whose_launch_was_refused_is_launched_by_the_next_pass() -> Tes
         "{refused:?}"
     );
     assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    assert!(matches!(
+        kitchen.store().task(&round_task(1)?)?.state(),
+        TaskState::Open
+    ));
     // The pickup worker is still the branch's latest writer, and its report
     // stands: the next pass launches the round's second attempt.
     let retried = acted(kitchen.repair()?)?;
@@ -3110,6 +3193,36 @@ fn repair_hands_over_when_the_head_is_not_the_reported_one() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn repair_rechecks_the_pr_head_before_claiming_the_reused_worktree() -> TestResult {
+    let kitchen = settled_with_pull_request(false)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    let original = kitchen
+        .forge()
+        .responses
+        .borrow()
+        .get(&format!("repos/{REPO}/pulls/12"))
+        .cloned()
+        .ok_or("no pull request")?;
+    let mut moved = original.clone();
+    moved["head"]["sha"] = json!(commit('f')?.as_str());
+    kitchen
+        .forge()
+        .queue(&format!("repos/{REPO}/pulls/12"), vec![original, moved]);
+    assert!(matches!(
+        kitchen.repair(),
+        Err(kitchen::Error::Run(RunError::AttestationStaleHead))
+    ));
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    assert!(matches!(
+        kitchen.store().task(&round_task(1)?),
+        Err(kitchen::Error::State(StateError::TaskNotFound(_)))
+    ));
+    Ok(())
+}
+
 /// Issue 7 settled on a report stating `checkout`, with pull request 12
 /// conflicting at the reported head.
 fn settled_stating(checkout: CheckoutReport) -> TestResult<Kitchen> {
@@ -3131,6 +3244,7 @@ fn settled_stating(checkout: CheckoutReport) -> TestResult<Kitchen> {
         .store()
         .link_pull_request(&kitchen.task(7)?, kitchen.claim_fence(7)?, pr(12)?)?;
     acted(kitchen.coordinate()?)?;
+    kitchen.set_preserved_worktree(checkout.clean == CheckoutFact::Yes)?;
     assert!(matches!(
         kitchen.store().task(&kitchen.task(7)?)?.state(),
         TaskState::Settled {
@@ -3146,6 +3260,69 @@ fn settled_stating(checkout: CheckoutReport) -> TestResult<Kitchen> {
         .forge()
         .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
     Ok(kitchen)
+}
+
+#[test]
+fn repair_hands_over_missing_or_dirty_preserved_worktrees() -> TestResult {
+    for (checkout, expected) in [
+        (None, WorktreeStatus::Missing),
+        (Some(false), WorktreeStatus::Dirty),
+    ] {
+        let kitchen = settled_stating(CLEAN_AND_PUSHED)?;
+        let resource = kitchen.preserved_worktree()?;
+        kitchen.backend.set_worktree_checkout(
+            &resource,
+            match checkout {
+                Some(clean) => Some((BranchName::new("kitchen/issue-7")?, commit('d')?, clean)),
+                None => None,
+            },
+        );
+        let actions = acted(kitchen.repair()?)?;
+        assert_eq!(
+            actions,
+            [RepairAction::WorktreeUnavailable {
+                pull_request: pr(12)?,
+                reason: expected,
+            }]
+        );
+        assert_eq!(kitchen.backend.launched_agents().len(), 1);
+        assert!(matches!(
+            kitchen.store().task(&round_task(1)?),
+            Err(kitchen::Error::State(StateError::TaskNotFound(_)))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn follow_up_hands_over_missing_or_dirty_preserved_worktrees() -> TestResult {
+    for (checkout, expected) in [
+        (None, WorktreeStatus::Missing),
+        (Some(false), WorktreeStatus::Dirty),
+    ] {
+        let kitchen = settled_with_pull_request(true)?;
+        follow_up_thread(&kitchen)?;
+        let resource = kitchen.preserved_worktree()?;
+        kitchen.backend.set_worktree_checkout(
+            &resource,
+            match checkout {
+                Some(clean) => Some((BranchName::new("kitchen/issue-7")?, commit('d')?, clean)),
+                None => None,
+            },
+        );
+        let actions = acted(kitchen.follow_up()?)?;
+        assert_eq!(
+            actions,
+            [
+                kitchen::workflows::run::FollowUpAction::WorktreeUnavailable {
+                    pull_request: pr(12)?,
+                    reason: expected,
+                }
+            ]
+        );
+        assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    }
+    Ok(())
 }
 
 #[test]
@@ -3224,6 +3401,7 @@ fn checked_push_survives_orcas_empty_completion_and_allows_follow_up() -> TestRe
         kitchen.clock.now(),
     )?;
     acted(kitchen.coordinate()?)?;
+    kitchen.set_preserved_worktree(true)?;
     pull_request(kitchen.forge(), 7, 12, false)?;
     kitchen
         .forge()
@@ -3264,6 +3442,7 @@ fn owner_preservation_is_bound_to_the_settled_pr_head() -> TestResult {
         ExternalRef::new("owner-preserved-person")?,
         kitchen.clock.now(),
     )?;
+    kitchen.set_preserved_worktree(true)?;
     let actions = acted(kitchen.repair()?)?;
     assert!(
         matches!(
@@ -3341,7 +3520,7 @@ fn repair_takeover_mid_pass_launches_the_claimed_round_once() -> TestResult {
             authority: template.authority.clone(),
             retry: template.retry,
             provenance: template.provenance.clone(),
-            resources: std::collections::BTreeSet::new(),
+            resources: std::collections::BTreeSet::from([kitchen.preserved_worktree()?]),
             requires: template.requires.clone(),
             agent: kitchen::workflows::pickup::resolve_agent(
                 template.agents.as_ref(),

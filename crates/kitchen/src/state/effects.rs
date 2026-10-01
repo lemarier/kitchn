@@ -452,6 +452,7 @@ mod tests {
                     workspace: Workspace::Isolated,
                     brief: Text::new("Implement the issue.")?,
                     branch: None,
+                    pinned: None,
                     agent: None,
                 }
                 .into(),

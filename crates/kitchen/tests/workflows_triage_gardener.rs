@@ -478,6 +478,7 @@ fn unresolved_issue_requests_one_bounded_gardener_worker() -> common::TestResult
             workspace: Workspace::Isolated,
             brief,
             branch: None,
+            pinned: None,
             agent: None,
         })] if brief.as_str().contains("sample/project issue #10"))
     ));

@@ -2827,6 +2827,7 @@ fn task_with_branch(harness: &mut Harness, liveness: Liveness) -> TestResult<(Ow
             workspace,
             brief,
             branch: Some(BranchName::new("lemarier/task-1")?),
+            pinned: None,
             agent,
         },
     )?;

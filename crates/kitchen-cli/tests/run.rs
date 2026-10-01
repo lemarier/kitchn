@@ -231,6 +231,7 @@ fn gate_ready_task(house: &House) -> TestResult {
                 workspace: Workspace::Isolated,
                 brief: Text::new("Implement issue 7")?,
                 branch: Some(BranchName::new("kitchen/issue-7")?),
+                pinned: None,
                 agent: None,
             }
             .into(),

@@ -106,6 +106,7 @@ fn launch(branch: &str) -> TestResult<Effect> {
         workspace: Workspace::Isolated,
         brief: Text::new("Fix the flaky test.")?,
         branch: Some(BranchName::new(branch)?),
+        pinned: None,
         agent: None,
     }))
 }

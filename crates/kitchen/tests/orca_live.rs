@@ -489,6 +489,7 @@ fn adapter_checks(
             workspace: Workspace::Isolated,
             brief: fixture.brief.clone(),
             branch: None,
+            pinned: None,
             agent: None,
         },
     )?;
@@ -638,6 +639,7 @@ fn exit_checks(
             workspace: Workspace::Isolated,
             brief: fixture.brief.clone(),
             branch: Some(branch.clone()),
+            pinned: None,
             agent: None,
         },
     )?;

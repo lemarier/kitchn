@@ -5,8 +5,8 @@
 //! Each repair round is its own task ([`repair_task_id`]), shared with the
 //! interactive `pr` request, so a round a person holds is never also run
 //! here. Rounds already spent count against the house's follow-up budget
-//! (#148). The writer works in a new isolated checkout of the pushed
-//! branch; the checkout of the branch's earlier writer is never written. Its
+//! (#148). The writer reuses the preserved checkout of the pushed branch
+//! only after live inspection at the PR head. Its
 //! work counts as preserved only when that writer settled successfully,
 //! the backend shows its worker settled, and its latest recorded report
 //! names the pull request's head and states the checkout clean and pushed.
@@ -39,8 +39,8 @@ use crate::{
     ConsumerId, TaskId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, BranchName, Claimant, Clock, CommitId,
-        ContractError, EvidenceKind, EvidenceVerdict, Fence, IssueNumber, Repository, ResourceRef,
-        Role, Settlement, TaskSpec, Text, WorkerBackend, Workspace,
+        ContractError, EvidenceKind, EvidenceVerdict, Fence, IssueNumber, Repository, ResourceKind,
+        ResourceRef, Role, Settlement, TaskSpec, Text, WorkerBackend, Workspace, WorktreeStatus,
     },
     house::HouseConfig,
     integrations::github::{
@@ -48,8 +48,8 @@ use crate::{
     },
     selection::WorkType,
     state::{
-        HouseStore, MailSender, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject, PostKind,
-        StateError, TaskRecord, TaskState, WorkItem, WorkerPost,
+        EffectState, HouseStore, MailSender, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject,
+        PostKind, StateError, TaskRecord, TaskState, WorkItem, WorkerPost,
     },
     workflows::{
         coordination::{
@@ -171,6 +171,13 @@ pub enum RepairAction {
         /// Why.
         outcome: LaunchOutcome,
     },
+    /// The earlier worktree is not safe to reuse.
+    WorktreeUnavailable {
+        /// Pull request needing a writer.
+        pull_request: IssueNumber,
+        /// The observed obstruction.
+        reason: WorktreeStatus,
+    },
     /// The policy decided a repair, but it waits.
     Waiting {
         /// The pull request.
@@ -217,6 +224,13 @@ pub enum FollowUpAction {
         /// The pull request whose branch cannot safely be written.
         pull_request: IssueNumber,
     },
+    /// The preserved checkout cannot be assigned to another writer.
+    WorktreeUnavailable {
+        /// Pull request needing a writer.
+        pull_request: IssueNumber,
+        /// The observed obstruction.
+        reason: WorktreeStatus,
+    },
     /// The backend did not accept the launch.
     NotLaunched {
         /// The pull request.
@@ -260,6 +274,14 @@ impl fmt::Display for FollowUpAction {
             Self::PreservationUnknown { pull_request } => write!(
                 formatter,
                 "pull request #{}: branch preservation or ownership unknown; owner decision needed",
+                pull_request.get()
+            ),
+            Self::WorktreeUnavailable {
+                pull_request,
+                reason,
+            } => write!(
+                formatter,
+                "pull request #{}: preserved worktree unavailable ({reason:?}); owner decision needed",
                 pull_request.get()
             ),
             Self::NotLaunched {
@@ -311,6 +333,14 @@ impl fmt::Display for RepairAction {
             } => write!(
                 formatter,
                 "pull request #{}: repair task {task} not launched: {outcome:?}",
+                pull_request.get()
+            ),
+            Self::WorktreeUnavailable {
+                pull_request,
+                reason,
+            } => write!(
+                formatter,
+                "pull request #{}: preserved worktree unavailable ({reason:?}); owner decision needed",
                 pull_request.get()
             ),
             Self::Waiting {
@@ -499,6 +529,21 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
                 });
                 continue;
             }
+            let workspace = match self.reusable_worktree(
+                &record,
+                &rounds,
+                &pr.branch,
+                &pr.pull_request.head.sha,
+            ) {
+                Ok(resource) => resource,
+                Err(reason) => {
+                    actions.push(FollowUpAction::WorktreeUnavailable {
+                        pull_request: pr.pull_request.number,
+                        reason,
+                    });
+                    continue;
+                }
+            };
             renew()?;
             let live = known(self.forge.pull_request(
                 self.store.house(),
@@ -546,8 +591,8 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
             ids.sort();
             super::record(self.store, self.tick, &task, self.clock)?;
             let owned = match rounds.waiting(self.repository) {
-                Some(_) => self.own_round(&task, &claimant)?,
-                None => self.claim_round(template, &task, &claimant)?,
+                Some(_) => self.own_round_with_worktree(&task, &claimant, &workspace)?,
+                None => self.claim_round(template, &task, &claimant, &workspace)?,
             };
             let fence = match owned {
                 Ok(fence) => fence,
@@ -589,11 +634,24 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
                 &ctx,
                 &task,
                 fence,
-                Workspace::Isolated,
+                Workspace::Existing(workspace),
                 &pr.branch,
                 false,
+                Some(crate::contracts::PinnedCheckout {
+                    head: live.head.sha.clone(),
+                    report_path: self.settings.report_path.clone(),
+                }),
                 |spec, follow_ups| brief.render(spec, follow_ups),
             )?;
+            if matches!(
+                outcome,
+                LaunchOutcome::NotApplied {
+                    disposition: crate::contracts::Disposition::RetryAvailable { .. },
+                    ..
+                }
+            ) {
+                self.store.relinquish(&task, fence, self.clock.now())?;
+            }
             actions.push(match outcome {
                 LaunchOutcome::Accepted { attempt, worker } => FollowUpAction::Launched {
                     pull_request: live.number,
@@ -824,6 +882,23 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
                 });
                 continue;
             };
+            let rounds = self.rounds(&tasks, number);
+            let record = self.store.task(&pull_request.task)?;
+            let workspace = match self.reusable_worktree(
+                &record,
+                &rounds,
+                &pull_request.branch,
+                &pull_request.pull_request.head.sha,
+            ) {
+                Ok(resource) => resource,
+                Err(reason) => {
+                    actions.push(RepairAction::WorktreeUnavailable {
+                        pull_request: number,
+                        reason,
+                    });
+                    continue;
+                }
+            };
             let round = self.rounds(&tasks, number).used().saturating_add(1);
             let task = repair_task_id(self.repository, number, round)?;
             let wait = if launched {
@@ -845,10 +920,20 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
             // Read before taking the round, so a failed read leaves it as
             // it was.
             let findings = self.findings(&pull_request.pull_request)?;
+            let live = known(
+                self.forge
+                    .pull_request(self.store.house(), self.repository, number),
+            )?;
+            if live.head.sha != pull_request.pull_request.head.sha
+                || live.state != crate::integrations::github::IssueState::Open
+                || live.merged
+            {
+                return Err(RunError::AttestationStaleHead.into());
+            }
             super::record(self.store, self.tick, &task, self.clock)?;
             let owned = match waiting {
-                Some(_) => self.own_round(&task, &claimant)?,
-                None => self.claim_round(template, &task, &claimant)?,
+                Some(_) => self.own_round_with_worktree(&task, &claimant, &workspace)?,
+                None => self.claim_round(template, &task, &claimant, &workspace)?,
             };
             match owned {
                 Ok(fence) => {
@@ -857,6 +942,7 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
                         round,
                         fence,
                         findings: &findings,
+                        workspace,
                     };
                     actions.push(self.launch(&ctx, pull_request, launch)?);
                     launched = true;
@@ -945,6 +1031,51 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
         })
     }
 
+    fn reusable_worktree(
+        &self,
+        pickup: &TaskRecord,
+        rounds: &Rounds<'_>,
+        branch: &BranchName,
+        head: &CommitId,
+    ) -> std::result::Result<ResourceRef, WorktreeStatus> {
+        let last = rounds
+            .waiting(self.repository)
+            .filter(|round| current_worker(round).is_some())
+            .or_else(|| rounds.settled.last().copied())
+            .unwrap_or(pickup);
+        let resource = last
+            .spec()
+            .resources
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::Worktree)
+            .cloned()
+            .or_else(|| {
+                last.effects()
+                    .iter()
+                    .rev()
+                    .find_map(|effect| match effect.state() {
+                        EffectState::Applied { receipt, .. }
+                        | EffectState::Ended { receipt, .. } => receipt
+                            .created()
+                            .iter()
+                            .find(|resource| resource.kind == ResourceKind::Worktree)
+                            .cloned(),
+                        _ => None,
+                    })
+            });
+        let Some(resource) = resource else {
+            return Err(WorktreeStatus::Missing);
+        };
+        match self
+            .backend
+            .inspect_worktree(&resource, branch, head, &self.settings.report_path)
+        {
+            Ok(WorktreeStatus::Ready) => Ok(resource),
+            Ok(reason) => Err(reason),
+            Err(_) => Err(WorktreeStatus::Unknown),
+        }
+    }
+
     /// Create repair round `task` and take it for this pass. A round task
     /// that already exists with another specification waits.
     fn claim_round(
@@ -952,17 +1083,31 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
         template: &TaskTemplate,
         task: &TaskId,
         claimant: &Claimant,
+        workspace: &ResourceRef,
     ) -> Result<std::result::Result<Fence, Wait>> {
         let now = self.clock.now();
-        match self
-            .store
-            .create_task(round_spec(template, task, self.repository), claimant, now)
-        {
+        match self.store.create_task(
+            round_spec(template, task, self.repository, workspace),
+            claimant,
+            now,
+        ) {
             Ok(_) => {}
             Err(crate::Error::State(StateError::TaskConflict(_))) => {
                 return Ok(Err(Wait::RoundHeld));
             }
             Err(error) => return Err(error),
+        }
+        self.own_round(task, claimant)
+    }
+
+    fn own_round_with_worktree(
+        &self,
+        task: &TaskId,
+        claimant: &Claimant,
+        workspace: &ResourceRef,
+    ) -> Result<std::result::Result<Fence, Wait>> {
+        if !self.store.task(task)?.spec().resources.contains(workspace) {
+            return Ok(Err(Wait::RoundHeld));
         }
         self.own_round(task, claimant)
     }
@@ -1019,6 +1164,7 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
             round,
             fence,
             findings,
+            workspace,
         } = launch;
         let brief = RepairBrief {
             repository: self.repository,
@@ -1031,30 +1177,42 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
             budget: self.house.follow_up_budget(),
         };
         let number = pull_request.number;
-        Ok(
-            match launch_rendered(
-                ctx,
-                &task,
-                fence,
-                Workspace::Isolated,
-                &found.branch,
-                false,
-                |spec, follow_ups| brief.render(spec, follow_ups),
-            )? {
-                LaunchOutcome::Accepted { attempt, worker } => RepairAction::Launched {
-                    pull_request: number,
-                    task,
-                    round,
-                    attempt,
-                    worker,
-                },
-                outcome => RepairAction::NotLaunched {
-                    pull_request: number,
-                    task,
-                    outcome,
-                },
+        let outcome = launch_rendered(
+            ctx,
+            &task,
+            fence,
+            Workspace::Existing(workspace),
+            &found.branch,
+            false,
+            Some(crate::contracts::PinnedCheckout {
+                head: pull_request.head.sha.clone(),
+                report_path: self.settings.report_path.clone(),
+            }),
+            |spec, follow_ups| brief.render(spec, follow_ups),
+        )?;
+        if matches!(
+            outcome,
+            LaunchOutcome::NotApplied {
+                disposition: crate::contracts::Disposition::RetryAvailable { .. },
+                ..
+            }
+        ) {
+            self.store.relinquish(&task, fence, self.clock.now())?;
+        }
+        Ok(match outcome {
+            LaunchOutcome::Accepted { attempt, worker } => RepairAction::Launched {
+                pull_request: number,
+                task,
+                round,
+                attempt,
+                worker,
             },
-        )
+            outcome => RepairAction::NotLaunched {
+                pull_request: number,
+                task,
+                outcome,
+            },
+        })
     }
 }
 
@@ -1063,6 +1221,7 @@ struct Launch<'a> {
     task: TaskId,
     round: u8,
     fence: Fence,
+    workspace: ResourceRef,
     findings: &'a [(String, String)],
 }
 
@@ -1129,7 +1288,12 @@ fn worktree(last: &TaskRecord, writer: &Writer, head: &CommitId) -> WorktreeView
 /// The task spec of scheduled repair round `task`: the house template's
 /// authority, retry policy, pinned revisions, and worker requirements, the
 /// fix work type, and its agent selection.
-fn round_spec(template: &TaskTemplate, task: &TaskId, repository: &Repository) -> TaskSpec {
+fn round_spec(
+    template: &TaskTemplate,
+    task: &TaskId,
+    repository: &Repository,
+    workspace: &ResourceRef,
+) -> TaskSpec {
     let role = Role::StationCook;
     let work_type = WorkType::fix();
     TaskSpec {
@@ -1139,7 +1303,7 @@ fn round_spec(template: &TaskTemplate, task: &TaskId, repository: &Repository) -
         authority: template.authority.clone(),
         retry: template.retry,
         provenance: template.provenance.clone(),
-        resources: std::collections::BTreeSet::new(),
+        resources: std::collections::BTreeSet::from([workspace.clone()]),
         requires: template.requires.clone(),
         agent: resolve_agent(template.agents.as_ref(), role, &work_type, repository),
         work_type: Some(work_type),

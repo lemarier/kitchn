@@ -255,6 +255,7 @@ fn held_store(root: &std::path::Path, applied: bool) -> TestResult<String> {
                 workspace: Workspace::Isolated,
                 brief: Text::new("Create the core issue.")?,
                 branch: None,
+                pinned: None,
                 agent: None,
             }
             .into(),

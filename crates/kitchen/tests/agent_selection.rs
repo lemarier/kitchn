@@ -602,6 +602,7 @@ fn launch(agent: Option<AgentSelection>) -> TestResult<Operation> {
         workspace: Workspace::Isolated,
         brief: Text::new("Fix the failing check.")?,
         branch: None,
+        pinned: None,
         agent,
     })
 }

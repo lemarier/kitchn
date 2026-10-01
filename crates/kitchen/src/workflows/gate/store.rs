@@ -285,6 +285,7 @@ impl HouseGateStore<'_> {
                 workspace: Workspace::Isolated,
                 brief,
                 branch: Some(branch),
+                pinned: None,
                 agent,
             },
         })

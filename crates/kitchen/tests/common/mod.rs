@@ -141,6 +141,7 @@ pub fn launch() -> TestResult<Operation> {
         workspace: Workspace::Isolated,
         brief: Text::new("Implement the task described in the issue.")?,
         branch: None,
+        pinned: None,
         agent: None,
     })
 }

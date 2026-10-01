@@ -208,6 +208,10 @@ owner can inspect its bound worktree from a separate coordinator checkout with
 `--confirm-preserved` after the preview shows a clean checkout at the live PR
 head. Confirmation requires a TTY and the owner must type the displayed head
 prefix. It refuses inside a Kitchen-launched worktree or worker environment.
+Repair and review follow-up reuse that worktree only when a live check finds
+the PR branch at its exact head and no tracked or untracked changes. A missing,
+dirty, or moved worktree is handed to the owner; Orca cannot create a fresh
+worktree from an existing remote PR branch yet.
 On a host where workers share the OS user and credentials, this is an
 interactive owner checkpoint, not person authentication: a worker could still
 impersonate the owner. Full enforcement requires worker isolation such as

@@ -2055,6 +2055,7 @@ impl Durable {
                 workspace: Workspace::Isolated,
                 brief: Text::new("Implement issue 9.")?,
                 branch: Some(BranchName::new(branch)?),
+                pinned: None,
                 agent: None,
             },
         )?;
@@ -2776,6 +2777,7 @@ fn durable_fix_launches_on_the_exact_branch_then_messages_that_worker_within_two
         brief,
         branch,
         agent,
+        ..
     } = d.operation(&launch)?
     else {
         return Err("expected a launch".into());

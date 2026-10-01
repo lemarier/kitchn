@@ -14,6 +14,9 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum OrcaError {
+    /// The worktree listing was incomplete, so branch availability is unknown.
+    #[error("Orca did not provide a complete worktree listing")]
+    BranchUnverified,
     /// The Orca executable could not be started; nothing reached Orca.
     #[error("orca could not be started: {0}")]
     Spawn(io::ErrorKind),
@@ -241,6 +244,7 @@ impl OrcaError {
             | Self::BranchUnconfirmed { .. }
             | Self::BranchUnconfirmedRunning { .. }
             | Self::BranchTaken { .. }
+            | Self::BranchUnverified
             | Self::WrongBranchRunning { .. }
             | Self::InstallUncertain
             | Self::StateMismatch

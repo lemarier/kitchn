@@ -278,6 +278,14 @@ kitchn hand-back <task> --holder <you>
 | `--revision <sha>` | The commit whose repository instructions are pinned, such as `git rev-parse HEAD`. |
 | `--orca-status <file>`, `--orca-worktree <file>` | Captured `orca status --json` and `orca worktree current --json`. Without them the session works as a single agent. |
 | `--repository-path <dir>` | A path inside the checkout (default: the current directory). |
+
+The forge can read review-thread text and locations within configured page and
+byte limits. A thread with more than 100 comments is incomplete. Replying to a
+thread requires the house's `post-comment` grant; resolving it requires the
+separate `resolve-review-thread` grant. Both bind the thread to its pull request
+and expected head, persist intent before writing, and read back the result.
+Uncertain writes remain pending reconciliation. The scheduled follow-up pass is
+not exposed by this CLI yet.
 | `--lease-minutes <n>` | Claim lease (default: 120). |
 | `--take-over` | Take a claim whose lease expired without a hand-back. |
 | `--as <intent>` | `pr` only. Routed from the facts when omitted. |

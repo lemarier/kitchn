@@ -382,7 +382,9 @@ fn targets(effect: &EffectRecord, record: &GateVerdictRecord) -> bool {
                     | GitHubAction::LinkDependency { .. }
                     | GitHubAction::CreateLabel { .. }
                     | GitHubAction::OpenPullRequest { .. }
-                    | GitHubAction::ReviewPullRequest { .. } => false,
+                    | GitHubAction::ReviewPullRequest { .. }
+                    | GitHubAction::ReplyToReviewThread { .. }
+                    | GitHubAction::ResolveReviewThread { .. } => false,
                 }
         }
         Effect::Worker(

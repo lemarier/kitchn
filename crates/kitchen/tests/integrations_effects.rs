@@ -40,6 +40,7 @@ struct Remote {
     pulls: Vec<Value>,
     /// Remote branch heads by name.
     branches: BTreeMap<String, String>,
+    review_thread: Option<Value>,
 }
 /// One query-string value of a relative endpoint.
 fn query<'a>(endpoint: &'a str, name: &str) -> Option<&'a str> {
@@ -78,7 +79,21 @@ impl GitHubReadTransport for Provider {
             return Err(IntegrationError::Unavailable);
         }
         let path = request.endpoint();
-        let value = if path.contains("/pulls?") {
+        let value = if path == "graphql" {
+            let node = remote
+                .review_thread
+                .clone()
+                .ok_or(IntegrationError::Unknown)?;
+            if request
+                .graphql()
+                .and_then(|q| q.pointer("/variables/id"))
+                .and_then(Value::as_str)
+                != node.get("id").and_then(Value::as_str)
+            {
+                return Err(IntegrationError::Unknown);
+            }
+            json!({"data":{"node":node}})
+        } else if path.contains("/pulls?") {
             let head = query(path, "head")
                 .ok_or(IntegrationError::Unknown)?
                 .replace("%3A", ":")
@@ -182,7 +197,34 @@ impl GitHubMutationTransport for Provider {
         }
         let path = request.endpoint();
         let body = request.body();
-        if path.ends_with("/pulls") {
+        if path == "graphql" {
+            let thread = remote
+                .review_thread
+                .as_mut()
+                .ok_or(EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
+            let input = &body["variables"]["input"];
+            if body["query"]
+                .as_str()
+                .is_some_and(|q| q.contains("addPullRequestReviewThreadReply"))
+            {
+                if input["pullRequestReviewThreadId"] != thread["id"] {
+                    return Err(EffectFailure::NotApplied(NotAppliedReason::Rejected));
+                }
+                let id = "PRRC_fixture";
+                thread["comments"]["nodes"].as_array_mut().ok_or(EffectFailure::NotApplied(NotAppliedReason::Rejected))?.push(json!({"id":id,"body":input["body"],"url":"https://github.com/sample/project/pull/1#discussion_r2","author":{"login":"sample-bot"}}));
+            } else if body["query"]
+                .as_str()
+                .is_some_and(|q| q.contains("resolveReviewThread"))
+            {
+                if input["threadId"] != thread["id"] {
+                    return Err(EffectFailure::NotApplied(NotAppliedReason::Rejected));
+                }
+                thread["isResolved"] = json!(true);
+                thread["resolvedBy"] = json!({"login":"sample-bot"});
+            } else {
+                return Err(EffectFailure::NotApplied(NotAppliedReason::Rejected));
+            }
+        } else if path.ends_with("/pulls") {
             let number = remote.pulls.len() + 7;
             let head = body["head"].as_str().unwrap_or_default().to_owned();
             let sha = remote.branches.get(&head).cloned();
@@ -2082,6 +2124,265 @@ fn open_remote(fault: Option<Fault>) -> Rc<RefCell<Remote>> {
         fault,
         ..Remote::default()
     }))
+}
+fn thread_action(reply: bool) -> TestResult<GitHubAction> {
+    let number = IssueNumber::new(1)?;
+    let expected_head = CommitId::new(&"a".repeat(40))?;
+    let thread = ExternalRef::new("PRRT_fixture")?;
+    Ok(if reply {
+        GitHubAction::ReplyToReviewThread {
+            number,
+            expected_head,
+            thread,
+            body: Text::new("Fixed with a regression test.")?,
+        }
+    } else {
+        GitHubAction::ResolveReviewThread {
+            number,
+            expected_head,
+            thread,
+        }
+    })
+}
+fn thread_remote(fault: Option<Fault>) -> Rc<RefCell<Remote>> {
+    // Shape checked against `gh api graphql` for lemarier/kitchn PR #275.
+    Rc::new(RefCell::new(Remote {
+        review_thread: Some(json!({
+            "id":"PRRT_fixture", "isResolved":false, "resolvedBy":null,
+            "pullRequest":{"number":1,"headRefOid":"a".repeat(40),"repository":{"nameWithOwner":"sample/project"}},
+            "comments":{"nodes":[{"id":"PRRC_original","body":"Finding","url":"https://github.com/sample/project/pull/1#discussion_r1","author":{"login":"reviewer"}}],
+                "pageInfo":{"hasNextPage":false,"endCursor":"cursor"}}
+        })),
+        fault,
+        ..Remote::default()
+    }))
+}
+#[test]
+fn review_thread_effects_succeed_replay_and_reconcile() -> TestResult {
+    for reply in [true, false] {
+        let permission = if reply {
+            Permission::PostComment
+        } else {
+            Permission::ResolveReviewThread
+        };
+        for fault in [None, Some(Fault::LoseAfterApply)] {
+            let fixture = Fixture::new()?;
+            let (scope, grants, task, fence) = setup(&fixture, 3, &[permission], "github")?;
+            let remote = thread_remote(fault);
+            let backend = GitHubExecutor::new(
+                BackendId::new("github")?,
+                scope.clone(),
+                provider(&fixture, &task, remote.clone())?,
+                ReadLimits::default(),
+            );
+            let effect = backend.effect(mutation(thread_action(reply)?)?)?;
+            assert_eq!(effect.required_permission(), permission);
+            let record = run_effect(
+                &fixture.store,
+                &backend,
+                &grants,
+                plan(&task, fence, "thread-effect", effect.clone())?,
+                &ManualClock::starting_at(1),
+            )?;
+            if fault.is_some() {
+                assert!(matches!(record.state(), EffectState::Uncertain { .. }));
+                assert!(matches!(
+                    run_effect(
+                        &fixture.reopen()?,
+                        &backend,
+                        &grants,
+                        plan(&task, fence, "thread-effect", effect.clone())?,
+                        &ManualClock::starting_at(2)
+                    ),
+                    Err(Error::State(StateError::UnsafeRetry(_)))
+                ));
+                let restarted = GitHubExecutor::new(
+                    BackendId::new("github")?,
+                    scope,
+                    provider(&fixture, &task, remote.clone())?,
+                    ReadLimits::default(),
+                );
+                let result = kitchen::state::reconcile(
+                    &fixture.reopen()?,
+                    &restarted,
+                    &task,
+                    fence,
+                    &ManualClock::starting_at(3),
+                )?;
+                assert_eq!(result.resolved.len(), 1);
+            } else {
+                assert!(matches!(record.state(), EffectState::Applied { .. }));
+            }
+            let replay = run_effect(
+                &fixture.reopen()?,
+                &backend,
+                &grants,
+                plan(&task, fence, "thread-effect", effect)?,
+                &ManualClock::starting_at(4),
+            )?;
+            assert!(matches!(replay.state(), EffectState::Applied { .. }));
+            let remote = remote.borrow();
+            assert_eq!(remote.calls.len(), 1);
+            assert_eq!(remote.calls[0].0, "graphql");
+            let input = &remote.calls[0].1["variables"]["input"];
+            assert_eq!(
+                input[if reply {
+                    "pullRequestReviewThreadId"
+                } else {
+                    "threadId"
+                }],
+                "PRRT_fixture"
+            );
+            assert!(input["clientMutationId"].as_str().is_some());
+            if reply {
+                assert!(input["body"].as_str().is_some_and(|body| {
+                    body.starts_with("Fixed with a regression test.\n\n<!-- kitchen:")
+                }));
+            } else {
+                assert_eq!(
+                    remote.review_thread.as_ref().ok_or("missing thread")?["isResolved"],
+                    true
+                );
+            }
+        }
+    }
+    Ok(())
+}
+#[test]
+fn review_thread_effects_refuse_missing_permission_and_moved_head() -> TestResult {
+    for reply in [true, false] {
+        let needed = if reply {
+            Permission::PostComment
+        } else {
+            Permission::ResolveReviewThread
+        };
+        let fixture = Fixture::new()?;
+        let (scope, _, task, _) = setup(&fixture, 3, &[Permission::CreateIssue], "github")?;
+        let remote = thread_remote(None);
+        let backend = GitHubExecutor::new(
+            BackendId::new("github")?,
+            scope,
+            provider(&fixture, &task, remote.clone())?,
+            ReadLimits::default(),
+        );
+        assert_eq!(
+            backend.effect(mutation(thread_action(reply)?)?),
+            Err(IntegrationError::MissingPermission(needed))
+        );
+        assert!(remote.borrow().calls.is_empty());
+
+        let fixture = Fixture::new()?;
+        let (scope, grants, task, fence) = setup(&fixture, 3, &[needed], "github")?;
+        let remote = thread_remote(None);
+        remote
+            .borrow_mut()
+            .review_thread
+            .as_mut()
+            .ok_or("missing thread")?["pullRequest"]["headRefOid"] = json!("b".repeat(40));
+        let backend = GitHubExecutor::new(
+            BackendId::new("github")?,
+            scope,
+            provider(&fixture, &task, remote.clone())?,
+            ReadLimits::default(),
+        );
+        let effect = backend.effect(mutation(thread_action(reply)?)?)?;
+        let record = run_effect(
+            &fixture.store,
+            &backend,
+            &grants,
+            plan(&task, fence, "thread-effect", effect)?,
+            &ManualClock::starting_at(1),
+        )?;
+        assert!(matches!(record.state(), EffectState::NotApplied { .. }));
+        assert!(remote.borrow().calls.is_empty());
+    }
+    Ok(())
+}
+#[test]
+fn review_thread_effects_keep_lost_before_apply_uncertain() -> TestResult {
+    for reply in [true, false] {
+        let permission = if reply {
+            Permission::PostComment
+        } else {
+            Permission::ResolveReviewThread
+        };
+        let fixture = Fixture::new()?;
+        let (scope, grants, task, fence) = setup(&fixture, 3, &[permission], "github")?;
+        let remote = thread_remote(Some(Fault::LoseBeforeApply));
+        let backend = GitHubExecutor::new(
+            BackendId::new("github")?,
+            scope,
+            provider(&fixture, &task, remote.clone())?,
+            ReadLimits::default(),
+        );
+        let effect = backend.effect(mutation(thread_action(reply)?)?)?;
+        let record = run_effect(
+            &fixture.store,
+            &backend,
+            &grants,
+            plan(&task, fence, "thread-effect", effect)?,
+            &ManualClock::starting_at(1),
+        )?;
+        assert!(matches!(record.state(), EffectState::Uncertain { .. }));
+        let result = kitchen::state::reconcile(
+            &fixture.reopen()?,
+            &backend,
+            &task,
+            fence,
+            &ManualClock::starting_at(2),
+        )?;
+        assert!(result.resolved.is_empty());
+        assert_eq!(result.unresolved.len(), 1);
+        assert_eq!(remote.borrow().calls.len(), 1);
+    }
+    Ok(())
+}
+#[test]
+fn review_thread_effects_reject_invalid_node_and_partial_comments() -> TestResult {
+    for reply in [true, false] {
+        let permission = if reply {
+            Permission::PostComment
+        } else {
+            Permission::ResolveReviewThread
+        };
+        let fixture = Fixture::new()?;
+        let (scope, grants, task, fence) = setup(&fixture, 3, &[permission], "github")?;
+        let remote = thread_remote(None);
+        let backend = GitHubExecutor::new(
+            BackendId::new("github")?,
+            scope,
+            provider(&fixture, &task, remote.clone())?,
+            ReadLimits::default(),
+        );
+        let mut action = thread_action(reply)?;
+        match &mut action {
+            GitHubAction::ReplyToReviewThread { thread, .. }
+            | GitHubAction::ResolveReviewThread { thread, .. } => {
+                *thread = ExternalRef::new("foreign-node")?
+            }
+            _ => return Err("unexpected action".into()),
+        }
+        assert_eq!(
+            backend.effect(mutation(action)?),
+            Err(IntegrationError::InvalidInput)
+        );
+        let effect = backend.effect(mutation(thread_action(reply)?)?)?;
+        remote
+            .borrow_mut()
+            .review_thread
+            .as_mut()
+            .ok_or("missing thread")?["comments"]["pageInfo"]["hasNextPage"] = json!(true);
+        let record = run_effect(
+            &fixture.store,
+            &backend,
+            &grants,
+            plan(&task, fence, "thread-effect", effect)?,
+            &ManualClock::starting_at(1),
+        )?;
+        assert!(matches!(record.state(), EffectState::NotApplied { .. }));
+        assert!(remote.borrow().calls.is_empty());
+    }
+    Ok(())
 }
 #[test]
 fn open_pull_request_requires_its_grant_and_reconciles_a_lost_response() -> TestResult {

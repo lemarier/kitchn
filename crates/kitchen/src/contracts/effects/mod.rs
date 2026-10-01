@@ -88,6 +88,10 @@ closed_names! {
         OpenPullRequest = "open_pull_request",
         /// Submit an exact-head review.
         ReviewPullRequest = "review_pull_request",
+        /// Reply to an existing review thread.
+        ReplyToReviewThread = "reply_to_review_thread",
+        /// Resolve an existing review thread.
+        ResolveReviewThread = "resolve_review_thread",
         /// The `ask` effect.
         Ask = "ask",
         /// The `install_disabled_schedule` effect.
@@ -121,6 +125,8 @@ impl EffectKind {
             Self::CloseIssue => Capability::LookupCloseIssue,
             Self::OpenPullRequest => Capability::LookupOpenPullRequest,
             Self::ReviewPullRequest => Capability::LookupReviewPullRequest,
+            Self::ReplyToReviewThread => Capability::LookupReplyToReviewThread,
+            Self::ResolveReviewThread => Capability::LookupResolveReviewThread,
             Self::Ask => Capability::LookupAsk,
             Self::InstallDisabledSchedule => Capability::LookupInstallDisabledSchedule,
             Self::SetScheduleState => Capability::LookupSetScheduleState,
@@ -148,6 +154,8 @@ impl EffectKind {
             Self::CloseIssue => Capability::IdempotentCloseIssue,
             Self::OpenPullRequest => Capability::IdempotentOpenPullRequest,
             Self::ReviewPullRequest => Capability::IdempotentReviewPullRequest,
+            Self::ReplyToReviewThread => Capability::IdempotentReplyToReviewThread,
+            Self::ResolveReviewThread => Capability::IdempotentResolveReviewThread,
             Self::Ask => Capability::IdempotentAsk,
             Self::InstallDisabledSchedule => Capability::IdempotentInstallDisabledSchedule,
             Self::SetScheduleState => Capability::IdempotentSetScheduleState,
@@ -207,6 +215,8 @@ impl Effect {
                 GitHubAction::CloseIssue { .. } => EffectKind::CloseIssue,
                 GitHubAction::OpenPullRequest { .. } => EffectKind::OpenPullRequest,
                 GitHubAction::ReviewPullRequest { .. } => EffectKind::ReviewPullRequest,
+                GitHubAction::ReplyToReviewThread { .. } => EffectKind::ReplyToReviewThread,
+                GitHubAction::ResolveReviewThread { .. } => EffectKind::ResolveReviewThread,
             },
             Self::Roger(_) => EffectKind::Ask,
             Self::Schedule(effect) => match effect {

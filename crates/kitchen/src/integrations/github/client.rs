@@ -735,6 +735,90 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             Err(IntegrationError::LimitExceeded)
         })())
     }
+
+    /// Read complete review-thread text and locations for a follow-up writer.
+    /// A thread with more than 100 comments is refused rather than truncated.
+    pub fn follow_up_threads(
+        &self,
+        house: &HouseId,
+        repo: &Repository,
+        number: IssueNumber,
+    ) -> Observation<Vec<FollowUpThread>> {
+        observe((|| {
+            self.scope.authorize_read(house, repo)?;
+            let started = Instant::now();
+            let mut remaining = self.limits.bytes;
+            let mut cursor: Option<String> = None;
+            let mut result = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..self.limits.pages {
+                let request = ReadRequest {
+                    access: self.read_access(repo, None),
+                    endpoint: "graphql".into(),
+                    graphql: Some(json!({
+                        "query": "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated path line originalLine comments(first:100){nodes{id body author{login}} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}",
+                        "variables": {"owner":repo.owner(),"name":repo.name(),"number":number.get(),"cursor":cursor}
+                    })),
+                };
+                let value: Value = self.fetch(&request, started, &mut remaining)?;
+                if value.get("errors").is_some() {
+                    return Err(IntegrationError::Unknown);
+                }
+                let connection = value
+                    .pointer("/data/repository/pullRequest/reviewThreads")
+                    .ok_or(IntegrationError::Unknown)?;
+                let nodes: Vec<FollowUpThread> = serde_json::from_value(
+                    connection
+                        .get("nodes")
+                        .cloned()
+                        .ok_or(IntegrationError::Unknown)?,
+                )
+                .map_err(|_| IntegrationError::Unknown)?;
+                if nodes.len() > 100
+                    || nodes.iter().any(|thread| {
+                        thread.comments.nodes.len() > 100 || thread.comments.page_info.has_next_page
+                    })
+                {
+                    return Err(IntegrationError::LimitExceeded);
+                }
+                if nodes.iter().any(|thread| {
+                    thread.id.is_empty()
+                        || thread.path.is_empty()
+                        || thread.comments.nodes.is_empty()
+                        || thread
+                            .comments
+                            .nodes
+                            .iter()
+                            .any(|comment| comment.id.is_empty())
+                }) {
+                    return Err(IntegrationError::Unknown);
+                }
+                if nodes.iter().any(|thread| !seen.insert(thread.id.clone())) {
+                    return Err(IntegrationError::Unknown);
+                }
+                result.extend(nodes);
+                let page: ThreadPageInfo = serde_json::from_value(
+                    connection
+                        .get("pageInfo")
+                        .cloned()
+                        .ok_or(IntegrationError::Unknown)?,
+                )
+                .map_err(|_| IntegrationError::Unknown)?;
+                if !page.has_next_page {
+                    return Ok(result);
+                }
+                let next = page
+                    .end_cursor
+                    .filter(|v| !v.is_empty() && v.len() <= 1024)
+                    .ok_or(IntegrationError::Unknown)?;
+                if cursor.as_deref() == Some(next.as_str()) {
+                    return Err(IntegrationError::Unknown);
+                }
+                cursor = Some(next);
+            }
+            Err(IntegrationError::LimitExceeded)
+        })())
+    }
     fn single<R: DeserializeOwned>(
         &self,
         house: &HouseId,

@@ -58,6 +58,8 @@ closed_names! {
         OpenPullRequest = "open-pull-request",
         /// Submit a review on a pull request.
         ReviewPullRequest = "review-pull-request",
+        /// Resolve a pull-request review thread after a fixed disposition.
+        ResolveReviewThread = "resolve-review-thread",
         /// Request a review from a reviewer.
         RequestReview = "request-review",
         /// Merge a pull request.
@@ -99,6 +101,7 @@ impl Permission {
             | Self::PushBranch
             | Self::OpenPullRequest
             | Self::ReviewPullRequest
+            | Self::ResolveReviewThread
             | Self::RequestReview
             | Self::Merge
             | Self::ManageSchedule

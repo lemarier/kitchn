@@ -207,6 +207,60 @@ fn threads_follow_cursors_and_reject_partial_graphql_errors() -> Result {
     );
     Ok(())
 }
+
+#[test]
+fn follow_up_threads_preserve_bot_comments_and_refuse_truncation() -> Result {
+    // Sanitized from PR #275's reviewThreads GraphQL response. The API
+    // returns thread and comment node IDs, path, line, and author login.
+    let thread = json!({"id":"PRRT_kwDOUwEj4s6n_CJr","isResolved":false,
+        "isOutdated":false,"path":"README.md","line":183,"originalLine":183,
+        "comments":{"nodes":[{"id":"PRRC_kwDOUwEj4s73vynI",
+            "body":"Document the readiness exception.",
+            "author":{"login":"coderabbitai"}}],
+            "pageInfo":{"hasNextPage":false,"endCursor":"comment-cursor"}}});
+    let page = |node: Value| {
+        json!({"data":{"repository":{"pullRequest":{
+        "reviewThreads":{"nodes":[node],
+            "pageInfo":{"hasNextPage":false,"endCursor":"thread-cursor"}}}}}})
+    };
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![Ok(page(thread.clone()))])?,
+        ReadLimits::default(),
+    );
+    let Observation::Known(threads) = client.follow_up_threads(
+        &HouseId::new("sample")?,
+        &Repository::new("sample/project")?,
+        IssueNumber::new(275)?,
+    ) else {
+        return Err("expected complete follow-up threads".into());
+    };
+    assert_eq!(threads[0].path, "README.md");
+    assert_eq!(threads[0].line, Some(183));
+    assert_eq!(
+        threads[0].comments.nodes[0]
+            .author
+            .as_ref()
+            .map(|v| v.login.as_str()),
+        Some("coderabbitai")
+    );
+    let mut truncated = thread;
+    truncated["comments"]["pageInfo"]["hasNextPage"] = json!(true);
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![Ok(page(truncated))])?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        client.follow_up_threads(
+            &HouseId::new("sample")?,
+            &Repository::new("sample/project")?,
+            IssueNumber::new(275)?,
+        ),
+        Observation::Unavailable(IntegrationError::LimitExceeded)
+    );
+    Ok(())
+}
 #[test]
 fn unknown_permission_and_identity_mismatch_cannot_approve() -> Result {
     let house = HouseId::new("sample")?;

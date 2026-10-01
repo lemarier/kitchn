@@ -113,6 +113,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #242 workflow precheck failure causes | `WorkflowError::PrecheckFailed` and `known` in `workflows/mod.rs`; marker read mapping in `workflows/triage.rs` and `workflows/gardener.rs` | Gardener precheck CLI error in `crates/kitchen-cli/src/commands/gardener.rs`; cause tests in `crates/kitchen/tests/workflows_triage_gardener.rs` and `crates/kitchen-cli/tests/gardener.rs` |
 | #240 checkout scope defaults | — | Shared CLI argument resolution in `crates/kitchen-cli/src/commands/defaults.rs`, command help, and `crates/kitchen-cli/tests/defaults.rs`; the typed missing-flag error in `house/error.rs` |
 | #256 gate checkout inference | `adoption/remote.rs` clean checkout head and `integrations/github/client.rs` open PR read | Shared gate identifier resolution in `crates/kitchen-cli/src/commands/defaults.rs`, `gate review` and `gate attest` in `commands/gate.rs`, and gate CLI tests in `crates/kitchen-cli/tests/run.rs` |
+| #271 coordinator recovery and merged delivery | `adapters/orca/inspect.rs` stale terminal diagnosis; merged PR settlement in `workflows/run/coordinate.rs` | Read-only doctor probe in `crates/kitchen-cli/src/commands/house.rs`; merge evidence in `contracts/evidence.rs`; focused run and CLI tests |
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.

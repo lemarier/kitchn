@@ -172,6 +172,12 @@ the check. Later commits use the same command and task branch.
 
 ## 4. Scheduling
 
+If `kitchn house doctor` names a stale Orca coordinator handle, create a new
+terminal, bind it to the Run with `orca orchestration run-use`, then run
+`kitchn tick configure` with the new coordinator handle. Coordination can
+settle a lost worker report after the linked PR merges only when the PR head
+matches the task's checked push and Orca confirms successful worker settlement.
+
 A request such as "schedule pickup every 15 minutes" needs a preview
 (repository, interval, agent), the person's approval, and `kitchn house
 doctor` reporting every capability scheduled pickup needs as observed. This

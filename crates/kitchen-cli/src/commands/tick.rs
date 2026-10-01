@@ -212,6 +212,9 @@ impl DuePasses<'_> {
             ),
             Pass::Gate => None,
         };
+        if pass == Pass::Gate {
+            opened.probe_stored_coordinator()?;
+        }
         let forge = opened.forge()?;
         let binding = forge_binding(&opened.registry, &opened.config.house)?;
         let authors = [binding.requester.to_string()];

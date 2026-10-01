@@ -411,7 +411,9 @@ fn route(call: &Recorded, backend: &FakeBackend, state: &Mutex<State>) -> (u16, 
                 })),
                 Ok(None) => ok(json!({ "status": "empty" })),
                 Err(MailboxError::Fenced) => ok(json!({ "status": "fenced" })),
-                Err(MailboxError::Unavailable(_)) => (503, String::new()),
+                Err(MailboxError::Unavailable(_) | MailboxError::CoordinatorStale) => {
+                    (503, String::new())
+                }
             }
         }
         _ => (404, String::new()),

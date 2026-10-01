@@ -16,12 +16,15 @@ use super::{
 use crate::{
     ConsumerId, TaskId, WorkflowId,
     contracts::{
-        AttemptNumber, Capability, CheckoutReport, Clock, CoordinatorMailbox, Delivery, Effect,
-        Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef, Fence, LeaseTtl,
-        MailMessage, MessageKind, Operation, ResourceRef, Text, Timestamp, WorkerOutcome,
+        AttemptNumber, AttemptOutcome, Capability, CheckoutReport, Clock, CoordinatorMailbox,
+        Delivery, Effect, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef,
+        Fence, LeaseTtl, MailMessage, MessageKind, Operation, ResourceRef, Text, Timestamp,
+        WorkerOutcome, WorkerState,
     },
     house::HouseConfig,
-    integrations::github::{GitHubClient, GitHubReadTransport, IntegrationError, Observation},
+    integrations::github::{
+        GitHubClient, GitHubReadTransport, HeadLocation, IntegrationError, IssueState, Observation,
+    },
     state::{
         HouseMailbox, HouseStore, MailSender, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject,
         OwnershipEvent, PostKind, StateError, TaskRecord, TaskState, WorkItem, WorkerPost,
@@ -34,6 +37,7 @@ use crate::{
             start_coordinator_recording, supervise, task_branch,
         },
         known,
+        push::last_pushed_head,
         tick::PassRun,
     },
 };
@@ -403,6 +407,11 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             claim_ttl: LeaseTtl::new(TASK_LEASE)?,
         };
         let mut supervised: BTreeMap<TaskId, Supervision> = BTreeMap::new();
+        for task in &owned {
+            if let Some(outcome) = self.settle_merged(task)? {
+                supervised.insert(task.task.clone(), outcome);
+            }
+        }
         let mut delivery = mailbox.next_delivery().map_err(RunError::Mailbox)?;
         for _ in 0..MAX_BATCHES {
             let Some(batch) = delivery else { break };
@@ -445,6 +454,87 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                 .map(|(task, outcome)| CoordinateAction::Supervised { task, outcome }),
         );
         Ok(actions)
+    }
+
+    /// A merged linked PR can prove delivery even when the worker's mailbox
+    /// report was lost. Require the last checked push of this task, the exact
+    /// PR head, a merge commit, and the worker's successful settlement.
+    fn settle_merged(&self, owned: &Owned) -> Result<Option<Supervision>> {
+        let record = self.store.task(&owned.task)?;
+        let (Some(number), Some(branch), Some(repository), Some(worker)) = (
+            record.pull_request(),
+            task_branch(&record),
+            record.spec().repository.as_ref(),
+            current_worker(&record),
+        ) else {
+            return Ok(None);
+        };
+        let Some(pushed) = last_pushed_head(self.store, &owned.task, &branch)? else {
+            return Ok(None);
+        };
+        let Observation::Known(pr) =
+            self.forge
+                .pull_request(self.store.house(), repository, number)
+        else {
+            return Ok(None);
+        };
+        if pr.state != IssueState::Closed
+            || !pr.merged
+            || pr.head_location(repository) != HeadLocation::SameRepository
+            || pr.head.name != branch.as_str()
+            || pr.head.sha != pushed
+        {
+            return Ok(None);
+        }
+        let Some(merge_commit) = pr.merge_commit_sha else {
+            return Ok(None);
+        };
+        if self.backend.observe_worker(&worker.worker)
+            != Ok(WorkerState::Settled(WorkerOutcome::Succeeded))
+        {
+            return Ok(None);
+        }
+        let Some(attempt) =
+            self.store
+                .continue_attempt(&owned.task, owned.fence, self.clock.now())?
+        else {
+            return Ok(None);
+        };
+        let evidence = Evidence {
+            kind: EvidenceKind::ForgeMerge(merge_commit),
+            verdict: EvidenceVerdict::Pass,
+            subject: EvidenceSubject {
+                head: pushed,
+                base: None,
+            },
+            source: ExternalRef::new(&format!(
+                "https://github.com/{repository}/pull/{}",
+                number.get()
+            ))?,
+            observed_at: self.clock.now(),
+        };
+        if !record.evidence().items().iter().any(|prior| {
+            prior.kind == evidence.kind
+                && prior.subject == evidence.subject
+                && prior.source == evidence.source
+                && prior.verdict == evidence.verdict
+        }) {
+            self.store
+                .record_evidence(&owned.task, owned.fence, evidence, self.clock.now())?;
+        }
+        let outcome = self.store.finish_attempt(
+            &owned.task,
+            owned.fence,
+            attempt,
+            AttemptOutcome::Succeeded,
+            self.clock.now(),
+        )?;
+        Ok(Some(match outcome {
+            crate::contracts::Disposition::Settled(settlement) => Supervision::Settled(settlement),
+            crate::contracts::Disposition::RetryAvailable { remaining } => {
+                Supervision::Retry { remaining }
+            }
+        }))
     }
 
     /// Continue every scheduled pickup task: the runner's live claims,
@@ -808,7 +898,13 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         for owned in owned {
             let record = self.store.task(&owned.task)?;
             if current_worker(&record).is_some_and(|view| &view.worker == worker) {
-                return Ok(Some(Route::Owned(owned, Box::new(record))));
+                return Ok(Some(
+                    if matches!(record.state(), TaskState::Settled { .. }) {
+                        Route::Stale(owned.task.clone())
+                    } else {
+                        Route::Owned(owned, Box::new(record))
+                    },
+                ));
             }
         }
         for record in self.store.tasks()? {

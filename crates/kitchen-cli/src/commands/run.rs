@@ -23,13 +23,15 @@ use kitchen::{
     adapters::{
         HttpSession, OrcaSession, backend_binding,
         orca::{
-            DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, SystemRunner,
+            DEFAULT_CALL_TIMEOUT, DEFAULT_LAUNCH_TIMEOUT, DEFAULT_RESERVATION_TIMEOUT, OrcaError,
+            SystemRunner, probe_coordinator,
         },
         resolve_backend, resolve_http_backend,
     },
     adoption::{HouseRegistry, resolve_instructions},
     contracts::{
-        BranchName, Capability, CoordinatorMailbox, ExternalRef, Repository, SystemClock, Text,
+        BranchName, Capability, CoordinatorMailbox, ExternalRef, MailboxError, Repository,
+        SystemClock, Text,
     },
     house::{
         BackendKind, CredentialKind, ForgeCredential, HouseConfig, PickupConfig, credential_path,
@@ -335,6 +337,18 @@ impl Opened {
             .with_read_access(TokenScope::for_reads(self.repository.clone()))?)
     }
 
+    /// A gate has no worker backend to construct, but must still refuse a
+    /// stale stored Orca coordinator before acting on this house's PRs.
+    pub(super) fn probe_stored_coordinator(&self) -> Result<(), kitchen::Error> {
+        if matches!(backend_binding(&self.config), Ok((_, BackendKind::Orca)))
+            && let Some(orca) =
+                runtime_config(&self.registry, &self.config.house)?.and_then(|runtime| runtime.orca)
+        {
+            probe_orca_coordinator(&orca.executable, &orca.run, &orca.coordinator)?;
+        }
+        Ok(())
+    }
+
     /// The house's bound worker backend for `caller` (a pass name, or the
     /// tick), which must support `required`. Orca names each worker's
     /// workspace after its branch without `branch_prefix`.
@@ -386,6 +400,7 @@ impl Opened {
                 if !orca.is_absolute() || !runtime_dir.is_absolute() {
                     return Err(missing("absolute --orca and --runtime-dir paths"));
                 }
+                probe_orca_coordinator(orca, run, coordinator)?;
                 Ok(Box::new(resolve_backend(
                     &self.config,
                     OrcaSession {
@@ -427,6 +442,25 @@ impl Opened {
             }
             _ => Err(missing("a backend this command knows")),
         }
+    }
+}
+
+fn probe_orca_coordinator(
+    executable: &std::path::Path,
+    run: &ExternalRef,
+    coordinator: &ExternalRef,
+) -> Result<(), kitchen::Error> {
+    match probe_coordinator(
+        &SystemRunner::new(executable),
+        run,
+        coordinator,
+        DEFAULT_CALL_TIMEOUT,
+    ) {
+        Err(OrcaError::Refused { code, .. }) if code == "terminal_handle_stale" => {
+            Err(RunError::Mailbox(MailboxError::CoordinatorStale).into())
+        }
+        Err(error) => Err(error.into()),
+        Ok(()) => Ok(()),
     }
 }
 
@@ -539,6 +573,7 @@ pub fn run(args: RunArgs) -> ExitCode {
             let binding = forge_binding(&opened.registry, &opened.config.house)?;
             let authors = [binding.requester.to_string()];
             let provenance = instructions(&opened)?.provenance;
+            opened.probe_stored_coordinator()?;
             render(
                 GatePass {
                     store: &opened.store,

@@ -44,6 +44,24 @@ against another process running as the same user.
 Nothing is cleaned up automatically. A damaged house configuration is reported
 on its own and doesn't stop other houses from resolving.
 
+## Orca coordinator restart
+
+An Orca restart can invalidate the coordinator terminal saved by `kitchn tick
+configure`. Run `kitchn house doctor` from the bound repository. Its coordinator
+finding names a stale handle and the recovery: create a live terminal with
+`orca terminal create --focus`, bind it to the existing Run with `orca
+orchestration run-use --id <run> --from <new-terminal>`, then store that
+terminal with `kitchn tick configure --registry <registry> --house <house>
+--orca-coordinator <new-terminal>`.
+Check the Run and its pending deliveries before resuming scheduled passes.
+The doctor probe only reads the mailbox; it does not acknowledge messages or
+change the Run binding.
+
+If the worker's report was lost during the restart, coordination can settle
+the task after its linked PR merges. It requires the PR's exact head to match
+the task's last checked push, a forge merge commit, and a successfully settled
+worker. An open PR or a different head still needs the report or a person.
+
 ## File safety
 
 The installer refuses redirected roots, parents and target paths, and never

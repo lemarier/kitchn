@@ -7,6 +7,8 @@ mod common;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
+    fmt::Write as _,
+    num::NonZeroU32,
     rc::Rc,
     time::Duration,
 };
@@ -27,8 +29,9 @@ use kitchen::{
     },
     scheduling::IntervalMinutes,
     state::{
-        ConsumerState, EffectOutcome, EffectState, HouseStore, MailSender, PostKind,
-        ReportedOutcome, RiskAction, RiskDecision, RunState, StateError, TaskState, WorkerPost,
+        ConsumerState, EffectOutcome, EffectState, HouseStore, MailSender, MarkerFact, MarkerKey,
+        MarkerSchema, MarkerSubject, PostKind, ReportedOutcome, RiskAction, RiskDecision, RunState,
+        StateError, TaskState, WorkItem, WorkerPost,
     },
     workflows::{
         coordination::{Supervision, current_worker},
@@ -49,6 +52,7 @@ use kitchen::{
     },
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const REPO: &str = "origin89hq/firmware";
 
@@ -1054,6 +1058,131 @@ fn coordinate_is_idle_without_scheduled_tasks() -> TestResult {
     assert!(matches!(kitchen.coordinate()?, Outcome::Idle));
     assert_eq!(kitchen.forge().reads(), 0);
     assert_eq!(kitchen.backend.execute_calls(), 0);
+    Ok(())
+}
+
+/// A checked push marker has the same durable shape the push boundary writes.
+fn checked_push_marker(kitchen: &Kitchen, head: &kitchen::contracts::CommitId) -> TestResult {
+    let task = kitchen.task(7)?;
+    let mut name = String::from("branch-");
+    for byte in Sha256::digest(b"kitchen/issue-7").iter().take(16) {
+        write!(name, "{byte:02x}")?;
+    }
+    kitchen.store().record_marker_unless(
+        MarkerKey {
+            workflow: WorkflowId::new("worker-push")?,
+            item: WorkItem::Task { task: task.clone() },
+            subject: MarkerSubject::Observation(ExternalRef::new(&name)?),
+        },
+        MarkerFact::workflow(
+            MarkerSchema::new("worker-push-head", NonZeroU32::MIN)?,
+            head,
+        )?,
+        &person_session()?,
+        kitchen.clock.now(),
+        |_| Ok(None::<()>),
+    )?;
+    Ok(())
+}
+
+fn lost_report_with_pull_request(kitchen: &Kitchen) -> TestResult {
+    kitchen.ready_seven();
+    acted(kitchen.pickup(false)?)?;
+    let worker = kitchen.worker(7)?;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen
+        .store()
+        .link_pull_request(&kitchen.task(7)?, kitchen.claim_fence(7)?, pr(12)?)?;
+    checked_push_marker(kitchen, &commit('d')?)?;
+    pull_request(kitchen.forge(), 7, 12, true)?;
+    Ok(())
+}
+
+#[test]
+fn coordinate_settles_a_checked_merged_pr_without_a_worker_report() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    lost_report_with_pull_request(&kitchen)?;
+    let merge = commit('f')?;
+    let endpoint = format!("repos/{REPO}/pulls/12");
+    let mut response = kitchen
+        .forge()
+        .responses
+        .borrow()
+        .get(&endpoint)
+        .cloned()
+        .ok_or("missing PR fixture")?;
+    response["state"] = json!("closed");
+    response["merged"] = json!(true);
+    response["merge_commit_sha"] = json!(merge.as_str());
+    kitchen.forge().set(&endpoint, response);
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.contains(&CoordinateAction::Supervised {
+        task: kitchen.task(7)?,
+        outcome: Supervision::Settled(Settlement::Succeeded),
+    }));
+    let record = kitchen.store().task(&kitchen.task(7)?)?;
+    assert!(matches!(
+        record.state(),
+        TaskState::Settled {
+            settlement: Settlement::Succeeded,
+            ..
+        }
+    ));
+    let pushed = commit('d')?;
+    assert!(record.evidence().items().iter().any(|evidence| {
+        evidence.kind == EvidenceKind::ForgeMerge(merge.clone()) && evidence.subject.head == pushed
+    }));
+    Ok(())
+}
+
+#[test]
+fn coordinate_refuses_a_merged_pr_at_another_head() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    lost_report_with_pull_request(&kitchen)?;
+    let endpoint = format!("repos/{REPO}/pulls/12");
+    let mut response = kitchen
+        .forge()
+        .responses
+        .borrow()
+        .get(&endpoint)
+        .cloned()
+        .ok_or("missing PR fixture")?;
+    response["state"] = json!("closed");
+    response["merged"] = json!(true);
+    response["merge_commit_sha"] = json!(commit('f')?.as_str());
+    response["head"]["sha"] = json!(commit('e')?.as_str());
+    kitchen.forge().set(&endpoint, response);
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.contains(&CoordinateAction::Supervised {
+        task: kitchen.task(7)?,
+        outcome: Supervision::Escalate(
+            kitchen::workflows::coordination::Escalation::MissingEvidence
+        )
+    }));
+    assert!(!matches!(
+        kitchen.store().task(&kitchen.task(7)?)?.state(),
+        TaskState::Settled { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn coordinate_keeps_an_open_pr_with_a_lost_report() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    lost_report_with_pull_request(&kitchen)?;
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(actions.contains(&CoordinateAction::Supervised {
+        task: kitchen.task(7)?,
+        outcome: Supervision::Escalate(
+            kitchen::workflows::coordination::Escalation::MissingEvidence
+        )
+    }));
+    assert!(!matches!(
+        kitchen.store().task(&kitchen.task(7)?)?.state(),
+        TaskState::Settled { .. }
+    ));
     Ok(())
 }
 

@@ -118,6 +118,11 @@ pub enum MailboxError {
     /// mailbox and must stop consuming.
     #[error("another coordinator adopted the run")]
     Fenced,
+    /// The stored coordinator terminal disappeared after an Orca restart.
+    #[error(
+        "Orca coordinator terminal is stale; create a live terminal with `orca terminal create --focus`, bind it with `orca orchestration run-use --id <run> --from <new-terminal>`, then run `kitchn tick configure --registry <registry> --house <house> --orca-coordinator <new-terminal>`"
+    )]
+    CoordinatorStale,
     /// The mailbox could not be read; nothing may be inferred from it,
     /// including that no message is waiting.
     #[error(transparent)]
@@ -159,6 +164,7 @@ pub trait CoordinatorMailbox: WorkerBackend {
     ///
     /// # Errors
     /// [`MailboxError::Fenced`] after another coordinator adopted the run,
+    /// [`MailboxError::CoordinatorStale`] when its stored terminal disappeared,
     /// and [`MailboxError::Unavailable`].
     fn next_delivery(&self) -> Result<Option<Delivery>, MailboxError>;
 

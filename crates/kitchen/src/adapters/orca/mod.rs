@@ -139,7 +139,9 @@ pub use backend::{
     WORKER_SELECTION, launch_marker, verify_branch,
 };
 pub use error::OrcaError;
-pub use inspect::{MAX_INVENTORY_PAGES, RetainedReason, TerminalAccounting, WorkerRecord};
+pub use inspect::{
+    MAX_INVENTORY_PAGES, RetainedReason, TerminalAccounting, WorkerRecord, probe_coordinator,
+};
 pub use process::{
     DEFAULT_MAX_STDOUT, ENV_ALLOWLIST, Invocation, OrcaRunner, RawOutput, SystemRunner,
 };

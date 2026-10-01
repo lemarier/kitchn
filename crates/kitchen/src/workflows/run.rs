@@ -263,7 +263,9 @@ impl RunError {
             | Self::RuntimeMismatch(_) => ErrorClass::InvalidInput,
             Self::ReviewClaimsWithoutApproval | Self::ReviewBodyInvalid => ErrorClass::InvalidInput,
             Self::NoBackend | Self::NoPickupSettings | Self::NoPassSettings => ErrorClass::Refused,
-            Self::Mailbox(MailboxError::Fenced) => ErrorClass::Conflict,
+            Self::Mailbox(MailboxError::Fenced | MailboxError::CoordinatorStale) => {
+                ErrorClass::Conflict
+            }
             Self::Mailbox(MailboxError::Unavailable(_)) | Self::GateRecords => {
                 ErrorClass::Execution
             }

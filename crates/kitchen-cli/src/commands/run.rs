@@ -459,6 +459,9 @@ fn probe_orca_coordinator(
         Err(OrcaError::Refused { code, .. }) if code == "terminal_handle_stale" => {
             Err(RunError::Mailbox(MailboxError::CoordinatorStale).into())
         }
+        // The terminal is live, but another consumer holds the Run. Once
+        // Kitchen owns the pass, coordination binds this terminal with run-use.
+        Err(OrcaError::Refused { code, .. }) if code == "consumer_fenced" => Ok(()),
         Err(error) => Err(error.into()),
         Ok(()) => Ok(()),
     }

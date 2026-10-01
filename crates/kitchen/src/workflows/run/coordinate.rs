@@ -147,6 +147,14 @@ pub enum CoordinateAction {
         /// Its result.
         outcome: Supervision,
     },
+    /// Optional merged-delivery recovery failed for this task. Mailbox
+    /// processing and other tasks continue; the next pass may retry it.
+    RecoveryFailed {
+        /// The task.
+        task: TaskId,
+        /// The structured error rendered for the operator.
+        reason: String,
+    },
     /// The worker finished its work but has not delivered a pull request.
     AwaitingDelivery {
         /// The task awaiting a pull request.
@@ -247,6 +255,12 @@ impl fmt::Display for CoordinateAction {
             ),
             Self::Supervised { task, outcome } => {
                 write!(formatter, "supervised task {task}: {outcome:?}")
+            }
+            Self::RecoveryFailed { task, reason } => {
+                write!(
+                    formatter,
+                    "merged delivery recovery failed for task {task}: {reason}"
+                )
             }
             Self::AwaitingDelivery { task, message } => {
                 write!(
@@ -385,10 +399,14 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                 &house_mailbox
             }
         };
-        // This process is a new coordinator instance: it fences the previous
-        // reader before reading. A backend without run transfer has no other
-        // reader to fence.
-        if route == MailboxRoute::House || descriptor.capabilities.supports(Capability::RunTransfer)
+        // Kitchen recorded ownership before this binding. Orca declares
+        // RunTransfer partial because run-use records no relinquish itself,
+        // but it must still bind this terminal before any mailbox read.
+        if route == MailboxRoute::House
+            || descriptor
+                .capabilities
+                .support(Capability::RunTransfer)
+                .is_some()
         {
             mailbox.adopt_run().map_err(RunError::Mailbox)?;
         }
@@ -408,8 +426,18 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
         };
         let mut supervised: BTreeMap<TaskId, Supervision> = BTreeMap::new();
         for task in &owned {
-            if let Some(outcome) = self.settle_merged(task)? {
-                supervised.insert(task.task.clone(), outcome);
+            match still_owned(self.settle_merged(task)) {
+                Ok(Some(Some(outcome))) => {
+                    supervised.insert(task.task.clone(), outcome);
+                }
+                Ok(Some(None)) => {}
+                Ok(None) => actions.push(CoordinateAction::Lost {
+                    task: task.task.clone(),
+                }),
+                Err(error) => actions.push(CoordinateAction::RecoveryFailed {
+                    task: task.task.clone(),
+                    reason: error.to_string(),
+                }),
             }
         }
         let mut delivery = mailbox.next_delivery().map_err(RunError::Mailbox)?;

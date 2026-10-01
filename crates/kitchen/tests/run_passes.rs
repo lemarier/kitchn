@@ -1063,6 +1063,16 @@ fn coordinate_is_idle_without_scheduled_tasks() -> TestResult {
 
 /// A checked push marker has the same durable shape the push boundary writes.
 fn checked_push_marker(kitchen: &Kitchen, head: &kitchen::contracts::CommitId) -> TestResult {
+    push_marker(
+        kitchen,
+        MarkerFact::workflow(
+            MarkerSchema::new("worker-push-head", NonZeroU32::MIN)?,
+            head,
+        )?,
+    )
+}
+
+fn push_marker(kitchen: &Kitchen, fact: MarkerFact) -> TestResult {
     let task = kitchen.task(7)?;
     let mut name = String::from("branch-");
     for byte in Sha256::digest(b"kitchen/issue-7").iter().take(16) {
@@ -1074,14 +1084,111 @@ fn checked_push_marker(kitchen: &Kitchen, head: &kitchen::contracts::CommitId) -
             item: WorkItem::Task { task: task.clone() },
             subject: MarkerSubject::Observation(ExternalRef::new(&name)?),
         },
-        MarkerFact::workflow(
-            MarkerSchema::new("worker-push-head", NonZeroU32::MIN)?,
-            head,
-        )?,
+        fact,
         &person_session()?,
         kitchen.clock.now(),
         |_| Ok(None::<()>),
     )?;
+    Ok(())
+}
+
+#[test]
+fn bad_merged_recovery_marker_does_not_block_mailbox_or_other_task() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    acted(kitchen.pickup(false)?)?;
+    let worker = kitchen.worker(7)?;
+    kitchen
+        .store()
+        .link_pull_request(&kitchen.task(7)?, kitchen.claim_fence(7)?, pr(12)?)?;
+    push_marker(
+        &kitchen,
+        MarkerFact::workflow(
+            MarkerSchema::new("wrong-push-head", NonZeroU32::MIN)?,
+            &commit('d')?,
+        )?,
+    )?;
+    let template = kitchen::workflows::run::task_template(
+        &kitchen.config,
+        kitchen::workflows::coordination::MailboxRoute::Backend,
+        kitchen.settings.instructions.provenance.clone(),
+    )?;
+    kitchen::workflows::pickup::claim_issue(
+        kitchen.store(),
+        &template,
+        &IssueRef {
+            repository: repo()?,
+            number: kitchen::contracts::IssueNumber::new(8)?,
+        },
+        &run_claimant()?,
+        LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    let stranger = stray(&worker, "stray-after-bad-marker")?;
+    kitchen.backend.post(vec![stranger])?;
+    let actions = acted(kitchen.coordinate()?)?;
+    let task = kitchen.task(7)?;
+    assert!(actions.iter().any(|action| matches!(action,
+        CoordinateAction::RecoveryFailed { task: failed, reason }
+            if failed == &task && reason.contains("marker"))));
+    assert!(actions.iter().any(|action| matches!(action,
+        CoordinateAction::Unroutable { message, .. }
+            if message.as_str() == "stray-after-bad-marker")));
+    assert!(actions.contains(&CoordinateAction::Supervised {
+        task: kitchen.task(8)?,
+        outcome: Supervision::AwaitingLaunch,
+    }));
+    use kitchen::contracts::CoordinatorMailbox;
+    assert_eq!(kitchen.backend.next_delivery(), Ok(None));
+    Ok(())
+}
+
+#[test]
+fn full_evidence_log_does_not_abort_merged_recovery() -> TestResult {
+    let kitchen = Kitchen::new()?;
+    lost_report_with_pull_request(&kitchen)?;
+    let endpoint = format!("repos/{REPO}/pulls/12");
+    let mut response = kitchen
+        .forge()
+        .responses
+        .borrow()
+        .get(&endpoint)
+        .cloned()
+        .ok_or("missing PR fixture")?;
+    response["state"] = json!("closed");
+    response["merged"] = json!(true);
+    response["merge_commit_sha"] = json!(commit('f')?.as_str());
+    kitchen.forge().set(&endpoint, response);
+    let task = kitchen.task(7)?;
+    let fence = kitchen.claim_fence(7)?;
+    for index in 0..kitchen::state::MAX_EVIDENCE_PER_REVISION {
+        kitchen.store().record_evidence(
+            &task,
+            fence,
+            Evidence {
+                kind: EvidenceKind::WorkerReport(CLEAN_AND_PUSHED),
+                verdict: EvidenceVerdict::Pass,
+                subject: EvidenceSubject {
+                    head: commit('d')?,
+                    base: None,
+                },
+                source: ExternalRef::new(&format!("prior-{index}"))?,
+                observed_at: kitchen.clock.now(),
+            },
+            kitchen.clock.now(),
+        )?;
+    }
+    let actions = acted(kitchen.coordinate()?)?;
+    assert!(
+        actions.iter().any(|action| matches!(action,
+        CoordinateAction::RecoveryFailed { task: failed, reason }
+            if failed == &task && reason.contains("evidence items per revision"))),
+        "{actions:?}"
+    );
+    assert!(!matches!(
+        kitchen.store().task(&task)?.state(),
+        TaskState::Settled { .. }
+    ));
     Ok(())
 }
 

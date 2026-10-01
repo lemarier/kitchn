@@ -1221,34 +1221,42 @@ impl<T: GitHubReadTransport> RepairPass<'_, T> {
         {
             return Ok(false);
         }
-        let mut held = false;
+        let mut held = None;
         for event in coordinate.history() {
             match event {
                 ConsumerEvent::Acquired {
                     holder: owner,
+                    fence: consumer_fence,
                     at: since,
-                    ..
                 }
                 | ConsumerEvent::Adopted {
                     holder: owner,
+                    fence: consumer_fence,
                     at: since,
                     ..
                 }
                 | ConsumerEvent::TakenOver {
                     holder: owner,
+                    fence: consumer_fence,
                     at: since,
                     ..
-                } if *since <= *at => held = owner == holder,
-                ConsumerEvent::Relinquished { at: until, .. }
-                | ConsumerEvent::Released { at: until, .. }
-                    if *until < *at =>
-                {
-                    held = false
+                } if *since <= *at => {
+                    held = (owner == holder && *consumer_fence < *fence).then_some(*consumer_fence);
+                }
+                ConsumerEvent::Relinquished {
+                    fence: consumer_fence,
+                    at: until,
+                }
+                | ConsumerEvent::Released {
+                    fence: consumer_fence,
+                    at: until,
+                } if *until < *at && held == Some(*consumer_fence) => {
+                    held = None;
                 }
                 _ => {}
             }
         }
-        Ok(held)
+        Ok(held.is_some())
     }
 
     /// The change requests on the pull request's current head, quoted in

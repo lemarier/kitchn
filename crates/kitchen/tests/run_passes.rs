@@ -2377,17 +2377,24 @@ fn legacy_coordinate_takeover(kitchen: &Kitchen, task: &kitchen::TaskId) -> Test
         LeaseTtl::new(PASS_LEASE)?,
         kitchen.clock.now(),
     )?;
+    let acquired_at = kitchen.clock.now();
+    kitchen.clock.advance(1);
     let lease = kitchen.store().take_over(
         task,
         &run_claimant()?,
         LeaseTtl::new(TASK_LEASE)?,
         kitchen.clock.now(),
     )?;
+    let taken_over_at = kitchen.clock.now();
+    kitchen.clock.advance(1);
     kitchen
         .store()
         .release_consumer(&consumer, pass.fence(), kitchen.clock.now())?;
+    let released_at = kitchen.clock.now();
     let record = kitchen.store().task(task)?;
     assert!(lease.consumer().is_none());
+    assert!(pass.fence() < lease.fence());
+    assert!(acquired_at < taken_over_at && taken_over_at < released_at);
     assert!(
         matches!(record.ownership().last(), Some(kitchen::state::OwnershipEvent::TakenOver { holder, fence, .. }) if holder.as_str() == "kitchen-run" && *fence == lease.fence())
     );
@@ -3222,6 +3229,109 @@ fn repair_does_not_adopt_consumerless_takeover_without_coordinate_proof() -> Tes
         LeaseTtl::new(TASK_LEASE)?,
         kitchen.clock.now(),
     )?;
+    let actions = acted(kitchen.repair()?)?;
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [RepairAction::Waiting {
+                wait: Wait::RoundHeld,
+                ..
+            }]
+        ),
+        "{actions:?}"
+    );
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn repair_does_not_adopt_takeover_after_coordinate_release() -> TestResult {
+    let kitchen = settled_with_pull_request(false)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    kitchen
+        .backend
+        .inject(kitchen::contracts::fake::ExecuteFault::Reject);
+    acted(kitchen.repair()?)?;
+    let task = round_task(1)?;
+    kitchen.store().claim(
+        &task,
+        &run_claimant()?,
+        LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    kitchen.clock.advance(TASK_LEASE.as_secs() + 1);
+    let consumer = Pass::Coordinate.consumer(&repo()?)?;
+    let pass = kitchen.store().acquire_consumer(
+        &consumer,
+        &run_claimant()?,
+        LeaseTtl::new(PASS_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    kitchen
+        .store()
+        .release_consumer(&consumer, pass.fence(), kitchen.clock.now())?;
+    kitchen.clock.advance(1);
+    let lease = kitchen.store().take_over(
+        &task,
+        &run_claimant()?,
+        LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    assert!(pass.fence() < lease.fence());
+    let actions = acted(kitchen.repair()?)?;
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [RepairAction::Waiting {
+                wait: Wait::RoundHeld,
+                ..
+            }]
+        ),
+        "{actions:?}"
+    );
+    assert_eq!(kitchen.backend.launched_agents().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn repair_does_not_adopt_takeover_during_another_pass() -> TestResult {
+    let kitchen = settled_with_pull_request(false)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    kitchen
+        .backend
+        .inject(kitchen::contracts::fake::ExecuteFault::Reject);
+    acted(kitchen.repair()?)?;
+    let task = round_task(1)?;
+    kitchen.store().claim(
+        &task,
+        &run_claimant()?,
+        LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    kitchen.clock.advance(TASK_LEASE.as_secs() + 1);
+    let consumer = Pass::Pickup.consumer(&repo()?)?;
+    let pass = kitchen.store().acquire_consumer(
+        &consumer,
+        &run_claimant()?,
+        LeaseTtl::new(PASS_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    kitchen.clock.advance(1);
+    let lease = kitchen.store().take_over(
+        &task,
+        &run_claimant()?,
+        LeaseTtl::new(TASK_LEASE)?,
+        kitchen.clock.now(),
+    )?;
+    kitchen.clock.advance(1);
+    kitchen
+        .store()
+        .release_consumer(&consumer, pass.fence(), kitchen.clock.now())?;
+    assert!(pass.fence() < lease.fence());
     let actions = acted(kitchen.repair()?)?;
     assert!(
         matches!(

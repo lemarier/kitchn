@@ -3158,6 +3158,94 @@ fn repair_hands_over_unless_the_report_states_a_clean_pushed_checkout() -> TestR
 }
 
 #[test]
+fn checked_push_survives_orcas_empty_completion_and_allows_follow_up() -> TestResult {
+    let mut kitchen = Kitchen::new()?;
+    kitchen.ready_seven();
+    acted(kitchen.pickup(false)?)?;
+    let worker = kitchen.worker(7)?;
+    kitchen
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    kitchen.backend.post(vec![report_with(
+        &worker,
+        "done-7",
+        CheckoutReport::default(),
+    )?])?;
+    kitchen.forge().set(
+        &format!("repos/{REPO}/branches/kitchen/issue-7"),
+        json!({"name": "kitchen/issue-7", "commit": {"sha": commit('d')?.as_str()}}),
+    );
+    kitchen
+        .store()
+        .link_pull_request(&kitchen.task(7)?, kitchen.claim_fence(7)?, pr(12)?)?;
+    kitchen.store().record_evidence(
+        &kitchen.task(7)?,
+        kitchen.claim_fence(7)?,
+        Evidence {
+            kind: EvidenceKind::WorkerReport(CLEAN_AND_PUSHED),
+            verdict: EvidenceVerdict::Pass,
+            subject: EvidenceSubject {
+                head: commit('d')?,
+                base: None,
+            },
+            source: ExternalRef::new("checked-push-1")?,
+            observed_at: kitchen.clock.now(),
+        },
+        kitchen.clock.now(),
+    )?;
+    acted(kitchen.coordinate()?)?;
+    pull_request(kitchen.forge(), 7, 12, false)?;
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/issues/7/timeline"), json!([]));
+    kitchen
+        .forge()
+        .set(&format!("repos/{REPO}/pulls/12/reviews"), json!([]));
+    grant_follow_up(&mut kitchen)?;
+    follow_up_thread(&kitchen)?;
+    let follow_up = acted(kitchen.follow_up()?)?;
+    assert!(
+        matches!(
+            follow_up.as_slice(),
+            [kitchen::workflows::run::FollowUpAction::Launched { round: 1, .. }]
+        ),
+        "{follow_up:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn owner_preservation_is_bound_to_the_settled_pr_head() -> TestResult {
+    let kitchen = settled_stating(CheckoutReport::default())?;
+    assert!(matches!(
+        kitchen.store().record_owner_preservation(
+            &kitchen.task(7)?,
+            pr(12)?,
+            commit('e')?,
+            ExternalRef::new("owner-preserved-person")?,
+            kitchen.clock.now(),
+        ),
+        Err(kitchen::Error::State(StateError::PreservationMismatch))
+    ));
+    kitchen.store().record_owner_preservation(
+        &kitchen.task(7)?,
+        pr(12)?,
+        commit('d')?,
+        ExternalRef::new("owner-preserved-person")?,
+        kitchen.clock.now(),
+    )?;
+    let actions = acted(kitchen.repair()?)?;
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [RepairAction::Launched { round: 1, .. }]
+        ),
+        "{actions:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn reports_recorded_before_the_checkout_field_read_as_unknown() -> TestResult {
     assert_eq!(
         serde_json::from_str::<EvidenceKind>(r#""worker-report""#)?,

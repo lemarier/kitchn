@@ -197,6 +197,14 @@ and every acceptance item was checked. Otherwise the PR body says `Part of`
 the issue. If the command reports a refused or uncertain outcome, stop and
 give that result to the coordinator; do not use a direct `git push` to bypass
 the check. Later commits use the same command and task branch.
+After a successful push, read the printed clean/pushed facts and run the
+brief's absolute `kitchn mailbox report` command with those values as the
+last checkout action. Kitchen ignores only the configured report path when
+checking cleanliness. If a settled worker left no checkout statement, the
+owner can inspect its bound worktree with `kitchn preserve <task>
+--pull-request <n> --head <sha> --holder <you> --registry <dir>` and repeat
+with `--confirm-preserved` after the preview shows a clean checkout at the
+live PR head.
 
 ## 4. Scheduling
 

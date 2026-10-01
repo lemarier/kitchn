@@ -182,6 +182,9 @@ pub enum StateError {
     /// The task has not settled, so its writes cannot be acknowledged.
     #[error("task {0} has not settled")]
     TaskNotSettled(TaskId),
+    /// An owner confirmation did not name this settled task's linked PR.
+    #[error("preservation confirmation does not match the settled task and pull request")]
+    PreservationMismatch,
     /// Another holder has a live claim or lease.
     #[error("held by {holder} until {expires_at}")]
     ClaimHeld {
@@ -408,6 +411,7 @@ impl StateError {
             | Self::TaskConflict(_)
             | Self::TaskSettled { .. }
             | Self::TaskNotSettled(_)
+            | Self::PreservationMismatch
             | Self::TaskNotRetirable(_)
             | Self::ClaimHeld { .. }
             | Self::LeaseExpired { .. }

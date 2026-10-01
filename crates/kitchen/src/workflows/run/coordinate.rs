@@ -985,7 +985,11 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
             observed_branch: branch.as_str().to_owned(),
             requested: branch,
             report: Evidence {
-                kind: EvidenceKind::WorkerReport(message.checkout),
+                kind: EvidenceKind::WorkerReport(crate::workflows::push::checkout_at_head(
+                    record,
+                    &head,
+                    message.checkout,
+                )),
                 verdict: EvidenceVerdict::Pass,
                 subject: EvidenceSubject { head, base: None },
                 source: message.id.clone(),
@@ -1005,7 +1009,9 @@ impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
         message: &MailMessage,
         completion: Option<&Completion>,
     ) -> Result<()> {
-        if !message.checkout.clean_and_pushed()
+        if !completion.is_some_and(|completion| {
+            matches!(completion.report.kind, EvidenceKind::WorkerReport(checkout) if checkout.clean_and_pushed())
+        })
             || current_worker(record).is_none_or(|worker| {
                 self.backend.observe_worker(&worker.worker)
                     != Ok(WorkerState::Settled(WorkerOutcome::Succeeded))

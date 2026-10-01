@@ -368,7 +368,7 @@ fn list_ignored(path: &Path, limits: &GitLimits) -> Result<Vec<String>, GitReadE
 /// `git status` does not report edits to them. The index listing can be far
 /// larger than the output limit, so it is filtered while it streams and only
 /// the deadline bounds the scan.
-fn count_hidden_tracked(path: &Path, limits: &GitLimits) -> Result<u32, GitReadError> {
+pub(crate) fn count_hidden_tracked(path: &Path, limits: &GitLimits) -> Result<u32, GitReadError> {
     let (status, hidden) = run_with(path, ["ls-files", "-v", "-z"], limits, |stdout| {
         count_hidden(stdout)
     })?;

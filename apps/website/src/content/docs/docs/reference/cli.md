@@ -259,6 +259,33 @@ grant or forge binding before retrying. `--acceptance-done` requires the
 worker's evidence report to contain `Acceptance: done`; otherwise the pull
 request body says `Part of`
 the issue. A refused or uncertain push must be reconciled before retrying.
+After a checked push, Kitchen compares the live branch tip with the checkout's
+HEAD and records clean/pushed facts at that exact head. Only the report path
+named in the task's launch brief is excluded from Git status; any other changed
+or untracked path records `clean no`. Tracked files with skip-worktree or
+assume-unchanged flags also prevent a clean result because they can hide edits
+from Git status. The command prints both facts. The worker
+then uses the brief's absolute `kitchn mailbox report` command as its final
+checkout action, stating those facts. Orca's `worker_done` carries no checkout
+fields, so coordination retains the checked push observation at that head.
+
+## `kitchn preserve`
+
+Inspect a settled task's bound worktree and the live PR head before a person
+confirms its work is preserved. The first call previews dirty files and the
+unpushed range; repeat with `--confirm-preserved` only after reviewing it.
+
+```sh
+kitchn preserve <task> --pull-request <n> --head <sha> --holder <you> --registry <dir>
+kitchn preserve <task> --pull-request <n> --head <sha> --holder <you> --registry <dir> --confirm-preserved
+```
+
+Run the command from the original launched worktree. Kitchen matches Orca's
+current worktree ID and path to the task's launch record. The checkout must
+belong to the registry's bound house and repository, match the task's branch
+and exact live PR head, and have no changes other than the configured report path.
+A different head, dirty file, missing forge observation, or unsettled task is
+refused. The recorded decision applies only to that head.
 
 ## `kitchn work`, `kitchn pr` and `kitchn hand-back`
 
@@ -541,10 +568,10 @@ owner, such as during a coordinator handover. A repeated identical reply
 changes nothing; a different one exits 1.
 
 `report --clean` states whether the worker's checkout had no uncommitted or
-untracked changes, and `--pushed` whether its HEAD was the remote branch tip
-with nothing unpushed. A report without them records the checkout as unknown,
-and scheduled repair then hands the pull request over instead of repairing
-it from a new checkout.
+untracked changes other than the configured report path, and `--pushed`
+whether its HEAD was the remote branch tip with nothing unpushed. A report
+without them records the checkout as unknown unless the exact head has a
+checked push observation; otherwise scheduled repair hands the PR over.
 
 A successful scheduled follow-up report uses `--body` with JSON shaped as
 `{"sourceHead":"<head at launch>","dispositions":[{"thread":"<thread id>","verdict":"fixed","reply":"<reason>"}]}`.
@@ -700,8 +727,8 @@ before anything runs.
   while another branch writer of the repository may be working, scheduled or
   a person's, and at most one per pass. When the branch's last writer did not
   settle successfully with a report of the current head that states its
-  checkout clean and pushed (`kitchn mailbox report --clean yes --pushed
-  yes`), the pull request is handed over instead. A round whose writer's
+  checkout clean and pushed (including a checked `kitchn push` observation),
+  the pull request is handed over instead. A round whose writer's
   attempt ended without settling it gets its next attempt only through the
   same decision; once that writer ran, it is the branch's last writer, so the
   pull request is handed over. `--branch-prefix` and `--report-path` are

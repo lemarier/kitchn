@@ -30,7 +30,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     num::NonZeroU32,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -39,9 +39,9 @@ use std::{
 use crate::{
     BackendId, EffectName, ErrorClass, HouseId, TaskId, WorkflowId,
     contracts::{
-        BranchName, Clock, CommitId, Effect, ExternalRef, Fence, GitHubAction, GitHubMutation,
-        GrantScope, HouseGrants, IssueNumber, Operation, Permission, Repository, ResourceKind,
-        Text, WorkerBackend, WorkerState,
+        BranchName, CheckoutReport, Clock, CommitId, Effect, EvidenceKind, EvidenceVerdict,
+        ExternalRef, Fence, GitHubAction, GitHubMutation, GrantScope, HouseGrants, IssueNumber,
+        Operation, Permission, Repository, ResourceKind, Text, WorkerBackend, WorkerState,
     },
     house::StackTool,
     integrations::github::{
@@ -60,6 +60,125 @@ use crate::{
         repair::{Observed, PullRequestState, PullRequestView, observe_pull_request},
     },
 };
+
+/// Prefer an explicit worker report. Orca's `worker_done` has no checkout
+/// field, so its empty report inherits the latest checked push at this head.
+#[must_use]
+pub fn checkout_at_head(
+    record: &TaskRecord,
+    head: &CommitId,
+    reported: CheckoutReport,
+) -> CheckoutReport {
+    if reported != CheckoutReport::default() {
+        return reported;
+    }
+    record
+        .evidence()
+        .items()
+        .iter()
+        .rev()
+        .find_map(|evidence| {
+            if evidence.verdict != EvidenceVerdict::Pass
+                || &evidence.subject.head != head
+                || !evidence.source.as_str().starts_with("checked-push-")
+            {
+                return None;
+            }
+            match evidence.kind {
+                EvidenceKind::WorkerReport(checkout) => Some(checkout),
+                _ => None,
+            }
+        })
+        .unwrap_or(reported)
+}
+
+/// Observe the checkout after delivery. Only the configured report file is
+/// Kitchen-owned; every other status entry is worker work to preserve.
+pub fn checkout_clean_except_report(
+    worktree: &Path,
+    report_path: &Path,
+) -> std::result::Result<bool, crate::git::GitReadError> {
+    Ok(checkout_changes_except_report(worktree, report_path)?.is_empty())
+}
+
+/// Files still changed after excluding the house report path.
+pub fn checkout_changes_except_report(
+    worktree: &Path,
+    report_path: &Path,
+) -> std::result::Result<Vec<String>, crate::git::GitReadError> {
+    let limits = crate::git::GitLimits::default();
+    let status = crate::git::run(
+        worktree,
+        [
+            "-c",
+            "status.relativePaths=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+        &limits,
+    )?;
+    if !status.is_empty() && !status.ends_with('\0') {
+        return Err(crate::git::GitReadError::Malformed);
+    }
+    let mut changed = Vec::new();
+    let mut entries = status.split_terminator('\0');
+    while let Some(entry) = entries.next() {
+        let (Some(code), Some(path)) = (entry.get(..3), entry.get(3..)) else {
+            return Err(crate::git::GitReadError::Malformed);
+        };
+        if path.is_empty()
+            || !code.as_bytes()[0..2].iter().all(|byte| {
+                matches!(
+                    byte,
+                    b' ' | b'?' | b'A' | b'M' | b'D' | b'R' | b'C' | b'U' | b'T' | b'!'
+                )
+            })
+            || code.as_bytes()[2] != b' '
+        {
+            return Err(crate::git::GitReadError::Malformed);
+        }
+        // A rename has two paths. It is always work, even if its destination
+        // has the configured report name.
+        if code.as_bytes()[0..2].contains(&b'R') || code.as_bytes()[0..2].contains(&b'C') {
+            let from = entries.next().ok_or(crate::git::GitReadError::Malformed)?;
+            changed.push(format!("{from} -> {path}"));
+            continue;
+        }
+        if Path::new(path) != report_path {
+            changed.push(path.to_owned());
+        }
+    }
+    let hidden = crate::workflows::cleanup::count_hidden_tracked(worktree, &limits)?;
+    if hidden > 0 {
+        changed.push(format!("{hidden} tracked path(s) hidden from Git status"));
+    }
+    Ok(changed)
+}
+
+/// The attached branch and commit observed without environment redirects.
+pub fn observed_branch_head(
+    worktree: &Path,
+) -> std::result::Result<(BranchName, CommitId), crate::git::GitReadError> {
+    let limits = crate::git::GitLimits::default();
+    let branch = crate::git::run(worktree, ["symbolic-ref", "--quiet", "HEAD"], &limits)?;
+    let branch = BranchName::new(
+        branch
+            .trim()
+            .strip_prefix("refs/heads/")
+            .ok_or(crate::git::GitReadError::Malformed)?,
+    )
+    .map_err(|_| crate::git::GitReadError::Malformed)?;
+    let head = crate::git::run(
+        worktree,
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        &limits,
+    )?;
+    let head = CommitId::new(head.trim()).map_err(|_| crate::git::GitReadError::Malformed)?;
+    Ok((branch, head))
+}
 
 /// A branch cannot be delivered unless every new commit has the bound house
 /// writer as both author and committer.

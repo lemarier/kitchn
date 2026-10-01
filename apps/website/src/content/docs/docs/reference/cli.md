@@ -278,7 +278,6 @@ kitchn hand-back <task> --holder <you>
 | `--revision <sha>` | The commit whose repository instructions are pinned, such as `git rev-parse HEAD`. |
 | `--orca-status <file>`, `--orca-worktree <file>` | Captured `orca status --json` and `orca worktree current --json`. Without them the session works as a single agent. |
 | `--repository-path <dir>` | A path inside the checkout (default: the current directory). |
-
 | `--lease-minutes <n>` | Claim lease (default: 120). |
 | `--take-over` | Take a claim whose lease expired without a hand-back. |
 | `--as <intent>` | `pr` only. Routed from the facts when omitted. |

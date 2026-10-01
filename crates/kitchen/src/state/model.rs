@@ -3052,6 +3052,19 @@ impl StoreState {
         self.mailbox.post(task, sender, post, now)
     }
 
+    pub(crate) fn post_mail_unique(
+        &mut self,
+        sender: &MailSender,
+        post: WorkerPost,
+        now: Timestamp,
+    ) -> Result<ExternalRef> {
+        let task = self
+            .tasks
+            .get(&sender.task)
+            .ok_or_else(|| Error::State(StateError::TaskNotFound(sender.task.clone())))?;
+        self.mailbox.post_unique(task, sender, post, now)
+    }
+
     pub(crate) fn mail_answer(
         &self,
         sender: &MailSender,

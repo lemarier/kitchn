@@ -10,25 +10,27 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    Outcome, RunError, TASK_LEASE, held_by_run, pass_current, run_claimant, scheduled_writer,
-    transfer,
+    Outcome, RunError, TASK_LEASE,
+    follow_up::{FollowUpVerdict, record_report, snapshot, target},
+    held_by_run, pass_current, run_claimant, scheduled_writer, transfer,
 };
 use crate::{
-    ConsumerId, TaskId, WorkflowId,
+    ConsumerId, EffectName, TaskId, WorkflowId,
     contracts::{
         AttemptNumber, AttemptOutcome, Capability, CheckoutReport, Clock, CoordinatorMailbox,
         Delivery, Effect, Evidence, EvidenceKind, EvidenceSubject, EvidenceVerdict, ExternalRef,
-        Fence, LeaseTtl, MailMessage, MessageKind, Operation, ResourceRef, Text, Timestamp,
-        WorkerOutcome, WorkerState,
+        Fence, GitHubAction, GitHubMutation, LeaseTtl, MailMessage, MessageKind, Operation,
+        ResourceRef, Text, Timestamp, WorkerOutcome, WorkerState,
     },
     house::HouseConfig,
     integrations::github::{
-        GitHubClient, GitHubReadTransport, HeadLocation, IntegrationError, IssueState, Observation,
+        GitHubClient, GitHubExecutor, GitHubMutationTransport, HeadLocation, IntegrationError,
+        IssueState, Observation,
     },
     state::{
-        HouseMailbox, HouseStore, MailSender, MarkerFact, MarkerKey, MarkerSchema, MarkerSubject,
-        OwnershipEvent, PostKind, StateError, TaskRecord, TaskState, WorkItem, WorkerPost,
-        reconcile,
+        EffectPlan, EffectState, HouseMailbox, HouseStore, MailSender, MarkerFact, MarkerKey,
+        MarkerSchema, MarkerSubject, OwnershipEvent, PostKind, StateError, TaskRecord, TaskState,
+        WorkItem, WorkerPost, reconcile, run_effect,
     },
     workflows::{
         coordination::{
@@ -96,6 +98,9 @@ pub struct CoordinatePass<'a, T> {
     pub backend: &'a dyn CoordinatorMailbox,
     /// The house's forge reads, for the head a completed worker pushed.
     pub forge: &'a GitHubClient<T>,
+    /// The house-scoped forge effect executor, required to complete a
+    /// review-thread follow-up report.
+    pub forge_executor: Option<&'a GitHubExecutor<T>>,
     /// Time source.
     pub clock: &'a dyn Clock,
     /// Take over an expired pass lease, and expired scheduled task claims,
@@ -327,7 +332,7 @@ impl Owned {
     }
 }
 
-impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
+impl<T: GitHubMutationTransport> CoordinatePass<'_, T> {
     /// Run one pass under the house's coordination lease.
     ///
     /// # Errors
@@ -750,6 +755,11 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
                         Some(WorkerOutcome::Succeeded) => self.completion(&record, message)?,
                         Some(WorkerOutcome::Failed | WorkerOutcome::Cancelled) | None => None,
                     };
+                    if message.outcome == Some(WorkerOutcome::Succeeded)
+                        && snapshot(self.store, &owned.task)?.is_some()
+                    {
+                        self.complete_follow_up(owned, &record, message, completion.as_ref())?;
+                    }
                     let Some(outcome) = still_owned(supervise(
                         ctx,
                         &owned.task,
@@ -981,6 +991,177 @@ impl<T: GitHubReadTransport> CoordinatePass<'_, T> {
             },
             addressed: Vec::new(),
         }))
+    }
+
+    /// Record every disposition before posting. Each forge write has its own
+    /// stable effect name and persisted intent, so a lost reply or resolution
+    /// response is reconciled on redelivery before any later write.
+    fn complete_follow_up(
+        &self,
+        owned: &Owned,
+        record: &TaskRecord,
+        message: &MailMessage,
+        completion: Option<&Completion>,
+    ) -> Result<()> {
+        if !message.checkout.clean_and_pushed()
+            || current_worker(record).is_none_or(|worker| {
+                self.backend.observe_worker(&worker.worker)
+                    != Ok(WorkerState::Settled(WorkerOutcome::Succeeded))
+            })
+        {
+            return Err(RunError::FollowUpPushMissing.into());
+        }
+        self.store
+            .continue_attempt(&owned.task, owned.fence, self.clock.now())?
+            .ok_or(RunError::DispositionInvalid)?;
+        let saved = snapshot(self.store, &owned.task)?.ok_or(RunError::DispositionInvalid)?;
+        let report = record_report(
+            self.store,
+            &owned.task,
+            owned.fence,
+            message.body.as_ref(),
+            self.clock.now(),
+        )?;
+        let head = &completion
+            .ok_or(RunError::DispositionInvalid)?
+            .report
+            .subject
+            .head;
+        let repository = record
+            .spec()
+            .repository
+            .as_ref()
+            .ok_or(RunError::DispositionInvalid)?;
+        let branch = task_branch(record).ok_or(RunError::DispositionInvalid)?;
+        if last_pushed_head(self.store, &owned.task, &branch)?.as_ref() != Some(head) {
+            return Err(RunError::FollowUpPushMissing.into());
+        }
+        let executor = self.forge_executor.ok_or(RunError::NoBackend)?;
+        let pending = reconcile(self.store, executor, &owned.task, owned.fence, self.clock)?;
+        if !pending.unresolved.is_empty() || !pending.foreign.is_empty() {
+            return Err(RunError::FollowUpEffectUncertain.into());
+        }
+        let current_record = self.store.task(&owned.task)?;
+        let pr = known(self.forge.pull_request(
+            self.store.house(),
+            repository,
+            saved.pull_request,
+        ))?;
+        if pr.state != IssueState::Open
+            || pr.merged
+            || &pr.head.sha != head
+            || pr.head.name != branch.as_str()
+            || pr.head_location(repository) != HeadLocation::SameRepository
+        {
+            return Err(RunError::AttestationStaleHead.into());
+        }
+        let reviews = known(self.forge.reviews(
+            self.store.house(),
+            repository,
+            saved.pull_request,
+        ))?;
+        if saved.reviews.iter().any(|expected| {
+            !reviews.iter().any(|review| {
+                review.id == expected.id
+                    && review.state == crate::integrations::github::ReviewState::ChangesRequested
+                    && review.commit_id == saved.source_head
+                    && super::super::pickup::stable_hash(
+                        review.body.as_deref().unwrap_or_default().as_bytes(),
+                    ) == expected.body_digest
+            })
+        }) {
+            return Err(RunError::DispositionInvalid.into());
+        }
+        let live = known(self.forge.follow_up_threads(
+            self.store.house(),
+            repository,
+            saved.pull_request,
+        ))?;
+        if report.dispositions.iter().any(|item| {
+            let digest = super::super::pickup::stable_hash(item.thread.as_str().as_bytes());
+            let resolved_here = current_record.effects().iter().any(|effect| {
+                effect.name().as_str() == format!("thread-{digest:016x}-resolve")
+                    && matches!(effect.state(), EffectState::Applied { .. })
+            });
+            let expected_target = saved.threads.iter().find(|saved| saved.id == item.thread);
+            !live.iter().any(|thread| {
+                thread.id == item.thread.as_str()
+                    && target(thread, self.forge.scope().requester().as_str())
+                        .ok()
+                        .as_ref()
+                        == expected_target
+                    && (!thread.is_resolved
+                        || (item.verdict == FollowUpVerdict::Fixed && resolved_here))
+            })
+        }) {
+            return Err(RunError::DispositionInvalid.into());
+        }
+        let grants = super::standing_grants(self.house)?;
+        for item in report.dispositions {
+            let explanation = item.reply.clone();
+            let reply = GitHubMutation {
+                repository: repository.clone(),
+                action: GitHubAction::ReplyToReviewThread {
+                    number: saved.pull_request,
+                    expected_head: head.clone(),
+                    thread: item.thread.clone(),
+                    body: item.reply,
+                },
+            };
+            let digest = super::super::pickup::stable_hash(item.thread.as_str().as_bytes());
+            for (suffix, mutation) in std::iter::once(("reply", reply)).chain(
+                (item.verdict == FollowUpVerdict::Fixed).then(|| {
+                    (
+                        "resolve",
+                        GitHubMutation {
+                            repository: repository.clone(),
+                            action: GitHubAction::ResolveReviewThread {
+                                number: saved.pull_request,
+                                expected_head: head.clone(),
+                                thread: item.thread.clone(),
+                            },
+                        },
+                    )
+                }),
+            ) {
+                let effect = executor.effect(mutation)?.into();
+                let result = run_effect(
+                    self.store,
+                    executor,
+                    &grants,
+                    EffectPlan {
+                        task: owned.task.clone(),
+                        fence: owned.fence,
+                        name: EffectName::new(&format!("thread-{digest:016x}-{suffix}"))?,
+                        decided_at: self.store.task(&owned.task)?.evidence().revision(),
+                        effect,
+                        consent: None,
+                        basis: None,
+                    },
+                    self.clock,
+                )?;
+                if !matches!(result.state(), EffectState::Applied { .. }) {
+                    return Err(RunError::FollowUpEffectUncertain.into());
+                }
+            }
+            if item.verdict == FollowUpVerdict::Declined {
+                self.store.post_mail_unique(
+                    &MailSender {
+                        task: owned.task.clone(),
+                        fence: owned.fence,
+                    },
+                    WorkerPost {
+                        kind: PostKind::Question,
+                        subject: Some(Text::new(&format!(
+                            "Follow-up thread {digest:016x} declined"
+                        ))?),
+                        body: explanation,
+                    },
+                    self.clock.now(),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// A branch needs delivery only when the forge proves it has commits

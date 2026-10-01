@@ -37,7 +37,9 @@ use kitchen::{
         BackendKind, CredentialKind, ForgeCredential, HouseConfig, PickupConfig, credential_path,
         forge_binding, runtime_config,
     },
-    integrations::github::{CredentialFile, GhCli, GitHubClient, ReadLimits, TokenScope},
+    integrations::github::{
+        CredentialFile, GhCli, GitHubClient, GitHubExecutor, ReadLimits, TokenScope,
+    },
     scheduling::AgentFamily,
     state::{HouseStore, StoreOptions},
     workflows::{
@@ -82,6 +84,15 @@ enum RunCommand {
     /// repair, and launch one repair writer within the house's follow-up
     /// budget when no other writer of the repository is open.
     Repair {
+        #[command(flatten)]
+        house: HouseArgs,
+        #[command(flatten)]
+        backend: BackendArgs,
+        #[command(flatten)]
+        repair: RepairArgs,
+    },
+    /// Launch one review-thread follow-up writer for a delivered Kitchen PR.
+    FollowUp {
         #[command(flatten)]
         house: HouseArgs,
         #[command(flatten)]
@@ -523,12 +534,20 @@ pub fn run(args: RunArgs) -> ExitCode {
                 MailboxRoute::House.worker_requirements(),
             )?;
             let forge = opened.forge()?;
+            let binding = forge_binding(&opened.registry, &opened.config.house)?;
+            let executor = GitHubExecutor::new(
+                binding.backend.clone(),
+                binding.scope(&opened.config)?,
+                forge.transport().clone(),
+                ReadLimits::default(),
+            );
             render(
                 CoordinatePass {
                     store: &opened.store,
                     house: &opened.config,
                     backend: backend.as_ref(),
                     forge: &forge,
+                    forge_executor: Some(&executor),
                     clock: &clock,
                     take_over: house.take_over,
                     tick: None,
@@ -576,6 +595,45 @@ pub fn run(args: RunArgs) -> ExitCode {
                     tick: None,
                 }
                 .run()?,
+            )
+        }),
+        RunCommand::FollowUp {
+            house,
+            backend,
+            repair,
+        } => Opened::open(&house).and_then(|opened| {
+            let pickup = pickup_config(
+                &opened,
+                &PickupArgs {
+                    branch_prefix: repair.branch_prefix,
+                    report_path: repair.report_path,
+                    ..PickupArgs::default()
+                },
+            )?;
+            let settings = RepairSettings {
+                instructions: instructions(&opened)?,
+                report_path: Text::new(&pickup.report_path)?,
+            };
+            let backend = opened.backend(
+                &backend,
+                Pass::FollowUp.as_str(),
+                Some(BranchName::new(&pickup.branch_prefix)?),
+                MailboxRoute::House.worker_requirements(),
+            )?;
+            let forge = opened.forge()?;
+            render(
+                RepairPass {
+                    store: &opened.store,
+                    house: &opened.config,
+                    backend: backend.as_ref(),
+                    forge: &forge,
+                    clock: &clock,
+                    repository: &opened.repository,
+                    settings: &settings,
+                    take_over: house.take_over,
+                    tick: None,
+                }
+                .run_follow_up()?,
             )
         }),
         RunCommand::Gate { house } => Opened::open(&house).and_then(|opened| {

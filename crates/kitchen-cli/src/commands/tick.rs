@@ -167,16 +167,16 @@ impl DuePasses<'_> {
         let opened = self.opened;
         let settings = match pass {
             Pass::Pickup => Some(super::run::settings(opened, self.pickup)?),
-            Pass::Coordinate | Pass::Repair | Pass::Gate => None,
+            Pass::Coordinate | Pass::Repair | Pass::FollowUp | Pass::Gate => None,
         };
         // Repair briefs name the pinned instructions and the report path
         // pickup briefs name; a gate task records the same revisions.
         let instructions = match pass {
-            Pass::Repair | Pass::Gate => Some(super::run::instructions(opened)?),
+            Pass::Repair | Pass::FollowUp | Pass::Gate => Some(super::run::instructions(opened)?),
             Pass::Pickup | Pass::Coordinate => None,
         };
         let repair_pickup = match pass {
-            Pass::Repair => Some(super::run::pickup_config(opened, self.pickup)?),
+            Pass::Repair | Pass::FollowUp => Some(super::run::pickup_config(opened, self.pickup)?),
             Pass::Pickup | Pass::Coordinate | Pass::Gate => None,
         };
         let repair = match (&instructions, &repair_pickup) {
@@ -199,7 +199,7 @@ impl DuePasses<'_> {
             ),
             // A repair writer is supervised like a pickup worker, and its
             // workspace is named without pickup's branch prefix.
-            Pass::Repair => Some(
+            Pass::Repair | Pass::FollowUp => Some(
                 opened.backend(
                     self.backend,
                     pass.as_str(),
@@ -217,12 +217,19 @@ impl DuePasses<'_> {
         }
         let forge = opened.forge()?;
         let binding = forge_binding(&opened.registry, &opened.config.house)?;
+        let executor = kitchen::integrations::github::GitHubExecutor::new(
+            binding.backend.clone(),
+            binding.scope(&opened.config)?,
+            forge.transport().clone(),
+            kitchen::integrations::github::ReadLimits::default(),
+        );
         let authors = [binding.requester.to_string()];
         TickPasses {
             store: &opened.store,
             house: &opened.config,
             backend: backend.as_deref(),
             forge: &forge,
+            forge_executor: Some(&executor),
             clock: self.clock,
             repository: &opened.repository,
             pickup: settings.as_ref(),

@@ -1026,6 +1026,18 @@ impl HouseStore {
         self.transact(|state| state.post_mail(sender, post, now))
     }
 
+    /// Post one idempotent coordinator question for a running task. The
+    /// subject is its stable key within the attempt; conflicting text is
+    /// refused and an exact replay returns the first message id.
+    pub fn post_mail_unique(
+        &self,
+        sender: &MailSender,
+        post: WorkerPost,
+        now: Timestamp,
+    ) -> Result<ExternalRef> {
+        self.transact(|state| state.post_mail_unique(sender, post, now))
+    }
+
     /// The answer to `question`, for the worker that asked it.
     ///
     /// # Errors

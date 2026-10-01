@@ -141,6 +141,12 @@ The first time you use it in a repository, it asks which house the repository
 belongs to and which workflows to turn on, then shows you what's still missing.
 It never guesses a house.
 
+For a configured scheduled house, `kitchn run follow-up` handles review
+threads and change requests on Kitchen PRs. `kitchn tick` runs the same pass
+when the house gives `follow-up` an interval. A writer verifies the findings
+and pushes through `kitchn push`; Kitchen posts its thread replies and leaves
+declined findings for the owner in the house mailbox.
+
 Every comment, label, push or worker launch needs your yes, for that exact
 action, in that session. A yes never carries over to the next action.
 

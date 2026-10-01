@@ -825,6 +825,7 @@ pub(crate) fn launch_rendered(
                 | NotAppliedReason::ConfirmedAbsent
                 | NotAppliedReason::RateLimited { .. } => FailureClass::Retryable,
                 NotAppliedReason::Unsupported(_)
+                | NotAppliedReason::BranchInUse
                 | NotAppliedReason::WorktreeConfigDisabled
                 | NotAppliedReason::CrossHouse
                 | NotAppliedReason::ForeignBackend => FailureClass::Permanent,

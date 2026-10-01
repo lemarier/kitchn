@@ -371,6 +371,8 @@ pub enum NotAppliedReason {
     ForeignBackend,
     /// The provider refused the request before acting.
     Rejected,
+    /// The requested branch is already checked out in another worktree.
+    BranchInUse,
     /// The repository owner must enable per-worktree Git configuration with
     /// `kitchn house setup --enable-worktree-config` before a writer launch.
     WorktreeConfigDisabled,
@@ -386,6 +388,7 @@ pub enum NotAppliedReason {
 impl std::fmt::Display for NotAppliedReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BranchInUse => f.write_str("branch is already checked out in a worktree"),
             Self::WorktreeConfigDisabled => f.write_str(
                 "extensions.worktreeConfig is disabled; run kitchn house setup --enable-worktree-config from this repository",
             ),
@@ -550,6 +553,23 @@ pub struct ResourceObservation {
     pub liveness: Liveness,
 }
 
+/// A checkout's suitability for continuing work at an exact PR head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeStatus {
+    /// Exact branch and head, with no tracked or untracked changes.
+    Ready,
+    /// The backend no longer has this worktree.
+    Missing,
+    /// The checkout has tracked or untracked changes.
+    Dirty,
+    /// The worktree holds another branch.
+    WrongBranch,
+    /// The branch tip differs from the PR head.
+    WrongHead,
+    /// The inspection failed or is unsupported.
+    Unknown,
+}
+
 /// Performs persisted effects for exactly one house in one namespace.
 ///
 /// Contract, checked by [`crate::contracts::conformance::run`]:
@@ -612,6 +632,19 @@ static NO_VERIFICATION_ENVIRONMENTS: VerificationEnvironments = VerificationEnvi
 /// `inventory` returns at most [`MAX_INVENTORY_RESOURCES`] observations,
 /// reporting [`Liveness::Unverifiable`] rather than guessing.
 pub trait WorkerBackend: EffectExecutor {
+    /// Inspect an existing worktree before assigning another writer to it.
+    /// An unsupported or failed inspection cannot authorize reuse.
+    fn inspect_worktree(
+        &self,
+        _worktree: &ResourceRef,
+        _branch: &BranchName,
+        _head: &crate::contracts::CommitId,
+        _report_path: &Text,
+    ) -> Result<WorktreeStatus, BackendUnavailable> {
+        Err(BackendUnavailable::Unsupported(
+            Capability::ResourceInventory,
+        ))
+    }
     /// Whether a launch receipt's branch is the branch this backend can
     /// create for the requested name. The default requires an exact match.
     fn accepts_launch_branch(

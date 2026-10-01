@@ -35,7 +35,7 @@ use kitchen::{
         MessageKind, NotAppliedReason, Operation, Permission, Provenance, Receipt, Repository,
         ResourceKind, ResourceRef, RetryPolicy, Role, ScheduleBackend, ScheduleEffect,
         TaskAuthority, TaskSpec, Text, Timestamp, UncertainReason, WorkerBackend, WorkerOutcome,
-        WorkerState, Workspace,
+        WorkerState, Workspace, WorktreeStatus,
         conformance::{self, Check, CheckResult, ConformanceFixture},
     },
     scheduling::{
@@ -2540,6 +2540,82 @@ fn worktree(handle: &str) -> TestResult<ResourceRef> {
 }
 
 #[test]
+fn preserved_worktree_inspection_checks_the_real_checkout() -> TestResult {
+    use std::process::Command;
+    let temp = tempfile::tempdir()?;
+    let main = temp.path().join("main");
+    let checkout = temp.path().join("preserved");
+    std::fs::create_dir(&main)?;
+    let git = |args: &[&str]| -> TestResult<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    };
+    git(&["init", "-q", "-b", "main"])?;
+    git(&[
+        "-c",
+        "user.name=Person",
+        "-c",
+        "user.email=person@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "base",
+    ])?;
+    git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "lemarier/issue-6",
+        checkout.to_str().ok_or("path")?,
+    ])?;
+    let head = kitchen::contracts::CommitId::new(&git(&["rev-parse", "HEAD"])?)?;
+    let sim = SimOrca::default();
+    sim.state().identity_worktree = Some((
+        "wt_preserved".to_owned(),
+        "refs/heads/lemarier/issue-6".to_owned(),
+        "kitchen-marker".to_owned(),
+        checkout.clone(),
+    ));
+    let backend = connect(&sim)?;
+    let resource = worktree("wt_preserved")?;
+    let branch = BranchName::new("lemarier/issue-6")?;
+    let report = Text::new("report.md")?;
+    std::fs::write(checkout.join("report.md"), "evidence")?;
+    assert_eq!(
+        backend.inspect_worktree(&resource, &branch, &head, &report)?,
+        WorktreeStatus::Ready
+    );
+    assert_eq!(
+        backend.inspect_worktree(&resource, &branch, &commit('a')?, &report)?,
+        WorktreeStatus::WrongHead
+    );
+    std::fs::write(checkout.join("untracked.txt"), "keep")?;
+    assert_eq!(
+        backend.inspect_worktree(&resource, &branch, &head, &report)?,
+        WorktreeStatus::Dirty
+    );
+    std::fs::remove_file(checkout.join("untracked.txt"))?;
+    sim.state().identity_worktree = None;
+    assert_eq!(
+        backend.inspect_worktree(&resource, &branch, &head, &report)?,
+        WorktreeStatus::Missing
+    );
+    Ok(())
+}
+
+#[test]
 fn presets_are_sent_and_compared_as_cron() -> TestResult {
     let sim = SimOrca::default();
     let backend = connect(&sim)?;
@@ -3229,7 +3305,7 @@ fn a_branch_an_orca_worktree_holds_is_refused_before_anything_is_created() -> Te
     )?;
     assert_eq!(
         backend.execute(&launch),
-        Err(EffectFailure::NotApplied(NotAppliedReason::Rejected))
+        Err(EffectFailure::NotApplied(NotAppliedReason::BranchInUse))
     );
     nothing_launched(&sim);
     let listings = sim.calls_to(&["worktree", "list"]);
@@ -3315,9 +3391,7 @@ fn a_listing_that_cannot_show_the_branch_free_refuses_the_launch() -> TestResult
     let backend = connect(&sim)?;
     assert_eq!(
         backend.check_branch_free(&branch("lemarier/issue-6")?),
-        Err(OrcaError::BranchTaken {
-            requested: "lemarier/issue-6".to_owned()
-        })
+        Err(OrcaError::BranchUnverified)
     );
     Ok(())
 }

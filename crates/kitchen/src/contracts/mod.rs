@@ -78,7 +78,7 @@ pub use backend::{
     BackendUnavailable, EffectExecutor, EffectFailure, EffectRequest, IdempotencyKey, Liveness,
     Lookup, MAX_INVENTORY_RESOURCES, MAX_RECEIPT_RESOURCES, NotAppliedReason, Operation, Receipt,
     ResourceObservation, Retarget, UncertainReason, WorkerBackend, WorkerOutcome, WorkerState,
-    Workspace,
+    Workspace, WorktreeStatus,
 };
 pub use capability::{BackendDescriptor, Capability, CapabilitySet, Support};
 pub use effects::{

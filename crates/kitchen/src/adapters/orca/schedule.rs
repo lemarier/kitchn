@@ -855,6 +855,7 @@ fn schedule_failure(error: &OrcaError) -> EffectFailure {
         | OrcaError::ReservationUnavailable(_)
         | OrcaError::BranchUnobtainable { .. }
         | OrcaError::BranchTaken { .. }
+        | OrcaError::BranchUnverified
         | OrcaError::Schedule(_)
         | OrcaError::ScheduleLimit(_)
         | OrcaError::Selection(_)

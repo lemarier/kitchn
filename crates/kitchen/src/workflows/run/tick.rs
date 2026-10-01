@@ -208,6 +208,7 @@ fn repair_worker(action: &RepairAction) -> Option<ExternalRef> {
         RepairAction::Decided { .. }
         | RepairAction::Stacked { .. }
         | RepairAction::NotLaunched { .. }
+        | RepairAction::WorktreeUnavailable { .. }
         | RepairAction::Waiting { .. } => None,
     }
 }
@@ -218,6 +219,7 @@ fn follow_up_worker(action: &FollowUpAction) -> Option<ExternalRef> {
         FollowUpAction::Waiting { .. }
         | FollowUpAction::Exhausted { .. }
         | FollowUpAction::PreservationUnknown { .. }
+        | FollowUpAction::WorktreeUnavailable { .. }
         | FollowUpAction::NotLaunched { .. } => None,
     }
 }

@@ -149,6 +149,55 @@ the [CLI reference](https://getkitchn.com/docs/reference/cli/) documents
 their flags and exit codes. `house init` also creates the house state store
 where claims live, and commands find it through the registry.
 
+## Unattended merges
+
+The scheduled gate merges a pull request without a person only when the house
+grants `merge` for the repository and an independent reviewer has attested the
+exact head and base. Checks must pass, threads must be resolved, and the
+attestation must say the review was clean and read-only, acceptance and
+hardware are complete, and no risk class applies. Any risk class needs a
+separate human approval, so the gate reports the pull request instead of
+merging it. The gate also never merges a branch a person wrote.
+
+The reviewer who attests must not be the pull request's author, any author or
+committer of a commit on the branch, or a worker that a launch on the branch
+created. Kitchen reads these from the forge and the house records when the
+attestation is recorded, and the gate checks them again before merging.
+
+To attest, the reviewer posts an approved review at the pull request's head
+whose body contains exactly one `kitchen-attestation` block:
+
+```kitchen-attestation
+head=4f2c9a1e7b3d5f608192a3b4c5d6e7f809a1b2c3
+base=9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807
+semantic=clean
+read_only=true
+acceptance=complete
+hardware=complete
+risk=none
+```
+
+| Field | Meaning |
+| --- | --- |
+| `head` | The full SHA of the pull request head the review read. |
+| `base` | The full SHA of the base branch's live tip. |
+| `semantic` | `clean`, `findings`, `partial`, or `unavailable`. |
+| `read_only` | `true` when the review read committed content without running the pull request's code with credentials. |
+| `acceptance` | `complete` or `incomplete`: the linked issue's acceptance evidence. |
+| `hardware` | `complete` or `incomplete`; `complete` when no hardware work is required. |
+| `risk` | `none`, or distinct classes separated by commas, such as `workflow-rules,dependencies`. |
+
+Each field appears once, with no others. Then, in a clean checkout at that
+head, the reviewer records the attestation:
+
+```sh
+kitchn gate attest --review-id <forge-review-id>
+```
+
+A new head or base needs a new review and attestation. The
+[CLI reference](https://getkitchn.com/docs/reference/cli/) lists every risk
+class.
+
 ## Repository layout
 
 | Path | Contents |

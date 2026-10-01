@@ -579,6 +579,7 @@ mod tests {
     use crate::{
         contracts::{CommitId, ContractError},
         integrations::github::PullRequestCommit,
+        workflows::gate::SemanticReview,
     };
 
     fn commit(
@@ -629,6 +630,31 @@ mod tests {
             parse_review_block(Some(&valid.replace('\n', "\r\n")))?,
             claims
         );
+        Ok(())
+    }
+
+    #[test]
+    fn readme_example_block_parses_as_a_mergeable_attestation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let readme =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))?;
+        // The README holds exactly one block, so the whole file is a valid
+        // review body only while the example parses.
+        let claims = parse_review_block(Some(&readme))?;
+        assert_eq!(
+            claims.head,
+            CommitId::new("4f2c9a1e7b3d5f608192a3b4c5d6e7f809a1b2c3")?
+        );
+        assert_eq!(
+            claims.base,
+            CommitId::new("9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807")?
+        );
+        assert_eq!(claims.semantic, SemanticReview::Clean);
+        assert!(claims.read_only && claims.acceptance && claims.hardware);
+        assert!(claims.risk.is_empty());
+        // A second copy of the block makes the body ambiguous.
+        let doubled = format!("{readme}\n{readme}");
+        assert!(parse_review_block(Some(&doubled)).is_err());
         Ok(())
     }
 

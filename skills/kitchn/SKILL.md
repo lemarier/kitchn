@@ -111,6 +111,11 @@ facts again and rerun. `review` and `gate` are read-only; merging is always
 the person's decision. `follow-up` and `repair` claim the writer round, so
 scheduled repair skips the pull request until you hand it back.
 
+Review-thread replies use the house forge's `post-comment` grant; resolving a
+thread needs `resolve-review-thread`. Verify the exact PR head and the thread
+against current code before proposing either effect. A missing or partial forge
+read is not permission to retry an uncertain write.
+
 ### `issue new` and `issue refine <n>`
 
 Draft with the person: outcome, ownership, acceptance criteria, and

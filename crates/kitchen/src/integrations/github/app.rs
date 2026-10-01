@@ -229,6 +229,9 @@ impl TokenScope {
             Action::ReviewPullRequest { .. } => {
                 &[(PullRequests, Access::Write), (Contents, Access::Read)]
             }
+            Action::ReplyToReviewThread { .. } | Action::ResolveReviewThread { .. } => {
+                &[(PullRequests, Access::Write)]
+            }
         };
         Self {
             repository: mutation.repository.clone(),
@@ -246,6 +249,15 @@ impl TokenScope {
                 (AppPermission::Contents, Access::Read),
             ]
             .into(),
+        }
+    }
+
+    /// Minimal token for GraphQL review-thread readback.
+    #[must_use]
+    pub fn for_thread_read(repository: &Repository) -> Self {
+        Self {
+            repository: repository.clone(),
+            permissions: [(AppPermission::PullRequests, Access::Read)].into(),
         }
     }
 

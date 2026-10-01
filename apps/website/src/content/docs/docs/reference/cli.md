@@ -283,6 +283,14 @@ kitchn hand-back <task> --holder <you>
 | `--as <intent>` | `pr` only. Routed from the facts when omitted. |
 | `--fix-rounds <n>` | `pr` only. Lowers the house's fix-round budget; it cannot raise it. |
 
+The forge can read review-thread text and locations within configured page and
+byte limits. A thread with more than 100 comments is incomplete. Replying to a
+thread requires the house's `post-comment` grant; resolving it requires the
+separate `resolve-review-thread` grant. Both bind the thread to its pull request
+and expected head, persist intent before writing, and read back the result.
+Uncertain writes remain pending reconciliation. The scheduled follow-up pass is
+not exposed by this CLI yet.
+
 ## `kitchn issue`
 
 Preview an issue draft. Posts nothing.

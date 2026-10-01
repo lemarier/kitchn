@@ -218,6 +218,26 @@ pub enum GitHubAction {
         /// Findings and structured attestation block.
         body: Text,
     },
+    /// Reply in one existing review thread with a durable marker.
+    ReplyToReviewThread {
+        /// Pull request that owns the thread.
+        number: IssueNumber,
+        /// Exact head on which the reply was decided.
+        expected_head: CommitId,
+        /// GraphQL review-thread node ID.
+        thread: crate::contracts::ExternalRef,
+        /// Reply text.
+        body: Text,
+    },
+    /// Resolve one review thread after the fixed disposition is recorded.
+    ResolveReviewThread {
+        /// Pull request that owns the thread.
+        number: IssueNumber,
+        /// Exact head on which resolution was decided.
+        expected_head: CommitId,
+        /// GraphQL review-thread node ID.
+        thread: crate::contracts::ExternalRef,
+    },
 }
 /// Review outcome accepted by the forge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,12 +295,30 @@ impl GitHubMutation {
                 Err(invalid())
             }
             GitHubAction::ReviewPullRequest { .. } => Ok(()),
+            GitHubAction::ReplyToReviewThread { thread, body, .. }
+                if !valid_thread_id(thread) || body.as_str().len() > 60 * 1024 =>
+            {
+                Err(invalid())
+            }
+            GitHubAction::ResolveReviewThread { thread, .. } if !valid_thread_id(thread) => {
+                Err(invalid())
+            }
+            GitHubAction::ReplyToReviewThread { .. } | GitHubAction::ResolveReviewThread { .. } => {
+                Ok(())
+            }
             GitHubAction::LinkSubIssue { parent, child } if parent == child => Err(invalid()),
             GitHubAction::LinkDependency { issue, blocker } if issue == blocker => Err(invalid()),
             GitHubAction::LinkSubIssue { .. } | GitHubAction::LinkDependency { .. } => Ok(()),
             GitHubAction::CreateLabel { label } => label.validate(),
         }
     }
+}
+fn valid_thread_id(id: &crate::contracts::ExternalRef) -> bool {
+    id.as_str().starts_with("PRRT_")
+        && id
+            .as_str()
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 fn validate_title_body(title: &Text, body: &Text) -> Result<(), ContractError> {
     if title.as_str().len() > 256
@@ -329,6 +367,8 @@ impl GitHubEffect {
             GitHubAction::CreateIssue { .. } => Permission::CreateIssue,
             GitHubAction::OpenPullRequest { .. } => Permission::OpenPullRequest,
             GitHubAction::ReviewPullRequest { .. } => Permission::ReviewPullRequest,
+            GitHubAction::ReplyToReviewThread { .. } => Permission::PostComment,
+            GitHubAction::ResolveReviewThread { .. } => Permission::ResolveReviewThread,
             GitHubAction::LinkSubIssue { .. } | GitHubAction::LinkDependency { .. } => {
                 Permission::EditIssueRelationships
             }

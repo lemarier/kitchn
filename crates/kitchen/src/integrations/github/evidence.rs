@@ -723,6 +723,58 @@ pub struct ReviewThread {
     pub is_outdated: bool,
 }
 
+/// An unresolved review thread with the comment text needed by a writer.
+/// Text and paths are untrusted forge data.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FollowUpThread {
+    /// GraphQL thread node id, used for a later reply and resolution.
+    pub id: String,
+    /// Explicit resolution state.
+    pub is_resolved: bool,
+    /// Whether the diff position became outdated.
+    pub is_outdated: bool,
+    /// File path named by the review.
+    pub path: String,
+    /// Current diff line, absent for an outdated thread.
+    pub line: Option<u32>,
+    /// Original diff line.
+    pub original_line: Option<u32>,
+    /// Comments on the thread.
+    pub comments: FollowUpComments,
+}
+
+/// One bounded page of thread comments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FollowUpComments {
+    /// Comment nodes.
+    pub nodes: Vec<FollowUpComment>,
+    /// Whether this page omitted comments.
+    pub page_info: ThreadPageInfo,
+}
+
+/// One review comment.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FollowUpComment {
+    /// GraphQL comment node id.
+    pub id: String,
+    /// Untrusted review text.
+    pub body: String,
+    /// Author, including a bot when one wrote the comment.
+    pub author: Option<User>,
+}
+
+/// Cursor evidence for a bounded GraphQL connection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadPageInfo {
+    /// Whether more nodes exist.
+    pub has_next_page: bool,
+    /// Next cursor, when there is another page.
+    pub end_cursor: Option<String>,
+}
+
 /// Permission evidence for one named user.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct PermissionEvidence {

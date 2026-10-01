@@ -12,6 +12,7 @@ use crate::{
     },
     workflows::gate::MergeGrant,
 };
+use serde_json::Value;
 
 /// GitHub effects execute only after core has persisted their intent.
 /// GitHub has no native idempotency key: this executor deliberately does not
@@ -159,7 +160,10 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
             .map_err(|_| EffectFailure::NotApplied(NotAppliedReason::Rejected))?
         {
             Inspection::Applied(receipt) => return Ok(receipt),
-            Inspection::Conflict | Inspection::Retargeted | Inspection::MergedAtOtherHead => {
+            Inspection::Conflict
+            | Inspection::ResolvedUnattributed
+            | Inspection::Retargeted
+            | Inspection::MergedAtOtherHead => {
                 return Err(EffectFailure::NotApplied(NotAppliedReason::Rejected));
             }
             // A marked pull request may be this request's, moved since.
@@ -174,7 +178,7 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
         let timeout = provider
             .remaining()
             .map_err(|_| EffectFailure::NotApplied(NotAppliedReason::Rejected))?;
-        self.transport.submit(
+        let response = self.transport.submit(
             self.scope.credential(),
             &mutation,
             timeout,
@@ -187,6 +191,35 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
             .map_err(uncertain)?
         {
             Inspection::Applied(receipt) => Ok(receipt),
+            Inspection::ResolvedUnattributed => {
+                let GitHubAction::ResolveReviewThread { thread, .. } = &effect.mutation.action
+                else {
+                    return Err(EffectFailure::Uncertain(UncertainReason::ResponseLost));
+                };
+                let confirmed =
+                    serde_json::from_slice::<Value>(&response)
+                        .ok()
+                        .is_some_and(|value| {
+                            value.get("errors").is_none()
+                                && value
+                                    .pointer("/data/resolveReviewThread/clientMutationId")
+                                    .and_then(Value::as_str)
+                                    == Some(request.key().as_str())
+                                && value
+                                    .pointer("/data/resolveReviewThread/thread/id")
+                                    .and_then(Value::as_str)
+                                    == Some(thread.as_str())
+                                && value
+                                    .pointer("/data/resolveReviewThread/thread/isResolved")
+                                    .and_then(Value::as_bool)
+                                    == Some(true)
+                        });
+                if confirmed {
+                    super::provider::receipt(request.key()).map_err(uncertain)
+                } else {
+                    Err(EffectFailure::Uncertain(UncertainReason::ResponseLost))
+                }
+            }
             Inspection::Missing
             | Inspection::Conflict
             | Inspection::Retargeted
@@ -216,6 +249,7 @@ impl<T: GitHubMutationTransport> EffectExecutor for GitHubExecutor<T> {
             Ok(
                 Inspection::Missing
                 | Inspection::Conflict
+                | Inspection::ResolvedUnattributed
                 | Inspection::Retargeted
                 | Inspection::MergedAtOtherHead
                 | Inspection::MarkedElsewhere,

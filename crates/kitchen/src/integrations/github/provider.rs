@@ -136,6 +136,8 @@ pub(crate) enum Inspection {
     Applied(Receipt),
     Missing,
     Conflict,
+    /// Resolution has no intent marker, so readback alone cannot credit it.
+    ResolvedUnattributed,
     /// An unmerged pull request at the expected head now targets another
     /// base. No new merge may start, but an earlier request carrying the
     /// expected head can still merge it, so this is not absence evidence.
@@ -253,6 +255,49 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             .map(Some)
             .ok_or(IntegrationError::Unknown)
     }
+    fn review_thread(&mut self, thread: &str) -> Result<Value, IntegrationError> {
+        let query = "query($id:ID!){node(id:$id){... on PullRequestReviewThread{id isResolved resolvedBy{login} pullRequest{number headRefOid repository{nameWithOwner}} comments(first:100){nodes{id body url author{login}} pageInfo{hasNextPage endCursor}}}}}";
+        let bytes = self.transport.read(
+            self.scope.credential(),
+            &ReadRequest {
+                endpoint: "graphql".into(),
+                graphql: Some(json!({"query":query,"variables":{"id":thread}})),
+                access: self.access.clone(),
+            },
+            self.remaining()?,
+            self.remaining,
+        )?;
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or(IntegrationError::LimitExceeded)?;
+        let response: Value =
+            serde_json::from_slice(&bytes).map_err(|_| IntegrationError::Unknown)?;
+        if response.get("errors").is_some() {
+            return Err(IntegrationError::Unknown);
+        }
+        let node = response
+            .pointer("/data/node")
+            .ok_or(IntegrationError::Unknown)?;
+        if node.get("id").and_then(Value::as_str) != Some(thread) {
+            return Err(IntegrationError::Unknown);
+        }
+        if node
+            .pointer("/comments/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            != Some(false)
+        {
+            return Err(IntegrationError::LimitExceeded);
+        }
+        let comments = node
+            .pointer("/comments/nodes")
+            .and_then(Value::as_array)
+            .ok_or(IntegrationError::Unknown)?;
+        if comments.len() > 100 {
+            return Err(IntegrationError::LimitExceeded);
+        }
+        Ok(node.clone())
+    }
     fn pages(&mut self, endpoint: &str) -> Result<Vec<Value>, IntegrationError> {
         let mut all = Vec::new();
         for page in 1..=self.limits.pages() {
@@ -277,7 +322,12 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
         mutation.validate()?;
         self.scope
             .authorize_read(self.scope.house(), &mutation.repository)?;
-        self.access = Some(TokenScope::for_read(&mutation.repository, None));
+        self.access = Some(match mutation.action {
+            GitHubAction::ReplyToReviewThread { .. } | GitHubAction::ResolveReviewThread { .. } => {
+                TokenScope::for_thread_read(&mutation.repository)
+            }
+            _ => TokenScope::for_read(&mutation.repository, None),
+        });
         let root = format!("repos/{}", mutation.repository);
         let reference = receipt(key)?;
         match &mutation.action {
@@ -500,6 +550,75 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                         vec![],
                     )?)),
                     None => Ok(Inspection::Missing),
+                }
+            }
+            GitHubAction::ReplyToReviewThread {
+                number,
+                expected_head,
+                thread,
+                body,
+            } => {
+                let node = self.review_thread(thread.as_str())?;
+                check_thread_scope(&node, &mutation.repository, *number)?;
+                let expected = marked(body.as_str(), key);
+                let comments = node
+                    .pointer("/comments/nodes")
+                    .and_then(Value::as_array)
+                    .ok_or(IntegrationError::Unknown)?;
+                let mut found = None;
+                for comment in comments {
+                    if comment.get("body").and_then(Value::as_str) != Some(&expected) {
+                        continue;
+                    }
+                    if comment
+                        .pointer("/author/login")
+                        .and_then(Value::as_str)
+                        .is_some_and(|login| {
+                            login.eq_ignore_ascii_case(self.scope.requester().as_str())
+                        })
+                    {
+                        let url = comment
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .ok_or(IntegrationError::Unknown)?;
+                        if !url.starts_with(&format!(
+                            "https://github.com/{}/pull/{}#discussion_",
+                            mutation.repository,
+                            number.get()
+                        )) {
+                            return Err(IntegrationError::Unknown);
+                        }
+                        if found
+                            .replace(Receipt::new(ExternalRef::new(url)?, vec![], vec![])?)
+                            .is_some()
+                        {
+                            return Err(IntegrationError::Unknown);
+                        }
+                    }
+                }
+                if let Some(receipt) = found {
+                    return Ok(Inspection::Applied(receipt));
+                }
+                Ok(if thread_head(&node)? == expected_head.as_str() {
+                    Inspection::Missing
+                } else {
+                    Inspection::Conflict
+                })
+            }
+            GitHubAction::ResolveReviewThread {
+                number,
+                expected_head,
+                thread,
+            } => {
+                let node = self.review_thread(thread.as_str())?;
+                check_thread_scope(&node, &mutation.repository, *number)?;
+                if thread_head(&node)? != expected_head.as_str() {
+                    return Ok(Inspection::Conflict);
+                }
+                match node.get("isResolved").and_then(Value::as_bool) {
+                    Some(true) => Ok(Inspection::ResolvedUnattributed),
+                    Some(false) => Ok(Inspection::Missing),
+                    None => Err(IntegrationError::Unknown),
                 }
             }
             GitHubAction::LinkSubIssue { parent, child } => self.relationship(
@@ -764,6 +883,16 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
                     json!({"commit_id":expected_head.as_str(),"event":event,"body":marked(body.as_str(),key)}),
                 )
             }
+            GitHubAction::ReplyToReviewThread { thread, body, .. } => (
+                "POST",
+                "graphql".into(),
+                json!({"query":"mutation($input:AddPullRequestReviewThreadReplyInput!){addPullRequestReviewThreadReply(input:$input){comment{id}}}","variables":{"input":{"pullRequestReviewThreadId":thread.as_str(),"body":marked(body.as_str(),key),"clientMutationId":key.as_str()}}}),
+            ),
+            GitHubAction::ResolveReviewThread { thread, .. } => (
+                "POST",
+                "graphql".into(),
+                json!({"query":"mutation($input:ResolveReviewThreadInput!){resolveReviewThread(input:$input){clientMutationId thread{id isResolved}}}","variables":{"input":{"threadId":thread.as_str(),"clientMutationId":key.as_str()}}}),
+            ),
             GitHubAction::LinkSubIssue { parent, child } => {
                 let id = self.issue_id(&root, child.get())?;
                 (
@@ -801,6 +930,26 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             .filter(|v| *v > 0 && *v <= i64::MAX as u64)
             .ok_or(IntegrationError::Unknown)
     }
+}
+fn check_thread_scope(
+    node: &Value,
+    repository: &crate::contracts::Repository,
+    number: crate::contracts::IssueNumber,
+) -> Result<(), IntegrationError> {
+    if node.pointer("/pullRequest/number").and_then(Value::as_u64) != Some(number.get())
+        || node
+            .pointer("/pullRequest/repository/nameWithOwner")
+            .and_then(Value::as_str)
+            .is_none_or(|name| !name.eq_ignore_ascii_case(repository.as_str()))
+    {
+        return Err(IntegrationError::ScopeMismatch);
+    }
+    Ok(())
+}
+fn thread_head(node: &Value) -> Result<&str, IntegrationError> {
+    node.pointer("/pullRequest/headRefOid")
+        .and_then(Value::as_str)
+        .ok_or(IntegrationError::Unknown)
 }
 pub(crate) fn receipt(key: &IdempotencyKey) -> Result<Receipt, IntegrationError> {
     Receipt::new(

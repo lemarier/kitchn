@@ -133,6 +133,14 @@ closed_names! {
         IdempotentOpenPullRequest = "effect.idempotent.open_pull_request",
         /// Native same-key review idempotency, when a backend provides it.
         IdempotentReviewPullRequest = "effect.idempotent.review_pull_request",
+        /// Reconcile a marked review-thread reply.
+        LookupReplyToReviewThread = "effect.lookup.reply_to_review_thread",
+        /// Native same-key reply idempotency, when available.
+        IdempotentReplyToReviewThread = "effect.idempotent.reply_to_review_thread",
+        /// Reconcile review-thread resolution from its provider state.
+        LookupResolveReviewThread = "effect.lookup.resolve_review_thread",
+        /// Native same-key resolution idempotency, when available.
+        IdempotentResolveReviewThread = "effect.idempotent.resolve_review_thread",
         /// Look up a `ask` effect's outcome by its persisted request.
         LookupAsk = "effect.lookup.ask",
         /// Resubmitting a `ask` effect's key never repeats it.

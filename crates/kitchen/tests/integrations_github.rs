@@ -14,6 +14,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 struct Fake {
     pages: RefCell<VecDeque<std::result::Result<Vec<u8>, IntegrationError>>>,
     requests: RefCell<Vec<String>>,
+    accesses: RefCell<Vec<Option<TokenScope>>>,
 }
 impl Fake {
     fn new(pages: Vec<std::result::Result<Value, IntegrationError>>) -> Result<Self> {
@@ -27,6 +28,7 @@ impl Fake {
         Ok(Self {
             pages: RefCell::new(encoded),
             requests: RefCell::default(),
+            accesses: RefCell::default(),
         })
     }
 }
@@ -39,6 +41,7 @@ impl GitHubReadTransport for Fake {
         _: usize,
     ) -> std::result::Result<Vec<u8>, IntegrationError> {
         self.requests.borrow_mut().push(request.endpoint().into());
+        self.accesses.borrow_mut().push(request.access().cloned());
         self.pages
             .borrow_mut()
             .pop_front()
@@ -204,6 +207,68 @@ fn threads_follow_cursors_and_reject_partial_graphql_errors() -> Result {
             IssueNumber::new(1)?
         ),
         Observation::Unknown
+    );
+    Ok(())
+}
+
+#[test]
+fn follow_up_threads_preserve_bot_comments_and_refuse_truncation() -> Result {
+    // Sanitized from PR #275's reviewThreads GraphQL response. The API
+    // returns thread and comment node IDs, path, line, and author login.
+    let thread = json!({"id":"PRRT_kwDOUwEj4s6n_CJr","isResolved":false,
+        "isOutdated":false,"path":"README.md","line":183,"originalLine":183,
+        "comments":{"nodes":[{"id":"PRRC_kwDOUwEj4s73vynI",
+            "body":"Document the readiness exception.",
+            "author":{"login":"coderabbitai"}}],
+            "pageInfo":{"hasNextPage":false,"endCursor":"comment-cursor"}}});
+    let page = |node: Value| {
+        json!({"data":{"repository":{"pullRequest":{
+        "reviewThreads":{"nodes":[node],
+            "pageInfo":{"hasNextPage":false,"endCursor":"thread-cursor"}}}}}})
+    };
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![Ok(page(thread.clone()))])?,
+        ReadLimits::default(),
+    );
+    let Observation::Known(threads) = client.follow_up_threads(
+        &HouseId::new("sample")?,
+        &Repository::new("sample/project")?,
+        IssueNumber::new(275)?,
+    ) else {
+        return Err("expected complete follow-up threads".into());
+    };
+    assert_eq!(threads[0].path, "README.md");
+    assert_eq!(threads[0].line, Some(183));
+    assert_eq!(
+        threads[0].comments.nodes[0]
+            .author
+            .as_ref()
+            .map(|v| v.login.as_str()),
+        Some("coderabbitai")
+    );
+    let accesses = client.transport().accesses.borrow();
+    assert_eq!(accesses.len(), 1);
+    let access = accesses[0].as_ref().ok_or("missing token scope")?;
+    assert_eq!(access.repository(), &Repository::new("sample/project")?);
+    assert_eq!(
+        access.permissions().collect::<Vec<_>>(),
+        vec![(AppPermission::PullRequests, Access::Read)]
+    );
+    let mut truncated = thread;
+    truncated["comments"]["pageInfo"]["hasNextPage"] = json!(true);
+    let client = GitHubClient::new(
+        scope()?,
+        Fake::new(vec![Ok(page(truncated))])?,
+        ReadLimits::default(),
+    );
+    assert_eq!(
+        client.follow_up_threads(
+            &HouseId::new("sample")?,
+            &Repository::new("sample/project")?,
+            IssueNumber::new(275)?,
+        ),
+        Observation::Unavailable(IntegrationError::LimitExceeded)
     );
     Ok(())
 }

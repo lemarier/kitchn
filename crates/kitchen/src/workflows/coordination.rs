@@ -743,6 +743,16 @@ pub(crate) fn launch_rendered(
                 .iter()
                 .find(|resource| resource.kind == ResourceKind::Worker)
             else {
+                // A setup failure can end before worker-start while retaining
+                // an owned worktree receipt. Settle the attempt so cleanup can
+                // inspect that resource instead of leaving a live attempt.
+                ctx.store.finish_attempt(
+                    task,
+                    fence,
+                    attempt,
+                    AttemptOutcome::Failed(FailureClass::Retryable),
+                    ctx.clock.now(),
+                )?;
                 return Ok(LaunchOutcome::Uncertain);
             };
             let disposition = ctx.store.finish_attempt(
@@ -800,6 +810,7 @@ pub(crate) fn launch_rendered(
                 | NotAppliedReason::ConfirmedAbsent
                 | NotAppliedReason::RateLimited { .. } => FailureClass::Retryable,
                 NotAppliedReason::Unsupported(_)
+                | NotAppliedReason::WorktreeConfigDisabled
                 | NotAppliedReason::CrossHouse
                 | NotAppliedReason::ForeignBackend => FailureClass::Permanent,
             };

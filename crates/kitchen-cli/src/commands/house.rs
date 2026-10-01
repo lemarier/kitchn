@@ -17,6 +17,7 @@ use std::{
     collections::BTreeSet,
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
+    process::Command,
 };
 
 #[derive(Args)]
@@ -43,7 +44,7 @@ enum HouseCommand {
         guided: Box<super::house_init::InitArgs>,
     },
     /// Bind a repository in the registry; prompt only for house and workflows.
-    /// Nothing is written to the repository's working tree.
+    /// Can explicitly enable per-worktree Git config in the shared Git config.
     Setup {
         #[arg(long)]
         registry: PathBuf,
@@ -62,6 +63,9 @@ enum HouseCommand {
         /// Preview without storing the registry binding.
         #[arg(long)]
         preview: bool,
+        /// Enable extensions.worktreeConfig in this checkout's shared .git/config.
+        #[arg(long)]
+        enable_worktree_config: bool,
         /// Optional scoped read-only integration observations.
         #[arg(long)]
         evidence: Option<PathBuf>,
@@ -278,10 +282,14 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             house,
             workflows,
             preview,
+            enable_worktree_config,
             evidence,
             json,
         } => {
             let registry = HouseRegistry::new(canonical_root(registry)?)?;
+            if enable_worktree_config && repository.is_some() {
+                return Err(HouseError::InvalidInput.into());
+            }
             let (repository, existing) = match repository {
                 Some(repository) => {
                     let existing = registry.binding(&repository)?;
@@ -292,7 +300,8 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
                     (repository, existing)
                 }
                 None => {
-                    let start = canonical_root(repository_path.unwrap_or_else(|| ".".into()))?;
+                    let start =
+                        canonical_root(repository_path.clone().unwrap_or_else(|| ".".into()))?;
                     registry.claims(&start)?.setup_target()?
                 }
             };
@@ -338,6 +347,17 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
             };
             let house = registry.load(&config.house)?;
             config.validate(&house)?;
+            let config_root = if enable_worktree_config {
+                let start = canonical_root(repository_path.clone().unwrap_or_else(|| ".".into()))?;
+                let root = kitchen::adoption::checkout_root(&start)?;
+                let (found, _) = registry.claims(&root)?.setup_target()?;
+                if found != config.repository {
+                    return Err(HouseError::CheckoutRepositoryMismatch.into());
+                }
+                Some(root)
+            } else {
+                None
+            };
             let evidence: Option<DoctorEvidence> = evidence.as_deref().map(decode).transpose()?;
             // Scope-check observations and preview label changes before any write.
             let report = doctor(&registry, &config, evidence.as_ref())?;
@@ -356,7 +376,10 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
                 binding,
                 BindingStatus::Created | BindingStatus::Unchanged | BindingStatus::Updated
             );
-            if !preview {
+            if !preview && accepted {
+                if let Some(root) = &config_root {
+                    enable_git_worktree_config(root)?;
+                }
                 match (&existing, binding) {
                     (Some(existing), BindingStatus::Updated) => {
                         registry.configure_repository(existing, &config)?;
@@ -372,7 +395,16 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
                     preview,
                     binding,
                     written: !preview
-                        && matches!(binding, BindingStatus::Created | BindingStatus::Updated),
+                        && accepted
+                        && (matches!(binding, BindingStatus::Created | BindingStatus::Updated)
+                            || config_root.is_some()),
+                    git_config_change: config_root.as_ref().filter(|_| accepted).map(|root| {
+                        format!(
+                            "extensions.worktreeConfig=true in shared Git config for {} at {}",
+                            config.repository,
+                            root.display()
+                        )
+                    }),
                     doctor: &report,
                 })?
             } else {
@@ -385,14 +417,36 @@ pub fn run(args: HouseArgs) -> Result<(String, bool), kitchen::Error> {
                     (BindingStatus::Updated, false) => "Updated",
                 };
                 format!(
-                    "{action} {} to house {} in the registry; the working tree is unchanged.\n{}",
+                    "{action} {} to house {} in the registry; the working tree is unchanged.{}\n{}",
                     config.repository,
                     config.house,
+                    config_root.as_ref().filter(|_| accepted).map_or_else(String::new, |root| format!("\n{} extensions.worktreeConfig=true in the shared Git config for {} at {}.", if preview { "Would set" } else { "Set" }, config.repository, root.display())),
                     report.human_readable()
                 )
             };
             Ok((result, accepted))
         }
+    }
+}
+
+fn enable_git_worktree_config(root: &Path) -> Result<(), HouseError> {
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let status = command
+        .current_dir(root)
+        .args(["config", "--local", "extensions.worktreeConfig", "true"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .status()
+        .map_err(|_| HouseError::WorktreeConfigSetup)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(HouseError::WorktreeConfigSetup)
     }
 }
 /// What doctor reads besides the registry.
@@ -545,6 +599,8 @@ struct SetupReport<'a> {
     preview: bool,
     binding: BindingStatus,
     written: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_config_change: Option<String>,
     #[serde(flatten)]
     doctor: &'a DoctorReport,
 }

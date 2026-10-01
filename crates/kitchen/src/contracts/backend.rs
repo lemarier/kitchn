@@ -371,6 +371,9 @@ pub enum NotAppliedReason {
     ForeignBackend,
     /// The provider refused the request before acting.
     Rejected,
+    /// The repository owner must enable per-worktree Git configuration with
+    /// `kitchn house setup --enable-worktree-config` before a writer launch.
+    WorktreeConfigDisabled,
     /// A rate-limit refusal with a provider retry delay.
     RateLimited {
         /// Delay advertised by the provider, when it is a numeric Retry-After value.
@@ -378,6 +381,17 @@ pub enum NotAppliedReason {
     },
     /// A lookup established that the provider never applied the key.
     ConfirmedAbsent,
+}
+
+impl std::fmt::Display for NotAppliedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WorktreeConfigDisabled => f.write_str(
+                "extensions.worktreeConfig is disabled; run kitchn house setup --enable-worktree-config from this repository",
+            ),
+            other => write!(f, "{other:?}"),
+        }
+    }
 }
 
 /// Why the outcome of an effect is unknown.
@@ -426,14 +440,17 @@ impl UncertainReason {
 }
 
 /// An `execute` failure. Only [`EffectFailure::NotApplied`] proves nothing happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EffectFailure {
     /// The effect definitely did not happen.
-    #[error("effect not applied: {0:?}")]
+    #[error("effect not applied: {0}")]
     NotApplied(NotAppliedReason),
     /// The effect may or may not have happened; reconcile before retrying.
     #[error("effect outcome unknown: {0:?}")]
     Uncertain(UncertainReason),
+    /// A launch did not start a worker but created resources that cleanup owns.
+    #[error("launch ended before worker start with owned resources")]
+    Ended(Receipt),
 }
 
 /// What a backend knows about an idempotency key.

@@ -67,6 +67,7 @@ pub fn run_effect(
         Ok(receipt) => EffectOutcome::Applied(receipt),
         Err(EffectFailure::NotApplied(reason)) => EffectOutcome::NotApplied(reason),
         Err(EffectFailure::Uncertain(reason)) => EffectOutcome::Uncertain(reason),
+        Err(EffectFailure::Ended(receipt)) => EffectOutcome::Ended(receipt),
     };
     store.record_submission_outcome(
         &task,

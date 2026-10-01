@@ -156,6 +156,50 @@ fn guided_setup_asks_two_choices_and_leaves_the_tree_unchanged() -> TestResult {
 }
 
 #[test]
+fn owner_previews_and_enables_worktree_config_for_the_named_checkout() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let registry = initialize(&root)?;
+    let consumer = root.join("consumer");
+    checkout(&consumer, "https://github.com/crabnebula/tauri-fixture")?;
+    let config = consumer.join(".git/config");
+    let before = fs::read(&config)?;
+    let preview = setup(
+        &consumer,
+        &registry,
+        &["--enable-worktree-config", "--preview", "--json"],
+    )?;
+    assert_eq!(preview.status.code(), Some(0));
+    assert_eq!(fs::read(&config)?, before);
+    assert!(json(&preview)?["git_config_change"].as_str().is_some());
+    let preview_text = String::from_utf8(preview.stdout)?;
+    assert!(preview_text.contains("extensions.worktreeConfig=true"));
+    assert!(preview_text.contains("crabnebula/tauri-fixture"));
+    let applied = setup(
+        &consumer,
+        &registry,
+        &["--enable-worktree-config", "--json"],
+    )?;
+    assert_eq!(applied.status.code(), Some(0));
+    assert_eq!(
+        git(
+            &consumer,
+            &[
+                "config",
+                "--local",
+                "--bool",
+                "--get",
+                "extensions.worktreeConfig"
+            ]
+        )?
+        .trim(),
+        "true"
+    );
+    assert_ne!(fs::read(&config)?, before);
+    Ok(())
+}
+
+#[test]
 fn preview_is_read_only_and_json_doctor_does_not_claim_live_access() -> TestResult {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;

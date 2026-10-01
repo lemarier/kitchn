@@ -39,6 +39,7 @@ pub struct SimWorker {
     pub waiting: bool,
     pub task: Option<String>,
     pub worktree: Option<String>,
+    pub created_worktree: bool,
     pub branch: Option<String>,
     pub release_state: &'static str,
     pub ownership: &'static str,
@@ -102,6 +103,7 @@ impl SimWorker {
             waiting,
             task: None,
             worktree: None,
+            created_worktree: false,
             branch: None,
             release_state: "not_requested",
             ownership: "owned",
@@ -674,6 +676,7 @@ impl SimState {
                 };
                 worker.task = Some(task_id.clone());
                 worker.worktree = Some(worktree.clone());
+                worker.created_worktree = requested_worktree == "new-top-level";
                 // Orca prefixes the requested worktree name and reports the
                 // full ref; an existing worktree keeps the branch it has.
                 worker.branch = match flags.get("name") {
@@ -790,7 +793,7 @@ impl SimState {
                             "state": worker.worker_state,
                             "stage": worker.stage_detail(),
                             "lastError": worker.last_error,
-                            "effects": worker.worktree.iter().map(|id| json!({
+                            "effects": worker.worktree.iter().filter(|_| worker.created_worktree).map(|id| json!({
                                 "kind": "worktree", "action": "created_top_level", "id": id,
                             })).collect::<Vec<_>>(),
                         },
@@ -849,28 +852,34 @@ impl SimState {
             }
             ["worktree", "list"] => {
                 let rows: Vec<Value> = self
-                    .workers
-                    .values()
-                    .filter_map(|worker| {
-                        worker
-                            .worktree
-                            .as_ref()
-                            .map(|id| json!({"id": id, "branch": worker.branch}))
+                    .identity_repo
+                    .iter()
+                    .map(|path| {
+                        json!({"id": "main", "path": path, "isMainWorktree": true,
+                        "branch": "refs/heads/main"})
                     })
                     .chain(
-                        self.worktrees
-                            .iter()
-                            .map(|(id, branch)| json!({"id": id, "branch": branch})),
-                    )
-                    .chain(
-                        self.identity_worktree
-                            .iter()
-                            .map(|(id, branch, comment, path)| {
-                                json!({
-                                    "id": id, "branch": branch, "comment": comment,
-                                    "path": path, "isMainWorktree": false,
-                                })
-                            }),
+                        self.workers
+                            .values()
+                            .filter_map(|worker| {
+                                worker
+                                    .worktree
+                                    .as_ref()
+                                    .map(|id| json!({"id": id, "branch": worker.branch}))
+                            })
+                            .chain(
+                                self.worktrees
+                                    .iter()
+                                    .map(|(id, branch)| json!({"id": id, "branch": branch})),
+                            )
+                            .chain(self.identity_worktree.iter().map(
+                                |(id, branch, comment, path)| {
+                                    json!({
+                                        "id": id, "branch": branch, "comment": comment,
+                                        "path": path, "isMainWorktree": false,
+                                    })
+                                },
+                            )),
                     )
                     .collect();
                 ok(json!({
@@ -905,6 +914,36 @@ impl SimState {
                 self.identity_worktree = Some((id.clone(), branch.clone(), comment, path));
                 self.effects += 1;
                 ok(json!({"worktree": {"id": id, "branch": branch}}))
+            }
+            ["worktree", "rm"] => {
+                let selector = Self::flag(flags, "worktree");
+                let Some((id, branch, _, path)) = self.identity_worktree.as_ref() else {
+                    return refuse("worktree_not_found");
+                };
+                if selector != format!("id:{id}") {
+                    return refuse("worktree_not_found");
+                }
+                if let Some(repo) = &self.identity_repo {
+                    let removed = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(repo)
+                        .args(["worktree", "remove"])
+                        .arg(path)
+                        .status();
+                    if !removed.is_ok_and(|status| status.success()) {
+                        return refuse("worktree_remove_failed");
+                    }
+                    if let Some(branch) = branch.strip_prefix("refs/heads/") {
+                        let _ = std::process::Command::new("git")
+                            .arg("-C")
+                            .arg(repo)
+                            .args(["branch", "-D", branch])
+                            .status();
+                    }
+                }
+                self.identity_worktree = None;
+                self.effects += 1;
+                ok(json!({"state": "removed"}))
             }
             ["orchestration", "worker-read"] => {
                 let dispatch = Self::flag(flags, "dispatch");

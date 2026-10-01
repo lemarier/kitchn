@@ -402,6 +402,7 @@ impl Reread {
 pub fn not_applied(reason: NotAppliedReason) -> String {
     match reason {
         NotAppliedReason::Rejected => "rejected; check the token's account and access".to_owned(),
+        NotAppliedReason::WorktreeConfigDisabled => "worktree Git config is disabled; run kitchn house setup --enable-worktree-config for this repository".to_owned(),
         NotAppliedReason::RateLimited {
             retry_after: Some(delay),
         } => format!("rate limited; retry after {}s", delay.as_secs()),

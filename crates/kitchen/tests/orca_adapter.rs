@@ -436,6 +436,7 @@ fn identity_launch_configures_the_worktree_before_worker_start() -> TestResult {
             "base",
         ],
     )?;
+    let config_before = std::fs::read(main.join(".git/config"))?;
     let sim = SimOrca::default();
     {
         let mut state = sim.state();
@@ -455,7 +456,21 @@ fn identity_launch_configures_the_worktree_before_worker_start() -> TestResult {
         agent: None,
     };
     let launch_request = request(effect, "identity-launch")?;
+    assert!(matches!(
+        backend.execute(&launch_request),
+        Err(EffectFailure::NotApplied(
+            NotAppliedReason::WorktreeConfigDisabled
+        ))
+    ));
+    assert_eq!(std::fs::read(main.join(".git/config"))?, config_before);
+    assert!(sim.calls_to(&["worktree", "create"]).is_empty());
+    git(
+        &main,
+        &["config", "--local", "extensions.worktreeConfig", "true"],
+    )?;
+    let config_before = std::fs::read(main.join(".git/config"))?;
     let receipt = backend.execute(&launch_request)?;
+    assert_eq!(std::fs::read(main.join(".git/config"))?, config_before);
     assert!(sim.state().identity_seen_at_start);
     assert_eq!(git(&main, &["config", "user.name"])?, "Person");
     assert_eq!(git(&worker_path, &["config", "user.name"])?, "house[bot]");
@@ -471,6 +486,12 @@ fn identity_launch_configures_the_worktree_before_worker_start() -> TestResult {
             .created()
             .iter()
             .any(|item| item.kind == ResourceKind::Worktree)
+    );
+    assert!(
+        !receipt
+            .touched()
+            .iter()
+            .any(|item| item.kind == ResourceKind::Branch)
     );
     let repeated = backend.execute(&launch_request)?;
     assert_eq!(repeated, receipt);
@@ -499,7 +520,31 @@ fn identity_launch_configures_the_worktree_before_worker_start() -> TestResult {
         },
         "identity-follow-up",
     )?;
-    backend.execute(&resumed)?;
+    let resumed_receipt = backend.execute(&resumed)?;
+    assert!(
+        !resumed_receipt
+            .created()
+            .iter()
+            .any(|item| item.kind == ResourceKind::Branch)
+    );
+    assert!(
+        !resumed_receipt
+            .created()
+            .iter()
+            .any(|item| item.kind == ResourceKind::Worktree)
+    );
+    assert!(
+        resumed_receipt
+            .touched()
+            .iter()
+            .any(|item| item.kind == ResourceKind::Branch)
+    );
+    assert!(
+        resumed_receipt
+            .touched()
+            .iter()
+            .any(|item| item.kind == ResourceKind::Worktree)
+    );
     let resumed_base =
         kitchen::adapters::orca::read_writer_base(&sim.runtime_dir()?, resumed.key())?;
     assert!(!resumed_base.created);
@@ -507,19 +552,59 @@ fn identity_launch_configures_the_worktree_before_worker_start() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn identity_setup_failure_never_starts_a_worker_or_creates_a_second_worktree() -> TestResult {
+fn failed_identity_launch(removal_refused: bool, base_write_failure: bool) -> TestResult {
+    use std::process::Command;
     let temp = tempfile::tempdir()?;
-    let empty = temp.path().join("empty");
-    std::fs::create_dir(&empty)?;
+    let main = temp.path().join("main");
+    let worker = temp.path().join("worker");
+    std::fs::create_dir(&main)?;
+    let git = |args: &[&str]| -> TestResult<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    };
+    git(&["init", "-q", "-b", "main"])?;
+    git(&[
+        "-c",
+        "user.name=Person",
+        "-c",
+        "user.email=person@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "base",
+    ])?;
+    git(&["config", "--local", "extensions.worktreeConfig", "true"])?;
     let sim = SimOrca::default();
     {
         let mut state = sim.state();
-        state.identity_path = Some(empty);
+        state.identity_repo = Some(main.clone());
+        state.identity_path = Some(worker.clone());
         state.branch_prefix = "lemarier/";
     }
+    if removal_refused {
+        sim.fault_on(&["worktree", "rm"], Fault::Refuse("busy"));
+    }
+    if base_write_failure {
+        std::fs::write(sim.runtime_dir()?.join("writer-bases"), "blocked")?;
+    }
     let backend = connect(&sim)?.with_writer_identity(
-        "house[bot]".into(),
+        if base_write_failure {
+            "house[bot]"
+        } else {
+            "invalid\nname"
+        }
+        .into(),
         "123+house[bot]@users.noreply.github.com".into(),
     );
     let request = request(
@@ -532,17 +617,66 @@ fn identity_setup_failure_never_starts_a_worker_or_creates_a_second_worktree() -
         },
         "identity-setup-failure",
     )?;
-    assert!(matches!(
-        backend.execute(&request),
-        Err(EffectFailure::Uncertain(_))
-    ));
-    assert!(matches!(
-        backend.execute(&request),
-        Err(EffectFailure::Uncertain(_))
-    ));
+    let result = backend.execute(&request);
+    if removal_refused {
+        let Err(EffectFailure::Ended(receipt)) = result else {
+            return Err("failed removal did not return an owned receipt".into());
+        };
+        assert!(
+            receipt
+                .created()
+                .iter()
+                .any(|item| item.kind == ResourceKind::Worktree)
+        );
+    } else {
+        assert!(matches!(result, Err(EffectFailure::Uncertain(_))));
+    }
     assert_eq!(sim.calls_to(&["worktree", "create"]).len(), 1);
+    assert_eq!(sim.calls_to(&["worktree", "rm"]).len(), 1);
     assert!(sim.calls_to(&["orchestration", "worker-start"]).is_empty());
+    if removal_refused {
+        assert!(worker.exists());
+        let Lookup::Ended(receipt) = backend.lookup(&request)? else {
+            return Err("undispatched worktree did not retain ownership".into());
+        };
+        assert!(
+            receipt
+                .created()
+                .iter()
+                .any(|item| item.kind == ResourceKind::Worktree)
+        );
+        assert!(
+            receipt
+                .created()
+                .iter()
+                .any(|item| item.kind == ResourceKind::Branch)
+        );
+    } else {
+        assert!(!worker.exists());
+        assert_eq!(
+            git(&["worktree", "list", "--porcelain"])?
+                .matches("worktree ")
+                .count(),
+            1
+        );
+        assert_eq!(git(&["branch", "--list", "lemarier/issue-1"])?, "");
+    }
     Ok(())
+}
+
+#[test]
+fn identity_setup_failure_removes_an_unused_worktree() -> TestResult {
+    failed_identity_launch(false, false)
+}
+
+#[test]
+fn identity_setup_failed_removal_retains_an_owned_receipt() -> TestResult {
+    failed_identity_launch(true, false)
+}
+
+#[test]
+fn writer_base_failure_removes_an_unused_worktree() -> TestResult {
+    failed_identity_launch(false, true)
 }
 
 #[test]
@@ -3127,7 +3261,9 @@ fn a_branch_an_orca_worktree_holds_is_refused_before_anything_is_created() -> Te
     )?;
     let listed = sim.calls_to(&["worktree", "list"]).len();
     let receipt = backend.execute(&reuse)?;
-    verify_branch(&receipt, "lemarier/issue-6")?;
+    assert!(receipt.touched().iter().any(|resource| {
+        resource.kind == ResourceKind::Branch && resource.handle.as_str() == "lemarier/issue-6"
+    }));
     assert_eq!(
         sim.calls_to(&["worktree", "list"]).len(),
         listed,

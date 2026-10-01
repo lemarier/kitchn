@@ -68,6 +68,11 @@ earned, never assumed.
 Each [role card](roles/) lists what the station owes as evidence and the line it
 can't cross.
 
+For supervised work, the house writer GitHub App authors worker commits and
+opens the pull request. A separate GitHub identity, currently a person,
+reviews and attests it. Kitchen sets the writer identity in each launched
+worktree and refuses a push with a foreign author or committer.
+
 The dishwasher recognizes a reconciled stopped launch as creation evidence.
 After a retry, it checks the worker and worktree from each attempt for backend
 ownership, settlement, and preserved work before an approved release.

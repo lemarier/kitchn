@@ -175,6 +175,16 @@ fn an_app_binding_shows_its_key_file_and_needs_both_ids() -> TestResult {
     );
     let registry = fixture.home.join(".kitchn");
     let registry_arg = registry.display().to_string();
+    let gh = fixture.root.join("bin/gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '%s\\n' '{\"id\":336054063,\"login\":\"kitchn-app[bot]\",\"type\":\"Bot\"}'\n",
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))?;
+    }
     let bind = |requester: &str, ids: &[&str]| {
         let mut args = vec![
             "forge",
@@ -461,6 +471,7 @@ mod apply {
                         requester: ExternalRef::new("acme-bot")?,
                         credential: CredentialId::new("github")?,
                         credential_kind: CredentialKind::Token,
+                        bot_user_id: None,
                         posting_budget: PostingBudget::new(5)?,
                     },
                 )?;

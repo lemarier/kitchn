@@ -131,6 +131,7 @@ mod runtime;
 mod schedule;
 mod signals;
 mod wire;
+mod writer;
 
 pub use accounts::{ACCOUNT_LIST_TIMEOUT, ManagedAccounts, managed_accounts};
 pub use backend::{
@@ -154,3 +155,4 @@ pub use signals::{
     AgentPrompt, DispatchActivity, MAX_ARCHIVE_PAGES, ProviderErrorClass, SIGNAL_WINDOW_ROWS,
     StartOutcome, StartWindow, TerminalOwner, TranscriptProgress, WorkerSignals,
 };
+pub use writer::{WriterBase, WriterBaseError, read_writer_base, record_writer_base};

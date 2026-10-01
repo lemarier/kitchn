@@ -22,7 +22,7 @@ use kitchen::{
         Capability, Clock, ExternalRef, GrantScope, HouseGrants, Permission, Repository,
         SystemClock, TaskAuthority, Text,
     },
-    house::{CredentialKind, checked_forge_credential, forge_binding, runtime_config},
+    house::{CredentialKind, checked_forge_credential, runtime_config},
     integrations::github::{
         GitHubClient, GitHubExecutor, HouseScope, IntegrationError, PushPreflight, ReadLimits,
     },
@@ -117,7 +117,7 @@ impl PushArgs {
             .clone()
             .ok_or(kitchen::integrations::github::IntegrationError::InvalidInput)?;
         let grants = house.authority()?;
-        let binding = forge_binding(&registry, &self.house)?;
+        let binding = super::forge::writer_binding(&registry, &self.house)?;
         require_app_binding(binding.credential_kind)?;
         let scope = binding.scope(&house)?;
         authorize_delivery(
@@ -265,7 +265,38 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
     {
         return Err(IntegrationError::PushPreflight(PushPreflight::Checkout).into());
     }
-    let binding = forge_binding(&selected.registry, &args.house)?;
+    let worker = current_worker(&selected.record)
+        .ok_or(IntegrationError::PushPreflight(PushPreflight::Worker))?;
+    let launch = selected
+        .record
+        .effects()
+        .iter()
+        .rev()
+        .find(|effect| {
+            effect.request().attempt() == worker.attempt
+                && matches!(
+                    effect.request().effect(),
+                    kitchen::contracts::Effect::Worker(
+                        kitchen::contracts::Operation::LaunchWorker { .. }
+                    )
+                )
+                && matches!(effect.state(), kitchen::state::EffectState::Applied { .. })
+        })
+        .ok_or(kitchen::workflows::push::PushWriterError::UnknownHistory)?;
+    let writer_base =
+        kitchen::adapters::orca::read_writer_base(&runtime.runtime_dir, launch.request().key())
+            .map_err(|_| kitchen::workflows::push::PushWriterError::UnknownHistory)?;
+    if writer_base.house != args.house
+        || writer_base.worktree.as_str() != worktree_id.as_str()
+        || writer_base.branch != branch
+    {
+        return Err(kitchen::workflows::push::PushWriterError::UnknownHistory.into());
+    }
+    let binding = super::forge::writer_binding(&selected.registry, &args.house)?;
+    let (writer_name, writer_email) = binding
+        .writer_identity()
+        .ok_or(kitchen::workflows::push::PushWriterError::MissingIdentity)?;
+    remote.verify_writer(&writer_base.base, &writer_name, &writer_email)?;
     let gh = connect_gh(checked_forge_credential(&selected.registry, &binding)?)?;
     let remote = remote.with_push_credential(gh.clone(), binding.credential_ref());
     let client = GitHubClient::new(binding.scope(&selected.house)?, gh, ReadLimits::default());

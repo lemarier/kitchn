@@ -37,7 +37,7 @@ use std::{
 };
 
 use crate::{
-    BackendId, EffectName, HouseId, TaskId, WorkflowId,
+    BackendId, EffectName, ErrorClass, HouseId, TaskId, WorkflowId,
     contracts::{
         BranchName, Clock, CommitId, Effect, ExternalRef, Fence, GitHubAction, GitHubMutation,
         GrantScope, HouseGrants, IssueNumber, Operation, Permission, Repository, ResourceKind,
@@ -60,6 +60,41 @@ use crate::{
         repair::{Observed, PullRequestState, PullRequestView, observe_pull_request},
     },
 };
+
+/// A branch cannot be delivered unless every new commit has the bound house
+/// writer as both author and committer.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PushWriterError {
+    /// The app binding has no verified bot ID.
+    #[error(
+        "house forge binding has no verified bot user ID; rebind the app before worker delivery"
+    )]
+    MissingIdentity,
+    /// The branch history could not be established within the Git bounds.
+    #[error(
+        "cannot establish the branch commits from its base; inspect the checkout before retrying"
+    )]
+    UnknownHistory,
+    /// One or more commits were written by another identity.
+    #[error(
+        "commits {commits:?} do not have the house writer as both author and committer; amend each with `git commit --amend --reset-author` under the worktree identity, or rebase them"
+    )]
+    ForeignCommits {
+        /// Offending branch commits, ordered newest first.
+        commits: Vec<CommitId>,
+    },
+}
+
+impl PushWriterError {
+    /// Broad handling class.
+    #[must_use]
+    pub const fn class(&self) -> ErrorClass {
+        match self {
+            Self::MissingIdentity | Self::ForeignCommits { .. } => ErrorClass::Refused,
+            Self::UnknownHistory => ErrorClass::Execution,
+        }
+    }
+}
 
 /// The durable result of opening a task's pull request. An uncertain result
 /// must be reconciled before another submission.
@@ -1064,6 +1099,64 @@ impl GitRemote {
             branch,
             CommitId::new(String::from_utf8(head).ok()?.trim()).ok()?,
         ))
+    }
+
+    /// Verify the commits unique to this checkout against the house writer.
+    /// The trusted launch record supplies the base. A missing base or
+    /// incomplete Git answer refuses delivery.
+    pub fn verify_writer(
+        &self,
+        base: &CommitId,
+        name: &str,
+        email: &str,
+    ) -> std::result::Result<(), PushWriterError> {
+        let range = format!("{}..HEAD", base.as_str());
+        let (Some(0), _) = self
+            .run(&["merge-base", "--is-ancestor", base.as_str(), "HEAD"])
+            .ok_or(PushWriterError::UnknownHistory)?
+        else {
+            return Err(PushWriterError::UnknownHistory);
+        };
+        let (Some(0), output) = self
+            .run(&[
+                "log",
+                "-z",
+                "--format=%H%x00%an%x00%ae%x00%cn%x00%ce",
+                &range,
+            ])
+            .ok_or(PushWriterError::UnknownHistory)?
+        else {
+            return Err(PushWriterError::UnknownHistory);
+        };
+        if output.is_empty() {
+            return Ok(());
+        }
+        if output.last() != Some(&0) {
+            return Err(PushWriterError::UnknownHistory);
+        }
+        let mut fields: Vec<&[u8]> = output.split(|byte| *byte == 0).collect();
+        fields.pop();
+        if !fields.len().is_multiple_of(5) {
+            return Err(PushWriterError::UnknownHistory);
+        }
+        let mut commits = Vec::new();
+        for record in fields.as_chunks::<5>().0 {
+            let sha =
+                std::str::from_utf8(record[0]).map_err(|_| PushWriterError::UnknownHistory)?;
+            let sha = CommitId::new(sha).map_err(|_| PushWriterError::UnknownHistory)?;
+            if record[1] != name.as_bytes()
+                || record[2] != email.as_bytes()
+                || record[3] != name.as_bytes()
+                || record[4] != email.as_bytes()
+            {
+                commits.push(sha);
+            }
+        }
+        if commits.is_empty() {
+            Ok(())
+        } else {
+            Err(PushWriterError::ForeignCommits { commits })
+        }
     }
 
     /// Longest remote name accepted, in bytes.

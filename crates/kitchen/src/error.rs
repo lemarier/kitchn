@@ -44,6 +44,9 @@ pub enum Error {
     /// A house-scoped integration failed.
     #[error(transparent)]
     Integration(#[from] crate::integrations::github::IntegrationError),
+    /// A worker branch has an unverified or foreign commit writer.
+    #[error(transparent)]
+    PushWriter(#[from] crate::workflows::push::PushWriterError),
     /// A template, rendering, or scaffold planning operation failed.
     #[error(transparent)]
     Scaffold(#[from] ScaffoldError),
@@ -126,6 +129,7 @@ impl Error {
             Self::Orca(error) => error.class(),
             Self::House(error) => error.class(),
             Self::Integration(error) => error.class(),
+            Self::PushWriter(error) => error.class(),
             Self::Scaffold(error) => error.class(),
             Self::Cleanup(error) => error.class(),
             Self::Decomposition(error) => error.class(),

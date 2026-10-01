@@ -219,6 +219,13 @@ key. Each write then runs with an installation token limited to its repository
 and the permissions it needs, minted with `curl` and refreshed before it
 expires. A write to a repository the installation does not cover is refused
 before anything is written, naming the repository.
+For an app binding, `bind` reads `GET /users/<app-slug>[bot]` and stores its
+numeric bot user ID with the binding. Worker commits use the app login as
+`user.name` and `<bot-user-id>+<app-slug>[bot]@users.noreply.github.com` as
+`user.email` in their own Git worktree. A missing or mismatched bot lookup
+refuses the bind. A worker launch or push reads GitHub and records the ID in
+an older app binding that lacks it; a failed lookup leaves that binding as it
+was and refuses the worker action.
 
 `--posting-budget` caps the writes one task may make (0 to 100). House policy
 limits for forge writes must name the credential. `show` exits 1 when the token
@@ -241,6 +248,11 @@ the app installation must cover the task repository. Kitchen requests an
 installation token limited to that repository and contents write. A house
 bound to a personal token is refused before that credential is read or passed
 to a child process. Before updating the branch, Kitchen also checks that the
+branch commits since the launch base recorded outside the worktree name the house writer as both author and
+committer. A foreign commit is refused with its SHA; amend it under the
+worktree identity with `git commit --amend --reset-author`, or rebase the
+branch. Kitchen sets the identity before starting an Orca worker; the worker
+must not change it. Kitchen also checks that the
 task's push and pull request grants use the bound forge credential and that
 the forge scope permits both effects. If either check fails, correct the house
 grant or forge binding before retrying. `--acceptance-done` requires the

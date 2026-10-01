@@ -607,6 +607,7 @@ pub fn plan_house_init(
                     requester,
                     credential,
                     credential_kind: CredentialKind::Token,
+                    bot_user_id: None,
                     posting_budget: PostingBudget::new(DEFAULT_POSTING_BUDGET)
                         .map_err(|_| HouseError::InvalidInput)?,
                 })

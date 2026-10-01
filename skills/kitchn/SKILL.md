@@ -159,7 +159,10 @@ consenting to a release.
 
 When a Kitchen launch brief names a `Push:` command, run that exact command
 from the launched worktree after committing and completing the required checks.
-It checks the task's branch, worktree, grants, forge scope, and live remote state, then pushes
+Keep the Git author and committer identity Kitchen set for that worktree. The
+house writer authors every worker commit and opens the PR; a different GitHub
+identity reviews and attests it. The command checks each branch commit's author
+and committer, the task's branch, worktree, grants, forge scope, and live remote state, then pushes
 with a repository-scoped GitHub App installation token and opens a pull request.
 The house must use `kitchn forge bind --app-id ... --installation ...`;
 a personal-token binding is refused before its credential is read. Do not call

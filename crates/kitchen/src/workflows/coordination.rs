@@ -672,7 +672,7 @@ pub(crate) fn launch_rendered(
         .to_str()
         .ok_or(CoordinationError::InvalidBriefArgument)?;
     let push_command = format!(
-        "Push: run {} push --store {} --house {} --task {} from this worktree after committing; it pushes with the house forge credential and opens the pull request. Add `--acceptance-done` only when your evidence report contains `Acceptance: done` after checking every item; otherwise the pull request says `Part of` the issue.",
+        "Push: run {} push --store {} --house {} --task {} from this worktree after committing; it pushes with the house forge credential and opens the pull request. Keep the Git author and committer identity Kitchen set on this worktree; do not change it. Add `--acceptance-done` only when your evidence report contains `Acceptance: done` after checking every item; otherwise the pull request says `Part of` the issue.",
         shell_quote(executable),
         shell_quote(&ctx.store.dir().to_string_lossy()),
         ctx.store.house(),

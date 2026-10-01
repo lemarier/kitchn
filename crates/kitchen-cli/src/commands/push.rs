@@ -34,7 +34,7 @@ use kitchen::{
         push::{
             GitHubPullRequests, GitHubRemoteBranches, GitRemote, IsolatedGitConfig, OpenOutcome,
             OpenRequest, PullRequests, PushBoundary, PushIntent, PushOutcome, delivery_worker_live,
-            open_task_pull_request, owns_worktree,
+            launch_worktree, open_task_pull_request,
         },
         repair::Observed,
         stack::{LayerText, PullRequestText},
@@ -227,7 +227,7 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
         return Err(IntegrationError::PushPreflight(PushPreflight::WorktreePath).into());
     }
     let worktree_id = ExternalRef::new(worktree_id)?;
-    if !owns_worktree(&selected.record, &worktree_id) {
+    if !launch_worktree(&selected.record, &worktree_id) {
         return Err(IntegrationError::PushPreflight(PushPreflight::WorktreeOwnership).into());
     }
     if worktree["projectId"].as_str() != Some(&format!("github:{}", selected.repository)) {
@@ -296,7 +296,6 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
     let (writer_name, writer_email) = binding
         .writer_identity()
         .ok_or(kitchen::workflows::push::PushWriterError::MissingIdentity)?;
-    remote.verify_writer(&writer_base.base, &writer_name, &writer_email)?;
     let gh = connect_gh(checked_forge_credential(&selected.registry, &binding)?)?;
     let remote = remote.with_push_credential(gh.clone(), binding.credential_ref());
     let client = GitHubClient::new(binding.scope(&selected.house)?, gh, ReadLimits::default());
@@ -305,6 +304,15 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
         house: &args.house,
         repository: &selected.repository,
     };
+    let Observed::Known(default_branch) = reads.default_branch() else {
+        return Err(kitchen::workflows::push::PushWriterError::UnknownHistory.into());
+    };
+    let kitchen::integrations::github::Observation::Known(default_tip) =
+        client.branch_tip(&args.house, &selected.repository, &default_branch)
+    else {
+        return Err(kitchen::workflows::push::PushWriterError::UnknownHistory.into());
+    };
+    remote.verify_writer(&head, &default_tip, &writer_name, &writer_email)?;
     let remote_reads = GitHubRemoteBranches {
         git: &remote,
         client: &client,

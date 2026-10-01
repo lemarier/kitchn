@@ -1387,7 +1387,7 @@ mod git_remote {
     }
 
     #[test]
-    fn worker_push_checks_every_author_and_committer_from_base() -> TestResult {
+    fn worker_push_checks_every_author_and_committer_unique_to_branch() -> TestResult {
         use kitchen::workflows::push::PushWriterError;
 
         let repos = fresh_repos()?;
@@ -1396,11 +1396,12 @@ mod git_remote {
         assert_eq!(
             remote.verify_writer(
                 &missing,
+                &missing,
                 "house[bot]",
                 "123+house[bot]@users.noreply.github.com"
             ),
             Err(PushWriterError::UnknownHistory),
-            "an unborn base cannot prove the branch history"
+            "missing commits cannot prove the branch history"
         );
         let base = commit_in(&repos.worker, "base")?;
         git(&repos.worker, &["push", "origin", "HEAD:main"])?;
@@ -1414,7 +1415,9 @@ mod git_remote {
         let mut commit = bot.to_vec();
         commit.extend(["commit", "--allow-empty", "-m", "bot change"]);
         git(&repos.worker, &commit)?;
+        let head = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
         remote.verify_writer(
+            &head,
             &base,
             "house[bot]",
             "123+house[bot]@users.noreply.github.com",
@@ -1433,6 +1436,7 @@ mod git_remote {
         let sha = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
         assert_eq!(
             remote.verify_writer(
+                &sha,
                 &base,
                 "house[bot]",
                 "123+house[bot]@users.noreply.github.com"
@@ -1448,7 +1452,9 @@ mod git_remote {
             "--no-edit",
         ]);
         git(&repos.worker, &amend)?;
+        let head = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
         remote.verify_writer(
+            &head,
             &base,
             "house[bot]",
             "123+house[bot]@users.noreply.github.com",
@@ -1478,12 +1484,109 @@ mod git_remote {
         let sha = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
         assert_eq!(
             remote.verify_writer(
+                &sha,
                 &base,
                 "house[bot]",
                 "123+house[bot]@users.noreply.github.com"
             ),
             Err(PushWriterError::ForeignCommits { commits: vec![sha] })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn writer_check_uses_captured_head_and_ignores_replace_objects() -> TestResult {
+        use kitchen::workflows::push::PushWriterError;
+
+        let repos = fresh_repos()?;
+        let base = commit_in(&repos.worker, "base")?;
+        let foreign = commit_in(&repos.worker, "foreign")?;
+        let remote = remote_for(&repos)?;
+        let bot = [
+            "-c",
+            "user.name=house[bot]",
+            "-c",
+            "user.email=123+house[bot]@users.noreply.github.com",
+        ];
+        git(&repos.worker, &["checkout", "--detach", base.as_str()])?;
+        let mut args = bot.to_vec();
+        args.extend(["commit", "--allow-empty", "-m", "replacement"]);
+        git(&repos.worker, &args)?;
+        let replacement = git(&repos.worker, &["rev-parse", "HEAD"])?;
+        git(&repos.worker, &["replace", foreign.as_str(), &replacement])?;
+        assert_eq!(
+            remote.verify_writer(
+                &foreign,
+                &base,
+                "house[bot]",
+                "123+house[bot]@users.noreply.github.com"
+            ),
+            Err(PushWriterError::ForeignCommits {
+                commits: vec![foreign.clone()]
+            })
+        );
+        let mut args = bot.to_vec();
+        args.extend(["commit", "--allow-empty", "-m", "moved head"]);
+        git(&repos.worker, &args)?;
+        assert_eq!(
+            remote.verify_writer(
+                &foreign,
+                &base,
+                "house[bot]",
+                "123+house[bot]@users.noreply.github.com"
+            ),
+            Err(PushWriterError::ForeignCommits {
+                commits: vec![foreign]
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn writer_check_accepts_rebase_and_merge_of_updated_main() -> TestResult {
+        let repos = fresh_repos()?;
+        let base = commit_in(&repos.worker, "base")?;
+        git(&repos.worker, &["push", "origin", "HEAD:main"])?;
+        git(&repos.other, &["fetch", "origin", "main"])?;
+        git(&repos.other, &["checkout", "-B", "main", "FETCH_HEAD"])?;
+        let main_tip = commit_in(&repos.other, "new main")?;
+        git(&repos.other, &["push", "origin", "main"])?;
+        git(&repos.worker, &["fetch", "origin", "main"])?;
+        let bot = [
+            "-c",
+            "user.name=house[bot]",
+            "-c",
+            "user.email=123+house[bot]@users.noreply.github.com",
+        ];
+        let mut args = bot.to_vec();
+        args.extend(["commit", "--allow-empty", "-m", "task"]);
+        git(&repos.worker, &args)?;
+        let remote = remote_for(&repos)?;
+        let mut args = bot.to_vec();
+        args.extend(["rebase", main_tip.as_str()]);
+        git(&repos.worker, &args)?;
+        let rebased = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
+        assert_ne!(base, rebased);
+        remote.verify_writer(
+            &rebased,
+            &main_tip,
+            "house[bot]",
+            "123+house[bot]@users.noreply.github.com",
+        )?;
+        git(&repos.worker, &["reset", "--hard", base.as_str()])?;
+        let mut args = bot.to_vec();
+        args.extend(["commit", "--allow-empty", "-m", "task merged"]);
+        git(&repos.worker, &args)?;
+        let mut args = bot.to_vec();
+        args.extend(["merge", "--no-ff", "--no-edit", main_tip.as_str()]);
+        git(&repos.worker, &args)?;
+        let merged = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
+        remote.verify_writer(
+            &merged,
+            &main_tip,
+            "house[bot]",
+            "123+house[bot]@users.noreply.github.com",
+        )?;
         Ok(())
     }
 

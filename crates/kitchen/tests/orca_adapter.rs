@@ -3621,6 +3621,23 @@ fn an_existing_workspace_is_verified_not_renamed() -> TestResult {
 }
 
 #[test]
+fn pre_identity_launch_reconciles_without_writer_base() -> TestResult {
+    let sim = SimOrca::default();
+    sim.state().existing_branch = Some("lemarier/issue-6");
+    let request = request(
+        launch_on("lemarier/issue-6", Workspace::Existing(worktree("wt-9")?))?,
+        "pre-identity",
+    )?;
+    let original = connect(&sim)?.execute(&request)?;
+    let upgraded = connect(&sim)?.with_writer_identity(
+        "house[bot]".into(),
+        "123+house[bot]@users.noreply.github.com".into(),
+    );
+    assert_eq!(upgraded.lookup(&request)?, Lookup::Applied(original));
+    Ok(())
+}
+
+#[test]
 fn an_unusable_existing_workspace_is_refused_before_a_task_exists() -> TestResult {
     let sim = SimOrca::default();
     let backend = connect(&sim)?;

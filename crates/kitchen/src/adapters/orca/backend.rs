@@ -1640,8 +1640,12 @@ impl<R: OrcaRunner> OrcaBackend<R> {
         if self.writer_identity.is_none() {
             return Some(receipt);
         }
-        let recorded =
-            crate::adapters::orca::read_writer_base(&self.config.runtime_dir, key).ok()?;
+        let recorded = match crate::adapters::orca::read_writer_base(&self.config.runtime_dir, key)
+        {
+            Ok(recorded) => recorded,
+            Err(crate::adapters::orca::WriterBaseError::NotFound) => return Some(receipt),
+            Err(_) => return None,
+        };
         let mut created = receipt.created().to_vec();
         if !recorded.created {
             let mut touched = receipt.touched().to_vec();

@@ -165,7 +165,7 @@ fn github_bot_id(
     );
     let mut command = Command::new(gh);
     command
-        .args(["api", &endpoint])
+        .args(["api", "--hostname", "github.com", &endpoint])
         .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -484,7 +484,7 @@ mod tests {
         let login = ExternalRef::new("kitchn-expediter[bot]")?;
         fake_gh(
             temp.path(),
-            "#!/bin/sh\nprintf '%s\\n' '{\"id\":336054063,\"login\":\"kitchn-expediter[bot]\",\"type\":\"Bot\"}'\n",
+            "#!/bin/sh\n[ \"$1\" = api ] && [ \"$2\" = --hostname ] && [ \"$3\" = github.com ] || exit 1\nprintf '%s\\n' '{\"id\":336054063,\"login\":\"kitchn-expediter[bot]\",\"type\":\"Bot\"}'\n",
         )?;
         assert_eq!(github_bot_id(Some(path.clone()), &login)?, 336054063);
         fake_gh(

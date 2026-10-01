@@ -47,7 +47,7 @@ use crate::{
         BranchName, Capability, Claimant, Clock, Consent, ContractError, DecisionBinding,
         DecisionOwner, Disposition, Effect, EffectExecutor, Evidence, EvidenceKind,
         EvidenceRevision, EvidenceVerdict, ExternalRef, FailureClass, Fence, HouseGrants, LeaseTtl,
-        NotAppliedReason, Operation, Permission, PostingBudget, ResourceKind, ResourceRef,
+        NotAppliedReason, Operation, Permission, PostingBudget, Receipt, ResourceKind, ResourceRef,
         RogerAsk, RogerEffect, Settlement, Text, Timestamp, Trigger, UncertainReason,
         WorkerBackend, WorkerOutcome, WorkerState, Workspace,
     },
@@ -779,16 +779,7 @@ pub(crate) fn launch_rendered(
             // The backend checks its own branch naming rule before returning
             // an applied receipt. Require a valid reported branch here too;
             // later push and gate decisions use this durable actual name.
-            let mut branches = receipt
-                .created()
-                .iter()
-                .filter(|resource| resource.kind == ResourceKind::Branch);
-            let actual = match (branches.next(), branches.next()) {
-                (Some(resource), None) if resource.backend == ctx.backend.descriptor().backend => {
-                    BranchName::new(resource.handle.as_str()).ok()
-                }
-                _ => None,
-            };
+            let actual = receipt_branch(receipt, &ctx.backend.descriptor().backend);
             let wrong_branch = actual.as_ref().is_none_or(|actual| {
                 !ctx.backend
                     .accepts_launch_branch(branch, actual, &workspace)
@@ -931,6 +922,20 @@ pub struct WorkerView {
     pub branch: Option<BranchName>,
 }
 
+fn receipt_branch(receipt: &Receipt, backend: &crate::BackendId) -> Option<BranchName> {
+    let mut branches = receipt
+        .created()
+        .iter()
+        .chain(receipt.touched())
+        .filter(|resource| resource.kind == ResourceKind::Branch);
+    match (branches.next(), branches.next()) {
+        (Some(resource), None) if &resource.backend == backend => {
+            BranchName::new(resource.handle.as_str()).ok()
+        }
+        _ => None,
+    }
+}
+
 /// Every applied launch's worker, oldest first.
 pub(crate) fn launched_workers(
     record: &TaskRecord,
@@ -950,11 +955,7 @@ pub(crate) fn launched_workers(
                     worker: worker.clone(),
                     attempt: effect.request().attempt(),
                     launched_at: *at,
-                    branch: receipt
-                        .created()
-                        .iter()
-                        .find(|resource| resource.kind == ResourceKind::Branch)
-                        .and_then(|resource| BranchName::new(resource.handle.as_str()).ok()),
+                    branch: receipt_branch(receipt, &worker.backend),
                 }),
             _ => None,
         })

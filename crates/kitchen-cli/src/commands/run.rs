@@ -418,9 +418,6 @@ impl Opened {
                     SystemRunner::new(orca),
                     required,
                 )?;
-                if caller == Pass::Coordinate.as_str() {
-                    return Ok(Box::new(backend));
-                }
                 let binding = super::forge::writer_binding(&self.registry, &self.config.house)?;
                 Ok(Box::new(match binding.writer_identity() {
                     Some((writer_name, writer_email)) => {

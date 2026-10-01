@@ -72,7 +72,7 @@ pub enum PushWriterError {
     MissingIdentity,
     /// The branch history could not be established within the Git bounds.
     #[error(
-        "cannot establish the branch commits from its base; inspect the checkout before retrying"
+        "cannot establish the branch commits against the default tip; inspect the checkout before retrying"
     )]
     UnknownHistory,
     /// One or more commits were written by another identity.
@@ -167,6 +167,17 @@ fn record_pushed_head(
 /// worktree handle. A branch name or filesystem path alone does not prove it.
 #[must_use]
 pub fn owns_worktree(record: &TaskRecord, worktree: &ExternalRef) -> bool {
+    launch_worktree_in(record, worktree, false)
+}
+
+/// Whether the current launch bound this worktree, whether created by this
+/// attempt or already present. This authorizes delivery, not cleanup.
+#[must_use]
+pub fn launch_worktree(record: &TaskRecord, worktree: &ExternalRef) -> bool {
+    launch_worktree_in(record, worktree, true)
+}
+
+fn launch_worktree_in(record: &TaskRecord, worktree: &ExternalRef, include_touched: bool) -> bool {
     let Some(worker) = current_worker(record) else {
         return false;
     };
@@ -178,7 +189,9 @@ pub fn owns_worktree(record: &TaskRecord, worktree: &ExternalRef) -> bool {
             )
             && matches!(effect.state(), EffectState::Applied { receipt, .. } if
                 receipt.created().contains(&worker.worker)
-                    && receipt.created().iter().any(|resource|
+                    && receipt.created().iter().chain(
+                        include_touched.then_some(receipt.touched()).into_iter().flatten()
+                    ).any(|resource|
                         resource.kind == ResourceKind::Worktree && &resource.handle == worktree))
     })
 }
@@ -1101,28 +1114,24 @@ impl GitRemote {
         ))
     }
 
-    /// Verify the commits unique to this checkout against the house writer.
-    /// The trusted launch record supplies the base. A missing base or
-    /// incomplete Git answer refuses delivery.
+    /// Verify commits reachable from the captured head but not from the
+    /// house-scoped forge's default-branch tip. An incomplete Git answer
+    /// refuses delivery.
     pub fn verify_writer(
         &self,
-        base: &CommitId,
+        head: &CommitId,
+        default_tip: &CommitId,
         name: &str,
         email: &str,
     ) -> std::result::Result<(), PushWriterError> {
-        let range = format!("{}..HEAD", base.as_str());
-        let (Some(0), _) = self
-            .run(&["merge-base", "--is-ancestor", base.as_str(), "HEAD"])
-            .ok_or(PushWriterError::UnknownHistory)?
-        else {
-            return Err(PushWriterError::UnknownHistory);
-        };
         let (Some(0), output) = self
             .run(&[
                 "log",
                 "-z",
                 "--format=%H%x00%an%x00%ae%x00%cn%x00%ce",
-                &range,
+                head.as_str(),
+                "--not",
+                default_tip.as_str(),
             ])
             .ok_or(PushWriterError::UnknownHistory)?
         else {
@@ -1605,6 +1614,7 @@ pub(crate) fn git_environment(config: &IsolatedGitConfig, remote: &str) -> Vec<(
     let mut env = Vec::with_capacity(pins.len() * 2 + 5);
     env.extend([
         ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
+        ("GIT_NO_REPLACE_OBJECTS".to_owned(), "1".to_owned()),
         (
             "GIT_CONFIG_GLOBAL".to_owned(),
             config.path.to_string_lossy().into_owned(),

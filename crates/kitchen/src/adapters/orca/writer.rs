@@ -37,6 +37,9 @@ pub struct WriterBase {
 /// A missing, incomplete, or different record never licenses a push.
 #[derive(Debug, thiserror::Error)]
 pub enum WriterBaseError {
+    /// This launch predates writer-base recording.
+    #[error("writer base record was not found")]
+    NotFound,
     /// The runtime directory was invalid or unavailable.
     #[error("writer base runtime storage is unavailable")]
     Unavailable,
@@ -63,7 +66,13 @@ fn path(root: &Path, key: &IdempotencyKey) -> Result<std::path::PathBuf, WriterB
 /// Read one complete record, refusing links and oversized files.
 pub fn read_writer_base(root: &Path, key: &IdempotencyKey) -> Result<WriterBase, WriterBaseError> {
     let path = path(root, key)?;
-    let meta = fs::symlink_metadata(&path).map_err(|_| WriterBaseError::Unavailable)?;
+    let meta = fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            WriterBaseError::NotFound
+        } else {
+            WriterBaseError::Unavailable
+        }
+    })?;
     if !meta.file_type().is_file() || meta.len() > MAX_RECORD_BYTES {
         return Err(WriterBaseError::Malformed);
     }

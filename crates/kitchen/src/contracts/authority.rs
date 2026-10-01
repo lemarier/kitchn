@@ -81,6 +81,36 @@ closed_names! {
 }
 
 impl Permission {
+    /// Whether this permission authorizes a forge (GitHub) effect, so its
+    /// grants name the house's forge binding rather than its worker backend.
+    #[must_use]
+    pub const fn is_forge(self) -> bool {
+        match self {
+            Self::PostComment
+            | Self::EditLabels
+            | Self::CreateIssue
+            | Self::CloseIssue
+            | Self::EditIssueRelationships
+            | Self::PushBranch
+            | Self::OpenPullRequest
+            | Self::ReviewPullRequest
+            | Self::ResolveReviewThread
+            | Self::RequestReview
+            | Self::Merge
+            | Self::Publish => true,
+            Self::LaunchWorker
+            | Self::MessageWorker
+            | Self::CancelWorker
+            | Self::ReleaseResource
+            | Self::AskHuman
+            | Self::ManageSchedule
+            | Self::ActivateSchedule
+            | Self::TrialSchedule
+            | Self::OperateEquipment
+            | Self::UseVerificationEnvironment => false,
+        }
+    }
+
     /// Whether grants of this permission name the verification targets they
     /// cover. Only [`TaskAuthority::authorize_target`] authorizes these
     /// permissions, and only for a target a grant names.

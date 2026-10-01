@@ -658,3 +658,40 @@ fn grant_without_registry_uses_kitchn_home() -> TestResult {
     assert!(!temp.path().join("elsewhere/.kitchn").exists());
     Ok(())
 }
+
+#[test]
+fn review_thread_resolution_is_granted_on_the_forge_binding() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let registry = fixture(temp.path())?;
+    let output = run(
+        &registry,
+        &[
+            "grant",
+            "--house",
+            "crabnebula",
+            "--repository",
+            "crabnebula/tauri-fixture",
+            "--permission",
+            "resolve-review-thread",
+            "--yes",
+        ],
+    )?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let house = registry.load(&"crabnebula".parse()?)?;
+    let grant = house
+        .grants
+        .iter()
+        .find(|grant| grant.permission == Permission::ResolveReviewThread)
+        .ok_or("no resolve-review-thread grant")?;
+    assert_eq!(grant.destination, BackendId::new("github")?);
+    assert_eq!(grant.credential, CredentialId::new("github")?);
+    assert_eq!(
+        grant.scope,
+        GrantScope::Repository("crabnebula/tauri-fixture".parse()?)
+    );
+    Ok(())
+}

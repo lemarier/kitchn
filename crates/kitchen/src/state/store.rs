@@ -29,10 +29,10 @@ use std::path::Path;
 use crate::{
     ConsumerId, Error, HolderId, HouseId, TaskId, WorkflowId,
     contracts::{
-        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Claimant, ConsumerFence,
-        Delivery, Disposition, EffectExecutor, EffectSeq, Evidence, EvidenceKind, EvidenceRevision,
-        ExternalRef, Fence, HouseGrants, IssueNumber, LeaseTtl, RecordedEvidence, TaskSpec, Text,
-        Timestamp, VerificationError,
+        AttemptNumber, AttemptOutcome, AttemptStart, BackendDescriptor, Claimant, CommitId,
+        ConsumerFence, Delivery, Disposition, EffectExecutor, EffectSeq, Evidence, EvidenceKind,
+        EvidenceRevision, ExternalRef, Fence, HouseGrants, IssueNumber, LeaseTtl, RecordedEvidence,
+        TaskSpec, Text, Timestamp, VerificationError,
     },
     scheduling::IntervalMinutes,
     state::{
@@ -510,6 +510,20 @@ impl HouseStore {
                 self.transact(|state| state.record_evidence(id, fence, evidence, now))
             }
         }
+    }
+
+    /// Record a person's exact-head preservation decision for a settled task.
+    /// The caller must show the person live forge and worktree observations
+    /// before using this transition; the store rechecks the task and PR link.
+    pub fn record_owner_preservation(
+        &self,
+        id: &TaskId,
+        pull_request: IssueNumber,
+        head: CommitId,
+        source: ExternalRef,
+        now: Timestamp,
+    ) -> Result<EvidenceRevision> {
+        self.transact(|state| state.record_owner_preservation(id, pull_request, head, source, now))
     }
 
     /// Record the result of a verification run. Only

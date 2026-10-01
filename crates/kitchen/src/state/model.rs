@@ -15,12 +15,12 @@ use crate::{
     ConsumerId, CredentialId, EffectName, Error, HolderId, HouseId, TaskId, WorkflowId,
     contracts::{
         AttemptNumber, AttemptOutcome, AttemptStart, Authorization, BackendDescriptor, Capability,
-        Claimant, Consent, ConsumerFence, ContractError, Disposition, Effect, EffectContext,
-        EffectRequest, EffectSeq, Evidence, EvidenceRevision, EvidenceSubject, ExternalRef,
-        FailureClass, Fence, HouseGrants, IdempotencyKey, IssueNumber, LeaseTtl, NotAppliedReason,
-        Operation, Receipt, ResourceKind, ResourceRef, RetryPolicy, ScheduleEffect,
-        ScheduleRequirements, Settlement, SubmittedEffects, TaskSpec, Text, Timestamp, Trigger,
-        UncertainReason,
+        CheckoutFact, CheckoutReport, Claimant, CommitId, Consent, ConsumerFence, ContractError,
+        Disposition, Effect, EffectContext, EffectRequest, EffectSeq, Evidence, EvidenceKind,
+        EvidenceRevision, EvidenceSubject, EvidenceVerdict, ExternalRef, FailureClass, Fence,
+        HouseGrants, IdempotencyKey, IssueNumber, LeaseTtl, NotAppliedReason, Operation, Receipt,
+        ResourceKind, ResourceRef, RetryPolicy, ScheduleEffect, ScheduleRequirements, Settlement,
+        SubmittedEffects, TaskSpec, Text, Timestamp, Trigger, UncertainReason,
     },
     scheduling::IntervalMinutes,
     state::{
@@ -2299,6 +2299,61 @@ impl StoreState {
             });
         }
         log.items.push(evidence);
+        Ok(log.revision)
+    }
+
+    pub(crate) fn record_owner_preservation(
+        &mut self,
+        id: &TaskId,
+        pull_request: IssueNumber,
+        head: CommitId,
+        source: ExternalRef,
+        now: Timestamp,
+    ) -> Result<EvidenceRevision> {
+        let task = self.task_mut(id)?;
+        if !matches!(
+            task.state,
+            TaskState::Settled {
+                settlement: Settlement::Succeeded,
+                ..
+            }
+        ) || task.pull_request != Some(pull_request)
+            || task
+                .evidence
+                .subject
+                .as_ref()
+                .is_none_or(|subject| subject.head != head)
+        {
+            return fail(StateError::PreservationMismatch);
+        }
+        let evidence = Evidence {
+            kind: EvidenceKind::WorkerReport(CheckoutReport {
+                clean: CheckoutFact::Yes,
+                pushed: CheckoutFact::Yes,
+            }),
+            verdict: EvidenceVerdict::Pass,
+            subject: EvidenceSubject { head, base: None },
+            source,
+            observed_at: now,
+        };
+        let log = &mut task.evidence;
+        if log.subject.as_ref() != Some(&evidence.subject) {
+            log.revision = log.revision.next();
+            log.subject = Some(evidence.subject.clone());
+            log.items.clear();
+        }
+        if !log
+            .items
+            .iter()
+            .any(|item| item.source == evidence.source && item.kind == evidence.kind)
+        {
+            if log.items.len() >= MAX_EVIDENCE_PER_REVISION {
+                return fail(StateError::CapacityExceeded {
+                    limit: Limit::Evidence,
+                });
+            }
+            log.items.push(evidence);
+        }
         Ok(log.revision)
     }
 

@@ -1099,6 +1099,9 @@ fn worktree(last: &TaskRecord, writer: &Writer, head: &CommitId) -> WorktreeView
         .iter()
         .rev()
         .find_map(|evidence| match evidence.kind {
+            // Orca's completion has no checkout fields. The preceding
+            // checked push still states the worktree facts for this head.
+            EvidenceKind::WorkerReport(checkout) if checkout == Default::default() => None,
             EvidenceKind::WorkerReport(checkout) => Some((evidence, checkout)),
             EvidenceKind::Check
             | EvidenceKind::ForgeMerge(_)

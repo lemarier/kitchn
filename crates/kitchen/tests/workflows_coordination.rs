@@ -1337,6 +1337,11 @@ fn a_launch_is_accepted_when_the_backend_reports_the_exact_branch() -> TestResul
         .ok_or("launch brief missing")?;
     assert!(launch.contains("Push: run '/"), "{launch}");
     assert!(
+        launch.contains("--clean yes --pushed yes --body '<summary>'"),
+        "{launch}"
+    );
+    assert!(!launch.contains("yes|no"), "{launch}");
+    assert!(
         launch.contains(&format!(
             "push --store '{}' --house {} --task {}",
             world.fixture.store.dir().display(),

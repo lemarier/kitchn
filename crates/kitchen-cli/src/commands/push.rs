@@ -19,8 +19,9 @@ use kitchen::{
     },
     adoption::HouseRegistry,
     contracts::{
-        Capability, Clock, ExternalRef, GrantScope, HouseGrants, Permission, Repository,
-        SystemClock, TaskAuthority, Text,
+        Capability, CheckoutFact, CheckoutReport, Clock, Evidence, EvidenceKind, EvidenceSubject,
+        EvidenceVerdict, ExternalRef, GrantScope, HouseGrants, Permission, Repository, SystemClock,
+        TaskAuthority, Text,
     },
     house::{CredentialKind, checked_forge_credential, runtime_config},
     integrations::github::{
@@ -33,8 +34,9 @@ use kitchen::{
         pickup::{IssueRef, issue_task_id},
         push::{
             GitHubPullRequests, GitHubRemoteBranches, GitRemote, IsolatedGitConfig, OpenOutcome,
-            OpenRequest, PullRequests, PushBoundary, PushIntent, PushOutcome, delivery_worker_live,
-            launch_worktree, open_task_pull_request,
+            OpenRequest, PullRequests, PushBoundary, PushIntent, PushOutcome,
+            checkout_clean_except_report, delivery_worker_live, launch_worktree,
+            open_task_pull_request,
         },
         repair::Observed,
         stack::{LayerText, PullRequestText},
@@ -362,6 +364,60 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
         }
         _ => return Ok(("push outcome unsupported".into(), false)),
     }
+    // Re-read the remote after the checked update. A successful API result
+    // alone does not establish that this checkout still names its tip.
+    let pushed = match client.branch_tip(&args.house, &selected.repository, &branch) {
+        kitchen::integrations::github::Observation::Known(tip) if tip == head => CheckoutFact::Yes,
+        kitchen::integrations::github::Observation::Known(_) => CheckoutFact::No,
+        _ => CheckoutFact::Unknown,
+    };
+    let current_head = match remote.checkout() {
+        Some((found_branch, found_head)) if found_branch == branch && found_head == head => {
+            CheckoutFact::Yes
+        }
+        Some(_) => CheckoutFact::No,
+        None => CheckoutFact::Unknown,
+    };
+    let report_path = report_path(&selected.record)?;
+    let clean = checkout_clean_except_report(Path::new(worktree_path), &report_path)
+        .map_err(|_| IntegrationError::Unknown)?;
+    let checkout = CheckoutReport {
+        clean: if clean {
+            CheckoutFact::Yes
+        } else {
+            CheckoutFact::No
+        },
+        pushed: match (pushed, current_head) {
+            (CheckoutFact::Yes, CheckoutFact::Yes) => CheckoutFact::Yes,
+            (CheckoutFact::No, _) | (_, CheckoutFact::No) => CheckoutFact::No,
+            _ => CheckoutFact::Unknown,
+        },
+    };
+    let checkout_text = format!(
+        "checkout clean {} pushed {}",
+        if clean { "yes" } else { "no" },
+        match checkout.pushed {
+            CheckoutFact::Yes => "yes",
+            CheckoutFact::No => "no",
+            CheckoutFact::Unknown => "unknown",
+        },
+    );
+    let source = format!("checked-push-{}", worker.attempt.get());
+    selected.store.record_evidence(
+        &args.task,
+        selected.fence,
+        Evidence {
+            kind: EvidenceKind::WorkerReport(checkout),
+            verdict: EvidenceVerdict::Pass,
+            subject: EvidenceSubject {
+                head: head.clone(),
+                base: None,
+            },
+            source: ExternalRef::new(&source)?,
+            observed_at: SystemClock.now(),
+        },
+        SystemClock.now(),
+    )?;
     if let Some(number) = selected.record.pull_request() {
         let live = reads.pull_request(number);
         if !matches!(
@@ -379,8 +435,8 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
         }
         return Ok((
             format!(
-                "branch {branch} at {head}; pull request #{} already linked",
-                number.get()
+                "branch {branch} at {head}; pull request #{} already linked; {checkout_text}",
+                number.get(),
             ),
             true,
         ));
@@ -436,7 +492,10 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
     )?;
     Ok(match opened {
         OpenOutcome::Opened(number) => (
-            format!("opened pull request #{} for {branch}", number.get()),
+            format!(
+                "opened pull request #{} for {branch}; {checkout_text}",
+                number.get()
+            ),
             true,
         ),
         OpenOutcome::NotApplied => ("pull request was not opened".into(), false),
@@ -448,10 +507,33 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
 }
 
 fn acceptance_reported(selected: &Selected, worktree: &Path) -> Result<(), kitchen::Error> {
-    let worker = current_worker(&selected.record)
+    let path = report_path(&selected.record)?;
+    let canonical_worktree = worktree
+        .canonicalize()
+        .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
+    let canonical_file = worktree
+        .join(path)
+        .canonicalize()
+        .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
+    if !canonical_file.starts_with(canonical_worktree) {
+        return Err(IntegrationError::PushPreflight(PushPreflight::AcceptanceReport).into());
+    }
+    let file = std::fs::File::open(canonical_file)
+        .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
+    let mut text = String::new();
+    file.take(65537)
+        .read_to_string(&mut text)
+        .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
+    if text.len() > 65536 || !text.lines().any(|line| line == "Acceptance: done") {
+        return Err(kitchen::integrations::github::IntegrationError::InvalidInput.into());
+    }
+    Ok(())
+}
+
+pub(super) fn report_path(record: &kitchen::state::TaskRecord) -> Result<PathBuf, kitchen::Error> {
+    let worker = current_worker(record)
         .ok_or(kitchen::integrations::github::IntegrationError::InvalidInput)?;
-    let brief = selected
-        .record
+    let brief = record
         .effects()
         .iter()
         .rev()
@@ -487,26 +569,7 @@ fn acceptance_reported(selected: &Selected, worktree: &Path) -> Result<(), kitch
     {
         return Err(kitchen::integrations::github::IntegrationError::InvalidInput.into());
     }
-    let canonical_worktree = worktree
-        .canonicalize()
-        .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
-    let canonical_file = worktree
-        .join(path)
-        .canonicalize()
-        .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
-    if !canonical_file.starts_with(canonical_worktree) {
-        return Err(IntegrationError::PushPreflight(PushPreflight::AcceptanceReport).into());
-    }
-    let file = std::fs::File::open(canonical_file)
-        .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
-    let mut text = String::new();
-    file.take(65537)
-        .read_to_string(&mut text)
-        .map_err(|_| kitchen::integrations::github::IntegrationError::InvalidInput)?;
-    if text.len() > 65536 || !text.lines().any(|line| line == "Acceptance: done") {
-        return Err(kitchen::integrations::github::IntegrationError::InvalidInput.into());
-    }
-    Ok(())
+    Ok(path.to_path_buf())
 }
 
 fn executable(name: &str) -> Option<PathBuf> {

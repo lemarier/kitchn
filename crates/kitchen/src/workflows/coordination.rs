@@ -235,7 +235,7 @@ fn house_mailbox_brief(store: &HouseStore, task: &TaskId, fence: Fence) -> Strin
         fence.get()
     );
     format!(
-        "Mailbox: this backend does not carry worker messages, so report to the coordinator through Kitchen's house mailbox, and only for this task. Ask a question with `kitchn mailbox ask {scope} --body <text> --wait-secs 600`, which waits for the answer; read a late answer with `kitchn mailbox answer {scope} --question <id>`. Escalate with `kitchn mailbox escalate {scope} --body <text>`. When done, report once with `kitchn mailbox report {scope} --outcome succeeded|failed --clean yes|no --pushed yes|no --body <summary>`: `--clean yes` only when `git status --porcelain` prints nothing, and `--pushed yes` only when your checkout's HEAD is the remote branch tip with nothing unpushed."
+        "Mailbox: this backend does not carry worker messages, so use Kitchen's house mailbox for this task. Ask a question with `kitchn mailbox ask {scope} --body <text> --wait-secs 600`, which waits for the answer; read a late answer with `kitchn mailbox answer {scope} --question <id>`. Escalate with `kitchn mailbox escalate {scope} --body <text>`."
     )
 }
 
@@ -672,13 +672,21 @@ pub(crate) fn launch_rendered(
         .to_str()
         .ok_or(CoordinationError::InvalidBriefArgument)?;
     let push_command = format!(
-        "Push: run {} push --store {} --house {} --task {} from this worktree after committing; it pushes with the house forge credential and opens the pull request. Keep the Git author and committer identity Kitchen set on this worktree; do not change it. Add `--acceptance-done` only when your evidence report contains `Acceptance: done` after checking every item; otherwise the pull request says `Part of` the issue.",
+        "Push: run {} push --store {} --house {} --task {} from this worktree after committing; it pushes with the house forge credential and opens the pull request. Keep the Git author and committer identity Kitchen set on this worktree; do not change it. Add `--acceptance-done` only when your evidence report contains `Acceptance: done` after checking every item; otherwise the pull request says `Part of` the issue. After a successful push, finish with {} mailbox report --store {} --house {} --task {} --fence {} --outcome succeeded --clean yes --pushed yes --body '<summary>'. Replace each yes with no if the checked push printed no; omit that flag if it printed unknown. Replace the summary text. Only the configured evidence report path may be ignored as Kitchen-owned. Do not edit the checkout after the push.",
         shell_quote(executable),
         shell_quote(&ctx.store.dir().to_string_lossy()),
         ctx.store.house(),
         task,
+        shell_quote(executable),
+        shell_quote(&ctx.store.dir().to_string_lossy()),
+        ctx.store.house(),
+        task,
+        fence.get(),
     );
-    let text = Text::new(&format!("{}\n{}", text.as_str(), push_command))?;
+    let proposed = Text::new(&format!("{}\n{}", text.as_str(), push_command))?;
+    // A resumed launch reuses its persisted brief. The earlier worker saw
+    // that exact text and its original mailbox fence; a takeover must not
+    // turn a replay into a different logical effect.
     // A selection the executor cannot launch is a configuration problem no
     // retry fixes: refuse it before an attempt is spent on it.
     if let Some(resolved) = &record.spec().agent {
@@ -694,6 +702,22 @@ pub(crate) fn launch_rendered(
         }
         Err(error) => return Err(error),
     };
+    // Reuse a brief only for a replay of this same attempt. A retry needs
+    // its new mailbox fence and the follow-ups selected for this launch.
+    let text = record
+        .effects()
+        .iter()
+        .rev()
+        .find_map(|effect| {
+            if effect.request().attempt() != attempt {
+                return None;
+            }
+            match effect.request().effect() {
+                Effect::Worker(Operation::LaunchWorker { brief, .. }) => Some(brief.clone()),
+                _ => None,
+            }
+        })
+        .unwrap_or(proposed);
     if stacked {
         // The push boundary reads the layer from this record, never from
         // the writer.

@@ -197,7 +197,8 @@ fn launched_worker(action: &PickupAction) -> Option<ExternalRef> {
         | PickupAction::NotClaimed { .. }
         | PickupAction::IssueClosed { .. }
         | PickupAction::StackedRetry { .. }
-        | PickupAction::Moved { .. } => None,
+        | PickupAction::Moved { .. }
+        | PickupAction::TaskClaimUncertain { .. } => None,
     }
 }
 

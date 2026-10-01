@@ -16,9 +16,11 @@
 //! superseded, the store refuses the claim's effects and renewals. The
 //! coordination pass then moves the task to its own claim, under the
 //! scheduled runner holder ([`RUN_HOLDER`]) for [`TASK_LEASE`], and renews
-//! it while it supervises across passes. A coordination claim is not bound
-//! to one pass's lease, because binding it would move every task on every
-//! pass and fill its ownership history. Instead, a coordination pass that
+//! it while it supervises across passes. Ordinary pickup claims continued
+//! by coordination are not bound to one pass's lease, because binding them
+//! would move every task on every pass and fill ownership history. Repair
+//! and follow-up rounds moved or taken over by coordination retain its pass
+//! binding so a later writer can prove who held an idle round. A pass that
 //! took over an expired lease moves every task it continues to a new fence
 //! before acting, so the process it replaced holds only stale fences. Each
 //! move is a recorded relinquish and adoption; unresolved effects stay with

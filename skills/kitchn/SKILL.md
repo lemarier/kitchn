@@ -75,6 +75,10 @@ is `skipped`, someone else holds the item: say who (`scheduled` or
 `interactive`) and stop. Use `--take-over` only when the plan says the
 previous claim expired and the person asks for it.
 
+For a scheduled repair or follow-up round waiting after an expired claim,
+inspect the prior launch, then run `kitchn run coordinate --take-over`.
+The writer pass can then adopt the round and launch its next attempt.
+
 ### `work <issue>`
 
 Write the issue facts you read from the forge to a temporary file:

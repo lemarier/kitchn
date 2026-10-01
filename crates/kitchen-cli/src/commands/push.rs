@@ -312,7 +312,14 @@ pub fn run(args: PushArgs) -> Result<(String, bool), kitchen::Error> {
     else {
         return Err(kitchen::workflows::push::PushWriterError::UnknownHistory.into());
     };
-    remote.verify_writer(&head, &default_tip, &writer_name, &writer_email)?;
+    remote.verify_writer(
+        &selected.repository,
+        &default_branch,
+        &head,
+        &default_tip,
+        &writer_name,
+        &writer_email,
+    )?;
     let remote_reads = GitHubRemoteBranches {
         git: &remote,
         client: &client,

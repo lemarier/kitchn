@@ -1395,6 +1395,8 @@ mod git_remote {
         let remote = remote_for(&repos)?;
         assert_eq!(
             remote.verify_writer(
+                &Repository::new("origin89hq/firmware")?,
+                &branch("main")?,
                 &missing,
                 &missing,
                 "house[bot]",
@@ -1417,6 +1419,8 @@ mod git_remote {
         git(&repos.worker, &commit)?;
         let head = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
         remote.verify_writer(
+            &Repository::new("origin89hq/firmware")?,
+            &branch("main")?,
             &head,
             &base,
             "house[bot]",
@@ -1436,6 +1440,8 @@ mod git_remote {
         let sha = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
         assert_eq!(
             remote.verify_writer(
+                &Repository::new("origin89hq/firmware")?,
+                &branch("main")?,
                 &sha,
                 &base,
                 "house[bot]",
@@ -1454,6 +1460,8 @@ mod git_remote {
         git(&repos.worker, &amend)?;
         let head = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
         remote.verify_writer(
+            &Repository::new("origin89hq/firmware")?,
+            &branch("main")?,
             &head,
             &base,
             "house[bot]",
@@ -1484,6 +1492,8 @@ mod git_remote {
         let sha = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
         assert_eq!(
             remote.verify_writer(
+                &Repository::new("origin89hq/firmware")?,
+                &branch("main")?,
                 &sha,
                 &base,
                 "house[bot]",
@@ -1500,6 +1510,7 @@ mod git_remote {
 
         let repos = fresh_repos()?;
         let base = commit_in(&repos.worker, "base")?;
+        git(&repos.worker, &["push", "origin", "HEAD:main"])?;
         let foreign = commit_in(&repos.worker, "foreign")?;
         let remote = remote_for(&repos)?;
         let bot = [
@@ -1516,6 +1527,8 @@ mod git_remote {
         git(&repos.worker, &["replace", foreign.as_str(), &replacement])?;
         assert_eq!(
             remote.verify_writer(
+                &Repository::new("origin89hq/firmware")?,
+                &branch("main")?,
                 &foreign,
                 &base,
                 "house[bot]",
@@ -1530,6 +1543,8 @@ mod git_remote {
         git(&repos.worker, &args)?;
         assert_eq!(
             remote.verify_writer(
+                &Repository::new("origin89hq/firmware")?,
+                &branch("main")?,
                 &foreign,
                 &base,
                 "house[bot]",
@@ -1539,6 +1554,106 @@ mod git_remote {
                 commits: vec![foreign]
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_graft_cannot_hide_a_foreign_commit() -> TestResult {
+        use kitchen::workflows::push::PushWriterError;
+
+        let repos = fresh_repos()?;
+        let base = commit_in(&repos.worker, "base")?;
+        git(&repos.worker, &["push", "origin", "HEAD:main"])?;
+        let foreign = commit_in(&repos.worker, "foreign")?;
+        git(
+            &repos.worker,
+            &[
+                "-c",
+                "user.name=house[bot]",
+                "-c",
+                "user.email=123+house[bot]@users.noreply.github.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "bot head",
+            ],
+        )?;
+        let head = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
+        fs::write(
+            repos.worker.join(".git/info/grafts"),
+            format!("{head} {base}\n"),
+        )?;
+        let remote = remote_for(&repos)?;
+        assert_eq!(
+            remote.verify_writer(
+                &Repository::new("origin89hq/firmware")?,
+                &branch("main")?,
+                &head,
+                &base,
+                "house[bot]",
+                "123+house[bot]@users.noreply.github.com",
+            ),
+            Err(PushWriterError::ForeignCommits {
+                commits: vec![foreign]
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn writer_check_fetches_the_observed_default_tip_missing_from_worker() -> TestResult {
+        use kitchen::workflows::push::PushWriterError;
+
+        let repos = fresh_repos()?;
+        let base = commit_in(&repos.worker, "base")?;
+        git(&repos.worker, &["push", "origin", "HEAD:main"])?;
+        git(&repos.other, &["fetch", "origin", "main"])?;
+        git(&repos.other, &["checkout", "-B", "main", "FETCH_HEAD"])?;
+        let advanced = commit_in(&repos.other, "new main")?;
+        git(&repos.other, &["push", "origin", "main"])?;
+        assert!(
+            !Command::new(GIT)
+                .args(["cat-file", "-e", advanced.as_str()])
+                .current_dir(&repos.worker)
+                .status()?
+                .success()
+        );
+        git(
+            &repos.worker,
+            &[
+                "-c",
+                "user.name=house[bot]",
+                "-c",
+                "user.email=123+house[bot]@users.noreply.github.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "task",
+            ],
+        )?;
+        let head = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
+        let remote = remote_for(&repos)?;
+        remote.verify_writer(
+            &Repository::new("origin89hq/firmware")?,
+            &branch("main")?,
+            &head,
+            &advanced,
+            "house[bot]",
+            "123+house[bot]@users.noreply.github.com",
+        )?;
+        let missing = CommitId::new("1111111111111111111111111111111111111111")?;
+        assert_eq!(
+            remote.verify_writer(
+                &Repository::new("origin89hq/firmware")?,
+                &branch("main")?,
+                &head,
+                &missing,
+                "house[bot]",
+                "123+house[bot]@users.noreply.github.com",
+            ),
+            Err(PushWriterError::UnknownHistory)
+        );
+        assert_ne!(base, advanced);
         Ok(())
     }
 
@@ -1568,6 +1683,8 @@ mod git_remote {
         let rebased = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
         assert_ne!(base, rebased);
         remote.verify_writer(
+            &Repository::new("origin89hq/firmware")?,
+            &branch("main")?,
             &rebased,
             &main_tip,
             "house[bot]",
@@ -1582,6 +1699,8 @@ mod git_remote {
         git(&repos.worker, &args)?;
         let merged = CommitId::new(&git(&repos.worker, &["rev-parse", "HEAD"])?)?;
         remote.verify_writer(
+            &Repository::new("origin89hq/firmware")?,
+            &branch("main")?,
             &merged,
             &main_tip,
             "house[bot]",

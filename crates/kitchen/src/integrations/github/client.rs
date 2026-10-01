@@ -753,7 +753,7 @@ impl<T: GitHubReadTransport> GitHubClient<T> {
             let mut seen = std::collections::BTreeSet::new();
             for _ in 0..self.limits.pages {
                 let request = ReadRequest {
-                    access: self.read_access(repo, None),
+                    access: Some(super::TokenScope::for_thread_read(repo)),
                     endpoint: "graphql".into(),
                     graphql: Some(json!({
                         "query": "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{id isResolved isOutdated path line originalLine comments(first:100){nodes{id body author{login}} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}",

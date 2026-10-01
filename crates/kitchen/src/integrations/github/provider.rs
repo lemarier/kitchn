@@ -136,6 +136,8 @@ pub(crate) enum Inspection {
     Applied(Receipt),
     Missing,
     Conflict,
+    /// Resolution has no intent marker, so readback alone cannot credit it.
+    ResolvedUnattributed,
     /// An unmerged pull request at the expected head now targets another
     /// base. No new merge may start, but an earlier request carrying the
     /// expected head can still merge it, so this is not absence evidence.
@@ -610,22 +612,12 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             } => {
                 let node = self.review_thread(thread.as_str())?;
                 check_thread_scope(&node, &mutation.repository, *number)?;
+                if thread_head(&node)? != expected_head.as_str() {
+                    return Ok(Inspection::Conflict);
+                }
                 match node.get("isResolved").and_then(Value::as_bool) {
-                    Some(true)
-                        if node
-                            .pointer("/resolvedBy/login")
-                            .and_then(Value::as_str)
-                            .is_some_and(|login| {
-                                login.eq_ignore_ascii_case(self.scope.requester().as_str())
-                            }) =>
-                    {
-                        Ok(Inspection::Applied(reference))
-                    }
-                    Some(true) => Ok(Inspection::Conflict),
-                    Some(false) if thread_head(&node)? == expected_head.as_str() => {
-                        Ok(Inspection::Missing)
-                    }
-                    Some(false) => Ok(Inspection::Conflict),
+                    Some(true) => Ok(Inspection::ResolvedUnattributed),
+                    Some(false) => Ok(Inspection::Missing),
                     None => Err(IntegrationError::Unknown),
                 }
             }
@@ -899,7 +891,7 @@ impl<'a, T: GitHubReadTransport> Provider<'a, T> {
             GitHubAction::ResolveReviewThread { thread, .. } => (
                 "POST",
                 "graphql".into(),
-                json!({"query":"mutation($input:ResolveReviewThreadInput!){resolveReviewThread(input:$input){thread{id isResolved}}}","variables":{"input":{"threadId":thread.as_str(),"clientMutationId":key.as_str()}}}),
+                json!({"query":"mutation($input:ResolveReviewThreadInput!){resolveReviewThread(input:$input){clientMutationId thread{id isResolved}}}","variables":{"input":{"threadId":thread.as_str(),"clientMutationId":key.as_str()}}}),
             ),
             GitHubAction::LinkSubIssue { parent, child } => {
                 let id = self.issue_id(&root, child.get())?;

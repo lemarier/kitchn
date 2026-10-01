@@ -274,6 +274,17 @@ impl GitHubMutationTransport for Provider {
         if matches!(fault, Some(Fault::LoseAfterApply)) {
             return Err(EffectFailure::Uncertain(UncertainReason::ResponseLost));
         }
+        if path == "graphql"
+            && body["query"]
+                .as_str()
+                .is_some_and(|q| q.contains("resolveReviewThread"))
+        {
+            return serde_json::to_vec(&json!({"data":{"resolveReviewThread":{
+                "clientMutationId":body["variables"]["input"]["clientMutationId"],
+                "thread":{"id":body["variables"]["input"]["threadId"],"isResolved":true}
+            }}}))
+            .map_err(|_| EffectFailure::Uncertain(UncertainReason::ResponseLost));
+        }
         Ok(b"{}".to_vec())
     }
 }
@@ -2209,7 +2220,8 @@ fn review_thread_effects_succeed_replay_and_reconcile() -> TestResult {
                     fence,
                     &ManualClock::starting_at(3),
                 )?;
-                assert_eq!(result.resolved.len(), 1);
+                assert_eq!(result.resolved.len(), usize::from(reply));
+                assert_eq!(result.unresolved.len(), usize::from(!reply));
             } else {
                 assert!(matches!(record.state(), EffectState::Applied { .. }));
             }
@@ -2219,8 +2231,15 @@ fn review_thread_effects_succeed_replay_and_reconcile() -> TestResult {
                 &grants,
                 plan(&task, fence, "thread-effect", effect)?,
                 &ManualClock::starting_at(4),
-            )?;
-            assert!(matches!(replay.state(), EffectState::Applied { .. }));
+            );
+            if !reply && fault.is_some() {
+                assert!(matches!(
+                    replay,
+                    Err(Error::State(StateError::UnsafeRetry(_)))
+                ));
+            } else {
+                assert!(matches!(replay?.state(), EffectState::Applied { .. }));
+            }
             let remote = remote.borrow();
             assert_eq!(remote.calls.len(), 1);
             assert_eq!(remote.calls[0].0, "graphql");
@@ -2294,6 +2313,45 @@ fn review_thread_effects_refuse_missing_permission_and_moved_head() -> TestResul
             &ManualClock::starting_at(1),
         )?;
         assert!(matches!(record.state(), EffectState::NotApplied { .. }));
+        assert!(remote.borrow().calls.is_empty());
+    }
+    Ok(())
+}
+#[test]
+fn review_thread_resolution_cannot_claim_prior_bot_resolution() -> TestResult {
+    for head in ["a".repeat(40), "b".repeat(40)] {
+        let fixture = Fixture::new()?;
+        let (scope, grants, task, fence) =
+            setup(&fixture, 3, &[Permission::ResolveReviewThread], "github")?;
+        let remote = thread_remote(None);
+        {
+            let mut remote = remote.borrow_mut();
+            let thread = remote.review_thread.as_mut().ok_or("missing thread")?;
+            thread["isResolved"] = json!(true);
+            thread["resolvedBy"] = json!({"login":"sample-bot"});
+            thread["pullRequest"]["headRefOid"] = json!(head);
+        }
+        let backend = GitHubExecutor::new(
+            BackendId::new("github")?,
+            scope,
+            provider(&fixture, &task, remote.clone())?,
+            ReadLimits::default(),
+        );
+        let effect = backend.effect(mutation(thread_action(false)?)?)?;
+        let record = run_effect(
+            &fixture.store,
+            &backend,
+            &grants,
+            plan(&task, fence, "prior-resolution", effect)?,
+            &ManualClock::starting_at(1),
+        )?;
+        assert!(matches!(
+            record.state(),
+            EffectState::NotApplied {
+                reason: NotAppliedReason::Rejected,
+                ..
+            }
+        ));
         assert!(remote.borrow().calls.is_empty());
     }
     Ok(())

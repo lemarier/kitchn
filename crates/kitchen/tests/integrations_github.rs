@@ -14,6 +14,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 struct Fake {
     pages: RefCell<VecDeque<std::result::Result<Vec<u8>, IntegrationError>>>,
     requests: RefCell<Vec<String>>,
+    accesses: RefCell<Vec<Option<TokenScope>>>,
 }
 impl Fake {
     fn new(pages: Vec<std::result::Result<Value, IntegrationError>>) -> Result<Self> {
@@ -27,6 +28,7 @@ impl Fake {
         Ok(Self {
             pages: RefCell::new(encoded),
             requests: RefCell::default(),
+            accesses: RefCell::default(),
         })
     }
 }
@@ -39,6 +41,7 @@ impl GitHubReadTransport for Fake {
         _: usize,
     ) -> std::result::Result<Vec<u8>, IntegrationError> {
         self.requests.borrow_mut().push(request.endpoint().into());
+        self.accesses.borrow_mut().push(request.access().cloned());
         self.pages
             .borrow_mut()
             .pop_front()
@@ -243,6 +246,14 @@ fn follow_up_threads_preserve_bot_comments_and_refuse_truncation() -> Result {
             .as_ref()
             .map(|v| v.login.as_str()),
         Some("coderabbitai")
+    );
+    let accesses = client.transport().accesses.borrow();
+    assert_eq!(accesses.len(), 1);
+    let access = accesses[0].as_ref().ok_or("missing token scope")?;
+    assert_eq!(access.repository(), &Repository::new("sample/project")?);
+    assert_eq!(
+        access.permissions().collect::<Vec<_>>(),
+        vec![(AppPermission::PullRequests, Access::Read)]
     );
     let mut truncated = thread;
     truncated["comments"]["pageInfo"]["hasNextPage"] = json!(true);

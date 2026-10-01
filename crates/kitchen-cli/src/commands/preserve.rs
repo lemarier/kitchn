@@ -363,6 +363,25 @@ mod tests {
                 .status()?
                 .success()
         );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "initial",
+                ])
+                .status()?
+                .success()
+        );
         assert!(checkout_changes_except_report(root, Path::new("report.md"))?.is_empty());
         let accepted = confirm_and_recheck(
             || {

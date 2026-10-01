@@ -260,11 +260,13 @@ worker's evidence report to contain `Acceptance: done`; otherwise the pull
 request body says `Part of`
 the issue. A refused or uncertain push must be reconciled before retrying.
 After a checked push, Kitchen compares the live branch tip with the checkout's
-HEAD and records clean/pushed facts at that exact head. Only the report path
-named in the task's launch brief is excluded from Git status; any other changed
-or untracked path records `clean no`. Tracked files with skip-worktree or
-assume-unchanged flags also prevent a clean result because they can hide edits
-from Git status. The command prints both facts. The worker
+HEAD and records clean/pushed facts at that exact head. Untracked files are
+ignored only when `.gitignore` rules committed at HEAD ignore them. Local
+`.gitignore` edits, `.git/info/exclude`, and global excludes cannot hide work.
+The report path named in the task's launch brief is exempt only when it is a
+regular file; other changed or untracked paths record `clean no`. Tracked files
+with skip-worktree or assume-unchanged flags also prevent a clean result
+because they can hide edits from Git status. The command prints both facts. The worker
 then uses the brief's absolute `kitchn mailbox report` command as its final
 checkout action, stating those facts. Orca's `worker_done` carries no checkout
 fields, so coordination retains the checked push observation at that head.
@@ -283,7 +285,8 @@ kitchn preserve <task> --pull-request <n> --head <sha> --holder <you> --registry
 Run the command from a separate coordinator checkout. Kitchen matches Orca's
 recorded worktree ID and path to the task's launch record. The checkout must
 belong to the registry's bound house and repository, match the task's branch
-and exact live PR head, and have no changes other than the configured report path.
+and exact live PR head, and have no changes except files covered by committed
+`.gitignore` rules and the configured regular report file.
 A different head, dirty file, missing forge observation, or unsettled task is
 refused. The recorded decision applies only to that head.
 Confirmation refuses a worker environment or launched worktree and requires an

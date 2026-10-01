@@ -199,8 +199,9 @@ give that result to the coordinator; do not use a direct `git push` to bypass
 the check. Later commits use the same command and task branch.
 After a successful push, read the printed clean/pushed facts and run the
 brief's absolute `kitchn mailbox report` command with those values as the
-last checkout action. Kitchen ignores only the configured report path when
-checking cleanliness. If a settled worker left no checkout statement, the
+last checkout action. Kitchen honors committed `.gitignore` rules and exempts
+the configured report file when checking cleanliness. Local exclude rules
+cannot hide work. If a settled worker left no checkout statement, the
 owner can inspect its bound worktree from a separate coordinator checkout with
 `kitchn preserve <task> --pull-request <n> --head <sha> --holder <you>
 --registry <dir> --worktree <launched-worktree>` and repeat with

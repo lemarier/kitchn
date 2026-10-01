@@ -70,8 +70,9 @@ budget applies. You can ask for fewer rounds in a session, never more.
 
 After a supervised writer uses `kitchn push`, Kitchen records whether its
 checkout is clean and matches the pushed head. The configured evidence report
-file does not count as a dirty file. The worker finishes with the absolute
-mailbox report command in its brief. If the earlier writer left no usable
+file and files ignored by `.gitignore` rules committed at HEAD do not count as
+dirty. The worker finishes with the absolute mailbox report command in its
+brief. If the earlier writer left no usable
 checkout statement, the owner can preview the bound worktree and live PR head
 with `kitchn preserve --worktree <launched-worktree>` from a separate
 coordinator checkout, then confirm that exact head when the preview is clean.

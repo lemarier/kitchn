@@ -2,6 +2,8 @@
 //! compare-and-swap update. Fakes cover the decision matrix; a local bare
 //! Git remote covers the real compare-and-swap. Simulated evidence: no real
 //! forge, credentials, or network is used.
+//! Separate binary: the inherited Git environment test relaunches this
+//! executable by exact test name and must avoid unrelated tests in the child.
 
 mod common;
 mod workflows_support;

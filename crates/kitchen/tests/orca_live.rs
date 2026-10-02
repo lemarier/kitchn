@@ -1,4 +1,6 @@
 //! Controlled live smoke test against the installed Orca runtime.
+//! Separate binary: opt-in live process and resource operations are isolated
+//! from the offline integration suite.
 //!
 //! Opt-in only. It runs when `KITCHEN_ORCA_LIVE=1` and these are set:
 //!

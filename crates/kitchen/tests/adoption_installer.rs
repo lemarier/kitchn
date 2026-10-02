@@ -1,4 +1,6 @@
 //! Create-only adoption behavior in disposable consumers.
+//! Separate binary: the restrictive umask test relaunches this executable by
+//! exact test name under a different process umask.
 use kitchen::adoption::{
     FileMode, FileStatus, NewFile, RelativePath, SafeInstaller, install_new_files,
 };

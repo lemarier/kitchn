@@ -1,6 +1,8 @@
 //! Shared execution-backend contract and effect recovery, exercised with the
 //! in-memory fake backend. These are simulated results, not live runtime
 //! evidence; later adapters run `contracts::conformance::run` themselves.
+//! Separate binary: the crash recovery test relaunches this executable by
+//! exact test name and exits the child process inside the effect.
 
 mod common;
 

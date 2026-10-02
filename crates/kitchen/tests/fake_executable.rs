@@ -1,5 +1,6 @@
 //! The fake-executable helper: freshly written scripts must run at once, even
 //! while other threads keep forking children.
+//! Separate binary: fork pressure must stay isolated from unrelated tests.
 #![cfg(unix)]
 
 mod common;

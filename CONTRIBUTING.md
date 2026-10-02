@@ -117,6 +117,7 @@ dependency coordinates the root manifest and lockfile with the other active owne
 | #256 gate checkout inference | `adoption/remote.rs` clean checkout head and `integrations/github/client.rs` open PR read | Shared gate identifier resolution in `crates/kitchen-cli/src/commands/defaults.rs`, `gate review` and `gate attest` in `commands/gate.rs`, and gate CLI tests in `crates/kitchen-cli/tests/run.rs` |
 | #271 coordinator recovery and merged delivery | `adapters/orca/inspect.rs` stale terminal diagnosis; merged PR settlement in `workflows/run/coordinate.rs` | Read-only doctor probe in `crates/kitchen-cli/src/commands/house.rs`; merge evidence in `contracts/evidence.rs`; focused run and CLI tests |
 | #269 house writer identity | The app bot ID and worker identity in `house/forge.rs`; pre-start worktree identity in `adapters/orca/backend.rs`; commit author and committer check in `workflows/push.rs` | `kitchn forge bind` and `kitchn push`; Orca adapter, forge, and push tests; expediter and CLI guidance |
+| #290 owner task cancellation | `workflows/task_cancel.rs`; the owner transition in `state/model.rs` and `state/store.rs` | `kitchn task cancel` in `crates/kitchen-cli/src/commands/task.rs`; fake backend tests in `crates/kitchen/tests/task_cancel.rs` |
 
 #5 owns house/repository config adoption and the safe-write installer. #16 owns
 template assets, rendering, and repository scaffolding, built on #5's installer.

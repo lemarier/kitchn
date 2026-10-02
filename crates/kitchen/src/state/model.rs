@@ -598,9 +598,16 @@ impl EvidenceLog {
 pub struct CancelRequest {
     requested_by: HolderId,
     at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<Text>,
 }
 
 impl CancelRequest {
+    /// The person's recorded reason, when supplied by an owner command.
+    #[must_use]
+    pub const fn reason(&self) -> Option<&Text> {
+        self.reason.as_ref()
+    }
     /// Who asked.
     #[must_use]
     pub const fn requested_by(&self) -> &HolderId {
@@ -1733,6 +1740,7 @@ impl StoreState {
             task.cancel = Some(CancelRequest {
                 requested_by: requested_by.clone(),
                 at: now,
+                reason: None,
             });
         }
         if task.state == TaskState::Open && task.blocking_settlement(false) == 0 {
@@ -1766,12 +1774,85 @@ impl StoreState {
             task.cancel = Some(CancelRequest {
                 requested_by: holder,
                 at: now,
+                reason: None,
             });
         }
         if let Some(attempt) = task.running_attempt_mut(fence) {
             attempt.state = AttemptState::Cancelled { at: now };
         }
         task.settle(Settlement::Cancelled, fence, now)
+    }
+
+    /// Atomically supersede a claim and settle a task whose external effects
+    /// and workers were checked against `expected` outside the state lock.
+    pub(crate) fn owner_cancel(
+        &mut self,
+        expected: &TaskRecord,
+        claimant: &Claimant,
+        reason: &Text,
+        now: Timestamp,
+    ) -> Result<Fence> {
+        self.check_claimant(claimant, now)?;
+        let id = &expected.spec.id;
+        if self.task(id)? != expected {
+            return fail(StateError::CancelPreviewChanged(id.clone()));
+        }
+        if matches!(expected.state, TaskState::Settled { .. }) {
+            return fail(StateError::CancelPreviewChanged(id.clone()));
+        }
+        if expected.effects.iter().any(|effect| {
+            !matches!(
+                effect.state,
+                EffectState::NotApplied { .. } | EffectState::Applied { .. }
+            )
+        }) {
+            return fail(StateError::UnresolvedEffects { count: 1 });
+        }
+        let lease = self.new_lease(claimant, LeaseTtl::new(LeaseTtl::MIN)?, now);
+        let fence = lease.fence;
+        let task = self.task_mut(id)?;
+        match &task.state {
+            TaskState::Open => {
+                let event = match task.ownership.last() {
+                    Some(OwnershipEvent::Relinquished {
+                        fence: previous, ..
+                    }) => OwnershipEvent::Adopted {
+                        previous: *previous,
+                        holder: claimant.holder.clone(),
+                        trigger: claimant.trigger.clone(),
+                        fence,
+                        at: now,
+                    },
+                    _ => OwnershipEvent::Claimed {
+                        holder: claimant.holder.clone(),
+                        trigger: claimant.trigger.clone(),
+                        fence,
+                        at: now,
+                    },
+                };
+                task.push_ownership(event)?;
+            }
+            TaskState::Claimed { lease: old } => {
+                let previous = old.fence;
+                task.push_ownership(OwnershipEvent::TakenOver {
+                    previous,
+                    holder: claimant.holder.clone(),
+                    trigger: claimant.trigger.clone(),
+                    fence: lease.fence,
+                    at: now,
+                })?;
+            }
+            TaskState::Settled { .. } => return fail(StateError::CancelPreviewChanged(id.clone())),
+        }
+        task.interrupt_running(now);
+        task.state = TaskState::Claimed { lease };
+        task.cancel = Some(CancelRequest {
+            requested_by: claimant.holder.clone(),
+            at: now,
+            reason: Some(reason.clone()),
+        });
+        task.settle(Settlement::Cancelled, fence, now)?;
+        Ok(fence)
     }
 
     pub(crate) fn begin_effect(

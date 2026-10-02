@@ -18,5 +18,6 @@ pub mod push;
 pub mod run;
 pub mod scaffold;
 pub mod store;
+pub mod task;
 pub mod tick;
 pub mod trust;

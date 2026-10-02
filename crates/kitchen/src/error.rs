@@ -116,6 +116,9 @@ pub enum Error {
     /// A house's runtime configuration was refused.
     #[error(transparent)]
     Runtime(#[from] crate::house::RuntimeError),
+    /// Owner cancellation was refused or failed.
+    #[error(transparent)]
+    TaskCancel(#[from] crate::workflows::task_cancel::CancelError),
 }
 
 impl Error {
@@ -153,6 +156,7 @@ impl Error {
             Self::Tick(error) => error.class(),
             Self::Run(error) => error.class(),
             Self::Runtime(error) => error.class(),
+            Self::TaskCancel(error) => error.class(),
         }
     }
 }

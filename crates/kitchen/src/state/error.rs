@@ -168,6 +168,9 @@ pub enum StateError {
     /// A task id was reused with a different specification.
     #[error("task {0} already exists with a different specification")]
     TaskConflict(TaskId),
+    /// The task changed after cancellation was previewed.
+    #[error("task {0} changed since cancellation preview; preview again")]
+    CancelPreviewChanged(TaskId),
     /// A task-fenced marker write named a marker of another work item.
     #[error("marker is not for task {0}")]
     MarkerNotForTask(TaskId),
@@ -408,6 +411,7 @@ impl StateError {
                 ErrorClass::InvalidInput
             }
             Self::TaskNotFound(_)
+            | Self::CancelPreviewChanged(_)
             | Self::TaskConflict(_)
             | Self::TaskSettled { .. }
             | Self::TaskNotSettled(_)

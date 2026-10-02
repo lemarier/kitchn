@@ -48,6 +48,8 @@ enum Command {
     Push(commands::push::PushArgs),
     /// Inspect a settled writer's checkout and confirm preservation at one PR head.
     Preserve(commands::preserve::PreserveArgs),
+    /// Preview and cancel a stuck task as the house owner.
+    Task(commands::task::TaskArgs),
     /// Bind a house to the forge account it writes as, or show its binding.
     Forge(commands::forge::ForgeArgs),
     /// Record an independent review for the scheduled merge gate.
@@ -125,6 +127,7 @@ fn main() -> ExitCode {
         Some(Command::Pickup(args)) => commands::pickup::run(args).map(|output| (output, true)),
         Some(Command::Push(args)) => commands::push::run(args),
         Some(Command::Preserve(args)) => commands::preserve::run(args),
+        Some(Command::Task(args)) => commands::task::run(args),
         Some(Command::Forge(args)) => commands::forge::run(args),
         Some(Command::Gate(args)) => commands::gate::run(args),
         Some(Command::Store(args)) => commands::store::run(args),

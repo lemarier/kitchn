@@ -199,6 +199,7 @@ fn scope(args: &[OsString]) -> Scope {
         | ("cleanup", _)
         | ("budget", _)
         | ("store", _)
+        | ("task", _)
         | ("mailbox", _)
         | ("audit", _)
         | ("gardener", "report-stale") => Scope::Both,

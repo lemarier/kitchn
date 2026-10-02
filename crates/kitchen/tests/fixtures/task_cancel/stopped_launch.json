@@ -1,0 +1,17 @@
+{
+  "name": "launch-1",
+  "request": { "effect": { "executor": "worker", "effect": { "type": "launch-worker" } } },
+  "state": {
+    "type": "applied",
+    "receipt": {
+      "reference": "task_example",
+      "created": [{ "kind": "worker", "backend": "orca", "handle": "ctx_stopped" }],
+      "touched": [
+        { "kind": "branch", "backend": "orca", "handle": "example/repair" },
+        { "kind": "worktree", "backend": "orca", "handle": "example-worktree" }
+      ]
+    }
+  },
+  "lookup": "ended",
+  "workerState": "stopped"
+}

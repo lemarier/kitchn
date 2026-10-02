@@ -3,11 +3,14 @@
 mod common;
 mod workflows_support;
 
-use common::{TestResult, holder, ttl};
+use common::{TestResult, holder, plan, ttl};
 use kitchen::{
     TaskId,
-    contracts::{Settlement, Text, WorkerOutcome, WorkerState, Workspace, fake::ExecuteFault},
-    state::{EffectState, OwnershipEvent, TaskState},
+    contracts::{
+        Capability, CapabilitySet, Effect, ExternalRef, Lookup, Operation, Receipt, ResourceKind,
+        Settlement, Text, WorkerOutcome, WorkerState, Workspace, fake::ExecuteFault,
+    },
+    state::{EffectState, OwnershipEvent, TaskState, run_effect},
     workflows::{
         coordination::{LaunchOutcome, launch_worker},
         pickup::{ClaimOutcome, claim_issue, issue_task_id},
@@ -42,6 +45,208 @@ fn launched(world: &World) -> TestResult<(TaskId, kitchen::contracts::ResourceRe
         other => return Err(format!("unexpected launch: {other:?}").into()),
     };
     Ok((task, worker))
+}
+
+fn launch_receipt(
+    world: &World,
+    task: &TaskId,
+) -> TestResult<(kitchen::contracts::IdempotencyKey, Receipt)> {
+    let record = world.fixture.store.task(task)?;
+    let effect = record.effects().first().ok_or("missing launch")?;
+    let EffectState::Applied { receipt, .. } = effect.state() else {
+        return Err("launch was not applied".into());
+    };
+    Ok((effect.request().key().clone(), receipt.clone()))
+}
+
+fn claimed_fence(world: &World, task: &TaskId) -> TestResult<kitchen::contracts::Fence> {
+    let record = world.fixture.store.task(task)?;
+    let TaskState::Claimed { lease } = record.state() else {
+        return Err("task is not claimed".into());
+    };
+    Ok(lease.fence())
+}
+
+#[test]
+fn applied_messages_and_reply_use_receipts_after_worker_settles() -> TestResult {
+    let capabilities =
+        CapabilitySet::supporting(Capability::ALL.iter().copied().filter(|capability| {
+            !matches!(
+                capability,
+                Capability::EffectLookup
+                    | Capability::LookupMessageWorker
+                    | Capability::LookupReplyToWorker
+            )
+        }));
+    let world = World::with_capabilities(capabilities)?;
+    let (task, worker) = launched(&world)?;
+    let fence = claimed_fence(&world, &task)?;
+    world.backend.set_worker_state(&worker, WorkerState::Ready);
+    for (name, operation) in [
+        (
+            "message-1",
+            Operation::MessageWorker {
+                worker: worker.clone(),
+                body: Text::new("Follow up")?,
+            },
+        ),
+        (
+            "reply-1",
+            Operation::ReplyToWorker {
+                worker: worker.clone(),
+                question: ExternalRef::new("question-1")?,
+                body: Text::new("Proceed")?,
+            },
+        ),
+    ] {
+        let effect = run_effect(
+            &world.fixture.store,
+            &world.backend,
+            &world.grants,
+            plan(&task, fence, name, Effect::Worker(operation))?,
+            &world.clock,
+        )?;
+        assert!(matches!(effect.state(), EffectState::Applied { .. }));
+    }
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Succeeded));
+    let preview = task_cancel::preview(&world.fixture.store, &world.backend, &task)?;
+    assert_eq!(preview.effects(), 3);
+    task_cancel::cancel(
+        &world.fixture.store,
+        &world.backend,
+        preview,
+        holder("person")?,
+        Text::new("settled round")?,
+        &world.clock,
+    )?;
+    assert!(matches!(
+        world.fixture.reopen()?.task(&task)?.state(),
+        TaskState::Settled {
+            settlement: Settlement::Cancelled,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn stopped_launch_with_reconstructed_receipt_cancels() -> TestResult {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/task_cancel/stopped_launch.json"))?;
+    assert_eq!(fixture["name"], "launch-1");
+    assert_eq!(
+        fixture["request"]["effect"]["effect"]["type"],
+        "launch-worker"
+    );
+    assert_eq!(fixture["state"]["type"], "applied");
+    assert_eq!(fixture["lookup"], "ended");
+    assert_eq!(fixture["workerState"], "stopped");
+    let example: Receipt = serde_json::from_value(fixture["state"]["receipt"].clone())?;
+    assert!(
+        example
+            .created()
+            .iter()
+            .any(|resource| resource.kind == ResourceKind::Worker)
+    );
+    let world = World::new()?;
+    let (task, worker) = launched(&world)?;
+    let (key, persisted) = launch_receipt(&world, &task)?;
+    let reconstructed = Receipt::new(
+        persisted.reference().clone(),
+        vec![worker.clone()],
+        example.touched().to_vec(),
+    )?;
+    assert_ne!(reconstructed, persisted);
+    world.backend.set_lookup(key, Lookup::Ended(reconstructed));
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Cancelled));
+    let preview = task_cancel::preview(&world.fixture.store, &world.backend, &task)?;
+    assert_eq!(preview.workers(), 1);
+    task_cancel::cancel(
+        &world.fixture.store,
+        &world.backend,
+        preview,
+        holder("person")?,
+        Text::new("stopped launch")?,
+        &world.clock,
+    )?;
+    assert!(matches!(
+        world.fixture.reopen()?.task(&task)?.state(),
+        TaskState::Settled {
+            settlement: Settlement::Cancelled,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn failed_worker_allows_changed_applied_lookup_but_foreign_identity_refuses() -> TestResult {
+    let world = World::new()?;
+    let (task, worker) = launched(&world)?;
+    let (key, persisted) = launch_receipt(&world, &task)?;
+    let changed = Receipt::new(persisted.reference().clone(), vec![worker.clone()], vec![])?;
+    assert_ne!(changed, persisted);
+    world.backend.set_lookup(key, Lookup::Applied(changed));
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Failed));
+    assert_eq!(
+        task_cancel::preview(&world.fixture.store, &world.backend, &task)?.workers(),
+        1
+    );
+
+    let other = World::new()?;
+    let (task, worker) = launched(&other)?;
+    let (key, persisted) = launch_receipt(&other, &task)?;
+    let foreign = Receipt::new(
+        persisted.reference().clone(),
+        vec![kitchen::contracts::ResourceRef {
+            handle: ExternalRef::new("ctx_foreign")?,
+            ..worker.clone()
+        }],
+        vec![],
+    )?;
+    other.backend.set_lookup(key, Lookup::Ended(foreign));
+    other
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Cancelled));
+    let error = task_cancel::preview(&other.fixture.store, &other.backend, &task)
+        .err()
+        .ok_or("different launch identity was accepted")?;
+    assert!(matches!(error, CancelError::Effect { .. }));
+    assert!(error.to_string().contains("launch-1"));
+    Ok(())
+}
+
+#[test]
+fn uncertain_or_live_launch_names_the_cause() -> TestResult {
+    let world = World::new()?;
+    let (task, worker) = launched(&world)?;
+    let (key, _) = launch_receipt(&world, &task)?;
+    world.backend.set_lookup(key, Lookup::Unknown);
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Cancelled));
+    let error = task_cancel::preview(&world.fixture.store, &world.backend, &task)
+        .err()
+        .ok_or("uncertain lookup was accepted")?;
+    assert!(matches!(error, CancelError::Effect { .. }));
+    assert!(error.to_string().contains("launch-1"));
+    assert!(error.to_string().contains("uncertain"));
+
+    let live = World::new()?;
+    let (task, worker) = launched(&live)?;
+    live.backend.set_worker_state(&worker, WorkerState::Ready);
+    let error = task_cancel::preview(&live.fixture.store, &live.backend, &task)
+        .err()
+        .ok_or("live launch was accepted")?;
+    assert!(matches!(error, CancelError::Worker { .. }));
+    assert!(error.to_string().contains("Ready"));
+    Ok(())
 }
 
 #[test]

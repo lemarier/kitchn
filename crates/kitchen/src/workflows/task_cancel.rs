@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use crate::{
     ErrorClass, HolderId, TaskId,
     contracts::{
-        Capability, Claimant, Clock, Effect, Lookup, ResourceKind, ResourceRef, Text,
-        WorkerBackend, WorkerState,
+        Capability, Claimant, Clock, Effect, Lookup, Operation, Receipt, ResourceKind, ResourceRef,
+        Text, WorkerBackend, WorkerState,
     },
     state::{EffectState, HouseStore, TaskRecord, TaskState},
 };
@@ -94,8 +94,8 @@ impl CancelPreview {
 }
 
 /// Inspect every effect and worker without changing the store or backend.
-/// Applied worker effects are looked up again under their persisted keys,
-/// including a stopped launch whose dispatch is now reported as ended.
+/// Applied worker effects whose outcomes can change are looked up under their
+/// persisted keys. Applied messages and replies use their durable receipts.
 pub fn preview(
     store: &HouseStore,
     backend: &dyn WorkerBackend,
@@ -123,30 +123,63 @@ pub fn preview(
         match effect.state() {
             EffectState::NotApplied { .. } => {}
             EffectState::Applied { receipt, .. } => {
-                if matches!(effect.request().effect(), Effect::Worker(_)) {
-                    if effect.request().backend() != &backend.descriptor().backend
-                        || !backend
-                            .descriptor()
-                            .supports_lookup(effect.request().effect())
-                    {
+                if let Effect::Worker(operation) = effect.request().effect() {
+                    if effect.request().backend() != &backend.descriptor().backend {
                         return Err(CancelError::Effect {
                             name: effect.name().to_string(),
                             cause: "bound backend cannot reconcile this effect",
                         });
                     }
-                    let outcome =
-                        backend
-                            .lookup(effect.request())
-                            .map_err(|_| CancelError::Effect {
+                    if !matches!(
+                        operation,
+                        Operation::MessageWorker { .. } | Operation::ReplyToWorker { .. }
+                    ) {
+                        if !backend
+                            .descriptor()
+                            .supports_lookup(effect.request().effect())
+                        {
+                            return Err(CancelError::Effect {
                                 name: effect.name().to_string(),
-                                cause: "backend lookup unavailable",
-                            })?;
-                    if !matches!(outcome, Lookup::Applied(ref found) | Lookup::Ended(ref found) if found == receipt)
-                    {
-                        return Err(CancelError::Effect {
-                            name: effect.name().to_string(),
-                            cause: "backend outcome is absent, uncertain, or differs from recorded receipt",
-                        });
+                                cause: "bound backend cannot reconcile this effect",
+                            });
+                        }
+                        let outcome =
+                            backend
+                                .lookup(effect.request())
+                                .map_err(|_| CancelError::Effect {
+                                    name: effect.name().to_string(),
+                                    cause: "backend lookup unavailable",
+                                })?;
+                        let consistent = match (&outcome, operation) {
+                            (Lookup::Applied(found) | Lookup::Ended(found), _)
+                                if found == receipt =>
+                            {
+                                true
+                            }
+                            (Lookup::Ended(found), Operation::LaunchWorker { .. }) => {
+                                same_launch(receipt, found)
+                            }
+                            (Lookup::Applied(found), Operation::LaunchWorker { .. })
+                                if same_launch(receipt, found) =>
+                            {
+                                receipt_workers(receipt).all(|worker| {
+                                    matches!(
+                                        backend.observe_worker(worker),
+                                        Ok(WorkerState::Settled(
+                                            crate::contracts::WorkerOutcome::Cancelled
+                                                | crate::contracts::WorkerOutcome::Failed
+                                        ))
+                                    )
+                                })
+                            }
+                            _ => false,
+                        };
+                        if !consistent {
+                            return Err(CancelError::Effect {
+                                name: effect.name().to_string(),
+                                cause: "backend outcome is absent, uncertain, or differs from recorded receipt",
+                            });
+                        }
                     }
                 }
                 for resource in receipt.created().iter().chain(receipt.touched()) {
@@ -181,6 +214,23 @@ pub fn preview(
         record,
         workers: workers.len(),
     })
+}
+
+fn receipt_workers(receipt: &Receipt) -> impl Iterator<Item = &ResourceRef> {
+    receipt
+        .created()
+        .iter()
+        .chain(receipt.touched())
+        .filter(|resource| resource.kind == ResourceKind::Worker)
+}
+
+// Orca reconstructs a stopped dispatch's receipt from its current records;
+// branch and worktree details can differ after the worker stops. The task id
+// and worker identity must still identify the same launch.
+fn same_launch(recorded: &Receipt, found: &Receipt) -> bool {
+    recorded.reference() == found.reference()
+        && receipt_workers(recorded).next().is_some()
+        && receipt_workers(recorded).eq(receipt_workers(found))
 }
 
 /// Settle the exact previewed task under a fresh fence. The caller must be a

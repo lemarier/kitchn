@@ -1792,6 +1792,11 @@ impl StoreState {
         reason: &Text,
         now: Timestamp,
     ) -> Result<Fence> {
+        if reason.as_str().len() > MAX_ACKNOWLEDGEMENT_REASON_BYTES {
+            return fail(StateError::CapacityExceeded {
+                limit: Limit::AcknowledgementReason,
+            });
+        }
         self.check_claimant(claimant, now)?;
         let id = &expected.spec.id;
         if self.task(id)? != expected {

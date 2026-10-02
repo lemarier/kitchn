@@ -444,3 +444,30 @@ fn uncertain_launch_effect_names_the_effect_and_keeps_the_task_claimed() -> Test
     ));
     Ok(())
 }
+
+#[test]
+fn an_oversized_reason_is_refused_without_settlement() -> TestResult {
+    let world = World::new()?;
+    let (task, worker) = launched(&world)?;
+    world
+        .backend
+        .set_worker_state(&worker, WorkerState::Settled(WorkerOutcome::Cancelled));
+    let preview = task_cancel::preview(&world.fixture.store, &world.backend, &task)?;
+    let long = "x".repeat(kitchen::state::MAX_ACKNOWLEDGEMENT_REASON_BYTES + 1);
+    assert!(
+        task_cancel::cancel(
+            &world.fixture.store,
+            &world.backend,
+            preview,
+            holder("person")?,
+            Text::new(&long)?,
+            &world.clock,
+        )
+        .is_err()
+    );
+    assert!(!matches!(
+        world.fixture.reopen()?.task(&task)?.state(),
+        TaskState::Settled { .. }
+    ));
+    Ok(())
+}

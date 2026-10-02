@@ -62,6 +62,15 @@ the task after its linked PR merges. It requires the PR's exact head to match
 the task's last checked push, a forge merge commit, and a successfully settled
 worker. An open PR or a different head still needs the report or a person.
 
+A round created by older code may lack the worktree resource needed to
+relaunch. From a separate owner checkout, run `kitchn task cancel <task>
+--reason "older round cannot relaunch"` to inspect its effects and workers.
+If every effect is resolved and every worker has stopped or settled, repeat
+with `--confirm`. Kitchen records a fresh fenced cancellation, allowing the
+next follow-up pass to create a round with the current task specification.
+The command refuses an uncertain effect or worker and names it; investigate
+that outcome before retrying.
+
 ## File safety
 
 The installer refuses redirected roots, parents and target paths, and never

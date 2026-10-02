@@ -43,6 +43,7 @@ pub enum ExecuteFault {
 #[derive(Debug, Default)]
 struct FakeState {
     applied: BTreeMap<IdempotencyKey, Receipt>,
+    lookup_overrides: BTreeMap<IdempotencyKey, Lookup>,
     workers: BTreeMap<ExternalRef, WorkerState>,
     worktrees: BTreeMap<ExternalRef, (BranchName, CommitId, bool)>,
     owners: BTreeMap<ExternalRef, ExternalRef>,
@@ -138,6 +139,12 @@ impl FakeBackend {
     /// Make the next `count` lookups fail with a timeout.
     pub fn fail_lookups(&self, count: usize) {
         self.lock().lookup_outages = count;
+    }
+
+    /// Override one key's lookup answer to simulate a changed backend
+    /// projection without changing the persisted execution receipt.
+    pub fn set_lookup(&self, key: IdempotencyKey, answer: Lookup) {
+        self.lock().lookup_overrides.insert(key, answer);
     }
 
     /// How many effects were actually performed, counting duplicates a
@@ -412,6 +419,9 @@ impl EffectExecutor for FakeBackend {
         if state.lookup_outages > 0 {
             state.lookup_outages = state.lookup_outages.saturating_sub(1);
             return Err(BackendUnavailable::Timeout);
+        }
+        if let Some(answer) = state.lookup_overrides.get(request.key()) {
+            return Ok(answer.clone());
         }
         Ok(state
             .applied

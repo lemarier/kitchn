@@ -25,6 +25,7 @@ pub mod repair;
 pub mod run;
 pub mod sampling;
 pub mod stack;
+pub mod task_cancel;
 pub mod tick;
 pub mod train;
 pub mod triage;

@@ -91,6 +91,9 @@ worktree's `config.worktree`.
 The dishwasher recognizes a reconciled stopped launch as creation evidence.
 After a retry, it checks the worker and worktree from each attempt for backend
 ownership, settlement, and preserved work before an approved release.
+An owner can preview a stuck task with `kitchn task cancel <task> --reason
+"cannot relaunch"` from a separate checkout and repeat with `--confirm` after
+the backend proves its effects resolved and workers stopped or settled.
 
 ## What stays true
 

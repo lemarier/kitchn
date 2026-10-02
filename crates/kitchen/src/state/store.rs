@@ -348,6 +348,18 @@ impl HouseStore {
         self.transact(|state| state.settle_cancelled(id, fence, now))
     }
 
+    /// Fence and settle a previewed task in one transaction, recording the
+    /// owner's reason. A changed task invalidates the preview.
+    pub(crate) fn owner_cancel(
+        &self,
+        expected: &TaskRecord,
+        claimant: &Claimant,
+        reason: &Text,
+        now: Timestamp,
+    ) -> Result<Fence> {
+        self.transact(|state| state.owner_cancel(expected, claimant, reason, now))
+    }
+
     /// Persist the intent for one effect on `executor` before it is executed.
     ///
     /// Every check uses the executor's own descriptor, so a caller cannot

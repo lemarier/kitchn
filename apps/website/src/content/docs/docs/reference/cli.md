@@ -294,6 +294,31 @@ interactive TTY where the owner types the displayed head prefix. This checkpoint
 cannot authenticate a person when workers share the same OS user and credentials.
 Full enforcement requires worker isolation such as OpenShell, deferred here.
 
+## `kitchn task cancel`
+
+Preview a stuck task from a separate checkout of its repository, then repeat
+with `--confirm` after reviewing the result:
+
+```sh
+kitchn task cancel <task> --reason "older round cannot relaunch"
+kitchn task cancel <task> --reason "older round cannot relaunch" --confirm
+```
+
+The command infers `--registry` from `KITCHN_HOME` or `~/.kitchn`, `--house`
+from the checkout's stored repository binding, and `--holder` from the GitHub
+user configured in `gh`; each can be passed explicitly. The reason is required.
+Kitchen refuses a launched worktree or Orca worker environment. It checks every
+effect in the store: not-applied effects are safe, and applied effects have a
+recorded outcome. Applied worker effects also need a matching backend lookup.
+Every worker the task owns must be
+reported settled by the backend. Missing, live, uncertain, or unreadable
+effects and workers are named in refusals. Confirmation rechecks the backend
+and task, takes a fresh fence, and records the person, reason, and cancelled
+settlement in one store transaction. It does not stop a worker or undo an
+applied effect. `--confirm` requires a terminal and typing the task ID shown
+with the second preview. A process with the same OS identity can impersonate the owner;
+worker isolation remains necessary for strong person authentication.
+
 ## `kitchn work`, `kitchn pr` and `kitchn hand-back`
 
 The entrypoints behind the [`/kitchn` skill](/docs/guides/sessions/). Each

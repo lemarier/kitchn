@@ -183,10 +183,23 @@ where claims live, and commands find it through the registry.
 The scheduled gate merges a pull request without a person only when the house
 grants `merge` for the repository and an independent reviewer has attested the
 exact head and base. Checks must pass, threads must be resolved, and the
-attestation must say the review was clean and read-only, acceptance and
-hardware are complete, and no risk class applies. Any risk class needs a
-separate human approval, so the gate reports the pull request instead of
-merging it. The gate also never merges a branch a person wrote.
+attestation must say the review was clean and read-only and that acceptance
+and hardware are complete. The gate also never merges a branch a person wrote.
+
+A risk class blocks the merge unless an approval covers it. The gate's
+rules accept a pull request with risk classes only when an approval is
+verified on the forge as an approving review at the exact head, comes from a
+login with write access to the repository, and names the same house,
+repository, head, and base. Every other merge condition still applies. The
+scheduled gate does not read such an approval yet, so today it reports every
+pull request with a risk class instead of merging it.
+
+Merge authority needs two entries in the house config: a `merge` grant scoped
+to the repository on the house's forge, and a house policy limit that permits
+that grant. Kitchen refuses a house config whose grant no limit permits, and
+with a limit but no grant the gate only reports. `kitchn house grant` creates
+neither; it refuses `merge`. The house's readiness policy must also clear the
+repository.
 
 The reviewer who attests must not be the pull request's author, any author or
 committer of a commit on the branch, or a worker that a launch on the branch
